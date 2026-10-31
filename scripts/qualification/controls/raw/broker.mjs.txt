@@ -1,0 +1,390 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import { createHash } from 'node:crypto';
+import { spawn } from 'node:child_process';
+import { createInterface } from 'node:readline';
+import { Database } from 'bun:sqlite';
+import { plugin } from 'bun';
+
+const [bindingFile, role = 'coordinator', childFile] = process.argv.slice(2);
+const binding = JSON.parse(fs.readFileSync(bindingFile, 'utf8'));
+assert.equal(binding.schema, 'CoreforgeBrokerRefreshRuntimeBinding');
+assert.equal(binding.version, '18.12.0');
+const home = fs.realpathSync(process.env.HOME);
+assert(home === binding.home || home.startsWith(binding.home + path.sep));
+assert.equal(fs.readFileSync(path.join(binding.work, '.owner'), 'utf8'), binding.owner);
+assert.equal(process.env.GIT_OPTIONAL_LOCKS, '0');
+assert.equal(process.env.GIT_NO_REPLACE_OBJECTS, '1');
+const hash = value => createHash('sha256').update(value).digest('hex');
+const engine = binding.engine;
+if (binding.variant === 'frozen-incoming') {
+  const replacements = new Map();
+  for (const row of binding.frozenOwners) {
+    const file = path.join(engine, row.relative);
+    assert.equal(hash(fs.readFileSync(row.preimage)), row.sha256);
+    replacements.set(file, row.preimage);
+  }
+  plugin({ name: 'immutable-incoming-broker-lifecycle', setup(build) {
+    build.onLoad({ filter: /\.(?:ts|js)$/ }, args => {
+      const preimage = replacements.get(args.path);
+      if (!preimage) return;
+      return { contents: fs.readFileSync(preimage, 'utf8'), loader: 'ts', resolveDir: path.dirname(args.path) };
+    });
+  } });
+} else assert.equal(binding.variant, 'current');
+
+const ai = await import(path.join(engine, 'packages/ai/src/auth-storage.ts'));
+const cli = await import(path.join(engine, 'packages/coding-agent/src/cli/auth-broker-cli.ts'));
+const utils = await import(path.join(engine, 'packages/utils/src/index.ts'));
+const { CredentialPool } = await import(path.join(engine, 'packages/ai/src/auth/pool.ts'));
+const { mcpOAuthCredentialId } = await import(path.join(engine, 'packages/coding-agent/src/mcp/oauth-flow.ts'));
+const { SqliteAuthCredentialStore } = ai;
+const { createBrokerAuthStorage, runAuthBrokerCommand } = cli;
+const timeoutMs = 8_000;
+async function bounded(work, label) {
+  const deadline = Promise.withResolvers();
+  const timer = setTimeout(() => deadline.reject(new Error('Harness deadline: ' + label)), timeoutMs);
+  try { return await Promise.race([work, deadline.promise]); }
+  finally { clearTimeout(timer); }
+}
+function observeStore(target, emit) {
+  const restores = [];
+  for (const method of ['tryAcquireCredentialRefreshLease', 'tryUpdateAuthCredentialIfMatches', 'releaseCredentialRefreshLease', 'close']) {
+    const descriptor = Object.getOwnPropertyDescriptor(target, method);
+    const original = target[method];
+    assert.equal(typeof original, 'function', method);
+    Object.defineProperty(target, method, { configurable: true, writable: true, value: function (...args) {
+      const detail = method === 'tryUpdateAuthCredentialIfMatches'
+        ? { id: args[0], expectedDataSha256: hash(args[1]), credential: args[2], lease: args[3] }
+        : { id: args[0], owner: args[1], expiresAt: args[2] };
+      emit({ kind: 'store', method, phase: 'enter', ...detail });
+      try {
+        const result = original.apply(this, args);
+        emit({ kind: 'store', method, phase: 'return', result, ...detail });
+        return result;
+      } catch (error) {
+        emit({ kind: 'store', method, phase: 'throw', error: String(error), ...detail });
+        throw error;
+      }
+    } });
+    restores.push(() => descriptor ? Object.defineProperty(target, method, descriptor) : Reflect.deleteProperty(target, method));
+  }
+  return () => { for (const restore of restores.reverse()) restore(); };
+}
+function rawState(dbPath, provider) {
+  const db = new Database(dbPath, { readonly: true });
+  try {
+    return {
+      rows: db.query('SELECT id, provider, credential_type, data, identity_key, disabled_cause FROM auth_credentials WHERE provider = ? ORDER BY id').all(provider),
+      leases: db.query('SELECT credential_id, owner, expires_at_ms FROM auth_credential_refresh_leases ORDER BY credential_id').all(),
+      revision: db.query('SELECT revision FROM auth_change_revision WHERE id = 1').get(),
+    };
+  } finally { db.close(); }
+}
+function check(result, label, predicate, detail) {
+  result.checks.push({ label, passed: predicate, ...(detail === undefined ? {} : { detail }) });
+}
+async function durable(dbPath, provider) {
+  const store = await SqliteAuthCredentialStore.open(dbPath);
+  try { return { credentials: store.listAuthCredentials(provider), ...rawState(dbPath, provider) }; }
+  finally { store.close(); }
+}
+
+if (role === 'cli-child') {
+  const config = JSON.parse(fs.readFileSync(childFile, 'utf8'));
+  const allowedOrigin = new URL(config.tokenUrl).origin;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (input, init) => {
+    const url = new URL(typeof input === 'string' || input instanceof URL ? String(input) : input.url);
+    assert.equal(url.origin, allowedOrigin, 'Non-fixture CLI transport');
+    return originalFetch(input, init);
+  };
+  const emit = value => fs.writeSync(1, '@BROKER_REFRESH@' + JSON.stringify(value) + '\n');
+  const dbPath = utils.getAgentDbPath();
+  assert(dbPath.startsWith(home + path.sep), 'CLI database escaped private HOME');
+  fs.mkdirSync(path.dirname(dbPath), { recursive: true, mode: 0o700 });
+  fs.mkdirSync(utils.getConfigRootDir(), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(utils.getConfigRootDir(), 'auth-broker.token'), config.token + '\n', { flag: 'wx', mode: 0o600 });
+  const seedStore = await SqliteAuthCredentialStore.open(dbPath);
+  const seed = createBrokerAuthStorage(seedStore);
+  await seed.credentials.set(config.provider, [config.credential]);
+  const seedRow = seedStore.listAuthCredentials(config.provider)[0];
+  assert(seedRow);
+  await seed.close();
+  emit({ kind: 'seed', dbPath, id: seedRow.id, initial: rawState(dbPath, config.provider) });
+  observeStore(SqliteAuthCredentialStore.prototype, emit);
+  const originalBump = CredentialPool.prototype.bump;
+  CredentialPool.prototype.bump = function (reason) {
+    const result = originalBump.call(this, reason);
+    emit({ kind: 'generation', reason, generation: this.generation });
+    return result;
+  };
+  utils.logger.registerLogSink(({ message, context }) => {
+    if (message === 'auth-broker listening') emit({ kind: 'ready', url: context?.url });
+    if (message === 'auth-broker shutting down') emit({ kind: 'shutdown', signal: context?.signal });
+    if (message === 'auth-broker refresh failed') emit({ kind: 'request-settled', error: context?.error, id: context?.id });
+  });
+  const lines = createInterface({ input: process.stdin });
+  lines.on('line', line => {
+    const message = JSON.parse(line);
+    assert.equal(message.kind, 'checkpoint');
+    emit({ kind: 'checkpoint', state: rawState(dbPath, config.provider) });
+  });
+  await runAuthBrokerCommand({ action: 'serve', flags: { bind: '127.0.0.1:0' } });
+  throw new Error('Real CLI serve returned without signal exit');
+}
+assert.equal(role, 'coordinator');
+const report = { schema: 'CoreforgeBrokerRefreshConsumer', binding, authoredOnly: false, complete: false, consumerInvariantsSatisfied: false, observations: [], transportViolations: [], cleanupVerified: false };
+const ownedChildren = new Set();
+const ownedServers = new Set();
+const openStorages = new Set();
+const originalFetch = globalThis.fetch;
+const allowedOrigins = new Set();
+globalThis.fetch = (input, init) => {
+  const url = new URL(typeof input === 'string' || input instanceof URL ? String(input) : input.url);
+  if (!allowedOrigins.has(url.origin)) {
+    report.transportViolations.push(url.origin);
+    throw new Error('Non-fixture coordinator transport: ' + url.origin);
+  }
+  return originalFetch(input, init);
+};
+function fixture(label) {
+  const rotated = Promise.withResolvers();
+  const response = Promise.withResolvers();
+  const state = { label, exchanges: [], currentRefresh: label + '-old-refresh', released: false };
+  const server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(req) {
+    assert.equal(new URL(req.url).pathname, '/token');
+    assert.equal(req.method, 'POST');
+    const body = new URLSearchParams(await req.text());
+    assert.equal(body.get('grant_type'), 'refresh_token');
+    assert.equal(body.get('client_id'), 'synthetic-client');
+    assert.equal(body.get('refresh_token'), state.currentRefresh);
+    assert.equal(state.exchanges.length, 0, 'Consumed refresh grant replayed');
+    state.currentRefresh = label + '-rotated-refresh';
+    const event = { oldRefreshInvalidated: true, grantType: body.get('grant_type'), clientId: body.get('client_id'), oldRefresh: body.get('refresh_token'), newRefresh: state.currentRefresh };
+    state.exchanges.push(event);
+    rotated.resolve(event);
+    return response.promise;
+  } });
+  ownedServers.add(server);
+  const origin = `http://127.0.0.1:${server.port}`;
+  allowedOrigins.add(origin);
+  const provider = mcpOAuthCredentialId(origin + '/resource', 'default');
+  const credential = { type: 'oauth', access: label + '-old-access', refresh: state.currentRefresh, expires: Date.now() + 3_600_000, tokenUrl: origin + '/token', clientId: 'synthetic-client', resource: origin + '/resource' };
+  return { label, state, origin, provider, credential, rotated: rotated.promise,
+    release() {
+      if (state.released) return;
+      state.released = true;
+      response.resolve(Response.json({ access_token: label + '-rotated-access', refresh_token: state.currentRefresh, expires_in: 3600, token_type: 'Bearer' }));
+    },
+    close() { this.release(); server.stop(true); ownedServers.delete(server); },
+  };
+}
+function assertLease(state, id) {
+  const lease = state.leases.find(row => row.credential_id === id);
+  assert(lease && typeof lease.owner === 'string' && lease.owner.length > 0 && lease.expires_at_ms > Date.now(), 'No real live row refresh lease');
+}
+function inspectDurable(result, state, initialId, label) {
+  const credential = state.credentials.find(row => row.id === initialId)?.credential;
+  check(result, 'same durable credential row survives', state.credentials.length === 1 && state.credentials[0].id === initialId, state.credentials.map(row => row.id));
+  check(result, 'rotated provider grant is durable', credential?.access === label + '-rotated-access' && credential?.refresh === label + '-rotated-refresh', credential);
+  check(result, 'refresh lease is released', state.leases.length === 0, state.leases);
+  check(result, 'credential remains active', state.rows.length === 1 && state.rows[0].disabled_cause === null);
+}
+function inspectCas(result, events) {
+  const cas = events.filter(event => event.kind === 'store' && event.method === 'tryUpdateAuthCredentialIfMatches' && event.phase === 'return' && event.result === true);
+  check(result, 'real lease-fenced CAS persists once', cas.length === 1 && typeof cas[0].lease?.owner === 'string', cas);
+  const firstClose = events.findIndex(event => event.kind === 'store' && event.method === 'close' && event.phase === 'enter');
+  const persisted = events.findIndex(event => event.kind === 'store' && event.method === 'tryUpdateAuthCredentialIfMatches' && event.phase === 'return' && event.result === true);
+  check(result, 'database close follows durable CAS', firstClose >= 0 && persisted >= 0 && persisted < firstClose, { firstClose, persisted });
+}
+
+async function detachedControl() {
+  const f = fixture('control');
+  const result = { label: 'detached-cancel-without-teardown', checks: [], events: [] };
+  const dbPath = path.join(binding.work, 'control.db');
+  const store = await SqliteAuthCredentialStore.open(dbPath);
+  const storage = createBrokerAuthStorage(store);
+  openStorages.add(storage);
+  await storage.credentials.set(f.provider, [f.credential]);
+  const id = store.listAuthCredentials(f.provider)[0].id;
+  const released = Promise.withResolvers();
+  const restore = observeStore(store, event => { result.events.push(event); if (event.method === 'releaseCredentialRefreshLease' && event.phase !== 'enter') released.resolve(); });
+  try {
+    const abort = new AbortController();
+    const request = storage.oauth.refresh(id, abort.signal).then(() => ({ rejected: false }), error => ({ rejected: true, error: String(error) }));
+    await bounded(f.rotated, 'control remote rotation');
+    assertLease(rawState(dbPath, f.provider), id);
+    abort.abort(new Error('synthetic requester canceled after provider rotation'));
+    const canceled = await bounded(request, 'control requester cancellation');
+    assert(canceled.rejected, 'Request did not cancel');
+    result.request = canceled;
+    f.release();
+    await bounded(released.promise, 'control detached persistence');
+    await storage.close(); openStorages.delete(storage);
+    result.durable = await durable(dbPath, f.provider);
+    inspectDurable(result, result.durable, id, f.label);
+    inspectCas(result, result.events);
+    result.remote = f.state;
+    return result;
+  } finally { restore(); f.close(); }
+}
+
+async function cliShutdown() {
+  const f = fixture('cli');
+  const result = { label: 'actual-cli-sigterm-after-requester-cancel', checks: [], events: [], stderr: '' };
+  const childHome = path.join(binding.home, 'broker-cli-home');
+  fs.mkdirSync(childHome, { mode: 0o700 });
+  const config = path.join(binding.work, 'cli.json');
+  const token = 'synthetic-broker-only-token';
+  fs.writeFileSync(config, JSON.stringify({ tokenUrl: f.origin + '/token', token, provider: f.provider, credential: f.credential }), { flag: 'wx', mode: 0o600 });
+  const waiters = [];
+  const waitEvent = kind => {
+    const existing = result.events.find(event => event.kind === kind);
+    if (existing) return Promise.resolve(existing);
+    const gate = Promise.withResolvers();
+    waiters.push({ kind, resolve: gate.resolve });
+    return gate.promise;
+  };
+  const child = spawn(process.execPath, ['--no-env-file', import.meta.path, bindingFile, 'cli-child', config], {
+    cwd: binding.work, env: { ...process.env, HOME: childHome, USERPROFILE: childHome,
+      XDG_CONFIG_HOME: path.join(childHome, 'config'), XDG_CACHE_HOME: path.join(childHome, 'cache'), XDG_DATA_HOME: path.join(childHome, 'data'), XDG_STATE_HOME: path.join(childHome, 'state') },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  ownedChildren.add(child);
+  const exitGate = Promise.withResolvers();
+  child.once('error', exitGate.reject);
+  child.once('close', (code, signal) => { ownedChildren.delete(child); exitGate.resolve({ kind: 'exit', code, signal }); });
+  const exited = exitGate.promise;
+  child.stderr.on('data', bytes => { result.stderr += bytes.toString(); assert(result.stderr.length < 256 * 1024, 'CLI stderr limit'); });
+  child.stdin.on('error', error => { if (error.code !== 'EPIPE') result.stdinError = String(error); });
+  const lines = createInterface({ input: child.stdout });
+  lines.on('line', line => {
+    if (!line.startsWith('@BROKER_REFRESH@')) return;
+    const event = JSON.parse(line.slice('@BROKER_REFRESH@'.length));
+    result.events.push(event);
+    for (let i = waiters.length - 1; i >= 0; i--) if (waiters[i].kind === event.kind) waiters.splice(i, 1)[0].resolve(event);
+  });
+  const aliveEvent = kind => bounded(Promise.race([waitEvent(kind), exited.then(exit => { throw new Error('CLI exited before ' + kind + ': ' + JSON.stringify(exit) + '\n' + result.stderr); })]), 'CLI ' + kind);
+  try {
+    const seed = await aliveEvent('seed');
+    const ready = await aliveEvent('ready');
+    assert.equal(new URL(ready.url).hostname, '127.0.0.1');
+    allowedOrigins.add(new URL(ready.url).origin);
+    const abort = new AbortController();
+    const request = fetch(ready.url + '/v1/credential/' + seed.id + '/refresh', {
+      method: 'POST', headers: { authorization: 'Bearer ' + token }, signal: abort.signal,
+    }).then(async response => ({ rejected: false, status: response.status, body: await response.text() }), error => ({ rejected: true, error: String(error) }));
+    await bounded(f.rotated, 'CLI provider rotation');
+    result.beforeCancellation = rawState(seed.dbPath, f.provider);
+    assertLease(result.beforeCancellation, seed.id);
+    abort.abort(new Error('synthetic HTTP requester canceled after provider rotation'));
+    const canceled = await bounded(request, 'HTTP requester cancellation');
+    assert(canceled.rejected, 'HTTP requester did not cancel');
+    result.request = canceled;
+    const detached = await aliveEvent('request-settled');
+    assert.match(detached.error, /abort/i, 'Broker did not observe caller abort');
+    assert(child.kill('SIGTERM'), 'Cannot signal owned CLI');
+    await bounded(Promise.race([waitEvent('shutdown'), exited]), 'actual CLI signal shutdown');
+    if (!child.stdin.destroyed) child.stdin.write(JSON.stringify({ kind: 'checkpoint' }) + '\n');
+    result.boundary = await bounded(Promise.race([waitEvent('checkpoint'), exited]), 'shutdown event-loop checkpoint or actual exit');
+    f.release();
+    result.exit = await bounded(exited, 'CLI signal exit');
+    assert(result.events.some(event => event.kind === 'shutdown'), 'Actual CLI shutdown handler did not execute');
+    result.durable = await durable(seed.dbPath, f.provider);
+    inspectDurable(result, result.durable, seed.id, f.label);
+    inspectCas(result, result.events);
+    check(result, 'CLI finishes without forced termination', result.exit.signal === null && [0, 143].includes(result.exit.code), result.exit);
+    check(result, 'real refresh advances generation', result.events.some(event => event.kind === 'generation' && event.reason === 'credentials' && event.generation > 2), result.events.filter(event => event.kind === 'generation'));
+    result.remote = f.state;
+    return result;
+  } finally {
+    f.close();
+    if (ownedChildren.has(child)) { child.kill('SIGKILL'); await bounded(exited, 'failed CLI fixture closure'); }
+    lines.close();
+  }
+}
+
+async function replaceStore() {
+  const f = fixture('replace');
+  const result = { label: 'actual-replaceStore-after-requester-cancel', checks: [], events: [], generations: [] };
+  const oldPath = path.join(binding.work, 'replacement-old.db'), newPath = path.join(binding.work, 'replacement-new.db');
+  const oldStore = await SqliteAuthCredentialStore.open(oldPath), nextStore = await SqliteAuthCredentialStore.open(newPath);
+  const storage = createBrokerAuthStorage(oldStore);
+  openStorages.add(storage);
+  await storage.credentials.set(f.provider, [f.credential]);
+  const oldId = oldStore.listAuthCredentials(f.provider)[0].id;
+  const nextCredential = { ...f.credential, access: 'replacement-generation-access', refresh: 'replacement-generation-refresh' };
+  await nextStore.replaceAuthCredentials(f.provider, [nextCredential]);
+  const nextId = nextStore.listAuthCredentials(f.provider)[0].id;
+  assert.equal(nextId, oldId, 'Fixture must collide numeric row ids across distinct stores');
+  const released = Promise.withResolvers();
+  const restore = observeStore(oldStore, event => { result.events.push(event); if (event.method === 'releaseCredentialRefreshLease' && event.phase !== 'enter') released.resolve(); });
+  let replacement;
+  const unsubscribe = storage.credentials.onGeneration(generation => result.generations.push({ generation, activeGeneration: storage.credentials.generation, activeRows: storage.credentials.snapshot().credentials }));
+  try {
+    const abort = new AbortController();
+    const request = storage.oauth.refresh(oldId, abort.signal).then(() => ({ rejected: false }), error => ({ rejected: true, error: String(error) }));
+    await bounded(f.rotated, 'replacement provider rotation');
+    result.beforeCancellation = rawState(oldPath, f.provider);
+    assertLease(result.beforeCancellation, oldId);
+    abort.abort(new Error('synthetic replacement requester canceled after provider rotation'));
+    const canceled = await bounded(request, 'replacement requester cancellation');
+    assert(canceled.rejected, 'Replacement requester did not cancel');
+    result.request = canceled;
+    const generationBefore = storage.credentials.generation;
+    replacement = storage.replaceStore(nextStore).then(() => ({ completed: true }), error => ({ completed: false, error: String(error) }));
+    const checkpoint = Promise.withResolvers();
+    setImmediate(checkpoint.resolve);
+    await checkpoint.promise;
+    result.boundary = { oldClosedBeforeResponse: result.events.some(event => event.method === 'close' && event.phase === 'return'), activeGeneration: storage.credentials.generation, runnableMicrotasksDrained: true };
+    f.release();
+    result.replacement = await bounded(replacement, 'actual store replacement');
+    assert(result.replacement.completed, 'replaceStore itself failed: ' + result.replacement.error);
+    await bounded(released.promise, 'old-generation detached refresh settlement');
+    result.active = { generation: storage.credentials.generation, credentials: storage.credentials.snapshot().credentials };
+    check(result, 'replacement generation advances', result.active.generation > generationBefore, { generationBefore, generationAfter: result.active.generation });
+    check(result, 'old generation cannot publish through replacement subscribers', result.generations.every(event => event.generation === event.activeGeneration), result.generations);
+    const active = result.active.credentials.find(row => row.id === nextId)?.credential;
+    check(result, 'active replacement keeps its own grant', active?.access === nextCredential.access && active?.refresh !== f.label + '-rotated-refresh', active);
+    await storage.close(); openStorages.delete(storage);
+    result.oldDurable = await durable(oldPath, f.provider);
+    result.nextDurable = await durable(newPath, f.provider);
+    inspectDurable(result, result.oldDurable, oldId, f.label);
+    inspectCas(result, result.events);
+    const next = result.nextDurable.credentials[0];
+    check(result, 'matching numeric id cannot corrupt next store', result.nextDurable.credentials.length === 1 && next.id === nextId && next.credential.access === nextCredential.access && next.credential.refresh === nextCredential.refresh, next);
+    check(result, 'next store has no old refresh lease', result.nextDurable.leases.length === 0, result.nextDurable.leases);
+    result.remote = f.state;
+    return result;
+  } finally {
+    f.close();
+    if (replacement) await bounded(replacement, 'replacement final settlement');
+    unsubscribe(); restore();
+    nextStore.close();
+  }
+}
+
+try {
+  for (const run of [detachedControl, cliShutdown, replaceStore]) {
+    try { report.observations.push(await run()); }
+    catch (error) { report.observations.push({ label: run.name, harnessError: String(error), stack: error.stack }); }
+  }
+  report.complete = report.observations.length === 3 && report.observations.every(row => !row.harnessError);
+  report.consumerInvariantsSatisfied = report.complete && report.observations.every(row => row.checks.every(item => item.passed));
+} finally {
+  const closingChildren = [...ownedChildren].map(child => {
+    const closed = Promise.withResolvers();
+    child.once('close', closed.resolve);
+    child.kill('SIGKILL');
+    return closed.promise;
+  });
+  await bounded(Promise.all(closingChildren), 'owned child final closure');
+  for (const server of ownedServers) { server.stop(true); ownedServers.delete(server); }
+  for (const storage of openStorages) { await storage.close(); openStorages.delete(storage); }
+  globalThis.fetch = originalFetch;
+  report.cleanupVerified = ownedChildren.size === 0 && ownedServers.size === 0 && openStorages.size === 0 && report.transportViolations.length === 0;
+  fs.writeSync(1, JSON.stringify(report) + '\n');
+  if (!report.complete || !report.consumerInvariantsSatisfied || !report.cleanupVerified) process.exitCode = 1;
+}

@@ -10,6 +10,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: cf-verify-${{ github.event.pull_request.number }}
@@ -18,6 +19,7 @@ concurrency:
 jobs:
   prepare:
     name: classify native inputs
+    if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-24.04
     outputs:
       native_changed: ${{ steps.native.outputs.changed }}
@@ -67,6 +69,9 @@ jobs:
 
   build:
     needs: prepare
+    env:
+      SOURCE_SHA: ${{ github.event.pull_request.head.sha }}
+      CARGO_BUILD_JOBS: "2"
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -175,6 +180,18 @@ jobs:
           sudo rm -rf /usr/local/lib/android /opt/hostedtoolcache/CodeQL
           df -h /
       - run: bun install --frozen-lockfile
+      - name: Install pinned qualification toolchain
+        if: matrix.target == 'linux-x64' || matrix.target == 'darwin-arm64'
+        run: |
+          channel="$(bun -e 'console.log(Bun.TOML.parse(await Bun.file("rust-toolchain.toml").text()).toolchain.channel)')"
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy --no-self-update
+          echo "RUSTUP_TOOLCHAIN=$channel" >> "$GITHUB_ENV"
+          echo "RUSTUP_AUTO_INSTALL=0" >> "$GITHUB_ENV"
+      - name: Bind native source identity
+        if: matrix.target == 'linux-x64' || matrix.target == 'darwin-arm64'
+        env:
+          QUALIFICATION_RECEIPT_DIR: ${{ runner.temp }}/qualification-producer
+        run: bun scripts/ci-qualification-engine.ts snapshot native-effective
       # Pull requests can restore trusted base-branch release caches, but never
       # save multi-gigabyte merge-ref caches that sibling pull requests cannot use.
       - name: Restore Bazel native build cache
@@ -203,7 +220,13 @@ jobs:
           } > "$RUNNER_TEMP/coreforge-bazel.rc"
           export OMP_BAZEL_RC="$RUNNER_TEMP/coreforge-bazel.rc"
           read -r -a targets <<< "$NATIVE_TARGETS"
-          bun scripts/bazel-natives.ts "${targets[@]}"
+          if [ "${{ matrix.target }}" = linux-x64 ] || [ "${{ matrix.target }}" = darwin-arm64 ]; then
+            export QUALIFICATION_RECEIPT_DIR="$RUNNER_TEMP/qualification-producer"
+            bun scripts/ci-qualification-engine.ts snapshot native-effective
+            bun scripts/ci-qualification-engine.ts build-native "${targets[@]}"
+          else
+            bun scripts/bazel-natives.ts "${targets[@]}"
+          fi
           ls packages/natives/native/*.node
       - name: Build native addon from Coreforge sources (Windows ARM64)
         if: needs.prepare.outputs.native_changed == 'true' && matrix.windows == '1'
@@ -352,9 +375,16 @@ jobs:
         shell: pwsh
         run: bun scripts/set-cf-version.ts $env:VERIFY_VERSION
       - name: Build binary
+        if: matrix.target != 'linux-x64' && matrix.target != 'darwin-arm64'
         env:
           RELEASE_TARGETS: ${{ matrix.target }}
         run: bun run ci:release:build-binaries
+      - name: Build and bind qualification binary
+        if: matrix.target == 'linux-x64' || matrix.target == 'darwin-arm64'
+        env:
+          RELEASE_TARGETS: ${{ matrix.target }}
+          QUALIFICATION_RECEIPT_DIR: ${{ runner.temp }}/qualification-producer
+        run: bun scripts/ci-qualification-engine.ts build-binary
       - name: Smoke binary
         if: matrix.windows != '1' && matrix.cross != '1'
         run: |
@@ -388,12 +418,188 @@ jobs:
           if (-not (Test-Path $binaryPath) -or (Get-Item $binaryPath).Length -eq 0) {
             throw "binary asset is missing: $binaryPath"
           }
+      - name: Seal qualification inputs
+        if: matrix.target == 'linux-x64' || matrix.target == 'darwin-arm64'
+        env:
+          QUALIFICATION_RECEIPT_DIR: ${{ runner.temp }}/qualification-producer
+          NATIVE_SOURCE: ${{ needs.prepare.outputs.native_changed == 'true' && 'pull-request' || needs.prepare.outputs.release_tag }}
+        run: bun scripts/ci-qualification-engine.ts inputs "${{ matrix.target }}"
+      - name: Retain exact-head qualification inputs
+        if: matrix.target == 'linux-x64' || matrix.target == 'darwin-arm64'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: qualification-inputs-${{ matrix.target }}
+          retention-days: 3
+          if-no-files-found: error
+          path: |
+            qualification-inputs.json
+            qualification-effective-source/**
+            packages/natives/native/**
+            packages/coding-agent/binaries/${{ matrix.binary }}
+            LICENSE
+            THIRD-PARTY-NOTICES.txt
+            packages/natives/LICENSE
+            packages/natives/THIRD-PARTY-NOTICES.txt
+            packages/coding-agent/LICENSE
+            packages/coding-agent/THIRD-PARTY-NOTICES.txt
+      - name: Retain qualification producer receipts
+        if: always() && (matrix.target == 'linux-x64' || matrix.target == 'darwin-arm64')
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: qualification-producer-${{ matrix.target }}
+          retention-days: 3
+          if-no-files-found: error
+          path: ${{ runner.temp }}/qualification-producer
+
+  qualification_engine:
+    name: full engine / ${{ matrix.target }} / ${{ matrix.scope }}
+    needs: build
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x64
+            os: ubuntu-24.04
+            scope: typescript
+          - target: linux-x64
+            os: ubuntu-24.04
+            scope: rust
+          - target: darwin-arm64
+            os: xcode-27
+            scope: typescript
+          - target: darwin-arm64
+            os: xcode-27
+            scope: rust
+    env:
+      SOURCE_SHA: ${{ github.event.pull_request.head.sha }}
+      QUALIFICATION_RECEIPT_DIR: ${{ runner.temp }}/qualification-engine
+      CARGO_BUILD_JOBS: "2"
+      CARGO_INCREMENTAL: "0"
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_PROFILE_DEV_STRIP: "false"
+      CARGO_PROFILE_TEST_STRIP: "false"
+      CARGO_PROFILE_CI_STRIP: "false"
+      CARGO_PROFILE_RELEASE_STRIP: "false"
+      OMP_TEST_CONCURRENCY: "2"
+      OMP_NO_ENV_FILE: "1"
+      AWS_EC2_METADATA_DISABLED: "true"
+      AWS_CONFIG_FILE: /dev/null
+      AWS_SHARED_CREDENTIALS_FILE: /dev/null
+      NO_COLOR: "1"
+      CARGO_TERM_COLOR: never
+      CARGO_HOME: ${{ runner.temp }}/qualification-cargo
+      RUSTUP_HOME: ${{ runner.temp }}/qualification-rustup
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: "1.4.4"
+      - name: Prepare private qualification environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/qualification-home" "$RUNNER_TEMP/qualification-tmp" "$QUALIFICATION_RECEIPT_DIR"
+          chmod 700 "$RUNNER_TEMP/qualification-home" "$RUNNER_TEMP/qualification-tmp"
+          echo "HOME=$RUNNER_TEMP/qualification-home" >> "$GITHUB_ENV"
+          echo "TMPDIR=$RUNNER_TEMP/qualification-tmp" >> "$GITHUB_ENV"
+          echo "TMP=$RUNNER_TEMP/qualification-tmp" >> "$GITHUB_ENV"
+          echo "TEMP=$RUNNER_TEMP/qualification-tmp" >> "$GITHUB_ENV"
+      - name: Restore Cargo qualification cache
+        id: cargo-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ${{ runner.temp }}/qualification-cargo
+            ${{ runner.temp }}/qualification-rustup
+            target
+          key: qualification-cargo-v1-${{ matrix.target }}-${{ matrix.scope }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', '.cargo/config.toml') }}
+          restore-keys: |
+            qualification-cargo-v1-${{ matrix.target }}-${{ matrix.scope }}-
+      - name: Install pinned qualification tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          channel="$(bun -e 'console.log(Bun.TOML.parse(await Bun.file("rust-toolchain.toml").text()).toolchain.channel)')"
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy --no-self-update
+          toolchain_bin="$(dirname "$(rustup which --toolchain "$channel" cargo)")"
+          echo "$toolchain_bin" >> "$GITHUB_PATH"
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+          echo "RUSTUP_TOOLCHAIN=$channel" >> "$GITHUB_ENV"
+          echo "RUSTUP_AUTO_INSTALL=0" >> "$GITHUB_ENV"
+      - name: Install Rust suite runner
+        if: matrix.scope == 'rust'
+        run: |
+          if ! cargo nextest --version | grep -F '0.9.114'; then
+            cargo install cargo-nextest --version 0.9.114 --locked
+          fi
+      - name: Install pinned attribution tool
+        if: matrix.scope == 'rust' && runner.os == 'Linux'
+        run: |
+          if ! cargo about --version | grep -F 'cargo-about 0.8.2'; then
+            cargo install cargo-about --version 0.8.2 --locked
+          fi
+      - name: Install Linux qualification dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends ninja-build pkg-config cmake libclang-dev libasound2-dev libudev-dev libssl-dev python3 redis-server bubblewrap
+          if [ "${{ matrix.scope }}" = typescript ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - name: Install Darwin qualification dependencies
+        if: runner.os == 'macOS'
+        run: brew install ninja pkg-config cmake redis
+      - name: Install exact locked dependencies
+        run: |
+          bun install --frozen-lockfile
+          bun install --cwd .omp/tools --frozen-lockfile
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: qualification-inputs-${{ matrix.target }}
+          path: .
+      - name: Run complete engine scope
+        run: bun scripts/ci-qualification-engine.ts "${{ matrix.scope }}"
+      - name: Retain engine qualification receipts and logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: qualification-engine-${{ matrix.target }}-${{ matrix.scope }}
+          retention-days: 3
+          if-no-files-found: error
+          path: ${{ runner.temp }}/qualification-engine
+      - name: Save compatible Cargo qualification cache
+        if: success() && steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ${{ runner.temp }}/qualification-cargo
+            ${{ runner.temp }}/qualification-rustup
+            target
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
+
+  qualification_consumers:
+    needs: [build]
+    uses: ./.github/workflows/cf-qualification-consumers.yml
+    with:
+      source-sha: ${{ github.event.pull_request.head.sha }}
+    permissions:
+      contents: read
+      actions: read
 
   browser_relay:
+    if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.event.pull_request.head.sha }}
           persist-credentials: false
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:

@@ -1,0 +1,164 @@
+import assert from "node:assert/strict";
+import { createHash, randomUUID } from "node:crypto";
+import * as path from "node:path";
+import type { IndexedSessionStorage } from "../../packages/coding-agent/src/session/indexed-session-storage";
+import { SQL, RedisClient } from "bun";
+import { SqlSessionStorage } from "../../packages/coding-agent/src/session/sql-session-storage";
+import { RedisSessionStorage } from "../../packages/coding-agent/src/session/redis-session-storage";
+import { SessionWriteConflictError } from "../../packages/coding-agent/src/session/session-storage";
+import { SessionManager } from "../../packages/coding-agent/src/session/session-manager";
+import { admitTitleCard, serializeTitleSlot, titleUpdateFromContent } from "../../packages/coding-agent/src/session/session-title-slot";
+
+/** Called by the isolated source/compiled runtime proof, never with an ambient production database. */
+export async function runPortableTitleDatabaseProof(adapter: string, endpoint: string, root: string) {
+ assert(["sqlite", "postgres", "mysql", "redis"].includes(adapter));
+ if (adapter !== "sqlite") {
+  const url = new URL(endpoint);
+  assert(["localhost", "127.0.0.1", "[::1]"].includes(url.hostname), "Database proof permits only an explicitly supplied loopback fixture");
+  assert.equal(url.protocol, adapter === "postgres" ? "postgres:" : adapter + ":");
+ }
+ const id = randomUUID().replaceAll("-", "");
+ const table = "cf_title_proof_" + id;
+ const prefix = "cf:title-proof:" + id + ":";
+ const sql = adapter === "redis" ? undefined : new SQL(adapter === "sqlite" ? "sqlite://" + path.join(root, id + ".db") : endpoint);
+ const redis = adapter === "redis" ? new RedisClient(endpoint) : undefined;
+ const owners: IndexedSessionStorage[] = [];
+ const managers: SessionManager[] = [];
+ const checked: string[] = [];
+ const files = ["/fixture/source.jsonl", "/fixture/moved.jsonl", "/fixture/plain.jsonl"];
+ let cleaned = false;
+ try {
+  if (sql) {
+   const ddl = adapter === "mysql"
+    ? `CREATE TABLE ${table} (path VARCHAR(512) PRIMARY KEY, content LONGTEXT NOT NULL, mtime_ms BIGINT NOT NULL, title TEXT NULL, title_source VARCHAR(16) NULL, title_updated_at VARCHAR(64) NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin`
+    : `CREATE TABLE ${table} (path TEXT PRIMARY KEY, content TEXT NOT NULL, mtime_ms BIGINT NOT NULL, title TEXT, title_source TEXT, title_updated_at TEXT)`;
+   await sql.unsafe(ddl);
+  }
+  const open = async () => {
+   const storage = redis
+    ? await RedisSessionStorage.create({ client: redis, prefix })
+    : await SqlSessionStorage.create({ client: sql!, table, adapter: adapter as "sqlite" | "postgres" | "mysql" });
+   owners.push(storage); return storage;
+  };
+  const storage = await open();
+  if (sql) { await sql.unsafe(`SELECT title_card FROM ${table}`); checked.push("real-old-schema-migration"); }
+  const first = { title: "Portable database", source: "auto" as const, updatedAt: "2026-01-01T00:00:00.000Z" };
+  const body = serializeTitleSlot(first) + JSON.stringify({ type: "session", version: 3, id, cwd: root, timestamp: first.updatedAt, title: first.title, titleSource: first.source, titleUpdatedAt: first.updatedAt }) + "\n";
+  await storage.writeText(files[0]!, body);
+  const update = { ...first, updatedAt: "2026-01-02T00:00:00.000Z" };
+  const candidates = { code: "DB", emoji: "🧪", nf: "nf-md-flask" };
+  const card = admitTitleCard(update, candidates)!; assert(card);
+  await storage.updateSessionTitle(files[0]!, { ...update, card });
+  const cold = await open();
+  assert.deepEqual(titleUpdateFromContent(await cold.readText(files[0]!)), { ...update, card });
+  const [head] = await cold.readTextSlices(files[0]!, 256, 0);
+  assert.equal(Buffer.byteLength(head), 256); assert.deepEqual(JSON.parse(head).card, card);
+  checked.push("cold-index-title-card", "physical-slot-overlay");
+  const before = await storage.readTextSnapshot(files[0]!);
+  const changed = admitTitleCard(update, { code: "NEW", emoji: "🔥" })!;
+  await cold.updateSessionTitle(files[0]!, { ...update, card: changed });
+  await assert.rejects(storage.writeTextAtomic(files[0]!, body, {
+   expectedSize: Buffer.byteLength(before.rawContent),
+   expectedFingerprint: createHash("sha1").update(before.rawContent).digest("hex"),
+   expectedTitleMeta: before.titleMeta,
+  }), SessionWriteConflictError);
+  assert.deepEqual(titleUpdateFromContent((await cold.readTextSnapshot(files[0]!)).content)?.card, changed);
+  checked.push("actual-card-only-CAS-conflict", "rejected-publish-retains-winner");
+  const recovered = await open();
+  const cleared = { ...update, source: "user" as const, updatedAt: "2026-01-03T00:00:00.000Z" };
+  await recovered.updateSessionTitle(files[0]!, cleared);
+  const plain = await open();
+  assert.deepEqual(titleUpdateFromContent(await plain.readText(files[0]!)), cleared);
+  if (sql) {
+   const marker = adapter === "postgres" ? "$1" : "?";
+   const rows = await sql.unsafe(`SELECT title, title_source, title_updated_at, title_card FROM ${table} WHERE path = ${marker}`, [files[0]!]);
+   assert.deepEqual(Array.from(rows), [{ title: cleared.title, title_source: "user", title_updated_at: cleared.updatedAt, title_card: null }]);
+  }
+  checked.push("same-text-manual-clear", "real-persisted-null-card");
+  const overflow = { ...cleared, title: "界".repeat(2000), updatedAt: "2026-01-04T00:00:00.000Z" };
+  await plain.updateSessionTitle(files[0]!, overflow);
+  const long = await open();
+  const overflowSnapshot = await long.readTextSnapshot(files[0]!);
+  assert.deepEqual(titleUpdateFromContent(overflowSnapshot.content), overflow);
+  assert.deepEqual(JSON.parse(overflowSnapshot.titleMeta!), overflow);
+  assert.equal(Buffer.byteLength(overflowSnapshot.content.split("\n")[0]! + "\n"), 256);
+  const writer = long.openWriter(files[0]!, { flags: "a" });
+  try {
+   await writer.append(JSON.stringify({ type: "custom", id: "extra", parentId: null, timestamp: overflow.updatedAt, customType: "proof", data: "尾" }) + "\n");
+  } finally {
+   await writer.close();
+  }
+  await long.drain();
+  await long.rename(files[0]!, files[1]!);
+  const moved = await open();
+  assert.deepEqual(titleUpdateFromContent(await moved.readText(files[1]!)), overflow);
+  checked.push("full-overflow-header-and-semantic-tuple", "append-move-cold-reopen");
+  await moved.writeText(files[2]!, "plain source\n");
+  await moved.rename(files[2]!, files[1]!);
+  const replaced = await open();
+  const replacedSnapshot = await replaced.readTextSnapshot(files[1]!);
+  assert.equal(replacedSnapshot.content, "plain source\n"); assert.equal(replacedSnapshot.titleMeta, null);
+  checked.push("move-clears-stale-destination-tuple");
+  await replaced.writeText(files[1]!, body);
+  await replaced.updateSessionTitle(files[1]!, { ...update, card });
+  await replaced.writeText(files[1]!, "plain replacement\n");
+  const truncated = await open();
+  assert.equal((await truncated.readTextSnapshot(files[1]!)).titleMeta, null);
+  assert.equal(await truncated.readText(files[1]!), "plain replacement\n");
+  checked.push("truncate-clears-title-tuple");
+  const manager = SessionManager.create(root, path.join(root, "database-sessions"), await open()); managers.push(manager);
+  manager.appendMessage({ role: "user", content: "Synthetic database title fixture", timestamp: 1 });
+  await manager.ensureOnDisk();
+  await manager.setSessionName("Manager database title", "auto", undefined, candidates);
+  const managerFile = manager.getSessionFile()!; const managerTime = manager.titleUpdatedAt; await manager.close();
+  const reopened = await SessionManager.open(managerFile, undefined, await open()); managers.push(reopened);
+  assert.equal(reopened.getSessionName(), "Manager database title");
+  assert.equal(reopened.titleUpdatedAt, managerTime); assert.deepEqual(reopened.getSessionTitleCard(), candidates);
+  await reopened.setSessionName("Manager database title", "user");
+  assert.equal(reopened.getSessionTitleCard(), undefined);
+  assert.equal(await reopened.setSessionName("Late auto", "auto", undefined, candidates), false);
+  await reopened.setSessionName(overflow.title, "user", undefined, candidates); await reopened.close();
+  const managerCold = await SessionManager.open(managerFile, undefined, await open()); managers.push(managerCold);
+  assert.equal(managerCold.getSessionName(), overflow.title); assert.equal(managerCold.getSessionTitleCard(), undefined);
+  await managerCold.close(); checked.push("real-manager-cold-open-clear-precedence-overflow");
+  if (sql) {
+   const fresh = await SqlSessionStorage.create({ client: sql, table: table + "_fresh", adapter: adapter as "sqlite" | "postgres" | "mysql" });
+   owners.push(fresh);
+   await fresh.writeText(files[0]!, body);
+   await fresh.updateSessionTitle(files[0]!, { ...update, card });
+   assert.deepEqual(titleUpdateFromContent(await fresh.readText(files[0]!)), { ...update, card });
+   checked.push("real-fresh-schema-title-card");
+  }
+ } finally {
+  await Promise.allSettled(managers.map(manager => manager.close()));
+  await Promise.allSettled(owners.map(storage => storage.drain()));
+  try {
+   if (sql) {
+    for (const ownedTable of [table, table + "_fresh"]) {
+     await sql.unsafe(`DROP TABLE IF EXISTS ${ownedTable}`);
+     const remaining = await sql.unsafe(adapter === "sqlite"
+      ? `SELECT name FROM sqlite_master WHERE type = 'table' AND name = '${ownedTable}'`
+      : `SELECT table_name FROM information_schema.tables WHERE table_name = '${ownedTable}'`);
+     assert.equal(remaining.length, 0);
+    }
+   }
+   if (redis) {
+    let cursor = "0";
+    do {
+     const result = await redis.send("SCAN", [cursor, "MATCH", prefix + "*", "COUNT", "100"]);
+     assert(Array.isArray(result)); cursor = String(result[0]);
+     const keys = result[1] as string[];
+     if (keys.length) await redis.del(...keys);
+    } while (cursor !== "0");
+    cursor = "0";
+    do {
+     const final = await redis.send("SCAN", [cursor, "MATCH", prefix + "*", "COUNT", "1000"]);
+     assert(Array.isArray(final)); cursor = String(final[0]); assert.equal((final[1] as string[]).length, 0);
+    } while (cursor !== "0");
+   }
+   cleaned = true;
+  } finally { if (sql) await sql.end(); redis?.close(); }
+ }
+ assert(cleaned);
+ return { adapter, status: "passed", checked, cleanup: { fixtureRemoved: true, clientsClosed: true }, boundary: "Actual supplied loopback engine; no fixture command emulation, service startup, installation, or provider request." };
+}

@@ -1,0 +1,317 @@
+import assert from "node:assert/strict";
+import { createHash, randomUUID } from "node:crypto";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
+import type { AssistantMessage, Context, FetchImpl, Model, ProviderSessionState, ServiceTier } from "../../packages/ai/src/types";
+import type { AgentSession as Session } from "../../packages/coding-agent/src/session/agent-session";
+
+// Synthetic-only source/compiled proof; Parent supplies the current candidate identities and native artifact.
+const compiled = process.env.PI_COMPILED === "true";
+const version = process.env.CF_UPSTREAM_CANDIDATE_VERSION;
+const nativeSha256 = process.env.V1890_NATIVE_SHA256;
+const sourceInputSha256 = process.env.V1890_SOURCE_INPUT_SHA256;
+const manifestPath = process.env.V1890_SOURCE_INPUT_MANIFEST;
+const heads = {
+ engineHead: process.env.CF_UPSTREAM_ENGINE_HEAD,
+ mergeHead: process.env.CF_UPSTREAM_MERGE_HEAD || null,
+ companionHead: null,
+};
+const sourceRoots = [process.env.CF_QUAL_CHECKOUT!]; assert(sourceRoots[0] && path.isAbsolute(sourceRoots[0]));
+const outsideSources = (file: string) => sourceRoots.every(root => file !== root && !file.startsWith(root + path.sep));
+const digest = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest("hex");
+assert(version && /^\d+\.\d+\.\d+$/.test(version));
+assert(nativeSha256 && /^[a-f0-9]{64}$/.test(nativeSha256));
+assert(sourceInputSha256 && /^[a-f0-9]{64}$/.test(sourceInputSha256));
+assert(heads.engineHead && /^[a-f0-9]{40}$/.test(heads.engineHead));
+if (heads.mergeHead) assert(/^[a-f0-9]{40}$/.test(heads.mergeHead));
+assert(manifestPath && path.isAbsolute(manifestPath));
+assert(outsideSources(manifestPath));
+assert((await fs.lstat(manifestPath)).isFile());
+assert(outsideSources(await fs.realpath(manifestPath)));
+const manifestBytes = await fs.readFile(manifestPath);
+assert.equal(digest(manifestBytes), sourceInputSha256);
+const manifest = JSON.parse(manifestBytes.toString());
+assert.equal(manifest.schema, "CoreforgeCandidateSourceSnapshot");
+assert.equal(manifest.engineHead, heads.engineHead);
+assert.equal(manifest.mergeHead, heads.mergeHead);
+assert.equal(manifest.companionHead, heads.companionHead);
+assert.equal(manifest.native.sha256, nativeSha256);
+assert(process.env.HOME && process.env.TMPDIR);
+const parentTmp = await fs.realpath(process.env.TMPDIR);
+assert(outsideSources(parentTmp));
+const root = await fs.mkdtemp(path.join(parentTmp, "final-sol-ultrafast-"));
+const owner = randomUUID();
+await fs.writeFile(path.join(root, ".owner"), owner, { flag: "wx", mode: 0o600 });
+const home = path.join(root, "home"), tmp = path.join(root, "tmp");
+await fs.mkdir(home); await fs.mkdir(tmp);
+const oldFetch = globalThis.fetch, oldWebSocket = globalThis.WebSocket;
+for (const key of new Set([...Object.keys(process.env), ...Object.keys(Bun.env)])) {
+ delete process.env[key]; delete Bun.env[key];
+}
+const isolatedEnv = {
+ PATH: "/usr/bin:/bin", HOME: home, USERPROFILE: home, TMPDIR: tmp,
+ PI_CODING_AGENT_DIR: path.join(home, "agent"), GIT_OPTIONAL_LOCKS: "0", GIT_NO_REPLACE_OBJECTS: "1", LANG: "en_US.UTF-8",
+};
+for (const [key, value] of Object.entries(isolatedEnv)) { process.env[key] = value; Bun.env[key] = value; }
+await fs.mkdir(isolatedEnv.PI_CODING_AGENT_DIR);
+process.chdir(root);
+let forbiddenNetworkAttempts = 0;
+const refuseNetwork = () => { forbiddenNetworkAttempts++; throw new Error("Sol probe forbids provider/network access"); };
+globalThis.fetch = Object.assign(refuseNetwork, { preconnect: refuseNetwork }) as typeof fetch;
+class ForbiddenWebSocket { constructor() { refuseNetwork(); } }
+globalThis.WebSocket = ForbiddenWebSocket as unknown as typeof WebSocket;
+const sessions = new Set<Session>();
+const providerStates: Map<string, ProviderSessionState>[] = [];
+const callbacks = new Set<Promise<void>>();
+const callbackErrors: unknown[] = [];
+const sockets: SyntheticWebSocket[] = [];
+const cases: Record<string, unknown>[] = [];
+let completed = false, auth: { close(): void } | undefined;
+let syntheticFetchCalls = 0, capturedSocketFrames = 0;
+const schedule = (fn: () => void) => {
+ const pending = Promise.resolve().then(fn).catch(error => { callbackErrors.push(error); }).finally(() => { callbacks.delete(pending); });
+ callbacks.add(pending);
+};
+const drainCallbacks = async () => { while (callbacks.size) await Promise.all([...callbacks]); };
+const responseEvents = (id: string, text: string, echo?: ServiceTier) => [
+ { type: "response.created", response: { id } },
+ { type: "response.output_item.added", item: { type: "message", id: `msg_${id}`, role: "assistant", status: "in_progress", content: [] } },
+ { type: "response.content_part.added", part: { type: "output_text", text: "" } },
+ { type: "response.output_text.delta", delta: text },
+ { type: "response.output_item.done", item: { type: "message", id: `msg_${id}`, role: "assistant", status: "completed", content: [{ type: "output_text", text }] } },
+ { type: "response.completed", response: { id, status: "completed", service_tier: echo, usage: { input_tokens: 5, output_tokens: 3, total_tokens: 8, input_tokens_details: { cached_tokens: 0 } } } },
+];
+const frames: Record<string, unknown>[] = [];
+const handshakeHeaders: Headers[] = [];
+class SyntheticWebSocket {
+ static readonly CONNECTING = 0; static readonly OPEN = 1; static readonly CLOSING = 2; static readonly CLOSED = 3;
+ readyState = SyntheticWebSocket.CONNECTING;
+ binaryType = "blob";
+ onopen: ((event: Event) => void) | null = null;
+ onmessage: ((event: MessageEvent) => void) | null = null;
+ onerror: ((event: Event) => void) | null = null;
+ onclose: ((event: Event) => void) | null = null;
+ constructor(readonly url: string, options?: { headers?: HeadersInit }) {
+  assert.equal(new URL(url).hostname, "chatgpt.com");
+  handshakeHeaders.push(new Headers(options?.headers));
+  sockets.push(this);
+  schedule(() => { if (this.readyState !== SyntheticWebSocket.CLOSED) { this.readyState = SyntheticWebSocket.OPEN; this.onopen?.(new Event("open")); } });
+ }
+ send(data: string) {
+  assert.equal(this.readyState, SyntheticWebSocket.OPEN);
+  const frame = JSON.parse(data);
+  assert.equal(frame.type, "response.create");
+  frames.push(frame); capturedSocketFrames++;
+  const id = `sol_ws_${capturedSocketFrames}`;
+  schedule(() => {
+   if (this.readyState === SyntheticWebSocket.CLOSED) return;
+   for (const event of responseEvents(id, `answer ${capturedSocketFrames}`, "default")) {
+    this.onmessage?.({ data: JSON.stringify(event) } as MessageEvent);
+   }
+  });
+ }
+ close() { this.readyState = SyntheticWebSocket.CLOSED; this.onopen = this.onmessage = this.onerror = this.onclose = null; }
+}
+
+try {
+ // Module-loading boundary: static imports would read inherited credentials before HOME/environment isolation.
+ await import("../../packages/natives/native/index.js");
+ const { nativeAddonStatus } = await import("../../packages/natives/native/loader-state.js");
+ const native = nativeAddonStatus(); assert(native);
+ assert.equal(native.version, version); assert.equal(native.packageVersion, version); assert.equal(native.stale, false);
+ if (compiled) { assert(outsideSources(native.path)); assert(outsideSources(await fs.realpath(native.path))); }
+ assert.equal(digest(await fs.readFile(native.path)), nativeSha256);
+ const { buildModel } = await import("../../packages/catalog/src/build");
+ const { Agent } = await import("../../packages/agent/src/agent");
+ const { AuthStorage } = await import("../../packages/coding-agent/src/session/auth-storage");
+ const { ModelRegistry } = await import("../../packages/coding-agent/src/config/model-registry");
+ const { Settings } = await import("../../packages/coding-agent/src/config/settings");
+ const { SessionManager } = await import("../../packages/coding-agent/src/session/session-manager");
+ const { AgentSession } = await import("../../packages/coding-agent/src/session/agent-session");
+ const { prewarmOpenAICodexResponses, streamOpenAICodexResponses } = await import("../../packages/ai/src/providers/openai-codex-responses");
+ const { shouldSendServiceTier, getPremiumServiceTierRequests } = await import("../../packages/ai/src/types");
+ const authStorage = await AuthStorage.create(path.join(home, "synthetic-auth.db")); auth = authStorage;
+ const registry = new ModelRegistry(authStorage, path.join(home, "models.yml"));
+ const tokenPayload = Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "synthetic-sol-only" } })).toString("base64url");
+ const token = `synthetic.${tokenPayload}.not-a-signature`;
+ const base = {
+  id: "gpt-6.1-sol", name: "Synthetic Sol", api: "openai-codex-responses" as const, provider: "openai-codex",
+  baseUrl: "https://chatgpt.com/backend-api", reasoning: true, input: ["text"] as ("text")[],
+  cost: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 }, contextWindow: 272000, maxTokens: 128000,
+ };
+ const context = (): Context => ({ systemPrompt: ["Synthetic no-provider fixture"], messages: [{ role: "user", content: "synthetic request", timestamp: 1 }] });
+ const closeStates = (states: Map<string, ProviderSessionState>) => { for (const state of states.values()) state.close(); states.clear(); };
+ const createSession = (model?: Model) => {
+  if (model) authStorage.keys.setRuntime(model.provider, token);
+  const session = new AgentSession({ agent: new Agent({ initialState: { ...(model ? { model } : {}), systemPrompt: ["Synthetic fixture"], tools: [], messages: [] } }), sessionManager: SessionManager.inMemory(), settings: Settings.isolated(), modelRegistry: registry });
+  sessions.add(session); return session;
+ };
+ const checkUsage = (result: AssistantMessage, model: Model, tier: ServiceTier) => {
+  assert.equal(result.stopReason, "stop", result.errorMessage);
+  assert.equal(result.serviceTier, tier);
+  assert.equal(result.usage.premiumRequests, tier === "ultrafast" || tier === "priority" ? (model.provider === "openai-codex" ? 1 : 0) : 0);
+  const multiplier = tier === "flex" || tier === "priority" || tier === "ultrafast" ? model.serviceTierCost?.[tier] ?? 1 : 1;
+  assert(Math.abs(result.usage.cost.input - 5 * model.cost.input / 1e6 * multiplier) < 1e-12);
+  assert(Math.abs(result.usage.cost.output - 3 * model.cost.output / 1e6 * multiplier) < 1e-12);
+  assert(result.content.some(block => block.type === "text" && block.text === "synthetic answer"));
+ };
+ const runSse = async (model: Model<"openai-codex-responses">, selected: ServiceTier | undefined, expectedWire: ServiceTier | undefined, echo?: ServiceTier, rewrite?: "flex" | "omit") => {
+  const states = new Map<string, ProviderSessionState>(); providerStates.push(states);
+  let captured: Record<string, unknown> | undefined, requestedUrl: string | undefined;
+  const fetchFixture: FetchImpl = async (url, init) => {
+   syntheticFetchCalls++;
+   requestedUrl = String(url);
+   const body = init?.body;
+   const text = typeof body === "string" ? body : body instanceof Uint8Array ? new TextDecoder().decode(Bun.zstdDecompressSync(body)) : undefined;
+   assert(text, "actual serialized Codex body required"); captured = JSON.parse(text);
+   const headers = new Headers(init?.headers);
+   assert.equal(headers.get("authorization"), `Bearer ${token}`);
+   return new Response(responseEvents(`sse_${syntheticFetchCalls}`, "synthetic answer", echo).map(event => `data: ${JSON.stringify(event)}\n\n`).join(""), { headers: { "content-type": "text/event-stream" } });
+  };
+  let result: AssistantMessage;
+  try {
+   result = await streamOpenAICodexResponses(model, context(), {
+    apiKey: token, fetch: fetchFixture, preferWebsockets: false, serviceTier: selected, codexSseMaxAttempts: 1, providerSessionState: states,
+    ...(rewrite ? { onPayload: async (payload: unknown) => { const body = { ...(payload as Record<string, unknown>) }; if (rewrite === "omit") delete body.service_tier; else body.service_tier = rewrite; return body; } } : {}),
+   }).result();
+  } finally { closeStates(states); await drainCallbacks(); }
+  assert(captured && requestedUrl);
+  assert.equal(captured.model, model.requestModelId ?? model.id);
+  assert.equal(captured.service_tier, expectedWire);
+  const served = echo && echo !== "default" && echo !== "auto" ? echo : expectedWire ?? "default";
+  checkUsage(result!, model, served);
+  return { selected: selected ?? null, wire: captured.service_tier ?? null, echo: echo ?? null, served: result!.serviceTier, premiumRequests: result!.usage.premiumRequests, cost: result!.usage.cost, serializedModel: captured.model };
+ };
+ const matrix = [
+  { name: "Sol-absent", overrides: {}, admit: true },
+  { name: "Sol-empty", overrides: { serviceTiers: [] }, admit: true },
+  { name: "Sol-priority-only", overrides: { serviceTiers: ["priority"] }, admit: true },
+  { name: "Sol-advertised", overrides: { serviceTiers: ["priority", "ultrafast"] }, admit: true },
+  { name: "non-Sol-absent", overrides: { id: "gpt-6-sol" }, admit: false },
+  { name: "unknown-priority-only", overrides: { id: "gpt-unknown", serviceTiers: ["priority"] }, admit: false },
+  { name: "non-Sol-advertised", overrides: { id: "gpt-6-sol", serviceTiers: ["priority", "ultrafast"] }, admit: true },
+  { name: "custom-provider-Sol", overrides: { provider: "custom-relay", serviceTiers: ["priority"] }, admit: false },
+  { name: "Codex-provider-relay-Sol", overrides: { baseUrl: "https://relay.invalid/backend-api", serviceTiers: ["priority"] }, admit: false },
+  { name: "advertised-custom-Sol", overrides: { provider: "custom-relay", baseUrl: "https://relay.invalid/backend-api", serviceTiers: ["priority", "ultrafast"] }, admit: true },
+  { name: "lookalike-host", overrides: { baseUrl: "https://chatgpt.com.evil.invalid/backend-api", serviceTiers: ["priority"] }, admit: false },
+  { name: "lookalike-path", overrides: { baseUrl: "https://chatgpt.com/backend-apix", serviceTiers: ["priority"] }, admit: false },
+  { name: "remapped-wire-model", overrides: { requestModelId: "gpt-6-sol", serviceTiers: ["priority"] }, admit: false },
+  { name: "local-alias-to-Sol", overrides: { id: "sol-alias", requestModelId: "gpt-6.1-sol", serviceTiers: ["priority"] }, admit: false },
+  { name: "empty-wire-model", overrides: { requestModelId: "", serviceTiers: ["priority"] }, admit: false },
+ ];
+ for (const row of matrix) {
+  const model = buildModel({ ...base, ...row.overrides });
+  const metadataBefore = JSON.stringify(model);
+  const session = createSession(model);
+  let selection: Record<string, unknown>;
+  try {
+   assert.deepEqual(session.serviceTierByFamily, {});
+   assert.equal(session.isFastModeActive(), false);
+   const standard = await runSse(model, session.effectiveServiceTier(model), undefined, "default");
+   assert.equal(session.setFastMode(true), true);
+   assert.equal(session.effectiveServiceTier(model), "priority");
+   const accepted = session.setUltrafastMode(true);
+   assert.equal(accepted, row.admit);
+   assert.equal(session.isUltrafastModeEnabled(), row.admit);
+   assert.equal(session.effectiveServiceTier(model), row.admit ? "ultrafast" : "priority");
+   assert.equal(session.isFastModeActive(), true);
+   const selected = await runSse(model, session.effectiveServiceTier(model), row.admit ? "ultrafast" : "priority", "default");
+   const explicit = await runSse(model, "ultrafast", row.admit ? "ultrafast" : undefined, "default");
+   assert.equal(shouldSendServiceTier("ultrafast", model), row.admit);
+   assert.equal(getPremiumServiceTierRequests("ultrafast", model), row.admit && model.provider === "openai-codex" ? 1 : 0);
+   session.setFastMode(false);
+   assert.deepEqual(session.serviceTierByFamily, {});
+   selection = { case: row.name, admitted: accepted, standard, selected, directExplicit: explicit, disabled: !session.isFastModeActive() };
+  } finally { await session.dispose(); sessions.delete(session); }
+  assert.equal(JSON.stringify(model), metadataBefore, "no discovered capability mutation");
+  cases.push(selection!);
+ }
+ for (const api of ["openai-responses", "openai-completions"] as const) {
+  const model = buildModel({ ...base, api, serviceTiers: ["priority"] });
+  assert.equal(shouldSendServiceTier("ultrafast", model), false);
+  cases.push({ case: "non-Codex-API-excluded", api, admitted: false });
+ }
+ const historical = { provider: base.provider, api: base.api, identity: buildModel(base).identity };
+ assert.equal(shouldSendServiceTier("ultrafast", historical), false);
+ assert.equal(getPremiumServiceTierRequests("ultrafast", historical, { served: true }), 1);
+ {
+  const session = createSession();
+  let accepted: boolean;
+  try { accepted = session.setUltrafastMode(true); }
+  finally { await session.dispose(); sessions.delete(session); }
+  assert.equal(accepted!, false);
+  cases.push({ case: "no-model-selection", admitted: accepted! });
+ }
+ const sol = buildModel({ ...base, serviceTiers: ["priority"] });
+ for (const selected of [undefined, "auto", "default", "priority"] as const) {
+  cases.push({ case: "ordinary-tier", ...await runSse(sol, selected, selected === "auto" ? undefined : selected, "default") });
+ }
+ for (const echo of [undefined, "default", "auto", "ultrafast", "priority", "flex", "scale"] as const) {
+  cases.push({ case: "authoritative-echo-or-request-fallback", ...await runSse(sol, "ultrafast", "ultrafast", echo) });
+ }
+ for (const rewrite of ["flex", "omit"] as const) {
+  cases.push({ case: "payload-hook-records-actual-sent-tier", rewrite, ...await runSse(sol, "ultrafast", rewrite === "omit" ? undefined : "flex", "default", rewrite) });
+ }
+ const noPriority = buildModel({ ...base, serviceTiers: ["ultrafast"] });
+ const noPrioritySession = createSession(noPriority);
+ try {
+  assert.equal(noPrioritySession.setFastMode(true), false);
+  assert.deepEqual(noPrioritySession.serviceTierByFamily, {});
+  assert.equal(noPrioritySession.setUltrafastMode(true), true);
+ } finally { await noPrioritySession.dispose(); sessions.delete(noPrioritySession); }
+ cases.push({ case: "priority-advertisement-gate-preserved", ...await runSse(noPriority, "priority", undefined, "default") });
+ globalThis.WebSocket = SyntheticWebSocket as unknown as typeof WebSocket;
+ for (const serviceTiers of [undefined, [], ["priority"], ["priority", "ultrafast"]]) {
+  frames.length = 0;
+  const states = new Map<string, ProviderSessionState>(); providerStates.push(states);
+  const model = buildModel({ ...base, preferWebsockets: true, serviceTiers });
+  const transcript = context();
+  const firstSocketFrame = capturedSocketFrames;
+  const sessionId = randomUUID();
+  const servedTiers: (ServiceTier | undefined)[] = [], premiums: (number | undefined)[] = [];
+  try {
+   const handshakeIndex = handshakeHeaders.length;
+   await prewarmOpenAICodexResponses(model, { apiKey: token, sessionId, providerSessionState: states, serviceTier: "ultrafast" });
+   assert.equal(handshakeHeaders[handshakeIndex]?.get("x-codex-routing-hint"), "model=gpt-6.1-sol;tier=ultrafast");
+   for (const [turn, tier] of [undefined, "ultrafast", "ultrafast", undefined].entries()) {
+    if (turn) transcript.messages.push({ role: "user", content: `question ${turn + 1}`, timestamp: turn + 1 });
+    const response = await streamOpenAICodexResponses(model, transcript, {
+     apiKey: token, fetch: refuseNetwork as FetchImpl, preferWebsockets: true, sessionId,
+     providerSessionState: states, serviceTier: tier as ServiceTier | undefined,
+    }).result();
+    assert.equal(response.stopReason, "stop", response.errorMessage);
+    servedTiers.push(response.serviceTier); premiums.push(response.usage.premiumRequests);
+    transcript.messages.push(response);
+   }
+  } finally { closeStates(states); await drainCallbacks(); }
+  assert.equal(frames.length, 4);
+  assert.deepEqual(servedTiers, ["default", "ultrafast", "ultrafast", "default"]);
+  assert.deepEqual(premiums, [0, 1, 1, 0]);
+  assert.deepEqual(frames.map(frame => [frame.service_tier ?? null, frame.previous_response_id ?? null]), [
+   [null, null], ["ultrafast", null], ["ultrafast", `sol_ws_${firstSocketFrame + 2}`], [null, null],
+  ]);
+  assert(JSON.stringify(frames[1]!.input).includes("synthetic request"));
+  assert(!JSON.stringify(frames[2]!.input).includes("question 2"));
+  assert(JSON.stringify(frames[3]!.input).includes("synthetic request"));
+  cases.push({ case: "websocket-ultrafast-chain-boundary", advertised: serviceTiers ?? null, servedTiers, premiums, wire: frames.map(frame => ({ tier: frame.service_tier ?? null, previousResponseId: frame.previous_response_id ?? null })) });
+ }
+ completed = true;
+} finally {
+ for (const session of sessions) await session.dispose(); sessions.clear();
+ for (const states of providerStates) { for (const state of states.values()) state.close(); states.clear(); }
+ for (const socket of sockets) socket.close();
+ await drainCallbacks();
+ await auth?.close();
+ globalThis.fetch = oldFetch; globalThis.WebSocket = oldWebSocket;
+ process.chdir(parentTmp);
+ for (const key of new Set([...Object.keys(process.env), ...Object.keys(Bun.env)])) { delete process.env[key]; delete Bun.env[key]; }
+ assert.equal(await fs.readFile(path.join(root, ".owner"), "utf8"), owner);
+ await fs.rm(root, { recursive: true });
+}
+assert.equal(completed, true);
+assert.equal(forbiddenNetworkAttempts, 0);
+assert.deepEqual(callbackErrors, []);
+assert.equal(callbacks.size, 0); assert.equal(sessions.size, 0);
+assert(sockets.every(socket => socket.readyState === SyntheticWebSocket.CLOSED));
+await assert.rejects(fs.lstat(root), (error: NodeJS.ErrnoException) => error.code === "ENOENT");
+console.log(JSON.stringify({ proof: "final-sol-ultrafast-actual-owner", status: "passed", compiled, version, nativeSha256, sourceInputSha256, ...heads, cases, syntheticFetchCalls, capturedSocketFrames, forbiddenNetworkAttempts, cleanup: { sessionsDisposed: true, providerStatesClosed: true, syntheticSocketsClosed: true, callbacksDrained: true, syntheticAuthClosed: true, ownedHomeAndTmpRemoved: true, isolatedProcessEnvironmentCleared: true, globalsRestored: true, realChildren: 0, ipcSockets: 0, loopbackServers: 0 } }));

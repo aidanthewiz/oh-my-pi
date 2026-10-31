@@ -1,0 +1,338 @@
+import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import { writeSync } from "node:fs";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
+import type { Shell, ShellRunResult } from "../../packages/natives/native/index.js";
+
+const required = (key: string) => {
+	const value = process.env[key];
+	assert(value, `${key} is required`);
+	return value;
+};
+const version = required("CF_UPSTREAM_CANDIDATE_VERSION");
+assert.match(version, /^\d+\.\d+\.\d+$/);
+const marker = required("CF19_MARKER");
+assert.match(marker, /^[a-zA-Z0-9._-]{8,128}$/);
+const mode = process.env.PI_COMPILED === "true" ? "compiled" : "source";
+const sourceDigest = required("V1890_SOURCE_INPUT_SHA256");
+const nativeSha256 = required("V1890_NATIVE_SHA256");
+for (const digest of [sourceDigest, nativeSha256]) assert.match(digest, /^[a-f0-9]{64}$/);
+const sha256 = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest("hex");
+const checkoutRoots = [required("CF_QUAL_CHECKOUT")];
+const outsideCheckout = (file: string) => checkoutRoots.every(root => file !== root && !file.startsWith(root + path.sep));
+const runtimeRoot = await fs.realpath(required("CF19_RUNTIME_ROOT"));
+assert(outsideCheckout(runtimeRoot));
+const home = await fs.realpath(required("HOME"));
+assert(home === runtimeRoot || home.startsWith(runtimeRoot + path.sep), "HOME must be private before Bun launch");
+for (const directory of [runtimeRoot, home]) {
+	const stat = await fs.lstat(directory);
+	assert(stat.isDirectory() && !stat.isSymbolicLink());
+	if (process.platform !== "win32") {
+		assert.equal(stat.uid, process.geteuid!());
+		assert.equal(stat.mode & 0o777, 0o700);
+	}
+}
+const manifestPath = await fs.realpath(required("V1890_SOURCE_INPUT_MANIFEST"));
+assert(outsideCheckout(manifestPath), "read only the copied source-input manifest");
+const manifestBytes = await fs.readFile(manifestPath);
+assert.equal(sha256(manifestBytes), sourceDigest);
+const manifest = JSON.parse(manifestBytes.toString());
+assert.equal(manifest.schema, "CoreforgeCandidateSourceSnapshot");
+const engineHead = required("CF_UPSTREAM_ENGINE_HEAD");
+const companionHead = null;
+assert.match(engineHead, /^[a-f0-9]{40}$/);
+const mergeHead = process.env.CF_UPSTREAM_MERGE_HEAD || null;
+assert(mergeHead === null || /^[a-f0-9]{40}$/.test(mergeHead));
+assert.equal(manifest.engineHead, engineHead);
+assert.equal(manifest.companionHead, companionHead);
+assert.equal(manifest.mergeHead, mergeHead);
+assert.equal(manifest.native.sha256, nativeSha256);
+const fixture = path.join(runtimeRoot, `native-builtins-${marker}`);
+await fs.mkdir(fixture, { mode: 0o700 });
+const bin = path.join(fixture, "empty-bin");
+await fs.mkdir(bin, { mode: 0o700 });
+const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
+const cases: { id: string; status: "passed"; evidence: unknown }[] = [];
+const sessions: Shell[] = [];
+let completed = false;
+let fixtureRootRemoved = false;
+let cleanupVerified = false;
+let sequence = 0;
+const oldAmbient = process.env.CF19_SYNTHETIC_AMBIENT;
+process.env.CF19_SYNTHETIC_AMBIENT = marker;
+try {
+	// This load boundary must follow private-HOME and copied-manifest validation.
+	const native = await import("../../packages/natives/native/index.js");
+	const { nativeAddonStatus } = await import("../../packages/natives/native/loader-state.js");
+	const addon = nativeAddonStatus();
+	assert(addon);
+	assert.equal(addon.version, version);
+	assert.equal(addon.packageVersion, version);
+	assert.equal(addon.stale, false);
+	const addonPath = await fs.realpath(addon.path);
+	if (mode === "compiled") assert(outsideCheckout(addonPath));
+	assert.equal(sha256(await fs.readFile(addonPath)), nativeSha256);
+	cases.push({ id: "production-native-identity", status: "passed", evidence: { version: addon.version, nativeSha256, sourceDigest, mode } });
+	const environment = { HOME: home, TMPDIR: fixture, TMP: fixture, TEMP: fixture, PATH: bin, LC_ALL: "C", LANG: "C", TZ: "UTC", PROBE: "parent" };
+	const session = (extra: Record<string, string> = {}) => {
+		const owner = new native.Shell({ clearEnv: true, sessionEnv: { ...environment, ...extra } });
+		sessions.push(owner);
+		return owner;
+	};
+	const shell = session();
+	type Capture = { result: ShellRunResult; out: Buffer; err: Buffer };
+	const run = async (command: string, owner = shell): Promise<Capture> => {
+		const index = sequence++;
+		const outFile = `capture-${index}.stdout`;
+		const errFile = `capture-${index}.stderr`;
+		const result = await owner.run({
+			command: `{ ${command}; } > ${quote(path.join(fixture, outFile))} 2> ${quote(path.join(fixture, errFile))}`,
+			cwd: fixture,
+			timeoutMs: 10_000,
+		});
+		assert.equal(result.cancelled, false, command);
+		assert.equal(result.timedOut, false, command);
+		return { result, out: await fs.readFile(path.join(fixture, outFile)), err: await fs.readFile(path.join(fixture, errFile)) };
+	};
+	const expect = (capture: Capture, code: number, out: string | Uint8Array, err: string | RegExp = "") => {
+		assert.equal(capture.result.exitCode, code);
+		assert.deepEqual(capture.out, Buffer.from(out));
+		if (err instanceof RegExp) assert.match(capture.err.toString(), err);
+		else assert.equal(capture.err.toString(), err);
+	};
+	const evidence = (capture: Capture) => ({ exitCode: capture.result.exitCode, stdoutSha256: sha256(capture.out), stderrSha256: sha256(capture.err), stdoutBytes: capture.out.length, stderrBytes: capture.err.length });
+	const passed = (id: string, details: unknown) => cases.push({ id, status: "passed", evidence: details });
+	await fs.writeFile(path.join(fixture, "copy-input"), "abcdefghi");
+	await fs.writeFile(path.join(fixture, "copy-output"), "unchanged");
+	{
+		const copy = await run("dd if=copy-input of=copy-output bs=3 skip=1 count=2 conv=ucase status=noxfer");
+		expect(copy, 0, "", "2+0 records in\n2+0 records out\n");
+		assert.equal(await fs.readFile(path.join(fixture, "copy-output"), "utf8"), "DEFGHI");
+		const partial = await run("dd if=copy-input of=copy-output bs=1 count=2 seek=2 conv=notrunc status=none");
+		expect(partial, 0, "");
+		assert.equal(await fs.readFile(path.join(fixture, "copy-output"), "utf8"), "DEabHI");
+		const before = sha256(await fs.readFile(path.join(fixture, "copy-output")));
+		const exclusive = await run("dd if=copy-input of=copy-output conv=excl status=none");
+		expect(exclusive, 1, "", /dd: failed to open/);
+		const invalid = await run("dd if=copy-input of=copy-output bs=0 status=none");
+		expect(invalid, 1, "", /dd: invalid number/);
+		assert.equal(sha256(await fs.readFile(path.join(fixture, "copy-output"))), before);
+		const tables = await run("dd if=copy-input conv=ebcdic status=none | dd conv=ascii status=none");
+		expect(tables, 0, "abcdefghi");
+		passed("dd-copy-conversion-offset-exclusive-validation", { copy: evidence(copy), partial: evidence(partial), exclusive: evidence(exclusive), invalid: evidence(invalid), tableRoundTrip: evidence(tables), preservedSha256: before });
+	}
+	{
+		const blocked = session({ PI_DISABLE_UUTILS_DESTRUCTIVE: "1" });
+		const before = sha256(await fs.readFile(path.join(fixture, "copy-output")));
+		const refused = await run("dd if=copy-input of=copy-output status=none", blocked);
+		expect(refused, 127, "", /dd/);
+		assert.equal(sha256(await fs.readFile(path.join(fixture, "copy-output"))), before);
+		const retained = await run("nl -w1 -s: copy-input", blocked);
+		expect(retained, 0, "1:abcdefghi\n");
+		passed("destructive-switch-refusal-preserves-bytes", { refused: evidence(refused), retainedNonDestructiveBuiltin: evidence(retained), unchangedSha256: before, externalExecutables: 0 });
+	}
+	{
+		await fs.writeFile(path.join(fixture, "mode-file"), "mode sentinel", { mode: 0o600 });
+		if (process.platform === "win32") {
+			const refused = await run("chmod 777 mode-file");
+			expect(refused, 127, "", /chmod/);
+			assert.equal(await fs.readFile(path.join(fixture, "mode-file"), "utf8"), "mode sentinel");
+			passed("chmod-unix-only-platform-gate", evidence(refused));
+		} else {
+			const changed = await run("chmod u=rw,g=r,o= mode-file");
+			expect(changed, 0, "");
+			assert.equal((await fs.stat(path.join(fixture, "mode-file"))).mode & 0o777, 0o640);
+			const invalid = await run("chmod invalid-mode mode-file");
+			expect(invalid, 1, "", /chmod: invalid mode/);
+			assert.equal((await fs.stat(path.join(fixture, "mode-file"))).mode & 0o777, 0o640);
+			await fs.mkdir(path.join(fixture, "mode-tree"));
+			await fs.symlink("../mode-file", path.join(fixture, "mode-tree/link"));
+			const physical = await run("chmod -RP 700 mode-tree");
+			expect(physical, 0, "");
+			assert.equal((await fs.stat(path.join(fixture, "mode-tree"))).mode & 0o777, 0o700);
+			assert.equal((await fs.stat(path.join(fixture, "mode-file"))).mode & 0o777, 0o640);
+			passed("chmod-symbolic-invalid-physical-symlink-boundaries", { changed: evidence(changed), invalid: evidence(invalid), physical: evidence(physical), fileMode: "0640", treeMode: "0700" });
+		}
+	}
+	{
+		await fs.link(path.join(fixture, "copy-input"), path.join(fixture, "same-inode"));
+		const once = await run("du -b copy-input same-inode");
+		expect(once, 0, "9\tcopy-input\n");
+		const twice = await run("du -bl copy-input same-inode");
+		expect(twice, 0, "9\tcopy-input\n9\tsame-inode\n");
+		const blocks = await run("DU_BLOCK_SIZE=4 du --apparent-size copy-input");
+		expect(blocks, 0, "3\tcopy-input\n");
+		const override = await run("DU_BLOCK_SIZE=4 du --apparent-size -B1 copy-input");
+		expect(override, 0, "9\tcopy-input\n");
+		const error = await run("du -b missing-du-file");
+		expect(error, 1, "", /du: cannot access/);
+		passed("du-hardlink-accounting-block-precedence-missing-input", { once: evidence(once), twice: evidence(twice), blocks: evidence(blocks), override: evidence(override), error: evidence(error) });
+	}
+	{
+		const capacity = await run("df -B1 --output=size .");
+		assert.equal(capacity.result.exitCode, 0);
+		assert.equal(capacity.err.length, 0);
+		const lines = capacity.out.toString().trim().split(/\r?\n/);
+		assert.equal(lines.length, 2);
+		assert.match(lines[1]!.trim(), /^\d+$/);
+		const stat = await fs.statfs(fixture, { bigint: true });
+		assert.equal(BigInt(lines[1]!.trim()), stat.bsize * stat.blocks);
+		const invalid = await run("df -B0 .");
+		expect(invalid, 1, "", /df: invalid/);
+		passed("df-private-volume-capacity-and-invalid-scale", { capacity: evidence(capacity), capacityBytes: lines[1]!.trim(), invalid: evidence(invalid), comparison: "Node statfs of owned fixture volume" });
+	}
+	{
+		const isolated = await run(`env -i PATH=${quote(bin)} PROBE=child env -0`);
+		assert.equal(isolated.result.exitCode, 0);
+		assert.equal(isolated.err.length, 0);
+		assert.deepEqual(isolated.out.toString().split("\0").filter(Boolean).sort(), [`PATH=${bin}`, "PROBE=child"].sort());
+		const unchanged = await run("printf '%s|%s\\n' \"$PROBE\" \"${CF19_SYNTHETIC_AMBIENT-unset}\"");
+		expect(unchanged, 0, "parent|unset\n");
+		const missing = await run(`env -i PATH=${quote(bin)} cf19-no-such-program`);
+		expect(missing, 127, "", /env: .*cf19-no-such-program/);
+		await fs.mkdir(path.join(fixture, "child-dir"));
+		const cwd = await run(`env -C child-dir -i PATH=${quote(bin)} pwd`);
+		expect(cwd, 0, path.join(fixture, "child-dir") + "\n");
+		const parentCwd = await run("pwd");
+		expect(parentCwd, 0, fixture + "\n");
+		const split = await run("env -S 'PROBE=split printenv PROBE'");
+		expect(split, 0, "split\n");
+		const still = await run("printenv PROBE");
+		expect(still, 0, "parent\n");
+		passed("env-clear-split-child-cwd-error-and-restoration", { isolated: evidence(isolated), unchanged: evidence(unchanged), missing: evidence(missing), cwd: evidence(cwd), parentCwd: evidence(parentCwd), split: evidence(split), restored: evidence(still), ambientSyntheticCredentialAbsent: true });
+	}
+	{
+		await fs.writeFile(path.join(fixture, "fold-input"), "abcdefghij\n");
+		const wrapped = await run("fold -w3 fold-input");
+		expect(wrapped, 0, "abc\ndef\nghi\nj\n");
+		await fs.writeFile(path.join(fixture, "fold-spaces"), "ab cd ef\n");
+		const spaces = await run("fold -s -w5 fold-spaces");
+		expect(spaces, 0, "ab \ncd ef\n");
+		const invalid = await run("fold -w0 fold-input");
+		expect(invalid, 1, "", /fold: invalid number of columns/);
+		passed("fold-width-space-and-zero-boundaries", { wrapped: evidence(wrapped), spaces: evidence(spaces), invalid: evidence(invalid) });
+	}
+	{
+		if (process.platform === "win32") {
+			const absent = await run("id -u");
+			expect(absent, 127, "", /id/);
+			passed("id-unix-only-platform-gate", evidence(absent));
+		} else {
+			const effective = await run("id -u");
+			expect(effective, 0, `${process.geteuid!()}\n`);
+			const real = await run("id -ru");
+			expect(real, 0, `${process.getuid!()}\n`);
+			const group = await run("id -g -z");
+			expect(group, 0, `${process.getegid!()}\0`);
+			const context = await run("id -Z");
+			expect(context, 1, "", /id: .*SELinux/);
+			passed("id-current-process-numeric-and-context-refusal", { effective: evidence(effective), real: evidence(real), group: evidence(group), context: evidence(context), identityMutation: false, userDatabaseLookup: false });
+		}
+	}
+	{
+		await fs.writeFile(path.join(fixture, "nl-bre"), "aa\nab\nbb\n");
+		const bre = await run("nl -w2 -s: -b 'p^\\([ab]\\)\\1$' nl-bre");
+		expect(bre, 0, " 1:aa\n   ab\n 2:bb\n");
+		await fs.writeFile(path.join(fixture, "nl-pages"), "######\nH\n####\nB\n##\nF\n######\nJ\n");
+		const pages = await run("nl -d '##' -ha -ba -fa -w2 -nrz -v7 -i2 -s'|' nl-pages");
+		expect(pages, 0, "\n07|H\n\n07|B\n\n07|F\n\n07|J\n");
+		const continuous = await run("nl -p -d '##' -ha -ba -fa -w2 -nrz -v7 -i2 -s'|' nl-pages");
+		expect(continuous, 0, "\n07|H\n\n09|B\n\n11|F\n\n13|J\n");
+		await fs.writeFile(path.join(fixture, "nl-blanks"), "\n\n\nx\n\n\n");
+		const blanks = await run("nl -ba -l2 -w1 -s: nl-blanks");
+		expect(blanks, 0, "  \n1:\n  \n2:x\n  \n3:\n");
+		await fs.writeFile(path.join(fixture, "nl-signed"), "x\ny\nz\n");
+		const formats: Record<string, string> = { ln: "-2 |x\n-1 |y\n0  |z\n", rn: " -2|x\n -1|y\n  0|z\n", rz: "-02|x\n-01|y\n000|z\n" };
+		for (const [format, output] of Object.entries(formats)) expect(await run(`nl -w3 -s'|' -n${format} -v-2 nl-signed`), 0, output);
+		const overflow = await run("nl -w1 -s: -v9223372036854775807 nl-signed");
+		expect(overflow, 1, "9223372036854775807:x\n", /nl: line number overflow/);
+		await fs.writeFile(path.join(fixture, "nl-first"), "a\n");
+		await fs.writeFile(path.join(fixture, "nl-last"), "b");
+		const missing = await run("nl -w1 -s: nl-first missing-nl-file nl-last");
+		expect(missing, 1, "1:a\n2:b\n", /nl: .*missing-nl-file/);
+		const invalid = await run("nl -b 'p\\(' nl-first");
+		expect(invalid, 1, "", /nl:/);
+		passed("nl-bre-backrefs-pages-grouping-formats-overflow-and-operands", { bre: evidence(bre), pages: evidence(pages), continuous: evidence(continuous), blanks: evidence(blanks), formats: Object.keys(formats), overflow: evidence(overflow), missing: evidence(missing), invalid: evidence(invalid) });
+	}
+	{
+		await fs.writeFile(path.join(fixture, "octets"), Buffer.from([0, 1, 127, 128, 255]));
+		const hex = await run("od -An -tx1 -v octets");
+		expect(hex, 0, " 00 01 7f 80 ff\n");
+		const endian = await run("od -An -tu2 --endian=big -N4 octets");
+		assert.equal(endian.result.exitCode, 0);
+		assert.equal(endian.err.length, 0);
+		assert.deepEqual(endian.out.toString().trim().split(/\s+/).map(Number), [1, 32640]);
+		const beyond = await run("od -j9 octets");
+		expect(beyond, 1, "", /od: cannot skip past end/);
+		passed("od-bytes-explicit-endianness-and-skip-error", { hex: evidence(hex), endian: evidence(endian), beyond: evidence(beyond) });
+	}
+	{
+		await fs.mkdir(path.join(fixture, "empty/a"), { recursive: true });
+		const removed = await run("rmdir -p empty/a");
+		expect(removed, 0, "");
+		await assert.rejects(fs.lstat(path.join(fixture, "empty")), { code: "ENOENT" });
+		await fs.mkdir(path.join(fixture, "nonempty"));
+		await fs.writeFile(path.join(fixture, "nonempty/sentinel"), marker);
+		const refused = await run("rmdir nonempty");
+		expect(refused, 1, "", /rmdir: failed to remove/);
+		const ignored = await run("rmdir --ignore-fail-on-non-empty nonempty");
+		expect(ignored, 0, "");
+		assert.equal(await fs.readFile(path.join(fixture, "nonempty/sentinel"), "utf8"), marker);
+		passed("rmdir-parents-and-nonempty-preservation", { removed: evidence(removed), refused: evidence(refused), ignored: evidence(ignored), sentinelPreserved: true });
+	}
+	{
+		const boot = 1_791_629_675;
+		let utmp: Buffer;
+		if (process.platform === "darwin") {
+			utmp = Buffer.alloc(628 * 2);
+			utmp.write("utmpx-1.00", 0, "ascii");
+			utmp.writeInt16LE(10, 296);
+			utmp.writeInt16LE(2, 628 + 296);
+			utmp.writeInt32LE(boot, 628 + 300);
+		} else if (process.platform === "linux") {
+			utmp = Buffer.alloc(384);
+			utmp.writeInt16LE(2, 0);
+			utmp.writeInt32LE(boot, 340);
+		} else {
+			utmp = Buffer.alloc(0);
+		}
+		await fs.writeFile(path.join(fixture, "synthetic-utmp"), utmp);
+		const since = await run("uptime -s synthetic-utmp");
+		if (process.platform === "darwin" || process.platform === "linux") {
+			expect(since, 0, "2026-10-10 10:54:35\n");
+			const shifted = await run("TZ=EST5 uptime -s synthetic-utmp");
+			expect(shifted, 0, "2026-10-10 05:54:35\n");
+		} else {
+			expect(since, 1, "", /uptime: couldn't get boot time/);
+		}
+		await fs.writeFile(path.join(fixture, "empty-utmp"), "");
+		const unknown = await run("uptime -p empty-utmp");
+		expect(unknown, 1, "", /uptime: couldn't get boot time/);
+		assert.equal(sha256(await fs.readFile(path.join(fixture, "synthetic-utmp"))), sha256(utmp));
+		passed("uptime-owned-record-zone-and-unknown-boot-boundaries", { since: evidence(since), unknown: evidence(unknown), platform: process.platform, fixtureSha256: sha256(utmp), systemLoginRecordsRead: false, processProbes: false });
+	}
+	{
+		const sort = await run("printf '10\\n2\\n1\\n' | LC_ALL=C sort -n");
+		expect(sort, 0, "1\n2\n10\n");
+		const date = await run("TZ=:UTC date -d @0 '+%Y-%m-%d %H:%M:%S %z'");
+		expect(date, 0, "1970-01-01 00:00:00 +0000\n");
+		const uniq = await run("printf 'a\\na\\nb\\n' | LC_ALL=C uniq");
+		expect(uniq, 0, "a\nb\n");
+		passed("shared-locale-timezone-existing-consumers", { sort: evidence(sort), date: evidence(date), uniq: evidence(uniq) });
+	}
+	completed = true;
+} finally {
+	for (const session of sessions) await session.abort();
+	if (oldAmbient === undefined) delete process.env.CF19_SYNTHETIC_AMBIENT;
+	else process.env.CF19_SYNTHETIC_AMBIENT = oldAmbient;
+	const stat = await fs.lstat(fixture);
+	assert(stat.isDirectory() && !stat.isSymbolicLink());
+	assert.equal(path.dirname(fixture), runtimeRoot);
+	await fs.rm(fixture, { recursive: true });
+	await assert.rejects(fs.lstat(fixture), { code: "ENOENT" });
+	fixtureRootRemoved = true;
+	cleanupVerified = true;
+}
+assert(completed);
+writeSync(1, JSON.stringify({ schema: "CoreforgeFrozen19DomainProof", domain: "native-builtins", complete: true, passed: true, mode, version, sourceDigest, nativeSha256, cases, cleanupVerified, fixtureRootRemoved, paidRequests: 0 }) + "\n");

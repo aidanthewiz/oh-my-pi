@@ -201,6 +201,9 @@ async function main(): Promise<void> {
 	// checked-in placeholders, even if a generate or build step throws.
 	try {
 		await generateBundle();
+		if (Bun.env.QUALIFICATION_RECEIPT_DIR) {
+			await runCommand(["bun", "scripts/ci-qualification-engine.ts", "snapshot", "binary-effective"], repoRoot);
+		}
 		for (const target of selectedTargets) {
 			await buildBinary(target);
 		}

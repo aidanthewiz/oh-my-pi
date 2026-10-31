@@ -1,0 +1,325 @@
+import assert from "node:assert/strict";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
+import { createHash } from "node:crypto";
+import { TUI } from "../../packages/tui/src/tui";
+import { setKeybindings, getKeybindings } from "../../packages/tui/src/keybindings";
+import { KeybindingsManager } from "../../packages/tui/src/app-keybindings";
+import type { Terminal, TspHelloHandler } from "../../packages/tui/src/terminal";
+import { splitTspMessage, type TspHello } from "../../packages/tui/src/native/encode";
+import { TspDocument } from "../../packages/tui/src/native/apply";
+import { TSP_KINDS, type TspFrame, type TspNode, type TspPickerProps } from "../../packages/wire/src/index";
+import { TreeSelectorComponent, type TreeSelectorNode } from "../../packages/tui/src/overlays/tree-selector";
+import { ModelHubComponent, type ModelHubRegistry, type ModelHubSource } from "../../packages/tui/src/overlays/model-hub";
+import { SessionModelScopeCache, providerMark, resolveRoleAssignments } from "../../packages/tui/src/overlays/model-browser";
+import { buildModel } from "../../packages/catalog/src/build";
+import type { Model } from "../../packages/ai/src/types";
+import { initTheme } from "../../packages/tui/src/theme/theme";
+import { GitModel } from "../../packages/coding-agent/src/cli/git-tui/state";
+import { showGitOverlay } from "../../packages/tui/src/apps/git/git-tui";
+import { DiffPane } from "../../packages/tui/src/apps/git/diff-pane";
+import { __piNativesBuildVersion } from "../../packages/natives/native/index.js";
+import { nativeAddonStatus } from "../../packages/natives/native/loader-state.js";
+
+const sha = (bytes: Uint8Array | string) => createHash("sha256").update(bytes).digest("hex");
+const required = (name: string) => {
+	const value = process.env[name];
+	assert.ok(value, `${name} is required`);
+	return value;
+};
+const walk = (root: TspNode): TspNode[] => [root, ...(root.c ?? []).flatMap(walk)];
+
+// This private terminal is a protocol peer, not a host desktop or user terminal.
+class PrivateTerminal implements Terminal {
+	readonly columns = 150;
+	readonly rows = 40;
+	readonly kittyProtocolActive = false;
+	readonly kittyEnableSequence = null;
+	readonly appearance = "dark" as const;
+	readonly docs = new Map<string, TspDocument>();
+	readonly errors: unknown[] = [];
+	readonly chunks = new Map<string, string>();
+	readonly blobs = new Map<string, Uint8Array>();
+	readonly writes: string[] = [];
+	input: ((data: string) => void) | undefined;
+	hello: TspHello | null | undefined;
+	callbacks: TspHelloHandler[] = [];
+	constructor(readonly images: boolean) {}
+	start(input: (data: string) => void) {
+		this.input = input;
+		queueMicrotask(() => {
+			this.hello = { r: "hello", v: 1, term: "coreforge-private-proof", kinds: TSP_KINDS.filter(kind => this.images || kind !== "image"), features: [], cols: this.columns, dark: true, reduceMotion: true };
+			for (const callback of this.callbacks) callback(this.hello);
+		});
+	}
+	onTspHello(callback: TspHelloHandler) { this.callbacks.push(callback); if (this.hello !== undefined) callback(this.hello); }
+	stop() { this.input = undefined; this.callbacks.length = 0; }
+	async drainInput() { await Promise.resolve(); }
+	send(data: string) { this.input?.(data); }
+	write(data: string) {
+		this.writes.push(data);
+		for (const sequence of data.matchAll(/\x1b_tsp;[\s\S]*?\x1b\\/g)) {
+			const raw = splitTspMessage(sequence[0]);
+			assert.ok(raw, "valid production TSP encoding");
+			let body = raw.body;
+			if (raw.params.c !== undefined) {
+				body = (this.chunks.get(raw.params.c) ?? "") + body;
+				if (raw.params.m === "1") { this.chunks.set(raw.params.c, body); continue; }
+				this.chunks.delete(raw.params.c);
+			}
+			if (raw.verb === "o") { const open = JSON.parse(body); this.docs.set(open.id, new TspDocument(open.id)); }
+			if (raw.verb === "x") { const close = JSON.parse(body); this.docs.delete(close.id); }
+			if (raw.verb === "b") {
+				const bytes = Buffer.from(body, "base64");
+				assert.equal(sha(bytes), raw.params.id);
+				this.blobs.set(raw.params.id!, bytes);
+			}
+			if (raw.verb === "f") {
+				const frame = JSON.parse(body) as TspFrame;
+				const doc = this.docs.get(frame.sf);
+				assert.ok(doc, "frame has an opened surface");
+				this.errors.push(...doc.applyFrame(frame));
+				queueMicrotask(() => this.send(`\x1b_tsp;e;${JSON.stringify({ ev: "ack", sf: frame.sf, s: frame.s })}\x1b\\`));
+			}
+		}
+	}
+	nodes() { return [...this.docs.values()].flatMap(doc => walk(doc.snapshot())); }
+	moveBy(lines: number) { this.write(`\x1b[${Math.abs(lines)}${lines < 0 ? "A" : "B"}`); }
+	hideCursor() { this.write("\x1b[?25l"); }
+	showCursor() { this.write("\x1b[?25h"); }
+	clearLine() { this.write("\x1b[2K"); }
+	clearFromCursor() { this.write("\x1b[J"); }
+	clearScreen() { this.write("\x1b[2J\x1b[H"); }
+	setTitle(title: string) { this.write(`\x1b]0;${title}\x07`); }
+	setProgress(active: boolean) { this.write(`\x1b]9;4;${active ? 3 : 0}\x07`); }
+	onAppearanceChange(callback: (appearance: "dark" | "light") => void) { callback("dark"); }
+}
+
+export async function runPresentationProof() {
+	const root = path.resolve(required("CF19_RUNTIME_ROOT"));
+	const marker = required("CF19_MARKER");
+	assert.match(marker, /^[A-Za-z0-9_-]+$/);
+	const version = required("CF_UPSTREAM_CANDIDATE_VERSION");
+	const sourceDigest = required("V1890_SOURCE_INPUT_SHA256");
+	const nativeSha256 = required("V1890_NATIVE_SHA256");
+	const manifest = path.resolve(required("V1890_SOURCE_INPUT_MANIFEST"));
+	assert.ok(manifest.startsWith(`${root}${path.sep}`), "manifest must be a copied runtime input");
+	assert.equal(sha(await fs.readFile(manifest)), sourceDigest);
+	JSON.parse(await fs.readFile(manifest, "utf8"));
+	assert.ok(path.resolve(required("HOME")).startsWith(`${root}${path.sep}`), "HOME must be private before Bun launch");
+	assert.equal(__piNativesBuildVersion(), version);
+	const addon = nativeAddonStatus();
+	assert.ok(addon && !addon.stale);
+	assert.equal(addon.version, version);
+	assert.equal(sha(await fs.readFile(addon.path)), nativeSha256);
+	const fixture = path.join(root, `presentation-${marker}`);
+	const artifactRoot = path.join(root, `presentation-artifacts-${marker}`);
+	await fs.mkdir(fixture, { recursive: false });
+	await fs.mkdir(artifactRoot, { recursive: false });
+	await fs.writeFile(path.join(fixture, ".owner"), marker);
+	const cases: { id: string; status: "passed"; evidence: unknown }[] = [];
+	const artifacts: { file: string; sha256: string; bytes: number; kind: string }[] = [];
+	const record = (id: string, evidence: unknown) => cases.push({ id, status: "passed", evidence });
+	const artifact = async (file: string, bytes: string | Uint8Array, kind: string) => {
+		const dest = path.join(artifactRoot, file);
+		await fs.writeFile(dest, bytes);
+		artifacts.push({ file: dest, sha256: sha(bytes), bytes: Buffer.byteLength(bytes), kind });
+	};
+	const keybindings = getKeybindings();
+	let fixtureRootRemoved = false;
+	try {
+		await initTheme(false);
+		const message = (id: string, parentId: string | null): TreeSelectorNode => ({ entry: { type: "message", id, parentId, timestamp: "2024-01-01T00:00:00Z", message: { role: "user", content: id, timestamp: 0 } }, children: [] });
+		const rootNode = message("root", null);
+		const a = message("a", "root");
+		const a1 = message("a1", "a");
+		const a2 = message("a2", "a");
+		const b = message("b", "root");
+		a.children.push(a1, a2); rootNode.children.push(a, b);
+		setKeybindings(KeybindingsManager.inMemory({ "app.tree.previousBranch": "shift+left", "app.tree.nextBranch": "shift+right" }));
+		const selected: string[] = [];
+		const tree = new TreeSelectorComponent([rootNode], "a1", 40, id => selected.push(id), () => {});
+		const cycle = (key: string, count: number) => { for (let i = 0; i < count; i++) { tree.handleInput(key); tree.handleInput("\n"); } };
+		cycle("\x1b[1;2D", 5);
+		assert.deepEqual(selected, ["a", "b", "a2", "a1", "a"]);
+		selected.length = 0;
+		cycle("\x1b[1;2C", 5);
+		assert.deepEqual(selected, ["a1", "a2", "b", "a", "a1"]);
+		record("nested-fork-forward-reverse-wrap", { reverse: ["a", "b", "a2", "a1", "a"], forward: [...selected] });
+		const hidden: TreeSelectorNode = { entry: { type: "model_change", id: "hidden", parentId: "root", timestamp: "2024-01-01T00:00:00Z", model: "private/test" }, children: [message("promoted", "hidden")] };
+		const filteredRoot = message("root", null); filteredRoot.children.push(message("visible", "root"), hidden);
+		const filtered: string[] = [];
+		const filteredTree = new TreeSelectorComponent([filteredRoot], "visible", 40, id => filtered.push(id), () => {});
+		filteredTree.handleInput("\x1b[1;2C"); filteredTree.handleInput("\n");
+		assert.deepEqual(filtered, ["promoted"]);
+		filteredTree.handleInput("\x1ba");
+		filteredTree.handleInput("\x1b[1;2D"); filteredTree.handleInput("\n");
+		filteredTree.handleInput("\x1b[1;2C"); filteredTree.handleInput("\n");
+		assert.deepEqual(filtered, ["promoted", "visible", "hidden"]);
+		setKeybindings(KeybindingsManager.inMemory({ "app.tree.nextBranch": "ctrl+n", "app.tree.previousBranch": [] }));
+		filteredTree.handleInput("\x1b[1;2C"); filteredTree.handleInput("\n");
+		filteredTree.handleInput("\x0e"); filteredTree.handleInput("\n");
+		assert.deepEqual(filtered.slice(-2), ["hidden", "visible"]);
+		setKeybindings(KeybindingsManager.inMemory({ "app.tree.nextBranch": [], "app.tree.previousBranch": [] }));
+		filteredTree.handleInput("\x0e"); filteredTree.handleInput("\n");
+		assert.equal(filtered.at(-1), "visible");
+		await artifact("tree.ansi", filteredTree.render(120).join("\n"), "ansi");
+		record("filtered-head-invalidation-and-rebinding", { selected: filtered });
+
+		const makeModel = (provider: string, id: string): Model => buildModel({ id, name: id, provider, api: "openai-completions", baseUrl: "http://127.0.0.1:1/v1", reasoning: false, input: ["text"], cost: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 }, contextWindow: 32000, maxTokens: 1024 });
+		const allowed = makeModel("anthropic", "allowed");
+		const blocked = makeModel("openai", "blocked");
+		const models = [allowed, blocked];
+		const roles: Record<string, string> = { default: "anthropic/allowed", advisor: "openai/blocked" };
+		const source: ModelHubSource = {
+			revision: 0, defaultThinkingLevel: "off", modelProviderOrder: [], knownRoleIds: ["default", "advisor"], mruOrder: [], modelPerf: new Map(),
+			getRoleInfo: role => ({ tag: role, name: role, section: "chat", accepts: () => true }), defaultRoleChain: () => [],
+			resolveRoleValue: (value, pool) => ({ model: pool.find(model => `${model.provider}/${model.id}` === value), explicitThinkingLevel: false }),
+			getModelRole: role => roles[role], scopeModels: pool => pool.filter(model => model.id === "allowed"), disabledProviders: [],
+			fallbackChains: { default: ["openai/blocked"] }, modelRoleStorage: "global", cycleOrder: [], getProjectModelRole: () => undefined,
+			getGlobalModelRole: role => roles[role], getModelRoleSource: () => "global",
+		};
+		const assignments = resolveRoleAssignments(source, models, models);
+		assert.equal(assignments.default?.model.id, "allowed"); assert.equal(assignments.advisor, undefined);
+		const registry: ModelHubRegistry = {
+			getError: () => undefined, getAvailable: () => models, getAll: () => models, authStorage: { keys: { source: () => "env" } },
+			getDiscoverableProviders: () => [], getProviderDiscoveryState: () => undefined, find: (provider: string, id: string) => models.find(model => model.provider === provider && model.id === id),
+			refresh: async () => { throw new Error("online refresh forbidden"); }, refreshProvider: async () => { throw new Error("online refresh forbidden"); },
+		} as unknown as ModelHubRegistry;
+		const scope = new SessionModelScopeCache(source, registry).get([]);
+		assert.deepEqual(scope.items.map(item => item.selector), ["anthropic/allowed"]);
+		const unavailable = new SessionModelScopeCache(source, { ...registry, getAvailable: () => { throw new Error("synthetic catalog unavailable"); } }).get([]);
+		assert.deepEqual(unavailable.items, []);
+		assert.equal(unavailable.roles.default?.model.id, "allowed");
+		assert.equal(unavailable.roles.advisor, undefined);
+		assert.equal(unavailable.error, "synthetic catalog unavailable");
+		const terminal = new PrivateTerminal(true);
+		const ui = new TUI(terminal, false);
+		const assigned: string[] = [];
+		const hub = new ModelHubComponent(ui, source, registry, models.map(model => ({ model })), { onAssign: model => { assigned.push(model.id); }, onUnassign: () => {}, onCancel: () => {} });
+		try {
+			const cx = { cols: 150, reduceMotion: true, dark: true, supports: () => true, feature: () => false };
+			const p = hub.describe(cx).p as TspPickerProps;
+			assert.deepEqual(p.items?.map(item => item.id), ["anthropic/allowed"]);
+			assert.deepEqual(p.items?.[0]?.mark, providerMark("anthropic"));
+			assert.equal(p.scopes?.find(scope => scope.id === "provider:anthropic")?.mark?.icon, "provider:anthropic");
+			hub.handleNativeEvent({ type: "activate", key: "", item: "openai/blocked" });
+			const rejected = hub.describe(cx).p as TspPickerProps;
+			assert.equal(rejected.selected, "anthropic/allowed");
+			assert.deepEqual(assigned, []);
+			hub.handleNativeEvent({ type: "action", key: "", act: "scope", value: "provider:anthropic", mods: [] });
+			const scoped = hub.describe(cx).p as TspPickerProps;
+			assert.deepEqual(scoped.items?.map(item => item.id), ["anthropic/allowed"]);
+			await artifact("model-picker.ansi", hub.render(150).join("\n"), "ansi");
+			await artifact("model-picker.tsp.json", JSON.stringify(hub.describe(cx)), "tsp-node");
+		} finally { hub.dispose(); }
+		assert.deepEqual(providerMark("amazon-bedrock"), { text: "AB", seed: "amazon-bedrock", icon: "provider:amazon-bedrock" });
+		record("managed-model-restrictions-provider-identity", { selectors: scope.items.map(item => item.selector), configuredBlockedRole: "unresolved", forbiddenActivations: assigned.length });
+
+		const repo = path.join(fixture, "repo");
+		await fs.mkdir(repo);
+		await fs.mkdir(path.join(fixture, "hooks"));
+		const gitEnv = { PATH: required("PATH"), HOME: required("HOME"), TMPDIR: fixture, GIT_OPTIONAL_LOCKS: "0", GIT_NO_REPLACE_OBJECTS: "1", GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: path.join(fixture, "gitconfig"), GIT_TERMINAL_PROMPT: "0" };
+		const git = async (...args: string[]) => {
+			const child = Bun.spawn(["git", "-c", `core.hooksPath=${path.join(fixture, "hooks")}`, "-c", "commit.gpgsign=false", ...args], { cwd: repo, env: gitEnv, stdout: "pipe", stderr: "pipe" });
+			const [out, error, exit] = await Promise.all([new Response(child.stdout).arrayBuffer(), new Response(child.stderr).text(), child.exited]);
+			assert.equal(exit, 0, `private git ${args[0]}: ${error}`);
+			return Buffer.from(out);
+		};
+		await git("init", "--initial-branch=main"); await git("config", "user.name", "Coreforge Fixture"); await git("config", "user.email", "fixture@example.invalid");
+		const red = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC", "base64");
+		const gray = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=", "base64");
+		const binaryOld = Buffer.from([0, 1, 2, 3, 4]); const binaryNew = Buffer.from([0, 9, 8, 7, 6]);
+		const svgOld = '<svg xmlns="http://www.w3.org/2000/svg" width="2" height="2"><rect width="2" height="2" fill="red"/></svg>';
+		const svgNew = svgOld.replace("red", "blue");
+		await fs.writeFile(path.join(repo, "logo.png"), red); await fs.writeFile(path.join(repo, "fake.png"), binaryOld);
+		await fs.writeFile(path.join(repo, "diagram.svg"), svgOld);
+		await git("add", "logo.png", "fake.png", "diagram.svg"); await git("commit", "-m", "synthetic base");
+		await fs.writeFile(path.join(repo, "logo.png"), gray); await git("add", "logo.png");
+		await fs.writeFile(path.join(repo, "fake.png"), binaryNew);
+		await fs.writeFile(path.join(repo, "diagram.svg"), svgNew);
+		const model = new GitModel(repo); await model.refresh();
+		const imageFile = model.staged.find(file => file.path === "logo.png"); const binaryFile = model.unstaged.find(file => file.path === "fake.png");
+		assert.ok(imageFile && binaryFile);
+		const image = await model.streamContents(imageFile, () => {}); const binary = await model.streamContents(binaryFile, () => {});
+		assert.equal(image.kind, "asset"); assert.equal(binary.kind, "asset");
+		if (image.kind !== "asset" || binary.kind !== "asset") throw new Error("expected assets");
+		assert.equal(image.old.kind, "image"); assert.equal(image.new.kind, "image");
+		assert.equal(binary.old.kind, "binary"); assert.equal(binary.new.kind, "binary");
+		assert.deepEqual(image.oldRef, { path: path.join(repo, "logo.png"), rev: "HEAD" });
+		assert.deepEqual(image.newRef, { path: path.join(repo, "logo.png"), rev: ":0" });
+		assert.deepEqual(binary.oldRef, { path: path.join(repo, "fake.png"), rev: ":0" });
+		assert.deepEqual(binary.newRef, { path: path.join(repo, "fake.png") });
+		assert.deepEqual(await git("show", "HEAD:logo.png"), red); assert.deepEqual(await git("show", ":0:logo.png"), gray);
+		assert.deepEqual(await git("show", ":0:fake.png"), binaryOld); assert.deepEqual(await fs.readFile(path.join(repo, "fake.png")), binaryNew);
+		const svgFile = model.unstaged.find(file => file.path === "diagram.svg");
+		assert.ok(svgFile);
+		const svg = await model.streamContents(svgFile, () => {});
+		assert.equal(svg.kind, "asset");
+		if (svg.kind !== "asset" || svg.old.kind !== "image" || svg.new.kind !== "image") throw new Error("SVG must retain its existing rasterized preview");
+		assert.equal(svg.old.image.sourceMimeType, "image/svg+xml");
+		assert.equal(svg.new.image.sourceMimeType, "image/svg+xml");
+		for (const [name, file, contents] of [["image", imageFile, image], ["binary", binaryFile, binary]] as const) {
+			const pane = new DiffPane(); pane.setAsset(file.path, contents.old, contents.new);
+			const ansi = pane.render(100, 12).join("\n"); assert.ok(ansi.includes("\x1b["));
+			await artifact(`${name}-diff.ansi`, ansi, "ansi");
+		}
+		for (const images of [true, false]) {
+			const peer = new PrivateTerminal(images); const tui = new TUI(peer, false);
+			tui.start();
+			const closed = showGitOverlay(tui, { model: new GitModel(repo), createAvatarSource: () => ({ get: () => null }), aiStage: async () => { throw new Error("paid operation forbidden"); }, generateCommitMessage: async () => { throw new Error("paid operation forbidden"); } });
+			const until = async (ready: () => boolean) => { const deadline = Date.now() + 5000; while (!ready()) { assert.ok(Date.now() < deadline, "private Git UI settled"); tui.requestRender(); await Bun.sleep(5); } };
+			try {
+				for (const [name, area] of [["logo.png", "staged"], ["fake.png", "unstaged"], ["diagram.svg", "unstaged"]] as const) {
+					await until(() => peer.nodes().some(node => node.k === "list" && node.id.endsWith(`/${area}`) && node.c?.some(child => child.p && "title" in child.p && typeof child.p.title === "string" && child.p.title.endsWith(`: ${name}`))));
+					const list = peer.nodes().find(node => node.k === "list" && node.id.endsWith(`/${area}`))!;
+					const item = list.c!.find(child => child.p && "title" in child.p && typeof child.p.title === "string" && child.p.title.endsWith(`: ${name}`))!;
+					const surface = [...peer.docs.keys()].at(-1)!;
+					peer.send(`\x1b_tsp;e;${JSON.stringify({ ev: "select", sf: surface, id: list.id, item: item.id })}\x1b\\`);
+					const blobPreview = images && name !== "fake.png";
+					const decoded = name === "logo.png" ? image : svg;
+					const expected = blobPreview ? [decoded.old, decoded.new].map(side => {
+						assert.ok(side.kind === "image");
+						return Buffer.from(side.image.data, "base64");
+					}) : [];
+					const expectedIds = expected.map(sha);
+					await until(() => {
+						const nodes = peer.nodes();
+						if (blobPreview) return JSON.stringify(nodes.filter(node => node.k === "image").map(node => {
+							const p = node.p;
+							return p && "blob" in p ? p.blob : undefined;
+						})) === JSON.stringify(expectedIds);
+						const fact = name === "fake.png" ? "binary" : `image ${name === "logo.png" ? "1×1" : "2×2"}`;
+						return !nodes.some(node => node.k === "image") && nodes.some(node => node.k === "kv" && JSON.stringify(node.p).includes(fact));
+					});
+					const nodes = peer.nodes();
+					assert.equal(nodes.some(node => node.k === "media"), false);
+					if (blobPreview) {
+						const ids = nodes.filter(node => node.k === "image").map(node => { const p = node.p; assert.ok(p && "blob" in p && typeof p.blob === "string"); return p.blob; });
+						assert.deepEqual(ids, expectedIds);
+						for (const [index, id] of ids.entries()) assert.deepEqual(peer.blobs.get(id), expected[index]);
+						await fs.writeFile(path.join(repo, name), binaryNew);
+						for (const [index, id] of ids.entries()) assert.deepEqual(peer.blobs.get(id), expected[index]);
+						await fs.writeFile(path.join(repo, name), name === "logo.png" ? gray : svgNew);
+					} else { assert.ok(nodes.some(node => node.k === "kv")); }
+					await artifact(`${images ? "blob" : "fallback"}-${name}.tsp.json`, JSON.stringify([...peer.docs.values()].map(doc => doc.snapshot())), "tsp-document");
+				}
+				assert.deepEqual(peer.errors, []);
+				await artifact(`git-${images ? "blob" : "fallback"}.tsp`, peer.writes.join(""), "tsp-wire");
+			} finally {
+				try { peer.send("\x03"); await closed; }
+				finally { tui.stop(); assert.equal(peer.input, undefined); }
+			}
+		}
+		record("private-git-native-and-fallback-image-binary", { image: { before: sha(red), after: sha(gray), refs: [image.oldRef, image.newRef], delivery: "owned-content-addressed-blob" }, binary: { before: sha(binaryOld), after: sha(binaryNew), refs: [binary.oldRef, binary.newRef], spoofedRasterExtension: true }, svg: { before: sha(svgOld), after: sha(svgNew), delivery: "rasterized-owned-blob" }, mutableSourceReplacement: "retained-delivered-bytes", hostMedia: false, capabilities: ["image-and-media", "media-without-image"], paidRequests: 0 });
+	} finally {
+		setKeybindings(keybindings);
+		assert.equal(await fs.readFile(path.join(fixture, ".owner"), "utf8"), marker);
+		await fs.rm(fixture, { recursive: true });
+		fixtureRootRemoved = await fs.stat(fixture).then(() => false, error => { if (error.code === "ENOENT") return true; throw error; });
+	}
+	assert.equal(fixtureRootRemoved, true);
+	return { schema: "CoreforgeFrozen19DomainProof", domain: "presentation", complete: true, passed: true, mode: process.env.PI_COMPILED === "true" ? "compiled" : "source", version, sourceDigest, nativeSha256, cases, cleanupVerified: true, fixtureRootRemoved, artifactRoot, artifacts, paidRequests: 0 };
+}
+
+if (import.meta.main) console.log(JSON.stringify(await runPresentationProof()));

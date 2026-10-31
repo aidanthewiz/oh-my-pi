@@ -1,0 +1,62 @@
+import assert from "node:assert/strict";
+import fs from "node:fs/promises";
+import path from "node:path";
+import {createHash, randomUUID} from "node:crypto";
+import type {Component, TerminalFrameProvider} from "../../packages/tui/src/tui";
+import type {NativeSurfaceProvider} from "../../packages/tui/src/native/node";
+import type {ApprovalDialogComponent as Dialog} from "../../packages/tui/src/overlays/approval-dialog";
+import type {TspHarness as Harness} from "../../packages/tui/test/native/tsp-harness";
+
+declare const PI_COMPILED: boolean;
+const required=(name:string)=>{const value=process.env[name];assert(value,name);return value;};
+const sha=(bytes:string|Uint8Array)=>createHash("sha256").update(bytes).digest("hex");
+const roots=[required("CF_QUAL_CHECKOUT")];
+const outside=(file:string)=>roots.every(root=>file!==root&&!file.startsWith(root+path.sep));
+const compiled=typeof PI_COMPILED!=="undefined"?PI_COMPILED:process.env.PI_COMPILED==="true";
+const candidateVersion=required("CF_UPSTREAM_CANDIDATE_VERSION"),engineHead=required("CF_UPSTREAM_ENGINE_HEAD"),companionHead=null,mergeValue=required("CF_UPSTREAM_MERGE_HEAD"),mergeHead=mergeValue==="null"?null:mergeValue;
+const nativeSha256=required("V1890_NATIVE_SHA256"),sourceInputSha256=required("V1890_SOURCE_INPUT_SHA256");
+const manifestPath=await fs.realpath(required("V1890_SOURCE_INPUT_MANIFEST"));assert(outside(manifestPath));
+const manifestBytes=await fs.readFile(manifestPath);assert.equal(sha(manifestBytes),sourceInputSha256);
+const manifest=JSON.parse(manifestBytes.toString());assert.equal(manifest.schema,"CoreforgeCandidateSourceSnapshot");assert.equal(sha(JSON.stringify(manifest.records)),manifest.sourceDigest);
+assert.equal(manifest.engineHead,engineHead);assert.equal(manifest.mergeHead,mergeHead);assert.equal(manifest.companionHead,companionHead);assert.equal(manifest.native.sha256,nativeSha256);
+const home=await fs.realpath(required("HOME")),tmp=await fs.realpath(required("TMPDIR"));assert(outside(home)&&outside(tmp));
+const startCwd=process.cwd(),root=await fs.mkdtemp(path.join(tmp,"v18104-approval-")),owner=randomUUID();assert(outside(root));
+await fs.writeFile(path.join(root,".owner"),owner,{flag:"wx",mode:0o600});
+for(const env of [process.env,Bun.env]){const keep={PATH:env.PATH,HOME:home,USERPROFILE:home,TMPDIR:tmp,TMP:tmp,TEMP:tmp,PI_COMPILED:String(compiled),PI_CODING_AGENT_DIR:path.join(root,"agent"),GIT_OPTIONAL_LOCKS:"0",GIT_NO_REPLACE_OBJECTS:"1",LANG:"en_US.UTF-8"};for(const key of Object.keys(env))delete env[key];Object.assign(env,keep);}
+process.chdir(root);
+let networkAttempts=0,privateRootRemoved=false,complete=false;
+const previousFetch=globalThis.fetch,deny=():never=>{networkAttempts++;throw new Error("Approval surface proof forbids network");};globalThis.fetch=Object.assign(deny,{preconnect:deny}) as typeof fetch;
+const cases:Array<{id:string;evidence:unknown}>=[],artifacts:Array<{file:string;sha256:string;bytes:number;kind:string}>=[];
+const harnesses:Harness[]=[],dialogs:Dialog[]=[];
+const artifactRoot=path.join(requiredFromManifest(),"approval-artifacts-"+owner);
+function requiredFromManifest(){return path.dirname(manifestPath);}
+await fs.mkdir(artifactRoot,{mode:0o700});
+const artifact=async(name:string,bytes:string,kind:string)=>{const file=path.join(artifactRoot,name);await fs.writeFile(file,bytes,{flag:"wx",mode:0o600});artifacts.push({file,sha256:sha(bytes),bytes:Buffer.byteLength(bytes),kind});};
+const deadline=setTimeout(()=>{console.error("V18104_APPROVAL_SURFACE_DEADLINE");process.exit(124);},20_000);
+try{
+ await import("../../packages/natives/native/index.js");const {nativeAddonStatus}=await import("../../packages/natives/native/loader-state.js");const native=nativeAddonStatus();assert(native&&!native.stale);assert.equal(native.version,candidateVersion);assert.equal(native.packageVersion,candidateVersion);assert.equal(sha(await fs.readFile(native.path)),nativeSha256);if(compiled)assert(outside(await fs.realpath(native.path)));
+ const {initTheme}=await import("../../packages/tui/src/theme/theme");await initTheme(false);
+ const {KeybindingsManager}=await import("../../packages/tui/src/app-keybindings");const {setKeybindings}=await import("../../packages/tui/src/keybindings");setKeybindings(KeybindingsManager.inMemory({}));
+ const {ApprovalDialogComponent,APPROVE_ARM_MS}=await import("../../packages/tui/src/overlays/approval-dialog");const {md}=await import("../../packages/tui/src/native/describe");const {TspHarness}=await import("../../packages/tui/test/native/tsp-harness");
+ const mount=async(dialog:Dialog)=>{dialogs.push(dialog);const transcript:Component={render:()=>[],invalidate:()=>{},describe:()=>md("Completed transcript remains above the approval.")};const provider:TerminalFrameProvider&NativeSurfaceProvider={renderFrame:()=>({viewport:[]}),acknowledgeHistory:()=>{},describeSurface:()=>({main:[transcript],dock:[dialog]})};const h=await TspHarness.start(tui=>{tui.setFrameProvider(provider);tui.setFocus(dialog);},{cols:100,rows:32,expected:false});harnesses.push(h);assert.deepEqual(h.errors,[]);return h;};
+ let approved=0,denied=0;
+ const dialog=new ApprovalDialogComponent("Allow tool: write\nPath: /owned/synthetic-output.txt",{onApprove:()=>approved++,onDeny:()=>denied++});
+ const mountedAt=performance.now(),h=await mount(dialog);
+ assert.equal(h.region("dock")?.c?.filter(node=>node.p?.role==="omp.editor.ask.approval").length,1);assert.equal(h.findAll(node=>node.k==="overlay"||node.k==="card").length,0);assert(JSON.stringify(h.region("main")).includes("Completed transcript remains above the approval."));
+ await artifact("approval-dock.json",JSON.stringify(h.doc(),null,2)+"\n","actual-native-protocol-document");await artifact("approval-dialog.ansi",dialog.render(100).join("\n")+"\n","actual-component-ansi");
+ cases.push({id:"native-docked-surface-keeps-transcript",evidence:{dockRole:"omp.editor.ask.approval",overlayCount:0,frameCount:h.frames.length,protocolErrors:0,physicalTernPixelsClaimed:false}});
+ h.terminal.send("\r");h.flush();assert.equal(approved,0);assert.equal(denied,0);
+ assert(performance.now()-mountedAt<APPROVE_ARM_MS,"Private fixture stalled beyond the early-chord window");h.terminal.send("\x11");h.flush();assert.equal(approved,0);
+ await Bun.sleep(APPROVE_ARM_MS+20);h.terminal.send("\x11");h.flush();assert.equal(approved,1);assert.equal(denied,0);h.terminal.send("\x11");h.flush();assert.equal(approved,1);
+ cases.push({id:"real-keyboard-enter-and-arming-boundary",evidence:{enterApprovals:0,earlyChordApprovals:0,armedChordApprovals:approved,repeatedChordApprovals:approved,armingMilliseconds:APPROVE_ARM_MS}});h.stop();
+ let clickApprovals=0,clickDenials=0;const clicked=new ApprovalDialogComponent("Allow tool: bash\nCommand: printf 'synthetic approval'",{onApprove:()=>clickApprovals++,onDeny:()=>clickDenials++});const clickHarness=await mount(clicked);
+ const button=clickHarness.find(node=>node.p?.role==="omp.btn"&&node.id.endsWith("/approve"));assert(button,"Actual emitted approve button address");const action={ev:"action" as const,sf:clickHarness.terminal.surface!,id:button.id,act:"approve"};clickHarness.event(action);assert.equal(clickApprovals,1);assert.equal(clickDenials,0);clickHarness.event(action);assert.equal(clickApprovals,1);assert.deepEqual(clickHarness.errors,[]);
+ cases.push({id:"native-protocol-approval-is-one-shot",evidence:{emittedButtonId:button.id,deliveredAction:"approve",approvals:clickApprovals,denials:clickDenials,protocolErrors:0,toolExecuted:false}});clickHarness.stop();
+ let timeoutApprovals=0,timeoutDenials=0,timeouts=0;const expired=Promise.withResolvers<void>();const timed=new ApprovalDialogComponent("Allow tool: write\nPath: /owned/timeout-not-written.txt",{onApprove:()=>timeoutApprovals++,onDeny:()=>{timeoutDenials++;expired.resolve();}},{timeout:25,onTimeout:()=>timeouts++});dialogs.push(timed);await expired.promise;assert.equal(timeoutApprovals,0);assert.equal(timeoutDenials,1);assert.equal(timeouts,1);timed.handleInput("\x11");assert.equal(timeoutApprovals,0);assert.equal(timeoutDenials,1);
+ cases.push({id:"real-expiry-denies-and-retires-dialog",evidence:{timeouts,denials:timeoutDenials,approvals:timeoutApprovals,lateChordApprovals:timeoutApprovals,syntheticOutputWritten:false}});
+ complete=true;
+}finally{
+ for(const h of harnesses.reverse())h.stop();for(const dialog of dialogs)dialog.dispose();globalThis.fetch=previousFetch;clearTimeout(deadline);process.chdir(startCwd);assert.equal(await fs.readFile(path.join(root,".owner"),"utf8"),owner);assert.equal(await fs.realpath(root),root);await fs.rm(root,{recursive:true});await assert.rejects(fs.lstat(root),(error:NodeJS.ErrnoException)=>error.code==="ENOENT");privateRootRemoved=true;
+}
+assert(complete&&privateRootRemoved);assert.equal(cases.length,4);assert.equal(networkAttempts,0);
+console.log(JSON.stringify({proof:"v18104-approval-runtime",status:"passed",compiled,candidateVersion,nativeSha256,sourceInputSha256,sourceDigest:manifest.sourceDigest,engineHead,mergeHead,companionHead,cases,artifacts,privateRootRemoved,networkAttempts,paidRequests:0,ownedListeners:0,ownedWorkers:0,physicalTerminalClaimed:false,userDesktopInput:0,limits:{nativeProtocolPeer:"Owned in-process protocol peer, not the user's Tern or terminal.",toolExecution:"Dialog decisions only; no synthetic command or write is executed.",raster:"Captured actual component ANSI; not physical Tern font or layout pixels."}}));

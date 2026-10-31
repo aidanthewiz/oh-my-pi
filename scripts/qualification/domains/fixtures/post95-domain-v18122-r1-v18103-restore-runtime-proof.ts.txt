@@ -1,0 +1,399 @@
+import assert from "node:assert/strict";
+import { createHash, randomUUID } from "node:crypto";
+import * as fs from "node:fs/promises";
+import { homedir } from "node:os";
+import * as path from "node:path";
+import type { AssistantMessage } from "../../packages/ai/src/types";
+import type { ExtensionFactory } from "../../packages/coding-agent/src/extensibility/extensions/types";
+
+const required = (name: string): string => { const value = process.env[name]; assert(value, `${name} required`); return value; };
+const digest = (bytes: string | Uint8Array) => createHash("sha256").update(bytes).digest("hex");
+const sourceRoots = [required("CF_QUAL_CHECKOUT")];
+const outsideSources = (file: string) => sourceRoots.every(root => file !== root && !file.startsWith(root + path.sep));
+const compiled = process.env.PI_COMPILED === "true";
+const candidateVersion = required("CF_UPSTREAM_CANDIDATE_VERSION"); assert.match(candidateVersion, /^\d+\.\d+\.\d+$/);
+const loopbackPort = Number(required("CF_UPSTREAM_RESTORE_LOOPBACK_PORT")); assert(Number.isInteger(loopbackPort) && loopbackPort > 1024 && loopbackPort < 65536);
+const nativeSha256 = required("V1890_NATIVE_SHA256"), sourceInputSha256 = required("V1890_SOURCE_INPUT_SHA256");
+for (const value of [nativeSha256, sourceInputSha256]) assert.match(value, /^[a-f0-9]{64}$/);
+const engineHead = required("CF_UPSTREAM_ENGINE_HEAD"), companionHead = null;
+const mergeValue = required("CF_UPSTREAM_MERGE_HEAD"), mergeHead = mergeValue === "null" ? null : mergeValue;
+for (const value of [engineHead, ...(mergeHead === null ? [] : [mergeHead])]) assert.match(value, /^[a-f0-9]{40}$/);
+const manifestPath = await fs.realpath(required("V1890_SOURCE_INPUT_MANIFEST")); assert(outsideSources(manifestPath));
+assert((await fs.lstat(manifestPath)).isFile());
+const manifestBytes = await fs.readFile(manifestPath); assert.equal(digest(manifestBytes), sourceInputSha256);
+const manifest = JSON.parse(manifestBytes.toString()); assert.equal(manifest.schema, "CoreforgeCandidateSourceSnapshot");
+for (const [key, value] of Object.entries({ engineHead, mergeHead, companionHead })) assert.equal(manifest[key], value);
+assert.equal(manifest.native.sha256, nativeSha256);
+assert(Array.isArray(manifest.records) && manifest.records.length > 0);
+assert.match(manifest.sourceDigest, /^[a-f0-9]{64}$/); assert.equal(digest(JSON.stringify(manifest.records)), manifest.sourceDigest);
+const sourceDigest: string = manifest.sourceDigest;
+const home = await fs.realpath(required("HOME")), temporary = await fs.realpath(required("TMPDIR"));
+assert.equal(await fs.realpath(homedir()), home, "HOME must be bound before Bun startup");
+assert(home !== path.parse(home).root && outsideSources(home) && outsideSources(temporary));
+if (compiled) assert(outsideSources(process.cwd()));
+const owner = randomUUID(), root = await fs.mkdtemp(path.join(temporary, "v18103-restore-"));
+await fs.writeFile(path.join(root, ".owner"), owner, { flag: "wx", mode: 0o600 });
+for (const key of new Set([...Object.keys(process.env), ...Object.keys(Bun.env)])) {
+ if (!["PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR", "PI_COMPILED"].includes(key)) { delete process.env[key]; delete Bun.env[key]; }
+}
+for (const [key, value] of Object.entries({ PI_CODING_AGENT_DIR: path.join(root, "agent"), GIT_OPTIONAL_LOCKS: "0", GIT_NO_REPLACE_OBJECTS: "1", TERM: "dumb" })) {
+ process.env[key] = value; Bun.env[key] = value;
+}
+const originalCwd = process.cwd(); process.chdir(root);
+const originalFetch = globalThis.fetch;
+let networkAttempts = 0, loopbackRequests = 0, ownedPreconnects = 0;
+let endpoint: string | undefined;
+globalThis.fetch = Object.assign(((input: RequestInfo | URL, init?: RequestInit) => {
+ const url = new URL(input instanceof Request ? input.url : String(input));
+ if (!endpoint || url.href !== endpoint + "/responses") { networkAttempts++; throw new Error(`External network forbidden: ${url.origin}`); }
+ loopbackRequests++; return originalFetch(input, init);
+}) as typeof fetch, { preconnect: (target: string) => {
+ if (!endpoint || target !== endpoint) { networkAttempts++; throw new Error(`External preconnect forbidden: ${target}`); }
+ ownedPreconnects++; originalFetch.preconnect(target);
+} });
+const cases: Array<{ id: string; evidence: unknown }> = [];
+const bounded = async <T>(promise: Promise<T>, label: string, ms = 20000): Promise<T> => {
+ let timer: NodeJS.Timeout | undefined;
+ try { return await Promise.race([promise, new Promise<never>((_resolve, reject) => { timer = setTimeout(() => reject(new Error(`Deadline: ${label}`)), ms); })]); }
+ finally { clearTimeout(timer); }
+};
+const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+const apiName = "openai-responses", provider = `restore-${owner}`, modelName = `${provider}/owned`;
+const schema = { type: "object", properties: { answer: { type: "integer" } }, required: ["answer"], additionalProperties: false };
+type Scenario = { token: string; structured: boolean; fail: boolean };
+let active: Scenario | undefined;
+const wire: Array<{ token: string; child: boolean; tools: string[]; result: string }> = [];
+let server: Bun.Server<undefined> | undefined;
+let cleanupRuntime: (() => Promise<void>) | undefined;
+let authClose: (() => Promise<void>) | undefined;
+let closeCaches: (() => void) | undefined;
+let cleanupComplete = false;
+try {
+ // Runtime imports must follow private-environment isolation; static initializers can read ambient configuration.
+ await import("../../packages/natives/native/index.js");
+ const { nativeAddonStatus } = await import("../../packages/natives/native/loader-state.js");
+ const native = nativeAddonStatus(); assert(native); assert.equal(native.version, candidateVersion);
+ assert.equal(native.packageVersion, candidateVersion); assert.equal(native.stale, false);
+ assert.equal(digest(await fs.readFile(native.path)), nativeSha256);
+ if (compiled) assert(outsideSources(await fs.realpath(native.path)));
+ const { createAgentSession } = await import("../../packages/coding-agent/src/sdk");
+ const { initializeExtensions } = await import("../../packages/coding-agent/src/modes/runtime-init");
+ const { Settings } = await import("../../packages/coding-agent/src/config/settings");
+ const { ModelRegistry } = await import("../../packages/coding-agent/src/config/model-registry");
+ const { AuthStorage } = await import("../../packages/coding-agent/src/session/auth-storage");
+ const { SessionManager } = await import("../../packages/coding-agent/src/session/session-manager");
+ const { AgentRegistry, MAIN_AGENT_ID } = await import("../../packages/coding-agent/src/registry/agent-registry");
+ const { AgentLifecycleManager } = await import("../../packages/coding-agent/src/registry/agent-lifecycle");
+ const { ensurePersistedRoster } = await import("../../packages/coding-agent/src/registry/persisted-agents");
+ const { createPersistedSubagentReviverFactory } = await import("../../packages/coding-agent/src/task/persisted-revive");
+ const { restoreSession } = await import("../../packages/coding-agent/src/task/restore");
+ const { hasRestorableTurn } = await import("../../packages/coding-agent/src/session/exit-diagnostics");
+ const { AgentStorage } = await import("../../packages/coding-agent/src/session/agent-storage");
+ const { closeModelCache } = await import("../../packages/catalog/src/model-cache");
+ closeCaches = () => { AgentStorage.close(); closeModelCache(); };
+ const auth = await AuthStorage.create(":memory:"); authClose = () => auth.close();
+ const modelRegistry = new ModelRegistry(auth, path.join(root, "models.yml"), { ignoreLocalModelConfig: true });
+ const reply = (content: AssistantMessage["content"], stopReason: AssistantMessage["stopReason"] = "stop", errorMessage?: string): AssistantMessage => ({
+  role: "assistant", api: apiName, provider, model: "owned", content, usage: structuredClone(usage), stopReason, timestamp: Date.now(), ...(errorMessage ? { errorMessage } : {}),
+ });
+ server = Bun.serve({ hostname: "127.0.0.1", port: loopbackPort, async fetch(request) {
+  assert.equal(new URL(request.url).pathname, `/${owner}/responses`); assert(active);
+  assert.equal(request.method, "POST"); assert.equal(request.headers.get("origin"), null);
+  const body = await request.json() as Record<string, unknown>;
+  assert.equal(body.model, "owned"); assert(Array.isArray(body.input)); assert(body.tools === undefined || Array.isArray(body.tools));
+  const child = JSON.stringify([body.instructions, body.input]).includes(`RESTORE_CHILD:${active.token}`);
+  const tools = (body.tools ?? []).map(tool => {
+   assert(tool && typeof tool === "object" && "name" in tool && typeof tool.name === "string");
+   return tool.name;
+  });
+  const id = `resp_restore_${wire.length}`, events: Array<Record<string, unknown>> = [
+   { type: "response.created", response: { id, status: "in_progress" } },
+  ];
+  const billedUsage = { input_tokens: 0, output_tokens: 0, total_tokens: 0, input_tokens_details: { cached_tokens: 0 }, output_tokens_details: { reasoning_tokens: 0 } };
+  let result: string;
+  if (child && active.fail) {
+   result = "error";
+   events.push({ type: "response.failed", response: { id, status: "failed", usage: billedUsage,
+    error: { code: "invalid_request_error", message: "Owned deterministic transport failure" } } });
+  } else if (child && active.structured) {
+   assert(tools.includes("yield")); result = "toolUse";
+   const args = JSON.stringify({ type: "result", data: { answer: 42 } });
+   const item = { type: "function_call", id: `fc_${wire.length}`, call_id: `call_${wire.length}`, name: "yield", arguments: args, status: "completed" };
+   events.push(
+    { type: "response.output_item.added", output_index: 0, item: { ...item, arguments: "", status: "in_progress" } },
+    { type: "response.function_call_arguments.delta", output_index: 0, item_id: item.id, delta: args },
+    { type: "response.function_call_arguments.done", output_index: 0, item_id: item.id, arguments: args },
+    { type: "response.output_item.done", output_index: 0, item },
+    { type: "response.completed", response: { id, status: "completed", output: [item], usage: billedUsage } },
+   );
+  } else {
+   result = "stop";
+   const text = child ? `  Plain restored ${active.token}\nexact final whitespace.  ` : `Parent observed ${active.token}`;
+   const item = { type: "message", id: `msg_${wire.length}`, role: "assistant", status: "completed", content: [{ type: "output_text", text, annotations: [] }] };
+   events.push(
+    { type: "response.output_item.added", output_index: 0, item: { ...item, content: [], status: "in_progress" } },
+    { type: "response.content_part.added", output_index: 0, content_index: 0, part: { type: "output_text", text: "", annotations: [] } },
+    { type: "response.output_text.delta", output_index: 0, content_index: 0, delta: text },
+    { type: "response.output_item.done", output_index: 0, item },
+    { type: "response.completed", response: { id, status: "completed", output: [item], usage: billedUsage } },
+   );
+  }
+  wire.push({ token: active.token, child, tools, result });
+  return new Response(events.map(event => `data: ${JSON.stringify(event)}\n\n`).join(""), { headers: { "content-type": "text/event-stream" } });
+ } });
+ endpoint = `http://127.0.0.1:${server.port}/${owner}`;
+ modelRegistry.registerProvider(provider, { api: apiName, baseUrl: endpoint, apiKey: "synthetic-owned-loopback-only",
+  models: [{ id: "owned", name: "Owned restore transport", reasoning: false, input: ["text"], cost: usage.cost, contextWindow: 32768, maxTokens: 1024 }] }, owner);
+ const model = modelRegistry.find(provider, "owned"); assert(model);
+ const pending = (token: string) => reply([{ type: "toolCall", id: `probe-${token}`, name: "restore_probe", arguments: { token } }], "toolUse");
+ async function fixture(label: string, options: { child?: boolean; structured?: boolean; fail?: boolean; mainInterrupted?: boolean; capacity?: number; coldReviveGate?: boolean } = {}) {
+  AgentLifecycleManager.resetGlobalForTests(); AgentRegistry.resetGlobalForTests();
+  const token = `${label}-${randomUUID()}`; active = { token, structured: options.structured === true, fail: options.fail === true };
+  const cwd = path.join(root, token); await fs.mkdir(cwd);
+  const probeFile = path.join(cwd, "probe.jsonl");
+  const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+  const releaseOther: Array<() => void> = [];
+  const coldEntered = Promise.withResolvers<void>(), coldRelease = Promise.withResolvers<void>();
+  releaseOther.push(() => coldRelease.resolve());
+  const extension: ExtensionFactory = pi => {
+   pi.registerProvider(provider, { api: apiName, baseUrl: endpoint!, apiKey: "synthetic-owned-loopback-only",
+    models: [{ id: "owned", name: "Owned restore transport", reasoning: false, input: ["text"], cost: usage.cost, contextWindow: 32768, maxTokens: 1024 }] });
+   pi.registerTool({ name: "restore_probe", label: "Owned restoration probe", description: "Append one owned restoration receipt", approval: "write",
+    parameters: pi.zod.object({ token: pi.zod.string() }),
+    async execute(toolCallId, params, signal) {
+     assert.equal(params.token, token); assert.equal(toolCallId, `probe-${token}`);
+     await fs.appendFile(probeFile, JSON.stringify({ token, toolCallId }) + "\n", { mode: 0o600 });
+     entered.resolve();
+     const aborted = Promise.withResolvers<never>();
+     const onAbort = () => aborted.reject(signal?.reason ?? new Error("Owned probe aborted"));
+     if (signal?.aborted) onAbort(); else signal?.addEventListener("abort", onAbort, { once: true });
+     try { await bounded(Promise.race([release.promise, aborted.promise]), "owned probe release"); }
+     finally { signal?.removeEventListener("abort", onAbort); }
+     return { content: [{ type: "text", text: `Probe receipt ${token}` }], details: { token, probeFile } };
+    },
+   });
+  };
+  const settings = Settings.isolated({ "async.enabled": true, "async.maxJobs": options.capacity ?? 8, "task.batch": false, "task.structured": false,
+   "task.isolation.enabled": false, "task.enableLsp": false, "task.agentIdleTtlMs": 0, "task.maxRuntimeMs": 15000,
+   "task.completionProbe": false, "compaction.enabled": false, "retry.enabled": false, "todo.enabled": false,
+   "todo.reminders": false, "advisor.enabled": false, "autolearn.enabled": false, "lsp.enabled": false,
+   modelRoles: { default: modelName, tiny: modelName } });
+  const persisted = SessionManager.create(cwd, path.join(cwd, "sessions"));
+  const ownedWriters = [persisted];
+  cleanupRuntime = async () => {
+   release.resolve(); for (const fn of releaseOther) fn();
+   await bounded(Promise.all(ownedWriters.map(writer => writer.close())), `${label} fixture writers close`);
+  };
+  const userId = persisted.appendMessage({ role: "user", content: `Owned recovery ${token}`, timestamp: 1 });
+  if (options.mainInterrupted) persisted.appendMessage(pending(token));
+  else persisted.appendMessage(reply([{ type: "text", text: "Root turn already complete" }]));
+  await persisted.ensureOnDisk(); await persisted.flush();
+  const rootFile = persisted.getSessionFile()!;
+  let childFile: string | undefined, childId: string | undefined, crashBytes: Uint8Array | undefined;
+  if (options.child) {
+   childId = `Child${randomUUID().replaceAll("-", "")}`;
+   const childDir = rootFile.slice(0, -6); await fs.mkdir(childDir, { recursive: true });
+   const child = SessionManager.create(cwd, childDir);
+   ownedWriters.push(child);
+   child.appendSessionInit({ systemPrompt: [`RESTORE_CHILD:${token}`], task: `Complete owned probe ${token}`,
+    tools: ["restore_probe", ...(options.structured ? ["yield"] : [])], agent: "proofworker", resolvedModel: modelName,
+    modelRole: modelName, spawns: "", ...(options.structured ? { outputSchema: schema, outputSchemaMode: "strict" as const } : {}) });
+   child.appendMessage({ role: "user", content: `Owned recovery ${token}`, timestamp: 2 }); child.appendMessage(pending(token));
+   await child.ensureOnDisk(); await child.flush();
+   const generated = child.getSessionFile()!; await child.close(); childFile = path.join(childDir, `${childId}.jsonl`);
+   await fs.rename(generated, childFile); crashBytes = await fs.readFile(childFile);
+  }
+  const { session } = await createAgentSession({ cwd, agentDir: path.join(root, "agent"), authStorage: auth, modelRegistry, model,
+   settings, sessionManager: persisted, agentId: MAIN_AGENT_ID,
+   systemPrompt: () => ["RESTORE_ROOT"], extensions: [extension], toolNames: ["restore_probe"], autoApprove: true,
+   disableExtensionDiscovery: true, preloadedExtensionPaths: [], preloadedCustomToolPaths: [],
+   contextFiles: [], skills: [], promptTemplates: [], slashCommands: [], rules: [], enableMCP: false,
+   enableLsp: false, enableIrc: false, cacheWarming: false, skipPythonPreflight: true });
+  const manager = session.asyncJobManager; assert(manager, "Expected the root session's actual async job manager");
+  const lifecycle = AgentLifecycleManager.global();
+  const close = async () => {
+   release.resolve(); for (const fn of releaseOther) fn();
+   await bounded(lifecycle.dispose(), `${label} lifecycle dispose`);
+   await bounded(session.dispose(), `${label} root dispose`);
+   assert.equal(await manager.dispose({ timeoutMs: 10000 }), true, "All owned job bodies must settle before fixture retirement");
+  };
+  cleanupRuntime = close;
+  await initializeExtensions(session, { reportSendError: (_action, error) => { throw error; }, reportRuntimeError: error => { throw error.error; } });
+  assert(modelRegistry.find(provider, "owned"), "Owned provider must remain registered for cold revival");
+  const realReviverFactory = createPersistedSubagentReviverFactory({ session, authStorage: auth, modelRegistry, settings, enableLsp: false });
+  lifecycle.setPersistedSubagentReviverFactory(options.coldReviveGate ? async ref => {
+   const revive = await realReviverFactory(ref);
+   if (!revive) return undefined;
+   return async expectedRef => {
+    coldEntered.resolve();
+    await bounded(coldRelease.promise, "cold persisted reviver release");
+    return revive(expectedRef);
+   };
+  } : realReviverFactory, () => 0);
+  const writes = async () => {
+   try { return (await fs.readFile(probeFile, "utf8")).trim().split("\n").map(line => JSON.parse(line)); }
+   catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return []; throw error; }
+  };
+  const publications = () => session.messages.filter(message => message.role === "custom" && message.customType === "async-result" && JSON.stringify(message).includes(childId ?? "NO_CHILD"));
+  const jobs = () => manager.getAllJobs().filter(job => job.agentId === childId).map(job => ({ id: job.id, status: job.status, ownerId: job.ownerId }));
+  const settle = async () => { await bounded(session.settleAsyncWork(), `${label} async settlement`); await session.settleInFlightMessagePersistence(); await persisted.flush(); };
+  return { token, session, persisted, rootFile, userId, manager, lifecycle, entered, release, releaseOther, coldEntered, coldRelease, childFile, childId, crashBytes, writes, publications, jobs, settle,
+   async close() { await close(); cleanupRuntime = undefined; } };
+ }
+ {
+  const f = await fixture("main-concurrent", { mainInterrupted: true });
+  assert(hasRestorableTurn(f.persisted.getBranch()));
+  const pair = await Promise.all([f.session.restoreInterruptedTurn(), f.session.restoreInterruptedTurn()]);
+  assert.equal(pair.filter(Boolean).length, 1, "RESTORE_MAIN_DUPLICATE_ADMISSION"); assert.equal(await f.session.restoreInterruptedTurn(), false, "RESTORE_MAIN_DUPLICATE_ADMISSION");
+  await bounded(f.entered.promise, "main probe entry"); assert.equal((await f.writes()).length, 1);
+  assert.equal(await f.session.restoreInterruptedTurn(), false); f.release.resolve(); await f.session.waitForIdle(); await f.settle();
+  assert.equal(await f.session.restoreInterruptedTurn(), false); assert.equal((await f.writes()).length, 1);
+  const results = f.session.messages.filter(message => message.role === "toolResult" && message.toolName === "restore_probe" && !message.isError);
+  assert.equal(results.length, 1); const file = f.rootFile; await f.close();
+  const cold = await SessionManager.open(file); try { assert(!hasRestorableTurn(cold.getBranch())); assert.equal(cold.getBranch().filter(entry => entry.type === "message" && entry.message.role === "toolResult" && entry.message.toolName === "restore_probe" && !entry.message.isError).length, 1); } finally { await cold.close(); }
+  cases.push({ id: "main-leaf-concurrent-immediate-repeat-and-cold-persistence", evidence: { admitted: pair, probeWrites: 1, successfulResults: 1, coldTerminal: true } });
+ }
+ for (const mode of ["plain", "structured", "failed"] as const) {
+  const f = await fixture(`child-${mode}`, { child: true, structured: mode === "structured", fail: mode === "failed" });
+  const pair = await Promise.all([restoreSession(f.session), restoreSession(f.session)]);
+  assert.equal(pair.flatMap(result => result.subagents).filter(id => id === f.childId).length, 1, "RESTORE_CHILD_DUPLICATE_ADMISSION");
+  assert.equal((await restoreSession(f.session)).subagents.length, 0, "RESTORE_CHILD_DUPLICATE_ADMISSION");
+  const admittedJob = f.manager.getJob(f.childId!); assert(admittedJob, "Restored child job must exist before its probe");
+  await bounded(Promise.race([f.entered.promise, admittedJob.promise.then(() => {
+   const child = AgentRegistry.global().get(f.childId!)?.session;
+   throw new Error(`RESTORE_PROBE_JOB_SETTLED ${JSON.stringify({ id: admittedJob.id, status: admittedJob.status, error: admittedJob.errorText, result: admittedJob.resultText, activeTools: child?.getActiveToolNames(), model: child?.model, messages: child?.messages, wire: wire.filter(call => call.token === f.token) })}`);
+  })]), "child probe entry");
+  assert.deepEqual(f.jobs().map(job => job.id), [f.childId]); assert.equal(f.manager.getJob(f.childId!)?.status, "running");
+  assert.equal((await f.writes()).length, 1); assert.equal((await restoreSession(f.session)).subagents.length, 0);
+  f.release.resolve(); await bounded(f.manager.getJob(f.childId!)!.promise, "restored child completion"); await f.settle();
+  const job = f.manager.getJob(f.childId!)!;
+  assert.equal(job.status, mode === "failed" ? "failed" : "completed", JSON.stringify({ error: job.errorText, result: job.resultText, messages: AgentRegistry.global().get(f.childId!)?.session?.messages, wire: wire.filter(call => call.token === f.token) }));
+  if (mode === "structured") { assert.equal(job.structured?.status, "valid"); assert.deepEqual(job.structured?.data, { answer: 42 }); }
+  else assert.equal(job.structured, undefined);
+  if (mode === "plain") {
+   const childSession = AgentRegistry.global().get(f.childId!)?.session; assert(childSession);
+   const final = childSession.messages.findLast(message => message.role === "assistant"); assert(final?.role === "assistant");
+   assert.equal(final.content.filter(block => block.type === "text").map(block => block.text).join(""), `  Plain restored ${f.token}\nexact final whitespace.  `);
+   assert(!childSession.getActiveToolNames().includes("yield"));
+  }
+  assert.equal(f.publications().length, 1, JSON.stringify(f.session.messages));
+  const visible = JSON.stringify(f.publications()[0]); assert(visible.includes(f.childId!));
+  await f.lifecycle.park(f.childId!); assert.equal(AgentRegistry.global().get(f.childId!)?.session, null);
+  await fs.writeFile(f.childFile!, f.crashBytes!);
+  const rewound = await SessionManager.open(f.childFile!); try { assert(hasRestorableTurn(rewound.getBranch())); } finally { await rewound.close(); }
+  assert.equal((await restoreSession(f.session)).subagents.length, 0, "RESTORE_CHILD_TERMINAL_IDENTITY");
+  await f.settle(); assert.deepEqual(f.jobs().map(row => row.id), [f.childId]); assert.equal(f.publications().length, 1); assert.equal((await f.writes()).length, 1);
+  const evidence = { jobId: job.id, status: job.status, structured: job.structured ?? null, probeWrites: 1, parentPublications: 1,
+   transcriptRewoundToInterruptedForRetainedJobCheck: true, jobs: f.jobs(), publication: visible };
+  await f.close(); cases.push({ id: `child-${mode}-concurrent-running-and-terminal-deduplication`, evidence });
+ }
+ {
+  const f = await fixture("capacity-retry", { child: true, capacity: 1 });
+  const gate = Promise.withResolvers<string>(); f.releaseOther.push(() => gate.resolve("Owned blocker released"));
+  const blocker = f.manager.register("task", "Owned capacity blocker", async () => gate.promise, { id: "owned-capacity-blocker", ownerId: MAIN_AGENT_ID, foreground: true });
+  await assert.rejects(restoreSession(f.session), /Background job limit reached/);
+  assert.equal(f.manager.getJob(f.childId!), undefined); assert.equal((await f.writes()).length, 0);
+  gate.resolve("Owned blocker released"); await f.manager.getJob(blocker)!.promise;
+  const retry = await restoreSession(f.session); assert.deepEqual(retry.subagents, [f.childId]);
+  await bounded(f.entered.promise, "retry probe entry"); f.release.resolve(); await f.settle();
+  assert.equal((await f.writes()).length, 1); assert.equal(f.publications().length, 1);
+  await f.close(); cases.push({ id: "capacity-rejection-does-not-consume-explicit-retry", evidence: { rejectedBeforeProbe: true, retryAdmitted: retry.subagents, probeWrites: 1, parentPublications: 1 } });
+ }
+ for (const boundary of ["leaf-change", "dispose"] as const) {
+  const f = await fixture(`root-${boundary}`, { child: true, mainInterrupted: true });
+  const attempt = restoreSession(f.session);
+  if (boundary === "leaf-change") f.persisted.branch(f.userId);
+  else f.session.beginDispose();
+  const result = await attempt; assert.deepEqual(result, { turn: false, subagents: [] });
+  assert.equal(f.jobs().length, 0); assert.equal((await f.writes()).length, 0);
+  await f.close(); cases.push({ id: `root-${boundary}-during-roster-await`, evidence: { result, childJobs: 0, probeWrites: 0 } });
+ }
+ {
+  const f = await fixture("cold-revive-new-session", { child: true, coldReviveGate: true });
+  assert(!hasRestorableTurn(f.persisted.getBranch()));
+  const interrupted = await SessionManager.open(f.childFile!);
+  try { assert(hasRestorableTurn(interrupted.getBranch())); } finally { await interrupted.close(); }
+  const oldSessionId = f.session.sessionId;
+  const attempt = restoreSession(f.session);
+  await bounded(f.coldEntered.promise, "registered child cold factory entry");
+  const originalJob = f.manager.getJob(f.childId!); assert(originalJob);
+  assert.equal(originalJob.type, "task"); assert.equal(originalJob.ownerId, MAIN_AGENT_ID);
+  assert.equal(originalJob.agentId, f.childId); assert.equal(originalJob.status, "running");
+  assert.equal(originalJob.abortController.signal.aborted, false);
+  assert.deepEqual(f.jobs().map(job => job.id), [f.childId]);
+  assert.equal(AgentRegistry.global().get(f.childId!)?.status, "parked");
+  assert.equal((await f.writes()).length, 0);
+  assert.equal(await bounded(f.session.newSession(), "actual root new session"), true);
+  assert.notEqual(f.session.sessionId, oldSessionId);
+  assert.equal(f.manager.getJob(f.childId!), originalJob);
+  assert.equal(originalJob.status, "cancelled"); assert.equal(originalJob.abortController.signal.aborted, true);
+  const callsAtRelease = wire.filter(call => call.token === f.token && call.child).length;
+  f.release.resolve(); f.coldRelease.resolve();
+  const outcome = await bounded(attempt, "cold cancelled restore admission settlement");
+  assert.deepEqual(outcome, { turn: false, subagents: [f.childId] });
+  await bounded(originalJob.promise, "cold cancelled actual job body settlement");
+  const childSession = AgentRegistry.global().get(f.childId!)?.session;
+  if (childSession) await bounded(childSession.waitForIdle(), "cold cancelled child idle");
+  await f.settle();
+  const effects = { probeAppends: (await f.writes()).length,
+   childProviderCallsAfterRelease: wire.filter(call => call.token === f.token && call.child).length - callsAtRelease,
+   parentPublications: f.publications().length };
+  assert.deepEqual(effects, { probeAppends: 0, childProviderCallsAfterRelease: 0, parentPublications: 0 }, "RESTORE_COLD_CANCEL_NO_EFFECTS");
+  assert.equal(originalJob.status, "cancelled"); assert.equal(f.manager.getJob(f.childId!), originalJob);
+  assert.equal(f.manager.getAllJobs().filter(job => job.status === "running").length, 0);
+  await f.close(); assert.equal(f.manager.getAllJobs().length, 0); assert.equal(f.lifecycle.has(f.childId!), false);
+  assert.equal(childSession?.isDisposed ?? true, true);
+  cases.push({ id: "registered-child-cancelled-by-new-session-during-cold-revive", evidence: {
+   marker: "RESTORE_COLD_CANCEL_NO_EFFECTS", originalJobId: originalJob.id, ownerId: originalJob.ownerId,
+   status: originalJob.status, signalAbortedBeforeRelease: true, outcome, ...effects, jobBodiesSettled: true,
+   lifecycleReleased: true, managerDisposed: true } });
+ }
+ {
+  const f = await fixture("root-replaced", { mainInterrupted: true });
+  const oldId = f.session.sessionId;
+  await f.session.newSession(); assert.notEqual(f.session.sessionId, oldId);
+  assert.equal(await f.session.restoreInterruptedTurn(), false); assert.deepEqual(await restoreSession(f.session), { turn: false, subagents: [] });
+  assert.equal((await f.writes()).length, 0);
+  await f.close(); cases.push({ id: "replaced-root-has-no-old-restoration-authority", evidence: { oldRootNotContinued: true, probeWrites: 0 } });
+ }
+ {
+  const f = await fixture("path-mismatch", { child: true }); await ensurePersistedRoster(AgentRegistry.global(), f.rootFile);
+  const ref = AgentRegistry.global().get(f.childId!)!; assert(ref);
+  const wrong = path.join(path.dirname(f.childFile!), "foreign.jsonl");
+  ref.sessionFile = wrong;
+  const result = await restoreSession(f.session); assert(!result.subagents.includes(f.childId!));
+  assert.equal(f.manager.getJob(f.childId!), undefined); assert.equal((await f.writes()).length, 0);
+  ref.sessionFile = f.childFile!;
+  await f.close(); cases.push({ id: "registry-path-cannot-borrow-sibling-transcript-authority", evidence: { mismatchedChildNotAdmitted: true, probeWrites: 0 } });
+ }
+ {
+  const f = await fixture("owner-mismatch", { child: true });
+  const gate = Promise.withResolvers<string>(); f.releaseOther.push(() => gate.resolve("Foreign-owned fixture settled"));
+  const collision = f.manager.register("task", "Owned identity collision fixture", async () => gate.promise,
+   { id: f.childId!, agentId: f.childId!, ownerId: "AnotherOwnedParent", foreground: true });
+  await assert.rejects(restoreSession(f.session), /job id belongs to another execution/);
+  assert.equal(f.manager.getJob(collision)?.ownerId, "AnotherOwnedParent"); assert.equal((await f.writes()).length, 0);
+  assert.equal(f.manager.getAllJobs().some(job => job.agentId === f.childId), false);
+  gate.resolve("Foreign-owned fixture settled"); await f.manager.getJob(collision)!.promise;
+  await f.close(); cases.push({ id: "existing-job-owner-mismatch-fails-closed-without-suffix", evidence: { originalOwnerPreserved: true, replacementJobs: 0, probeWrites: 0 } });
+ }
+ assert.equal(networkAttempts, 0); assert(loopbackRequests > 0);
+} finally {
+ let closed = false;
+ try { await cleanupRuntime?.(); closed = true; }
+ finally {
+  await server?.stop(true); await authClose?.(); closeCaches?.(); globalThis.fetch = originalFetch; process.chdir(originalCwd);
+  if (closed) {
+   assert.equal(await fs.readFile(path.join(root, ".owner"), "utf8"), owner);
+   await fs.rm(root, { recursive: true }); cleanupComplete = true;
+  }
+ }
+}
+assert(cleanupComplete); await assert.rejects(fs.lstat(root), (error: NodeJS.ErrnoException) => error.code === "ENOENT");
+console.log(JSON.stringify({ proof: "v18103-restore-runtime", status: "passed", compiled, candidateVersion, nativeSha256, sourceInputSha256,
+ sourceDigest, engineHead, mergeHead, companionHead, cases: cases.map(item => ({ ...item, status: "passed" })), privateRootRemoved: true, networkAttempts, paidRequests: 0, loopbackRequests, ownedPreconnects,
+ syntheticModelTurns: wire, limits: ["In-process duplicate admission and retained-job identity only; no permanent exactly-once guarantee across arbitrary crashes.",
+ "Probe replay starts from an owned persisted pending call whose first execution never happened; unknown effects before an arbitrary crash cannot be inferred.",
+ "Terminal-job sensitivity deliberately rewinds only closed owned child transcripts while retaining their actual completed or failed job records.",
+ "No real provider, credentials, desktop, browser, Tern, user input, or publication service is exercised.",
+ "Source identity is bound to a copied manifest; the parent must verify source hashes and enforce genuine compiled checkout-read denial and outbound network sandboxing."] }));

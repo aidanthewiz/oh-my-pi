@@ -1,0 +1,339 @@
+import assert from "node:assert/strict";
+import { createHash, randomUUID } from "node:crypto";
+import * as fs from "node:fs";
+import * as fsp from "node:fs/promises";
+import * as path from "node:path";
+import { fileURLToPath } from "node:url";
+import type { FileEntry } from "../../packages/coding-agent/src/session/session-entries";
+import type { SessionManager as SessionManagerType } from "../../packages/coding-agent/src/session/session-manager";
+import type { FileSessionStorage as FileSessionStorageType } from "../../packages/coding-agent/src/session/session-storage";
+import type { UnpackSessionResult } from "../../packages/coding-agent/src/session/session-transfer";
+
+interface RetainedChild {
+ process: { pid: number; exited: Promise<number>; kill(): void };
+ invocation: string[];
+ stderr: Promise<string>;
+ awaited: boolean;
+}
+interface ControlledChild { retained: RetainedChild; control: string }
+interface Scenario {
+ label: string; localProfile: string; localProject: string; remoteProject: string;
+ localFile: string; id: string; artifacts: string; artifactFile: string | undefined;
+ originalArtifact: Buffer | undefined; inbound: string; incomingUsers: FileEntry[];
+ remoteJournal: { file: string; bytes: number; sha256: string };
+}
+
+const sha256 = (bytes: Uint8Array | string) => createHash("sha256").update(bytes).digest("hex");
+const compiled = process.env.PI_COMPILED === "true";
+const childFlag = "--review-transfer-append-child";
+const childAt = process.argv.indexOf(childFlag);
+const isChild = childAt !== -1;
+const required = (name: string) => { const value = process.env[name]; assert(value, `Missing ${name}`); return value; };
+const runtimeRoot = await fsp.realpath(required("CF_REVIEW_RUNTIME_ROOT"));
+assert(path.isAbsolute(runtimeRoot));
+const inside = (file: string, dir: string) => file.startsWith(dir + path.sep);
+const manifestBytes = await fsp.readFile(required("V1890_SOURCE_INPUT_MANIFEST"));
+assert.equal(sha256(manifestBytes), required("V1890_SOURCE_INPUT_SHA256"));
+const manifest = JSON.parse(manifestBytes.toString());
+assert.equal(manifest.schema, "CoreforgeCandidateSourceSnapshot");
+assert(Array.isArray(manifest.records));
+assert.equal(sha256(JSON.stringify(manifest.records)), manifest.sourceDigest);
+assert.equal(manifest.native.sha256, required("V1890_NATIVE_SHA256"));
+assert(manifest.mergeHead === null || /^[a-f0-9]{40}$/.test(manifest.mergeHead));
+const binding = {
+ candidateVersion: required("CF_UPSTREAM_CANDIDATE_VERSION"),
+ manifestSha256: sha256(manifestBytes), sourceDigest: manifest.sourceDigest,
+ engineHead: manifest.engineHead, mergeHead: manifest.mergeHead, nativeSha256: manifest.native.sha256,
+};
+const root = isChild ? process.argv[childAt + 1]! : await fsp.mkdtemp(path.join(runtimeRoot, "t17-"));
+assert(inside(root, runtimeRoot));
+assert.equal(await fsp.realpath(root), root);
+const marker = path.join(root, ".review-transfer-owner");
+const owner = isChild ? process.argv[childAt + 2]! : randomUUID();
+if (isChild) assert.equal(await fsp.readFile(marker, "utf8"), owner);
+else await fsp.writeFile(marker, owner, { flag: "wx", mode: 0o600 });
+const originalCwd = process.cwd();
+const changes = {
+ HOME: path.join(root, "h"), USERPROFILE: path.join(root, "h"),
+ XDG_CONFIG_HOME: path.join(root, "h", "c"), XDG_CACHE_HOME: path.join(root, "h", "k"),
+ XDG_DATA_HOME: path.join(root, "h", "d"), XDG_STATE_HOME: path.join(root, "h", "s"),
+ TMPDIR: path.join(root, "t"), TMP: path.join(root, "t"), TEMP: path.join(root, "t"),
+ PI_TEST_SESSION_OWNERS_DIR: path.join(root, "o"), PI_CODING_AGENT_DIR: path.join(root, "a"),
+ PI_NO_TITLE: "1", GIT_OPTIONAL_LOCKS: "0",
+};
+const savedEnv = Object.fromEntries(Object.keys(changes).map(key => [key, { process: process.env[key], bun: Bun.env[key] }]));
+const originalFetch = globalThis.fetch;
+let networkAttempts = 0;
+const refuseNetwork = () => { networkAttempts++; throw new Error("Offline transfer consumer forbids fetch"); };
+const cases: Record<string, unknown>[] = [];
+const managers = new Set<{ close(): Promise<void> }>();
+const children: RetainedChild[] = [];
+let closeIndex: (() => void) | undefined;
+let primaryFailure: unknown;
+let fixtureRootRemoved = false;
+async function waitFile(file: string): Promise<void> {
+ const deadline = Date.now() + 30_000;
+ while (!fs.existsSync(file)) { assert(Date.now() < deadline, `Timed out waiting for ${file}`); await Bun.sleep(10); }
+}
+function waitFileSync(file: string): void {
+ const deadline = Date.now() + 30_000;
+ const sleeper = new Int32Array(new SharedArrayBuffer(4));
+ while (!fs.existsSync(file)) { assert(Date.now() < deadline, `Timed out waiting for ${file}`); Atomics.wait(sleeper, 0, 0, 10); }
+}
+function userEntries(entries: FileEntry[]) {
+ return entries.filter(entry => entry.type === "message" && entry.message.role === "user");
+}
+function texts(entries: FileEntry[]) {
+ return entries.flatMap(entry => entry.type === "message" && entry.message.role === "user" ? [entry.message.content] : []);
+}
+function header(entries: FileEntry[]) {
+ const value = entries[0]; assert(value?.type === "session"); return value;
+}
+async function fileEvidence(file: string) {
+ const bytes = await fsp.readFile(file);
+ return { file: path.relative(root, file), bytes: bytes.length, sha256: sha256(bytes) };
+}
+try {
+ for (const [key, value] of Object.entries(changes)) { process.env[key] = value; Bun.env[key] = value; }
+ for (const dir of [changes.HOME, changes.TMPDIR, changes.PI_TEST_SESSION_OWNERS_DIR]) await fsp.mkdir(dir, { recursive: true, mode: 0o700 });
+ process.chdir(root);
+ globalThis.fetch = Object.assign(refuseNetwork, { preconnect: refuseNetwork }) as typeof fetch;
+ // This consumer exercises initialization after private HOME/TMP/ownership binding; static imports capture the wrong directories.
+ const { SessionManager } = await import("../../packages/coding-agent/src/session/session-manager");
+ const { FileSessionStorage } = await import("../../packages/coding-agent/src/session/session-storage");
+ const { packSession, unpackSession, lastSessionTransfer, SESSION_TRANSFER_MESSAGE_TYPE } = await import("../../packages/coding-agent/src/session/session-transfer");
+ const { loadEntriesFromFile } = await import("../../packages/coding-agent/src/session/session-loader");
+ const { findSessionFiles } = await import("../../packages/coding-agent/src/session/session-listing");
+ const { closeSessionIndex } = await import("../../packages/coding-agent/src/session/session-index");
+ const { setAgentDir } = await import("../../packages/utils/src/dirs");
+ closeIndex = closeSessionIndex;
+ async function persist(manager: SessionManagerType) {
+  managers.add(manager);
+  try { await manager.ensureOnDisk(); await manager.flush(); }
+  finally { await manager.close(); managers.delete(manager); }
+  const file = manager.getSessionFile(); assert(file); return file;
+ }
+ async function append(file: string, text: string) {
+  const manager = await SessionManager.open(file); managers.add(manager);
+  try { manager.appendMessage({ role: "user", content: text, timestamp: 2 }); await manager.ensureOnDisk(); await manager.flush(); }
+  finally { await manager.close(); managers.delete(manager); }
+ }
+ if (isChild) {
+  const [mode, profile, file, control] = process.argv.slice(childAt + 3);
+  assert(mode === "boundary" || mode === "live");
+  for (const target of [profile!, file!, control!]) assert(inside(path.resolve(target), root));
+  setAgentDir(profile!);
+  await fsp.writeFile(control! + ".armed", "armed", { flag: "wx", mode: 0o600 });
+  await waitFile(control! + ".go");
+  const manager = await SessionManager.open(file!); managers.add(manager);
+  try {
+   manager.appendMessage({ role: "user", content: mode === "boundary" ? "completed-before-lease" : "live-local-work", timestamp: 3 });
+   await manager.ensureOnDisk(); await manager.flush();
+   if (mode === "live") {
+    await fsp.writeFile(control! + ".ready", JSON.stringify({ pid: process.pid, file, sha256: sha256(await fsp.readFile(file!)) }), { flag: "wx", mode: 0o600 });
+    await waitFile(control! + ".release");
+   }
+  } finally { await manager.close(); managers.delete(manager); }
+  await fsp.writeFile(control! + ".done.pending", JSON.stringify({ pid: process.pid, flushed: true, closed: true, file, sha256: sha256(await fsp.readFile(file!)), userTexts: texts(await loadEntriesFromFile(file!)) }), { flag: "wx", mode: 0o600 });
+  await fsp.rename(control! + ".done.pending", control! + ".done");
+ } else {
+  async function startChild(mode: "boundary" | "live", profile: string, file: string) {
+   const control = path.join(root, `c-${randomUUID().slice(0, 8)}`);
+   const invocation = [process.execPath, ...(compiled ? [] : [fileURLToPath(import.meta.url)]), childFlag, root, owner, mode, profile, file, control];
+   const proc = Bun.spawn(invocation, { cwd: root, env: process.env, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+   const retained = { process: proc, invocation, stderr: new Response(proc.stderr).text(), awaited: false };
+   children.push(retained);
+   await waitFile(control + ".armed");
+   return { retained, control };
+  }
+  async function finishChild(child: ControlledChild) {
+   const code = await child.retained.process.exited;
+   child.retained.awaited = true;
+   assert.equal(code, 0, await child.retained.stderr);
+   const receipt = JSON.parse(await fsp.readFile(child.control + ".done", "utf8"));
+   assert.equal(receipt.pid, child.retained.process.pid); assert.equal(receipt.flushed, true); assert.equal(receipt.closed, true);
+   return { ...receipt, exitCode: code, invocation: child.retained.invocation };
+  }
+  async function prepare(label: string, artifact?: "binary" | "subagent"): Promise<Scenario> {
+   const dir = path.join(root, label); await fsp.mkdir(dir);
+   const localProfile = path.join(dir, "a"), remoteProfile = path.join(dir, "b");
+   const localProject = path.join(dir, "p"), remoteProject = path.join(dir, "q");
+   await fsp.mkdir(localProject); await fsp.mkdir(remoteProject);
+   setAgentDir(localProfile);
+   const local = SessionManager.create(localProject);
+   local.appendMessage({ role: "user", content: "seed", timestamp: 1 });
+   const localFile = await persist(local), id = local.getSessionId();
+   const artifacts = localFile.slice(0, -6);
+   let artifactFile: string | undefined;
+   if (artifact === "binary") {
+    artifactFile = path.join(artifacts, "tools", "result.bin"); await fsp.mkdir(path.dirname(artifactFile), { recursive: true });
+    await fsp.writeFile(artifactFile, Buffer.from([0, 1, 2, 255]));
+   } else if (artifact === "subagent") {
+    const subagent = SessionManager.create(localProject, artifacts);
+    subagent.appendMessage({ role: "user", content: "subagent-seed", timestamp: 1 });
+    artifactFile = await persist(subagent);
+   }
+   const originalArtifact = artifactFile ? await fsp.readFile(artifactFile) : undefined;
+   const outbound = path.join(dir, "out.tar"), inbound = path.join(dir, "back.tar");
+   await packSession(localFile, outbound);
+   setAgentDir(remoteProfile);
+   const landed = await unpackSession(outbound, { cwd: remoteProject });
+   assert.equal(landed.mode, "created"); assert.equal(landed.id, id);
+   await append(landed.sessionFile, "remote-work");
+   const incomingUsers = userEntries(await loadEntriesFromFile(landed.sessionFile));
+   await packSession(landed.sessionFile, inbound);
+   const remoteJournal = await fileEvidence(landed.sessionFile);
+   setAgentDir(localProfile);
+   return { label, localProfile, localProject, remoteProject, localFile, id, artifacts, artifactFile, originalArtifact, inbound, incomingUsers, remoteJournal };
+  }
+  async function verifyIncoming(s: Scenario, result: UnpackSessionResult, mode: "forked" | "replaced") {
+   assert.equal(result.mode, mode);
+   const entries = await loadEntriesFromFile(result.sessionFile);
+   assert.equal(header(entries).cwd, s.localProject);
+   assert.equal(header(entries).id, result.id);
+   assert.deepEqual(userEntries(entries), s.incomingUsers);
+   assert.deepEqual(texts(entries), ["seed", "remote-work"]);
+   assert.deepEqual(lastSessionTransfer(entries), { kind: "arrived", fromCwd: s.remoteProject, cwd: s.localProject });
+   if (mode === "forked") { assert.notEqual(result.id, s.id); assert.equal(header(entries).parentSession, s.id); }
+   else { assert.equal(result.id, s.id); assert.equal(header(entries).parentSession, undefined); }
+   return { mode: result.mode, sessionId: result.id, parentSession: header(entries).parentSession ?? null, incomingUsers: texts(entries), journal: await fileEvidence(result.sessionFile), archive: await fileEvidence(s.inbound), remoteJournal: s.remoteJournal };
+  }
+  {
+   const s = await prepare("boundary");
+   const child = await startChild("boundary", s.localProfile, s.localFile);
+   const proto = FileSessionStorage.prototype;
+   const descriptor = Object.getOwnPropertyDescriptor(proto, "claimSession"); assert(descriptor?.value);
+   const original = proto.claimSession;
+   let calls = 0, before: Buffer | undefined;
+   Object.defineProperty(proto, "claimSession", { ...descriptor, value: function(this: FileSessionStorageType, id: string, file: string) {
+    if (id === s.id && calls === 0) {
+     calls++; fs.writeFileSync(child.control + ".go", "go", { flag: "wx", mode: 0o600 });
+     waitFileSync(child.control + ".done");
+     const receipt = JSON.parse(fs.readFileSync(child.control + ".done", "utf8"));
+     assert.equal(receipt.closed, true); assert.equal(receipt.flushed, true);
+     before = fs.readFileSync(s.localFile); assert.equal(sha256(before), receipt.sha256);
+    }
+    return original.call(this, id, file);
+   } });
+   let result: UnpackSessionResult;
+   try { result = await unpackSession(s.inbound, { cwd: s.localProject }); }
+   finally { Object.defineProperty(proto, "claimSession", descriptor); }
+   const childReceipt = await finishChild(child);
+   assert.equal(calls, 1); assert(before);
+   assert.deepEqual(await fsp.readFile(s.localFile), before);
+   assert.deepEqual(texts(await loadEntriesFromFile(s.localFile)), ["seed", "completed-before-lease"]);
+   cases.push({ id: "completed-append-before-first-parent-lease", ...await verifyIncoming(s, result, "forked"), localJournal: await fileEvidence(s.localFile), localUsers: ["seed", "completed-before-lease"], child: childReceipt, callbackRestored: true });
+  }
+  for (const kind of ["local-only", "edited", "subagent"] as const) {
+   const s = await prepare(kind, kind === "subagent" ? "subagent" : kind === "edited" ? "binary" : undefined);
+   const journalBefore = await fsp.readFile(s.localFile);
+   let artifactFile = s.artifactFile;
+   if (kind === "subagent") await append(artifactFile!, "independent-subagent-work");
+   else {
+    artifactFile ??= path.join(s.artifacts, "tools", "local-only.bin");
+    await fsp.mkdir(path.dirname(artifactFile), { recursive: true }); await fsp.writeFile(artifactFile, Buffer.from([255, 0, 42, 1]));
+   }
+   const artifactBefore = await fsp.readFile(artifactFile!);
+   assert.deepEqual(await fsp.readFile(s.localFile), journalBefore);
+   const result = await unpackSession(s.inbound, { cwd: s.localProject });
+   const evidence = await verifyIncoming(s, result, "forked");
+   assert.deepEqual(await fsp.readFile(s.localFile), journalBefore);
+   assert.deepEqual(await fsp.readFile(artifactFile!), artifactBefore);
+   const incomingArtifact = path.join(result.sessionFile.slice(0, -6), path.relative(s.artifacts, artifactFile!));
+   if (kind === "local-only") assert.equal(fs.existsSync(incomingArtifact), false);
+   else assert.deepEqual(await fsp.readFile(incomingArtifact), s.originalArtifact);
+   if (kind === "subagent") assert.deepEqual(texts(await loadEntriesFromFile(artifactFile!)), ["subagent-seed", "independent-subagent-work"]);
+   cases.push({ id: `${kind}-artifact-unchanged-parent`, ...evidence, localJournal: await fileEvidence(s.localFile), journalUnchanged: true, localArtifact: await fileEvidence(artifactFile!), incomingArtifact: kind === "local-only" ? null : await fileEvidence(incomingArtifact), localArtifactHex: artifactBefore.toString("hex"), incomingArtifactSha256: s.originalArtifact ? sha256(s.originalArtifact) : null });
+  }
+  {
+   const s = await prepare("ancestor", "binary");
+   const ancestorBefore = await fsp.readFile(s.localFile);
+   const result = await unpackSession(s.inbound, { cwd: s.localProject });
+   const evidence = await verifyIncoming(s, result, "replaced");
+   assert.deepEqual(await findSessionFiles(s.id), [result.sessionFile]);
+   const artifact = path.join(result.sessionFile.slice(0, -6), path.relative(s.artifacts, s.artifactFile!));
+   assert.deepEqual(await fsp.readFile(artifact), s.originalArtifact);
+   cases.push({ id: "identical-artifact-ancestor-safe-replacement", ...evidence, ancestorSha256: sha256(ancestorBefore), retainedArtifact: await fileEvidence(artifact), retainedArtifactHex: s.originalArtifact!.toString("hex"), copies: [path.relative(root, result.sessionFile)] });
+  }
+  for (const target of ["subagent", "parent"] as const) {
+   const s = await prepare(`live-${target}`, "subagent");
+   const writer = target === "subagent" ? s.artifactFile! : s.localFile;
+   const child = await startChild("live", s.localProfile, writer);
+   await fsp.writeFile(child.control + ".go", "go", { flag: "wx", mode: 0o600 });
+   try {
+    await waitFile(child.control + ".ready");
+    const parentBefore = await fsp.readFile(s.localFile), subagentBefore = await fsp.readFile(s.artifactFile!);
+    await assert.rejects(unpackSession(s.inbound, { cwd: s.localProject }));
+    assert.deepEqual(await fsp.readFile(s.localFile), parentBefore);
+    assert.deepEqual(await fsp.readFile(s.artifactFile!), subagentBefore);
+    assert.deepEqual(await findSessionFiles(s.id), [s.localFile]);
+   } finally { await fsp.writeFile(child.control + ".release", "release", { mode: 0o600 }); }
+   const childReceipt = await finishChild(child);
+   const parentBefore = await fsp.readFile(s.localFile), subagentBefore = await fsp.readFile(s.artifactFile!);
+   const result = await unpackSession(s.inbound, { cwd: s.localProject });
+   const evidence = await verifyIncoming(s, result, "forked");
+   assert.deepEqual(await fsp.readFile(s.localFile), parentBefore); assert.deepEqual(await fsp.readFile(s.artifactFile!), subagentBefore);
+   assert.deepEqual(texts(await loadEntriesFromFile(writer)), [target === "subagent" ? "subagent-seed" : "seed", "live-local-work"]);
+   cases.push({ id: `live-${target}-refusal-and-release`, refusedWhileOwned: true, ...evidence, localJournal: await fileEvidence(s.localFile), subagent: await fileEvidence(s.artifactFile!), child: childReceipt });
+  }
+  {
+   const s = await prepare("rollback", "binary");
+   const journalBefore = await fsp.readFile(s.localFile), artifactBefore = await fsp.readFile(s.artifactFile!);
+   const dir = path.dirname(s.localFile), namesBefore = (await fsp.readdir(dir)).sort();
+   const proto = SessionManager.prototype;
+   const descriptor = Object.getOwnPropertyDescriptor(proto, "appendCustomMessageEntry"); assert(descriptor?.value);
+   const original = proto.appendCustomMessageEntry;
+   const sentinel = new Error("synthetic arrival persistence fault");
+   let relocatedFile: string | undefined, failures = 0;
+   Object.defineProperty(proto, "appendCustomMessageEntry", { ...descriptor, value: function(this: SessionManagerType, ...args: Parameters<typeof original>) {
+    if (args[0] === SESSION_TRANSFER_MESSAGE_TYPE && (args[3] as { kind?: string } | undefined)?.kind === "arrived") {
+     relocatedFile = this.getSessionFile(); assert(relocatedFile && fs.existsSync(relocatedFile));
+     assert(fs.readdirSync(dir).some(name => name.startsWith(path.basename(s.localFile) + ".unpack-") && name.endsWith(".bak")));
+     failures++; throw sentinel;
+    }
+    return original.apply(this, args);
+   } });
+   try { await assert.rejects(unpackSession(s.inbound, { cwd: s.localProject }), error => error === sentinel); }
+   finally { Object.defineProperty(proto, "appendCustomMessageEntry", descriptor); }
+   assert.equal(failures, 1); assert(relocatedFile);
+   assert.deepEqual(await fsp.readFile(s.localFile), journalBefore); assert.deepEqual(await fsp.readFile(s.artifactFile!), artifactBefore);
+   assert.deepEqual((await fsp.readdir(dir)).sort(), namesBefore);
+   const restored = { journal: await fileEvidence(s.localFile), artifact: await fileEvidence(s.artifactFile!), directoryEntries: namesBefore };
+   const result = await unpackSession(s.inbound, { cwd: s.localProject });
+   const evidence = await verifyIncoming(s, result, "replaced");
+   assert.deepEqual(await fsp.readFile(path.join(result.sessionFile.slice(0, -6), path.relative(s.artifacts, s.artifactFile!))), artifactBefore);
+   cases.push({ id: "arrival-failure-after-relocation-restores-byte-custody", failures, relocatedFile: path.relative(root, relocatedFile), restored, callbackRestored: true, retry: evidence });
+  }
+  assert.equal(cases.length, 8);
+  assert.equal(networkAttempts, 0);
+ }
+} catch (error) { primaryFailure = error; }
+finally {
+ const cleanupErrors: unknown[] = [];
+ for (const child of children) {
+  if (!child.awaited) {
+   try { child.process.kill(); await child.process.exited; await child.stderr; child.awaited = true; }
+   catch (error) { cleanupErrors.push(error); }
+  }
+ }
+ for (const manager of managers) { try { await manager.close(); } catch (error) { cleanupErrors.push(error); } }
+ try { closeIndex?.(); } catch (error) { cleanupErrors.push(error); }
+ process.chdir(originalCwd); globalThis.fetch = originalFetch;
+ for (const [key, saved] of Object.entries(savedEnv)) {
+  if (saved.process === undefined) delete process.env[key]; else process.env[key] = saved.process;
+  if (saved.bun === undefined) delete Bun.env[key]; else Bun.env[key] = saved.bun;
+ }
+ if (!isChild && cleanupErrors.length === 0) {
+  try {
+   assert.equal(await fsp.readFile(marker, "utf8"), owner);
+   await fsp.rm(root, { recursive: true, force: true });
+   fixtureRootRemoved = !fs.existsSync(root); assert(fixtureRootRemoved);
+  } catch (error) { cleanupErrors.push(error); }
+ }
+ if (cleanupErrors.length) primaryFailure = new AggregateError([...(primaryFailure ? [primaryFailure] : []), ...cleanupErrors], "Transfer consumer cleanup failed");
+}
+if (primaryFailure) throw primaryFailure;
+if (!isChild) {
+ assert(children.every(child => child.awaited)); assert(fixtureRootRemoved);
+ fs.writeSync(1, JSON.stringify({ schema: "CoreforgeReview17TransferRuntime", passed: true, compiled, binding, cases, childPids: children.map(child => child.process.pid), allChildrenAwaited: true, networkAttempts, paidRequests: 0, cleanupVerified: true, fixtureRootRemoved }) + "\n");
+}
