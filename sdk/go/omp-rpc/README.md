@@ -168,6 +168,8 @@ OMP_RPC_SMOKE=1 go test -run TestSmoke -v ./...   # real servers via bun, from t
 
 `TestSmoke` configures an `auth: none` loopback model and rejects any request to it.
 The CLI still requires an available model for headless startup; these tests need no external credentials.
+Both smoke tests disable project skill discovery because startup can infer compressed skill descriptions.
+This keeps repository skills outside the RPC binding fixture.
 
 `TestSmokeModel` drives full prompt turns against the scripted model in
 `packages/coding-agent/test/rpc-wire/fake-openai-server.ts`.

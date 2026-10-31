@@ -396,8 +396,16 @@ async function packedLicense(): Promise<void> {
 		await fs.rm(staging, { recursive: true, force: true });
 	}
 }
+function normalizeLicenseParagraphs(text: string): string {
+	return text
+		.replaceAll("\r\n", "\n")
+		.replace(/\n(?:[ \t]*\n)+/g, "\n\n")
+		.trim();
+}
+
 async function legal(): Promise<void> {
 	const notice = (await Bun.file(path.join(root, "THIRD-PARTY-NOTICES.txt")).text()).replaceAll("\r\n", "\n");
+	const normalizedNotice = normalizeLicenseParagraphs(notice);
 	for (const file of [
 		"packages/natives/THIRD-PARTY-NOTICES.txt",
 		"packages/coding-agent/src/tools/browser/relay/extension-assets/THIRD-PARTY-NOTICES.txt",
@@ -479,7 +487,7 @@ async function legal(): Promise<void> {
 		const uses = license.used_by.filter(use => union.has(`${use.crate.name}@${use.crate.version}`));
 		if (!uses.length) continue;
 		assert(
-			notice.includes(license.text.replaceAll("\r\n", "\n").trim()),
+			normalizedNotice.includes(normalizeLicenseParagraphs(license.text)),
 			"Current cargo-about license payload missing from notices",
 		);
 		for (const use of uses) {

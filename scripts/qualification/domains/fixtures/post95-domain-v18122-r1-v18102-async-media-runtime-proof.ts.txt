@@ -212,8 +212,8 @@ try {
 			const ui = new TUI(consumer, false); uis.push(ui); ui.start(); await Bun.sleep(80); setNativeRendering(true);
 			const pendingTools = new Map<string, InstanceType<typeof ToolExecutionComponent>>();
 			const sessionManager = SessionManager.inMemory(fixtureRoot);
-			const context = { isInitialized: true, settings, session: { settings, isStreaming: false, isAborting: false },
-				viewSession: { settings, isStreaming: false, getToolByName: (name: string) => name === kind ? tool : undefined, hasBuiltInTool: (name: string) => name === kind },
+			const context = { isInitialized: true, settings, session: { settings, sessionManager, isStreaming: false, isAborting: false },
+				viewSession: { settings, sessionManager, isStreaming: false, getToolByName: (name: string) => name === kind ? tool : undefined, hasBuiltInTool: (name: string) => name === kind },
 				ui, chatContainer: ui, pendingTools, sessionManager, tableChartsVisible: false, toolOutputExpanded: true };
 			const controller = new EventController(context as never); controllers.push(controller);
 			let turn = 0, ended = false;
