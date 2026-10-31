@@ -75,32 +75,49 @@ describe("task progress rendering", () => {
 
 	it("shortens current and recent path arguments without rewriting search patterns", async () => {
 		const theme = (await getThemeByName("dark"))!;
-		const file = `${os.homedir()}/private/file`;
-		for (const [key, recent, args, expected] of [
-			["file_path", false, file, "~/private/file"],
-			["path", true, file, "~/private/file"],
-			["command", false, `cat <${file}`, "cat <~/private/file"],
-			["task", false, `Inspect ${file}`, "Inspect ~/private/file"],
-			["prompt", false, `Explain ${file}`, "Explain ~/private/file"],
-			["pattern", false, file, file],
+		const columns = 180;
+		for (const [home, literalPrefix] of [
+			["/home/preview", "/home/preview/private/file"],
+			["/home/preview/isolated/qualification-home", "/home/preview/isolated/"],
 		] as const) {
-			const progress = runningProgress(
-				recent
-					? { recentTools: [{ tool: "read", args, argsKey: key, endMs: 1 }] }
-					: { currentTool: "read", currentToolArgs: args, currentToolArgsKey: key },
-			);
-			const text = Bun.stripANSI(
-				taskToolRenderer
-					.renderResult(
-						{ content: [], details: detailsFor(progress) },
-						{ expanded: false, isPartial: true },
-						theme,
-					)
-					.render(180)
-					.join("\n"),
-			);
-			expect(text).toContain(expected);
-			if (key !== "pattern") expect(text).not.toContain(os.homedir());
+			const homedir = vi.spyOn(os, "homedir").mockReturnValue(home);
+			try {
+				const file = `${home}/private/file`;
+				for (const [key, args, expected] of [
+					["file_path", file, "~/private/file"],
+					["path", file, "~/private/file"],
+					["command", `cat <${file}`, "cat <~/private/file"],
+					["task", `Inspect ${file}`, "Inspect ~/private/file"],
+					["prompt", `Explain ${file}`, "Explain ~/private/file"],
+					["pattern", file, literalPrefix],
+				] as const) {
+					for (const recent of [false, true]) {
+						const progress = runningProgress(
+							recent
+								? { recentTools: [{ tool: "read", args, argsKey: key, endMs: 1 }] }
+								: { currentTool: "read", currentToolArgs: args, currentToolArgsKey: key },
+						);
+						const text = Bun.stripANSI(
+							taskToolRenderer
+								.renderResult(
+									{ content: [], details: detailsFor(progress) },
+									{ expanded: false, isPartial: true },
+									theme,
+								)
+								.render(columns)
+								.join("\n"),
+						);
+						expect(text).toContain(`read: ${expected}`);
+						if (key === "pattern") expect(text).not.toContain("~/private/file");
+						else expect(text).not.toContain(home);
+						for (const line of text.split("\n")) {
+							expect(visibleWidth(line)).toBeLessThanOrEqual(columns);
+						}
+					}
+				}
+			} finally {
+				homedir.mockRestore();
+			}
 		}
 	});
 

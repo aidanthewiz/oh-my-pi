@@ -68,8 +68,10 @@ async fn transitive_overlap_preserves_the_third_authored_change() {
 	assert_session_result(
 		BEFORE,
 		&input,
-		"alpha_header\nkeep_one\nblock_start\nmiddle_new\nanchor_inside\nkeep_three\nblock_end\\
-		 nfile_tail\n",
+		concat!(
+			"alpha_header\nkeep_one\nblock_start\nmiddle_new\n",
+			"anchor_inside\nkeep_three\nblock_end\nfile_tail\n",
+		),
 	)
 	.await;
 }
@@ -104,8 +106,10 @@ async fn transitive_overlap_defers_every_span_of_one_operation() {
 	assert_session_result(
 		BEFORE,
 		input,
-		"alpha_header\nkeep_one\nblock_start\nmiddle_new\nobsolete_row\nanchor_inside\nkeep_three\\
-		 nblock_end\nkeep_two_tail\nfile_tail\n",
+		concat!(
+			"alpha_header\nkeep_one\nblock_start\nmiddle_new\nobsolete_row\n",
+			"anchor_inside\nkeep_three\nblock_end\nkeep_two_tail\nfile_tail\n",
+		),
 	)
 	.await;
 }
@@ -122,8 +126,10 @@ async fn transitive_overlap_preserves_a_deleted_block_reemitted_by_the_last_oper
 	assert_session_result(
 		&before,
 		&input,
-		"alpha_header\nkeep_one\nblock_start\nmiddle_new\nanchor_inside\nkeep_three\nblock_end\\
-		 nmove_me\nfile_tail\n",
+		concat!(
+			"alpha_header\nkeep_one\nblock_start\nmiddle_new\n",
+			"anchor_inside\nkeep_three\nblock_end\nmove_me\nfile_tail\n",
+		),
 	)
 	.await;
 }

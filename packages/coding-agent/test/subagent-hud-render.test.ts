@@ -618,28 +618,51 @@ describe("subagent HUD lines", () => {
 			expect(out).not.toContain(os.homedir());
 		});
 
-		it("shortens a path argument by its key but keeps a literal search pattern as written", () => {
-			const homeFile = `${os.homedir()}/.ssh/config`;
-			const preview = (key: string) =>
-				render(
-					[
-						makeSession({
-							id: "Reader",
-							progress: makeProgress({
-								id: "Reader",
-								currentTool: "grep",
-								currentToolArgs: homeFile,
-								currentToolArgsKey: key,
-							}),
-						}),
-					],
-					200,
-					true,
-				);
-			expect(preview("path")).toContain("~/.ssh/config");
-			expect(preview("path")).not.toContain(os.homedir());
-			// A search pattern that names a home path must still show what was searched.
-			expect(preview("pattern")).toContain(homeFile);
+		it("shortens current and recent path arguments without rewriting search patterns", () => {
+			const columns = 200;
+			for (const [home, literalPrefix] of [
+				["/home/preview", "/home/preview/.ssh/config"],
+				["/home/preview/isolated/qualification-home", "/home/preview/isolated/"],
+			] as const) {
+				const homedir = vi.spyOn(os, "homedir").mockReturnValue(home);
+				try {
+					const homeFile = `${home}/.ssh/config`;
+					for (const [key, args, expected] of [
+						["file_path", homeFile, "~/.ssh/config"],
+						["path", homeFile, "~/.ssh/config"],
+						["command", `cat <${homeFile}`, "cat <~/.ssh/config"],
+						["task", `Inspect ${homeFile}`, "Inspect ~/.ssh/config"],
+						["prompt", `Explain ${homeFile}`, "Explain ~/.ssh/config"],
+						["pattern", homeFile, literalPrefix],
+					] as const) {
+						for (const recent of [false, true]) {
+							const out = render(
+								[
+									makeSession({
+										id: "Reader",
+										progress: makeProgress({
+											id: "Reader",
+											...(recent
+												? { recentTools: [{ tool: "grep", args, argsKey: key, endMs: 1 }] }
+												: { currentTool: "grep", currentToolArgs: args, currentToolArgsKey: key }),
+										}),
+									}),
+								],
+								columns,
+								true,
+							);
+							expect(out).toContain(`grep: ${expected}`);
+							if (key === "pattern") expect(out).not.toContain("~/.ssh/config");
+							else expect(out).not.toContain(home);
+							for (const line of out.split("\n")) {
+								expect(Bun.stringWidth(line)).toBeLessThanOrEqual(columns);
+							}
+						}
+					}
+				} finally {
+					homedir.mockRestore();
+				}
+			}
 		});
 
 		it("marks the last completed call with how it ended while idle between calls", () => {
