@@ -177,24 +177,31 @@ fn too_new_protocol_option_on_a_local_copy() {
 	);
 }
 
-	#[test]
-	fn deletion_messages_convert_receiver_names_before_display() {
-		let dir = tempfile::tempdir().unwrap();
-		fs::create_dir(dir.path().join("src")).unwrap();
-		fs::create_dir(dir.path().join("dst")).unwrap();
-		fs::write(dir.path().join("dst/café"), b"dry-run sentinel").unwrap();
-		fs::create_dir(dir.path().join("dst/diré")).unwrap();
-		let (code, out, err) = run(
-			&["-rni", "--delete", "--iconv=UTF-8,ISO-8859-1", "src/", "dst/"],
-			dir.path(),
-		);
-		assert_eq!(code, 0, "{err}");
-		let mut lines: Vec<_> = out.lines().collect();
-		lines.sort_unstable();
-		assert_eq!(lines, ["*deleting   cafÃ©", "*deleting   dirÃ©/"]);
-		assert_eq!(fs::read(dir.path().join("dst/café")).unwrap(), b"dry-run sentinel");
-		assert!(dir.path().join("dst/diré").is_dir());
-	}
+#[cfg(unix)]
+#[test]
+fn deletion_messages_convert_receiver_names_before_display() {
+	use clap::Parser;
+
+	let dir = tempfile::tempdir().unwrap();
+	fs::create_dir(dir.path().join("src")).unwrap();
+	fs::create_dir(dir.path().join("dst")).unwrap();
+	fs::write(dir.path().join("dst/café"), b"dry-run sentinel").unwrap();
+	fs::create_dir(dir.path().join("dst/diré")).unwrap();
+	let (mut host, capture) = Host::for_test_owning("rsync", Vec::new(), dir.path());
+	host.set_test_var("LC_ALL", "C.UTF-8");
+	let parsed = Rsync::try_parse_from([
+		"rsync", "--", "-rni", "--delete", "--iconv=UTF-8,ISO-8859-1", "src/", "dst/",
+	])
+	.unwrap();
+	let code = crate::host::run_caught::<Rsync>(parsed, &mut host);
+	assert_eq!(code, 0, "{}", capture.err());
+	let out = capture.out();
+	let mut lines: Vec<_> = out.lines().collect();
+	lines.sort_unstable();
+	assert_eq!(lines, ["*deleting   cafÃ©", "*deleting   dirÃ©/"]);
+	assert_eq!(fs::read(dir.path().join("dst/café")).unwrap(), b"dry-run sentinel");
+	assert!(dir.path().join("dst/diré").is_dir());
+}
 
 /// Captured from rsync 3.5.1 (a build without preallocation): `rsync --preallocate f h`.
 #[test]
