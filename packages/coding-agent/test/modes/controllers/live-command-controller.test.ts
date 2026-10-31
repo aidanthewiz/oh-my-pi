@@ -1,4 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
+import { Agent } from "@oh-my-pi/pi-agent-core";
+import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
+import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import type { ExtensionLiveStartOptions } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { LiveSessionController, type LiveSessionControllerOptions } from "@oh-my-pi/pi-coding-agent/live/controller";
@@ -8,6 +11,32 @@ import type { LiveTransportOptions } from "@oh-my-pi/pi-coding-agent/live/transp
 import { LiveVisualizer } from "@oh-my-pi/pi-tui/apps/live-visualizer";
 import { LiveCommandController } from "@oh-my-pi/pi-coding-agent/modes/controllers/live-command-controller";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
+import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+
+const ownedSessions: { session: AgentSession; auth: AuthStorage }[] = [];
+
+async function createAgentSession(): Promise<AgentSession> {
+	const auth = await AuthStorage.create(":memory:");
+	const mock = createMockModel({ handler: () => ({ content: ["unexpected paid turn"] }) });
+	const session = new AgentSession({
+		agent: new Agent({
+			initialState: { model: mock.model, systemPrompt: ["Test"], tools: [] },
+			streamFn: mock.stream,
+			getApiKey: () => "test-key",
+		}),
+		sessionManager: SessionManager.inMemory(),
+		settings: Settings.isolated({
+			"live.voice": "vale",
+			"compaction.enabled": false,
+			"todo.enabled": false,
+		}),
+		modelRegistry: new ModelRegistry(auth, undefined, { ignoreLocalModelConfig: true }),
+	});
+	ownedSessions.push({ session, auth });
+	return session;
+}
 
 /** Fake InteractiveModeContext plus typed capture channels for focus/mount traffic. */
 interface ContextHarness {
@@ -22,7 +51,7 @@ interface ContextHarness {
 	editorRefocused: Promise<void>;
 }
 
-function createContext(): ContextHarness {
+async function createContext(): Promise<ContextHarness> {
 	const editor = {
 		getUseTerminalCursor: vi.fn(() => true),
 		setUseTerminalCursor: vi.fn(),
@@ -30,10 +59,12 @@ function createContext(): ContextHarness {
 	const focused: unknown[] = [];
 	const mounted: unknown[] = [];
 	const refocused = Promise.withResolvers<void>();
+	const session = await createAgentSession();
 	const ctx = {
-		settings: Settings.isolated({ "live.voice": "vale" }),
+		settings: session.settings,
 		keybindings: { getKeys: vi.fn(() => ["ctrl+l"]) },
-		session: {},
+		session,
+		viewSession: session,
 		extractAssistantText: vi.fn(() => ""),
 		editor,
 		editorContainer: {
@@ -59,13 +90,17 @@ function createContext(): ContextHarness {
 	return { ctx, editor, focused, mounted, editorRefocused: refocused.promise };
 }
 
-afterEach(() => {
+afterEach(async () => {
 	vi.restoreAllMocks();
+	for (const { session, auth } of ownedSessions.splice(0)) {
+		await session.dispose();
+		await auth.close();
+	}
 });
 
 describe("LiveCommandController", () => {
 	it("forwards the selected voice across the live-session boundary", async () => {
-		const { ctx } = createContext();
+		const { ctx } = await createContext();
 		let receivedVoice: string | undefined;
 		const controller = new LiveCommandController(ctx, options => {
 			receivedVoice = options.voice;
@@ -84,7 +119,7 @@ describe("LiveCommandController", () => {
 	});
 
 	it("stops the session and restores the editor when the live-toggle chord hits the focused visualizer", async () => {
-		const { ctx, editor, focused, mounted, editorRefocused } = createContext();
+		const { ctx, editor, focused, mounted, editorRefocused } = await createContext();
 		const stop = vi.fn(async () => {});
 		const controller = new LiveCommandController(ctx, options => {
 			const session = new LiveSessionController(options);
@@ -115,7 +150,7 @@ describe("LiveCommandController", () => {
 	});
 
 	it("gives an extension session its SDP answer, its events, and one end when `/live` stops it", async () => {
-		const { ctx } = createContext();
+		const { ctx } = await createContext();
 		let receivedOffer: string | undefined;
 		const controller = new LiveCommandController(ctx, options => {
 			receivedOffer = options.sdpOffer;
@@ -162,7 +197,7 @@ describe("LiveCommandController", () => {
 	});
 
 	it("lets exactly one of two starts queued behind a closing session win", async () => {
-		const { ctx } = createContext();
+		const { ctx } = await createContext();
 		const cleanup = Promise.withResolvers<void>();
 		const created: { session: LiveSessionController; options: LiveSessionControllerOptions }[] = [];
 		const controller = new LiveCommandController(ctx, options => {
@@ -190,10 +225,11 @@ describe("LiveCommandController", () => {
 		});
 		expect(created).toHaveLength(2);
 		expect(controller.active).toBe(true);
+		await controller.stop();
 	});
 
 	it("rejects an extension start without an SDP offer before creating a session", async () => {
-		const { ctx, mounted } = createContext();
+		const { ctx, mounted } = await createContext();
 		const factory = vi.fn((options: LiveSessionControllerOptions) => new LiveSessionController(options));
 		const controller = new LiveCommandController(ctx, factory);
 		const untyped = { sdpOffer: undefined } as unknown as ExtensionLiveStartOptions;
@@ -206,7 +242,7 @@ describe("LiveCommandController", () => {
 	});
 
 	it("surfaces a session factory failure from `/live` and puts the editor back", async () => {
-		const { ctx, editor, mounted } = createContext();
+		const { ctx, editor, mounted } = await createContext();
 		const controller = new LiveCommandController(ctx, () => {
 			throw new Error("factory broke");
 		});
@@ -217,11 +253,11 @@ describe("LiveCommandController", () => {
 });
 
 describe("LiveSessionController with a caller-owned peer", () => {
-	it("mutes by phase only and reports no levels", () => {
+	it("mutes by phase only and reports no levels", async () => {
 		const phases: string[] = [];
 		const levels: number[][] = [];
 		const session = new LiveSessionController({
-			session: {} as unknown as LiveSessionControllerOptions["session"],
+			session: await createAgentSession(),
 			extractAssistantText: () => "",
 			sdpOffer: "v=0 offer",
 			callbacks: {
@@ -235,6 +271,7 @@ describe("LiveSessionController with a caller-owned peer", () => {
 		expect(phases.at(-1)).toBe("muted");
 		expect(session.muted).toBe(true);
 		expect(levels).toEqual([]);
+		await session.stop();
 	});
 
 	it("keeps a muted call muted when the server starts the session or delegates work", async () => {
@@ -256,14 +293,10 @@ describe("LiveSessionController with a caller-owned peer", () => {
 		});
 		const delegated: string[] = [];
 		const phases: string[] = [];
-		const agentSession = {
-			modelRegistry: { authStorage: {} },
-			sessionId: "s1",
-			subscribe: () => () => {},
-			sendCustomMessage: async (message: { content: string }) => {
-				delegated.push(message.content);
-			},
-		} as unknown as LiveSessionControllerOptions["session"];
+		const agentSession = await createAgentSession();
+		vi.spyOn(agentSession, "sendCustomMessage").mockImplementation(async message => {
+			delegated.push(String(message.content));
+		});
 		const session = new LiveSessionController({
 			session: agentSession,
 			extractAssistantText: () => "",

@@ -208,7 +208,7 @@ describe("AgentSession.restoreInterruptedTurn (omp --restore)", () => {
 		expect(last?.role === "assistant" && last.content).toContainEqual({ type: "text", text: "done after restore" });
 	});
 
-	it("retries a failed tool turn through its passive stop result and trailing eval snapshot", async () => {
+	it("retries a failed model turn without replaying tools or erasing its passive diagnostic and eval snapshot", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("Expected bundled Anthropic test model to exist");
 		const executed: string[] = [];
@@ -239,13 +239,22 @@ describe("AgentSession.restoreInterruptedTurn (omp --restore)", () => {
 		);
 		session.sessionManager.appendCustomMessageEntry("eval-state-context", "Retained eval state", false);
 		session.agent.replaceMessages(session.buildDisplaySessionContext().messages);
+		const retained = session.agent.state.messages.filter(message => message.role !== "assistant");
+		const transcriptBefore = session.sessionManager.buildSessionContext({ transcript: true }).messages;
 
 		expect(session.hasAbortedToolCallTail).toBe(true);
 		await expect(session.retry()).resolves.toBe(true);
 		await session.waitForIdle();
 
-		expect(executed).toEqual(["again"]);
+		expect(executed).toEqual([]);
+		expect(session.agent.state.messages.filter(message => message.role !== "assistant")).toEqual(retained);
+		expect(session.sessionManager.buildSessionContext({ transcript: true }).messages.slice(0, -1)).toEqual(
+			transcriptBefore,
+		);
 		expect(mock.calls.length).toBe(1);
+		expect(mock.calls[0].context.messages.filter(message => message.role === "toolResult")).toEqual(
+			retained.filter(message => message.role === "toolResult"),
+		);
 		const last = session.agent.state.messages.at(-1);
 		expect(last?.role === "assistant" && last.content).toContainEqual({ type: "text", text: "done after retry" });
 	});

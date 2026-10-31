@@ -120,7 +120,7 @@ export function approvalTargetKey(cwd: string, target: string): string | undefin
 export async function approvalTargetIdentities(
 	cwd: string,
 	targets: readonly string[],
-	context?: Parameters<InternalUrlRouter["locateSync"]>[1],
+	context?: Parameters<InternalUrlRouter["target"]>[1],
 ): Promise<readonly ToolApprovalCacheIdentity[]> {
 	const identities = new Map<string, string>();
 	const router = InternalUrlRouter.instance();
@@ -151,9 +151,9 @@ export async function approvalTargetIdentities(
 		const subject = treeFolder ?? target;
 		const normalized = router.normalize(subject);
 		if (router.canResolve(normalized)) {
-			const destination = router.locateSync(normalized, context);
-			if (destination === undefined) throw new Error(`Cannot bind approval destination: ${normalized}`);
-			identities.set(target, JSON.stringify({ url: normalized, destination: await fileIdentity(destination) }));
+			const destination = await router.target(normalized, context);
+			if (destination?.kind !== "file") throw new Error(`Cannot bind approval destination: ${normalized}`);
+			identities.set(target, JSON.stringify({ url: normalized, destination: await fileIdentity(destination.path) }));
 			continue;
 		}
 		if (isReadableUrlPath(subject)) {

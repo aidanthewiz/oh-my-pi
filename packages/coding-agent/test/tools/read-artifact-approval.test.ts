@@ -8,7 +8,7 @@ import { registerArtifactsDir } from "@oh-my-pi/pi-coding-agent/internal-urls/re
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { captureApprovalTargets, resolveApproval } from "@oh-my-pi/pi-coding-agent/tools/approval";
+import { captureApprovalTargets, recordApprovalGrant, resolveApproval } from "@oh-my-pi/pi-coding-agent/tools/approval";
 import { approvalGrantKey, SessionApprovals } from "@oh-my-pi/pi-coding-agent/tools/approval-cache";
 import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
 
@@ -103,12 +103,42 @@ describe("artifact reads through session approval", () => {
 			};
 			const captured = await captureApprovalTargets(read, { path: "artifact://54:raw:4-4" }, root);
 			expect(await approve("artifact://54:raw:4-4")).toBe("prompt");
-			for (const { target, identity } of captured.identities) {
-				grants.record(approvalGrantKey("read", target, identity));
-			}
+			recordApprovalGrant(
+				read,
+				{ path: "artifact://54:raw:4-4" },
+				grants,
+				"read",
+				{ grant: "target", always: false },
+				captured,
+			);
 			expect(await approve("artifact://54:raw:4-4")).toBe("allow");
 			expect(await approve("artifact://54:5-10")).toBe("allow");
 			expect(await approve("artifact://55:raw:4-4")).toBe("prompt");
+		} finally {
+			unregister();
+		}
+	});
+
+	it("binds an oversized artifact grant without materializing it and rejects a replacement file", async () => {
+		const artifact = path.join(root, "56.mcp.log");
+		await Bun.write(artifact, "large artifact\n");
+		await fs.truncate(artifact, 16 * 1024 * 1024);
+		const unregister = registerArtifactsDir(root);
+		try {
+			const read = readTool();
+			const args = { path: "artifact://56:raw:1-1" };
+			const grants = new SessionApprovals();
+			const captured = await captureApprovalTargets(read, args, root);
+			expect(captured.failed).toBe(false);
+			recordApprovalGrant(read, args, grants, "read", { grant: "target", always: false }, captured);
+			expect(resolveApproval(read, args, "always-ask-cached", {}, grants, undefined, captured).policy).toBe("allow");
+
+			const replacement = path.join(root, "replacement.log");
+			await Bun.write(replacement, "replacement content");
+			await fs.rename(replacement, artifact);
+			const rebound = await captureApprovalTargets(read, args, root);
+			expect(rebound.failed).toBe(false);
+			expect(resolveApproval(read, args, "always-ask-cached", {}, grants, undefined, rebound).policy).toBe("prompt");
 		} finally {
 			unregister();
 		}

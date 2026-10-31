@@ -86,15 +86,18 @@ const turns: MockResponse[] =
 			]
 		: [];
 let slowTurnPending = Bun.env.GOAL_RPC_SCRIPT === "slow";
+const slowSessionId = session.sessionManager.getSessionId();
 const mock = createMockModel({
 	handler: async (_context, options) => {
-		if (!slowTurnPending) return turns.shift() ?? { content: ["Nothing left to do."] };
+		if (!slowTurnPending || session.sessionManager.getSessionId() !== slowSessionId)
+			return turns.shift() ?? { content: ["Nothing left to do."] };
 		slowTurnPending = false;
 		const signal = options?.signal;
 		const stalled = Promise.withResolvers<void>();
 		void slowTurnRelease.promise.then(stalled.resolve);
 		if (signal?.aborted) stalled.resolve();
 		else signal?.addEventListener("abort", () => stalled.resolve(), { once: true });
+		session.emitNotice("info", "slow model request entered", "goal-rpc-agent");
 		await stalled.promise;
 		// An aborted stall ends through the mock's delay path, which reports a delay under an aborted signal as an aborted request.
 		return {

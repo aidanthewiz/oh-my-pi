@@ -384,10 +384,6 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 							continue;
 						}
 						const client = await getOrCreateClient(serverConfig, serverCwd, undefined, signal);
-						if (isProjectAwareLspServer(serverConfig)) {
-							await waitForProjectLoaded(client, signal);
-							throwIfAborted(signal);
-						}
 						await reconcileOpenFilesFromDisk(client, signal, uri);
 						const minVersion = client.diagnosticsVersion;
 						// Set when clangd was asked to rebuild: its report is final only once its

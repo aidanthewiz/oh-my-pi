@@ -21,6 +21,7 @@ const OPAQUE_URI_RE = /^([a-z][a-z0-9+.-]*):(.+)$/is;
 const SELECTOR_CHUNK_SRC = String.raw`(?:raw|conflicts|-?\d+(?:[-+]\d+)?(?:,\d+(?:[-+]\d+)?)*)`;
 // A `;` after the chain means a path list (`Dockerfile:198-220;a.yml:1-60`), not an opaque URI.
 const SELECTOR_CHAIN_RE = new RegExp(`^${SELECTOR_CHUNK_SRC}(?::${SELECTOR_CHUNK_SRC})*(?:;|$)`, "i");
+const WHOLE_SELECTOR_CHAIN_RE = new RegExp(`^${SELECTOR_CHUNK_SRC}(?::${SELECTOR_CHUNK_SRC})*$`, "i");
 
 /**
  * Extract the lowercased scheme from a URI-shaped input, or `undefined` when
@@ -32,8 +33,10 @@ const SELECTOR_CHAIN_RE = new RegExp(`^${SELECTOR_CHUNK_SRC}(?::${SELECTOR_CHUNK
  * - Windows drive paths (`C:\…`, `C:/…`, `C:foo`) — single-letter scheme.
  * - Filenames with extensions (`foo.ts:50`) — dot in the scheme segment.
  * - Read-tool selector tails (`Makefile:12`, `README:raw:1-20`).
+ * `allowSelectorList` defaults to true. Disable it when semicolons may belong
+ * to one opaque URI rather than introducing a path list.
  */
-export function extractUriScheme(input: string): string | undefined {
+export function extractUriScheme(input: string, options: { allowSelectorList?: boolean } = {}): string | undefined {
 	const hierarchical = input.match(SCHEME_HOST_RE);
 	if (hierarchical) return hierarchical[1].toLowerCase();
 	const opaque = input.match(OPAQUE_URI_RE);
@@ -41,7 +44,7 @@ export function extractUriScheme(input: string): string | undefined {
 	const [, scheme, rest] = opaque;
 	if (scheme.length === 1) return undefined;
 	if (scheme.includes(".")) return undefined;
-	if (SELECTOR_CHAIN_RE.test(rest)) return undefined;
+	if ((options.allowSelectorList === false ? WHOLE_SELECTOR_CHAIN_RE : SELECTOR_CHAIN_RE).test(rest)) return undefined;
 	return scheme.toLowerCase();
 }
 

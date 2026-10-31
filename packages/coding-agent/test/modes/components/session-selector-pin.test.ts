@@ -104,6 +104,53 @@ describe("SessionSelectorComponent pin actions", () => {
 		expect(order(selector)).toEqual(["oldest", "newest", "middle"]);
 	});
 
+	it("keeps a pinned body match ahead of exact and partial title matches", () => {
+		const exact = { ...newest, title: "needle" };
+		const partial = { ...middle, title: "needle notes" };
+		const body = { ...oldest, title: "archive", allMessagesText: "needle in an older conversation" };
+		const selector = new SessionSelectorComponent(
+			[exact, partial, body],
+			() => {},
+			() => {},
+			() => {},
+			{ pinnedIds: new Set([body.id]) },
+		);
+		for (const ch of "needle") selector.handleInput(ch);
+
+		expect(selector.getSessionList().pickerView().order).toEqual([body.path, exact.path, partial.path]);
+		expect(selector.getSessionList().selectedSession?.id).toBe(body.id);
+		selector.dispose();
+	});
+
+	it("pins and unpins a search result without losing the selected session", async () => {
+		const persistPin = vi.fn(async () => {});
+		const selector = picker(persistPin);
+		const list = selector.getSessionList();
+		for (const ch of "shared") selector.handleInput(ch);
+		selector.handleInput(DOWN);
+		selector.handleInput(DOWN);
+
+		selector.handleInput(ALT_K);
+		await persistPin.mock.results[0]!.value;
+		expect(order(selector)).toEqual(["oldest", "newest", "middle"]);
+		expect(list.selectedSession?.id).toBe("oldest");
+
+		selector.handleInput(ALT_SHIFT_K);
+		await persistPin.mock.results[1]!.value;
+		expect(order(selector)).toEqual(["newest", "middle", "oldest"]);
+		expect(list.selectedSession?.id).toBe("oldest");
+		selector.dispose();
+	});
+
+	it("does not include a pinned session that does not match the search", () => {
+		const selector = picker(async () => {}, new Set(["oldest"]));
+		for (const ch of "newest") selector.handleInput(ch);
+
+		expect(order(selector)).toEqual(["newest"]);
+		expect(selector.getSessionList().selectedSession?.id).toBe("newest");
+		selector.dispose();
+	});
+
 	it("leaves the order alone and shows the error when persisting the pin fails", async () => {
 		const selector = picker(async () => {
 			throw new Error("pins file locked");

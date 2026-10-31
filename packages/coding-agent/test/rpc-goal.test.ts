@@ -320,14 +320,17 @@ describe("RPC goal command", () => {
 
 	test("an extension session change aborts the detached run's prompt; the command's own result is unaffected", async () => {
 		const rpc = await start({ continuation: false, script: "slow" });
+		const originalSessionId = (await rpc.getState()).sessionId;
 		const { results, statusOf, unsubscribe } = watchPromptResults(rpc);
 		const started = Promise.withResolvers<void>();
-		const unsubscribeEvents = rpc.onEvent(event => {
-			if (event.type === "agent_start") started.resolve();
+		let agentStarts = 0;
+		const unsubscribeEvents = rpc.onSessionEvent(event => {
+			if (event.type === "agent_start") agentStarts++;
+			if (event.type === "notice" && event.source === "goal-rpc-agent") started.resolve();
 		});
 		try {
 			const first = await rpc.prompt("first, stalls");
-			await withTimeout(started.promise, 10_000, "First run never started");
+			await withTimeout(started.promise, 10_000, "First model request never started");
 			// The command then starts a run of its own in the new session.
 			await rpc.promptAndWait("/goaltest-new-session hello from the new session");
 			// The detached run never yields; its prompt must still be closed, as aborted.
@@ -336,11 +339,25 @@ describe("RPC goal command", () => {
 			);
 			const state = await rpc.getState();
 			expect(state.isSettled).toBe(true);
+			expect(state.sessionId).not.toBe(originalSessionId);
+			expect(agentStarts).toBe(2);
+			const messages = await rpc.getMessages();
+			expect(messages.filter(message => message.role === "user")).toEqual([
+				expect.objectContaining({ content: [{ type: "text", text: "hello from the new session" }] }),
+			]);
+			expect(messages).toContainEqual(
+				expect.objectContaining({
+					role: "assistant",
+					stopReason: "stop",
+					content: [{ type: "text", text: "Nothing left to do." }],
+				}),
+			);
 		} finally {
 			unsubscribe();
 			unsubscribeEvents();
 		}
 		expect([...results.values()].filter(status => status !== "aborted")).toEqual(["completed"]);
+		expect(results.size).toBe(2);
 	}, 30_000);
 
 	test("an extension navigation during a live run leaves that run's prompt to complete normally", async () => {

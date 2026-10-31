@@ -718,6 +718,13 @@ function isExclusionPart(part: string): boolean {
 	return part.length > 1 && part.startsWith("!") && !part.includes("://");
 }
 
+function isOpaquePathListUri(entry: string, parts: readonly string[]): boolean {
+	return (
+		extractUriScheme(entry, { allowSelectorList: false }) !== undefined &&
+		!parts.every(part => splitPathAndSel(normalizePathLikeInput(part)).sel !== undefined)
+	);
+}
+
 export async function splitDelimitedPathEntry(
 	entry: string,
 	cwd: string,
@@ -738,7 +745,8 @@ export async function splitDelimitedPathEntry(
 	const isBoundary = (part: string) => isUrl(part) || (options.exclusionParts === true && isExclusionPart(part));
 	const urlParts = await splitMixedUrlPathList(normalizedEntry, cwd, isBoundary, options.queryOwner);
 	if (urlParts || isInternalUrlPath(normalizedEntry)) return urlParts;
-	const opaqueUrl = isUrl(normalizedEntry);
+	const semicolonParts = await splitTopLevelDelimitedPath(normalizedEntry, "semicolon", isUrl, options.queryOwner);
+	const opaqueUrl = isUrl(normalizedEntry) || isOpaquePathListUri(normalizedEntry, semicolonParts);
 	// A real POSIX file may contain a delimiter and a selector-shaped tail
 	// (`a;b:1-2`, `a b:1-2`). Preserve the raw entry whenever the full literal
 	// resolves — or is only ambiguous — so downstream literal-preferring
@@ -817,8 +825,13 @@ export async function splitMixedUrlPathList(
 	const normalizedEntry = normalizePathLikeInput(entry);
 	if (!normalizedEntry.includes(";")) return null;
 	const rawParts = await splitTopLevelDelimitedPath(normalizedEntry, "semicolon", isUrl, queryOwner);
-	if (rawParts.length < 2 || (!isUrl(normalizedEntry) && !rawParts.some(part => isUrl(normalizePathLikeInput(part)))))
+	const opaqueUri = isOpaquePathListUri(normalizedEntry, rawParts);
+	if (
+		rawParts.length < 2 ||
+		(!opaqueUri && !isUrl(normalizedEntry) && !rawParts.some(part => isUrl(normalizePathLikeInput(part))))
+	) {
 		return null;
+	}
 	if (!isInternalUrlPath(normalizedEntry)) {
 		if ((await probeLiteralPathExists(normalizedEntry, cwd)) !== "missing") return null;
 		const selectorSplit = splitPathAndSel(normalizedEntry);
@@ -832,7 +845,9 @@ export async function splitMixedUrlPathList(
 	let pendingLiteral: { path: string; end: number } | null = null;
 	while (index < rawParts.length) {
 		const part = normalizePathLikeInput(rawParts[index]);
-		if (isUrl(part)) {
+		const opaquePrefix =
+			index === 0 && opaqueUri && !isUrl(part) && !(await findLiteralPathListPart(rawParts, index, cwd, isUrl));
+		if (isUrl(part) || opaquePrefix) {
 			hasResolvedTarget = true;
 			let end = index + 1;
 			while (end < rawParts.length) {

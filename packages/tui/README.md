@@ -776,6 +776,14 @@ Run it:
 npx tsx test/chat-simple.ts
 ```
 
+Run the interactive image demo with a local PNG:
+
+```bash
+bun examples/image-demo.ts /path/to/image.png
+```
+
+Press Ctrl+C to stop the demo. Automated tests do not start this interactive program.
+
 ## Development
 
 ```bash

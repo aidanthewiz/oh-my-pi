@@ -1,15 +1,12 @@
-import * as fs from "node:fs/promises";
-import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
-import { Shell } from "@oh-my-pi/pi-natives";
+import { Shell, ShellFsOp, type ShellFilesystem } from "@oh-my-pi/pi-natives";
 import type { ReadToolDetails } from "@oh-my-pi/pi-tui/tools/read";
 import { DEFAULT_MAX_LINES, truncateHead, truncateMiddle, truncateTail } from "@oh-my-pi/pi-tui/tools/streaming-output";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import {
 	filterChildShellEnv,
 	IMAGE_METADATA_HEADER_BYTES,
-	isEnoent,
 	parseHeifImageMimeType,
 	parseImageMetadata,
 	sanitizeText,
@@ -59,15 +56,66 @@ const PAGE_FULL_ABORT_DELAY_MS = 50;
 const JSON_QUERY_ERROR_LINE_MAX_BYTES = 512;
 /** Bounds the jq stderr quoted in a result; the tail keeps the error after any `debug` lines. */
 const JSON_QUERY_ERROR_MAX_BYTES = 8 * 1024;
+const JSON_QUERY_ERROR_DECODE_BYTES = 4096;
 /** jaq's default pretty-print indent. */
 const PRETTY_INDENT = "  ";
 
-function boundJqStderr(stderr: string): string {
-	const lines = stderr
-		.trim()
-		.split("\n")
-		.map(line => truncateMiddle(line, { maxBytes: JSON_QUERY_ERROR_LINE_MAX_BYTES }).content);
-	return truncateTail(lines.join("\n"), { maxBytes: JSON_QUERY_ERROR_MAX_BYTES }).content;
+/** Bound each diagnostic line before retaining the most recent diagnostics. */
+function captureJqStderr(): { filesystem: ShellFilesystem; finish: () => string } {
+	const decoder = new TextDecoder();
+	const halfLine = JSON_QUERY_ERROR_LINE_MAX_BYTES / 2;
+	let head = "";
+	let tail = "";
+	let lineLength = 0;
+	let retained = "";
+	const endLine = () => {
+		const line = lineLength > head.length + tail.length ? `${head}[…elided…]${tail}` : head + tail;
+		const bounded = truncateMiddle(sanitizeText(line), { maxBytes: JSON_QUERY_ERROR_LINE_MAX_BYTES }).content;
+		retained = truncateTail(`${retained}${bounded}\n`, { maxBytes: JSON_QUERY_ERROR_MAX_BYTES }).content;
+		head = "";
+		tail = "";
+		lineLength = 0;
+	};
+	const append = (text: string) => {
+		let start = 0;
+		while (start < text.length) {
+			const newline = text.indexOf("\n", start);
+			const end = newline === -1 ? text.length : newline;
+			const headEnd = Math.min(end, start + halfLine - head.length);
+			head += text.slice(start, headEnd);
+			lineLength += end - start;
+			if (end - headEnd >= halfLine) tail = text.slice(end - halfLine, end);
+			else tail = (tail + text.slice(headEnd, end)).slice(-halfLine);
+			if (newline === -1) break;
+			endLine();
+			start = newline + 1;
+		}
+	};
+	return {
+		filesystem: {
+			nativeLocalPaths: true,
+			handler: async (error, request) => {
+				if (error) return { error: { code: "EIO", message: error.message } };
+				if (request.op === ShellFsOp.Open && request.path === "jq-stderr://capture") return { handle: 1 };
+				if (request.handle === 1) {
+					if (request.op === ShellFsOp.Write && request.data) {
+						for (let offset = 0; offset < request.data.length; offset += JSON_QUERY_ERROR_DECODE_BYTES) {
+							const bytes = request.data.subarray(offset, offset + JSON_QUERY_ERROR_DECODE_BYTES);
+							append(decoder.decode(bytes, { stream: true }));
+						}
+						return { written: request.data.length };
+					}
+					if (request.op === ShellFsOp.Flush || request.op === ShellFsOp.Close) return {};
+				}
+				return { error: { code: "EBADF", message: "Invalid JSON diagnostic capture operation" } };
+			},
+		},
+		finish: () => {
+			append(decoder.decode());
+			if (lineLength > 0) endLine();
+			return retained.trim();
+		},
+	};
 }
 
 /** One page of query results requested via `offset`/`limit`. */
@@ -252,28 +300,10 @@ function pageStream(values: string[], selector: JsonSelector, page: JsonPage, mo
 	return lines.join("\n");
 }
 
-async function readStderr(stderrPath: string): Promise<string> {
-	try {
-		const file = await fs.open(stderrPath, "r");
-		try {
-			const stat = await file.stat();
-			const size = Math.min(stat.size, JSON_QUERY_ERROR_MAX_BYTES);
-			const buffer = Buffer.alloc(size);
-			const { bytesRead } = await file.read(buffer, 0, size, Math.max(0, stat.size - size));
-			return buffer.toString("utf8", 0, bytesRead);
-		} finally {
-			await file.close();
-		}
-	} catch (err) {
-		if (isEnoent(err)) return "";
-		throw err;
-	}
-}
-
 /**
- * Runs the bundled jaq over `filePath` and captures stdout; stderr goes to a
- * temp file so diagnostics never mix into result values. Capture stops at
- * {@link MAX_QUERY_CAPTURE_CHARS} or after `stopAfterLines` newlines.
+ * Runs the bundled jaq over `filePath` and captures stdout. A routed stderr
+ * sink bounds diagnostics as they arrive, separately from result values.
+ * Capture stops at {@link MAX_QUERY_CAPTURE_CHARS} or after `stopAfterLines` newlines.
  *
  * Like jq, jaq reports an input that fails and goes on with the rest, exiting
  * 0 unless the last input failed; `stderr` carries those reports.
@@ -289,12 +319,11 @@ async function runJq(
 	const { signal, stopAfterLines, cwd } = options;
 	throwIfAborted(signal);
 
-	const scratchDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-jq-"));
-	const stderrPath = path.join(scratchDir, "stderr");
+	const diagnostics = captureJqStderr();
 	const env = { ...filterChildShellEnv(Bun.env, cwd), PI_DISABLE_UUTILS_BUILTINS: "0" };
 	// jaq parses any argument starting with `-` as flags even when shell-quoted;
 	// `--` keeps filters such as `-.price` positional.
-	const command = `set -o pipefail; { jq ${flags.join(" ")} -- ${quotePosixArgument(query)} ${quotePosixArgument(filePath)} 2>&1 1>&3 | tail -c ${JSON_QUERY_ERROR_MAX_BYTES} >${quotePosixArgument(stderrPath)}; } 3>&1`;
+	const command = `jq ${flags.join(" ")} -- ${quotePosixArgument(query)} ${quotePosixArgument(filePath)} 2>jq-stderr://capture`;
 
 	let output = "";
 	let lines = 0;
@@ -312,7 +341,7 @@ async function runJq(
 
 	try {
 		throwIfAborted(signal);
-		const result = await new Shell({ clearEnv: true, sessionEnv: env }).run(
+		const result = await new Shell({ clearEnv: true, sessionEnv: env, filesystem: diagnostics.filesystem }).run(
 			{ command, timeoutMs: JSON_QUERY_TIMEOUT_MS, signal: run.signal },
 			(err, chunk) => {
 				if (err) callbackError = true;
@@ -332,7 +361,7 @@ async function runJq(
 		if (result.timedOut && !stopped) {
 			throw new ToolError(`JSON query timed out after ${JSON_QUERY_TIMEOUT_MS / 1000} seconds`);
 		}
-		const stderr = boundJqStderr(sanitizeText(await readStderr(stderrPath)));
+		const stderr = diagnostics.finish();
 		if (!stopped && (result.exitCode !== 0 || callbackError)) {
 			throw new ToolError(`Failed to execute JSON query: ${stderr || `jq exited with code ${result.exitCode}`}`);
 		}
@@ -340,7 +369,6 @@ async function runJq(
 	} finally {
 		clearTimeout(abortTimer);
 		signal?.removeEventListener("abort", onAbort);
-		await fs.rm(scratchDir, { recursive: true, force: true });
 	}
 }
 

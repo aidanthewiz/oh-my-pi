@@ -208,6 +208,7 @@ async function makeHarness(
 		},
 		syncRunningSubagentBadge: () => {},
 		syncComposerShape: () => {},
+		syncExtensionLinks: () => {},
 		eventBus: new EventBus(),
 	}) as unknown as InteractiveModeContext;
 	const showError = ctx.showError.bind(ctx);

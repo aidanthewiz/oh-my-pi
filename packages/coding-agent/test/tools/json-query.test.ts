@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { Shell } from "@oh-my-pi/pi-natives";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { Settings } from "../../src/config/settings";
 import { resolveLocalUrlToPath } from "../../src/internal-urls";
@@ -89,58 +90,32 @@ describe("JSON query in read tool", () => {
 		await fs.rm(tempDir, { recursive: true, force: true }).catch(() => undefined);
 	});
 
-	it("cancels during scratch creation without waiting for the JSON query timeout", async () => {
-		const entered = Promise.withResolvers<void>();
-		const resume = Promise.withResolvers<void>();
-		const originalMkdtemp = fs.mkdtemp;
-		let scratch: string | undefined;
-		const mkdtemp = spyOn(fs, "mkdtemp").mockImplementation(
-			new Proxy(originalMkdtemp, {
-				async apply(target, receiver, args) {
-					const directory = await Reflect.apply(target, receiver, args);
-					if (String(args[0]).startsWith(path.join(os.tmpdir(), "omp-jq-"))) {
-						scratch = String(directory);
-						entered.resolve();
-						await resume.promise;
-					}
-					return directory;
-				},
-			}),
-		);
+	it("cancels after query output begins without waiting for its execution timeout", async () => {
 		const controller = new AbortController();
-		const operation = readTool
-			.execute(
-				"cancel-during-scratch",
-				{ path: `${jsonFile}?q=reduce range(0;1000000000) as $i (0; . + $i)` },
-				controller.signal,
-			)
-			.then(
-				result => result,
-				error => error,
-			);
-		let deadline: ReturnType<typeof setTimeout> | undefined;
+		const originalRun = Shell.prototype.run;
+		const run = spyOn(Shell.prototype, "run").mockImplementation(function (this: Shell, options, onChunk) {
+			return originalRun.call(this, options, (error, chunk) => {
+				onChunk?.(error, chunk);
+				if (chunk?.includes("query-started")) controller.abort();
+			});
+		});
 		try {
-			await entered.promise;
-			controller.abort();
-			resume.resolve();
-			const outcome = await Promise.race([
-				operation,
-				// Native jq uses Tokio; fake JavaScript timers cannot bound a lost abort.
-				new Promise<symbol>(resolve => {
-					deadline = setTimeout(() => resolve(Symbol("query still running")), 1_000);
-				}),
-			]);
+			const outcome = await readTool
+				.execute(
+					"cancel-query",
+					{ path: `${jsonFile}?q="query-started", (reduce range(0;1000000000) as $i (0; . + $i))` },
+					controller.signal,
+				)
+				.then(
+					result => result,
+					error => error,
+				);
 			expect(outcome).toBeInstanceOf(ToolAbortError);
-			expect(outcome.name).toBe("ToolAbortError");
-			await expect(fs.access(scratch!)).rejects.toMatchObject({ code: "ENOENT" });
 		} finally {
-			clearTimeout(deadline);
 			controller.abort();
-			resume.resolve();
-			mkdtemp.mockRestore();
-			await operation;
+			run.mockRestore();
 		}
-	}, 40_000);
+	}, 5_000);
 
 	it("keeps caller credentials and value aliases out of env and $ENV while retaining safe settings", async () => {
 		const values: Record<string, string> = {
@@ -289,19 +264,31 @@ describe("JSON query in read tool", () => {
 		expect(lines.join("\n")).toContain("kept-diagnostic-marker");
 	});
 
-	it("retains the reason and key when jaq rejects a large JSON value", async () => {
+	it.each([false, true])("retains a large-value error's reason and key after debug=%s", async debug => {
 		const largeFile = path.join(tempDir, "large.json");
 		const rows = Array.from({ length: 400 }, (_, index) => ({ label: `row ${index}`, input: "x".repeat(40) }));
 		await Bun.write(largeFile, JSON.stringify([{ rows }]));
 
-		const error = await readTool.execute("large-error", { path: `${largeFile}?q=.changedFiles` }).then(
+		const query = debug ? ". as $value | (range(0;5000) | debug | empty), ($value.changedFiles)" : ".changedFiles";
+		const error = await readTool.execute("large-error", { path: `${largeFile}?q=${query}` }).then(
 			() => null,
 			error => error,
 		);
 		const message = String(error);
 		expect(message).toContain("cannot index");
 		expect(message).toContain('with "changedFiles"');
-		expect(message.length).toBeLessThan(1000);
+		expect(Buffer.byteLength(message)).toBeLessThan(debug ? 8 * 1024 + 100 : 1000);
+	});
+
+	it("bounds an unterminated diagnostic while preserving its endpoints and separate stdout", async () => {
+		const result = await readTool.execute("unterminated-diagnostic", {
+			path: `${jsonFile}?q=("diagnostic-start:" + ("😀" * 10000) + ":diagnostic-end") | stderr | 7`,
+		});
+		const text = getText(result);
+		expect(text).toContain("diagnostic-start:");
+		expect(text).toContain(":diagnostic-end");
+		expect(text.split("\n").pop()).toBe("7");
+		expect(Buffer.byteLength(text)).toBeLessThan(1000);
 	});
 
 	it("reads the file normally without jq query when ?q= is omitted", async () => {

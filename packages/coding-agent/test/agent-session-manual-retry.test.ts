@@ -283,16 +283,55 @@ describe("AgentSession manual retry", () => {
 		expect(provider.calls).toHaveLength(2);
 	});
 
-	it("does not retry an older failure through an unrelated custom message", async () => {
+	it.each(["live", "copied", "reopened"] as const)(
+		"does not retry an older %s failure through unrelated custom context and an eval snapshot",
+		async state => {
+			const { active, manager, provider } = await createWithStopDiagnostic([{ throw: "original failure" }]);
+			await active.prompt("fail once");
+			await active.waitForIdle();
+			await active.sendCustomMessage(
+				{ customType: "unrelated-context", content: "A different context update", display: false },
+				{ triggerTurn: false },
+			);
+			manager.appendCustomMessageEntry("eval-state-context", "Retained eval state", false);
+			active.agent.replaceMessages(active.buildDisplaySessionContext().messages);
+			if (state === "copied") {
+				active.agent.replaceMessages(active.agent.state.messages.map(message => ({ ...message })));
+			}
+			let current = active;
+			if (state === "reopened") {
+				const sessionFile = path.join(tempDir.path(), "unrelated-retry-context.jsonl");
+				fs.writeFileSync(
+					sessionFile,
+					[manager.getHeader(), ...manager.getEntries()].map(entry => JSON.stringify(entry)).join("\n") + "\n",
+				);
+				await active.dispose();
+				const reopened = await SessionManager.open(sessionFile, tempDir.path());
+				current = (await createWithStopDiagnostic([], [], undefined, { manager: reopened, provider })).active;
+			}
+			const before = current.agent.state.messages.slice();
+			await expect(current.retry()).resolves.toBe(false);
+			expect(current.hasAbortedToolCallTail).toBe(false);
+			expect(current.agent.state.messages).toEqual(before);
+			expect(provider.calls).toHaveLength(1);
+		},
+	);
+
+	it("does not borrow a persisted failure across newer active custom context", async () => {
 		const { active, provider } = await createWithStopDiagnostic([{ throw: "original failure" }]);
 		await active.prompt("fail once");
 		await active.waitForIdle();
-		await active.sendCustomMessage(
-			{ customType: "unrelated-context", content: "A different context update", display: false },
-			{ triggerTurn: false },
-		);
+		active.agent.appendMessage({
+			role: "custom",
+			customType: "active-context",
+			content: "Newer context not in the persisted failure branch",
+			display: false,
+			timestamp: Date.now(),
+		});
+		const before = active.agent.state.messages.slice();
 		await expect(active.retry()).resolves.toBe(false);
 		expect(active.hasAbortedToolCallTail).toBe(false);
+		expect(active.agent.state.messages).toEqual(before);
 		expect(provider.calls).toHaveLength(1);
 	});
 
@@ -337,7 +376,7 @@ describe("AgentSession manual retry", () => {
 						expect(results.map(result => result.toolCallId).sort()).toEqual(
 							partial ? ["failed-call", "successful-call"] : ["failed-call"],
 						);
-						expect(results.find(result => result.toolCallId === "failed-call")?.isError).toBe(partial);
+						expect(results.find(result => result.toolCallId === "failed-call")?.isError).toBe(true);
 						return { content: ["tool retry recovered"] };
 					},
 				],
@@ -346,10 +385,24 @@ describe("AgentSession manual retry", () => {
 			await active.prompt("run the probe");
 			await active.waitForIdle();
 			const failedLeaf = manager.getLeafId();
+			const completedResults = active.agent.state.messages.filter(message => message.role === "toolResult");
+			const diagnostic = active.agent.state.messages.at(-1);
 			expect(active.hasAbortedToolCallTail).toBe(!partial);
 			await expect(active.retry()).resolves.toBe(true);
 			await active.waitForIdle();
-			expect(executed).toEqual(partial ? ["fail", "success"] : ["fail", "fail"]);
+			expect(executed).toEqual(partial ? ["fail", "success"] : ["fail"]);
+			expect(active.agent.state.messages.filter(message => message.role === "toolResult")).toEqual(completedResults);
+			expect(active.agent.state.messages).toContainEqual(diagnostic);
+			const transcript = manager.buildSessionContext({ transcript: true }).messages;
+			expect(transcript.filter(message => message.role === "toolResult")).toEqual(completedResults);
+			expect(transcript).toContainEqual(diagnostic);
+			expect(transcript).toContainEqual(
+				expect.objectContaining({
+					role: "assistant",
+					stopReason: "error",
+					errorMessage: "provider failed after tool execution",
+				}),
+			);
 			expect(provider.calls).toHaveLength(3);
 			expect(lastAgentMessage(active).content).toContainEqual({ type: "text", text: "tool retry recovered" });
 			expect(

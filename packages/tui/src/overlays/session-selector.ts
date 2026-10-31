@@ -764,20 +764,19 @@ class SessionList<T extends SessionSelectorEntry> implements Component {
 		}, 0);
 	}
 
-	/**
-	 * Rebuild the menu by title, prompt-history, literal recency, then fuzzy score.
-	 * Pins order the unfiltered list but never outrank a stronger search match.
-	 */
+	/** Rebuild the menu with pinned matches first, retaining search rank within each group. */
 	#composeFiltered(): void {
 		this.#itemsVersion++;
 		this.#fuzzyRanked.sort(compareFuzzyRank);
 		const base: T[] = [];
 		for (const match of this.#literalRanked) base.push(match.session);
 		for (const match of this.#fuzzyRanked) base.push(match.session);
-		const composed = prioritizeTitleMatches(
-			this.#historyIds.length > 0 ? mergeSessionRanking(this.#allSessions, base, this.#historyIds) : base,
-			tokenizeSessionQuery(this.#searchInput.getValue()),
-			this.#literalRanked,
+		const composed = this.#pinnedFirst(
+			prioritizeTitleMatches(
+				this.#historyIds.length > 0 ? mergeSessionRanking(this.#allSessions, base, this.#historyIds) : base,
+				tokenizeSessionQuery(this.#searchInput.getValue()),
+				this.#literalRanked,
+			),
 		);
 		// A moved selection follows its session; the query path resets explicitly.
 		if (this.#selectionMoved) {

@@ -140,15 +140,21 @@ function hasNonWhitespace(value: string): boolean {
 }
 
 /**
- * End of the conversation in `messages`, before trailing context-only custom
- * messages: eval runtime snapshots (appended at startup and on display-context
- * rebuilds) and deliveries folded in without a turn — e.g. an `async-result`
- * landing while a user interrupt suppresses auto-resume. They trail a failed
- * turn without ending it. A user-authored custom prompt is conversation.
+ * End of the conversation before trailing eval snapshots or background results.
+ * Other custom messages are conversation boundaries unless their persisted
+ * stop-hook provenance is verified by the owning recovery controller.
  */
 function conversationEnd(messages: readonly AgentMessage[]): number {
 	let end = messages.length;
-	while (end > 0 && messages[end - 1].role === "custom" && !isUserAuthoredMessage(messages[end - 1])) end--;
+	while (end > 0) {
+		const message = messages[end - 1];
+		if (
+			!(message.role === "custom" && message.customType === "async-result" && !isUserAuthoredMessage(message)) &&
+			!isEvalStateContext(message)
+		)
+			break;
+		end--;
+	}
 	return end;
 }
 
@@ -3422,9 +3428,10 @@ export class TurnRecovery {
 	get hasAbortedToolCallTail(): boolean {
 		const active = this.#withoutPassiveStopResults(this.#host.agent.state.messages);
 		if (abortedToolCallTail(active)) return true;
-		// A trailing assistant message is authoritative for a live session: a
-		// settled successful turn leaves nothing to retry.
-		if (active[conversationEnd(active) - 1]?.role === "assistant") return false;
+		// Settled assistant turns and unrelated custom context are authoritative
+		// boundaries, even if the persisted transcript still ends in a failure.
+		const tail = active[conversationEnd(active) - 1];
+		if (tail?.role === "assistant" || tail?.role === "custom") return false;
 		// A restored session omits the failed turn (and its synthetic results)
 		// from provider context, so — mirroring retry() — the persisted display
 		// transcript decides whether a retryable tool-call tail exists.
@@ -3463,10 +3470,11 @@ export class TurnRecovery {
 		if (this.#host.isStreaming() || this.#host.isCompacting() || this.isRetrying) return false;
 		const generation = this.#host.promptGeneration();
 
-		const messages = this.#withoutPassiveStopResults(this.#host.agent.state.messages);
+		const originalMessages = this.#host.agent.state.messages;
+		const messages = this.#withoutPassiveStopResults(originalMessages);
 		const activeTurnEnd = retryableAssistantTurnEnd(messages);
 		if (activeTurnEnd !== undefined) {
-			const replayStart = toolReplayStart(messages);
+			const replayStart = toolReplayStart(originalMessages);
 			if (replayStart !== undefined) {
 				if (!(await this.#stripForToolReplay(messages, replayStart, generation))) return false;
 			} else {
@@ -3475,10 +3483,12 @@ export class TurnRecovery {
 				// trailing context deliveries the continuation is sent with.
 				this.#host.agent.replaceMessages([
 					...messages.slice(0, activeTurnEnd - 1),
-					...messages.slice(conversationEnd(messages)),
+					...originalMessages.slice(conversationEnd(messages)),
 				]);
 			}
 		} else {
+			const tail = messages[conversationEnd(messages) - 1];
+			if (tail?.role === "assistant" || tail?.role === "custom") return false;
 			// A restored session already dropped the failed assistant turn (and its
 			// paired synthetic tool results) from provider context, so the persisted
 			// display transcript is the source of truth for a retryable failed tail.
@@ -3486,10 +3496,9 @@ export class TurnRecovery {
 				this.#host.sessionManager.buildSessionContext({ transcript: true }).messages,
 			);
 			if (retryableAssistantTurnEnd(transcriptMessages) === undefined) return false;
-			if (messages !== this.#host.agent.state.messages) this.#host.agent.replaceMessages(messages);
 			// The boundary is already gone from active context; when the intact
 			// failed batch is still the tail, replay the tools directly.
-			const replayStart = toolReplayStart(messages);
+			const replayStart = toolReplayStart(originalMessages);
 			if (replayStart !== undefined && !(await this.#stripForToolReplay(messages, replayStart, generation)))
 				return false;
 		}

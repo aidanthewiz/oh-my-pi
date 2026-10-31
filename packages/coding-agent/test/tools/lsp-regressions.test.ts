@@ -398,8 +398,11 @@ function textResult(result: AgentToolResult<LspToolDetails>): string {
  */
 let lspHomeOverride: string | undefined;
 let lspOriginalHome: string | undefined;
+let lspOriginalConfigCache: Map<string, LspConfig>;
 
 beforeEach(() => {
+	lspOriginalConfigCache = new Map(configCache);
+	configCache.clear();
 	lspOriginalHome = process.env.HOME;
 	lspHomeOverride = fs.mkdtempSync(path.join(os.tmpdir(), "omp-lsp-test-home-"));
 	process.env.HOME = lspHomeOverride;
@@ -409,6 +412,8 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+	configCache.clear();
+	for (const [cwd, config] of lspOriginalConfigCache) configCache.set(cwd, config);
 	if (lspOriginalHome === undefined) delete process.env.HOME;
 	else process.env.HOME = lspOriginalHome;
 	if (lspHomeOverride) fs.rmSync(lspHomeOverride, { recursive: true, force: true });
@@ -4382,6 +4387,7 @@ describe("lsp regressions", () => {
 
 		/** Fake server: `onMessage` handles what it returns true for; other requests get `null`. */
 		function useServer(
+			cwd: string,
 			capabilities: Record<string, unknown>,
 			onMessage: (message: RpcMessage, srv: FakeLspServer) => boolean = () => false,
 			config: Partial<ServerConfig> = {},
@@ -4393,10 +4399,10 @@ describe("lsp regressions", () => {
 				isLinter: true,
 				...config,
 			};
-			vi.spyOn(lspConfig, "loadConfig").mockReturnValue({
-				servers: { [serverConfig.command]: serverConfig },
+			vi.spyOn(lspConfig, "loadConfig").mockImplementation(candidate => ({
+				servers: candidate === cwd ? { [serverConfig.command]: serverConfig } : {},
 				idleTimeoutMs: undefined,
-			});
+			}));
 			const server = installFakeLsp((message, srv) => {
 				if (message.method === "initialize") {
 					srv.send({
@@ -4431,7 +4437,7 @@ describe("lsp regressions", () => {
 		it("adds the other checkout as a workspace folder before opening its file", async () => {
 			const { tempDir, sessionRoot, siblingRoot } = await makeCheckouts("@omp-lsp-sibling-folder-");
 			try {
-				const { server } = useServer(FOLDER_CHANGES);
+				const { server } = useServer(sessionRoot, FOLDER_CHANGES);
 				const tool = new LspTool(makeLspSession(sessionRoot));
 				const siblingFile = path.join(siblingRoot, "src", "target.py");
 
@@ -4478,7 +4484,7 @@ describe("lsp regressions", () => {
 		it("leaves a server without workspace folder changes rooted at the session alone", async () => {
 			const { tempDir, sessionRoot, siblingRoot } = await makeCheckouts("@omp-lsp-sibling-nofolders-");
 			try {
-				const { server } = useServer({});
+				const { server } = useServer(sessionRoot, {});
 				await references(new LspTool(makeLspSession(sessionRoot)), path.join(siblingRoot, "src", "target.py"));
 
 				expect(server.spawnCount).toBe(1);
@@ -4497,7 +4503,7 @@ describe("lsp regressions", () => {
 			const siblingFile = path.join(siblingRoot, "src", "target.py");
 			try {
 				let calls = 0;
-				useServer(FOLDER_CHANGES, (message, srv) => {
+				useServer(sessionRoot, FOLDER_CHANGES, (message, srv) => {
 					if (message.method !== "textDocument/references") return false;
 					calls++;
 					if (calls === 1) {
@@ -4537,7 +4543,7 @@ describe("lsp regressions", () => {
 				for (const dir of [repo, worktree, vendored]) {
 					await Bun.write(path.join(dir, "src", "target.py"), "def target():\n    return 1\n");
 				}
-				const { server } = useServer(FOLDER_CHANGES);
+				const { server } = useServer(worktree, FOLDER_CHANGES);
 				const tool = new LspTool(makeLspSession(worktree));
 
 				await references(tool, path.join(worktree, "src", "target.py"));
@@ -4562,7 +4568,7 @@ describe("lsp regressions", () => {
 				await fsp.mkdir(path.join(home, ".git"), { recursive: true });
 				await Bun.write(path.join(home, "notes", "src", "target.py"), "def target():\n    return 1\n");
 				vi.spyOn(os, "homedir").mockReturnValue(home);
-				const { server } = useServer(FOLDER_CHANGES);
+				const { server } = useServer(sessionRoot, FOLDER_CHANGES);
 
 				await references(new LspTool(makeLspSession(sessionRoot)), path.join(home, "notes", "src", "target.py"));
 
@@ -4585,6 +4591,7 @@ describe("lsp regressions", () => {
 					await Bun.write(path.join(root, "src", "lib.rs"), "pub fn target() {}\npub fn caller() { target() }\n");
 				}
 				const { server } = useServer(
+					sessionRoot,
 					FOLDER_CHANGES,
 					(message, srv) => {
 						if (message.method === "initialized" || message.method === "workspace/didChangeWorkspaceFolders") {
@@ -4627,7 +4634,7 @@ describe("lsp regressions", () => {
 		it("lets a caller already waiting for the project load wait for an added checkout too", async () => {
 			const { tempDir, sessionRoot, siblingRoot } = await makeCheckouts("@omp-lsp-load-waiter-");
 			try {
-				const { server, serverConfig } = useServer(FOLDER_CHANGES);
+				const { server, serverConfig } = useServer(sessionRoot, FOLDER_CHANGES);
 				const client = await lspClient.getOrCreateClient(serverConfig, sessionRoot);
 				progress(server, "load", "begin");
 				await lspClient.sendRequest(client, "test/barrier", {});
@@ -4658,6 +4665,7 @@ describe("lsp regressions", () => {
 			try {
 				let indexing = false;
 				useServer(
+					sessionRoot,
 					{ ...FOLDER_CHANGES, diagnosticProvider: true },
 					(message, srv) => {
 						if (message.method === "initialized") {
@@ -4701,7 +4709,7 @@ describe("lsp regressions", () => {
 		it("adds the destination's checkout before asking the server about a rename into it", async () => {
 			const { tempDir, sessionRoot, siblingRoot } = await makeCheckouts("@omp-lsp-rename-folder-");
 			try {
-				const { server } = useServer(FOLDER_CHANGES);
+				const { server } = useServer(sessionRoot, FOLDER_CHANGES);
 
 				await new LspTool(makeLspSession(sessionRoot)).execute("rename-into-sibling", {
 					action: "rename_file",
@@ -4725,7 +4733,7 @@ describe("lsp regressions", () => {
 		it("aborts an applied rename whose checkout could not be added to a renaming server", async () => {
 			const { tempDir, sessionRoot, siblingRoot } = await makeCheckouts("@omp-lsp-rename-folder-failed-");
 			try {
-				const { server, serverConfig } = useServer(FOLDER_CHANGES, (message, srv) => {
+				const { server, serverConfig } = useServer(sessionRoot, FOLDER_CHANGES, (message, srv) => {
 					if (message.method !== "workspace/willRenameFiles") return false;
 					srv.send({ jsonrpc: "2.0", id: message.id, result: { changes: {} } });
 					return true;
@@ -4764,7 +4772,7 @@ describe("lsp regressions", () => {
 			const { tempDir, sessionRoot, siblingRoot } = await makeCheckouts("@omp-lsp-retry-bounds-");
 			try {
 				let commands = 0;
-				const { serverConfig } = useServer(FOLDER_CHANGES, (message, srv) => {
+				const { serverConfig } = useServer(sessionRoot, FOLDER_CHANGES, (message, srv) => {
 					if (message.method !== "textDocument/hover" && message.method !== "workspace/executeCommand") {
 						return false;
 					}
@@ -4795,7 +4803,7 @@ describe("lsp regressions", () => {
 		it("makes a concurrent caller for the same checkout wait for its add, which an abort does not cancel", async () => {
 			const { tempDir, sessionRoot, siblingRoot } = await makeCheckouts("@omp-lsp-concurrent-folder-");
 			try {
-				const { server, serverConfig } = useServer(FOLDER_CHANGES);
+				const { server, serverConfig } = useServer(sessionRoot, FOLDER_CHANGES);
 				const client = await lspClient.getOrCreateClient(serverConfig, sessionRoot);
 				const aborted = new AbortController();
 
@@ -4816,7 +4824,7 @@ describe("lsp regressions", () => {
 		it("keeps the load pending when progress running before the add ends before the folder's own", async () => {
 			const { tempDir, sessionRoot, siblingRoot } = await makeCheckouts("@omp-lsp-progress-cycle-");
 			try {
-				const { server, serverConfig } = useServer(FOLDER_CHANGES);
+				const { server, serverConfig } = useServer(sessionRoot, FOLDER_CHANGES);
 				const client = await lspClient.getOrCreateClient(serverConfig, sessionRoot);
 				progress(server, "startup", "begin");
 				await lspClient.sendRequest(client, "test/barrier", {});
@@ -4844,7 +4852,7 @@ describe("lsp regressions", () => {
 		it("keeps the load pending until each of two separate adds has begun its own progress", async () => {
 			const { tempDir, sessionRoot, siblingRoot, thirdRoot } = await makeCheckouts("@omp-lsp-two-adds-");
 			try {
-				const { server, serverConfig } = useServer(FOLDER_CHANGES);
+				const { server, serverConfig } = useServer(sessionRoot, FOLDER_CHANGES);
 				const client = await lspClient.getOrCreateClient(serverConfig, sessionRoot);
 				progress(server, "startup", "begin");
 				progress(server, "startup", "end");
@@ -4874,7 +4882,7 @@ describe("lsp regressions", () => {
 		it("adds both checkouts of a rename between two other checkouts in one notification", async () => {
 			const { tempDir, sessionRoot, siblingRoot, thirdRoot } = await makeCheckouts("@omp-lsp-rename-two-");
 			try {
-				const { server } = useServer(FOLDER_CHANGES);
+				const { server } = useServer(sessionRoot, FOLDER_CHANGES);
 
 				await new LspTool(makeLspSession(sessionRoot)).execute("rename-between-siblings", {
 					action: "rename_file",
@@ -4896,7 +4904,7 @@ describe("lsp regressions", () => {
 		it("does not hold the next add's load for an add whose load ended on the fallback timer", async () => {
 			const { tempDir, sessionRoot, siblingRoot, thirdRoot } = await makeCheckouts("@omp-lsp-fallback-add-");
 			try {
-				const { server, serverConfig } = useServer(FOLDER_CHANGES);
+				const { server, serverConfig } = useServer(sessionRoot, FOLDER_CHANGES);
 				const client = await lspClient.getOrCreateClient(serverConfig, sessionRoot);
 				progress(server, "startup", "begin");
 				progress(server, "startup", "end");
@@ -4930,7 +4938,7 @@ describe("lsp regressions", () => {
 		it("adds no checkout for a caller that aborted before delivery", async () => {
 			const { tempDir, sessionRoot, siblingRoot, thirdRoot } = await makeCheckouts("@omp-lsp-aborted-add-");
 			try {
-				const { server, serverConfig } = useServer(FOLDER_CHANGES);
+				const { server, serverConfig } = useServer(sessionRoot, FOLDER_CHANGES);
 				const client = await lspClient.getOrCreateClient(serverConfig, sessionRoot);
 				const controller = new AbortController();
 				controller.abort();
@@ -4955,7 +4963,7 @@ describe("lsp regressions", () => {
 		it("undoes the project-load wait of an add whose notification never reached the server", async () => {
 			const { tempDir, sessionRoot, siblingRoot } = await makeCheckouts("@omp-lsp-failed-folder-");
 			try {
-				const { server, serverConfig } = useServer(FOLDER_CHANGES);
+				const { server, serverConfig } = useServer(sessionRoot, FOLDER_CHANGES);
 				const client = await lspClient.getOrCreateClient(serverConfig, sessionRoot);
 				progress(server, "load", "begin");
 				progress(server, "load", "end");
@@ -4981,7 +4989,7 @@ describe("lsp regressions", () => {
 		it("keeps the load of a delivered add pending when an overlapping add's write fails", async () => {
 			const { tempDir, sessionRoot, siblingRoot, thirdRoot } = await makeCheckouts("@omp-lsp-overlap-failed-");
 			try {
-				const { server, serverConfig } = useServer(FOLDER_CHANGES);
+				const { server, serverConfig } = useServer(sessionRoot, FOLDER_CHANGES);
 				const client = await lspClient.getOrCreateClient(serverConfig, sessionRoot);
 				progress(server, "load", "begin");
 				progress(server, "load", "end");
@@ -5048,7 +5056,7 @@ describe("lsp regressions", () => {
 				let skew = 0;
 				vi.spyOn(Date, "now").mockImplementation(() => realNow() + skew);
 				let hovers = 0;
-				const { serverConfig } = useServer(FOLDER_CHANGES, (message, srv) => {
+				const { serverConfig } = useServer(sessionRoot, FOLDER_CHANGES, (message, srv) => {
 					if (message.method !== "textDocument/hover") return false;
 					hovers++;
 					if (hovers === 1) {

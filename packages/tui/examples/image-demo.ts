@@ -16,7 +16,7 @@ try {
 	imageBuffer = await file.bytes();
 } catch {
 	console.error(`Failed to load image: ${testImagePath}`);
-	console.error("Usage: bun test/image-test.ts [path-to-image.png]");
+	console.error("Usage: bun examples/image-demo.ts [path-to-image.png]");
 	process.exit(1);
 }
 

@@ -1458,6 +1458,7 @@ describe("extension terminal launch capability", () => {
 				},
 			},
 			syncComposerShape: () => {},
+			syncExtensionLinks: () => {},
 		} as unknown as InteractiveModeContext);
 		controller.initializeHookRunner(host as unknown as ExtensionUIContext, true);
 		const extensionUi = initialized.ui;

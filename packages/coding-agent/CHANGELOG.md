@@ -14,6 +14,11 @@
 
 ### Fixed
 
+- Preserve opaque URI semicolons during path-list expansion. Explicit path arrays disambiguate missing extensionless paths from opaque resources.
+- Retain bounded JSON-query error reasons before truncating large values, including streamed diagnostics and cancellation.
+- Capture artifact approval identities without materializing content, and keep grants scoped to the selected artifact.
+- Keep manual retry within the current failed turn while retaining completed tool results and diagnostic snapshots.
+- Open language-server documents before waiting for readiness so initial diagnostics cannot deadlock.
 - Preserve explicit provider authority during deferred model discovery. Advertise `out://` only for eligible parent sessions and refresh it after configuredness changes.
 - Preserve foreground Bash replies after execution or completion-hook failure, and retain replay-owned reply prefixes across transcript rebuilds.
 - Keep task-file paths contained and retain restrictive conflict-read provenance for empty, capped, and BOM-prefixed excerpts.
