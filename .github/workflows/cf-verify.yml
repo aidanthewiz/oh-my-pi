@@ -474,7 +474,6 @@ jobs:
             scope: rust
     env:
       SOURCE_SHA: ${{ github.event.pull_request.head.sha }}
-      QUALIFICATION_RECEIPT_DIR: ${{ runner.temp }}/qualification-engine
       CARGO_BUILD_JOBS: "2"
       CARGO_INCREMENTAL: "0"
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
@@ -491,8 +490,6 @@ jobs:
       AWS_SHARED_CREDENTIALS_FILE: /dev/null
       NO_COLOR: "1"
       CARGO_TERM_COLOR: never
-      CARGO_HOME: ${{ runner.temp }}/qualification-cargo
-      RUSTUP_HOME: ${{ runner.temp }}/qualification-rustup
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -505,12 +502,17 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/qualification-home" "$RUNNER_TEMP/qualification-tmp" "$QUALIFICATION_RECEIPT_DIR"
+          mkdir -p "$RUNNER_TEMP/qualification-home" "$RUNNER_TEMP/qualification-tmp" "$RUNNER_TEMP/qualification-engine"
           chmod 700 "$RUNNER_TEMP/qualification-home" "$RUNNER_TEMP/qualification-tmp"
-          echo "HOME=$RUNNER_TEMP/qualification-home" >> "$GITHUB_ENV"
-          echo "TMPDIR=$RUNNER_TEMP/qualification-tmp" >> "$GITHUB_ENV"
-          echo "TMP=$RUNNER_TEMP/qualification-tmp" >> "$GITHUB_ENV"
-          echo "TEMP=$RUNNER_TEMP/qualification-tmp" >> "$GITHUB_ENV"
+          {
+            echo "HOME=$RUNNER_TEMP/qualification-home"
+            echo "TMPDIR=$RUNNER_TEMP/qualification-tmp"
+            echo "TMP=$RUNNER_TEMP/qualification-tmp"
+            echo "TEMP=$RUNNER_TEMP/qualification-tmp"
+            echo "QUALIFICATION_RECEIPT_DIR=$RUNNER_TEMP/qualification-engine"
+            echo "CARGO_HOME=$RUNNER_TEMP/qualification-cargo"
+            echo "RUSTUP_HOME=$RUNNER_TEMP/qualification-rustup"
+          } >> "$GITHUB_ENV"
       - name: Restore Cargo qualification cache
         id: cargo-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
