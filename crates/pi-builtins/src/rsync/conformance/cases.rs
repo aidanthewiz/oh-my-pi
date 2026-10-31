@@ -256,7 +256,7 @@ pub(super) const DAEMON: &[Case] = &[
 	c("pull_host_syntax", 0, "", &["-ai", "--port={PORT}", "127.0.0.1::ro/sub", "dst/"]),
 	c("pull_no_motd", 0, "", &["-ai", "--no-motd", "rsync://127.0.0.1:{PORT}/ro/", "dst/"]),
 	u("pull_delete", 0, "stale", &["-ai", "--delete", "rsync://127.0.0.1:{PORT}/ro/", "dst/"]),
-	c("pull_compress", 0, "", &["-aiz", "rsync://127.0.0.1:{PORT}/ro/", "dst/"]),
+	c("pull_compress", 0, "stale", &["-aiz", "rsync://127.0.0.1:{PORT}/ro/", "dst/"]),
 	c("pull_protocol_29", 0, "stale", &["-ai", "--protocol=29", "rsync://127.0.0.1:{PORT}/ro/", "dst/"]),
 	c("pull_hidden_module", 0, "", &["-ai", "rsync://127.0.0.1:{PORT}/hidden/sub/", "dst/"]),
 	c("push", 0, "", &["-ai", "src/", "rsync://127.0.0.1:{PORT}/rw/"]),
