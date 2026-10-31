@@ -1,7 +1,9 @@
 //! A reference `rsync --daemon` per side, killed on drop.
 
+use std::collections::hash_map::DefaultHasher;
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::hash::{Hash, Hasher};
+use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -39,6 +41,12 @@ enum Failure {
 	NotReady,
 }
 
+fn ready_module(dir: &Path) -> String {
+	let mut hash = DefaultHasher::new();
+	dir.hash(&mut hash);
+	format!("__conformance_ready_{:016x}", hash.finish())
+}
+
 impl Daemon {
 	/// Starts the daemon with its config, secrets, motd, and log under `dir`
 	/// and waits until it greets on its port. A port race (the probed port is
@@ -51,6 +59,7 @@ impl Daemon {
 		fs::set_permissions(&secrets, fs::Permissions::from_mode(0o600)).unwrap();
 		fs::write(dir.join("motd"), MOTD).unwrap();
 		let log = dir.join("log");
+		let readiness = ready_module(dir);
 		let (d, w) = (dir.display(), w.display());
 		let conf = format!(
 			"pid file = {d}/pid\nlog file = {d}/log\nmotd file = {d}/motd\nuse chroot = no\n\
@@ -59,7 +68,8 @@ impl Daemon {
 			 [ro]\n\tpath = {w}/src\n\tcomment = read-only module\n\n\
 			 [auth]\n\tpath = {w}/src\n\tcomment = needs a password\n\tauth users = alice\n\
 			 \tsecrets file = {d}/secrets\n\n\
-			 [hidden]\n\tpath = {w}/src\n\tlist = no\n"
+			 [hidden]\n\tpath = {w}/src\n\tlist = no\n\n\
+			 [{readiness}]\n\tpath = {d}\n\tlist = no\n"
 		);
 		let config = dir.join("rsyncd.conf");
 		fs::write(&config, conf).unwrap();
@@ -82,7 +92,7 @@ impl Daemon {
 				.stderr(Stdio::null())
 				.spawn()
 				.unwrap();
-			let failure = match wait_ready(&mut child, port) {
+			let failure = match wait_ready(&mut child, port, &readiness) {
 				Ok(()) => return Self { child, port },
 				Err(failure) => failure,
 			};
@@ -99,16 +109,14 @@ impl Daemon {
 	}
 }
 
-/// Waits until `child` answers on `port` with an `@RSYNCD:` greeting, or it
-/// exits, or the deadline passes. A greeting rejects unrelated listeners
-/// that took the probed IPv4 port before the daemon could bind it.
-fn wait_ready(child: &mut Child, port: u16) -> Result<(), Failure> {
+/// Waits for this config's hidden module, rejecting unrelated rsync listeners.
+fn wait_ready(child: &mut Child, port: u16, readiness: &str) -> Result<(), Failure> {
 	let deadline = Instant::now() + READY_DEADLINE;
 	loop {
 		if let Ok(Some(status)) = child.try_wait() {
 			return Err(Failure::Exited(status.to_string()));
 		}
-		if greets(port) {
+		if greets(port, readiness) {
 			// Still ours: a daemon that lost the bind race exits.
 			return match child.try_wait() {
 				Ok(Some(status)) => Err(Failure::Exited(status.to_string())),
@@ -122,19 +130,62 @@ fn wait_ready(child: &mut Child, port: u16) -> Result<(), Failure> {
 	}
 }
 
-/// Whether something on `port` sends an rsync daemon greeting.
-fn greets(port: u16) -> bool {
+/// A generic greeting alone cannot establish ownership of a recycled port.
+fn greets(port: u16, readiness: &str) -> bool {
 	let Ok(stream) = TcpStream::connect(("127.0.0.1", port)) else { return false };
-	if stream.set_read_timeout(Some(Duration::from_secs(5))).is_err() {
+	let timeout = Duration::from_secs(5);
+	let deadline = Instant::now() + timeout;
+	if stream.set_read_timeout(Some(timeout)).is_err() || stream.set_write_timeout(Some(timeout)).is_err() {
 		return false;
 	}
+	let mut reader = BufReader::new(stream);
 	let mut line = String::new();
-	BufReader::new(stream).read_line(&mut line).is_ok() && line.starts_with("@RSYNCD: ")
+	if reader.read_line(&mut line).is_err() || !line.starts_with("@RSYNCD: ") {
+		return false;
+	}
+	if write!(reader.get_mut(), "@RSYNCD: 31.0\n{readiness}\n").is_err() {
+		return false;
+	}
+	for _ in 0..4 {
+		let Some(remaining) = deadline.checked_duration_since(Instant::now()) else { return false };
+		if reader.get_mut().set_read_timeout(Some(remaining)).is_err() {
+			return false;
+		}
+		line.clear();
+		if !matches!(reader.read_line(&mut line), Ok(size) if size > 0) {
+			return false;
+		}
+		if line.trim_end() == "@RSYNCD: OK" {
+			return true;
+		}
+		if line.starts_with("@ERROR") {
+			return false;
+		}
+	}
+	false
 }
 
 impl Drop for Daemon {
 	fn drop(&mut self) {
 		let _ = self.child.kill();
 		let _ = self.child.wait();
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::{Daemon, greets, ready_module};
+
+	#[test]
+	fn readiness_requires_the_owned_daemon_configuration() {
+		let Some(reference) = super::super::reference() else { return };
+		let root = tempfile::tempdir().unwrap();
+		let work = root.path().join("work");
+		std::fs::create_dir_all(work.join("src")).unwrap();
+		std::fs::create_dir(work.join("rw")).unwrap();
+		let config = root.path().join("daemon");
+		let daemon = Daemon::start(&reference, &config, &work);
+		assert!(greets(daemon.port, &ready_module(&config)));
+		assert!(!greets(daemon.port, &ready_module(&root.path().join("foreign-daemon"))));
 	}
 }

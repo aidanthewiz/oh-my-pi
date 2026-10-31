@@ -84,6 +84,8 @@ It normalizes packetization-dependent wire totals and derived rates.
 Known concurrent output compares as a multiset, preserving every event and duplicate count.
 This includes implicit `--delete-during` with protocol 30 or later.
 Explicit before, after and delayed deletion modes retain ordered comparisons.
+Daemon fixtures connect to their bound IPv4 address.
+Readiness requires a fixture-specific hidden module, not merely an rsync greeting from an unrelated listener.
 
 ## Licensing
 
