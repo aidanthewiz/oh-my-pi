@@ -736,7 +736,7 @@ impl Shared {
 							Some(body) => (body, true),
 							None => (&msg.payload[..], false),
 						};
-						let mut conv = ic.from_wire(body).unwrap_or_else(|_| body.to_vec());
+						let mut conv = ic.from_wire_message(body).unwrap_or_else(|_| body.to_vec());
 						if dir {
 							conv.push(0);
 						}
@@ -1950,14 +1950,6 @@ fn server_main(io: &HostIo, opts: Options, local: Option<LocalServer>) -> i32 {
 	};
 	let base_logger = Logger::remote_with_stderr(sink, Box::new(io.err.clone()), log_config(io, &opts, true, local_server))
 		.with_role(if opts.am_sender { Role::Sender } else { Role::PreReceiver });
-	{
-		let w = Arc::clone(&sink_writer);
-		let deleted: log::DeletedSink = Arc::new(move |payload: &[u8]| match lock(&w).clone() {
-			Some(w) => w.send_msg(MSG_DELETED, payload),
-			None => Ok(()),
-		});
-		base_logger.set_deleted_sink(Some(deleted));
-	}
 	if opts.logfile_name.is_some() {
 		base_logger.open_log_file(&io.fs, opts.insecure_links);
 	}
@@ -2060,6 +2052,27 @@ fn server_main(io: &HostIo, opts: Options, local: Option<LocalServer>) -> i32 {
 		logger.finish(err.code, err.site, &Stats::default(), false);
 		*lock(&sink_writer) = None;
 		return err.code;
+	}
+	{
+		let w = Arc::clone(&sink_writer);
+		let converter = iconv.clone();
+		let deleted: log::DeletedSink = Arc::new(move |payload: &[u8]| {
+			let Some(w) = lock(&w).clone() else { return Ok(()) };
+			if let Some(converter) = &converter {
+				let (name, directory) = match payload.strip_suffix(b"\0") {
+					Some(name) => (name, true),
+					None => (payload, false),
+				};
+				let mut wire = converter.to_wire_message(name)?;
+				if directory {
+					wire.push(0);
+				}
+				w.send_msg(MSG_DELETED, &wire)
+			} else {
+				w.send_msg(MSG_DELETED, payload)
+			}
+		});
+		logger.set_deleted_sink(Some(deleted));
 	}
 
 	// The transfer directory (argv[0]) and the remaining operands.

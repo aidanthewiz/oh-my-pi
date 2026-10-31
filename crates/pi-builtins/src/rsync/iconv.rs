@@ -195,6 +195,27 @@ impl Iconv {
 		}
 	}
 
+	/// Message conversion preserves invalid bytes, like ICB_INCLUDE_BAD/INCOMPLETE.
+	pub(crate) fn to_wire_message(&self, text: &[u8]) -> io::Result<Vec<u8>> {
+		#[cfg(unix)]
+		return self.send.convert_message(text);
+		#[cfg(not(unix))]
+		{
+			let _ = text;
+			Err(io::ErrorKind::Unsupported.into())
+		}
+	}
+
+	pub(crate) fn from_wire_message(&self, text: &[u8]) -> io::Result<Vec<u8>> {
+		#[cfg(unix)]
+		return self.recv.convert_message(text);
+		#[cfg(not(unix))]
+		{
+			let _ = text;
+			Err(io::ErrorKind::Unsupported.into())
+		}
+	}
+
 	/// [`Iconv::from_wire_io`] as an `RsyncError` whose message is
 	/// `cannot convert filename: NAME (STRERROR)` (callers add the `[role] ` prefix).
 	pub(crate) fn from_wire(&self, name: &[u8]) -> Result<Vec<u8>, RsyncError> {
@@ -315,6 +336,14 @@ mod sys {
 		/// Converts all of `input` (state reset first, like ICB_INIT); an invalid or
 		/// truncated sequence fails with its errno.
 		pub(super) fn convert(&self, input: &[u8]) -> io::Result<Vec<u8>> {
+			self.convert_with(input, false)
+		}
+
+		pub(super) fn convert_message(&self, input: &[u8]) -> io::Result<Vec<u8>> {
+			self.convert_with(input, true)
+		}
+
+		fn convert_with(&self, input: &[u8], preserve_invalid: bool) -> io::Result<Vec<u8>> {
 			let guard = lock(&self.cd);
 			let cd = guard.0;
 			// SAFETY: null buffers reset the conversion state.
@@ -341,6 +370,16 @@ mod sys {
 							out.resize(out.len() + grow, 0);
 						},
 						Some(libc::EINTR) => {},
+						Some(libc::EILSEQ | libc::EINVAL) if preserve_invalid && in_left > 0 => {
+							if done == out.len() {
+								out.resize(out.len() + 64, 0);
+							}
+							out[done] = input[input.len() - in_left];
+							done += 1;
+							// SAFETY: in_left proves one unread byte remains in input.
+							in_ptr = unsafe { in_ptr.add(1) };
+							in_left -= 1;
+						},
 						_ => return Err(err),
 					}
 				}
@@ -422,6 +461,17 @@ mod tests {
 		assert!(msg.starts_with("cannot convert filename: snow"), "{msg}");
 		// Truncated UTF-8 input.
 		assert!(ic.from_wire(b"ab\xc3").is_err());
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn message_conversion_preserves_invalid_bytes_without_losing_valid_names() {
+		let ic = Iconv::with_locale(b"SHIFT_JIS", false, None).unwrap();
+		let local = b"\x82\xa0\x82 ";
+		let wire = ["あ".as_bytes(), b"\x82 "].concat();
+		assert_eq!(ic.to_wire_message(local).unwrap(), wire);
+		assert_eq!(ic.from_wire_message(&wire).unwrap(), local);
+		assert!(ic.to_wire_io(local).is_err());
 	}
 
 	#[cfg(unix)]

@@ -76,6 +76,8 @@ $ cargo nextest run -p pi-builtins --no-default-features --features base,util.se
 `C` and `POSIX` locales escape non-ASCII bytes on Linux.
 macOS uses UTF-8, matching the reference's libcharset backend.
 `--8-bit-output` bypasses charset validation but retains control-character and literal-escape handling.
+With `--iconv`, deletion messages convert receiver filenames to UTF-8 before transmission and then to the client's charset.
+Directory markers and invalid message bytes remain intact.
 
 Conformance compares exit status, logical transfer sizes, output events and resulting filesystem state.
 It normalizes packetization-dependent wire totals and derived rates.

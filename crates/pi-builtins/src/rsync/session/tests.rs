@@ -177,6 +177,25 @@ fn too_new_protocol_option_on_a_local_copy() {
 	);
 }
 
+	#[test]
+	fn deletion_messages_convert_receiver_names_before_display() {
+		let dir = tempfile::tempdir().unwrap();
+		fs::create_dir(dir.path().join("src")).unwrap();
+		fs::create_dir(dir.path().join("dst")).unwrap();
+		fs::write(dir.path().join("dst/café"), b"dry-run sentinel").unwrap();
+		fs::create_dir(dir.path().join("dst/diré")).unwrap();
+		let (code, out, err) = run(
+			&["-rni", "--delete", "--iconv=UTF-8,ISO-8859-1", "src/", "dst/"],
+			dir.path(),
+		);
+		assert_eq!(code, 0, "{err}");
+		let mut lines: Vec<_> = out.lines().collect();
+		lines.sort_unstable();
+		assert_eq!(lines, ["*deleting   cafÃ©", "*deleting   dirÃ©/"]);
+		assert_eq!(fs::read(dir.path().join("dst/café")).unwrap(), b"dry-run sentinel");
+		assert!(dir.path().join("dst/diré").is_dir());
+	}
+
 /// Captured from rsync 3.5.1 (a build without preallocation): `rsync --preallocate f h`.
 #[test]
 fn preallocate_is_refused_by_the_receiving_half() {
