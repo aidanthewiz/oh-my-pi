@@ -189,6 +189,12 @@ function sessionFor(settings: InstanceType<typeof Settings>, manager: InstanceTy
 		getSessionFile: () => null, getSessionSpawns: () => null, getEvalKernelOwnerId: () => id, getActiveModel: () => model, getModelString: () => "owned-local/owned-local",
 		getActiveModelString: () => "owned-local/owned-local" } as ToolSession;
 }
+function cardContentState(card: InstanceType<typeof ToolExecutionComponent>): string {
+	return JSON.stringify(card.describe(), function(key, value) {
+		// Live elapsed ages advance without job frames.
+		return key === "age" && this.role === "omp.run.time" && this.stopped === undefined ? undefined : value;
+	});
+}
 let failure: unknown;
 try {
 	const evalImage = encodeRawPng(Uint8Array.of(255, 255, 255, 128), 1, 1, 4).toString("base64");
@@ -247,7 +253,7 @@ try {
 			let beforeDispose: string | undefined;
 			if (outcome === "disposed") {
 				controller.dispose();
-				beforeDispose = JSON.stringify(card.describe());
+				beforeDispose = cardContentState(card);
 			}
 			if (outcome === "cancelled") assert(manager.cancel(job.id)); else await fs.writeFile(gate, "release", { flag: "wx" });
 			await job.promise; await manager.drainDeliveries({ timeoutMs: 5000 }); await routing;
@@ -278,7 +284,7 @@ try {
 			}
 			if (outcome === "disposed") {
 				assert.equal(pendingTools.get(id), card);
-				assert.equal(JSON.stringify(card.describe()), beforeDispose, "disposed owner accepted actual later job frames");
+				assert.equal(cardContentState(card), beforeDispose, "disposed owner accepted actual later job frames");
 			} else {
 				assert.equal(pendingTools.has(id), false);
 				assert(card.isTranscriptBlockFinalized());
