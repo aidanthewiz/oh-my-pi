@@ -4,7 +4,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { required } from "../lib";
-import { requiredSurfaces } from "./contract";
+import { requiredSurfaces, selectVisualCaptures } from "./contract";
 import type { Mode, VisualInputs } from "./contract";
 
 const sha = (bytes: string | Uint8Array) => createHash("sha256").update(bytes).digest("hex");
@@ -75,7 +75,14 @@ else {
 	assert.equal(producer.version, manifest.version);
 }
 assert(Array.isArray(inputs.captures));
-assert.equal(new Set(inputs.captures.map(capture => `${capture.domain}/${capture.id}`)).size, inputs.captures.length);
+assert(Array.isArray(inputs.evidenceCaptures));
+const selection = selectVisualCaptures([...inputs.captures, ...inputs.evidenceCaptures]);
+assert.deepEqual(selection.captures, inputs.captures, "Visual inputs must contain only required runtime surfaces");
+assert.deepEqual(
+	selection.evidenceCaptures,
+	inputs.evidenceCaptures,
+	"Evidence captures must be classified separately",
+);
 
 // The qualification checkout is selected at runtime, independently of the script location.
 const load = (relative: string) => import(pathToFileURL(path.join(checkout, relative)).href);
@@ -141,9 +148,9 @@ const normalize = (value: string) =>
 const escape = (value: string) =>
 	value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;");
 const hex = (value: number) => `#${value.toString(16).padStart(6, "0")}`;
-const results = [];
-for (const capture of inputs.captures) {
-	assert(Object.hasOwn(requiredSurfaces, capture.domain));
+const results = [],
+	evidenceCaptures = [];
+for (const capture of [...selection.captures, ...selection.evidenceCaptures]) {
 	assert(/^[a-zA-Z0-9][a-zA-Z0-9._+/-]*$/.test(capture.id));
 	assert(path.isAbsolute(capture.file));
 	let captureFile = capture.file;
@@ -159,6 +166,11 @@ for (const capture of inputs.captures) {
 	const rawBytes = await fs.readFile(captureFile);
 	assert.equal(sha(rawBytes), capture.sha256);
 	assert.equal(rawBytes.length, capture.bytes);
+	if (capture.domain === "early-replay") {
+		evidenceCaptures.push({ capture, resolvedCaptureFile: captureFile });
+		continue;
+	}
+	assert(Object.hasOwn(requiredSurfaces, capture.domain));
 	const raw = rawBytes.toString("utf8"),
 		capturedRows = raw.split("\n");
 	const columns =
@@ -280,10 +292,15 @@ await fs.writeFile(
 			input: { file: "capture-inputs.json", originalFile: inputFile, sha256: sha(capturedInputBytes) },
 			producerSnapshot: { file: "producer-source-inputs.json", sha256: sha(producerManifestBytes) },
 			renderer: { file: "scripts/qualification/visual/render.ts", sha256: sha(await fs.readFile(import.meta.path)) },
+			captureSelection: {
+				file: "scripts/qualification/visual/contract.ts",
+				sha256: sha(await fs.readFile(path.join(import.meta.dir, "contract.ts"))),
+			},
 			native: { ...native, sha256: binding.nativeSha256 },
 			emulatorFiles,
 			fontFiles,
 			results,
+			evidenceCaptures,
 			unmet,
 			rendererExecutionChannel: "Source-only renderer of actual source/compiled domain captures",
 			normalization:

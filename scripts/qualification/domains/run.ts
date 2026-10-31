@@ -4,6 +4,7 @@ import * as fs from "node:fs/promises";
 import * as net from "node:net";
 import * as path from "node:path";
 import { compileFixture, environment, receipt, required, run, runCompiled } from "../lib.ts";
+import { requiredSurfaces, selectVisualCaptures } from "../visual/contract.ts";
 import { inside, inventory, materialize, sha256 } from "./materialize.ts";
 import type { Domain, Mode } from "./materialize.ts";
 
@@ -281,20 +282,16 @@ assert.equal(nativeAddonStatus()?.path,native.path);assert.equal(digest(),${JSON
 		}
 		if (!domain && !backend) {
 			assert.equal(observations.length, 12);
-			for (const [id, count] of [
-				["presentation", 4],
-				["async-media", 9],
-				["approval", 1],
-				["title", 6],
-			] as const)
-				assert.equal(captures.filter(row => row.domain === id).length, count);
+			const selection = selectVisualCaptures(captures);
+			for (const [id, count] of Object.entries(requiredSurfaces))
+				assert.equal(selection.captures.filter(row => row.domain === id).length, count);
 			await json(path.join(modeOutput, "visual-inputs.json"), {
 				schema: "CoreforgeQualificationVisualInputs",
 				mode,
 				sourceSha,
 				nativeSha256,
 				manifestSha256,
-				captures,
+				...selection,
 			});
 		}
 		await receipt("domains-" + mode + (domain ? "-" + domain : "") + (backend ? "-" + backend : ""), {

@@ -16,6 +16,10 @@
 
 - Preserve one monitor per task-managed continuation and retain result publication for service completions after executor detachment.
 - Prevent false async-media qualification failures when retired-card clocks continue to advance.
+- Publish collected walker results and their path arenas before worker completion.
+- Wait for owned shell jobs during replay qualification instead of relying on an external `wait` command.
+- Make rsync deletion qualification explicit about directory timestamp restoration.
+- Separate required visual captures from retained replay evidence without reducing the forty-image comparison contract.
 - Retire daemon brokers after runtime directory deletion or replacement, including relocated Unix sockets, without removing a successor's lease.
 - Honor live legacy broker leases on Linux and Windows even when they have no filesystem marker.
 - Preserve opaque URI semicolons during path-list expansion. Explicit path arrays disambiguate missing extensionless paths from opaque resources.
