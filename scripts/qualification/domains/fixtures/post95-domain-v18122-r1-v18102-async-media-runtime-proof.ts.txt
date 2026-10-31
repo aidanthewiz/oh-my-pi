@@ -190,9 +190,11 @@ function sessionFor(settings: InstanceType<typeof Settings>, manager: InstanceTy
 		getActiveModelString: () => "owned-local/owned-local" } as ToolSession;
 }
 function cardContentState(card: InstanceType<typeof ToolExecutionComponent>): string {
-	return JSON.stringify(card.describe(), function(key, value) {
-		// Live elapsed ages advance without job frames.
-		return key === "age" && this.role === "omp.run.time" && this.stopped === undefined ? undefined : value;
+	return JSON.stringify(card.describe(), (_key, value) => {
+		const props = value?.p;
+		const liveElapsed = value?.k === "elapsed" && props?.stopped === undefined;
+		const liveTool = value?.k === "tool" && (props?.status === "running" || props?.status === "pending");
+		return props && (liveElapsed || liveTool) ? { ...value, p: { ...props, age: undefined } } : value;
 	});
 }
 let failure: unknown;
