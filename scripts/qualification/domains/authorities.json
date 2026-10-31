@@ -30,7 +30,7 @@
     "final-portable-title-database-proof.ts": { "file": "post95-domain-v18122-r1-final-portable-title-database-proof.ts.txt", "sha256": "590d6a76e11ca932ffb05a6517cae4119378c35436544f4051e9889e986de160" },
     "final-sol-ultrafast-runtime-proof.ts": { "file": "post95-domain-v18122-r1-final-sol-ultrafast-runtime-proof.ts.txt", "sha256": "a4afaf9b2bf0831f062f92abd9a9d2e5641b26e848fb0ddff5d1a1c2ff22dc67" },
     "v18102-provider-beta-corrected-runtime-proof.ts": { "file": "post95-domain-v18122-r1-v18102-provider-beta-corrected-runtime-proof.ts.txt", "sha256": "15e03a5e32440a15bb92a4d3f6df27cf456f0e32de0e7625676763cd07322b74" },
-    "v18103-accounting-runtime-proof.ts": { "file": "post95-domain-v18122-r1-v18103-accounting-runtime-proof.ts.txt", "sha256": "a9e5ae81993c893f79548150ac3133f1ee430ab447d9d3196a8255f9b9e18b28" },
+    "v18103-accounting-runtime-proof.ts": { "file": "post95-domain-v18122-r1-v18103-accounting-runtime-proof.ts.txt", "sha256": "1af85f62ea3ee9d64d0cdd1e6c376a0531c777170ce10e0448a3f0a7917cf222" },
     "v18103-restore-runtime-proof.ts": { "file": "post95-domain-v18122-r1-v18103-restore-runtime-proof.ts.txt", "sha256": "2e4c6ba44394936174e58661008ce070b07da8a701ef1533363b377e8f08b17f" },
     "v18104-approval-runtime-proof.ts": { "file": "post95-domain-v18122-r1-v18104-approval-runtime-proof.ts.txt", "sha256": "60aeb28c96add67328a8d0bf95de0c5948eb025386cac5ee9c4ff63280b62f60" }
   },
@@ -43,6 +43,7 @@
     "Size the task-dispatch manual report above the current inline-output budget; retain full artifact equality, one parent delivery and exact child identity.",
     "Validate frozen-credit admission against the actual replay body and reject mutation before transport; do not pin callback counts.",
     "Resolve the accounting omptype package through its engine source entrypoint.",
+    "Import the Responses replay policy from openai-responses-state, matching the current Agent owner.",
     "Replace machine-home inequalities with filesystem-root and isolated-HOME assertions.",
     "Compile through the canonical parent compiler and execute with parent-enforced checkout-read denial.",
     "Copy actual ANSI, protocol, and image artifacts to output; expose title observations as six ANSI captures per mode."

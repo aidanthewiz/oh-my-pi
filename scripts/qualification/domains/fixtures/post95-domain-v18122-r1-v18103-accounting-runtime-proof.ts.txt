@@ -86,7 +86,7 @@ try {
  const { resolveImageTokenization, imageTokens } = await import("../../packages/catalog/src/compat/image-tokenization");
  const { Settings } = await import("../../packages/coding-agent/src/config/settings");
  const { createSettingsAwareStreamFn } = await import("../../packages/coding-agent/src/session/settings-stream-fn");
- const { openAIResponsesReplaysNativeHistory } = await import("../../packages/ai/src/providers/openai-responses");
+ const { openAIResponsesReplaysNativeHistory } = await import("../../packages/ai/src/providers/openai-responses-state");
  const { SessionManager } = await import("../../packages/coding-agent/src/session/session-manager");
  const { anonymizeSessionTranscripts } = await import("../../packages/coding-agent/src/session/session-anonymizer");
  const { closeSessionIndex } = await import("../../packages/coding-agent/src/session/session-index");
