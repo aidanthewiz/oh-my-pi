@@ -222,21 +222,21 @@ try {
 		params: { model: "claude-fable-5", stream: true, max_tokens: 512, messages: [{ role: "user", content: "frozen refused request" }], thinking: { type: "adaptive", ...(betaFields ? { block_binding: { prefix_mismatch_behavior: "drop_block" } } : {}) }, output_config: { effort: "high" }, fallbacks: [fallbackEntry] },
 		betas: [binding, contextBeta], betaHeader: `${binding},${contextBeta},${customBeta},server-side-fallback-2026-06-01`,
 	});
-	let freshBuilds = 0;
 	const forfeiture = frozen(true), forfeitureBefore = structuredClone(forfeiture);
-	const fresh = await capture(makeModel(), { fallbackCreditRedemption: forfeiture, onPayload: () => { freshBuilds++; } });
-	assert.equal(freshBuilds, 1);
+	const fresh = await capture(makeModel(), { fallbackCreditRedemption: forfeiture });
 	assert.equal(fresh.body.fallback_credit_token, undefined);
 	assert(JSON.stringify(fresh.body.messages).includes(marker));
 	assert(fresh.headers.get("anthropic-beta")?.includes("effort-2025-11-24"));
 	assert.deepEqual(forfeiture, forfeitureBefore);
 	noWithheldHeader(fresh);
-	record("frozen-beta-redemption-forfeited-fresh-betas-retained", fresh, { freshBuilds });
+	record("frozen-beta-redemption-forfeited-fresh-betas-retained", fresh);
 
-	freshBuilds = 0;
 	const safeFrozen = frozen(false), safeBefore = structuredClone(safeFrozen);
-	const redeemed = await capture(makeModel(), { fallbackCreditRedemption: safeFrozen, onPayload: () => { freshBuilds++; } });
-	assert.equal(freshBuilds, 0);
+	const redeemed = await capture(makeModel(), { fallbackCreditRedemption: safeFrozen, onPayload: payload => {
+		const admitted = payload as Record<string, any>;
+		assert.equal(admitted.fallback_credit_token, "fct_synthetic");
+		assert.equal(admitted.messages[0].content, "frozen refused request");
+	} });
 	assert.equal(redeemed.body.fallback_credit_token, "fct_synthetic");
 	assert.equal(redeemed.body.fallbacks, undefined);
 	assert.equal(redeemed.body.messages[0].content, "frozen refused request");
@@ -245,7 +245,18 @@ try {
 	assert(!redeemed.headers.get("anthropic-beta")?.includes("server-side-fallback-"));
 	assert.deepEqual(safeFrozen, safeBefore);
 	noWithheldHeader(redeemed);
-	record("safe-redemption-replays-frozen-body-drops-fallbacks-and-withheld-header", redeemed, { freshBuilds });
+	const beforeMutation = syntheticRequests;
+	const mutationDenied = await streamAnthropic(makeModel(), { messages }, {
+		apiKey, fallbackCreditRedemption: safeFrozen,
+		onPayload: payload => {
+			(payload as { messages: { content: unknown }[] }).messages[0].content = "rewritten frozen request";
+		},
+		fetch: (async () => { syntheticRequests++; throw new Error("mutated frozen replay reached transport"); }) as typeof fetch,
+	}).result();
+	assert.equal(mutationDenied.stopReason, "error");
+	assert.equal(syntheticRequests, beforeMutation);
+	assert.deepEqual(safeFrozen, safeBefore, "rejected admission must not mutate the saved credit");
+	record("safe-redemption-replays-frozen-body-drops-fallbacks-and-withheld-header", redeemed, { replayMutationRejected: true });
 
 	const beforeBlocked = syntheticRequests;
 	const blockedHandle = frozen(true);
