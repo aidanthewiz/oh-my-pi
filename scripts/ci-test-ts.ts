@@ -3,6 +3,7 @@
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { Process as ProcessHandle } from "@oh-my-pi/pi-natives";
 
 type Mode =
 	| "all"
@@ -438,6 +439,7 @@ async function runTestCommand(testCommand: TestCommand): Promise<void> {
 	}
 
 	const env = buildChildEnv();
+	const inspector = await loadProcessInspector();
 	for (let attempt = 1; ; attempt++) {
 		const proc = Bun.spawn(testCommand.command, {
 			cwd,
@@ -445,20 +447,21 @@ async function runTestCommand(testCommand: TestCommand): Promise<void> {
 			stdout: "inherit",
 			stderr: "inherit",
 		});
+		const ownedProcess = pinTestProcess(proc, inspector);
 		// Watchdog, mirroring the parallel path: record that *we* killed the child,
 		// otherwise the resulting 137 is indistinguishable from an OOM kill.
 		let timedOut = false;
-		const killTimer = setTimeout(async () => {
+		let retirement: Promise<void> | undefined;
+		const killTimer = setTimeout(() => {
 			timedOut = true;
-			try {
-				process.stdout.write(await describeStuckProcessTree(proc.pid));
-			} finally {
-				proc.kill("SIGKILL");
-			}
+			retirement = retireStuckTestProcess(proc, ownedProcess).then(diagnostics => {
+				process.stdout.write(diagnostics);
+			});
 		}, chunkTimeoutMs());
 		const exitCode = await proc.exited;
 		clearTimeout(killTimer);
-		if (exitCode === 0) {
+		await retirement;
+		if (exitCode === 0 && !timedOut) {
 			return;
 		}
 		if (!timedOut && BUN_CRASH_EXITS[exitCode] && attempt < MAX_CHUNK_ATTEMPTS) {
@@ -519,6 +522,95 @@ function chunkTimeoutMs(): number {
 	const raw = Number(Bun.env.OMP_TEST_CHUNK_TIMEOUT?.trim());
 	if (Number.isFinite(raw) && raw >= 1) return raw * 1000;
 	return 600_000;
+}
+
+type TestProcess = {
+	pid: number;
+	exitCode: number | null;
+	kill(signal: NodeJS.Signals): void;
+};
+type ProcessInspector = typeof ProcessHandle;
+
+async function loadProcessInspector(): Promise<ProcessInspector | undefined> {
+	try {
+		// Static loading would prevent even dry runs when the platform addon is absent.
+		return (await import("@oh-my-pi/pi-natives")).Process;
+	} catch {
+		// The runner must still enforce its deadline without a loadable addon.
+		return undefined;
+	}
+}
+
+function pinTestProcess(proc: TestProcess, inspector: ProcessInspector | undefined): ProcessHandle | undefined {
+	try {
+		if (proc.exitCode !== null) return undefined;
+		const owned = inspector?.fromPid(proc.pid);
+		return proc.exitCode === null && owned?.ppid === process.pid ? owned : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+async function retireStuckTestProcess(proc: TestProcess, owned: ProcessHandle | undefined): Promise<string> {
+	const descendants: ProcessHandle[] = [];
+	const cleanupFailures: string[] = [];
+	try {
+		if (!owned) throw new Error("owned process handle unavailable");
+		// Pin the whole tree before diagnostics yield. Detached workers can
+		// reparent when their coordinator exits, but the handles retain identity.
+		const seen = new Set([owned.pid]);
+		const pending = [owned];
+		for (const parent of pending) {
+			for (const child of parent.children()) {
+				if (seen.has(child.pid) || child.ppid !== parent.pid) continue;
+				seen.add(child.pid);
+				descendants.push(child);
+				pending.push(child);
+			}
+		}
+	} catch (err) {
+		cleanupFailures.push(
+			`[watchdog] descendant inspection failed: ${err instanceof Error ? err.message : String(err)}`,
+		);
+	}
+	let diagnostics = "";
+	try {
+		diagnostics = await describeStuckProcessTree(proc.pid);
+	} finally {
+		// Native handles validate identity and never signal a shared parent group.
+		// Retire children first so killing the coordinator cannot hide workers.
+		for (const child of descendants.reverse()) {
+			try {
+				if (child.status() === "running" && child.killTree(9) === 0 && child.status() === "running") {
+					cleanupFailures.push(`[watchdog] descendant ${child.pid}: no successful kill confirmed`);
+				}
+			} catch (err) {
+				cleanupFailures.push(
+					`[watchdog] descendant ${child.pid} cleanup failed: ${err instanceof Error ? err.message : String(err)}`,
+				);
+			}
+		}
+		try {
+			if (owned?.status() === "running" && owned.killTree(9) === 0 && owned.status() === "running") {
+				cleanupFailures.push(`[watchdog] coordinator ${owned.pid}: no successful native kill confirmed`);
+			}
+		} catch (err) {
+			cleanupFailures.push(
+				`[watchdog] coordinator cleanup failed: ${err instanceof Error ? err.message : String(err)}`,
+			);
+		}
+		// Inspection failure must not disable the coordinator's watchdog.
+		if (proc.exitCode === null) {
+			try {
+				proc.kill("SIGKILL");
+			} catch (err) {
+				cleanupFailures.push(
+					`[watchdog] coordinator SIGKILL failed: ${err instanceof Error ? err.message : String(err)}`,
+				);
+			}
+		}
+	}
+	return `${diagnostics}${cleanupFailures.length ? `${cleanupFailures.join("\n")}\n` : ""}`;
 }
 
 // What a watchdog-killed chunk was still doing, captured just before the
@@ -854,6 +946,7 @@ function formatChunkFailure(failure: ChunkOutcome, replayOutput: boolean): strin
 // run surfaces every broken chunk and exits non-zero without a runner stack trace.
 async function runTestCommandsInParallel(commands: TestCommand[], concurrency: number): Promise<void> {
 	const env = buildChildEnv();
+	const inspector = await loadProcessInspector();
 	const queue = [...commands];
 	const failures: ChunkOutcome[] = [];
 	let completed = 0;
@@ -915,6 +1008,7 @@ async function runTestCommandsInParallel(commands: TestCommand[], concurrency: n
 			stdout: "pipe",
 			stderr: "pipe",
 		});
+		const ownedProcess = pinTestProcess(proc, inspector);
 		const stdout = { text: "" };
 		const stderr = { text: "" };
 		const stdoutDrain = drainInto(proc.stdout as ReadableStream<Uint8Array>, stdout);
@@ -924,16 +1018,16 @@ async function runTestCommandsInParallel(commands: TestCommand[], concurrency: n
 		// after a GC crash) would otherwise hang this worker forever.
 		let timedOut = false;
 		let stuckTree = "";
-		const killTimer = setTimeout(async () => {
+		let retirement: Promise<void> | undefined;
+		const killTimer = setTimeout(() => {
 			timedOut = true;
-			try {
-				stuckTree = await describeStuckProcessTree(proc.pid);
-			} finally {
-				proc.kill("SIGKILL");
-			}
+			retirement = retireStuckTestProcess(proc, ownedProcess).then(diagnostics => {
+				stuckTree = diagnostics;
+			});
 		}, chunkTimeoutMs());
 		const exitCode = await proc.exited;
 		clearTimeout(killTimer);
+		await retirement;
 		if (!(await settleWithin(drains, 5000))) {
 			stdoutDrain.cancel();
 			stderrDrain.cancel();

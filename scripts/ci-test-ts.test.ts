@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { Process, ProcessStatus } from "@oh-my-pi/pi-natives";
 import { ptree, TempDir } from "@oh-my-pi/pi-utils";
 
 const fixtures = [
@@ -26,6 +27,7 @@ const inspectedNames = [
 async function prepareFixture(root: string): Promise<void> {
 	await fs.mkdir(path.join(root, "scripts"), { recursive: true });
 	await fs.copyFile(new URL("./ci-test-ts.ts", import.meta.url), path.join(root, "scripts/ci-test-ts.ts"));
+	await fs.symlink(path.resolve(import.meta.dir, "../node_modules"), path.join(root, "node_modules"), "junction");
 	for (const { name, file } of fixtures) {
 		const target = path.join(root, file);
 		await fs.mkdir(path.dirname(target), { recursive: true });
@@ -33,12 +35,18 @@ async function prepareFixture(root: string): Promise<void> {
 			target,
 			`import { test } from "bun:test";
 import * as path from "node:path";
+import * as fs from "node:fs/promises";
 test("owned runner consumer", async () => {
  const output = process.env.RUNNER_TEST_OUTPUT;
  if (!output) throw new Error("Missing owned output directory");
  const name = ${JSON.stringify(name)};
  if (process.env.RUNNER_TEST_STALL === name) {
-  await Bun.write(path.join(output, name + ".started"), "started");
+  const detached = Bun.spawn([process.execPath, "--no-env-file", "-e", "await Bun.sleep(60000)"], {
+   detached: true, stdin: "ignore", stdout: "ignore", stderr: "ignore",
+  });
+  const started = path.join(output, name + ".started");
+  await Bun.write(started + ".tmp", JSON.stringify({ pid: process.pid, detachedPid: detached.pid }));
+  await fs.rename(started + ".tmp", started);
   await Bun.sleep(60000);
  }
  await Bun.write(path.join(output, name + ".json"), JSON.stringify({name, env: Object.fromEntries(${JSON.stringify(inspectedNames)}.map(key => [key, process.env[key] ?? null]))}));
@@ -104,24 +112,69 @@ describe("CI runner process boundaries", () => {
 		}
 	}, 20_000);
 
-	test("kills a stalled chunk before completion and runs subsequent chunks", async () => {
-		using dir = TempDir.createSync("omp-test-runner-watchdog-");
-		await prepareFixture(dir.path());
-		const output = dir.join("output");
-		const result = await runFixture(dir.path(), output, {
-			OMP_TEST_CHUNK_TIMEOUT: "1",
-			RUNNER_TEST_STALL: "natives",
-		});
-		expect(result.exitCode).toBe(1);
-		expect(await Bun.file(path.join(output, "natives.started")).text()).toBe("started");
-		expect(await Bun.file(path.join(output, "natives.json")).exists()).toBe(false);
-		expect(await completedConsumers(output)).toEqual(
-			consumers
-				.slice(1)
-				.map(name => `${name}.json`)
-				.sort(),
-		);
-	}, 20_000);
+	// Real subprocess deadlines and process-table transitions require the platform clock.
+	for (const concurrency of ["1", undefined]) {
+		test(`retires a stalled chunk and its detached worker (${concurrency ? "pooled" : "sequential"})`, async () => {
+			using dir = TempDir.createSync("omp-test-runner-watchdog-");
+			await prepareFixture(dir.path());
+			const output = dir.join("output");
+			const unrelated = Bun.spawn([process.execPath, "--no-env-file", "-e", "await Bun.sleep(60000)"], {
+				detached: true,
+				stdin: "ignore",
+				stdout: "ignore",
+				stderr: "ignore",
+			});
+			const unrelatedHandle = Process.fromPid(unrelated.pid);
+			let owner: Process | null = null;
+			let detached: Process | null = null;
+			const pending = runFixture(dir.path(), output, {
+				OMP_TEST_CONCURRENCY: concurrency,
+				OMP_TEST_CHUNK_TIMEOUT: "1",
+				RUNNER_TEST_STALL: "natives",
+			});
+			try {
+				const startedPath = path.join(output, "natives.started");
+				const startedDeadline = Date.now() + 5000;
+				while (!(await Bun.file(startedPath).exists()) && Date.now() < startedDeadline) await Bun.sleep(10);
+				const started = await Bun.file(startedPath).json();
+				owner = Process.fromPid(started.pid);
+				detached = Process.fromPid(started.detachedPid);
+				expect(owner?.status()).toBe(ProcessStatus.Running);
+				expect(detached?.status()).toBe(ProcessStatus.Running);
+				if (process.platform !== "win32") {
+					expect(detached?.groupId()).toBe(started.detachedPid);
+					expect(detached?.groupId()).not.toBe(owner?.groupId());
+				}
+				const result = await pending;
+				expect(result.exitCode, result.stderr || result.stdout).toBe(1);
+				const exitDeadline = Date.now() + 1000;
+				while (
+					(owner?.status() === ProcessStatus.Running || detached?.status() === ProcessStatus.Running) &&
+					Date.now() < exitDeadline
+				) {
+					await Bun.sleep(10);
+				}
+				expect(owner?.status()).not.toBe(ProcessStatus.Running);
+				expect(detached?.status()).not.toBe(ProcessStatus.Running);
+				expect(unrelatedHandle?.status()).toBe(ProcessStatus.Running);
+				expect(await Bun.file(path.join(output, "natives.json")).exists()).toBe(false);
+				expect(await completedConsumers(output)).toEqual(
+					concurrency
+						? consumers
+								.slice(1)
+								.map(name => `${name}.json`)
+								.sort()
+						: [],
+				);
+			} finally {
+				if (detached?.status() === ProcessStatus.Running) detached.killTree(9);
+				if (owner?.status() === ProcessStatus.Running) owner.killTree(9);
+				unrelated.kill("SIGKILL");
+				await unrelated.exited;
+				await pending;
+			}
+		}, 20_000);
+	}
 
 	test("shards execute every chunk exactly once and remain balanced", async () => {
 		using dir = TempDir.createSync("omp-test-runner-shards-");
