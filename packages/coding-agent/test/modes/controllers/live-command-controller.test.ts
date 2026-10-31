@@ -295,7 +295,8 @@ describe("LiveSessionController with a caller-owned peer", () => {
 		const phases: string[] = [];
 		const agentSession = await createAgentSession();
 		vi.spyOn(agentSession, "sendCustomMessage").mockImplementation(async message => {
-			delegated.push(String(message.content));
+			delegated.push(String(typeof message === "string" ? message : message.content));
+			return true;
 		});
 		const session = new LiveSessionController({
 			session: agentSession,

@@ -387,6 +387,8 @@ describe("AgentSession manual retry", () => {
 			const failedLeaf = manager.getLeafId();
 			const completedResults = active.agent.state.messages.filter(message => message.role === "toolResult");
 			const diagnostic = active.agent.state.messages.at(-1);
+			if (!diagnostic) throw new Error("Expected retry diagnostic");
+			expect(diagnostic).toMatchObject({ role: "custom", customType: "retry-diagnostic" });
 			expect(active.hasAbortedToolCallTail).toBe(!partial);
 			await expect(active.retry()).resolves.toBe(true);
 			await active.waitForIdle();

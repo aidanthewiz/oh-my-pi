@@ -9,7 +9,12 @@ import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { captureApprovalTargets, recordApprovalGrant, resolveApproval } from "@oh-my-pi/pi-coding-agent/tools/approval";
-import { approvalGrantKey, SessionApprovals } from "@oh-my-pi/pi-coding-agent/tools/approval-cache";
+import {
+	approvalGrantKey,
+	ApprovalCache,
+	ApprovalGrants,
+	SessionApprovals,
+} from "@oh-my-pi/pi-coding-agent/tools/approval-cache";
 import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
 
 function textOf(result: { content: ReadonlyArray<{ type: string; text?: string }> }): string {
@@ -95,7 +100,7 @@ describe("artifact reads through session approval", () => {
 		const unregister = registerArtifactsDir(root);
 		try {
 			const read = readTool();
-			const grants = new SessionApprovals();
+			const grants = new ApprovalGrants(new SessionApprovals(), new ApprovalCache(path.join(root, "agent")));
 			const approve = async (target: string) => {
 				const args = { path: target };
 				const captured = await captureApprovalTargets(read, args, root);
@@ -127,7 +132,7 @@ describe("artifact reads through session approval", () => {
 		try {
 			const read = readTool();
 			const args = { path: "artifact://56:raw:1-1" };
-			const grants = new SessionApprovals();
+			const grants = new ApprovalGrants(new SessionApprovals(), new ApprovalCache(path.join(root, "agent")));
 			const captured = await captureApprovalTargets(read, args, root);
 			expect(captured.failed).toBe(false);
 			recordApprovalGrant(read, args, grants, "read", { grant: "target", always: false }, captured);
