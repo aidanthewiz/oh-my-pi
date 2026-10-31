@@ -14,8 +14,6 @@
 //!   fake remote shell), `{REF}` (the reference binary), `{BIN}` (shared
 //!   helper directory: password files), `{PORT}` (this side's daemon port).
 //!
-//! Every scenario here was run against rsync 3.5.1 repeatedly to confirm its
-//! normalized output and resulting trees are deterministic.
 
 use super::{Case, c, u};
 
@@ -44,25 +42,25 @@ pub(super) const LOCAL: &[Case] = &[
 	c("out_format_v", 0, "", &["-av", "--out-format=[%o] %n%L %l", "src/", "dst/"]),
 	c("log_file", 0, "stale", &["-ai", "--log-file=rsync.log", "src/", "dst/"]),
 	// Dry runs and listings.
-	c("dry_run", 0, "stale", &["-ain", "--delete", "src/", "dst/"]),
+	u("dry_run", 0, "stale", &["-ain", "--delete", "src/", "dst/"]),
 	c("dry_run_stats", 0, "stale", &["-an", "--stats", "src/", "dst/"]),
 	c("list_only_file", 0, "", &["--list-only", "src/small.txt"]),
 	c("list_only_dir", 0, "", &["--list-only", "src/"]),
 	c("list_only_r", 0, "", &["--list-only", "-r", "src"]),
 	c("list_implied", 0, "", &["-a", "src/"]),
-	// Deletion.
-	c("delete", 0, "stale", &["-ai", "--delete", "src/", "dst/"]),
+	// Incremental recursion defaults to --delete-during.
+	u("delete", 0, "stale", &["-ai", "--delete", "src/", "dst/"]),
 	c("delete_before", 0, "stale", &["-ai", "--delete-before", "src/", "dst/"]),
 	u("delete_during", 0, "stale", &["-ai", "--delete-during", "src/", "dst/"]),
 	c("delete_delay", 0, "stale", &["-ai", "--delete-delay", "src/", "dst/"]),
 	c("delete_after", 0, "stale", &["-ai", "--delete-after", "src/", "dst/"]),
-	c("delete_v", 0, "stale", &["-av", "--delete", "src/", "dst/"]),
-	c("delete_excluded", 0, "stale", &["-ai", "--delete-excluded", "--exclude=*.o", "src/", "dst/"]),
-	c("delete_keeps_excluded", 0, "stale", &["-ai", "--delete", "--exclude=*.o", "src/", "dst/"]),
-	c("max_delete", 25, "stale", &["-ai", "--delete", "--max-delete=1", "src/", "dst/"]),
+	u("delete_v", 0, "stale", &["-av", "--delete", "src/", "dst/"]),
+	u("delete_excluded", 0, "stale", &["-ai", "--delete-excluded", "--exclude=*.o", "src/", "dst/"]),
+	u("delete_keeps_excluded", 0, "stale", &["-ai", "--delete", "--exclude=*.o", "src/", "dst/"]),
+	u("max_delete", 25, "stale", &["-ai", "--delete", "--max-delete=1", "src/", "dst/"]),
 	c("conflict", 23, "conflict", &["-ai", "src/", "dst/"]),
 	c("conflict_force", 0, "conflict", &["-ai", "--force", "src/", "dst/"]),
-	c("conflict_delete", 0, "conflict", &["-ai", "--delete", "src/", "dst/"]),
+	u("conflict_delete", 0, "conflict", &["-ai", "--delete", "src/", "dst/"]),
 	// Backups.
 	c("backup", 0, "stale", &["-aib", "src/", "dst/"]),
 	c("backup_dir", 0, "stale", &["-ai", "--backup-dir=../bak", "src/", "dst/"]),
@@ -194,8 +192,8 @@ pub(super) const RSH: &[Case] = &[
 	c("pull_delta_stats", 0, "stale", &["-a", "--stats", "h:src/", "dst/"]),
 	c("push_verbose", 0, "stale", &["-av", "src/", "h:dst/"]),
 	c("pull_verbose", 0, "stale", &["-av", "h:src/", "dst/"]),
-	c("push_delete", 0, "stale", &["-ai", "--delete", "src/", "h:dst/"]),
-	c("pull_delete", 0, "stale", &["-ai", "--delete", "h:src/", "dst/"]),
+	u("push_delete", 0, "stale", &["-ai", "--delete", "src/", "h:dst/"]),
+	u("pull_delete", 0, "stale", &["-ai", "--delete", "h:src/", "dst/"]),
 	c("push_delete_after_excluded", 0, "stale", &["-ai", "--delete-after", "--delete-excluded", "--exclude=*.o", "src/", "h:dst/"]),
 	c("pull_delete_delay", 0, "stale", &["-ai", "--delete-delay", "h:src/", "dst/"]),
 	c("push_compress", 0, "stale", &["-aiz", "src/", "h:dst/"]),

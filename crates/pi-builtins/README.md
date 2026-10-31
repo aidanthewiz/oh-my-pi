@@ -82,6 +82,8 @@ Directory markers and invalid message bytes remain intact.
 Conformance compares exit status, logical transfer sizes, output events and resulting filesystem state.
 It normalizes packetization-dependent wire totals and derived rates.
 Known concurrent output compares as a multiset, preserving every event and duplicate count.
+This includes implicit `--delete-during` with protocol 30 or later.
+Explicit before, after and delayed deletion modes retain ordered comparisons.
 
 ## Licensing
 
