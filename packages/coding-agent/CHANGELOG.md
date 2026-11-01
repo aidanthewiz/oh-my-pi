@@ -20,7 +20,7 @@
 - Wait for owned shell jobs during replay qualification instead of relying on an external `wait` command.
 - Make rsync deletion qualification explicit about directory timestamp restoration.
 - Separate required visual captures from retained replay evidence without reducing the forty-image comparison contract.
-- Verify reviewed shell environments from child state without depending on PTY transcript framing.
+- Verify reviewed and filtered shell environments from child state without depending on PTY transcript framing.
 - Retire completed Rust qualification executables between shards while retaining compiler dependencies and full target coverage.
 - Close mirrored pipeline streams before downstream EOF completes foreground shell execution.
 - Preserve relay attachment ownership across unrelated extension storage updates and stale socket callbacks.

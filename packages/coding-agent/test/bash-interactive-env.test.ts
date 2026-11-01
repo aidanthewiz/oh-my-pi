@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import type { AgentToolContext } from "@oh-my-pi/pi-agent-core";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { runInteractiveBashPty } from "@oh-my-pi/pi-coding-agent/tools/bash-interactive";
+import { TempDir } from "@oh-my-pi/pi-utils";
 
 function headlessUi(): NonNullable<AgentToolContext["ui"]> {
 	// The test only exercises `custom`; the production context supplies the other UI methods.
@@ -24,13 +25,14 @@ function headlessUi(): NonNullable<AgentToolContext["ui"]> {
 
 test("interactive PTY commands receive only the filtered replacement environment", async () => {
 	const original = Bun.env.MANAGED_PROFILE_SECRET;
+	const tempDir = TempDir.createSync("@omp-filtered-pty-env-");
 	try {
 		Bun.env.MANAGED_PROFILE_SECRET = "parent-secret";
 		const shell = (await Settings.init()).getShellConfig();
 		const result = await runInteractiveBashPty(headlessUi(), {
-			command: `printf "%s|%s" "\${MANAGED_PROFILE_SECRET-unset}" "\${EXPLICIT_SAFE-unset}"`,
+			command: `printf "%s|%s" "\${MANAGED_PROFILE_SECRET-unset}" "\${EXPLICIT_SAFE-unset}" > filtered-env.txt`,
 			shell,
-			cwd: process.cwd(),
+			cwd: tempDir.path(),
 			env: {
 				MANAGED_PROFILE_SECRET: "caller-secret",
 				EXPLICIT_SAFE: "explicit-value",
@@ -38,9 +40,10 @@ test("interactive PTY commands receive only the filtered replacement environment
 		});
 
 		expect(result.exitCode).toBe(0);
-		expect(result.output).toBe("unset|explicit-value");
+		expect(await Bun.file(`${tempDir.path()}/filtered-env.txt`).text()).toBe("unset|explicit-value");
 	} finally {
 		if (original === undefined) delete Bun.env.MANAGED_PROFILE_SECRET;
 		else Bun.env.MANAGED_PROFILE_SECRET = original;
+		tempDir.removeSync();
 	}
 });
