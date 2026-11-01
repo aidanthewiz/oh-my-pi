@@ -49,7 +49,7 @@ describe("browser handle enrichment — fill()", () => {
 	it("adds a fill() that clears the current value before typing", async () => {
 		const node = { value: "old", focused: false };
 		const stub = {
-			evaluate: async (fn: (el: unknown) => unknown) => {
+			evaluate: async (fn: (el: unknown) => unknown) =>
 				fn({
 					get value() {
 						return node.value;
@@ -61,8 +61,7 @@ describe("browser handle enrichment — fill()", () => {
 						node.focused = true;
 					},
 					matches: () => false,
-				});
-			},
+				}),
 			frame: {
 				page: () => ({
 					keyboard: {

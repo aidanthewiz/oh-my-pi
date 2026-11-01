@@ -20,6 +20,7 @@ import {
 } from "@oh-my-pi/pi-ai";
 import type { ImageContent } from "@oh-my-pi/pi-ai/types";
 import { ConfigurationError, ProviderResponseError, ValidationError } from "@oh-my-pi/pi-ai/error";
+import { withCredentialRedaction } from "@oh-my-pi/pi-ai/providers/transform-messages";
 import { withEnv } from "./helpers";
 
 const LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
@@ -478,6 +479,28 @@ describe("NativeJudge", () => {
 				],
 			]),
 		);
+	});
+
+	it("redacts credentials from the state under an active redaction policy", async () => {
+		const token = `ghp_${"aB1".repeat(12)}`;
+		const state = { recent: [{ role: "user", text: `rotate ${token} for deploys` }] };
+		const bodies: string[] = [];
+		const judge = new NativeJudge({
+			apiKey: token,
+			fetch: async (_url, init) => {
+				expect(new Headers(init?.headers).get("authorization")).toBe(`Bearer ${token}`);
+				bodies.push(String(init?.body));
+				return answered();
+			},
+		});
+
+		await withCredentialRedaction(true, () => judge.judge({ ...request, state }));
+		await withCredentialRedaction(false, () => judge.judge({ ...request, state }));
+
+		expect(bodies[0]).not.toContain(token);
+		expect(bodies[0]).toContain("[github_token_redacted]");
+		expect(bodies[1]).toContain(token);
+		expect(state.recent[0].text).toBe(`rotate ${token} for deploys`);
 	});
 
 	it("sends the default User-Agent unless configured headers override it", async () => {

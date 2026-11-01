@@ -3709,7 +3709,7 @@ describe("ModelRegistry", () => {
 				{
 					seedCache: dbPath =>
 						writeModelCache(
-							"cached-compact-proxy:openai-models-list-context-v5",
+							"cached-compact-proxy:openai-models-list-context-v6",
 							Date.now(),
 							[
 								buildModel({

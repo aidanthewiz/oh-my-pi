@@ -19,6 +19,18 @@
 - Keep supported discovered models when other rows cannot be built; preserve cache fallback for incomplete responses.
 - Retained deterministic AWS, Nova, Mantle, and GPT-5.6 policies alongside the frozen 18.9.0 catalog source.
 - Derive AWS-hosted model throughput and prompt windows from the frozen provider catalog. Sonnet 4.5 follows the target's 200K prompt window instead of retaining the older 1M snapshot.
+## [18.14.1] - 2026-10-31
+
+### Changed
+
+- Clamping a requested thinking effort now resolves through the model's `effortMap` alias first, so the request lands on the tier the model serves instead of the nearest lower one ([#17395](https://github.com/can1357/oh-my-pi/pull/17395) by [@Maziar123](https://github.com/Maziar123))
+- Long image-heavy conversations on the official Anthropic API now keep up to 120 MB of inline images before evicting older ones, following the Messages API request limit increase from 32 MB to 128 MB
+- The official Anthropic API now records its 128 MB request limit (`request-body-byte-limit`), so the newest message's images can use the 8 MB reserve and long text cannot push images past the limit ([#17492](https://github.com/can1357/oh-my-pi/pull/17492) by [@will-bogusz](https://github.com/will-bogusz))
+
+### Fixed
+
+- Fixed Cursor's DeepSeek V4.1 Flash 1017 reporting zero cost; every effort level now bills at Cursor's API rate of $0.30/$1.20 per million tokens, with cache reads at $0.006 ([#17390](https://github.com/can1357/oh-my-pi/pull/17390) by [@eggpeat](https://github.com/eggpeat))
+
 ## [18.14.0] - 2026-10-29
 
 ### Breaking Changes

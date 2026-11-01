@@ -9,6 +9,16 @@
 - Fixed queued follow-ups being delayed by non-triggering custom messages appended at the end of a turn.
 - Invalidate cached tool context when NUL-bearing names and descriptions form different identity tuples.
 - Recount cross-model Claude signed thinking when the same reader's endpoint or prefix-binding policy changes.
+## [18.14.1] - 2026-10-31
+
+### Breaking Changes
+
+- `SentToolDefinitions.inactiveFor(messages, tools)` is replaced by `withInactiveTools(context)`, which also clears a stale `inactiveTools`; `transformProviderContext` now receives the request's `inactiveTools` ([#17492](https://github.com/can1357/oh-my-pi/pull/17492))
+
+### Fixed
+
+- Long tool-call intents no longer block tool execution when intent tracing is enabled ([#13140](https://github.com/can1357/oh-my-pi/issues/13140)).
+
 ## [18.14.0] - 2026-10-29
 
 ### Breaking Changes

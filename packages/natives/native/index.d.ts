@@ -258,6 +258,14 @@ export declare class FileLock {
    * Name-only locks never create files.
    */
   static tryAcquire(path: string, create?: boolean | undefined | null): FileLock
+  /**
+   * Whether any handle, in any process including this one, holds `path`.
+   *
+   * Observes without locking or opening the lock: a `connect(2)` probe on
+   * Linux, an `F_GETLK` query on other Unix platforms, a `\BaseNamedObjects`
+   * directory listing on Windows. A concurrent `tryAcquire()` never meets it.
+   */
+  static isHeld(path: string): boolean
   /** Whether this handle owns the requested lock. */
   get acquired(): boolean
   /** Release this handle's ownership without affecting a successor. */

@@ -402,6 +402,8 @@ A failed card leaves the title plain. An interrupt drops only the pending card f
 
 Empty context or failed generation leaves the current name unchanged. A switch, newer rename, cancellation, or newer title transaction rejects stale inference. Local tiny-model failures never fall back to an online provider.
 
+`title.refreshAfterPrompts` defaults to `0` (off). A positive value enables a judge check after that many operator prompts. Only stale generated titles are regenerated. Each check consumes its counted prompts, including unavailable judgments. User titles and newer title transactions remain unchanged. The judge uses the session's admission and cost hooks. Generation retains the existing title-request cancellation, credential-redaction, and cost checks.
+
 Presentation reads current preferences at its sinks. `boring` shows the authoritative title only. `emoji` uses the portable candidate. `nf+emoji` uses Nerd Fonts only with the active Nerd symbol preset; otherwise it uses emoji. Native and OS titles never select a private-use candidate. Extension terminal overrides retain their existing sanitization and survive preference-only refreshes.
 
 ### `ttsr_injection`
@@ -547,6 +549,14 @@ Algorithm:
 5. Convert `message`, `custom_message`, and `branch_summary` entries into messages. Other entry types only affect replay state or metadata.
 6. Remove dangling tool calls from replay (unless explicitly retained for a mid-turn transcript), neutralizing protected reasoning metadata on rewritten turns; drop unsafe aborted/error assistant turns and their paired tool results from model context.
 
+### Queued compaction
+
+During a run, `/compact` submitted with the follow-up key waits for the next yield instead of interrupting it. Earlier submissions, retries, and pending async results settle first. Later follow-ups wait behind compaction and are delivered once through the existing maintenance boundary.
+
+A focus-only view change preserves the queue. A session switch, incompatible tree navigation, or user stop returns the request and held input to the editor. The queue retains its conversation position through summarization; it never submits held input to a replacement conversation.
+
+The `providers.openai-codex.daybreak` setting defaults to `true`, preserving existing eligible-account selection of Daybreak Blue. Set it to `false` to opt out per session. OpenAI may use Daybreak Blue content for model improvement. Dedicated Daybreak models retain their provider-specific behavior.
+
 ## Persistence Guarantees and Failure Model
 
 ### Persist vs in-memory
@@ -575,6 +585,7 @@ Ordinary completed appends update memory and local file storage synchronously on
 - `FileSessionStorage` holds a process-owned OS lease on each session a process writes, keyed by the session id rather than the file's path, so every process that reaches one journal (through a symlink, a hard link, or after a move) meets the same lease. The lease is `pi-utils` `tryAcquireFileLock` on `<session-owners>/<session-id>`, where `<session-owners>` is `~/.omp/run/session-owners` (XDG: `$XDG_STATE_HOME/omp/run/session-owners`), shared across profiles: on Linux an abstract socket and on Windows a named mutex, neither of which creates a file; on macOS and other non-Linux Unix a `flock` on a sidecar in that directory. Only write paths claim it, so the first process to write a session owns it; opening a session to inspect it (`omp share`, `--export`, `render`) never does. Managers in one process share the lease; it is released on close or a session switch, and the kernel drops it when its process exits. Processes with different home or state directories do not meet in this lease. A plain copy of a session file keeps its id, so a process writing the copy while the original's writer is live moves to a sibling; a collab guest's replica takes its own id (`parentSession` is the host's) so it never contends with the host.
 - A process never writes a session whose lease another live process holds: its first write moves the session to a fresh sibling `<timestamp>_<new-session-id>.jsonl` in the same directory, publishes the whole in-memory transcript there once, and continues appending incrementally. The owner's file is left untouched. Like `fork`, the sibling gets a new session id with `parentSession` pointing at the old one and keeps the provider prompt-cache key, so resume-by-id, the title index, and the picker never see two files for one id. The artifacts directory is copied in the background without overwriting files the moved session has already written; its artifact manager waits for the copy before allocating ids or resolving `artifact://`, and `flush()`/`close()` await it. `local://` and `agent://` reads that bypass the artifact manager can miss pre-move files until the copy finishes.
 - `moveTo()` refuses to move a session another process writes or a source whose header ID changed. It never replaces an occupied destination, even when idle.
+- Another program can check ownership without claiming: `isSessionLeaseHeld(sessionId)`, `coreforge session lease --json -- <id>...` (`{"held": [...], "unknown": [...]}`), and RPC `get_session_lease` observe the lease without taking or opening it (a connect probe on Linux, `F_GETLK` on other Unix, a `\BaseNamedObjects` directory listing on Windows), so they never make a concurrent claim fork the session.
 - Under `bun test`, the lease directory is `<os temp>/omp-test-session-owners-<uid>` instead of the real state directory. It is exported as `PI_TEST_SESSION_OWNERS_DIR` when `session-storage` loads; a test that spawns an omp process which writes sessions must pass `env: process.env` (Bun's default is the launch environment), or run under `ci-test-ts`, whose children inherit `PI_TEST_RUNTIME=1` and derive the same directory.
 - File and memory rewrite recovery adopts only entries appended to the exact confirmed bytes, retaining the selected branch. Changed turns or titles remain untouched; the manager creates a sibling instead. Three repeated conflicts also force a sibling (`reason: "contested"`). Indexed backends retain shared-backend content and title preconditions.
 - `appendEntriesAtomically()` groups a synchronous callback's appends into one atomic publication. Failure rolls back staged entries and repairs retained concurrent work.

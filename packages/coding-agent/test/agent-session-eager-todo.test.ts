@@ -12,6 +12,7 @@ import { AgentSession, type AgentSessionConfig } from "@oh-my-pi/pi-coding-agent
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import * as titleDriftClassifier from "@oh-my-pi/pi-coding-agent/session/title-drift-classifier";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { TodoTool } from "@oh-my-pi/pi-coding-agent/tools";
 import { setInteractiveHost, TempDir } from "@oh-my-pi/pi-utils";
@@ -410,6 +411,159 @@ describe("AgentSession eager todo enforcement", () => {
 			}
 		},
 	);
+
+	describe("title.refreshAfterPrompts", () => {
+		const titleReply = (title: string) =>
+			({ stopReason: "stop", content: [{ type: "text", text: `<title>${title}</title>` }] }) as never;
+
+		async function autoTitled(settings: Record<string, unknown>): Promise<void> {
+			await recreateSession({ "title.icons": "boring", ...settings }, { autoTitle: true });
+			await session.setSessionName("Fix parser recovery", "auto");
+		}
+
+		it("asks the judge once enough operator prompts have counted, and regenerates a stale title", async () => {
+			await autoTitled({ "title.refreshAfterPrompts": 2 });
+			const driftSpy = vi.spyOn(titleDriftClassifier, "classifyTitleDrift").mockResolvedValue(true);
+			vi.spyOn(ai, "completeSimple").mockResolvedValue(titleReply("Ship release notes"));
+
+			await session.prompt("now draft the release notes for 2.0");
+			expect(driftSpy).not.toHaveBeenCalled();
+
+			const titleApplied = waitForSessionName("Ship release notes");
+			await session.prompt("publish the release notes to the changelog");
+			await titleApplied;
+			expect(driftSpy).toHaveBeenCalledTimes(1);
+			const [, title, recent] = driftSpy.mock.calls[0]!;
+			expect(title).toBe("Fix parser recovery");
+			expect(recent).toContainEqual({ role: "user", text: "publish the release notes to the changelog" });
+		});
+
+		it.each([
+			["still fits", false],
+			["no judge answers", undefined],
+		])("keeps the title when %s, and asks again only after as many prompts", async (_, verdict) => {
+			await autoTitled({ "title.refreshAfterPrompts": 2 });
+			const driftSpy = vi.spyOn(titleDriftClassifier, "classifyTitleDrift").mockResolvedValue(verdict);
+			const completeSimpleMock = vi.spyOn(ai, "completeSimple");
+
+			await session.prompt("add a regression test for parser recovery");
+			await session.prompt("run the parser tests");
+			await session.prompt("fix the failing parser test");
+			expect(driftSpy).toHaveBeenCalledTimes(1);
+			await session.prompt("run the parser tests again");
+			expect(driftSpy).toHaveBeenCalledTimes(2);
+			expect(completeSimpleMock).not.toHaveBeenCalled();
+			expect(session.sessionManager.getSessionName()).toBe("Fix parser recovery");
+		});
+
+		it("does not count low-signal prompts", async () => {
+			await autoTitled({ "title.refreshAfterPrompts": 2 });
+			const driftSpy = vi.spyOn(titleDriftClassifier, "classifyTitleDrift").mockResolvedValue(false);
+
+			await session.prompt("now draft the release notes for 2.0");
+			await session.prompt("ok thanks");
+			expect(driftSpy).not.toHaveBeenCalled();
+			await session.prompt("publish the release notes to the changelog");
+			expect(driftSpy).toHaveBeenCalledTimes(1);
+		});
+
+		it("is off by default", async () => {
+			await autoTitled({});
+			const driftSpy = vi.spyOn(titleDriftClassifier, "classifyTitleDrift").mockResolvedValue(true);
+
+			for (let i = 0; i < 10; i++) await session.prompt(`release step ${i}: draft the notes`);
+			expect(driftSpy).not.toHaveBeenCalled();
+		});
+
+		it("adds a missing card when the refresh regenerates the current plain title", async () => {
+			await autoTitled({ "title.refreshAfterPrompts": 1, "title.generator": "fork", "title.icons": "emoji" });
+			vi.spyOn(titleDriftClassifier, "classifyTitleDrift").mockResolvedValue(true);
+			vi.spyOn(ai, "completeSimple")
+				.mockResolvedValueOnce(titleReply("Fix parser recovery"))
+				.mockResolvedValueOnce(titleReply("🧪 PARSER"));
+
+			const cardApplied = Promise.withResolvers<void>();
+			const unsubscribe = session.sessionManager.onSessionNameChanged(() => {
+				if (session.sessionManager.getSessionTitleCard()?.code !== "PARSER") return;
+				unsubscribe();
+				cardApplied.resolve();
+			});
+			await session.prompt("keep fixing parser recovery");
+			await cardApplied.promise;
+			expect(session.sessionManager.getSessionName()).toBe("Fix parser recovery");
+			expect(session.sessionManager.getSessionTitleCard()).toEqual({ code: "PARSER", emoji: "🧪" });
+		});
+
+		it("never checks a user-set title", async () => {
+			await recreateSession({ "title.refreshAfterPrompts": 1 }, { autoTitle: true });
+			await session.setSessionName("Manual parser title", "user");
+			const driftSpy = vi.spyOn(titleDriftClassifier, "classifyTitleDrift").mockResolvedValue(true);
+
+			await session.prompt("now draft the release notes for 2.0");
+			expect(driftSpy).not.toHaveBeenCalled();
+		});
+
+		it("does not regenerate a title the user renames while the judge is deciding", async () => {
+			await autoTitled({ "title.refreshAfterPrompts": 1 });
+			const verdict = Promise.withResolvers<boolean | undefined>();
+			vi.spyOn(titleDriftClassifier, "classifyTitleDrift").mockReturnValue(verdict.promise);
+			const completeSimpleMock = vi.spyOn(ai, "completeSimple").mockResolvedValue(titleReply("Ship release notes"));
+
+			await session.prompt("now draft the release notes for 2.0");
+			await session.setSessionName("Release notes", "user");
+			verdict.resolve(true);
+			// A full run after the verdict gives a regeneration started by it time to reach the title model.
+			await session.prompt("publish the release notes to the changelog");
+
+			expect(completeSimpleMock).not.toHaveBeenCalled();
+			expect(session.sessionManager.getSessionName()).toBe("Release notes");
+		});
+
+		it.each(["auto", "user"] as const)(
+			"discards a delayed drift verdict after a newer same-text %s title transaction",
+			async source => {
+				await autoTitled({ "title.refreshAfterPrompts": 1 });
+				const verdict = Promise.withResolvers<boolean | undefined>();
+				const started = Promise.withResolvers<void>();
+				vi.spyOn(titleDriftClassifier, "classifyTitleDrift").mockImplementation(() => {
+					started.resolve();
+					return verdict.promise;
+				});
+				const completeSimpleMock = vi.spyOn(ai, "completeSimple").mockResolvedValue(titleReply("Stale title"));
+				await session.prompt("now draft release notes for the parser");
+				await started.promise;
+				await session.sessionManager.setSessionName("Fix parser recovery", source, undefined, {
+					code: "NEW",
+					emoji: "🔥",
+				});
+				verdict.resolve(true);
+				await new Promise<void>(resolve => setImmediate(resolve));
+				expect(completeSimpleMock).not.toHaveBeenCalled();
+				expect(session.sessionManager.getSessionName()).toBe("Fix parser recovery");
+				expect(session.sessionManager.titleSource).toBe(source);
+				expect(session.sessionManager.getSessionTitleCard()).toEqual({ code: "NEW", emoji: "🔥" });
+			},
+		);
+
+		it("discards a pending drift judgment after an interrupt", async () => {
+			await autoTitled({ "title.refreshAfterPrompts": 1 });
+			const verdict = Promise.withResolvers<boolean | undefined>();
+			const started = Promise.withResolvers<AbortSignal | undefined>();
+			vi.spyOn(titleDriftClassifier, "classifyTitleDrift").mockImplementation((_judge, _title, _recent, signal) => {
+				started.resolve(signal);
+				return verdict.promise;
+			});
+			const completeSimpleMock = vi.spyOn(ai, "completeSimple").mockResolvedValue(titleReply("Stale title"));
+			await session.prompt("now draft release notes for the parser");
+			const signal = await started.promise;
+			await session.abort();
+			verdict.resolve(true);
+			await new Promise<void>(resolve => setImmediate(resolve));
+			expect(signal?.aborted).toBe(true);
+			expect(completeSimpleMock).not.toHaveBeenCalled();
+			expect(session.sessionManager.getSessionName()).toBe("Fix parser recovery");
+		});
+	});
 
 	it("forwards the configured title system prompt to the replan refresh path", async () => {
 		// Issue #3734: TITLE_SYSTEM.md must apply on todo-init replan refresh,
