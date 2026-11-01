@@ -1440,7 +1440,7 @@ document.getElementById("menu-item").addEventListener("pointerdown", event => {
 						held.resolve();
 					}
 					await released.promise;
-					expect(await handle.evaluate(element => element.getAttribute("data-clicks"))).toBe(
+					expect(await page.$eval("#target", element => element.getAttribute("data-clicks"))).toBe(
 						fault === "acquire" ? "0" : "1",
 					);
 					expect(await page.evaluate("activeClickWatches()")).toBe(0);
@@ -1495,7 +1495,7 @@ document.getElementById("menu-item").addEventListener("pointerdown", event => {
 				expect(await delivery).toBeInstanceOf(Error);
 				held.resolve();
 				await released.promise;
-				const fileCount = await input.evaluate(element => {
+				const fileCount = await page.$eval("#upload", element => {
 					if (!("files" in element)) throw new Error("Expected a file input");
 					const files = element.files;
 					if (!files || typeof files !== "object" || !("length" in files)) {

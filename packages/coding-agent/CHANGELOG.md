@@ -25,6 +25,7 @@
 - Close mirrored pipeline streams before downstream EOF completes foreground shell execution.
 - Preserve relay attachment ownership across unrelated extension storage updates and stale socket callbacks.
 - Format Linux FIFO qualification failures from their exit status without requiring debug output from execution handles.
+- Verify cancelled browser click and upload effects from the owned page rather than retired element handles.
 - Retire daemon brokers after runtime directory deletion or replacement, including relocated Unix sockets, without removing a successor's lease.
 - Honor live legacy broker leases on Linux and Windows even when they have no filesystem marker.
 - Preserve opaque URI semicolons during path-list expansion. Explicit path arrays disambiguate missing extensionless paths from opaque resources.
