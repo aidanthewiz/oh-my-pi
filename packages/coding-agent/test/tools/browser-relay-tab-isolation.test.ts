@@ -78,6 +78,7 @@ interface RelayFixture extends RelayBrowser {
  * Headless Chromium running the real relay extension against a relay on a free port, plus a loopback
  * site. A test-only message listener controls its service worker: a programmatic debugger detach does
  * not fire `onDetach`, and `testRefuseRemoves` makes that many `chrome.tabs.remove` calls reject first.
+ * A local-state write can also be delivered while the debugger attach RPC is in flight.
  */
 async function launchRelayFixture(
 	log?: (message: string, data?: Record<string, unknown>) => void,
@@ -162,9 +163,28 @@ chrome.tabs.remove = tabId => {
 	}
 	return testRemoveTab(tabId);
 };
+const testAttachDebugger = chrome.debugger.attach.bind(chrome.debugger);
+chrome.debugger.attach = async (...args) => {
+	if (globalThis.testChangeLocalStateDuringAttach) {
+		globalThis.testChangeLocalStateDuringAttach = false;
+		const changed = Promise.withResolvers();
+		const listener = (changes, areaName) => {
+			if (areaName !== "local" || !("relayTestState" in changes)) return;
+			chrome.storage.onChanged.removeListener(listener);
+			changed.resolve();
+		};
+		chrome.storage.onChanged.addListener(listener);
+		await chrome.storage.local.set({ relayTestState: crypto.randomUUID() });
+		await changed.promise;
+	}
+	return testAttachDebugger(...args);
+};
 chrome.runtime.onMessage.addListener((message, _sender, respond) => {
 	if (message.op === "refuseRemoves") {
 		globalThis.testRefuseRemoves = message.count;
+		respond({});
+	} else if (message.op === "changeLocalStateDuringAttach") {
+		globalThis.testChangeLocalStateDuringAttach = true;
 		respond({});
 	} else if (message.op === "dismissDebugger") {
 		chrome.debugger.detach({ tabId: message.tabId }).then(() => {
@@ -286,9 +306,13 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("relay tab ownership", () => {
 
 	it("opens a default tab in the browser of the tab omp used last, not the first selected one", async () => {
 		const secondHello = Promise.withResolvers<void>();
-		let hellos = 0;
-		const fixture = await launchRelayFixture(message => {
-			if (message === "extension connected" && ++hellos === 2) secondHello.resolve();
+		const instances = new Set<string>();
+		const reconnected = new Set<string>();
+		const fixture = await launchRelayFixture((message, data) => {
+			if (message !== "extension connected" || typeof data?.instanceId !== "string") return;
+			if (instances.has(data.instanceId)) reconnected.add(data.instanceId);
+			instances.add(data.instanceId);
+			if (instances.size === 2) secondHello.resolve();
 		});
 		// The first browser shows the first selected tab, which a new tab would otherwise follow.
 		const human = await fixture.browser.newPage();
@@ -306,13 +330,15 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("relay tab ownership", () => {
 			// Borrowing waits until the relay lists the tab, so the first browser's selected tab is listed first.
 			const inFirst = await acquireTab(names[0]!, relay, { target: "Human sentinel", timeoutMs: 15_000 });
 			const other = await fixture.launchBrowser();
-			// The relay announces a browser's tabs to connected clients only as they change after its hello.
+			// Readiness belongs to the second browser, not a reconnect of the first.
 			await secondHello.promise;
+			await other.inExtension('chrome.runtime.sendMessage({ op: "changeLocalStateDuringAttach" })');
 			await (await other.browser.newPage()).goto(`${fixture.origin}/first`);
 			const inSecond = await acquireTab(names[1]!, relay, { target: "First", timeoutMs: 15_000 });
 			expect(browserOf(inSecond.tab.targetId)).not.toBe(browserOf(inFirst.tab.targetId));
 			const owned = await acquireTab(names[2]!, relay, { url: `${fixture.origin}/second`, timeoutMs: 15_000 });
 			expect(browserOf(owned.tab.targetId)).toBe(browserOf(inSecond.tab.targetId));
+			expect(reconnected).toEqual(new Set());
 		} finally {
 			for (const name of names) await releaseTab(name).catch(() => undefined);
 			await releaseBrowser(relay, { kill: false });

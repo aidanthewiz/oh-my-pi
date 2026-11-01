@@ -439,11 +439,17 @@ fn find_fifo_output_preserves_runtime_and_cancellation() {
 				}
 			};
 			tokio::select! {
-				result = &mut run => panic!("find finished before writing its FIFO payload: {result:?}"),
+				result = &mut run => panic!(
+					"find finished before writing its FIFO payload: {:?}",
+					result.map(|result| u8::from(result.exit_code))
+				),
 				byte = first_byte => assert_eq!(byte, b'x'),
 			}
 			tokio::select! {
-				result = &mut run => panic!("find finished with an undrained FIFO: {result:?}"),
+				result = &mut run => panic!(
+					"find finished with an undrained FIFO: {:?}",
+					result.map(|result| u8::from(result.exit_code))
+				),
 				() = tokio::time::sleep(Duration::from_millis(100)) => {},
 			}
 			cancel.cancel();

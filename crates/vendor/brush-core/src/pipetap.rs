@@ -65,7 +65,7 @@ pub(crate) fn pipe(
 	std::thread::Builder::new()
 		.name("brush-pipe-tap".into())
 		.spawn(move || {
-			if let Err(error) = relay(reader, relayed_writer, &guard) {
+			if let Err(error) = relay(reader, relayed_writer, guard) {
 				tracing::error!(%error, "pipeline pipe relay failed");
 			}
 		})?;
@@ -83,9 +83,10 @@ impl Drop for MirrorGuard {
 }
 
 /// Forwards `from` into `to`, copying each chunk to the mirror, until the
-/// producer closes `from` or the consumer stops reading `to`. Dropping both
-/// ends on return passes EOF on to the consumer and widows the producer.
-fn relay(mut from: PipeReader, mut to: PipeWriter, guard: &MirrorGuard) -> io::Result<()> {
+/// producer closes `from` or the consumer stops reading `to`. The last
+/// parameter drops first: the mirror closes before dropping `to` exposes EOF
+/// to the consumer, including on errors and unwinding.
+fn relay(mut from: PipeReader, mut to: PipeWriter, guard: MirrorGuard) -> io::Result<()> {
 	let mut buf = vec![0; RELAY_CHUNK];
 	loop {
 		#[cfg(unix)]
@@ -277,8 +278,7 @@ mod tests {
 		let guard = MirrorGuard(Arc::new(RecordingMirror(events)));
 		let (finished, completion) = mpsc::channel();
 		let worker = std::thread::spawn(move || {
-			relay(from, to, &guard).unwrap();
-			drop(guard);
+			relay(from, to, guard).unwrap();
 			finished.send(()).unwrap();
 		});
 
@@ -307,7 +307,7 @@ mod tests {
 		let (mut consumer, to) = io::pipe().unwrap();
 		let (events, recorded) = mpsc::channel();
 		let guard = MirrorGuard(Arc::new(RecordingMirror(events)));
-		let relay_worker = std::thread::spawn(move || relay(from, to, &guard).unwrap());
+		let relay_worker = std::thread::spawn(move || relay(from, to, guard).unwrap());
 		let bytes: Vec<u8> = (0..RELAY_CHUNK * 3 + 17).map(|n| n as u8).collect();
 		let expected = bytes.clone();
 		let producer_worker = std::thread::spawn(move || producer.write_all(&bytes).unwrap());
@@ -319,6 +319,53 @@ mod tests {
 
 		assert_eq!(forwarded, expected);
 		assert_eq!(captured(recorded), (expected, 1));
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn mirror_closes_before_consumer_eof() {
+		use std::os::fd::AsFd;
+
+		use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+
+		struct EofOrderMirror {
+			consumer: PipeReader,
+			events:   RecordingMirror,
+		}
+
+		impl PipeMirror for EofOrderMirror {
+			fn write(&self, bytes: &[u8]) {
+				self.events.write(bytes);
+			}
+
+			fn close(&self) {
+				let mut fds = [PollFd::new(self.consumer.as_fd(), PollFlags::POLLIN)];
+				poll(&mut fds, PollTimeout::ZERO).unwrap();
+				assert!(
+					!fds[0].revents().unwrap().contains(PollFlags::POLLHUP),
+					"consumer received EOF before the mirror closed",
+				);
+				self.events.close();
+			}
+		}
+
+		let (from, mut producer) = io::pipe().unwrap();
+		let (mut consumer, to) = io::pipe().unwrap();
+		let (events, recorded) = mpsc::channel();
+		let guard = MirrorGuard(Arc::new(EofOrderMirror {
+			consumer: consumer.try_clone().unwrap(),
+			events:   RecordingMirror(events),
+		}));
+		let worker = std::thread::spawn(move || relay(from, to, guard).unwrap());
+		let bytes = "界𝄞".as_bytes();
+		producer.write_all(bytes).unwrap();
+		drop(producer);
+		let mut forwarded = Vec::new();
+		consumer.read_to_end(&mut forwarded).unwrap();
+		worker.join().unwrap();
+
+		assert_eq!(forwarded, bytes);
+		assert_eq!(captured(recorded), (bytes.to_vec(), 1));
 	}
 
 	#[cfg(windows)]

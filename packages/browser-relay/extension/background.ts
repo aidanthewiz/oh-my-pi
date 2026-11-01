@@ -307,18 +307,22 @@ function scheduleReconnect(): void {
 async function connect(): Promise<void> {
 	if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
 	const settings = await loadSettings();
+	if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
 	const url = `ws://127.0.0.1:${settings.port}/ext${settings.token ? `?token=${encodeURIComponent(settings.token)}` : ""}`;
 	const socket = new WebSocket(url);
 	ws = socket;
 	socket.onopen = () => {
+		if (ws !== socket) return;
 		reconnectDelay = RECONNECT_MIN_MS;
 		void setBadge(true);
-		void buildHello().then(hello => post(hello));
+		void buildHello().then(hello => {
+			if (ws === socket && socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(hello));
+		});
 		clearInterval(pingTimer ?? undefined);
 		pingTimer = setInterval(() => post({ t: "ping" }), PING_INTERVAL_MS);
 	};
 	socket.onmessage = event => {
-		if (typeof event.data === "string") handleRelayMessage(socket, event.data);
+		if (ws === socket && typeof event.data === "string") handleRelayMessage(socket, event.data);
 	};
 	socket.onclose = () => {
 		if (ws !== socket) return;
@@ -379,8 +383,8 @@ chrome.alarms.onAlarm.addListener(alarm => {
 	if (alarm.name === "omp-relay-keepalive") void connect();
 });
 
-chrome.storage.onChanged.addListener((_changes, areaName) => {
-	if (areaName !== "local") return;
+chrome.storage.onChanged.addListener((changes, areaName) => {
+	if (areaName !== "local" || (!("port" in changes) && !("token" in changes))) return;
 	// Settings changed: drop the current connection and re-dial with new ones.
 	ws?.close();
 	void connect();

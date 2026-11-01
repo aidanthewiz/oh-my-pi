@@ -5,6 +5,9 @@
 ### Fixed
 
 - Authenticated the manual relay smoke against the configured authority and removed tokenized endpoint output.
+- Preserve active connections when unrelated extension storage changes.
+- Bind startup and hello callbacks to their originating socket.
+
 ## [18.13.3] - 2026-10-28
 
 ### Changed
