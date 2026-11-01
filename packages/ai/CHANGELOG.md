@@ -13,6 +13,7 @@
 
 ### Fixed
 
+- Cancel parked Cursor runs before accepting tool results after credentials, endpoint, provider, transport, or tenant headers change. This fixes an inherited upstream relay defect from #17382.
 - Preserve received PI-native text, usage, and completed tool calls when gateway transport fails without a canonical terminal message.
 - Keep fresh Cursor calls non-retryable after terminal provider rejection during an internal transport fallback, while preserving established-session recovery.
 - Carry rejected OAuth bearer identity through broker refreshes. Remint the rejected token while preserving newer mints, account scope, and credential privacy.

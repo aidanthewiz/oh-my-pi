@@ -865,6 +865,26 @@ describe("Cursor runs relayed across an external executor's requests", () => {
 		});
 	});
 
+	it.each([{ apiKey: "rotated-token" }, { headers: { "x-tenant-id": "next-tenant" } }])(
+		"rebuilds instead of sending results through the prior transport identity %j",
+		async changedOptions => {
+			const runs: ServedRun[] = [];
+			const states = new Map<string, ProviderSessionState>();
+			await withCursorServer(relayingCursor(runs), async baseUrl => {
+				const handedOff = await respond(baseUrl, [user], relayOptions(states));
+				const rebuilt = await respond(baseUrl, [user, handedOff, readResult], relayOptions(states, changedOptions));
+				await runs[0].closed;
+
+				expect(runs.map(run => [run.action, run.answers.length, run.cancelled])).toEqual([
+					["userMessageAction", 0, true],
+					["resumeAction", 0, false],
+				]);
+				expect(text(rebuilt)).toBe("Rebuilt.");
+				expect(states.size).toBe(0);
+			});
+		},
+	);
+
 	it.each<{ cause: string; session: () => { states: Map<string, ProviderSessionState>; giveUp(): void } }>([
 		{
 			cause: "its idle timeout",

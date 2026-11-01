@@ -1823,11 +1823,20 @@ function streamCursorWithWireMode(
 					const parked: CursorParkedRun = {
 						close: () => unpark(undefined),
 						resume: (nextModel, nextContext, nextOptions) => {
+							const nextHeaders = sanitizeCursorCallerHeaders(nextOptions?.headers);
+							const sameHeaders =
+								Object.keys(nextHeaders).length === Object.keys(callerHeaders).length &&
+								Object.entries(callerHeaders).every(([name, value]) => nextHeaders[name] === value);
 							const results = collectRelayedResults(nextContext.messages, relay.held);
 							const mismatch =
 								unparked || h2Settled || nextOptions?.signal?.aborted
 									? "ended"
 									: !nextOptions?.externalToolExecutor ||
+										  nextOptions.apiKey !== apiKey ||
+										  nextOptions.transport === "http1" ||
+										  nextModel.provider !== model.provider ||
+										  (nextModel.baseUrl || CURSOR_API_URL) !== baseUrl ||
+										  !sameHeaders ||
 										  nextModel.id !== model.id ||
 										  nextOptions.wireModelId !== wireModelId ||
 										  (nextOptions.conversationId ?? nextOptions.sessionId) !== conversationKey
