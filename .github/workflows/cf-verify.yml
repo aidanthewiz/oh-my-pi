@@ -517,6 +517,12 @@ jobs:
             echo "CARGO_HOME=$RUNNER_TEMP/qualification-cargo"
             echo "RUSTUP_HOME=$RUNNER_TEMP/qualification-rustup"
           } >> "$GITHUB_ENV"
+      - name: Reclaim unused hosted tools for complete Rust qualification
+        if: runner.os == 'Linux' && matrix.scope == 'rust'
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /opt/hostedtoolcache/CodeQL
+          df -h /
       - name: Restore Cargo qualification cache
         id: cargo-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -555,7 +561,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends ninja-build pkg-config cmake libclang-dev libasound2-dev libudev-dev libssl-dev python3 redis-server bubblewrap
+          sudo apt-get install --yes --no-install-recommends ninja-build pkg-config cmake libclang-dev libasound2-dev libudev-dev libssl-dev python3 redis-server bubblewrap lsof
           if [ "${{ matrix.scope }}" = typescript ]; then
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi

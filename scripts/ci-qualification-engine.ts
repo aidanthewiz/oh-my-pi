@@ -83,15 +83,23 @@ interface CargoPackage {
 	targets: CargoTarget[];
 }
 interface CargoMetadata {
+	target_directory: string;
 	workspace_members: string[];
 	packages: CargoPackage[];
 }
 interface NextestSuite {
 	"package-id": string;
 	"binary-name": string;
+	"binary-path": string;
 	kind: string;
 	status: string;
 	testcases: Record<string, unknown>;
+}
+interface RetiredRustExecutable {
+	path: string;
+	size: number;
+	dev: number;
+	ino: number;
 }
 
 function digest(bytes: Uint8Array | string): string {
@@ -199,6 +207,54 @@ async function run(command: string[], cwd = root, outputFile?: string): Promise<
 	assert.equal(entry.exitCode, 0, `Command failed; see ${log}: ${command.join(" ")}`);
 	return output;
 }
+export async function retireRustExecutables(
+	workspace: string,
+	target: string,
+	executables: readonly string[],
+): Promise<RetiredRustExecutable[]> {
+	for (const directory of [workspace, target]) {
+		assert(path.isAbsolute(directory), `Absolute Cargo directory required: ${directory}`);
+		assert.equal(await fs.realpath(directory), path.resolve(directory), `Ambiguous Cargo directory: ${directory}`);
+	}
+	assert(target.startsWith(workspace + path.sep), "Cargo target must belong to the qualification workspace");
+	assert.equal(executables.length, new Set(executables).size, "Duplicate retired executable");
+	const files: RetiredRustExecutable[] = [];
+	for (const file of executables) {
+		assert(path.isAbsolute(file) && file.startsWith(target + path.sep), `Executable escapes Cargo target: ${file}`);
+		assert.equal(await fs.realpath(file), file, `Ambiguous Cargo executable: ${file}`);
+		assert(!/\.(?:rlib|rmeta|a|so|dylib|dll|node)(?:\.\d+)*$/i.test(file), `Retain Cargo dependency: ${file}`);
+		const stat = await fs.lstat(file);
+		assert(stat.isFile() && !stat.isSymbolicLink() && (stat.mode & 0o111) !== 0, `Not an executable file: ${file}`);
+		files.push({ path: file, size: stat.size, dev: stat.dev, ino: stat.ino });
+	}
+	const uid = process.getuid?.();
+	assert(uid !== undefined, "Rust executable retirement requires a Unix qualification runner");
+	for (const file of files) {
+		const open: Bun.SyncSubprocess<"pipe", "pipe"> = Bun.spawnSync(
+			["lsof", "-a", "-u", String(uid), "-Fpn", "--", file.path],
+			{
+				stdin: "ignore",
+				stdout: "pipe",
+				stderr: "pipe",
+				timeout: 10_000,
+			},
+		);
+		assert(
+			open.exitCode === 1 && open.stdout.length === 0 && open.stderr.length === 0,
+			`Cargo executable is open or closure is unknown: ${file.path}\n${Buffer.from(open.stderr).toString()}`,
+		);
+	}
+	for (const file of files) {
+		const current = await fs.lstat(file.path);
+		assert(
+			current.isFile() && current.dev === file.dev && current.ino === file.ino && current.size === file.size,
+			`Cargo executable changed before retirement: ${file.path}`,
+		);
+		await fs.unlink(file.path);
+	}
+	return files;
+}
+
 async function nativeFiles(): Promise<string[]> {
 	return [...new Bun.Glob("packages/natives/native/**/*").scanSync({ cwd: root, onlyFiles: true })].sort();
 }
@@ -563,6 +619,12 @@ async function rust(): Promise<void> {
 	);
 	assert(targets.length > 0, "No declared workspace test targets");
 	const testFlags = ["--locked", "--profile", "ci"];
+	const retired: { label: string; files: Awaited<ReturnType<typeof retireRustExecutables>>; capacity: string }[] = [];
+	const retire = async (label: string, executables: string[]) => {
+		const files = await retireRustExecutables(root, metadata.target_directory, executables);
+		retired.push({ label, files, capacity: await capture(["df", "-k", metadata.target_directory]) });
+		await json(path.join(receipts, "rust-retired-executables.json"), retired);
+	};
 	await run(["cargo", "fmt", "--all", "--", "--check"]);
 	await run(["bun", "scripts/run-rs-task.ts", "lint:rs"]);
 	for (const pkg of packages) {
@@ -588,15 +650,17 @@ async function rust(): Promise<void> {
 				.split("\n")
 				.filter(Boolean)
 				.map(line => JSON.parse(line));
-			assert(
-				artifacts.some(
-					artifact =>
-						artifact.reason === "compiler-artifact" &&
-						artifact.package_id === pkg.id &&
-						artifact.target.name === example.name &&
-						artifact.target.kind.includes("example"),
-				),
-				`Missing compiled example: ${pkg.name}/${example.name}`,
+			const built = artifacts.filter(
+				artifact =>
+					artifact.reason === "compiler-artifact" &&
+					artifact.package_id === pkg.id &&
+					artifact.target.name === example.name &&
+					artifact.target.kind.includes("example"),
+			);
+			assert(built.length > 0, `Missing compiled example: ${pkg.name}/${example.name}`);
+			await retire(
+				`example-${pkg.name}-${example.name}`,
+				built.flatMap(artifact => (artifact.executable ? [artifact.executable] : [])),
 			);
 		}
 	}
@@ -685,6 +749,10 @@ async function rust(): Promise<void> {
 		}
 		completed.push({ label: shard.label, targets: shard.targets, testCount: plan["test-count"] });
 		await json(path.join(receipts, "rust-completed.json"), completed);
+		await retire(
+			shard.label,
+			suites.map(suite => suite["binary-path"]),
+		);
 	}
 	await run(["cargo", "test", ...testFlags, "--doc", "--workspace", "--exclude", "napi", "--", "--test-threads=2"]);
 }
