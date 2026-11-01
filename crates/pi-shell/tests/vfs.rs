@@ -380,7 +380,7 @@ async fn fd_reports_a_non_broken_pipe_output_failure() {
 	}
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[test]
 fn find_fifo_output_preserves_runtime_and_cancellation() {
 	use std::{

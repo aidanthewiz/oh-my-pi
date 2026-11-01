@@ -1082,7 +1082,6 @@ async fn wait_for_pipeline_processes_and_update_status(
 	params: &ExecutionParameters,
 	pipefail: bool,
 ) -> Result<ExecutionResult, error::Error> {
-	ensure_not_cancelled(params)?;
 	let mut result = ExecutionResult::success();
 	let mut stopped = false;
 	let mut last_failure_exit_code: Option<ExecutionExitCode> = None;
@@ -1117,11 +1116,16 @@ async fn wait_for_pipeline_processes_and_update_status(
 
 	for _ in 0..process_spawn_results.len() {
 		let Some(child) = process_spawn_results.pop_front() else { break };
-		ensure_not_cancelled(params)?;
-		let wait_result = if stopped {
-			child.poll().await?
-		} else {
-			child.wait_with_cancel(params.cancel_token()).await?
+		let wait_result = match child {
+			ExecutionSpawnResult::Completed(result) => ExecutionWaitResult::Completed(result),
+			child => {
+				ensure_not_cancelled(params)?;
+				if stopped {
+					child.poll().await?
+				} else {
+					child.wait_with_cancel(params.cancel_token()).await?
+				}
+			},
 		};
 
 		match wait_result {

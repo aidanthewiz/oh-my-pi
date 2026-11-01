@@ -9,6 +9,8 @@ use std::{
 };
 
 use async_trait::async_trait;
+#[cfg(unix)]
+use tokio::io::unix::AsyncFd;
 use tokio::runtime::Handle;
 use tokio_util::sync::CancellationToken;
 
@@ -85,9 +87,9 @@ pub trait FileHandle: Send + Sync + fmt::Debug + 'static {
 /// workers and foreign threads; async code must use the `*_async` methods.
 pub struct File {
 	repr:        Repr,
-	/// Cancellation of the facade that opened this host file: once it fires,
-	/// reads fail with [`crate::cancelled`]. Provider files keep theirs in
-	/// [`Shared`].
+	/// Cancellation of the facade that opened this host file. Reads and
+	/// nonblocking async writes fail with [`crate::cancelled`]. Provider files
+	/// keep their token in [`Shared`].
 	read_cancel: Option<HostCancel>,
 }
 
@@ -473,6 +475,64 @@ fn append_utf8(buf: &mut String, bytes: Vec<u8>) -> io::Result<usize> {
 	Ok(text.len())
 }
 
+#[cfg(unix)]
+async fn write_host_async<const ALL: bool>(
+	file: &std::fs::File,
+	mut bytes: &[u8],
+	cancel: Option<&CancellationToken>,
+) -> io::Result<usize> {
+	let length = bytes.len();
+	if ALL && bytes.is_empty() {
+		return Ok(0);
+	}
+	let mut readiness: Option<AsyncFd<std::fs::File>> = None;
+	loop {
+		if cancel.is_some_and(CancellationToken::is_cancelled) {
+			return Err(crate::cancelled());
+		}
+		let result = match &readiness {
+			None => host(file).write(bytes),
+			Some(descriptor) => {
+				let mut ready = match cancel {
+					Some(cancel) => tokio::select! {
+						biased;
+						() = cancel.cancelled() => return Err(crate::cancelled()),
+						ready = descriptor.writable() => ready?,
+					},
+					None => descriptor.writable().await?,
+				};
+				match ready.try_io(|descriptor| host(descriptor.get_ref()).write(bytes)) {
+					Ok(result) => result,
+					Err(_) => continue,
+				}
+			},
+		};
+		match result {
+			Ok(count) => {
+				if !ALL {
+					return Ok(count);
+				}
+				if count == 0 {
+					return Err(io::Error::from(io::ErrorKind::WriteZero));
+				}
+				bytes = &bytes[count..];
+				if bytes.is_empty() {
+					return Ok(length);
+				}
+			},
+			Err(error) if ALL && error.kind() == io::ErrorKind::Interrupted => {},
+			Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+				if readiness.is_none() {
+					// Each wait owns its reactor registration, including across file
+					// clones.
+					readiness = Some(AsyncFd::new(file.try_clone()?)?);
+				}
+			},
+			Err(error) => return Err(error),
+		}
+	}
+}
+
 impl File {
 	/// Wraps a provider handle. The current tokio runtime (if any) is captured
 	/// to drive synchronous I/O and deferred closes from foreign threads.
@@ -700,14 +760,39 @@ impl File {
 
 	pub async fn write_async(&self, buf: &[u8]) -> io::Result<usize> {
 		match &self.repr {
-			Repr::Native(file) => host(file).write(buf),
+			Repr::Native(file) => {
+				#[cfg(unix)]
+				{
+					write_host_async::<false>(
+						file,
+						buf,
+						self.read_cancel.as_ref().map(|cancel| &cancel.token),
+					)
+					.await
+				}
+				#[cfg(not(unix))]
+				host(file).write(buf)
+			},
 			Repr::Virtual(shared) => shared.guard(shared.handle().write(buf)).await,
 		}
 	}
 
 	pub async fn write_all_async(&self, buf: &[u8]) -> io::Result<()> {
 		match &self.repr {
-			Repr::Native(file) => host(file).write_all(buf),
+			Repr::Native(file) => {
+				#[cfg(unix)]
+				{
+					write_host_async::<true>(
+						file,
+						buf,
+						self.read_cancel.as_ref().map(|cancel| &cancel.token),
+					)
+					.await
+					.map(|_| ())
+				}
+				#[cfg(not(unix))]
+				host(file).write_all(buf)
+			},
 			Repr::Virtual(shared) => shared.guard(write_all_handle(shared.handle(), buf)).await,
 		}
 	}

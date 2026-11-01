@@ -24,6 +24,9 @@
 - Retire completed Rust qualification executables between shards while retaining compiler dependencies and full target coverage.
 - Close mirrored pipeline streams before downstream EOF completes foreground shell execution.
 - Retain identity-pinned descendants across process-tree termination so cancellation waits for reparented and TERM-resistant children.
+- Report asynchronous `fd` output errors instead of returning success after a failed destination flush.
+- Keep `find` FIFO writes cancellable without blocking the runtime or writing after cancellation.
+- Preserve completed builtin results when pipeline cancellation arrives before status settlement.
 - Preserve relay attachment ownership across unrelated extension storage updates and stale socket callbacks.
 - Format Linux FIFO qualification failures from their exit status without requiring debug output from execution handles.
 - Verify cancelled browser click and upload effects from the owned page rather than retired element handles.

@@ -703,7 +703,7 @@ async fn search(cli: FdCli, base_dir: PathBuf, host: &mut Host) -> io::Result<Se
 					if matches!(action, Action::SkipDir) {
 						tree.skip_dir();
 					}
-					let _ = host.flush_output().await;
+					host.flush_output().await?;
 					if max_results.is_some_and(|max| state.matches >= max) {
 						break;
 					}
@@ -712,14 +712,14 @@ async fn search(cli: FdCli, base_dir: PathBuf, host: &mut Host) -> io::Result<Se
 					if config.show_errors {
 						state.had_error = true;
 						let _ = writeln!(host.stderr, "fd: {}", error.error);
-						let _ = host.flush_output().await;
+						host.flush_output().await?;
 					}
 				},
 			}
 		}
 	}
 	out.flush()?;
-	let _ = host.flush_output().await;
+	host.flush_output().await?;
 	Ok(state)
 }
 

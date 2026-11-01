@@ -4263,6 +4263,23 @@ pub mod matchers {
 		host: &Host,
 	) -> Result<File, Box<dyn Error>> {
 		let file = host.vfs().create(host.resolve(path)).await?;
+		#[cfg(unix)]
+		if let Some(native) = file.native() {
+			use std::os::{fd::AsRawFd, unix::fs::FileTypeExt};
+
+			if native.metadata()?.file_type().is_fifo() {
+				let descriptor = native.as_raw_fd();
+				// SAFETY: find owns this newly opened descriptor before cloning it.
+				let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+				if flags == -1 {
+					return Err(io::Error::last_os_error().into());
+				}
+				// SAFETY: the live descriptor retains nonblocking mode for every owner.
+				if unsafe { libc::fcntl(descriptor, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
+					return Err(io::Error::last_os_error().into());
+				}
+			}
+		}
 		config.output_files.push((path.to_string(), file.try_clone()?));
 		Ok(file)
 	}
