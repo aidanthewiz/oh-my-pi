@@ -11,6 +11,7 @@ process.stdin.once("end", () => {
 process.stdin.resume();
 
 if (mode === "child") {
+	if (process.platform !== "win32") process.on("SIGTERM", () => {});
 	process.stdout.write(`child:${process.pid}\n`);
 	setInterval(() => {}, 1000);
 } else if (mode === "hang") {
