@@ -104,13 +104,13 @@ describe("runInteractiveBashPty", () => {
 			env: { ...reviewedShell.env, OMP_PTY_RUNTIME_PROBE: "changed-after-review" },
 		});
 		const result = await runInteractiveBashPty(headlessUi(), {
-			command: 'printf "%s" "$OMP_PTY_RUNTIME_PROBE"',
+			command: 'printf "%s" "$OMP_PTY_RUNTIME_PROBE" > reviewed-env.txt',
 			cwd: tempDir.path(),
 			shell: reviewedShell,
 			timeoutMs: 15_000,
 		});
 		expect(result.exitCode).toBe(0);
-		expect(result.output).toBe("from-shell-env");
+		expect(fs.readFileSync(`${tempDir.path()}/reviewed-env.txt`, "utf8")).toBe("from-shell-env");
 	});
 
 	it.skipIf(ptyUnavailable)("lets direnv values win over the terminal defaults and the dropped guards", async () => {
