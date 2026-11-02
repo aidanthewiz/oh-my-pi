@@ -83,10 +83,8 @@ export function buildAsyncResultBlock(message: CustomOrHookMessage): ToolActivit
 	return new ToolActivityContainer(new TranscriptStatusBlock(rows));
 }
 
-/** Hosts an extension renderer; relays `display.hideToolActivity` to the nested built-in fallback block. */
+/** Hosts a registered renderer with the built-in completion block as fallback. */
 class AsyncResultCard extends CustomMessageComponent {
-	readonly #block: ToolActivityContainer;
-
 	constructor(message: CustomOrHookMessage, renderer: MessageRenderer, block: ToolActivityContainer) {
 		super(message as CustomMessage<unknown>, (delegate, options, rendererTheme) => {
 			try {
@@ -95,11 +93,6 @@ class AsyncResultCard extends CustomMessageComponent {
 				return block;
 			}
 		});
-		this.#block = block;
-	}
-
-	setToolActivityVisible(visible: boolean): void {
-		this.#block.setToolActivityVisible(visible);
 	}
 }
 
@@ -112,7 +105,7 @@ export function buildAsyncResultComponent(
 	renderer: MessageRenderer | undefined,
 ): Component & { setExpanded(expanded: boolean): void } {
 	const block = buildAsyncResultBlock(message);
-	return renderer ? new AsyncResultCard(message, renderer, block) : block;
+	return renderer ? new ToolActivityContainer(new AsyncResultCard(message, renderer, block)) : block;
 }
 
 /** The warning row under a background job whose output artifact could not be saved. */
