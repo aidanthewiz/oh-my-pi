@@ -115,12 +115,7 @@ async fn dropping_suspended_recursion_releases_owned_pipe_descriptors() {
 		.expect("ready observer");
 	assert_eq!(first, "ready\n");
 	task.abort();
-	assert!(
-		task
-			.await
-			.expect_err("execution was aborted")
-			.is_cancelled()
-	);
+	assert!(matches!(task.await, Err(error) if error.is_cancelled()));
 	let rest = tokio::time::timeout(Duration::from_secs(10), output)
 		.await
 		.expect("dropped recursion released every pipe writer")
