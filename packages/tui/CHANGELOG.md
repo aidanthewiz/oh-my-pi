@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Preserve Hide Tool Activity, expansion, and renderer disposal for registered async-result cards.
 - Keep matching pinned sessions ahead of unpinned sessions after complete search ranking.
 - Invalidate stale link hints during resize publication gaps and dispose pending sign-in dialogs without detached focus or refresh effects.
 - Preserve full sign-in link targets and pending answers when clipboard operations fail.

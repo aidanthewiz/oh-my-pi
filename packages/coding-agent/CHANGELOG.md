@@ -14,6 +14,8 @@
 
 ### Fixed
 
+- Keep language-server configuration non-executing. Start package-less native TypeScript only through the managed client lifecycle.
+- Preserve live or mounted task-isolation data when teardown fails, isolation is replaced, or `worktree clear --all` runs. Retain workspaces when mount safety cannot be verified.
 - Reject late eval foreground replies after caller or session cancellation, including abort-insensitive backend completion. This fixes an inherited v18.14.2 publication race.
 - Preserve one monitor per task-managed continuation and retain result publication for service completions after executor detachment.
 - Prevent false async-media qualification failures when retired-card clocks continue to advance.
