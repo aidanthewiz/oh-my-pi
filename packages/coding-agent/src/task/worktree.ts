@@ -9,7 +9,7 @@ import * as vcs from "@oh-my-pi/pi-natives/vcs";
 import { filterGitChildShellEnv, formatBytes, getWorktreeDir, isEnoent, logger, Snowflake } from "@oh-my-pi/pi-utils";
 import type { SettingValueOf } from "../config/registry";
 import { withRepoLock } from "../utils/repo-lock";
-import { needsNativeTeardown, writeIsolationOwner, writeRetainedBackend } from "./isolation-ownership";
+import { assertWorktreeRemovalSafe, writeIsolationOwner, writeRetainedBackend } from "./isolation-ownership";
 import { mapWithConcurrencyLimit } from "./parallel";
 import type { cfgIsolationBackend } from "./settings";
 
@@ -658,6 +658,7 @@ export async function ensureIsolation(
 	let fallbackReason = resolution.reason ?? null;
 
 	for (const candidate of candidates) {
+		await assertWorktreeRemovalSafe(baseDir);
 		await fs.rm(baseDir, { recursive: true, force: true });
 		// Claim ownership before the backend materialises `m`. Backends only
 		// create/replace `mergedDir` (and overlay upper/work), never the base
@@ -666,8 +667,11 @@ export async function ensureIsolation(
 		// even while a large clone is still in progress.
 		await fs.mkdir(baseDir, { recursive: true });
 		await writeIsolationOwner(baseDir, id);
+		await writeRetainedBackend(baseDir, candidate);
+		let started = false;
 		try {
 			await natives.isoStart(candidate, repoRoot, mergedDir);
+			started = true;
 			// Sever the isolation's git metadata from the source checkout. Copy
 			// backends duplicate `repoRoot`'s `.git` verbatim — a linked-worktree
 			// pointer file (or the rcopy `git worktree add` registration) leaves
@@ -684,6 +688,15 @@ export async function ensureIsolation(
 				fallbackReason,
 			};
 		} catch (err) {
+			if (started) {
+				await assertWorktreeRemovalSafe(baseDir, { ownedRoot: true, stoppingRoot: mergedDir });
+				try {
+					await natives.isoStop(candidate, mergedDir);
+				} catch (stopErr) {
+					throw new AggregateError([err, stopErr], `Isolation teardown failed; retained workspace at ${baseDir}`);
+				}
+			}
+			await assertWorktreeRemovalSafe(baseDir, { ownedRoot: true, stoppedRoot: started });
 			await fs.rm(baseDir, { recursive: true, force: true });
 			const message = errorMessage(err);
 			if (!natives.isoIsUnavailableError(message)) {
@@ -703,28 +716,27 @@ export async function ensureIsolation(
  */
 export async function cleanupIsolation(handle: IsolationHandle): Promise<void> {
 	const baseDir = path.dirname(handle.mergedDir);
+	await assertWorktreeRemovalSafe(baseDir, { ownedRoot: true, stoppingRoot: handle.mergedDir });
 	try {
 		await natives.isoStop(handle.backend, handle.mergedDir);
 	} catch (err) {
-		const retain = needsNativeTeardown(handle.backend);
 		logger.warn("isolation backend stop failed during cleanup", {
 			backend: handle.backend,
 			mergedDir: handle.mergedDir,
 			error: err instanceof Error ? err.message : String(err),
-			retained: retain,
+			retained: true,
 		});
-		if (retain) {
-			try {
-				await writeRetainedBackend(baseDir, handle.backend);
-			} catch (writeErr) {
-				logger.warn("retained-backend record write failed; unmount the workspace manually", {
-					mergedDir: handle.mergedDir,
-					error: writeErr instanceof Error ? writeErr.message : String(writeErr),
-				});
-			}
-			return;
+		try {
+			await writeRetainedBackend(baseDir, handle.backend);
+		} catch (writeErr) {
+			logger.warn("retained-backend record write failed; unmount the workspace manually", {
+				mergedDir: handle.mergedDir,
+				error: writeErr instanceof Error ? writeErr.message : String(writeErr),
+			});
 		}
+		return;
 	}
+	await assertWorktreeRemovalSafe(baseDir, { ownedRoot: true, stoppedRoot: true });
 	await fs.rm(baseDir, { recursive: true, force: true });
 }
 

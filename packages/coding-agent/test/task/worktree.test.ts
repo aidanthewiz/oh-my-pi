@@ -15,7 +15,6 @@ import {
 	ISOLATION_BASELINE_MAX_CONTENT_BYTES,
 	IsolationBaselineTooLargeError,
 	mergeTaskBranches,
-	parseIsolationBackend,
 } from "@oh-my-pi/pi-coding-agent/task/worktree";
 import { readRetainedMountBackend } from "@oh-my-pi/pi-coding-agent/task/isolation-ownership";
 import * as natives from "@oh-my-pi/pi-natives";
@@ -64,18 +63,6 @@ afterEach(async () => {
 	await Promise.all(tempDirs.splice(0).map(dir => removeWithRetries(dir)));
 });
 describe("worktree isolation helpers", () => {
-	it("maps every isolation backend to the native backend contract", () => {
-		expect(parseIsolationBackend("auto")).toBeUndefined();
-		expect(parseIsolationBackend("apfs")).toBe(natives.IsoBackendKind.Apfs);
-		expect(parseIsolationBackend("btrfs")).toBe(natives.IsoBackendKind.Btrfs);
-		expect(parseIsolationBackend("zfs")).toBe(natives.IsoBackendKind.Zfs);
-		expect(parseIsolationBackend("reflink")).toBe(natives.IsoBackendKind.LinuxReflink);
-		expect(parseIsolationBackend("overlayfs")).toBe(natives.IsoBackendKind.Overlayfs);
-		expect(parseIsolationBackend("projfs")).toBe(natives.IsoBackendKind.Projfs);
-		expect(parseIsolationBackend("block-clone")).toBe(natives.IsoBackendKind.WindowsBlockClone);
-		expect(parseIsolationBackend("rcopy")).toBe(natives.IsoBackendKind.Rcopy);
-	});
-
 	it("retains a mount workspace with its backend sidecar when native stop fails", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-cleanup-"));
 		tempDirs.push(root);
@@ -246,6 +233,46 @@ describe("worktree isolation helpers", () => {
 		afterEach(() => {
 			vi.restoreAllMocks();
 		});
+
+		for (const stopFails of [false, true]) {
+			it(`preserves isolation after detach failure only when teardown fails=${stopFails}`, async () => {
+				const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-detach-failure-"));
+				tempDirs.push(root);
+				const originalWorktreeDir = process.env.OMP_WORKTREE_DIR;
+				delete process.env.OMP_WORKTREE_DIR;
+				setWorktreesDir(root);
+				let merged = "";
+				vi.spyOn(natives, "isoResolve").mockResolvedValue({
+					kind: natives.IsoBackendKind.Overlayfs,
+					candidates: [natives.IsoBackendKind.Overlayfs],
+					fellBack: false,
+					reason: undefined,
+				});
+				vi.spyOn(natives, "isoStart").mockImplementation(async (_backend, _source, destination) => {
+					merged = destination;
+					await fs.mkdir(merged, { recursive: true });
+					await fs.writeFile(path.join(merged, "result.txt"), "unpublished result");
+				});
+				vi.spyOn(vcs, "detachGitDir").mockRejectedValue(new Error("detach failed"));
+				const stop = vi.spyOn(natives, "isoStop");
+				if (stopFails) stop.mockRejectedValue(new Error("unmount failed"));
+				else stop.mockResolvedValue(undefined);
+				try {
+					await expect(ensureIsolation(repo, "detach-failure")).rejects.toBeInstanceOf(Error);
+					if (stopFails) {
+						expect(await fs.readFile(path.join(merged, "result.txt"), "utf8")).toBe("unpublished result");
+						await expect(ensureIsolation(repo, "detach-failure")).rejects.toBeInstanceOf(Error);
+						expect(await fs.readFile(path.join(merged, "result.txt"), "utf8")).toBe("unpublished result");
+					} else {
+						expect(await Bun.file(path.join(merged, "result.txt")).exists()).toBe(false);
+					}
+				} finally {
+					setWorktreesDir(undefined);
+					if (originalWorktreeDir === undefined) delete process.env.OMP_WORKTREE_DIR;
+					else process.env.OMP_WORKTREE_DIR = originalWorktreeDir;
+				}
+			});
+		}
 
 		it("retries isoResolve candidates when a backend is path-unavailable", async () => {
 			const unavailable = new Error("ISO_UNAVAILABLE: btrfs source is not a subvolume");

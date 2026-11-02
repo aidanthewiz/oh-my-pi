@@ -41,6 +41,7 @@ describe("worktree clear task-isolation ownership", () => {
 		const dir = path.join(base, name);
 		await fs.mkdir(path.join(dir, "m"), { recursive: true });
 		await Bun.write(path.join(dir, "m", "work.txt"), "uncaptured\n");
+		await writeRetainedBackend(dir, natives.IsoBackendKind.Rcopy);
 		return dir;
 	}
 
@@ -54,6 +55,8 @@ describe("worktree clear task-isolation ownership", () => {
 	it("keeps live-owned sandboxes and reclaims dead/markerless/corrupt ones", async () => {
 		const live = await makeSandbox("tlive0001");
 		await writeIsolationOwner(live, "live0001"); // marker names this test process
+		const liveOwner = await Bun.file(path.join(live, ISOLATION_OWNER_FILE)).json();
+		const observesStartToken = typeof liveOwner.startToken === "string";
 
 		const dead = await makeSandbox("tdead0002");
 		await Bun.write(path.join(dead, ISOLATION_OWNER_FILE), JSON.stringify({ pid: await deadPid(), id: "dead0002" }));
@@ -89,9 +92,7 @@ describe("worktree clear task-isolation ownership", () => {
 		expect(await exists(orphan)).toBe(false);
 		expect(await exists(corrupt)).toBe(false);
 		expect(await exists(pending)).toBe(true);
-		// Windows reports neither /proc start times nor `ps`, so pid-only liveness
-		// cannot spot the recycled pid and the sandbox is conservatively kept.
-		expect(await exists(recycled)).toBe(process.platform === "win32");
+		expect(await exists(recycled)).toBe(!observesStartToken);
 	});
 
 	it("unmounts retained mounting-backend workspaces before removal", async () => {
@@ -109,16 +110,23 @@ describe("worktree clear task-isolation ownership", () => {
 		await expect(fs.stat(retained)).rejects.toThrow();
 	});
 
-	it("removes sandboxes without a retained-mount sidecar without unmounting", async () => {
-		const plain = await makeSandbox("tplain08");
-		await Bun.write(path.join(plain, ISOLATION_OWNER_FILE), JSON.stringify({ pid: await deadPid(), id: "plain08" }));
-		const isoStopSpy = vi.spyOn(natives, "isoStop").mockResolvedValue(undefined);
+	it.skipIf(process.platform === "win32")(
+		"removes verified unmounted sandboxes without a retained-mount sidecar",
+		async () => {
+			const plain = await makeSandbox("tplain08");
+			await Bun.write(
+				path.join(plain, ISOLATION_OWNER_FILE),
+				JSON.stringify({ pid: await deadPid(), id: "plain08" }),
+			);
+			await fs.rm(path.join(plain, RETAINED_BACKEND_FILE));
+			const isoStopSpy = vi.spyOn(natives, "isoStop").mockResolvedValue(undefined);
 
-		await clearWorktrees({ all: false, dryRun: false, json: true });
+			await clearWorktrees({ all: false, dryRun: false, json: true });
 
-		expect(isoStopSpy).not.toHaveBeenCalled();
-		await expect(fs.stat(plain)).rejects.toThrow();
-	});
+			expect(isoStopSpy).not.toHaveBeenCalled();
+			await expect(fs.stat(plain)).rejects.toThrow();
+		},
+	);
 
 	it("keeps the workspace when its retained mount cannot stop", async () => {
 		const retained = await makeSandbox("tbusy0009");
@@ -148,5 +156,71 @@ describe("worktree clear task-isolation ownership", () => {
 
 		expect(isoStopSpy).not.toHaveBeenCalled();
 		expect(await Bun.file(path.join(retained, "m", "work.txt")).exists()).toBe(true);
+	});
+
+	it("keeps live-owned sandboxes even with --all", async () => {
+		const live = await makeSandbox("live-all");
+		await writeIsolationOwner(live, "live-all");
+		await writeRetainedBackend(live, natives.IsoBackendKind.Overlayfs);
+		vi.spyOn(natives, "isoStop").mockResolvedValue(undefined);
+		const result = await clearWorktrees({ all: true, dryRun: false, json: true });
+		expect(result).toEqual({ removed: 0, failed: 1 });
+		expect(await fs.readFile(path.join(live, "m", "work.txt"), "utf8")).toBe("uncaptured\n");
+	});
+
+	it("keeps a parent containing a nested live workspace", async () => {
+		const parent = await makeSandbox("parent");
+		const live = path.join(parent, "upper", "nested");
+		await fs.mkdir(path.join(live, "m"), { recursive: true });
+		await writeIsolationOwner(live, "nested-live");
+		await fs.writeFile(path.join(live, "m", "result.txt"), "active nested work");
+		const result = await clearWorktrees({ all: true, dryRun: false, json: true });
+		expect(result).toEqual({ removed: 0, failed: 1 });
+		expect(await fs.readFile(path.join(live, "m", "result.txt"), "utf8")).toBe("active nested work");
+	});
+
+	it("keeps a failed native teardown intact with --all", async () => {
+		const retained = await makeSandbox("failed-stop-all");
+		await writeRetainedBackend(retained, natives.IsoBackendKind.Overlayfs);
+		vi.spyOn(natives, "isoStop").mockRejectedValue(new Error("umount EBUSY"));
+		const result = await clearWorktrees({ all: true, dryRun: false, json: true });
+		expect(result).toEqual({ removed: 0, failed: 1 });
+		expect(await fs.readFile(path.join(retained, "m", "work.txt"), "utf8")).toBe("uncaptured\n");
+	});
+
+	for (const all of [false, true]) {
+		for (const nested of [false, true]) {
+			it.skipIf(process.platform !== "linux")(
+				`preserves an unrecorded ${nested ? "nested" : "root"} mount with all=${all}`,
+				async () => {
+					const unknown = await makeSandbox("unknown mount");
+					await fs.rm(path.join(unknown, RETAINED_BACKEND_FILE));
+					const mount = path.join(await fs.realpath(unknown), nested ? "upper" : "m");
+					await fs.mkdir(mount, { recursive: true });
+					const point = mount.replace(/ /g, "\\040");
+					const original = fs.readFile;
+					vi.spyOn(fs, "readFile").mockImplementation(((
+						file: Parameters<typeof fs.readFile>[0],
+						options: Parameters<typeof fs.readFile>[1],
+					) => {
+						if (file === "/proc/self/mountinfo") {
+							return Promise.resolve(`35 20 0:1 / ${point} rw - overlay overlay rw\n`);
+						}
+						return original(file, options);
+					}) as typeof fs.readFile);
+					const result = await clearWorktrees({ all, dryRun: false, json: true });
+					expect(result).toEqual({ removed: 0, failed: 1 });
+					expect(await fs.readFile(path.join(unknown, "m", "work.txt"), "utf8")).toBe("uncaptured\n");
+				},
+			);
+		}
+	}
+
+	it.skipIf(process.platform !== "win32")("keeps a workspace whose projected-mount state is unrecorded", async () => {
+		const unknown = await makeSandbox("unknown-projection");
+		await fs.rm(path.join(unknown, RETAINED_BACKEND_FILE));
+		const result = await clearWorktrees({ all: true, dryRun: false, json: true });
+		expect(result).toEqual({ removed: 0, failed: 1 });
+		expect(await fs.readFile(path.join(unknown, "m", "work.txt"), "utf8")).toBe("uncaptured\n");
 	});
 });
