@@ -14,6 +14,7 @@
 
 ### Fixed
 
+- Reject late eval foreground replies after caller or session cancellation, including abort-insensitive backend completion. This fixes an inherited v18.14.2 publication race.
 - Preserve one monitor per task-managed continuation and retain result publication for service completions after executor detachment.
 - Prevent false async-media qualification failures when retired-card clocks continue to advance.
 - Publish collected walker results and their path arenas before worker completion.

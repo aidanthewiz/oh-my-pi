@@ -894,6 +894,8 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 			// What bridged calls write to `out://`. Each frame carries the replies so far and the transcript
 			// draws the new ones; once the call returns (backgrounded), nothing would draw them.
 			const onReply = (text: string): void => {
+				throwIfAborted(signal);
+				throwIfAborted(sessionAbortController.signal);
 				if (!foreground()) {
 					throw new ToolError("out:// replies reach the user only while the eval cell runs in the foreground.");
 				}

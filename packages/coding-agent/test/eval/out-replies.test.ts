@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { disposeAllVmContexts } from "@oh-my-pi/pi-coding-agent/eval/js/context-manager";
@@ -12,6 +12,9 @@ import { WriteTool } from "@oh-my-pi/pi-coding-agent/tools/write";
 import type { EvalToolDetails } from "@oh-my-pi/pi-tui/tools/eval";
 import { $which, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
 import { beginSettingsTest, restoreSettingsTestState, type SettingsTestState } from "../helpers/settings-test-state";
+import { AsyncJobManager } from "../../src/async";
+import { jsBackend } from "../../src/eval";
+import { ToolAbortError } from "../../src/tools/tool-errors";
 
 let temp: TempDir;
 let settingsState: SettingsTestState;
@@ -106,5 +109,67 @@ describe("eval replies through out://", () => {
 			callSessionTool("write", { path: "out://", content }, { session, onReply: text => replies.push(text) }),
 		).rejects.toThrow(error);
 		expect(replies).toEqual([]);
+	});
+
+	it("keeps foreground replies but refuses an abort-insensitive completion after caller cancellation", async () => {
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const lateReply = Promise.withResolvers<unknown>();
+		const execute = vi.spyOn(jsBackend, "execute").mockImplementation(async (_code, options) => {
+			options.onReply?.("foreground reply");
+			entered.resolve();
+			await release.promise;
+			try {
+				options.onReply?.("late reply");
+				lateReply.resolve(undefined);
+			} catch (error) {
+				lateReply.resolve(error);
+			}
+			return {
+				output: "",
+				exitCode: 0,
+				cancelled: false,
+				truncated: false,
+				artifactId: undefined,
+				totalLines: 0,
+				totalBytes: 0,
+				outputLines: 0,
+				outputBytes: 0,
+				displayOutputs: [],
+			};
+		});
+		const manager = new AsyncJobManager({});
+		const session = makeSession();
+		session.asyncJobManager = manager;
+		session.settings = Settings.isolated({
+			"eval.autoBackground.enabled": true,
+			"eval.autoBackground.thresholdMs": 60_000,
+			"eval.autoProvision": false,
+		});
+		const controller = new AbortController();
+		const frames: (EvalToolDetails | undefined)[] = [];
+		const completion = new EvalTool(session)
+			.execute("cancelled-call", { language: "js", code: "await slowTool()" }, controller.signal, update =>
+				frames.push(update.details),
+			)
+			.then(
+				() => undefined,
+				error => error,
+			);
+		try {
+			await entered.promise;
+			controller.abort();
+			expect(await completion).toBeInstanceOf(ToolAbortError);
+			release.resolve();
+			expect(await lateReply.promise).toBeInstanceOf(ToolAbortError);
+			expect(frames.some(frame => frame?.replies?.includes("foreground reply"))).toBe(true);
+			expect(frames.flatMap(frame => frame?.replies ?? [])).not.toContain("late reply");
+		} finally {
+			controller.abort();
+			release.resolve();
+			await completion;
+			await manager.dispose();
+			execute.mockRestore();
+		}
 	});
 });
