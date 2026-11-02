@@ -5,12 +5,22 @@ async function runHost(source: string): Promise<{ exitCode: number; stdout: stri
 		stdout: "pipe",
 		stderr: "pipe",
 	});
-	const [exitCode, stdout, stderr] = await Promise.all([
-		child.exited,
-		new Response(child.stdout).text(),
-		new Response(child.stderr).text(),
-	]);
-	return { exitCode, stdout, stderr };
+	// Signal delivery runs in the real child process; fake timers cannot bound a wedged child.
+	const watchdog = setTimeout(() => {
+		try {
+			child.kill("SIGKILL");
+		} catch {}
+	}, 20_000);
+	try {
+		const [exitCode, stdout, stderr] = await Promise.all([
+			child.exited,
+			new Response(child.stdout).text(),
+			new Response(child.stderr).text(),
+		]);
+		return { exitCode, stdout, stderr };
+	} finally {
+		clearTimeout(watchdog);
+	}
 }
 
 describe("SDK import process ownership", () => {
@@ -23,7 +33,7 @@ describe("SDK import process ownership", () => {
 				process.exit(0);
 			});
 			// Dynamic import tests the host's process listener before the SDK dependency graph evaluates.
-			await import("@oh-my-pi/pi-catalog");
+			await import(${JSON.stringify(new URL("../src/sdk.ts", import.meta.url).href)});
 			process.kill(process.pid, "SIGTERM");
 		`);
 
