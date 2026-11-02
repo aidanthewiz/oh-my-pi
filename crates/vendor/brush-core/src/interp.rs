@@ -446,8 +446,8 @@ pub enum ProcessGroupPolicy {
 	SameProcessGroup,
 }
 
-const EXECUTION_STACK_RED_ZONE: usize = 256 * 1024;
 const EXECUTION_STACK_SEGMENT: usize = 2 * 1024 * 1024;
+const EXECUTION_STACK_RED_ZONE: usize = EXECUTION_STACK_SEGMENT / 2;
 
 /// Async recursion boxes its state, but polling and dropping it still recurse on the native stack.
 pub(crate) struct StackSafe<F: Future + ?Sized> {
