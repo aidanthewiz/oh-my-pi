@@ -3,6 +3,7 @@ import * as path from "node:path";
 import { AgentBusyError, type AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, Model } from "@oh-my-pi/pi-ai";
 import { getAgentDir, getBlobsDir, isEnoent, logger, type postmortem, VERSION } from "@oh-my-pi/pi-utils";
+import { withFileLock } from "@oh-my-pi/pi-utils/file-lock";
 import {
 	type Agent,
 	type AgentSideConnection,
@@ -79,6 +80,7 @@ import { AUTO_THINKING, parseConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/th
 import { OTHER_OPTION } from "../../tools/ask";
 import { resolvePlanFilePath } from "../../plan-mode/plan-files";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
+import { writeFileAtomically } from "../../utils/atomic-file";
 import {
 	DEFAULT_TTS_SPEED,
 	DEFAULT_TTS_VOICE,
@@ -139,7 +141,7 @@ const ACP_ASYNC_DELIVERY_DRAIN_MAX_PASSES = 3;
 /**
  * `<agentDir>/acp-session-handles.json` maps ACP handles whose durable session an
  * extension replaced (`ctx.newSession`) to the session id now behind them, so
- * `session/load` and `session/resume` by the handle reopen the conversation that
+ * loading, resuming, and forking by the handle use the conversation that
  * continued under it after the agent restarts.
  */
 const ACP_SESSION_HANDLES_FILE = "acp-session-handles.json";
@@ -1773,9 +1775,7 @@ export class AcpAgent implements Agent {
 	async #findHandleSession(handle: string, cwd: string): Promise<StoredSessionInfo> {
 		await this.#handleWrites;
 		const moved = (await readAcpSessionHandles())[handle];
-		const stored =
-			(moved ? await this.#findStoredSession(moved, cwd) : undefined) ??
-			(await this.#findStoredSession(handle, cwd));
+		const stored = await this.#findStoredSession(moved ?? handle, cwd);
 		if (!stored) throw new Error(`ACP session not found: ${handle}`);
 		return stored;
 	}
@@ -1786,17 +1786,21 @@ export class AcpAgent implements Agent {
 		const sessionId = record.session.sessionId;
 		this.#handleWrites = this.#handleWrites
 			.then(async () => {
-				const handles = await readAcpSessionHandles();
-				if (sessionId === handle ? !(handle in handles) : handles[handle] === sessionId) return;
-				if (sessionId === handle) delete handles[handle];
-				else handles[handle] = sessionId;
-				await Bun.write(path.join(getAgentDir(), ACP_SESSION_HANDLES_FILE), JSON.stringify(handles));
+				const filePath = path.join(getAgentDir(), ACP_SESSION_HANDLES_FILE);
+				await fs.mkdir(path.dirname(filePath), { recursive: true, mode: 0o700 });
+				await withFileLock(filePath, async () => {
+					const handles = await readAcpSessionHandles();
+					if (sessionId === handle ? !(handle in handles) : handles[handle] === sessionId) return;
+					if (sessionId === handle) delete handles[handle];
+					else handles[handle] = sessionId;
+					await writeFileAtomically(filePath, JSON.stringify(handles));
+				});
 			})
 			.catch(error => logger.warn("Failed to record ACP session handle", { handle, sessionId, error }));
 	}
 
 	async #forkManagedSession(params: ForkSessionRequest): Promise<ManagedSessionRecord> {
-		const sourcePath = await this.#resolveForkSourceSessionPath(params.sessionId);
+		const sourcePath = await this.#resolveForkSourceSessionPath(params.sessionId, params.cwd);
 		const { session, setToolUIContext } = normalizeCreatedAcpSession(
 			await this.#createSession(path.resolve(params.cwd), {
 				interactivePrompts: this.#clientCapabilities?.elicitation?.form != null,
@@ -1990,7 +1994,7 @@ export class AcpAgent implements Agent {
 		}
 	}
 
-	async #resolveForkSourceSessionPath(sessionId: string): Promise<string> {
+	async #resolveForkSourceSessionPath(sessionId: string, cwd: string): Promise<string> {
 		const loaded = this.#sessions.get(sessionId);
 		if (loaded) {
 			if (isPromptTurnInFlight(loaded.promptTurn)) {
@@ -2004,11 +2008,7 @@ export class AcpAgent implements Agent {
 			return sessionPath;
 		}
 
-		const storedSession = await this.#findStoredSessionById(sessionId);
-		if (!storedSession) {
-			throw new Error(`ACP session not found: ${sessionId}`);
-		}
-		return storedSession.path;
+		return (await this.#findHandleSession(sessionId, cwd)).path;
 	}
 
 	async #handlePromptEvent(record: ManagedSessionRecord, event: AgentSessionEvent): Promise<void> {

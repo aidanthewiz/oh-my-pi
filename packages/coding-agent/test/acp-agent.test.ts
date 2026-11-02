@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, spyOn, vi } from "bun:test";
+import type { Subprocess } from "bun";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -33,7 +34,7 @@ import { closeSessionIndex } from "@oh-my-pi/pi-coding-agent/session/session-ind
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TaskTool } from "@oh-my-pi/pi-coding-agent/task";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
-import { getConfigRootDir, setAgentDir } from "@oh-my-pi/pi-utils";
+import { getAgentDir, getConfigRootDir, setAgentDir } from "@oh-my-pi/pi-utils";
 import type {
 	AgentSideConnection,
 	ClientCapabilities,
@@ -53,6 +54,7 @@ import {
 	zSessionNotification,
 } from "@oh-my-pi/pi-utils/acp";
 import { TOOL_NAME as DELAYED_MCP_TOOL_NAME } from "./fixtures/delayed-tool-mcp";
+import type { AcpHandleWriterMessage } from "./fixtures/acp-handle-writer";
 
 import { cfgPlanAutosave, cfgPlanAutosaveDir, cfgPlanEnabled } from "@oh-my-pi/pi-coding-agent/plan-mode/settings";
 import { MCPManager } from "@oh-my-pi/pi-coding-agent/mcp/manager";
@@ -533,10 +535,15 @@ function expectAcpNotifications(updates: SessionNotification[]): void {
 }
 
 const cleanupRoots: string[] = [];
+const handleWriters: Array<Subprocess<"ignore", "ignore", "pipe">> = [];
 const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
 const fallbackAgentDir = path.join(getConfigRootDir(), "agent");
 
 afterEach(async () => {
+	for (const writer of handleWriters.splice(0)) {
+		if (writer.exitCode === null) writer.kill();
+		await writer.exited;
+	}
 	vi.useRealTimers();
 	if (originalAgentDir) {
 		setAgentDir(originalAgentDir);
@@ -658,6 +665,52 @@ async function advanceBootstrapGuard(): Promise<void> {
 	await Promise.resolve();
 }
 
+async function startHandleWriter(root: string, name: string, mode: string) {
+	const messages: AcpHandleWriterMessage[] = [];
+	const waiters: Array<{
+		events: AcpHandleWriterMessage["event"][];
+		resolve: (message: AcpHandleWriterMessage) => void;
+		reject: (error: Error) => void;
+	}> = [];
+	let failure: Error | undefined;
+	const worker = Bun.spawn(
+		[process.execPath, path.join(import.meta.dir, "fixtures", "acp-handle-writer.ts"), root, name, mode],
+		{
+			cwd: root,
+			env: { ...process.env, PI_CODING_AGENT_DIR: path.join(root, "agent") },
+			stdin: "ignore",
+			stdout: "ignore",
+			stderr: "pipe",
+			ipc(message: AcpHandleWriterMessage) {
+				if (message.event === "error") {
+					failure = new Error(message.error);
+					for (const waiter of waiters.splice(0)) waiter.reject(failure);
+					return;
+				}
+				const index = waiters.findIndex(waiter => waiter.events.includes(message.event));
+				if (index >= 0) waiters.splice(index, 1)[0]!.resolve(message);
+				else messages.push(message);
+			},
+		},
+	);
+	handleWriters.push(worker);
+	void worker.exited.then(async code => {
+		if (code === 0) return;
+		failure = new Error(`ACP handle writer exited ${code}: ${await new Response(worker.stderr).text()}`);
+		for (const waiter of waiters.splice(0)) waiter.reject(failure);
+	});
+	const wait = (...events: AcpHandleWriterMessage["event"][]): Promise<AcpHandleWriterMessage> => {
+		if (failure) return Promise.reject(failure);
+		const index = messages.findIndex(message => events.includes(message.event));
+		if (index >= 0) return Promise.resolve(messages.splice(index, 1)[0]!);
+		const { promise, resolve, reject } = Promise.withResolvers<AcpHandleWriterMessage>();
+		waiters.push({ events, resolve, reject });
+		return promise;
+	};
+	const ready = await wait("ready");
+	return { worker, wait, handle: ready.handle! };
+}
+
 describe("ACP agent", () => {
 	it("keeps the ACP handle after the durable session changes", async () => {
 		const elicitations: CreateElicitationRequest[] = [];
@@ -672,9 +725,7 @@ describe("ACP agent", () => {
 		});
 		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
 		const session = harness.findSession(created.sessionId)!;
-		// This harness reset delegates to the real SessionManager, as extension
-		// ctx.newSession does, and rolls the durable identifier in place.
-		await session.newSession();
+		await session.extensionRunner!.createCommandContext().newSession();
 		expect(session.sessionId).not.toBe(created.sessionId);
 
 		const response = await harness.agent.prompt({
@@ -700,6 +751,124 @@ describe("ACP agent", () => {
 		expect(harness.sessions.at(-1)?.sessionId).toBe(continued);
 		await harness.agent.dispose();
 	});
+
+	it.each([false, true])(
+		"forks a restarted handle's continued conversation with original removed=%s",
+		async removed => {
+			await createHarness();
+			const root = path.dirname(getAgentDir());
+			const original = await startHandleWriter(root, "consumer", "consumer");
+			original.worker.send({ command: "replace" });
+			const replacement = await original.wait("replaced");
+			original.worker.send({ command: "dispose" });
+			await original.wait("done");
+			await original.worker.exited;
+			if (removed) await fs.promises.rm(replacement.originalPath!);
+
+			const restarted = await startHandleWriter(root, "consumer", "consumer");
+			restarted.worker.send({ command: "fork", sessionId: original.handle });
+			const forked = await restarted.wait("forked", "fork-rejected");
+			expect(forked.event, forked.error).toBe("forked");
+			expect(forked.userMessages).toEqual(["continued conversation"]);
+			expect(forked.sessionId).not.toBe(replacement.sessionId);
+			restarted.worker.send({ command: "reopen", sessionId: original.handle });
+			const reopened = await restarted.wait("opened");
+			expect(reopened.reopenedIds).toEqual([replacement.sessionId!, replacement.sessionId!]);
+			restarted.worker.send({ command: "dispose" });
+			await restarted.wait("done");
+		},
+		30_000,
+	);
+
+	it("rejects a fork when its mapped transcript is missing instead of using the original", async () => {
+		await createHarness();
+		const root = path.dirname(getAgentDir());
+		const original = await startHandleWriter(root, "consumer", "consumer");
+		original.worker.send({ command: "replace" });
+		const replacement = await original.wait("replaced");
+		original.worker.send({ command: "dispose" });
+		await original.wait("done");
+		await original.worker.exited;
+		await fs.promises.rm(replacement.continuedPath!);
+
+		const restarted = await startHandleWriter(root, "consumer", "consumer");
+		restarted.worker.send({ command: "fork", sessionId: original.handle });
+		const forked = await restarted.wait("forked", "fork-rejected");
+		expect(forked.event).toBe("fork-rejected");
+		expect(forked.error).toContain(`ACP session not found: ${original.handle}`);
+		restarted.worker.send({ command: "dispose" });
+		await restarted.wait("done");
+	}, 30_000);
+
+	it.each([false, true])(
+		"retains independent process handle updates with existing map=%s",
+		async existing => {
+			await createHarness();
+			const root = path.dirname(getAgentDir());
+			const filePath = path.join(getAgentDir(), "acp-session-handles.json");
+			const seed = existing ? { untouched: "durable-untouched" } : {};
+			if (existing) await fs.promises.writeFile(filePath, JSON.stringify(seed));
+			const first = await startHandleWriter(root, "writer-a", "hold-read");
+			const second = await startHandleWriter(root, "writer-b", "observe-lock");
+			first.worker.send({ command: "replace" });
+			await first.wait("read");
+			const firstReplacement = await first.wait("replaced");
+			second.worker.send({ command: "replace" });
+			const boundary = await second.wait("read", "blocked");
+			const secondReplacement = await second.wait("replaced");
+			second.worker.send({ command: "dispose" });
+			// Without a cross-process lock, publish B before releasing A's stale snapshot.
+			if (boundary.event === "read") await second.wait("done");
+			first.worker.send({ command: "dispose" });
+			first.worker.send({ command: "release" });
+			await first.wait("done");
+			if (boundary.event === "blocked") await second.wait("done");
+			expect(JSON.parse(await fs.promises.readFile(filePath, "utf8"))).toEqual({
+				...seed,
+				[first.handle]: firstReplacement.sessionId,
+				[second.handle]: secondReplacement.sessionId,
+			});
+		},
+		30_000,
+	);
+
+	it("keeps the published handle map complete while another process stages a partial write", async () => {
+		await createHarness();
+		const root = path.dirname(getAgentDir());
+		const filePath = path.join(getAgentDir(), "acp-session-handles.json");
+		const seed = { untouched: "durable-untouched" };
+		await fs.promises.writeFile(filePath, JSON.stringify(seed));
+		const writer = await startHandleWriter(root, "writer", "hold-write");
+		writer.worker.send({ command: "replace" });
+		const replacement = await writer.wait("replaced");
+		await writer.wait("staged");
+		writer.worker.send({ command: "dispose" });
+		try {
+			expect(JSON.parse(await fs.promises.readFile(filePath, "utf8"))).toEqual(seed);
+		} finally {
+			writer.worker.send({ command: "release" });
+		}
+		await writer.wait("done");
+		expect(JSON.parse(await fs.promises.readFile(filePath, "utf8"))).toEqual({
+			...seed,
+			[writer.handle]: replacement.sessionId,
+		});
+		if (process.platform !== "win32") expect((await fs.promises.stat(filePath)).mode & 0o777).toBe(0o600);
+	}, 30_000);
+
+	it("does not publish a handle update after cross-process lock acquisition fails", async () => {
+		await createHarness();
+		const root = path.dirname(getAgentDir());
+		const filePath = path.join(getAgentDir(), "acp-session-handles.json");
+		const seed = { untouched: "durable-untouched" };
+		await fs.promises.writeFile(filePath, JSON.stringify(seed));
+		const writer = await startHandleWriter(root, "writer", "fail-lock");
+		writer.worker.send({ command: "replace" });
+		await writer.wait("replaced");
+		writer.worker.send({ command: "dispose" });
+		await writer.wait("done");
+		expect(JSON.parse(await fs.promises.readFile(filePath, "utf8"))).toEqual(seed);
+	}, 30_000);
 
 	it("supports multiple live ACP sessions with model and lifecycle handlers", async () => {
 		const harness = await createHarness();
