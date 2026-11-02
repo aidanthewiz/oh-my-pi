@@ -339,19 +339,12 @@ function typescriptPackageDir(tscPath: string): string | null {
  * Whether the `tsc` at `tscPath` speaks LSP itself. TypeScript 7 dropped the JS
  * `lib/tsserver.js` that typescript-language-server wraps and exposes
  * `tsc --lsp --stdio` instead; older releases reject the flag with TS5023.
- * Outside an npm layout (e.g. nixpkgs) ask the compiler for its version, run in
- * `cwd` so version-manager shims resolve the project's pinned TypeScript.
+ * Package-less installs use the native invocation only when the client starts;
+ * configuration discovery never executes a compiler or version-manager shim.
  */
-function typescriptSpeaksLsp(tscPath: string, cwd: string): boolean {
+function typescriptSpeaksLsp(tscPath: string): boolean {
 	const packageDir = typescriptPackageDir(tscPath);
-	if (packageDir !== null) return !fs.existsSync(path.join(packageDir, "lib", "tsserver.js"));
-	try {
-		const { stdout } = Bun.spawnSync([tscPath, "--version"], { cwd, stderr: "ignore", timeout: 3_000 });
-		const major = /^Version (\d+)\./.exec(stdout.toString())?.[1];
-		return major !== undefined && Number(major) >= 7;
-	} catch {
-		return false;
-	}
+	return packageDir === null || !fs.existsSync(path.join(packageDir, "lib", "tsserver.js"));
 }
 
 /**
@@ -359,10 +352,10 @@ function typescriptSpeaksLsp(tscPath: string, cwd: string): boolean {
  * `lib/tsserver.js`, which a TypeScript 7 workspace no longer ships, so it fails
  * at initialize there; `tsc --lsp` exits on older TypeScript.
  */
-function selectTypescriptServer(servers: Record<string, ServerConfig>, cwd: string): void {
+function selectTypescriptServer(servers: Record<string, ServerConfig>): void {
 	const native = servers["typescript-native"];
 	if (!native?.resolvedCommand) return;
-	if (typescriptSpeaksLsp(native.resolvedCommand, cwd)) {
+	if (typescriptSpeaksLsp(native.resolvedCommand)) {
 		delete servers["typescript-language-server"];
 	} else {
 		delete servers["typescript-native"];
@@ -466,7 +459,7 @@ export function loadConfig(cwd: string): LspConfig {
 		if (!resolved) continue;
 		servers[name] = { ...config, resolvedCommand: resolved };
 	}
-	selectTypescriptServer(servers, cwd);
+	selectTypescriptServer(servers);
 
 	return { servers, idleTimeoutMs };
 }

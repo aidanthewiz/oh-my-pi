@@ -3275,7 +3275,7 @@ describe("lsp regressions", () => {
 			}
 		});
 
-		it("drops tsc --lsp when the tsc install layout is unrecognized", async () => {
+		it("keeps an unrecognized compiler layout available without executing it", async () => {
 			const tempDir = TempDir.createSync("@omp-lsp-ts-unknown-");
 			vi.spyOn(Bun, "which").mockReturnValue(null);
 			try {
@@ -3284,35 +3284,80 @@ describe("lsp regressions", () => {
 				await fs.promises.mkdir(binDir, { recursive: true });
 				await Bun.write(path.join(binDir, "tsc"), "");
 				await Bun.write(path.join(binDir, "typescript-language-server"), "");
+				const spawn = vi.spyOn(Bun, "spawnSync").mockImplementation(() => {
+					throw new Error("Configuration must not execute a compiler");
+				});
 				const config = loadConfig(tempDir.path());
-				expect(Object.keys(config.servers)).toEqual(["typescript-language-server"]);
+				expect(Object.keys(config.servers)).toEqual(["typescript-native"]);
+				expect(spawn).not.toHaveBeenCalled();
 			} finally {
 				vi.restoreAllMocks();
 				tempDir.removeSync();
 			}
 		});
 
-		it("prefers tsc --lsp for a TypeScript 7 install outside any npm layout", async () => {
-			// #17659: nixpkgs ships TypeScript 7 without a package.json.
-			if (process.platform === "win32") return;
-			const tempDir = TempDir.createSync("@omp-lsp-ts7-native-");
-			const tsc = tempDir.join("store", "typescript-7.0.2", "bin", "tsc");
-			await Bun.write(tsc, "#!/bin/sh\nprintf 'Version 7.0.2\\n'\n");
-			await fs.promises.chmod(tsc, 0o755);
-			const project = tempDir.join("project");
-			await Bun.write(path.join(project, "tsconfig.json"), "{}");
-			const originalPath = process.env.PATH;
-			process.env.PATH = `${path.dirname(tsc)}${path.delimiter}${originalPath ?? ""}`;
-			try {
-				const config = loadConfig(project);
-				expect(Object.keys(config.servers)).toEqual(["typescript-native"]);
-				expect(config.servers["typescript-native"]?.resolvedCommand).toBe(tsc);
-			} finally {
-				if (originalPath === undefined) delete process.env.PATH;
-				else process.env.PATH = originalPath;
-				tempDir.removeSync();
-			}
-		});
+		it.skipIf(process.platform === "win32")(
+			"starts a package-less native compiler only through the owned LSP client",
+			async () => {
+				const tempDir = TempDir.createSync("@omp-lsp-ts7-native-");
+				const tsc = tempDir.join("store", "typescript-7.0.2", "bin", "tsc");
+				const marker = tempDir.join("invocation.json");
+				await Bun.write(
+					tsc,
+					`#!${process.execPath}
+import * as fs from "node:fs";
+fs.writeFileSync(${JSON.stringify(marker)}, JSON.stringify(process.argv.slice(2)));
+if (process.argv.includes("--version")) {
+	console.log("Version 7.0.2");
+	process.exit(0);
+}
+let buffer = Buffer.alloc(0);
+const reply = (id, result) => {
+	const body = JSON.stringify({ jsonrpc: "2.0", id, result });
+	process.stdout.write("Content-Length: " + Buffer.byteLength(body) + "\\r\\n\\r\\n" + body);
+};
+for await (const chunk of Bun.stdin.stream()) {
+	buffer = Buffer.concat([buffer, Buffer.from(chunk)]);
+	for (;;) {
+		const end = buffer.indexOf("\\r\\n\\r\\n");
+		if (end < 0) break;
+		const length = Number(/Content-Length:\\s*(\\d+)/i.exec(buffer.subarray(0, end).toString())?.[1]);
+		if (buffer.length < end + 4 + length) break;
+		const message = JSON.parse(buffer.subarray(end + 4, end + 4 + length).toString());
+		buffer = buffer.subarray(end + 4 + length);
+		if (message.method === "initialize") reply(message.id, { capabilities: { hoverProvider: true } });
+		else if (message.method === "textDocument/hover") reply(message.id, { contents: "Native compiler hover" });
+		else if (message.method === "shutdown") reply(message.id, null);
+		else if (message.method === "exit") process.exit(0);
+	}
+}
+`,
+				);
+				await fs.promises.chmod(tsc, 0o755);
+				const project = tempDir.join("project");
+				await Bun.write(path.join(project, "tsconfig.json"), "{}");
+				const originalPath = process.env.PATH;
+				process.env.PATH = path.dirname(tsc);
+				try {
+					const config = loadConfig(project);
+					expect(await Bun.file(marker).exists()).toBe(false);
+					const native = config.servers["typescript-native"];
+					expect(native).toBeDefined();
+					const client = await lspClient.getOrCreateClient(native!, project, 2_000);
+					expect(
+						await lspClient.sendRequest(client, "textDocument/hover", {
+							textDocument: { uri: fileToUri(path.join(project, "main.ts")) },
+							position: { line: 0, character: 0 },
+						}),
+					).toEqual({ contents: "Native compiler hover" });
+					expect(await Bun.file(marker).json()).toEqual(["--lsp", "--stdio"]);
+				} finally {
+					await lspClient.shutdownAll();
+					restoreEnvValue("PATH", originalPath);
+					tempDir.removeSync();
+				}
+			},
+		);
 	});
 
 	it("detects Ruff in Windows virtualenv Scripts directories", async () => {

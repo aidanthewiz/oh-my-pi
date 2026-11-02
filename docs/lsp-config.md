@@ -275,4 +275,4 @@ The following servers ship in `defaults.json` and are eligible for auto-detectio
 | `swiftlint`                   | Swift (linter)                | `swiftlint`                       |
 | `tlaplus`                     | TLA+                          | `tlapm_lsp`                       |
 
-Only one TypeScript server is kept per project: when the resolved `tsc` belongs to a TypeScript install without `lib/tsserver.js` (TypeScript 7+), or reports version 7+ from an install without an npm `package.json` (such as nixpkgs), `typescript-native` wins and `typescript-language-server` is dropped; otherwise `typescript-native` is dropped because older `tsc` rejects `--lsp`.
+Only one TypeScript server is kept per project. An npm install with `lib/tsserver.js` uses `typescript-language-server`; one without it uses `typescript-native`. Package-less compilers use `tsc --lsp --stdio` through the owned client launch. Configuration discovery never executes the compiler. A package-less compiler older than TypeScript 7 reports an unsupported native invocation. For that layout, disable `typescript-native` and configure `typescript-language-server` explicitly.
