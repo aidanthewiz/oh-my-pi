@@ -8116,7 +8116,9 @@ export class InteractiveMode implements InteractiveModeContext {
 		const sessionId = this.#resumableSessionId();
 		if (sessionId) {
 			// Command on its own line so triple-click selects just the command (#11001).
-			process.stderr.write(`\n${chalk.dim("Resume this session with")}\n${chalk.dim(resumeCommand(sessionId))}\n`);
+			process.stderr.write(
+				`\n${chalk.dim("Resume this session with")}\n${chalk.dim(resumeCommand(sessionId, this.sessionManager.getSessionDir()))}\n`,
+			);
 		}
 
 		await this.#quitHostOwned(0);

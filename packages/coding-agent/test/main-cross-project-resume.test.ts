@@ -22,6 +22,7 @@ import type { SessionInfo } from "@oh-my-pi/pi-coding-agent/session/session-list
 import * as sessionListingModule from "@oh-my-pi/pi-coding-agent/session/session-listing";
 import { loadEntriesFromFile } from "@oh-my-pi/pi-coding-agent/session/session-loader";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { resumeCommand } from "@oh-my-pi/pi-coding-agent/utils/resume-command";
 import {
 	__resetDirsFromEnvForTests,
 	getProjectDir,
@@ -498,4 +499,59 @@ describe("createSessionManager — cross-project --resume relocation (moved work
 		}
 		expect(movePrompt).toHaveBeenCalledTimes(1);
 	});
+});
+
+describe("generated resume hints — explicit custom session directory", () => {
+	it.skipIf(process.platform === "win32")(
+		"opens the original retained conversation from another launch directory",
+		async () => {
+			if (!agentDirRoot) throw new Error("Expected isolated agent directory");
+			const project = path.join(agentDirRoot, "project");
+			const launch = path.join(agentDirRoot, "another-launch-directory");
+			const sessionDir = path.join(agentDirRoot, "custom ' $HOME $(touch injected) sessions");
+			await fsp.mkdir(project);
+			await fsp.mkdir(launch);
+			const original = SessionManager.create(project, sessionDir);
+			original.appendMessage({ role: "user", content: "retained checkpoint", timestamp: 1 });
+			await original.flush();
+			const sessionId = original.getSessionId();
+			const sessionFile = original.getSessionFile();
+			const hint = resumeCommand(sessionId, original.getSessionDir());
+			await original.close();
+			const shell = Bun.spawn(["/bin/sh", "-c", `set -- ${hint}; printf '%s\\000' "$@"`], {
+				cwd: launch,
+				env: { PATH: "/usr/bin:/bin" },
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			const output = await new Response(shell.stdout).text();
+			expect(await shell.exited).toBe(0);
+			const args = parseArgs(output.split("\0").slice(1, -1));
+			const resumed = await createSessionManager(
+				args,
+				launch,
+				Settings.isolated({ "marketplace.autoUpdate": "off" }),
+			);
+			if (!resumed) throw new Error("Expected the original session manager");
+			try {
+				expect(resumed.getSessionId()).toBe(sessionId);
+				expect(resumed.getSessionFile()).toBe(sessionFile);
+				expect(resumed.getSessionDir()).toBe(sessionDir);
+				expect(resumed.getCwd()).toBe(project);
+				expect(
+					resumed
+						.getEntries()
+						.some(
+							entry =>
+								entry.type === "message" &&
+								entry.message.role === "user" &&
+								entry.message.content === "retained checkpoint",
+						),
+				).toBe(true);
+				expect(fs.existsSync(path.join(launch, "injected"))).toBe(false);
+			} finally {
+				await resumed.close();
+			}
+		},
+	);
 });
