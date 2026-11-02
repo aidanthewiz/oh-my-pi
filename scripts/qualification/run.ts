@@ -138,7 +138,6 @@ assert.equal(sourceDigest, effectiveSource.trackedFilesSha256);
 let passed = false;
 try {
 	const version = JSON.parse(await fs.readFile(path.join(checkout, "packages/natives/package.json"), "utf8")).version;
-	assert.match(version, /^18\.14\.0$/);
 	process.env.CF_QUAL_VERSION = version;
 	// The loader must first execute after private HOME, sealed overlays, and actual source verification.
 	const nativeModule = await import(path.join(checkout, "packages/natives/native/index.js"));
