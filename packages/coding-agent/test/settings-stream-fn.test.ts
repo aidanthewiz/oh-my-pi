@@ -443,6 +443,7 @@ describe("per-call server-side fallback switch", () => {
 		"removes paid fallback routes from the provider request only for a per-call worker: %p",
 		async disabled => {
 			const model = factoryModel("claude-fable-5", ["anthropic"]);
+			model.factoryDroidOrgId = "org-1";
 			const captured: CapturedRequest[] = [];
 			const chunks = anthropicChunks("ok").map(chunk => {
 				const frame = JSON.parse(chunk) as { message?: { model?: string } };

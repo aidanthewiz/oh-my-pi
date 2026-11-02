@@ -61,21 +61,22 @@ for (const language of ["bash", "python"] as const) {
 			]);
 			const component = language === "bash" ? ctx.bashComponent : ctx.pythonComponent;
 			if (!component) throw new Error(`${language} execution component was not mounted`);
+			const renderExecution = () => Bun.stripANSI(ctx.pendingShellContainer.render(120).join("\n"));
 			const beforeDrain = Bun.stripANSI(ctx.pendingMessagesContainer.render(120).join("\n"));
 			expect(beforeDrain).toContain("queued steer marker");
-			expect(beforeDrain).toContain("ready>");
+			expect(renderExecution()).toContain("ready>");
 			queue = { steering: [], followUp: [], liveSteered: 1 };
 			await events.handleEvent({ type: "queue_update", ...queue });
 			const afterDrain = Bun.stripANSI(ctx.pendingMessagesContainer.render(120).join("\n"));
 			expect(afterDrain).not.toContain("queued steer marker");
-			expect(afterDrain).toContain("ready>");
-			expect(ctx.pendingMessagesContainer.children).toContain(component);
+			expect(renderExecution()).toContain("ready>");
+			expect(ctx.pendingShellContainer.children).toContain(component);
 			release.resolve();
 			await run;
-			expect(Bun.stripANSI(ctx.pendingMessagesContainer.render(120).join("\n"))).toContain("ready>finished");
+			expect(renderExecution()).toContain("ready>finished");
 			helpers.flushPendingBashComponents();
 			helpers.flushPendingBashComponents();
-			expect(Bun.stripANSI(ctx.pendingMessagesContainer.render(120).join("\n"))).not.toContain("ready>");
+			expect(renderExecution()).not.toContain("ready>");
 			const transcript = Bun.stripANSI(ctx.chatContainer.render(120).join("\n"));
 			expect(transcript.split("ready>finished").length - 1).toBe(1);
 			expect(ctx.chatContainer.children.filter(child => child === component)).toEqual([component]);
@@ -86,13 +87,14 @@ for (const language of ["bash", "python"] as const) {
 			events.dispose();
 			const components = new Set([...ctx.pendingBashComponents, ...ctx.pendingPythonComponents]);
 			for (const component of components) {
-				ctx.pendingMessagesContainer.removeChild(component);
+				ctx.pendingShellContainer.removeChild(component);
 				ctx.chatContainer.removeChild(component);
 				component.dispose();
 			}
 			ctx.pendingBashComponents = [];
 			ctx.pendingPythonComponents = [];
 			ctx.pendingMessagesContainer.disposeChildren();
+			ctx.pendingShellContainer.disposeChildren();
 			ctx.chatContainer.disposeChildren();
 			vi.runAllTimers();
 			vi.useRealTimers();

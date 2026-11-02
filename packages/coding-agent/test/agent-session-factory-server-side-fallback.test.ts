@@ -20,6 +20,7 @@ describe("createAgentSession Factory server-side fallback", () => {
 	it.each([false, true])("preserves the Factory wire opt-out: %p", async disabled => {
 		using tempDir = TempDir.createSync("@pi-factory-server-side-fallback-");
 		const model = factoryModel("claude-fable-5", ["anthropic"]);
+		model.factoryDroidOrgId = "org-1";
 		const chunks = anthropicChunks("OK").map(chunk => {
 			const frame = JSON.parse(chunk) as { type?: string; message?: { model?: string } };
 			if (frame.type === "message_start" && frame.message) frame.message.model = model.id;
@@ -49,6 +50,11 @@ describe("createAgentSession Factory server-side fallback", () => {
 		});
 		try {
 			await session.prompt("hello");
+			expect(session.messages.at(-1)).toMatchObject({
+				role: "assistant",
+				stopReason: "stop",
+				content: [{ type: "text", text: "OK" }],
+			});
 		} finally {
 			await session.dispose();
 			await authStorage.close();

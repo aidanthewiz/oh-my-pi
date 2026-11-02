@@ -144,6 +144,19 @@ async function createSession(
 	return sess;
 }
 
+function makeToolContext(activeSession: AgentSession): AgentToolContext {
+	return {
+		sessionManager: activeSession.sessionManager,
+		modelRegistry: activeSession.modelRegistry,
+		settings: activeSession.settings,
+		model: activeSession.agent.state.model,
+		isIdle: () => !activeSession.agent.state.isStreaming,
+		hasQueuedMessages: () => false,
+		abort: () => activeSession.agent.abort(),
+		toolNames: activeSession.agent.state.tools.map(tool => tool.name),
+	};
+}
+
 beforeAll(async () => {
 	tempDir = TempDir.createSync("@pi-acp-permission-test-");
 	auth = await AuthStorage.create(tempDir.join("auth.db"));
@@ -402,6 +415,8 @@ it("rejects intercepted bash command before invoking ACP requestPermission", asy
 		settings,
 		isToolActive: (name: string) => name === "read" || name === "bash",
 	});
+	const approvalSpy = spyOn(realBashTool, "approval");
+	const executeSpy = spyOn(realBashTool, "execute");
 	session = await createSession([realBashTool as AgentTool, makeFakeTool("read")], bridge, {
 		"bashInterceptor.enabled": true,
 	});
@@ -413,12 +428,62 @@ it("rejects intercepted bash command before invoking ACP requestPermission", asy
 			"call-intercepted",
 			{ command: "cat file.txt" },
 			undefined,
-			undefined as never,
-			{ toolNames: ["read", "bash"] } as AgentToolContext,
+			undefined,
+			makeToolContext(session),
 		),
-	).rejects.toThrow("Use the `read` tool instead of cat/head/tail");
+	).rejects.toBeInstanceOf(Error);
+
+	expect(approvalSpy).toHaveBeenCalledTimes(1);
+	expect(approvalSpy.mock.results[0]?.value).toMatchObject({ policy: "deny", tier: "exec", override: true });
+	expect(executeSpy).not.toHaveBeenCalled();
 
 	expect(permissionSpy).not.toHaveBeenCalled();
+});
+
+it("refuses missing permission authority before requesting ACP permission or executing", async () => {
+	const bashTool = makeFakeTool("bash");
+	const bridge = makeBridge({ outcome: "selected", optionId: "allow_once", kind: "allow_once" });
+	const permissionSpy = spyOn(bridge, "requestPermission");
+	session = await createSession([bashTool], bridge);
+	const context = makeToolContext(session);
+	context.settings = undefined;
+	const wrappedBash = session.agent.state.tools.find(tool => tool.name === "bash");
+
+	await expect(
+		wrappedBash!.execute("call-missing-authority", { command: "echo hi" }, undefined, undefined, context),
+	).rejects.toBeInstanceOf(Error);
+
+	expect(permissionSpy).not.toHaveBeenCalled();
+	expect(bashTool.executeCalls).toBe(0);
+});
+
+it("refuses an ACP grant after the model authority changes", async () => {
+	const bashTool = makeFakeTool("bash");
+	const nextModel = getBundledModel("anthropic", "claude-opus-4-5");
+	if (!nextModel) throw new Error("Expected claude-opus-4-5 model to exist");
+	const bridge: ClientBridge = {
+		capabilities: { requestPermission: true },
+		async requestPermission() {
+			session!.agent.setModel(nextModel);
+			return { outcome: "selected", optionId: "allow_once", kind: "allow_once" };
+		},
+	};
+	const permissionSpy = spyOn(bridge, "requestPermission");
+	session = await createSession([bashTool], bridge);
+	const wrappedBash = session.agent.state.tools.find(tool => tool.name === "bash");
+
+	await expect(
+		wrappedBash!.execute(
+			"call-stale-authority",
+			{ command: "echo hi" },
+			undefined,
+			undefined,
+			makeToolContext(session),
+		),
+	).rejects.toBeInstanceOf(Error);
+
+	expect(permissionSpy).toHaveBeenCalledTimes(1);
+	expect(bashTool.executeCalls).toBe(0);
 });
 
 it("always-ask: an ACP grant satisfies the inner wrapper's explicit prompt policy", async () => {
