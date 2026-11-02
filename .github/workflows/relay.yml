@@ -80,9 +80,21 @@ jobs:
             echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
           fi
 
+  cache_restore:
+    needs: prepare
+    if: vars.CI_CACHE_ENABLED == 'true' && needs.prepare.outputs.native_changed == 'true'
+    uses: Coreforce-CAD/oh-my-pi/.github/workflows/cf-cache-read.yml@9dc313bdc0cbcd04aeacb6ede57738668b8ed325
+    with:
+      enabled: true
+      slots: '["linux-x64-ubuntu-24.04"]'
+    permissions:
+      contents: read
+      id-token: write
+
   validate:
     name: validate
-    needs: prepare
+    needs: [prepare, cache_restore]
+    if: ${{ !cancelled() && needs.prepare.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
@@ -132,16 +144,41 @@ jobs:
           RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
         run: bun scripts/ci-released-native.ts install "$RELEASE_TAG" linux-x64 packages/natives/native "$RUNNER_TEMP/released-native"
 
-      - name: Restore Bazel native build cache
+      - name: Identify compatible Bazel caches
         if: needs.prepare.outputs.native_changed == 'true'
+        id: cache-identity
+        continue-on-error: true
+        run: python3 scripts/ci_cache.py identity --slot linux-x64-ubuntu-24.04 --output "$RUNNER_TEMP/cache-identity.json"
+      - name: Download durable Bazel snapshot
+        if: needs.prepare.outputs.native_changed == 'true' && vars.CI_CACHE_ENABLED == 'true'
+        id: cache-download
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: cache-restore-linux-x64-ubuntu-24.04
+          path: ${{ runner.temp }}/cache-restore
+      - name: Restore durable Bazel snapshot
+        if: steps.cache-identity.outcome == 'success' && steps.cache-download.outcome == 'success'
+        id: cache-restore
+        continue-on-error: true
+        run: |
+          python3 scripts/ci_cache.py restore --identity "$RUNNER_TEMP/cache-identity.json" \
+            --snapshot "$RUNNER_TEMP/cache-restore" \
+            --disk "$HOME/.cache/omp-bazel-disk" --repo "$HOME/.cache/omp-bazel-repo"
+      - name: Report unavailable durable cache
+        if: steps.cache-identity.outcome == 'failure' || steps.cache-download.outcome == 'failure' || steps.cache-restore.outcome == 'failure'
+        run: echo "::warning::Bazel snapshot unavailable; required native build will run with compatible hot cache or cold inputs."
+      - name: Restore compatible GitHub hot cache
+        if: steps.cache-identity.outcome == 'success' && steps.cache-restore.outputs.hit != 'true'
+        continue-on-error: true
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cache/omp-bazel-disk
             ~/.cache/omp-bazel-repo
-          key: coreforge-bazel-v1-linux-x64-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'MODULE.bazel', 'MODULE.bazel.lock', 'rust-toolchain.toml', 'rustfmt.toml', '.bazelrc', '.bazelignore', '.bazelversion', 'bazel/**', 'crates/**', 'BUILD.bazel') }}
+          key: coreforge-bazel-v2-${{ steps.cache-identity.outputs.key }}-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'MODULE.bazel', 'MODULE.bazel.lock', 'rust-toolchain.toml', 'rustfmt.toml', '.bazelrc', '.bazelignore', '.bazelversion', 'bazel/**', 'crates/**', 'BUILD.bazel') }}
           restore-keys: |
-            coreforge-bazel-v1-linux-x64-${{ runner.os }}-${{ runner.arch }}-
+            coreforge-bazel-v2-${{ steps.cache-identity.outputs.key }}-
 
       - name: Build native addon from Coreforge sources
         if: needs.prepare.outputs.native_changed == 'true'
@@ -156,6 +193,17 @@ jobs:
           } > "$RUNNER_TEMP/coreforge-bazel.rc"
           export OMP_BAZEL_RC="$RUNNER_TEMP/coreforge-bazel.rc"
           bun scripts/bazel-natives.ts linux-x64-baseline linux-x64-modern
+
+      - name: Prepare durable cache candidate before reclaiming native outputs
+        if: success() && github.event_name == 'push' && needs.prepare.outputs.native_changed == 'true' && vars.CI_CACHE_ENABLED == 'true' && steps.cache-identity.outcome == 'success'
+        id: cache-pack
+        continue-on-error: true
+        run: |
+          BAZEL="$(command -v bazelisk || command -v bazel)"
+          "$BAZEL" --bazelrc="$RUNNER_TEMP/coreforge-bazel.rc" shutdown
+          python3 scripts/ci_cache.py pack --identity "$RUNNER_TEMP/cache-identity.json" \
+            --disk "$HOME/.cache/omp-bazel-disk" --repo "$HOME/.cache/omp-bazel-repo" \
+            --output "$RUNNER_TEMP/cache-snapshot"
 
       - name: Reclaim completed native build outputs
         if: needs.prepare.outputs.native_changed == 'true'
@@ -213,6 +261,29 @@ jobs:
         run: |
           cmp packages/natives/native/pi_natives.linux-x64-baseline.node "$RUNNER_TEMP/relay-native-roundtrip/pi_natives.linux-x64-baseline.node"
           cmp packages/natives/native/pi_natives.linux-x64-modern.node "$RUNNER_TEMP/relay-native-roundtrip/pi_natives.linux-x64-modern.node"
+      - name: Retain successful relay cache candidate
+        if: success() && steps.cache-pack.outcome == 'success'
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: snapshot-linux-x64-ubuntu-24.04
+          path: ${{ runner.temp }}/cache-snapshot
+          retention-days: 1
+          if-no-files-found: error
+
+  cache_publish:
+    needs: [prepare, validate, publish]
+    if: vars.CI_CACHE_ENABLED == 'true' && startsWith(github.ref, 'refs/tags/relay/v') && needs.prepare.outputs.native_changed == 'true' && needs.validate.result == 'success' && needs.publish.result == 'success'
+    uses: Coreforce-CAD/oh-my-pi/.github/workflows/cf-cache-write.yml@9dc313bdc0cbcd04aeacb6ede57738668b8ed325
+    with:
+      enabled: true
+      source-sha: ${{ github.sha }}
+      expected-workflow: relay
+      build-result: ${{ needs.validate.result }}
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
 
   publish:
     name: publish

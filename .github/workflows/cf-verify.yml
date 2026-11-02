@@ -50,6 +50,8 @@ jobs:
         run: bun run ci:check:full
       - name: Verify selective LLVM extraction
         run: python3 -m unittest discover -s bazel/toolchains -p test_extract_llvm.py
+      - name: Verify durable cache boundaries
+        run: python3 -m unittest discover -s scripts -p test_ci_cache.py
       - name: Select native verification source
         id: native
         env:
@@ -71,8 +73,20 @@ jobs:
             echo "Native inputs match $RELEASE_TAG; use its verified Coreforce addons."
           fi
 
-  build:
+  cache_restore:
     needs: prepare
+    if: vars.CI_CACHE_ENABLED == 'true' && needs.prepare.outputs.native_changed == 'true'
+    uses: Coreforce-CAD/oh-my-pi/.github/workflows/cf-cache-read.yml@9dc313bdc0cbcd04aeacb6ede57738668b8ed325
+    with:
+      enabled: true
+      slots: '["darwin-arm64-xcode-27","darwin-x64-macos-15-intel","linux-x64-ubuntu-22.04","linux-arm64-ubuntu-24.04-arm","linux-musl-x64-ubuntu-22.04","linux-musl-arm64-ubuntu-24.04-arm","win32-x64-ubuntu-24.04"]'
+    permissions:
+      contents: read
+      id-token: write
+
+  build:
+    needs: [prepare, cache_restore]
+    if: ${{ !cancelled() && needs.prepare.result == 'success' }}
     env:
       SOURCE_SHA: ${{ github.event.pull_request.head.sha }}
       CARGO_BUILD_JOBS: "2"
@@ -196,19 +210,41 @@ jobs:
         env:
           QUALIFICATION_RECEIPT_DIR: ${{ runner.temp }}/qualification-producer
         run: bun scripts/ci-qualification-engine.ts snapshot native-effective
-      # Pull requests can restore trusted base-branch release caches, but never
-      # save multi-gigabyte merge-ref caches that sibling pull requests cannot use.
-      - name: Restore Bazel native build cache
+      - name: Identify compatible Bazel caches
         if: needs.prepare.outputs.native_changed == 'true' && matrix.windows != '1'
-        id: bazel-cache
+        id: cache-identity
+        continue-on-error: true
+        run: python3 scripts/ci_cache.py identity --slot "${{ matrix.target }}-${{ matrix.os }}" --output "$RUNNER_TEMP/cache-identity.json"
+      - name: Download durable Bazel snapshot
+        if: needs.prepare.outputs.native_changed == 'true' && matrix.windows != '1' && vars.CI_CACHE_ENABLED == 'true'
+        id: cache-download
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: cache-restore-${{ matrix.target }}-${{ matrix.os }}
+          path: ${{ runner.temp }}/cache-restore
+      - name: Restore durable Bazel snapshot
+        if: steps.cache-identity.outcome == 'success' && steps.cache-download.outcome == 'success'
+        id: cache-restore
+        continue-on-error: true
+        run: |
+          python3 scripts/ci_cache.py restore --identity "$RUNNER_TEMP/cache-identity.json" \
+            --snapshot "$RUNNER_TEMP/cache-restore" \
+            --disk "$HOME/.cache/omp-bazel-disk" --repo "$HOME/.cache/omp-bazel-repo"
+      - name: Report unavailable durable cache
+        if: steps.cache-identity.outcome == 'failure' || steps.cache-download.outcome == 'failure' || steps.cache-restore.outcome == 'failure'
+        run: echo "::warning::Bazel snapshot unavailable; required native build will run with compatible hot cache or cold inputs."
+      - name: Restore compatible GitHub hot cache
+        if: steps.cache-identity.outcome == 'success' && steps.cache-restore.outputs.hit != 'true'
+        continue-on-error: true
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cache/omp-bazel-disk
             ~/.cache/omp-bazel-repo
-          key: coreforge-bazel-v1-${{ matrix.target }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'MODULE.bazel', 'MODULE.bazel.lock', 'rust-toolchain.toml', 'rustfmt.toml', '.bazelrc', '.bazelignore', '.bazelversion', 'bazel/**', 'crates/**', 'BUILD.bazel') }}
+          key: coreforge-bazel-v2-${{ steps.cache-identity.outputs.key }}-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'MODULE.bazel', 'MODULE.bazel.lock', 'rust-toolchain.toml', 'rustfmt.toml', '.bazelrc', '.bazelignore', '.bazelversion', 'bazel/**', 'crates/**', 'BUILD.bazel') }}
           restore-keys: |
-            coreforge-bazel-v1-${{ matrix.target }}-${{ runner.os }}-${{ runner.arch }}-
+            coreforge-bazel-v2-${{ steps.cache-identity.outputs.key }}-
       - name: Build native addon from Coreforge sources
         if: needs.prepare.outputs.native_changed == 'true' && matrix.windows != '1'
         env:
