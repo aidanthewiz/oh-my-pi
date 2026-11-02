@@ -17,7 +17,7 @@ import { expandPath } from "../path-utils";
 import { CELL_BUDGET_SLACK_MS } from "../run-scope";
 import { ToolAbortError, toWorkerErrorPayload } from "../tool-errors";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
-import { gracefulKillTreeOnce, pickElectronTarget } from "./attach";
+import { gracefulKillTreeOnce, isChromiumBrowserExecutable, pickElectronTarget } from "./attach";
 import type * as Cmux from "./cmux/cmux-tab";
 import { mapWaitUntil } from "./cmux/rpc";
 import { browserConnection, DEFAULT_VIEWPORT } from "./launch";
@@ -1828,6 +1828,10 @@ async function buildInitPayload(browser: PuppeteerBrowserHandle, opts: AcquireTa
 	if (browser.kind.kind === "relay" && !opts.target) {
 		// A relay open without a target owns a background tab in the browser used last on this relay.
 		page = { kind: "create", nearTargetId: lastUsedTargetOn(browser) };
+	} else if (browser.kind.kind === "spawned" && !opts.target && isChromiumBrowserExecutable(browser.kind.path)) {
+		// A dedicated Chrome profile can start with no pages; never navigate its
+		// welcome tab (or another user's tab on a reused endpoint).
+		page = { kind: "create" };
 	} else {
 		let relayJson: string | undefined;
 		if (browser.kind.kind === "relay") {

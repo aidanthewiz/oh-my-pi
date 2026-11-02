@@ -280,11 +280,12 @@ The Google Vertex AI provider enables streaming generation for Gemini models hos
 ### Auth & usage
 
 - **ADC Resolution Ladder**: `packages/ai/src/providers/google-auth.ts` resolves credentials in priority order:
-   1. `GOOGLE_APPLICATION_CREDENTIALS` env pointing to JSON credentials file. Supports `type: "service_account"` (RS256 JWT assertion signed via WebCrypto `crypto.subtle` exchanged at `https://oauth2.googleapis.com/token`), `type: "authorized_user"` (refresh-token exchange), or `type: "impersonated_service_account"` (exchanges source credentials then calls GCP IAM `generateAccessToken`).
-   2. User ADC file `~/.config/gcloud/application_default_credentials.json` (`authorized_user` flow).
+   1. `GOOGLE_APPLICATION_CREDENTIALS` env pointing to JSON credentials file. Supports `type: "service_account"` (RS256 JWT exchange), `type: "authorized_user"` (refresh-token exchange), `type: "external_account_authorized_user"` (workforce refresh at its `token_url` with HTTP Basic client authentication), or `type: "impersonated_service_account"` (exchanges source credentials then calls GCP IAM `generateAccessToken`).
+   2. User ADC file `~/.config/gcloud/application_default_credentials.json`, with the same supported credential types.
    3. GCE / Cloud Run metadata server (`http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token`).
 - **Explicit Access Token Override**: `GOOGLE_CLOUD_ACCESS_TOKEN` or `CLOUDSDK_AUTH_ACCESS_TOKEN` environment variables bypass file/metadata lookup and caching entirely.
 - **Token Caching & In-flight Deduplication**: Access tokens are stored in `tokenCache` (Map) keyed by resolved source and refreshed `GOOGLE_VERTEX_REFRESH_SKEW_MS` before expiry (default 60s). Concurrent resolution requests share a single in-flight promise in `inflight` Map, bounded by `SHARED_TOKEN_RESOLVE_TIMEOUT_MS` (30s). Individual callers race their abort signals against the shared promise via `raceWithSignal` so one caller's abort does not cancel batch resolution. OAuth scope requested: `https://www.googleapis.com/auth/cloud-platform`.
+- **Workforce Refresh Tokens**: Optional STS replacement refresh tokens remain in memory for subsequent refreshes, including after an individual caller cancels. Coreforge does not rewrite operator-owned ADC files. Google documents that [federated refresh tokens remain valid until their workforce session expires](https://docs.cloud.google.com/docs/authentication/token-types#federated-refresh-tokens).
 - **Usage & Token Normalization**: `consumeGoogleStream` in `packages/ai/src/providers/google-shared.ts` extracts `usageMetadata` from responses: `input` is calculated as `promptTokenCount - cachedContentTokenCount`, `output` as `candidatesTokenCount + thoughtsTokenCount`, `cacheRead` as `cachedContentTokenCount`, and `reasoningTokens` as `thoughtsTokenCount`. Passes normalized usage to `calculateCost(model, output.usage)`.
 
 ### Catalog model handling
@@ -1501,6 +1502,18 @@ Mistral AI provides access to Mistral, Codestral, Devstral, Ministral, and Pixtr
 
 - **Provider entry (`mistral`)**: `packages/catalog/src/compat/rules/providers/mistral.kdl` declares default model `devstral-medium-latest`. Environment keys: `MISTRAL_API_KEY`.
 - **Host Matching**: Host URL marker matching checks for `mistral.ai` (`packages/catalog/src/hosts.ts`: `mistral`).
+
+## Modular (`modular`)
+Modular Cloud serves open models on an OpenAI-compatible API at `https://api.modular.com/v1`. Requests use the OpenAI Chat Completions transport (`openai-completions`).
+
+### Special casings
+- **Thinking wire format**: `packages/catalog/src/compat/rules/providers/modular.kdl` uses OpenRouter's `reasoning` object for the whole provider (`thinking-format "openrouter"`), which the API accepts for every model, so a model models.dev adds later needs no rule of its own: on sends `reasoning.effort`, off sends `reasoning.enabled: false`. Two per-model overrides, as measured against the API: MiniMax M3.1 Flash takes a nested `reasoning.effort` (low through max) and always thinks, so it uses `thinking-requires-effort`. MiniMax M3 and Gemma 4 31B switch reasoning with `reasoning.enabled` and ignore effort, so they are toggle-only, with `enabled: true` sent through `when-thinking` extra-body.
+
+### Auth & usage
+- **API Key Login**: `packages/catalog/src/compat/rules/auth/modular.kdl` declares a `login "api-key"` rule pointing at the Modular Console and validates the key against `https://api.modular.com/v1/models`. Environment key: `MODULAR_API_KEY`.
+
+### Catalog model handling
+- **Catalog-only**: the models.dev `modular` entry (`openAiCompletionsDescriptor` in `packages/catalog/src/provider-models/openai-compat.ts`) supplies models, prices, and limits, and receives additive models.dev updates at runtime. There is no `/v1/models` discovery: that endpoint returns only ids, and it also lists models that are not sold on the shared endpoint yet.
 
 ## Moonshot (`moonshot`)
 

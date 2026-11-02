@@ -9,11 +9,15 @@ const postmortemModuleUrl = pathToFileURL(join(import.meta.dir, "../src/index.ts
 
 async function runPostmortemProbe(
 	source: string,
+	installHandlers = true,
 ): Promise<{ exitCode: number | null; stdout: string; stderr: string }> {
 	const root = await mkdtemp(join(tmpdir(), "omp-postmortem-probe-"));
 	const probePath = join(root, "probe.ts");
 	try {
-		await Bun.write(probePath, source);
+		await Bun.write(
+			probePath,
+			`${installHandlers ? `import { postmortem as installedPostmortem } from "${postmortemModuleUrl}"; installedPostmortem.installProcessHandlers();\n` : ""}${source}`,
+		);
 		const proc = Bun.spawn([process.execPath, probePath], {
 			cwd: process.cwd(),
 			stdout: "pipe",
@@ -45,6 +49,33 @@ function wrapCause(reason: Error, wrapperCount: number): Error {
 	}
 	return current;
 }
+
+describe("postmortem rejection ownership", () => {
+	for (const installHandlers of [false, true]) {
+		it(`consumes only the owned promise with CLI handlers ${installHandlers ? "installed" : "absent"}`, async () => {
+			const result = await runPostmortemProbe(
+				`
+				import { postmortem } from "${postmortemModuleUrl}";
+				const failure = new Error("owned browser rejection");
+				const consumed = Promise.withResolvers<void>();
+				const owned = Promise.reject(failure);
+				postmortem.interceptUnhandledRejections((reason, promise) => {
+					if (reason !== failure || promise !== owned) return false;
+					console.log("owned rejection consumed");
+					consumed.resolve();
+					return true;
+				});
+				await consumed.promise;
+				console.log("host survived");
+			`,
+				installHandlers,
+			);
+			expect(result.exitCode).toBe(0);
+			expect(result.stdout).toBe("owned rejection consumed\nhost survived\n");
+			expect(result.stderr).not.toContain("[Unhandled Rejection]");
+		});
+	}
+});
 
 describe("postmortem expected cleanup errors", () => {
 	it("marks errors with the well-known cleanup symbol and recognizes them", () => {

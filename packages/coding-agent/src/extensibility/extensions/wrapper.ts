@@ -284,6 +284,10 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			approvalArgs(params, context),
 			initialApproval.approvalMode,
 			initialApproval.userPolicies,
+			undefined,
+			undefined,
+			undefined,
+			context,
 		);
 		if (preResolved.policy === "deny") {
 			throw denyError(preResolved, this.tool.name);
@@ -418,6 +422,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 					approvalGrants,
 					restrictions,
 					targets,
+					context,
 				);
 				context?.xdevTierResolved?.(resolved.tier);
 				if (resolved.policy === "deny") throw denyError(resolved, this.tool.name);
@@ -624,6 +629,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 							approvalGrants,
 							approvalRestrictions(approvalContext?.settings, this.runner.cwd),
 							finalTargets,
+							context,
 						),
 					)
 				) {

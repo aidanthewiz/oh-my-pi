@@ -1236,17 +1236,17 @@ async function targetIdForPage(page: Page): Promise<string> {
 
 async function createTrackedPage(
 	browser: Browser,
-	relay: { nearTargetId?: string } | undefined,
+	attach: { nearTargetId?: string } | undefined,
 	reportTarget: (targetId: string) => void,
 ): Promise<Page> {
 	let targetId: string;
-	if (relay) {
-		// The omp relay has no attachable browser target, so its tab is created over the root connection:
-		// unselected, in the browser of `nearTargetId` (the relay's own parameter) when given.
+	if (attach) {
+		// Attached browsers may have no page or browser target yet. Create through
+		// the root CDP connection; the relay also uses nearTargetId to choose Chrome.
 		const params: Protocol.Target.CreateTargetRequest & { nearTargetId?: string } = {
 			url: "about:blank",
 			background: true,
-			nearTargetId: relay.nearTargetId,
+			nearTargetId: attach.nearTargetId,
 		};
 		({ targetId } = await browserConnection(browser).send("Target.createTarget", params));
 		reportTarget(targetId);
@@ -1784,7 +1784,7 @@ export class WorkerCore {
 			if (payload.mode === "headless" && page && !page.isClosed()) {
 				await page.close().catch(() => undefined);
 			}
-			// So would a relay tab it opened in the background.
+			// Attached browsers also own tabs created by omp, including spawned Chrome.
 			if (payload.mode === "attach" && payload.page.kind === "create" && page && !page.isClosed()) {
 				await page.close().catch(() => undefined);
 			}
@@ -1795,14 +1795,21 @@ export class WorkerCore {
 	async #initializePage(payload: WorkerInitPayload, attachedTarget?: Target): Promise<void> {
 		const browser = this.#requireBrowser();
 		if (payload.mode === "headless" || payload.page.kind === "create") {
-			const relay =
+			const attach =
 				payload.mode === "attach" && payload.page.kind === "create"
 					? { nearTargetId: payload.page.nearTargetId }
 					: undefined;
 			// Report ownership before Puppeteer waits for page initialization.
-			this.#page = await createTrackedPage(browser, relay, targetId => {
-				this.#transport.send({ type: "page-created", targetId });
-			});
+			try {
+				this.#page = await createTrackedPage(browser, attach, targetId => {
+					this.#transport.send({ type: "page-created", targetId });
+				});
+			} catch (error) {
+				if (!attach) throw error;
+				throw new ToolError(
+					`Could not create a managed tab in the attached browser profile: ${error instanceof Error ? error.message : String(error)}`,
+				);
+			}
 			this.#observeDialogs();
 			if (payload.mode === "headless") {
 				await applyStealthPatches(browser, this.#page, { browserSession: null, override: null });

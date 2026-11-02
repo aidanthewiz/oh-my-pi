@@ -1133,6 +1133,7 @@ export class SessionTools {
 							undefined,
 							restrictions,
 							targets,
+							ctx,
 						);
 						if (resolved.policy === "deny") throw denyError(resolved, target.name);
 						if (resolved.policy === "allow") {

@@ -1031,7 +1031,7 @@ mod tests {
 		let rsync = if let Some(path) = explicit {
 			assert!(
 				is_samba_rsync(&path),
-				"PI_RSYNC_REFERENCE_BINARY={} must successfully report rsync 3.5.1 protocol 33 with SHA512 daemon auth",
+				"PI_RSYNC_REFERENCE_BINARY={} must successfully report rsync protocol 33 with SHA512 daemon auth",
 				path.display()
 			);
 			path
@@ -1143,7 +1143,7 @@ mod tests {
 		assert_eq!(err.code, 5);
 	}
 
-	/// The live assertions require protocol 33 and SHA512 from rsync 3.5.1.
+	/// The live assertions require protocol 33 and SHA512 daemon authentication.
 	#[cfg(unix)]
 	fn is_samba_rsync(path: &Path) -> bool {
 		std::process::Command::new(path)
@@ -1152,7 +1152,7 @@ mod tests {
 			.is_ok_and(|out| {
 				let version = String::from_utf8_lossy(&out.stdout);
 				out.status.success()
-					&& version.starts_with("rsync  version 3.5.1  protocol version 33\n")
+					&& version.starts_with("rsync  version 3.") && version.contains("protocol version 33")
 					&& version.lines().skip_while(|line| *line != "Daemon auth list:").nth(1)
 						.is_some_and(|line| line.split_whitespace().any(|name| name == "sha512"))
 			})

@@ -27,6 +27,8 @@ changing export HTML/CSS/JS, web themes, or the shared tool/trace renderers, run
 `bun run gen:export-viewer` and include `src/export/html/viewer.generated.json`
 with the change. The generated JavaScript lives in ignored `export-assets/`.
 The generator verifies committed metadata with `--check`, also implied by `CI=true`.
+In a shell that sets `CI=true`, such as omp's bash tool, use
+`bun run gen:export-viewer --write` to update the metadata.
 
 Source and packaged exports inline the generated viewer and its Markdown,
 Highlight.js, theme, and shared-renderer dependencies. Run

@@ -656,9 +656,48 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 	readonly name = "bash";
 	/** Bash reads `skill://` paths through its shell filesystem, including as a working directory. */
 	readonly readsSkillUris = true;
-	readonly approval = (args: unknown): ToolApprovalDecision => {
-		const rawCommand = (args as Partial<BashToolInput>).command;
+	/**
+	 * The interceptor message for a call, checking the raw command and the one after a leading
+	 * `cd … &&` so the wrapper hides neither shell-navigation rules nor the dedicated-tool command.
+	 */
+	#interception(
+		rawCommand: string,
+		command: string,
+		name: string | undefined,
+		toolNames: string[],
+	): string | undefined {
+		if (!cfgBashInterceptorEnabled.get(this.session.settings)) return undefined;
+		const rules = cfgBashInterceptorPatterns
+			.get(this.session.settings)
+			.filter(
+				rule =>
+					name === undefined ||
+					!DEFAULT_BASH_INTERCEPTOR_RULES.some(
+						defaultRule =>
+							defaultRule.tool === "bash" &&
+							rule.tool === "bash" &&
+							rule.pattern === defaultRule.pattern &&
+							rule.message === defaultRule.message,
+					),
+			);
+		for (const commandToCheck of rawCommand === command ? [command] : [rawCommand, command]) {
+			const interception = checkBashInterception(commandToCheck, toolNames, rules, rawCommand);
+			if (interception.block) return interception.message ?? "Command blocked";
+		}
+		return undefined;
+	}
+
+	readonly approval = (args: unknown, ctx?: AgentToolContext): ToolApprovalDecision => {
+		const input = (args ?? {}) as Partial<BashToolInput>;
+		const rawCommand = input.command;
 		const command = typeof rawCommand === "string" ? rawCommand : "";
+		// An intercepted call is refused outright; asking first would only approve a doomed call.
+		const cwdCommand = input.cwd ? command : (extractLeadingCdTarget(command)?.rest ?? command);
+		const name = typeof input.name === "string" ? blankToUndefined(input.name) : undefined;
+		const interception = this.#interception(command, cwdCommand, name, ctx?.toolNames ?? []);
+		if (interception) {
+			return { tier: "exec", override: true, policy: "deny", reason: interception.replace(/^Blocked:\s*/u, "") };
+		}
 		const patternRules = getBashApprovalPatternRules(cfgBashPatterns.get(this.session.settings));
 		const shell = cfgBashAllowCompoundCommands.get(this.session.settings)
 			? this.session.settings.getShellConfig().shell
@@ -897,28 +936,8 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			throw new ToolError("Async bash execution is disabled. Enable async.enabled to use async mode.");
 		}
 
-		if (cfgBashInterceptorEnabled.get(this.session.settings)) {
-			const rules = cfgBashInterceptorPatterns
-				.get(this.session.settings)
-				.filter(
-					rule =>
-						input.name === undefined ||
-						!DEFAULT_BASH_INTERCEPTOR_RULES.some(
-							defaultRule =>
-								defaultRule.tool === "bash" &&
-								rule.tool === "bash" &&
-								rule.pattern === defaultRule.pattern &&
-								rule.message === defaultRule.message,
-						),
-				);
-			const commandsToCheck = rawCommand === command ? [command] : [rawCommand, command];
-			for (const commandToCheck of commandsToCheck) {
-				const interception = checkBashInterception(commandToCheck, ctx?.toolNames ?? [], rules, rawCommand);
-				if (interception.block) {
-					throw new ToolError(interception.message ?? "Command blocked");
-				}
-			}
-		}
+		const interception = this.#interception(rawCommand, command, input.name, ctx?.toolNames ?? []);
+		if (interception) throw new ToolError(interception);
 
 		const backend = this.#resolveExecutionBackend(input, ctx);
 		const router = InternalUrlRouter.instance();
@@ -1377,13 +1396,19 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				ownerId: this.session.getAgentId?.() ?? undefined,
 				foreground: options.foreground,
 				process: { command: options.command, cwd: options.commandCwd, pids: () => pids(), streams },
+				intent: options.intent,
 				widgetInputs: {
 					canAuthor: () =>
 						options.widgetOwnerCurrent?.() === true &&
 						(this.session.getSessionId?.() ?? undefined) === options.sessionId &&
 						manager.getJob(jobId)?.process?.streams === streams,
 					sources: () => [outputTap, ...pipeSources.list()],
-					brief: () => ({ kind: "bash", command: options.command, intent: options.intent }),
+					brief: () => ({
+						kind: "bash",
+						command: options.command,
+						timeoutSec: options.timeoutSec,
+						intent: options.intent,
+					}),
 				},
 			},
 		);
@@ -1467,7 +1492,10 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		} else if (ignoredReady !== undefined && (ignoredReady.log !== undefined || ignoredReady.port !== undefined)) {
 			pendingNotices.push("Ignored ready: service-only, and no service name was given.");
 		}
-		const approval = this.approval(input);
+		const approval = this.approval(input, ctx);
+		if (typeof approval !== "string" && approval.policy === "deny") {
+			throw new ToolError(approval.reason ?? "Bash execution is denied.");
+		}
 		const approvalTier = typeof approval === "string" ? approval : approval.tier;
 		const asyncRequested = normalizedInput.async === true;
 		const pty = normalizedInput.pty ?? false;

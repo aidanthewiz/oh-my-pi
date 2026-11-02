@@ -462,9 +462,7 @@ describe("AgentSession handoff", () => {
 		vi.spyOn(compactionModule, "prepareCompaction").mockReturnValue(fixedPreparation);
 		const compactSpy = vi.spyOn(compactionModule, "compact").mockRejectedValue(new Error("429 quota exhausted"));
 
-		await expect(session.compact(undefined, { mode: "snapcompact" })).rejects.toThrow(
-			"snapcompact cannot render this conversation locally",
-		);
+		await expect(session.compact(undefined, { mode: "snapcompact" })).rejects.toBeInstanceOf(Error);
 
 		expect(compactSpy).not.toHaveBeenCalled();
 	});

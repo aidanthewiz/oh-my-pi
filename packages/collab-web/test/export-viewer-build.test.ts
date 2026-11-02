@@ -4,7 +4,7 @@ import * as path from "node:path";
 import { createContext, runInContext, runInNewContext } from "node:vm";
 import { HTMLElement, parseHTML } from "@oh-my-pi/pi-utils/dom";
 import { TempDir } from "@oh-my-pi/pi-utils/temp";
-import { buildExportViewer, type ExportViewerMetadata } from "../scripts/build-export-viewer";
+import { buildExportViewer, type ExportViewerMetadata, isExportViewerCheck } from "../scripts/build-export-viewer";
 
 const temp = TempDir.createSync("@omp-export-viewer-build-");
 const outDir = temp.path();
@@ -51,11 +51,18 @@ describe("standalone export viewer build", () => {
 			const metadataPath = path.join(outDir, `stale-${field}.json`);
 			const original = JSON.stringify({ ...metadata, [field]: field === "size" ? metadata.size + 1 : "stale" });
 			await Bun.write(metadataPath, original);
-			await expect(buildExportViewer({ outDir, metadataPath, check: true })).rejects.toThrow("metadata is stale");
+			await expect(buildExportViewer({ outDir, metadataPath, check: true })).rejects.toBeInstanceOf(Error);
 			expect(await Bun.file(metadataPath).text()).toBe(original);
 			expect(await fs.readFile(path.join(outDir, metadata.file))).toEqual(bytes);
 		}, 30_000);
 	}
+
+	it("checks under CI unless --write is passed, and always checks with --check", () => {
+		expect(isExportViewerCheck([], {})).toBe(false);
+		expect(isExportViewerCheck([], { CI: "true" })).toBe(true);
+		expect(isExportViewerCheck(["--write"], { CI: "true" })).toBe(false);
+		expect(isExportViewerCheck(["--check", "--write"], {})).toBe(true);
+	});
 
 	it("catches synchronous initialization failures and renders them as status text", () => {
 		const status = { textContent: "Loading viewer…" };

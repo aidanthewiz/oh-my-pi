@@ -336,7 +336,7 @@ export class AuthBrokerClient {
 		reason?: OAuthRefreshReason,
 		rejectedAccess?: string,
 	): Promise<CredentialRefreshResponse> {
-		const suffix = reason === "auth-recovery" ? "?reason=auth-recovery" : "";
+		const suffix = reason ? `?reason=${reason}` : "";
 		const body: CredentialRefreshRequest | undefined =
 			reason === "auth-recovery" && rejectedAccess !== undefined ? { rejectedAccess } : undefined;
 		return this.#request<CredentialRefreshResponse>("POST", `/v1/credential/${id}/refresh${suffix}`, {

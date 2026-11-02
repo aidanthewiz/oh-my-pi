@@ -1030,7 +1030,7 @@ export const cfgAsyncWidgets = register({
 		group: "Execution",
 		label: "Live Job Widgets",
 		description:
-			"Draw local live widgets for background jobs. Remote spec authoring additionally requires explicit managed consent through async.widgetRemoteAuthoring and session model/provider/account admission.",
+			"Draw local live widgets for background jobs and caption long shell commands. Remote widget or caption authoring additionally requires explicit managed consent through async.widgetRemoteAuthoring and session model/provider/account admission.",
 	},
 });
 

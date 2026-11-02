@@ -3,7 +3,7 @@ import { existsSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { procmgr } from "@oh-my-pi/pi-utils";
+import { procmgr, TempDir } from "@oh-my-pi/pi-utils";
 import { getOrCreateSnapshot, sanitizeSnapshotForBrush } from "@oh-my-pi/pi-coding-agent/utils/shell-snapshot";
 import fnEnvHelper from "../src/utils/shell-snapshot-fn-env.sh" with { type: "text" };
 
@@ -300,6 +300,55 @@ describe("getOrCreateSnapshot", () => {
 		const dirStat = await fs.stat(path.dirname(snapshotPath!));
 		expect(dirStat.mode & 0o077).toBe(0);
 	});
+
+	it.skipIf(onWindows)(
+		"keeps private helpers referenced by snapshotted functions (mise/zoxide cd wrappers)",
+		async () => {
+			// Regression: `cd() { __zsh_like_cd cd "$@"; }` was kept without its helper, so `cd` exited 127.
+			using homeDir = TempDir.createSync("omp-snap-closure-");
+			const home = path.resolve(homeDir.path());
+			await fs.writeFile(
+				path.join(home, ".bashrc"),
+				[
+					// Stand-ins for `mise activate bash` / `zoxide init bash` output.
+					`__zsh_like_cd () { builtin "$@"; }`,
+					`__zoxide_cd () { builtin cd -- "$@"; }`,
+					`cd () { __zsh_like_cd cd "$@"; }`,
+					`z () { __zoxide_cd "$@"; }`,
+					// Shell-valid name with a hyphen, referenced by a kept body.
+					`_hyphen-helper () { echo helper-ok; }`,
+					`use_hyphen () { _hyphen-helper; }`,
+					``,
+				].join("\n"),
+			);
+
+			const realBash = REAL_BASH;
+			if (!existsSync(realBash)) return;
+			const shellLink = path.join(home, "bash-omp-closure");
+			await fs.symlink(realBash, shellLink);
+
+			const snapshotPath = await getOrCreateSnapshot(shellLink, { ...process.env, HOME: home });
+			expect(snapshotPath).not.toBeNull();
+			const replay = Bun.spawn(
+				[
+					realBash,
+					"--noprofile",
+					"--norc",
+					"-c",
+					`source "$1"; cd "$2" && pwd && z "$2" >/dev/null 2>&1; echo "z_rc=$?"; use_hyphen`,
+					"_",
+					snapshotPath!,
+					home,
+				],
+				{ stdout: "pipe", stderr: "pipe" },
+			);
+			const stdout = await readStream(replay.stdout as ReadableStream<Uint8Array> | null);
+			const stderr = await readStream(replay.stderr as ReadableStream<Uint8Array> | null);
+			await replay.exited;
+			expect({ exitCode: replay.exitCode, stderr }).toEqual({ exitCode: 0, stderr: "" });
+			expect(stdout).toBe(`${home}\nz_rc=0\nhelper-ok\n`);
+		},
+	);
 
 	it.skipIf(onWindows)("keeps the snapshot file at 0600 even when the rc file resets umask to 022", async () => {
 		// PR-review regression: previous revision ran `umask 077` BEFORE sourcing

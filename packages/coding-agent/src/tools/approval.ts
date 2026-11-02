@@ -491,9 +491,11 @@ function normalizeDecision(value: unknown): Omit<ResolvedApproval, "policy"> & {
 export function resolveToolDecision(
 	tool: ApprovalSubject,
 	args: unknown,
+	context?: AgentToolContext,
 ): Omit<ResolvedApproval, "policy"> & { policy?: ApprovalPolicy } {
 	const approval = tool.approval;
-	const decision: ToolApprovalDecision | undefined = typeof approval === "function" ? approval(args) : approval;
+	const decision: ToolApprovalDecision | undefined =
+		typeof approval === "function" ? approval(args, context) : approval;
 	return normalizeDecision(decision);
 }
 
@@ -502,8 +504,8 @@ export function resolveToolDecision(
  * resulting capability tier, defaulting to `exec` when the tool omits an
  * approval. Callers that also enforce policy must use {@link resolveToolDecision}.
  */
-export function resolveToolTier(tool: ApprovalSubject, args: unknown): ToolTier {
-	return resolveToolDecision(tool, args).tier;
+export function resolveToolTier(tool: ApprovalSubject, args: unknown, context?: AgentToolContext): ToolTier {
+	return resolveToolDecision(tool, args, context).tier;
 }
 
 function modeApprovesTier(mode: ApprovalMode, tier: ToolTier): boolean {
@@ -560,8 +562,9 @@ export function resolveApproval(
 	grants?: ApprovalGrantStore,
 	restrictions?: ApprovalRestrictions,
 	snapshot?: CapturedApprovalTargets,
+	context?: AgentToolContext,
 ): ResolvedApproval {
-	const resolved = resolvePolicy(tool, args, mode, userConfig, grants, snapshot);
+	const resolved = resolvePolicy(tool, args, mode, userConfig, grants, snapshot, context);
 	if (resolved.policy === "deny") return resolved;
 	const reason = restrictedFolderReason(tool, args, restrictions, snapshot);
 	if (reason === undefined) return resolved;
@@ -585,8 +588,9 @@ function resolvePolicy(
 	userConfig: Record<string, unknown>,
 	grants: ApprovalGrantStore | undefined,
 	snapshot?: CapturedApprovalTargets,
+	context?: AgentToolContext,
 ): ResolvedApproval {
-	const decision = resolveToolDecision(tool, args);
+	const decision = resolveToolDecision(tool, args, context);
 	const policyKey = decision.policyKey ?? tool.name;
 	const userPolicy = Object.hasOwn(userConfig, policyKey) ? normalizePolicy(userConfig[policyKey]) : undefined;
 	const fallbackPolicy =
@@ -830,8 +834,9 @@ export function requiresApproval(
 	args: unknown,
 	mode: ApprovalMode,
 	userConfig: Record<string, unknown> = {},
+	context?: AgentToolContext,
 ): { required: boolean; reason?: string } {
-	const resolved = resolveApproval(tool, args, mode, userConfig);
+	const resolved = resolveApproval(tool, args, mode, userConfig, undefined, undefined, undefined, context);
 	const { policy, reason } = resolved;
 
 	if (policy === "deny") {

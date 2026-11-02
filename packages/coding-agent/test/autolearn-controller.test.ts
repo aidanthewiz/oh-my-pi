@@ -1,7 +1,14 @@
 import { describe, expect, it } from "bun:test";
 import { type } from "@oh-my-pi/omptype";
 import { Agent, type AgentMessage, type AgentTool } from "@oh-my-pi/pi-agent-core";
-import type { AssistantMessage, FetchImpl, Model, ProviderSessionState, Usage } from "@oh-my-pi/pi-ai";
+import type {
+	AssistantMessage,
+	FetchImpl,
+	Model,
+	ProviderSessionState,
+	ToolResultMessage,
+	Usage,
+} from "@oh-my-pi/pi-ai";
 import { streamGoogle } from "@oh-my-pi/pi-ai/providers/google";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { streamOpenAIResponses } from "@oh-my-pi/pi-ai/providers/openai-responses";
@@ -340,6 +347,47 @@ describe("isolated auto-learn capture", () => {
 		};
 	}
 
+	it("refuses a call to a non-capture tool without running any of its code", async () => {
+		const mock = createMockModel({
+			responses: [
+				{ content: [{ type: "toolCall", id: "call_read", name: "read", arguments: {} }] },
+				{ content: ["Stopping."] },
+			],
+		});
+		let executed = 0;
+		let argStreams = 0;
+		const readTool: AgentTool = {
+			...captureTool("read", "Read files"),
+			execute: async () => {
+				executed++;
+				return { content: [{ type: "text", text: "file contents" }] };
+			},
+			openArgStream: () => {
+				argStreams++;
+				return undefined;
+			},
+		};
+		const manageSkillTool = captureTool("manage_skill", "Manage reusable skills");
+		const sourceAgent = new Agent({
+			initialState: { model: mock, systemPrompt: ["Test"], tools: [readTool, manageSkillTool] },
+		});
+		const runCapture = createAutoLearnCaptureRunner({
+			sourceAgent,
+			captureTools: () => [manageSkillTool],
+			createAgent: options => new Agent({ ...options, convertToLlm, streamFn: mock.stream }),
+		});
+
+		await runCapture("Automated capture prompt");
+
+		expect(executed).toBe(0);
+		expect(argStreams).toBe(0);
+		const followUp = mock.calls[1]?.context.messages ?? [];
+		const refusal = followUp.find((m): m is ToolResultMessage => m.role === "toolResult");
+		expect(refusal?.toolName).toBe("read");
+		expect(refusal?.isError).toBe(true);
+		expect(JSON.stringify(refusal?.content)).not.toContain("file contents");
+	});
+
 	const replayCases = [
 		{ api: "openai-responses", history: "native" },
 		{ api: "openrouter", history: "native" },
@@ -521,7 +569,7 @@ describe("isolated auto-learn capture", () => {
 		});
 	}
 
-	it("uses constrained tools and sends full Google context without the primary anchor", async () => {
+	it("advertises the primary tools and sends full Google context without the primary anchor", async () => {
 		const model = googleInteractionsModel();
 		const manageSkillTool = captureTool("manage_skill", "Manage reusable skills");
 		const readTool = captureTool("read", "Read files");
@@ -590,7 +638,7 @@ describe("isolated auto-learn capture", () => {
 		expect(requestBody).toContain("Automated capture prompt");
 		expect(requestBody).toContain("manage_skill");
 		expect(requestBody).not.toContain('"name":"learn"');
-		expect(requestBody).not.toContain('"name":"read"');
+		expect(requestBody).toContain('"name":"read"');
 		expect(sourceAgent.state.messages).toHaveLength(2);
 		const sourceAssistant = sourceAgent.state.messages.find(
 			(message): message is AssistantMessage => message.role === "assistant",

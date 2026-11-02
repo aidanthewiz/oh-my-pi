@@ -259,6 +259,7 @@ With `eval.tools.enabled` (default on), a cell can turn a function into a tool o
 - Cancellation is destructive when needed: JS terminates its worker; managed kernels interrupt and may escalate to shutdown. A reset is likewise destructive to concurrent work sharing that backend session.
 - Runtime evaluation checks cancellation again after asynchronous compilation. A cancelled browser run cannot execute its cell when a delayed compiler finishes.
 - Startup and replacement kernels retain their session and owner identities. Disposed owners cannot publish late allocations or accept stale results.
+- A retained runtime that dies between cells (crash, kill, out-of-memory, or a cancel/timeout that ended it) is replaced on the next call; the first cell to run on the replacement opens with `Kernel restarted: the previous Python kernel is dead; state is unavailable. …` (`JS worker` for JavaScript), once per replacement. A `reset` or owner disposal gives no notice.
 - Eval-driven `agent()` children stay registered as keep-alive agents; owner teardown cancels their jobs, releases completion handles/judgment batches, and closes the owner's work pools.
 
 ## Limits and errors

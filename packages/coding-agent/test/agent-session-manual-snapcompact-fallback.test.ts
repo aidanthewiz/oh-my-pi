@@ -141,7 +141,6 @@ describe.each([
 		const compactSpy = vi.spyOn(compactionModule, "compact");
 
 		await expect(harness.session.compact(undefined, { mode: "snapcompact" })).rejects.toBeInstanceOf(Error);
-
 		// Explicit no-LLM request must never reach the provider-backed summarizer.
 		expect(compactSpy).not.toHaveBeenCalled();
 		expect(harness.sessionManager.getBranch().find(entry => entry.type === "compaction")).toBeUndefined();

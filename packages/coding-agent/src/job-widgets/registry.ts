@@ -1,12 +1,14 @@
 /**
  * The widgets of one root session's jobs: derives each shown job's view from
  * its live output, asks the cheap model for a spec once the job has output
- * worth describing, and pushes refreshed views to subscribers while jobs run.
+ * worth describing (and for a caption of a command that needs explaining),
+ * and pushes refreshed views to subscribers while jobs run.
  */
 import type { JobWidgetView } from "@oh-my-pi/pi-tui/tools/job-widget";
 import { logger } from "@oh-my-pi/pi-utils";
 import type { AsyncJob } from "../async/job-manager";
 import type { JobWidgetAuthor, JobWidgetAuthorRequest } from "./author";
+import { type JobCaptionWriter, needsJobCaption, normalizeJobCaption } from "./caption";
 import { JobWidgetRuntime, sampleLines } from "./runtime";
 import { type JobWidgetSpec, jobWidgetSkip, validateJobWidgetSpec } from "./spec";
 import type { JobWidgetBrief, JobWidgetInputs, JobWidgetRegistry } from "./types";
@@ -15,7 +17,9 @@ import type { JobWidgetBrief, JobWidgetInputs, JobWidgetRegistry } from "./types
 export interface JobWidgetsOptions {
 	/** Writes specs; absent = fallback views only. */
 	author?: JobWidgetAuthor;
-	/** Whether widgets are on (`async.widgets`); read on every call. */
+	/** Writes command captions; absent = no captions. */
+	captioner?: JobCaptionWriter;
+	/** Whether widgets and captions are on (`async.widgets`); read on every call. */
 	enabled?: () => boolean;
 	/** Remote-author eligibility, independent of local derivation and the author's managed admission. */
 	authorEnabled?: () => boolean;
@@ -24,9 +28,9 @@ export interface JobWidgetsOptions {
 	refreshMs?: number;
 	/** Minimum time between two reads of one job's sources. */
 	minIngestMs?: number;
-	/** Job age before a spec may be requested. */
+	/** Job age before a spec or a caption may be requested. */
 	authorAfterMs?: number;
-	/** Spec requests in flight at once, across jobs. */
+	/** Spec and caption requests in flight at once, across jobs. */
 	maxInFlight?: number;
 	/** Spec requests (each with its one retry) per job. */
 	maxAttempts?: number;
@@ -66,6 +70,7 @@ interface WidgetEntry {
 	/** No model can write specs: stop asking. */
 	authorUnavailable: boolean;
 	request?: AbortController;
+	captionRequest?: AbortController;
 	/** Whether the installed spec was written knowing the task's `watch` hint. */
 	specHadWatch: boolean;
 	/**
@@ -76,17 +81,23 @@ interface WidgetEntry {
 	skippedWatch?: string;
 	/** A spec dropped for no longer fitting the output, sent back as rejected with the next request. */
 	misfit?: { answer: string; errors: string[] };
+	/** Set once the caption was decided: requested, or found unneeded. */
+	captionAsked?: boolean;
+	caption?: string;
 }
 
 /** {@link JobWidgetRegistry} for one root `AsyncJobManager`. */
 export class JobWidgets implements JobWidgetRegistry {
 	readonly #entries = new Map<string, WidgetEntry>();
+	/** Cancels in-flight caption requests on dispose. */
+	readonly #disposal = new AbortController();
 	readonly #listeners = new Set<() => void>();
 	readonly #author: JobWidgetAuthor | undefined;
+	readonly #captioner: JobCaptionWriter | undefined;
 	readonly #enabled: () => boolean;
 	readonly #authorEnabled: () => boolean;
 	readonly #now: () => number;
-	readonly #options: Required<Omit<JobWidgetsOptions, "author" | "enabled" | "authorEnabled" | "now">>;
+	readonly #options: Required<Omit<JobWidgetsOptions, "author" | "captioner" | "enabled" | "authorEnabled" | "now">>;
 	readonly #requests = new Set<AbortController>();
 	readonly #pending = new Set<Promise<void>>();
 	#timer: NodeJS.Timeout | undefined;
@@ -94,6 +105,7 @@ export class JobWidgets implements JobWidgetRegistry {
 
 	constructor(options: JobWidgetsOptions = {}) {
 		this.#author = options.author;
+		this.#captioner = options.captioner;
 		this.#enabled = options.enabled ?? (() => true);
 		this.#authorEnabled = options.authorEnabled ?? (() => true);
 		this.#now = options.now ?? Date.now;
@@ -110,35 +122,59 @@ export class JobWidgets implements JobWidgetRegistry {
 
 	view(job: AsyncJob): JobWidgetView | undefined {
 		if (!this.#active() || !job.widgetInputs) return undefined;
-		let entry = this.#entries.get(job.id);
-		if (!entry || entry.job !== job || entry.inputs !== job.widgetInputs) {
-			if (entry) this.#retire(entry);
-			if (this.#entries.size >= MAX_ENTRIES) {
-				const oldest = this.#entries.keys().next().value;
-				if (oldest !== undefined) this.forget(oldest);
-			}
-			const runtime = new JobWidgetRuntime(undefined, job.startTime, this.#now);
-			entry = {
-				job,
-				inputs: job.widgetInputs,
-				runtime,
-				view: runtime.view({ label: job.label, authoring: false }),
-				viewKey: "",
-				lastIngestAt: Number.NEGATIVE_INFINITY,
-				shown: false,
-				frozen: false,
-				attempts: 0,
-				authorUnavailable: false,
-				specHadWatch: false,
-			};
-			this.#entries.set(job.id, entry);
-		}
-		this.#entries.delete(job.id);
-		this.#entries.set(job.id, entry);
+		const entry = this.#entry(job);
 		entry.shown = true;
 		this.#refresh(entry, false);
 		this.#syncTimer();
 		return entry.view;
+	}
+
+	requestCaption(job: AsyncJob): void {
+		if (!this.#active() || !job.widgetInputs || job.status !== "running") return;
+		let brief: JobWidgetBrief;
+		try {
+			brief = job.widgetInputs.brief();
+		} catch (error) {
+			logger.warn("Job caption brief failed", { jobId: job.id, error: String(error) });
+			return;
+		}
+		this.#maybeCaption(this.#entry(job), brief, this.#now());
+	}
+
+	/** The job's entry, made fresh for a job not seen before or a new job reusing its id. */
+	#entry(job: AsyncJob): WidgetEntry {
+		const existing = this.#entries.get(job.id);
+		if (existing?.job === job && existing.inputs === job.widgetInputs) {
+			this.#entries.delete(job.id);
+			this.#entries.set(job.id, existing);
+			return existing;
+		}
+		if (existing) this.#retire(existing);
+		if (this.#entries.size >= MAX_ENTRIES) {
+			const oldest = this.#entries.keys().next().value;
+			if (oldest !== undefined) this.forget(oldest);
+		}
+		const runtime = new JobWidgetRuntime(undefined, job.startTime, this.#now);
+		const entry: WidgetEntry = {
+			job,
+			inputs: job.widgetInputs!,
+			runtime,
+			view: runtime.view({ label: job.intent ?? job.label, authoring: false }),
+			viewKey: "",
+			lastIngestAt: Number.NEGATIVE_INFINITY,
+			shown: false,
+			frozen: false,
+			attempts: 0,
+			authorUnavailable: false,
+			specHadWatch: false,
+		};
+		this.#entries.set(job.id, entry);
+		return entry;
+	}
+
+	caption(job: AsyncJob): string | undefined {
+		const entry = this.#entries.get(job.id);
+		return entry?.job === job && entry.inputs === job.widgetInputs && this.#active() ? entry.caption : undefined;
 	}
 
 	subscribe(listener: () => void): () => void {
@@ -173,17 +209,20 @@ export class JobWidgets implements JobWidgetRegistry {
 	dispose(): void {
 		this.#disposed = true;
 		for (const entry of this.#entries.values()) this.#retire(entry);
+		this.#disposal.abort();
 		this.#entries.clear();
 		this.#listeners.clear();
 		this.#syncTimer();
 	}
 
 	#retire(entry: WidgetEntry): void {
-		const request = entry.request;
-		if (!request) return;
+		for (const request of [entry.request, entry.captionRequest]) {
+			if (!request) continue;
+			this.#requests.delete(request);
+			request.abort();
+		}
 		entry.request = undefined;
-		this.#requests.delete(request);
-		request.abort();
+		entry.captionRequest = undefined;
 	}
 
 	#active(): boolean {
@@ -220,7 +259,7 @@ export class JobWidgets implements JobWidgetRegistry {
 			this.#entries.delete(entry.job.id);
 			return false;
 		}
-		if (entry.request && entry.inputs.canAuthor?.() !== true) this.#retire(entry);
+		if ((entry.request || entry.captionRequest) && entry.inputs.canAuthor?.() !== true) this.#retire(entry);
 		if (entry.frozen) return false;
 		const now = this.#now();
 		const settled = entry.job.status !== "running";
@@ -240,13 +279,14 @@ export class JobWidgets implements JobWidgetRegistry {
 			this.#retire(entry);
 		} else {
 			this.#maybeAuthor(entry, brief, now);
+			this.#maybeCaption(entry, brief, now);
 		}
 		return this.#recompute(entry, brief);
 	}
 
 	#recompute(entry: WidgetEntry, brief: JobWidgetBrief): boolean {
 		const view = entry.runtime.view({
-			label: entry.job.label,
+			label: entry.job.intent ?? entry.job.label,
 			stage: brief.stage,
 			// A subagent's tool results are file contents and search hits; only a command's newest line says what it does.
 			lineStage: brief.kind === "bash",
@@ -292,6 +332,45 @@ export class JobWidgets implements JobWidgetRegistry {
 				logger.warn("Job widget derivation failed", { jobId: entry.job.id, error: String(error) });
 			},
 		);
+	}
+
+	/** Ask once for the caption of a shown command that needs explaining, once the job is old enough. */
+	#maybeCaption(entry: WidgetEntry, brief: JobWidgetBrief, now: number): void {
+		const command = brief.command;
+		if (entry.captionAsked || !this.#captioner || brief.kind !== "bash" || !command || !this.#authorCurrent(entry))
+			return;
+		if (
+			now - entry.job.startTime < this.#options.authorAfterMs ||
+			this.#requests.size >= this.#options.maxInFlight ||
+			this.#pending.size >= MAX_PENDING_REQUESTS
+		)
+			return;
+		entry.captionAsked = true;
+		if (!needsJobCaption(command)) return;
+		const pending = this.#writeCaption(entry, { ...brief, command });
+		this.#pending.add(pending);
+		void pending.finally(() => this.#pending.delete(pending));
+	}
+
+	async #writeCaption(entry: WidgetEntry, brief: JobWidgetBrief & { command: string }): Promise<void> {
+		const controller = new AbortController();
+		entry.captionRequest = controller;
+		this.#requests.add(controller);
+		try {
+			const reply = await this.#captioner?.(
+				{ ...brief, jobId: entry.job.id, canAuthor: () => this.#authorCurrent(entry) },
+				AbortSignal.any([controller.signal, this.#disposal.signal]),
+			);
+			if (!this.#active() || !this.#authorCurrent(entry) || controller.signal.aborted) return;
+			entry.caption = normalizeJobCaption(reply ?? "");
+			if (entry.caption) this.#notify();
+		} catch (error) {
+			if (!controller.signal.aborted)
+				logger.debug("Job caption failed", { jobId: entry.job.id, error: String(error) });
+		} finally {
+			this.#requests.delete(controller);
+			if (entry.captionRequest === controller) entry.captionRequest = undefined;
+		}
 	}
 
 	#reauthorReason(entry: WidgetEntry, brief: JobWidgetBrief, now: number): string | undefined {

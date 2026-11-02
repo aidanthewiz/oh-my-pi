@@ -202,7 +202,7 @@ export interface ModelJobWidgetAuthorOptions {
 	obfuscate?: () => ((text: string) => string) | undefined;
 }
 
-function resolveWidgetModel(settings: Settings, registry: ModelRegistry): Model<Api> | undefined {
+export function resolveWidgetModel(settings: Settings, registry: ModelRegistry): Model<Api> | undefined {
 	const available = registry.getAvailable();
 	const matchPreferences = getModelMatchPreferences(settings);
 	const role = resolveModelRoleValue(formatModelRoleAlias("widget"), available, { settings, matchPreferences }).model;
@@ -217,6 +217,7 @@ function resolveWidgetModel(settings: Settings, registry: ModelRegistry): Model<
 /** A {@link JobWidgetAuthor} backed by the `widget` model role. */
 export function createModelJobWidgetAuthor(options: ModelJobWidgetAuthorOptions): JobWidgetAuthor {
 	return async (request, signal) => {
+		signal = AbortSignal.any([signal, AbortSignal.timeout(15_000)]);
 		if (!options.admit || signal.aborted || options.isEnabled?.() === false || request.canAuthor?.() !== true)
 			return undefined;
 		const obfuscate = options.obfuscate?.();
