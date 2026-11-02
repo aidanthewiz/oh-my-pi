@@ -6,6 +6,7 @@ import { buildGrpcRequest, type CursorOptions, streamCursor } from "@oh-my-pi/pi
 import { encodeStream as encodeChatCompletionsStream } from "@oh-my-pi/pi-ai/providers/openai-chat-server";
 import type {
 	AssistantMessage,
+	Context,
 	Message,
 	Model,
 	ProviderSessionState,
@@ -14,6 +15,7 @@ import type {
 	ToolResultMessage,
 } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { isRecord } from "@oh-my-pi/pi-utils";
 import {
 	type AgentClientMessage,
 	AgentClientMessageSchema,
@@ -22,6 +24,7 @@ import {
 	ConversationStateStructureSchema,
 	type ExecServerMessage,
 	ExecServerMessageSchema,
+	GetBlobArgsSchema,
 	type InteractionUpdate,
 	InteractionUpdateSchema,
 	KvServerMessageSchema,
@@ -40,7 +43,13 @@ import {
 	ToolRequestsListedUpdateSchema,
 	TurnEndedUpdateSchema,
 } from "@oh-my-pi/pi-catalog/discovery/cursor-proto";
-import { create, encodeJsonValue, fromBinary, toBinary } from "@oh-my-pi/pi-catalog/discovery/protobuf";
+import {
+	create,
+	decodeJsonValue,
+	encodeJsonValue,
+	fromBinary,
+	toBinary,
+} from "@oh-my-pi/pi-catalog/discovery/protobuf";
 
 // An auth-gateway runs Cursor for a client that owns every tool and is reached
 // only through the pi-native wire, which carries no `kCursorExecResolved`
@@ -375,6 +384,9 @@ interface ServedRun {
 	/** The client closed the stream before Cursor ended it. */
 	cancelled: boolean;
 	closed: Promise<void>;
+	requestContext?: { rules: string[]; tools: { name: string; schema: unknown }[] };
+	history?: string[];
+	customSystemPrompt?: string;
 }
 
 /** The model's closing text and the turn's end, whose output count covers the whole turn. */
@@ -392,18 +404,26 @@ function finished(text: string): Buffer {
  * rebuilt from history (`resumeAction`) finishes at once.
  */
 function relayingCursor(runs: ServedRun[], finish = true): FixtureStream {
-	const served = new WeakMap<http2.ServerHttp2Stream, { run: ServedRun; step: number; end(data: Buffer): void }>();
+	const served = new WeakMap<
+		http2.ServerHttp2Stream,
+		{ run: ServedRun; step: number; rootCount: number; end(data: Buffer): void }
+	>();
 	return (stream, _headers, received) => {
 		const entry = served.get(stream);
 		if (!entry) {
 			const request = received.find(message => message.message.case === "runRequest");
 			if (request?.message.case !== "runRequest") return;
 			const closed = Promise.withResolvers<void>();
+			const root =
+				request.message.value.action?.action.case === "resumeAction"
+					? (request.message.value.conversationState?.rootPromptMessagesJson ?? [])
+					: [];
 			const run: ServedRun = {
 				action: request.message.value.action?.action.case,
 				answers: [],
 				cancelled: false,
 				closed: closed.promise,
+				customSystemPrompt: request.message.value.customSystemPrompt,
 			};
 			let ended = false;
 			stream.on("close", () => {
@@ -413,6 +433,7 @@ function relayingCursor(runs: ServedRun[], finish = true): FixtureStream {
 			served.set(stream, {
 				run,
 				step: 0,
+				rootCount: root.length,
 				end: data => {
 					ended = true;
 					stream.end(data);
@@ -420,14 +441,44 @@ function relayingCursor(runs: ServedRun[], finish = true): FixtureStream {
 			});
 			runs.push(run);
 			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
-			stream.write(execFrame(1, { case: "requestContextArgs", value: create(RequestContextArgsSchema, {}) }));
+			stream.write(
+				Buffer.concat([
+					execFrame(1, { case: "requestContextArgs", value: create(RequestContextArgsSchema, {}) }),
+					...root.map((blobId, index) =>
+						frame({
+							case: "kvServerMessage",
+							value: create(KvServerMessageSchema, {
+								id: 100 + index,
+								message: { case: "getBlobArgs", value: create(GetBlobArgsSchema, { blobId }) },
+							}),
+						}),
+					),
+				]),
+			);
 			return;
 		}
 		const replies = received.flatMap(message =>
 			message.message.case === "execClientMessage" ? [message.message.value.message] : [],
 		);
 		entry.run.answers = replies.flatMap(reply => (reply.case === "mcpResult" ? [reply.value] : []));
-		if (entry.step === 0 && replies.some(reply => reply.case === "requestContextResult")) {
+		entry.run.history = received.flatMap(message =>
+			message.message.case === "kvClientMessage" && message.message.value.message.case === "getBlobResult"
+				? [new TextDecoder().decode(message.message.value.message.value.blobData)]
+				: [],
+		);
+		const context = replies.find(reply => reply.case === "requestContextResult");
+		if (entry.step === 0 && context?.case === "requestContextResult") {
+			const result = context.value.result;
+			if (result.case === "success") {
+				entry.run.requestContext = {
+					rules: (result.value.requestContext?.rules ?? []).map(rule => rule.content),
+					tools: (result.value.requestContext?.tools ?? []).map(tool => ({
+						name: tool.name,
+						schema: tool.inputSchema ? decodeJsonValue(tool.inputSchema) : undefined,
+					})),
+				};
+			}
+			if (entry.run.history.length < entry.rootCount) return;
 			entry.step = 1;
 			if (entry.run.action === "resumeAction") {
 				entry.end(finished("Rebuilt."));
@@ -497,8 +548,13 @@ function relayOptions(
 }
 
 /** One gateway request, as its client receives the reply over pi-native: plain JSON. */
-async function respond(baseUrl: string, messages: Message[], options: CursorOptions): Promise<AssistantMessage> {
-	const response = streamCursor(model(baseUrl), { messages, tools }, options);
+async function respond(
+	baseUrl: string,
+	messages: Message[],
+	options: CursorOptions,
+	context: Omit<Context, "messages"> = { tools },
+): Promise<AssistantMessage> {
+	const response = streamCursor(model(baseUrl), { ...context, messages }, options);
 	for await (const _event of response) {
 		// drain
 	}
@@ -815,6 +871,204 @@ describe("Cursor runs relayed across an external executor's requests", () => {
 			expect(text(resumed)).toBe("Fixed.");
 			// The turn-end count spans both responses; each reports only its share.
 			expect(handedOff.usage.output + resumed.usage.output).toBe(12);
+			expect(states.size).toBe(0);
+		});
+	});
+
+	it.each([
+		"system instructions",
+		"custom system prompt",
+		"tool schema",
+		"tool selection",
+		"earlier user history",
+		"earlier assistant history",
+		"earlier tool result",
+		"handed-off call",
+	])("cancels the parked run and rebuilds after in-place changes to %s", async change => {
+		const runs: ServedRun[] = [];
+		const states = new Map<string, ProviderSessionState>();
+		const context: Context = {
+			systemPrompt: ["Original instructions."],
+			tools: [tool("read"), tool("edit")],
+			messages: [
+				{ role: "user", content: "Original history.", timestamp: 0 },
+				{
+					role: "assistant",
+					content: [{ type: "toolCall", id: "earlier-read", name: "read", arguments: { path: "old.py" } }],
+					api: "cursor-agent",
+					provider: "cursor",
+					model: "composer-2.5",
+					usage: {
+						input: 0,
+						output: 0,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 0,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					stopReason: "toolUse",
+					timestamp: 0,
+				},
+				{ ...readResult, toolCallId: "earlier-read", content: [{ type: "text", text: "Original file." }] },
+				{ ...user },
+			],
+		};
+		const options = relayOptions(states, { sessionId: `context-${crypto.randomUUID()}` });
+		await withCursorServer(relayingCursor(runs), async baseUrl => {
+			const handedOff = await respond(baseUrl, context.messages, options, context);
+			expect(handedOff.stopReason).toBe("toolUse");
+			context.messages.push(handedOff, { ...readResult });
+			switch (change) {
+				case "system instructions":
+					context.systemPrompt![0] = "Replacement instructions.";
+					break;
+				case "custom system prompt":
+					options.customSystemPrompt = "Replacement system prompt.";
+					break;
+				case "tool schema": {
+					const parameters = context.tools![0].parameters;
+					if (!isRecord(parameters) || !isRecord(parameters.properties))
+						throw new Error("Raw fixture schema required");
+					parameters.properties.path = { type: "number" };
+					break;
+				}
+				case "tool selection":
+					context.tools!.splice(1, 1, tool("write"));
+					break;
+				case "earlier user history":
+					context.messages[0].content = "Replacement history.";
+					break;
+				case "earlier assistant history": {
+					const earlier = context.messages[1] as AssistantMessage;
+					(earlier.content[0] as ToolCall).arguments.path = "replacement.py";
+					break;
+				}
+				case "earlier tool result":
+					(context.messages[2] as ToolResultMessage).content[0] = { type: "text", text: "Replacement file." };
+					break;
+				case "handed-off call":
+					toolCalls(handedOff)[0].arguments.path = "replacement.py";
+					break;
+			}
+			const rebuilt = await respond(baseUrl, context.messages, options, context);
+			await runs[0].closed;
+
+			expect(runs.map(run => [run.action, run.answers.length, run.cancelled])).toEqual([
+				["userMessageAction", 0, true],
+				["resumeAction", 0, false],
+			]);
+			expect(text(rebuilt)).toBe("Rebuilt.");
+			const replacement = runs[1];
+			switch (change) {
+				case "system instructions":
+					expect(replacement.requestContext?.rules).toEqual(["Replacement instructions."]);
+					expect(replacement.history?.join("\n")).toContain("Replacement instructions.");
+					break;
+				case "custom system prompt":
+					expect(replacement.customSystemPrompt).toBe("Replacement system prompt.");
+					break;
+				case "tool schema":
+					expect(replacement.requestContext?.tools[0]).toMatchObject({
+						name: "read",
+						schema: { properties: { path: { type: "number" } } },
+					});
+					break;
+				case "tool selection":
+					expect(replacement.requestContext?.tools.map(tool => tool.name)).toEqual(["read", "write"]);
+					break;
+				case "earlier user history":
+					expect(replacement.history?.join("\n")).toContain("Replacement history.");
+					break;
+				case "earlier assistant history":
+				case "handed-off call":
+					expect(replacement.history?.join("\n")).toContain("replacement.py");
+					break;
+				case "earlier tool result":
+					expect(replacement.history?.join("\n")).toContain("Replacement file.");
+					break;
+			}
+			expect(states.size).toBe(0);
+		});
+	});
+
+	it("continues the parked run when only response usage and duration metadata change", async () => {
+		const runs: ServedRun[] = [];
+		const states = new Map<string, ProviderSessionState>();
+		await withCursorServer(relayingCursor(runs), async baseUrl => {
+			const handedOff = await respond(baseUrl, [user], relayOptions(states));
+			handedOff.usage.output += 10;
+			handedOff.duration = 1234;
+			handedOff.ttft = 123;
+			handedOff.timestamp += 1;
+			const resumed = await respond(baseUrl, [user, handedOff, readResult], relayOptions(states));
+
+			expect(runs).toHaveLength(1);
+			expect(runs[0].answers.map(mcpText)).toEqual(["1|def add(a, b):\n2|    return a - b"]);
+			expect(text(resumed)).toBe("Fixed.");
+			expect(states.size).toBe(0);
+		});
+	});
+
+	it("binds the parked run to context admitted before caller-owned objects change during streaming", async () => {
+		const cursor = drivenCursor();
+		const states = new Map<string, ProviderSessionState>();
+		const context: Context = {
+			systemPrompt: ["Original instructions."],
+			tools: [tool("read")],
+			messages: [{ ...user }],
+		};
+		const parameters = context.tools![0].parameters;
+		if (!isRecord(parameters) || !isRecord(parameters.properties)) throw new Error("Raw fixture schema required");
+		const properties = parameters.properties;
+		const options = relayOptions(states, { sessionId: `admitted-${crypto.randomUUID()}` });
+		await withCursorServer(cursor.serve, async baseUrl => {
+			const firstReply = respond(baseUrl, context.messages, options, context);
+			const run = await cursor.run(0);
+			context.systemPrompt![0] = "Replacement instructions.";
+			properties.path = { type: "number" };
+			context.messages[0].content = "Replacement history.";
+			await run.send(Buffer.concat([readCall(1), listed(1)]));
+			const first = await firstReply;
+			expect(first.stopReason).toBe("toolUse");
+			context.messages.push(first, fileResult(1));
+
+			const rebuiltReply = respond(baseUrl, context.messages, options, context);
+			const replacement = await cursor.run(1);
+			await run.closed;
+			expect(run.answers).toEqual([]);
+			expect(run.cancelled).toBe(true);
+			expect(replacement.action).toBe("resumeAction");
+			replacement.end(finished("Rebuilt."));
+			expect(text(await rebuiltReply)).toBe("Rebuilt.");
+			expect(states.size).toBe(0);
+		});
+	});
+
+	it("cancels instead of answering the next step after an admitted relay result changes in place", async () => {
+		const cursor = drivenCursor();
+		const states = new Map<string, ProviderSessionState>();
+		const options = relayOptions(states, { sessionId: `steps-${crypto.randomUUID()}` });
+		await withCursorServer(cursor.serve, async baseUrl => {
+			const firstReply = respond(baseUrl, [user], options);
+			const run = await cursor.run(0);
+			await run.send(Buffer.concat([readCall(1), listed(1)]));
+			const first = await firstReply;
+			const result = fileResult(1);
+			const secondReply = respond(baseUrl, [user, first, result], options);
+			await run.answered(1);
+			result.content[0] = { type: "text", text: "Replacement file." };
+			await run.send(Buffer.concat([readCall(2), listed(1)]));
+			const second = await secondReply;
+			expect(toolCalls(second)).toEqual([readToolCall(2)]);
+
+			const rebuiltReply = respond(baseUrl, [user, first, result, second, fileResult(2)], options);
+			const replacement = await cursor.run(1);
+			await run.closed;
+			expect(run.answers.map(mcpText)).toEqual(["file 1"]);
+			expect(run.cancelled).toBe(true);
+			expect(replacement.action).toBe("resumeAction");
+			replacement.end(finished("Rebuilt."));
+			expect(text(await rebuiltReply)).toBe("Rebuilt.");
 			expect(states.size).toBe(0);
 		});
 	});

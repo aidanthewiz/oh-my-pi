@@ -229,7 +229,7 @@ import { AssistantMessageEventStream } from "../utils/event-stream";
 import { connectProxiedSocket, getProxyForUrl, wrapFetchForProxy } from "../utils/proxy";
 import { createRequestDebugSession, isRequestDebugEnabled, type RequestDebugResponseLog } from "../utils/request-debug";
 import { waitForRetry } from "../utils/retry-wait";
-import { sanitizeSchemaForCursor, toolWireSchema } from "../utils/schema";
+import { isArkSchema, sanitizeSchemaForCursor, toolWireSchema } from "../utils/schema";
 import { formatConnectEndStreamError, hasRetryableCursorErrorDetail } from "./connect-error-detail";
 import { CONNECT_END_STREAM_FLAG, ConnectFrameDecoder, frameConnectMessage } from "./connect-frame";
 import mcpExternalHandoffMessage from "./cursor-external-tool-handoff.md" with { type: "text" };
@@ -1369,6 +1369,8 @@ function streamCursorWithWireMode(
 						turnOutputReported: false,
 					}
 				: undefined;
+		let relayHistoryHash = relay ? hashCursorRelayHistory(context.messages) : 0;
+		let relayHistoryLength = context.messages.length;
 		// A step is listed once its calls have streamed. Cursor can also run a
 		// step's calls one at a time, sending the next exec frame (and the
 		// listing) only after the previous call is answered, so held calls are
@@ -1417,6 +1419,13 @@ function streamCursorWithWireMode(
 			const conversationEntry: CursorConversationEntry = { state: cachedConversation?.state, blobs: blobStore };
 			cursorConversations.set(conversationId, conversationEntry);
 			const cachedState = retryContext?.checkpoint ?? (rotatedFresh ? undefined : cachedConversation?.state);
+			const requestContextTools = buildMcpToolDefinitions(
+				context.tools,
+				model.requiresCursorToolSchemaProjection === true,
+				options?.externalToolExecutor === true,
+			);
+			const requestContextRules = buildCursorRequestContextRules(context.systemPrompt);
+			const relayContextHash = relay ? hashCursorRelayContext(context, options, requestContextTools) : 0;
 			const builtRequest = await buildGrpcRequestForWireMode(
 				model,
 				context,
@@ -1436,12 +1445,6 @@ function streamCursorWithWireMode(
 			turnRecords.wireRoute ??= builtRequest.wireRoute;
 			if (builtRequest.wireRoute !== turnRecords.wireRoute) turnRecords.mixedRoutes = true;
 			conversationEntry.state = conversationState;
-			const requestContextTools = buildMcpToolDefinitions(
-				context.tools,
-				model.requiresCursorToolSchemaProjection === true,
-				options?.externalToolExecutor === true,
-			);
-			const requestContextRules = buildCursorRequestContextRules(context.systemPrompt);
 
 			const baseUrl = model.baseUrl || CURSOR_API_URL;
 			const requestPath = transportMode === "http2" ? CURSOR_RUN_PATH : CURSOR_RUN_SSE_PATH;
@@ -1814,6 +1817,8 @@ function streamCursorWithWireMode(
 
 					const wireModelId = options?.wireModelId;
 					const conversationKey = options?.conversationId ?? options?.sessionId;
+					const expectedHistoryHash = hashCursorRelayMessage(output, relayHistoryHash);
+					const expectedHistoryLength = relayHistoryLength + 1;
 					const resumed = Promise.withResolvers<CursorRelayResumption | undefined>();
 					let unparked = false;
 					const unpark = (resumption: CursorRelayResumption | undefined): void => {
@@ -1843,11 +1848,29 @@ function streamCursorWithWireMode(
 										? "route"
 										: results === undefined
 											? "results"
-											: undefined;
+											: nextContext.messages.length !== expectedHistoryLength + relay.held.size ||
+												  hashCursorRelayHistory(nextContext.messages, expectedHistoryLength) !==
+														expectedHistoryHash ||
+												  hashCursorRelayContext(
+														nextContext,
+														nextOptions,
+														buildMcpToolDefinitions(
+															nextContext.tools,
+															nextModel.requiresCursorToolSchemaProjection === true,
+															true,
+														),
+												  ) !== relayContextHash
+												? "context"
+												: undefined;
 							if (mismatch !== undefined || !nextOptions || !results) {
 								log("relay", "mismatch", { mismatch, last: nextContext.messages.at(-1)?.role });
 								return undefined;
 							}
+							relayHistoryHash = expectedHistoryHash;
+							for (let index = expectedHistoryLength; index < nextContext.messages.length; index++) {
+								relayHistoryHash = hashCursorRelayMessage(nextContext.messages[index], relayHistoryHash);
+							}
+							relayHistoryLength = nextContext.messages.length;
 							const nextStream = new AssistantMessageEventStream();
 							unpark({ context: nextContext, options: nextOptions, stream: nextStream, results });
 							return nextStream;
@@ -6158,6 +6181,42 @@ function hashCursorParts(
 	return hash;
 }
 
+/** Semantic history only: response accounting and timings do not change a parked run's prompt. */
+function hashCursorRelayMessage(message: Message, seed: number | bigint): number | bigint {
+	let hash = Bun.hash(message.role, seed);
+	if (message.role === "user" || message.role === "developer") return hashCursorUserMessage(message, hash);
+	if (message.role === "toolResult") {
+		return hashCursorToolResult(message, Bun.hash(message.toolName, Bun.hash(message.toolCallId, hash)));
+	}
+	for (const block of message.content) {
+		hash = Bun.hash(block.type, hash);
+		if (block.type === "text") hash = Bun.hash(block.text, hash);
+		else if (block.type === "thinking") hash = Bun.hash(block.thinking, hash);
+		else if (block.type === "image") hash = Bun.hash(block.data, Bun.hash(block.mimeType, hash));
+		else if (block.type === "toolCall") {
+			hash = Bun.hash(JSON.stringify(block.arguments), Bun.hash(block.name, Bun.hash(block.id, hash)));
+		} else hash = Bun.hash(JSON.stringify(block), hash);
+	}
+	return hash;
+}
+
+function hashCursorRelayHistory(messages: readonly Message[], endIndex = messages.length): number | bigint {
+	let hash: number | bigint = 0;
+	for (let index = 0; index < endIndex; index++) hash = hashCursorRelayMessage(messages[index], hash);
+	return hash;
+}
+
+function hashCursorRelayContext(
+	context: Context,
+	options: CursorOptions | undefined,
+	tools: readonly McpToolDefinition[],
+): number | bigint {
+	let hash = Bun.hash(options?.customSystemPrompt ?? "");
+	for (const prompt of buildCursorSystemPromptJsons(context.systemPrompt)) hash = Bun.hash(prompt, hash);
+	for (const tool of tools) hash = Bun.hash(toBinary(McpToolDefinitionSchema, tool), hash);
+	return hash;
+}
+
 /** Hash of a tool result's error state and content, chained from `seed`. */
 function hashCursorToolResult(result: ToolResultMessage, seed: number | bigint = 0): number | bigint {
 	return hashCursorParts(result.content, Bun.hash(result.isError ? "error" : "ok", seed));
@@ -6362,7 +6421,10 @@ export function buildMcpToolDefinitions(
 		writeTool && !advertisedTools.includes(writeTool) ? [...advertisedTools, writeTool] : advertisedTools;
 
 	return forwarded.map(tool => {
-		const wireSchema = toolWireSchema(tool);
+		// Raw schemas from external executors can change in place; the wire cache keys on object identity.
+		const wireSchema = toolWireSchema(
+			externalToolExecutor && !isArkSchema(tool.parameters) ? { ...tool, parameters: { ...tool.parameters } } : tool,
+		);
 		const jsonSchema = requiresCursorToolSchemaProjection ? sanitizeSchemaForCursor(wireSchema) : wireSchema;
 		const schemaValue: JsonValue =
 			jsonSchema !== null && !Array.isArray(jsonSchema) && isJsonValue(jsonSchema)
