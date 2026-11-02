@@ -8,6 +8,7 @@
 
 ### Fixed
 
+- Grow recursive shell execution stacks on demand while constructing, polling, and dropping borrowed interpreter futures. Preserve cancellation and owned-pipe EOF without enlarging every Tokio worker stack.
 - Include native third-party notices in the published package so exported notice imports and the source CLI's `--license` work after packing.
 - Preserve carried work and ignored user files when cloned checkouts contain a root `CMakeCache.txt` or `pyvenv.cfg`.
 - Report actual external process IDs for quoted and escaped literal background commands without evaluating command-name substitutions during classification.

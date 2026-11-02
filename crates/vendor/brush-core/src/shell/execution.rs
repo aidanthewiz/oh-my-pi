@@ -298,7 +298,8 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
 		program: brush_parser::ast::Program,
 		params: &ExecutionParameters,
 	) -> Result<ExecutionResult, error::Error> {
-		program.execute(self, params).await
+		let program_ref = &program;
+		crate::interp::stack_safe(move || program_ref.execute(self, params)).await
 	}
 
 	/// Evaluate the given arithmetic expression, returning the result.

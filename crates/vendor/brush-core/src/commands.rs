@@ -1121,7 +1121,9 @@ pub(crate) async fn invoke_shell_function(
 	)?;
 
 	// Invoke the function.
-	let result = body.execute(context.shell, &params).await;
+	let shell = &mut *context.shell;
+	let function_params = &params;
+	let result = interp::stack_safe(move || body.execute(shell, function_params)).await;
 
 	// Clean up parameters so any owned files are closed.
 	drop(params);

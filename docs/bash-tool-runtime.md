@@ -131,6 +131,8 @@ Relay replacement stops only the daemon generation that was inspected. A stale g
 
 ## Non-interactive execution engine (`executeBash`)
 
+Recursive function, sourced-script, and eval execution grows native stack segments on demand. Interpreter futures retain their original borrowed shell state; polling and destruction use the same stack guard. Cancellation unwinds the owned futures and closes their pipe descriptors. Ordinary Tokio workers do not require enlarged stacks.
+
 ## Shell session reuse model
 
 `executeBash()` caches native `Shell` instances in a process-global map keyed by:

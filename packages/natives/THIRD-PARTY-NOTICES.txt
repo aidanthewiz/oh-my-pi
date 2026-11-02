@@ -30761,6 +30761,7 @@ Used by:
 - pkg-config 0.3.34 (https://github.com/rust-lang/pkg-config-rs)
 - socket2 0.5.10 (https://github.com/rust-lang/socket2)
 - socket2 0.6.5 (https://github.com/rust-lang/socket2)
+- stacker 0.1.25 (https://github.com/rust-lang/stacker)
 
 Full license text:
 

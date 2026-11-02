@@ -15,9 +15,6 @@ const CHILD: &str = "PI_SHELL_TEST_DESCRIPTOR_LIMIT_CHILD";
 /// one descriptor of its own exhausts it within a few hundred levels.
 const LIMIT: libc::rlim_t = 128;
 
-/// Stack of each shell worker thread.
-const STACK_BYTES: usize = 512 << 20;
-
 fn soft_nofile() -> libc::rlim_t {
 	let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
 	// SAFETY: `lim` is a valid, writable `rlimit` for the duration of the call.
@@ -70,7 +67,6 @@ fn in_limited_child(name: &str) -> bool {
 fn run(command: &str) -> (Option<i32>, String) {
 	let runtime = tokio::runtime::Builder::new_multi_thread()
 		.worker_threads(2)
-		.thread_stack_size(STACK_BYTES)
 		.enable_all()
 		.build()
 		.expect("tokio runtime");
@@ -110,18 +106,28 @@ fn nesting_holds_no_descriptor_per_level() {
 	let outcomes: Vec<_> = [
 		(
 			"function",
-			"f() { if [ \"$1\" -lt 200 ]; then f $(( $1 + 1 )); else echo reached=$1; fi; }; f 0; \
-			 echo after=$?"
+			"f() { if [ \"$1\" -lt 200 ]; then f $(( $1 + 1 )); else echo reached=$1; fi; }; f 0 | \
+			 cat; echo after=$?"
 				.to_string(),
 		),
 		("source", format!("n=0; . '{}'; echo after=$?", again.display())),
+		(
+			"eval",
+			"n=0; step='if [ \"$n\" -lt 200 ]; then n=$((n + 1)); eval \"$step\"; else echo \
+			 reached=$n; fi'; eval \"$step\"; echo after=$?"
+				.to_string(),
+		),
 	]
 	.into_iter()
 	.map(|(shape, command)| (shape, run(&command)))
 	.collect();
 
 	let reached = (Some(0), "reached=200\nafter=0\n".to_string());
-	assert_eq!(outcomes, [("function", reached.clone()), ("source", reached)]);
+	assert_eq!(outcomes, [
+		("function", reached.clone()),
+		("source", reached.clone()),
+		("eval", reached)
+	]);
 }
 
 /// Running out of descriptors prints one diagnostic naming the limit, and the

@@ -1,9 +1,12 @@
 use std::{
 	borrow::Cow,
 	collections::VecDeque,
+	future::Future,
 	io::Write,
 	path::{Path, PathBuf},
+	pin::Pin,
 	sync::{Arc, atomic::AtomicBool},
+	task::{Context, Poll},
 };
 
 use brush_parser::ast::{self, CommandPrefixOrSuffixItem};
@@ -441,6 +444,45 @@ pub enum ProcessGroupPolicy {
 	NewProcessGroup,
 	/// Place the process in the same process group as its parent.
 	SameProcessGroup,
+}
+
+const EXECUTION_STACK_RED_ZONE: usize = 256 * 1024;
+const EXECUTION_STACK_SEGMENT: usize = 2 * 1024 * 1024;
+
+/// Async recursion boxes its state, but polling and dropping it still recurse on the native stack.
+pub(crate) struct StackSafe<F: Future + ?Sized> {
+	future: Option<Pin<Box<F>>>,
+}
+
+pub(crate) fn stack_safe<F: Future + ?Sized>(
+	create: impl FnOnce() -> Pin<Box<F>>,
+) -> StackSafe<F> {
+	StackSafe {
+		future: Some(stacker::maybe_grow(
+			EXECUTION_STACK_RED_ZONE,
+			EXECUTION_STACK_SEGMENT,
+			create,
+		)),
+	}
+}
+
+impl<F: Future + ?Sized> Future for StackSafe<F> {
+	type Output = F::Output;
+
+	fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+		let this = self.get_mut();
+		stacker::maybe_grow(EXECUTION_STACK_RED_ZONE, EXECUTION_STACK_SEGMENT, || {
+			this.future.as_mut().expect("execution future exists until drop").as_mut().poll(cx)
+		})
+	}
+}
+
+impl<F: Future + ?Sized> Drop for StackSafe<F> {
+	fn drop(&mut self) {
+		stacker::maybe_grow(EXECUTION_STACK_RED_ZONE, EXECUTION_STACK_SEGMENT, || {
+			drop(self.future.take());
+		});
+	}
 }
 
 #[async_trait::async_trait]
