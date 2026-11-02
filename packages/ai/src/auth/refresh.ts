@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { scheduler } from "node:timers/promises";
 import { isSqliteBusyError, logger, postmortem } from "@oh-my-pi/pi-utils";
 import * as AIError from "../error";
@@ -147,6 +148,7 @@ export class OAuthRefresher {
 	 */
 	#stalledRefreshes = new Map<number, { refresh: string; until: number }>();
 	#pendingRefreshes = new Set<Promise<unknown>>();
+	readonly #operationLifetime = new AsyncLocalStorage<Promise<unknown> | undefined>();
 	#cancelRefreshCleanup?: () => void;
 	#shuttingDown = false;
 	#closePromise?: Promise<void>;
@@ -354,7 +356,17 @@ export class OAuthRefresher {
 	}
 
 	runWithLifetime<T>(operation: () => Promise<T>): Promise<T> {
-		return this.#track(Promise.resolve().then(operation));
+		const admitted = !this.#shuttingDown || this.#hasAdmittedOperation();
+		const pending: Promise<T> = Promise.resolve().then(() =>
+			this.#operationLifetime.run(admitted ? pending : undefined, operation),
+		);
+		return this.#track(pending);
+	}
+
+	/** Only unfinished operations admitted before shutdown may finish read-only credential recovery. */
+	#hasAdmittedOperation(): boolean {
+		const pending = this.#operationLifetime.getStore();
+		return pending !== undefined && this.#pendingRefreshes.has(pending);
 	}
 
 	/** Keeps shutdown waiting until the complete credential operation settles. */
@@ -363,10 +375,7 @@ export class OAuthRefresher {
 		this.#armShutdownDrain();
 		const settled = () => {
 			this.#pendingRefreshes.delete(pending);
-			if (this.#pendingRefreshes.size === 0 && !this.#shuttingDown) {
-				this.#cancelRefreshCleanup?.();
-				this.#cancelRefreshCleanup = undefined;
-			}
+			if (this.#pendingRefreshes.size === 0 && !this.#shuttingDown) this.#disarmShutdownDrain();
 		};
 		void pending.then(settled, settled);
 		return pending;
@@ -376,14 +385,18 @@ export class OAuthRefresher {
 		if (this.#shuttingDown) throw new AIError.AbortError("OAuth refresh stopped during shutdown");
 	}
 
+	#disarmShutdownDrain(): void {
+		this.#cancelRefreshCleanup?.();
+		this.#cancelRefreshCleanup = undefined;
+	}
+
 	close(): Promise<void> {
 		this.#shuttingDown = true;
 		this.#closePromise ??= (async () => {
 			while (this.#pendingRefreshes.size > 0) {
 				await Promise.allSettled(this.#pendingRefreshes);
 			}
-			this.#cancelRefreshCleanup?.();
-			this.#cancelRefreshCleanup = undefined;
+			this.#disarmShutdownDrain();
 		})();
 		return this.#closePromise;
 	}
@@ -883,7 +896,12 @@ export class OAuthRefresher {
 		return "disabled";
 	}
 
-	async refresh(
+	/**
+	 * Refresh `credential` unless it is still fresh. Shutdown waits for the
+	 * refresh, and for the caller's synchronous save of its result, before the
+	 * store closes.
+	 */
+	refresh(
 		provider: Provider,
 		credential: OAuthCredential,
 		credentialId: number | undefined,
@@ -891,13 +909,15 @@ export class OAuthRefresher {
 		reason?: OAuthRefreshReason,
 		rejectedAccess?: string,
 	): Promise<OAuthCredentials> {
+		if (this.#shuttingDown && !this.#hasAdmittedOperation())
+			return Promise.reject(new AIError.AbortError("OAuth refresh stopped during shutdown"));
 		const authRecovery = reason === "auth-recovery";
 		if (authRecovery && credentialId !== undefined && !this.#oauthCredentialRefreshInFlight.has(credentialId)) {
 			const recent = this.#recentMint(credentialId);
 			// A token the provider has just rejected is not a usable recent mint.
-			if (recent && recent.credential.access !== rejectedAccess) return recent.credential;
+			if (recent && recent.credential.access !== rejectedAccess) return Promise.resolve(recent.credential);
 		}
-		return this.#refreshSingleFlight(provider, credential, credentialId, signal, reason, rejectedAccess);
+		return this.#track(this.#refreshSingleFlight(provider, credential, credentialId, signal, reason, rejectedAccess));
 	}
 
 	/** Refresh without recent-mint reuse; still shares the per-credential in-flight request. */
@@ -1106,6 +1126,8 @@ export class OAuthRefresher {
 		signal?: AbortSignal,
 		options?: OAuthRefreshByIdOptions,
 	): Promise<AuthCredentialSnapshotEntry> {
+		if (this.#shuttingDown && !this.#hasAdmittedOperation())
+			throw new AIError.AbortError("OAuth refresh stopped during shutdown");
 		const existing = this.#oauthRefreshInFlight.get(id);
 		if (existing) {
 			const joined = await raceSignal(existing, signal, "credential refresh aborted");

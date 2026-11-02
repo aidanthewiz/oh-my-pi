@@ -108,6 +108,7 @@ const UNDELIVERED_CONNECT_CODES = new Set([
 	"EHOSTUNREACH",
 	"ENOTFOUND",
 	"EAI_AGAIN",
+	"FAILEDTOOPENSOCKET",
 ]);
 
 function isUndeliveredMCPCall(error: unknown): boolean {

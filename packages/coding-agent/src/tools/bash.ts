@@ -815,14 +815,17 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 	/**
 	 * Session identity for a command, read when its tool call starts, so
 	 * `/fork`, `/new`, and `/resume` take effect on the next call while a call
-	 * already under way keeps the session it began in. Always set both keys: an
-	 * empty value replaces a stale one inherited from a parent omp process,
-	 * since an env overlay cannot unset.
+	 * already under way keeps the session it began in. `PI_TOOL_CALL_ID` is the
+	 * id this call runs under: the agent's call in the transcript, or the eval
+	 * tool bridge's own id for a call made from an eval cell. Always
+	 * set every key: an empty value replaces a stale one inherited from a parent
+	 * omp process, since an env overlay cannot unset.
 	 */
-	#sessionEnv(): Record<string, string> {
+	#sessionEnv(toolCallId: string): Record<string, string> {
 		return {
 			PI_SESSION_ID: this.session.sessionManager?.getSessionId?.() ?? this.session.getSessionId?.() ?? "",
 			PI_SESSION_FILE: this.session.getSessionFile() ?? "",
+			PI_TOOL_CALL_ID: toolCallId,
 		};
 	}
 
@@ -863,9 +866,9 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 
 	async #prepareExecution(
 		input: BashToolInput,
-		signal?: AbortSignal,
-		ctx?: AgentToolContext,
-		sessionEnv = this.#sessionEnv(),
+		signal: AbortSignal | undefined,
+		ctx: AgentToolContext | undefined,
+		sessionEnv: Record<string, string>,
 	): Promise<PreparedBashExecution> {
 		const rawCommand = input.command;
 		let command = rawCommand;
@@ -1003,7 +1006,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		if (typeof args !== "object" || args === null) return undefined;
 		const input = args as BashToolInput;
 		const normalizedInput = normalizeBashInput(input);
-		const execution = await this.#prepareExecution(normalizedInput, signal, context);
+		const execution = await this.#prepareExecution(normalizedInput, signal, context, this.#sessionEnv(toolCallId));
 		this.#preparedExecutions.set(args, {
 			toolCallId,
 			approved: false,
@@ -1405,7 +1408,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		ctx?: AgentToolContext,
 	): Promise<AgentToolResult<BashToolDetails>> {
 		const sessionId = this.session.getSessionId?.() ?? undefined;
-		const sessionEnv = this.#sessionEnv();
+		const sessionEnv = this.#sessionEnv(toolCallId);
 		const widgetOwnerCurrent = this.session.captureWidgetOwnerCurrent?.();
 		const normalizedInput = normalizeBashInput(input);
 		const cached = this.#preparedExecutions.get(input);

@@ -240,6 +240,21 @@ describe("taskFile dispatch", () => {
 		},
 	);
 
+	// `off` and `eval` refuse task calls through the same gate; one mode per shape covers it.
+	it.each([
+		["off", false],
+		["eval", true],
+	] as const)("checks the per-call gate before reading taskFile (mode=%s, batch=%s)", async (mode, batch) => {
+		const tool = await createTool(batch, undefined, { "task.perCallModel": mode });
+		const item = { taskFile: path.join(directory, "missing.md"), model: "@review" };
+
+		const result = await tool.execute("file-model-disabled", batch ? { context: "Context.", tasks: [item] } : item);
+
+		expect(result.isError).toBe(true);
+		expect(textOf(result)).toContain(`task.perCallModel: ${mode}`);
+		expect(executions).toHaveLength(0);
+	});
+
 	it("matches task files and the working directory against restricted folders, and never remembers the approval", async () => {
 		const cwd = path.join(directory, "work");
 		const restricted = path.join(directory, "restricted");

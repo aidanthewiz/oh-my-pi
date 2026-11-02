@@ -517,6 +517,10 @@ describe("subagent HUD lines", () => {
 	});
 
 	describe("live preview", () => {
+		afterEach(() => {
+			vi.restoreAllMocks();
+		});
+
 		it("shows the current tool call only when enabled", () => {
 			const sessions = [
 				makeSession({

@@ -50,9 +50,9 @@ const outputSchemaInputSchema = type("object | boolean | string | null");
 // Coarse per-spawn thinking effort; must stay in sync with TASK_EFFORTS in ../thinking.
 const effortRule = '"lo" | "med" | "hi"' as const;
 
-// Seance-only per-spawn fields the task tool refuses for every other agent.
-// Typed against SeanceTaskSchemaFields so a field added there fails to compile
-// until it is listed here too; a missed key would be dropped on batch items.
+// Per-spawn fields the seance schema adds or widens. Typed against
+// SeanceTaskSchemaFields so a field added there fails to compile until it is
+// listed here too; a missed key would be dropped on batch items.
 const SEANCE_ITEM_KEY_SET = { sourceSession: true, model: true } as const satisfies Record<SeanceItemKey, true>;
 const TASK_ITEM_GUARD_KEYS = [...Object.keys(SEANCE_ITEM_KEY_SET), "taskFile"];
 
@@ -81,6 +81,7 @@ export const taskItemSchema = type({
 	"schemaMode?": '"permissive" | "strict"',
 	"contextFilePolicy?": CONTEXT_FILE_POLICY_SCHEMA,
 	"tools?": "string[]",
+	"model?": "string",
 	"+": "delete",
 });
 const taskItemSchemaIsolated = type({
@@ -92,6 +93,7 @@ const taskItemSchemaIsolated = type({
 	"schemaMode?": '"permissive" | "strict"',
 	"contextFilePolicy?": CONTEXT_FILE_POLICY_SCHEMA,
 	"tools?": "string[]",
+	"model?": "string",
 	"isolated?": "boolean",
 	"+": "delete",
 });
@@ -105,6 +107,7 @@ export const taskSchema = type({
 	"schemaMode?": '"permissive" | "strict"',
 	"contextFilePolicy?": CONTEXT_FILE_POLICY_SCHEMA,
 	"tools?": "string[]",
+	"model?": "string",
 	"isolated?": "boolean",
 	"+": "delete",
 });
@@ -117,6 +120,7 @@ const taskSchemaNoIsolation = type({
 	"schemaMode?": '"permissive" | "strict"',
 	"contextFilePolicy?": CONTEXT_FILE_POLICY_SCHEMA,
 	"tools?": "string[]",
+	"model?": "string",
 	"+": "delete",
 });
 function guardBatchAgent(schema: BaseType): BaseType {
@@ -163,7 +167,7 @@ function taskAgentSchemaRule(defaultAgent: string): string {
 	return "string";
 }
 
-/** Seance-only task fields; `seanceTaskSchemaFields` in ./seance must match it exactly. */
+/** Task fields the seance schema adds or widens; `seanceTaskSchemaFields` in ./seance must match it exactly. */
 export type SeanceTaskSchemaFields = {
 	"sourceSession?"?: FluentType<string>;
 	"model?"?: FluentType<string | string[]>;
@@ -190,7 +194,9 @@ function createTaskSchema(options: {
 		? { "outputSchema?": outputSchemaInputSchema, "schemaMode?": '"permissive" | "strict"' }
 		: {};
 	const toolsField = options.evalToolsEnabled ? { "tools?": "string[]" } : {};
-	const seanceFields = options.seanceFields;
+	// `model` is always declared, and preflight decides whether a per-call model
+	// is allowed; seance widens it to a list.
+	const seanceFields = { "model?": "string", ...options.seanceFields };
 	if (options.batchEnabled) {
 		if (options.isolationEnabled) {
 			const item = type.raw({

@@ -347,10 +347,10 @@ export class LegacySseTransport implements MCPTransport {
 			if (
 				postStatus === undefined &&
 				normalized.failure === "connect" &&
-				(/^(?:ECONNREFUSED|CONNECTIONREFUSED|ENETUNREACH|EHOSTUNREACH|ENOTFOUND|EAI_AGAIN)$/i.test(
+				(/^(?:ECONNREFUSED|CONNECTIONREFUSED|ENETUNREACH|EHOSTUNREACH|ENOTFOUND|EAI_AGAIN|FAILEDTOOPENSOCKET)$/i.test(
 					String(normalized.code),
 				) ||
-					/\b(?:ECONNREFUSED|ConnectionRefused|ENETUNREACH|EHOSTUNREACH|ENOTFOUND|EAI_AGAIN)\b/i.test(
+					/\b(?:ECONNREFUSED|ConnectionRefused|ENETUNREACH|EHOSTUNREACH|ENOTFOUND|EAI_AGAIN|FailedToOpenSocket)\b/i.test(
 						normalized.message,
 					))
 			) {

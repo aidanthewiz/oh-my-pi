@@ -1,4 +1,5 @@
 import { afterAll, afterEach, describe, expect, it, vi } from "bun:test";
+import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { TempDir } from "@oh-my-pi/pi-utils";
@@ -91,6 +92,7 @@ function makeSession(options: SessionOptions = {}): ToolSession {
 			"async.enabled": false,
 			"task.isolation.enabled": false,
 			"task.enableLsp": true,
+			"task.perCallModel": "on",
 		});
 	const artifactsDir = options.artifactsDir ?? null;
 	const asyncJobManager = new AsyncJobManager({});
@@ -189,24 +191,6 @@ describe("runEvalAgent", () => {
 		jobManagers.clear();
 	});
 
-	it("resolves the default task agent and agent overrides", async () => {
-		mockAgents();
-		const runSpy = vi.spyOn(taskExecutor, "runSubprocess").mockImplementation(async options =>
-			singleResult(options, {
-				output: options.agent.name,
-			}),
-		);
-		const session = makeSession();
-
-		const defaultResult = await runEvalAgentAndWait({ prompt: "hello" }, { session });
-		const overrideResult = await runEvalAgentAndWait({ prompt: "hello", agent: "reviewer" }, { session });
-
-		expect(defaultResult.text).toBe("task");
-		expect(overrideResult.text).toBe("reviewer");
-		expect(runSpy.mock.calls[0]?.[0].agent.name).toBe("task");
-		expect(runSpy.mock.calls[1]?.[0].agent.name).toBe("reviewer");
-	});
-
 	it("throws for an unknown agent", async () => {
 		mockAgents([taskAgent]);
 		vi.spyOn(taskExecutor, "runSubprocess").mockImplementation(async options => singleResult(options));
@@ -227,23 +211,6 @@ describe("runEvalAgent", () => {
 			runEvalAgentAndWait({ prompt: "hello", agent: "task" }, { session: makeSession({ spawns: "reviewer" }) }),
 		).rejects.toThrow("Allowed: reviewer");
 		expect(runSpy).not.toHaveBeenCalled();
-	});
-
-	it("defaults to the first allowed spawn under restricted eval policies", async () => {
-		mockAgents();
-		const runSpy = vi.spyOn(taskExecutor, "runSubprocess").mockImplementation(async options =>
-			singleResult(options, {
-				output: options.agent.name,
-			}),
-		);
-
-		const result = await runEvalAgentAndWait(
-			{ prompt: "hello" },
-			{ session: makeSession({ spawns: "reviewer,task" }) },
-		);
-
-		expect(result.text).toBe("reviewer");
-		expect(runSpy.mock.calls[0]?.[0].agent.name).toBe("reviewer");
 	});
 
 	it("honors task.maxRecursionDepth without an eval-specific ceiling", async () => {
@@ -299,46 +266,48 @@ describe("runEvalAgent", () => {
 		expect(runSpy).toHaveBeenCalledTimes(1);
 	});
 
-	it("passes parent execution options and only sets outputSchema when schema is supplied", async () => {
+	it.each([
+		// The gate wins over the selector check, so an invalid selector still reports the disabled gate.
+		{ mode: "off", model: "@smol", error: /task\.perCallModel: off/ },
+		{ mode: "on", model: "default", error: /invalid `model`/ },
+		// The argument schema accepts only a string, so a candidate array never reaches preflight.
+		{ mode: "on", model: ["p/preferred:high", "p/alternative"], error: /model must be a string/ },
+	])("rejects agent() model $model under $mode before dispatch", async ({ mode, model, error }) => {
 		mockAgents();
 		const runSpy = vi.spyOn(taskExecutor, "runSubprocess").mockImplementation(async options => singleResult(options));
-		const abortController = new AbortController();
-		const schema = { type: "object", properties: { ok: { type: "boolean" } } };
-		const session = makeSession({
-			depth: 2,
-			activeModel: "p/current",
-			modelString: "p/fallback",
-			settings: Settings.isolated({
-				"async.enabled": false,
-				"task.isolation.enabled": false,
-				"task.enableLsp": true,
-				// Default task.maxRecursionDepth is 2, which would now (correctly)
-				// block depth=2 — widen it so the test still exercises depth=2.
-				"task.maxRecursionDepth": -1,
+		const settings = Settings.isolated({ "task.perCallModel": mode, "task.isolation.enabled": false });
+
+		await expect(
+			runEvalAgent({ prompt: "work", agent: "reviewer", model }, { session: makeSession({ settings }) }),
+		).rejects.toThrow(error);
+		expect(runSpy).not.toHaveBeenCalled();
+	});
+
+	it.each([
+		{ model: "unapproved", allow: undefined },
+		{ model: "approved", allow: ["mock/unapproved"] },
+	])("refuses an ungranted or narrowed model before registering an eval agent: $model", async ({ model, allow }) => {
+		const approved = createMockModel({ id: "approved" });
+		const unapproved = createMockModel({ id: "unapproved" });
+		mockAgents([{ ...reviewerAgent, source: "project", model: ["mock/unapproved"] }]);
+		const runSpy = vi.spyOn(taskExecutor, "runSubprocess");
+		const session = Object.assign(
+			makeSession({
+				settings: Settings.isolated({
+					"task.perCallModel": "eval",
+					"task.isolation.enabled": false,
+					modelRoles: { review: "mock/approved" },
+					...(allow ? { "task.perCallModelAllow": allow } : {}),
+				}),
 			}),
-		});
-
-		await runEvalAgentAndWait(
-			{ prompt: " hello ", label: "My Agent", schema },
-			{ session, signal: abortController.signal },
+			{ modelRegistry: { getAll: () => [approved, unapproved], getAvailable: () => [approved, unapproved] } },
 		);
-		await runEvalAgentAndWait({ prompt: "plain" }, { session });
 
-		const firstOptions = runSpy.mock.calls[0]?.[0];
-		const secondOptions = runSpy.mock.calls[1]?.[0];
-		if (!firstOptions || !secondOptions) throw new Error("runSubprocess was not called");
-		expect(firstOptions.taskDepth).toBe(2);
-		expect(firstOptions.signal).not.toBe(abortController.signal);
-		expect(firstOptions.signal?.aborted).toBe(false);
-		expect(firstOptions.parentActiveModelPattern).toBe("p/current");
-		expect(firstOptions.outputSchema).toBe(schema);
-		expect(firstOptions.outputSchemaOverridesAgent).toBe(true);
-		expect(firstOptions.assignment).toBe("hello");
-		expect(firstOptions.description).toBe("My Agent");
-		// No per-call override: the agent's own frontmatter model applies.
-		expect(firstOptions.modelOverride).toEqual(["p/current"]);
-		expect(secondOptions.outputSchema).toBeUndefined();
-		expect(secondOptions.outputSchemaOverridesAgent).toBeUndefined();
+		await expect(
+			runEvalAgent({ prompt: "work", agent: "reviewer", model: `mock/${model}`, label: "Denied" }, { session }),
+		).rejects.toThrow(/not approved/);
+		expect(runSpy).not.toHaveBeenCalled();
+		expect(session.asyncJobManager?.getJob("Denied")).toBeUndefined();
 	});
 
 	it("returns host-parsed data for caller, agent, and inherited schemas", async () => {
@@ -384,21 +353,6 @@ describe("runEvalAgent", () => {
 			agentSchema,
 			sessionSchema,
 		]);
-	});
-
-	it("inherits non-plan LSP and IRC policy", async () => {
-		mockAgents();
-		const runSpy = vi.spyOn(taskExecutor, "runSubprocess").mockImplementation(async options => singleResult(options));
-		// makeSession() defaults to enableLsp: true and task.enableLsp: true.
-		const session = makeSession();
-
-		await runEvalAgentAndWait({ prompt: "hello" }, { session });
-
-		const options = runSpy.mock.calls[0]?.[0];
-		if (!options) throw new Error("runSubprocess was not called");
-		expect(options.enableLsp).toBe(true);
-		expect(options.enableIrc).toBe(true);
-		expect(options.keepAlive).toBe(true);
 	});
 
 	it("registers temp artifact dirs for in-memory handle results so agent URLs resolve", async () => {

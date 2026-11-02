@@ -275,8 +275,15 @@ export function normalizeMCPTransportError(
 		normalizedCode === "EHOSTUNREACH" ||
 		normalizedCode === "ENOTFOUND" ||
 		normalizedCode === "EAI_AGAIN" ||
-		/\b(?:ECONNREFUSED|ConnectionRefused|ENETUNREACH|EHOSTUNREACH)\b/i.test(message)
+		normalizedCode === "FAILEDTOOPENSOCKET" ||
+		/\b(?:ECONNREFUSED|ConnectionRefused|ENETUNREACH|EHOSTUNREACH|ENOTFOUND|EAI_AGAIN|FailedToOpenSocket)\b/i.test(
+			message,
+		)
 	) {
+		code ??=
+			/\b(?:ECONNREFUSED|ConnectionRefused|ENETUNREACH|EHOSTUNREACH|ENOTFOUND|EAI_AGAIN|FailedToOpenSocket)\b/i.exec(
+				message,
+			)?.[0];
 		failure = "connect";
 		retryable = true;
 	} else if (normalizedCode === "ECONNRESET" || /\bECONNRESET\b/i.test(message)) {

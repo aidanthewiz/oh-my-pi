@@ -44,6 +44,12 @@
 - Exclude unknown process start times from newest/oldest selection without dropping them from unrestricted process listings.
 - Launch background pipelines once, preserve completed-stage statuses and launch-time `pipefail`, and isolate command-substitution capture from outer redirects.
 - Keep completed-job metadata available to `wait` without granting signal authority, and update `$!` when resuming a background job.
+## [18.14.2] - 2026-10-31
+
+### Added
+
+- Added `listWorkspace({ pruneExcludedDirs: false })` to stop pruning standard dependency/build directory names; hidden directories such as `.git` also require `hidden: true` ([#17539](https://github.com/can1357/oh-my-pi/issues/17539))
+
 ## [18.14.1] - 2026-10-31
 
 ### Added

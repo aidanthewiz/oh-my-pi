@@ -7,7 +7,7 @@
 import type { BigIntStats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { isRecord } from "@oh-my-pi/pi-utils";
+import { isRecord, logger, toError } from "@oh-my-pi/pi-utils";
 import { replaceFileAtomically } from "../utils/atomic-file";
 import { withArtifactPublicationLock } from "./artifact-publication";
 
@@ -87,7 +87,9 @@ export async function writeArtifact(path: string, content: string): Promise<numb
 			await file.slice(0, Math.min(expectedBytes, 1)).arrayBuffer();
 			await replaceFileAtomically(tempPath, path);
 		} catch (error) {
-			await fs.rm(tempPath, { force: true });
+			await fs.rm(tempPath, { force: true }).catch(cleanupError => {
+				logger.warn("Failed to remove staged artifact", { tempPath, error: toError(cleanupError).message });
+			});
 			throw error;
 		}
 		return expectedBytes;

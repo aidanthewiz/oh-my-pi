@@ -83,6 +83,7 @@ function makeGuestHarness(model: Model, modelRegistry: ModelRegistry): GuestHarn
 		sessionManager: manager,
 		session,
 		statusContainer: { clear: () => {}, disposeChildren: () => {} },
+		pendingShellContainer: { clear: () => {} },
 		pendingMessagesContainer: { clear: () => {} },
 		compactionQueuedMessages: [],
 		streamingComponent: undefined,

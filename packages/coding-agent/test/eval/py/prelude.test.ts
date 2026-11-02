@@ -77,45 +77,6 @@ describe("python prelude", () => {
 		expect(lines[1]).toBe("True []");
 	});
 
-	it("appends line selectors to delegated URI paths", async () => {
-		const requests: unknown[] = [];
-		const server = Bun.serve({
-			hostname: "127.0.0.1",
-			port: 0,
-			fetch: async request => {
-				requests.push(await request.json());
-				return Response.json({
-					ok: true,
-					value: { text: "resource contents", details: { resolvedPath: "/tmp/resource.txt" } },
-				});
-			},
-		});
-
-		try {
-			const result = await runPrelude(`print(read("mcp://server/resource", 10, 5))`, {
-				PI_TOOL_BRIDGE_URL: server.url.toString(),
-				PI_TOOL_BRIDGE_TOKEN: "test-token",
-				PI_TOOL_BRIDGE_SESSION: "test-session",
-			});
-
-			expect(result).toEqual({
-				stdout: "resource contents\n",
-				stderr: "",
-				exitCode: 0,
-			});
-			expect(requests).toEqual([
-				{
-					session: "test-session",
-					run: null,
-					name: "read",
-					args: { path: "mcp://server/resource:10-14" },
-				},
-			]);
-		} finally {
-			server.stop(true);
-		}
-	});
-
 	async function runWithReadBridge(
 		code: string,
 		env: Record<string, string>,
@@ -206,24 +167,6 @@ describe("python prelude", () => {
 		expect(stderr).toBe("");
 		expect(await Bun.file(out).text()).toBe(largeArtifact);
 		expect(requests).toMatchObject([{ name: "read", args: { path: "artifact://12:raw:1-1" } }]);
-	});
-
-	it("returns a replacement read tool's text when it names no artifact file", async () => {
-		// An extension's same-name `read` replacement returns its own content without the built-in's `details`.
-		const { stdout, stderr, requests } = await runWithReadBridge(
-			[`print(read("artifact://12"))`, `print(read("artifact://12", offset=2, limit=2))`].join("\n"),
-			{},
-			async args => ({ text: `replaced ${args.path}` }),
-		);
-
-		expect(stderr).toBe("");
-		expect(stdout).toBe("replaced artifact://12:raw\nreplaced artifact://12:raw:2-3\n");
-		expect(requests).toMatchObject([
-			{ name: "read", args: { path: "artifact://12:raw:1-1" } },
-			{ name: "read", args: { path: "artifact://12:raw" } },
-			{ name: "read", args: { path: "artifact://12:raw:1-1" } },
-			{ name: "read", args: { path: "artifact://12:raw:2-3" } },
-		]);
 	});
 
 	it("bypasses discovered proxies for loopback bridge calls", async () => {

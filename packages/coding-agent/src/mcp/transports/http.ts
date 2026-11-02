@@ -587,13 +587,12 @@ export class HttpTransport implements MCPTransport {
 			const refusedBeforeDispatch =
 				stage === "send" &&
 				diagnostic.failure === "connect" &&
-				(diagnostic.code === "ECONNREFUSED" ||
-					diagnostic.code === "ConnectionRefused" ||
-					diagnostic.code === "CONNECTIONREFUSED" ||
-					diagnostic.code === "ENETUNREACH" ||
-					diagnostic.code === "EHOSTUNREACH" ||
-					diagnostic.code === "ENOTFOUND" ||
-					diagnostic.code === "EAI_AGAIN");
+				(/^(?:ECONNREFUSED|CONNECTIONREFUSED|ENETUNREACH|EHOSTUNREACH|ENOTFOUND|EAI_AGAIN|FAILEDTOOPENSOCKET)$/i.test(
+					String(diagnostic.code),
+				) ||
+					/\b(?:ECONNREFUSED|ConnectionRefused|ENETUNREACH|EHOSTUNREACH|ENOTFOUND|EAI_AGAIN|FailedToOpenSocket)\b/i.test(
+						diagnostic.message,
+					));
 			const staleSession = diagnostic.failure === "http_status" && diagnostic.code === 404;
 			throw refusedBeforeDispatch || staleSession ? diagnostic : nonRetryableMCPTransportError(diagnostic);
 		} finally {
