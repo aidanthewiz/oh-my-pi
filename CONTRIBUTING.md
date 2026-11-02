@@ -31,6 +31,42 @@ Hosted jobs run complete TypeScript and Rust checks, SDK consumers, synthetic da
 Visual artifacts retain current, historical reference, and peer images; inspection remains a separate evidence requirement.
 Coreforge companion qualification runs in its own repository. Engine qualification needs no companion credentials.
 
+## Durable native build caches
+
+The seven Linux/macOS Bazel native jobs in `cf-verify` and `cf-release`, plus relay validation, support private-S3 snapshots.
+Windows ARM64 and full Rust qualification use Cargo and retain their existing cache ownership.
+No build, test, signing, qualification, or release command is replaced by a cache hit.
+
+Snapshots contain only regular Bazel action/CAS files under `~/.cache/omp-bazel-disk` and repository downloads under `~/.cache/omp-bazel-repo`.
+Zero-byte repository canonical-ID markers are included so downloaded archives remain reusable.
+Output bases, extracted repository trees, logs, credentials, signing material, and user profiles are excluded.
+
+Compatibility identities include target/runner slot, actual OS and architecture, Bazel 9.2.0, compiler/SDK/tool identities, and pinned toolchain/configuration inputs.
+Native source files, dependency lock changes, and commit SHAs do not partition durable snapshots; Bazel action hashes invalidate changed inputs.
+S3 restores first. A missing, incompatible, or rejected snapshot falls back to the identity-scoped GitHub hot cache, then a real cold build.
+Cache-only failures produce warnings; they never skip required work or turn a failed build into success.
+
+Build jobs receive verified snapshot data through one-day GitHub transfer artifacts, never AWS credentials.
+Immutable reusable brokers execute only protected `coreforge` helper code.
+The writer verifies the actual source, run attempt, successful predecessor graph, and same-run snapshot provenance before OIDC.
+Engine publication waits for all eight platform builds, release publication, and `verify_release`.
+Relay cache publication waits for successful validation and the existing guarded relay publication.
+PR, `pull_request_target`, and `workflow_run` execution cannot publish shared snapshots.
+
+`scripts/ci_cache.py` publishes immutable archives and manifests before updating each current reference.
+Restore verifies the archive digest, complete identity, and every member before replacing either cache root.
+Successful publication explicitly prunes obsolete generations, retaining every current snapshot plus two historical generations per dimension.
+A 24-hour grace protects in-flight transfers. Owners explicitly retire noncurrent dimensions with `prune --retire`; inactivity never expires current snapshots.
+
+This feature is disabled until the CI/cloud owners complete [the bucket, IAM, OIDC, and variable setup](docs/ci-cache-iam.md).
+Requiring `job_workflow_ref` affects the repository's existing relay/cosign OIDC consumers.
+Complete their reviewed compatibility migration before enabling this cache; do not weaken broker trust or change live configuration implicitly.
+
+Run `python3 -m unittest discover -s scripts -p test_ci_cache.py` for cache boundaries.
+Local qualification exercised a real Bazel 9.2.0 C build with isolated output bases and a loopback repository download.
+Warm restore produced a disk-cache hit with repository downloads disabled; changed inputs rebuilt correctly, and a miss ran a real cold build.
+These checks do not qualify live S3/OIDC, the native-addon matrix, or deployed performance.
+
 ## Dependency releases
 
 A verified pull request merged into `coreforge` triggers `.github/workflows/cf-release.yml`.

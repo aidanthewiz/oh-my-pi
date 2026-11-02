@@ -1,0 +1,249 @@
+name: cf-cache-write
+
+on:
+  workflow_call:
+    inputs:
+      enabled:
+        description: Owner-controlled cache enablement
+        default: false
+        type: boolean
+      source-sha:
+        description: Exact protected build source commit
+        required: true
+        type: string
+      expected-workflow:
+        description: cf-release or relay
+        required: true
+        type: string
+      build-result:
+        description: Caller needs result; API-verified predecessors remain authoritative
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  publish:
+    if: >-
+      inputs.enabled && vars.CI_CACHE_ENABLED == 'true' &&
+      github.repository == 'Coreforce-CAD/oh-my-pi' && github.event_name == 'push' &&
+      (github.ref == 'refs/heads/coreforge' || startsWith(github.ref, 'refs/tags/v') || startsWith(github.ref, 'refs/tags/relay/v'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    continue-on-error: true
+    concurrency:
+      group: cf-durable-cache-publish
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    env:
+      CI_CACHE_BUCKET: ${{ vars.CI_CACHE_BUCKET }}
+      CI_CACHE_REGION: ${{ vars.CI_CACHE_REGION }}
+      CI_CACHE_PREFIX: ${{ vars.CI_CACHE_PREFIX }}
+      AWS_ENDPOINT_URL: ""
+      AWS_ENDPOINT_URL_S3: ""
+      AWS_IGNORE_CONFIGURED_ENDPOINT_URLS: "true"
+      AWS_CONFIG_FILE: /dev/null
+      AWS_SHARED_CREDENTIALS_FILE: /dev/null
+    steps:
+      - name: Verify authoritative run and completed predecessors before OIDC
+        id: guard
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ inputs.source-sha }}
+          EXPECTED_WORKFLOW: ${{ inputs.expected-workflow }}
+          BUILD_RESULT: ${{ inputs.build-result }}
+          WRITE_ROLE: ${{ vars.CI_CACHE_WRITE_ROLE }}
+          CALLER_WORKFLOW_REF: ${{ github.workflow_ref }}
+          CALLER_WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re, urllib.request
+          from pathlib import Path
+
+          repo = 'Coreforce-CAD/oh-my-pi'
+          sha = os.environ['SOURCE_SHA']
+          ref = os.environ['GITHUB_REF']
+          workflow = os.environ['EXPECTED_WORKFLOW']
+          run_id = int(os.environ['GITHUB_RUN_ID'])
+          attempt = int(os.environ['GITHUB_RUN_ATTEMPT'])
+          if os.environ['GITHUB_REPOSITORY'] != repo or os.environ['GITHUB_EVENT_NAME'] != 'push':
+              raise SystemExit('Cache publication refused: untrusted execution source')
+          if workflow not in ('cf-release', 'relay') or os.environ['BUILD_RESULT'] != 'success':
+              raise SystemExit('Cache publication refused: invalid caller or failed build')
+          if not re.fullmatch(r'[0-9a-f]{40}', sha) or sha != os.environ['GITHUB_SHA']:
+              raise SystemExit('Cache publication refused: source SHA mismatch')
+          path = f'.github/workflows/{workflow}.yml'
+          if os.environ['CALLER_WORKFLOW_REF'] != f'{repo}/{path}@{ref}' or os.environ['CALLER_WORKFLOW_SHA'] != sha:
+              raise SystemExit('Cache publication refused: unexpected workflow source')
+          valid_ref = (ref == 'refs/heads/coreforge' or re.fullmatch(r'refs/tags/v[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+', ref)) if workflow == 'cf-release' else re.fullmatch(r'refs/tags/relay/v[0-9A-Za-z.+-]+', ref)
+          if not valid_ref:
+              raise SystemExit('Cache publication refused: unexpected source ref')
+          missing = [name for name in ('CI_CACHE_BUCKET', 'CI_CACHE_REGION', 'CI_CACHE_PREFIX', 'WRITE_ROLE') if not os.environ.get(name)]
+          if missing:
+              raise SystemExit('Cache configuration incomplete: ' + ', '.join(missing))
+
+          def api(suffix):
+              request = urllib.request.Request(
+                  f'https://api.github.com/repos/{repo}/{suffix}',
+                  headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28'})
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  return json.load(response)
+
+          def pages(suffix, field):
+              result = []
+              page = 1
+              while True:
+                  data = api(f'{suffix}{"&" if "?" in suffix else "?"}per_page=100&page={page}')
+                  batch = data[field]
+                  if not isinstance(batch, list):
+                      raise SystemExit('Cache publication refused: invalid API listing')
+                  result.extend(batch)
+                  if len(result) == data['total_count']:
+                      return result
+                  if not batch or len(result) > data['total_count']:
+                      raise SystemExit('Cache publication refused: incomplete API listing')
+                  page += 1
+
+          run = api(f'actions/runs/{run_id}/attempts/{attempt}')
+          if (run['id'] != run_id or run['run_attempt'] != attempt or run['event'] != 'push'
+                  or run['head_sha'] != sha or run['repository']['full_name'] != repo
+                  or run['head_repository']['full_name'] != repo or run['path'].split('@', 1)[0] != path):
+              raise SystemExit('Cache publication refused: run provenance mismatch')
+          if api(f'actions/workflows/{run["workflow_id"]}')['path'] != path:
+              raise SystemExit('Cache publication refused: workflow identity mismatch')
+          if api('git/ref/heads/coreforge')['object']['sha'] != sha:
+              raise SystemExit('Cache publication refused: source is no longer current coreforge tip')
+          if ref.startswith('refs/tags/'):
+              from urllib.parse import quote
+              obj = api('git/ref/tags/' + quote(ref.removeprefix('refs/tags/'), safe=''))['object']
+              seen = set()
+              while obj['type'] == 'tag':
+                  if obj['sha'] in seen or len(seen) >= 8:
+                      raise SystemExit('Cache publication refused: invalid tag chain')
+                  seen.add(obj['sha'])
+                  obj = api('git/tags/' + obj['sha'])['object']
+              if obj['type'] != 'commit' or obj['sha'] != sha:
+                  raise SystemExit('Cache publication refused: tag does not resolve to source')
+
+          targets = ('darwin-arm64', 'darwin-x64', 'linux-x64', 'linux-arm64', 'linux-musl-x64', 'linux-musl-arm64', 'win32-x64', 'win32-arm64')
+          required = {'prepare', 'release', 'verify_release', *(f'build ({target})' for target in targets)} if workflow == 'cf-release' else {'validate', 'publish'}
+          jobs = pages(f'actions/runs/{run_id}/attempts/{attempt}/jobs', 'jobs')
+          for name in required:
+              matches = [job for job in jobs if job['name'] == name]
+              if len(matches) != 1 or matches[0]['status'] != 'completed' or matches[0]['conclusion'] != 'success' or not matches[0]['completed_at']:
+                  raise SystemExit('Cache publication refused: predecessor not completed successfully: ' + name)
+          if workflow == 'cf-release':
+              builds = [job['name'] for job in jobs if job['name'].startswith('build (')]
+              if set(builds) != {f'build ({target})' for target in targets} or len(builds) != len(targets):
+                  raise SystemExit('Cache publication refused: unexpected build matrix')
+
+          slots = ('darwin-arm64-xcode-27', 'darwin-x64-macos-15-intel', 'linux-x64-ubuntu-22.04', 'linux-arm64-ubuntu-24.04-arm', 'linux-musl-x64-ubuntu-22.04', 'linux-musl-arm64-ubuntu-24.04-arm', 'win32-x64-ubuntu-24.04') if workflow == 'cf-release' else ('linux-x64-ubuntu-24.04',)
+          artifacts = [item for item in pages(f'actions/runs/{run_id}/artifacts', 'artifacts') if item['name'].startswith('snapshot-')]
+          expected = {'snapshot-' + slot for slot in slots}
+          if len(artifacts) != len(expected) or {item['name'] for item in artifacts} != expected:
+              raise SystemExit('Cache publication refused: incomplete or unexpected snapshot artifacts')
+          for artifact in artifacts:
+              source = artifact['workflow_run']
+              if artifact['expired'] or source['id'] != run_id or source['head_sha'] != sha or source['head_repository_id'] != run['repository']['id']:
+                  raise SystemExit('Cache publication refused: artifact source mismatch')
+          (Path(os.environ['RUNNER_TEMP']) / 'cache-expected-slots.json').write_text(json.dumps(slots))
+          PY
+
+      - name: Checkout protected helper only
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Coreforce-CAD/oh-my-pi
+          ref: coreforge
+          persist-credentials: false
+
+      - name: Verify protected helper source
+        env:
+          SOURCE_SHA: ${{ inputs.source-sha }}
+        run: test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+
+      - name: Download inert snapshots from this run only
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: snapshot-*
+          path: ${{ runner.temp }}/cache-publish
+          merge-multiple: false
+
+      - name: Validate same-attempt snapshot provenance before OIDC
+        env:
+          SOURCE_SHA: ${{ inputs.source-sha }}
+        run: |
+          python3 - <<'PY'
+          import json, os, stat
+          from pathlib import Path
+
+          root = Path(os.environ['RUNNER_TEMP']) / 'cache-publish'
+          slots = json.loads((Path(os.environ['RUNNER_TEMP']) / 'cache-expected-slots.json').read_text())
+          if {entry.name for entry in root.iterdir()} != {'snapshot-' + slot for slot in slots}:
+              raise SystemExit('Cache publication refused: unexpected snapshot directories')
+          for slot in slots:
+              snapshot = root / ('snapshot-' + slot)
+              if not stat.S_ISDIR(snapshot.lstat().st_mode) or {entry.name for entry in snapshot.iterdir()} != {'manifest.json', 'snapshot.tar.gz'}:
+                  raise SystemExit('Cache publication refused: unexpected snapshot layout')
+              for name in ('manifest.json', 'snapshot.tar.gz'):
+                  if not stat.S_ISREG((snapshot / name).lstat().st_mode):
+                      raise SystemExit('Cache publication refused: snapshot is not a regular file')
+              manifest = json.loads((snapshot / 'manifest.json').read_text())
+              if (manifest.get('slot') != slot or manifest.get('source_sha') != os.environ['SOURCE_SHA']
+                      or str(manifest.get('run_id')) != os.environ['GITHUB_RUN_ID']
+                      or str(manifest.get('run_attempt')) != os.environ['GITHUB_RUN_ATTEMPT']):
+                  raise SystemExit('Cache publication refused: manifest provenance mismatch')
+          PY
+
+      - name: Recheck current protected tip immediately before OIDC
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ inputs.source-sha }}
+        run: |
+          python3 - <<'PY'
+          import json, os, urllib.request
+
+          request = urllib.request.Request(
+              'https://api.github.com/repos/Coreforce-CAD/oh-my-pi/git/ref/heads/coreforge',
+              headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28'})
+          with urllib.request.urlopen(request, timeout=30) as response:
+              if json.load(response)['object']['sha'] != os.environ['SOURCE_SHA']:
+                  raise SystemExit('Cache publication refused: source is no longer current coreforge tip')
+          PY
+
+      - name: Assume cache write and controlled-prune role
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.CI_CACHE_WRITE_ROLE }}
+          aws-region: ${{ vars.CI_CACHE_REGION }}
+          role-session-name: cache-write-${{ github.run_id }}-${{ github.run_attempt }}
+          translate-env-variables: false
+          output-env-credentials: true
+          unset-current-credentials: true
+
+      - name: Publish verified snapshots and prune unreferenced generations
+        env:
+          CACHE_BUILD_RESULT: success
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess
+          from pathlib import Path
+
+          slots = json.loads((Path(os.environ['RUNNER_TEMP']) / 'cache-expected-slots.json').read_text())
+          for slot in slots:
+              snapshot = Path(os.environ['RUNNER_TEMP']) / 'cache-publish' / ('snapshot-' + slot)
+              subprocess.run(['python3', 'scripts/ci_cache.py', 'publish', '--snapshot', str(snapshot)], check=True)
+          subprocess.run(['python3', 'scripts/ci_cache.py', 'prune', '--keep', '2', '--apply'], check=True)
+          PY
+
+      - name: Report cache-only outcome
+        if: always()
+        env:
+          CACHE_JOB_STATUS: ${{ job.status }}
+        run: |
+          if [ "$CACHE_JOB_STATUS" != success ]; then
+            echo '::warning::Durable S3 cache publication failed or was refused. Original build, release, verification, and relay gates remain authoritative.'
+          fi
+          printf 'Durable S3 cache publication: **%s**. This is not a release or verification result.\n' "$CACHE_JOB_STATUS" >> "$GITHUB_STEP_SUMMARY"

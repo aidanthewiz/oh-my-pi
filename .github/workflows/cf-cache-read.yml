@@ -1,0 +1,156 @@
+name: cf-cache-read
+
+on:
+  workflow_call:
+    inputs:
+      slots:
+        description: JSON array of Bazel cache slots
+        required: true
+        type: string
+      enabled:
+        description: Owner-controlled cache enablement
+        default: false
+        type: boolean
+
+permissions: {}
+
+jobs:
+  fetch:
+    if: >-
+      github.repository == 'Coreforce-CAD/oh-my-pi' &&
+      (github.event_name == 'pull_request' || github.event_name == 'push')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        slot: ${{ fromJSON(inputs.slots) }}
+    env:
+      CI_CACHE_BUCKET: ${{ vars.CI_CACHE_BUCKET }}
+      CI_CACHE_REGION: ${{ vars.CI_CACHE_REGION }}
+      CI_CACHE_PREFIX: ${{ vars.CI_CACHE_PREFIX }}
+      AWS_ENDPOINT_URL: ""
+      AWS_ENDPOINT_URL_S3: ""
+      AWS_IGNORE_CONFIGURED_ENDPOINT_URLS: "true"
+      AWS_CONFIG_FILE: /dev/null
+      AWS_SHARED_CREDENTIALS_FILE: /dev/null
+    steps:
+      - name: Guard execution source and configuration
+        id: guard
+        continue-on-error: true
+        env:
+          REQUESTED: ${{ inputs.enabled }}
+          ENABLED: ${{ vars.CI_CACHE_ENABLED }}
+          READ_ROLE: ${{ vars.CI_CACHE_READ_ROLE }}
+          CACHE_SLOT: ${{ matrix.slot }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re
+          from pathlib import Path
+
+          if os.environ['GITHUB_REPOSITORY'] != 'Coreforce-CAD/oh-my-pi':
+              raise SystemExit('Cache read refused: unexpected repository')
+          event = json.loads(Path(os.environ['GITHUB_EVENT_PATH']).read_text())
+          if os.environ['GITHUB_EVENT_NAME'] == 'pull_request':
+              base = event['pull_request']['base']
+              if base['repo']['full_name'] != 'Coreforce-CAD/oh-my-pi' or base['ref'] != 'coreforge':
+                  raise SystemExit('Cache read refused: unexpected PR base')
+          elif os.environ['GITHUB_EVENT_NAME'] == 'push':
+              ref = os.environ['GITHUB_REF']
+              if ref != 'refs/heads/coreforge' and not re.fullmatch(r'refs/tags/(?:v[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+|relay/v[0-9A-Za-z.+-]+)', ref):
+                  raise SystemExit('Cache read refused: unexpected push ref')
+          else:
+              raise SystemExit('Cache read refused: unexpected event')
+          if not re.fullmatch(r'[a-z0-9][a-z0-9.-]{0,95}', os.environ['CACHE_SLOT']):
+              raise SystemExit('Cache read refused: invalid slot')
+          enabled = os.environ['REQUESTED'] == 'true' and os.environ['ENABLED'] == 'true'
+          if enabled:
+              missing = [name for name in ('CI_CACHE_BUCKET', 'CI_CACHE_REGION', 'CI_CACHE_PREFIX', 'READ_ROLE') if not os.environ.get(name)]
+              if missing:
+                  raise SystemExit('Cache configuration incomplete: ' + ', '.join(missing))
+          else:
+              print('::notice::Durable S3 cache disabled; native builds remain authoritative.')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'enabled={str(enabled).lower()}\n')
+          PY
+
+      - name: Checkout protected helper only
+        if: steps.guard.outputs.enabled == 'true'
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Coreforce-CAD/oh-my-pi
+          ref: coreforge
+          persist-credentials: false
+
+      - name: Assume cache read role
+        if: steps.guard.outputs.enabled == 'true' && steps.checkout.outcome == 'success'
+        id: credentials
+        continue-on-error: true
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.CI_CACHE_READ_ROLE }}
+          aws-region: ${{ vars.CI_CACHE_REGION }}
+          role-session-name: cache-read-${{ github.run_id }}-${{ github.run_attempt }}
+          translate-env-variables: false
+          output-env-credentials: true
+          unset-current-credentials: true
+
+      - name: Fetch inert snapshot
+        if: steps.credentials.outcome == 'success'
+        id: fetch
+        continue-on-error: true
+        env:
+          CACHE_SLOT: ${{ matrix.slot }}
+        run: python3 scripts/ci_cache.py fetch --slot "$CACHE_SLOT" --output "$RUNNER_TEMP/cache-fetch"
+
+      - name: Record cache-only outcome
+        if: always()
+        env:
+          REQUESTED: ${{ inputs.enabled }}
+          ENABLED: ${{ vars.CI_CACHE_ENABLED }}
+          GUARD_OUTCOME: ${{ steps.guard.outcome }}
+          CHECKOUT_OUTCOME: ${{ steps.checkout.outcome }}
+          CREDENTIAL_OUTCOME: ${{ steps.credentials.outcome }}
+          FETCH_OUTCOME: ${{ steps.fetch.outcome }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+
+          requested = os.environ['REQUESTED'] == 'true' and os.environ['ENABLED'] == 'true'
+          outcomes = {name: os.environ[name] for name in ('GUARD_OUTCOME', 'CHECKOUT_OUTCOME', 'CREDENTIAL_OUTCOME', 'FETCH_OUTCOME')}
+          failed = any(value == 'failure' for value in outcomes.values())
+          state = 'disabled'
+          if failed:
+              state = 'error'
+              print('::warning::Durable cache read failed; use a real cold build. ' + json.dumps(outcomes))
+          elif requested:
+              root = Path(os.environ['RUNNER_TEMP']) / 'cache-fetch'
+              state = ('snapshot' if (root / 'manifest.json').is_file() else 'miss') if os.environ['FETCH_OUTCOME'] == 'success' else 'unavailable'
+          if requested:
+              root = Path(os.environ['RUNNER_TEMP']) / 'cache-fetch'
+              root.mkdir(parents=True, exist_ok=True)
+              (root / 'status.json').write_text(json.dumps({'state': state, 'steps': outcomes}) + '\n')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              summary.write(f'Durable S3 cache read: **{state}**. This is not a build or verification result.\n')
+          PY
+
+      - name: Transfer inert restore data
+        if: always() && inputs.enabled && vars.CI_CACHE_ENABLED == 'true'
+        id: upload
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cache-restore-${{ matrix.slot }}
+          path: ${{ runner.temp }}/cache-fetch/
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Report transfer failure
+        if: always() && steps.upload.outcome == 'failure'
+        run: echo '::warning::Durable cache artifact transfer failed; use a real cold build.'
