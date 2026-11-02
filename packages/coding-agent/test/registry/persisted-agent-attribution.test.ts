@@ -1,4 +1,6 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, vi } from "bun:test";
+import type { BigIntStats, PathLike, StatOptions, Stats } from "node:fs";
+import { promises as fs } from "node:fs";
 import * as path from "node:path";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
@@ -355,5 +357,102 @@ describe("persisted agent model attribution", () => {
 		const history = registry.get("Branching")?.history;
 		expect(history?.metrics?.requests).toBe(1);
 		expect(history?.metrics?.cost).toBeCloseTo(0.3);
+	});
+});
+
+describe("persisted history rescans", () => {
+	it("reads a transcript again only after it changed", async () => {
+		using tempDir = TempDir.createSync("@omp-history-rescan-");
+		const rootFile = path.join(tempDir.path(), "main.jsonl");
+		const transcriptFile = path.join(tempDir.path(), "main", "Worker.jsonl");
+		const registry = await historyFor(tempDir.path(), "Worker", [
+			...transcriptHead(),
+			assistant("a1", "si", SONNET, "stop", [{ type: "text", text: "done" }], 0.5),
+		]);
+		const ref = registry.get("Worker")!;
+		expect(ref.history?.directCost).toBeCloseTo(0.5);
+		const changed: string[] = [];
+		registry.onChange(event => {
+			if (event.type === "metadata_changed") changed.push(event.ref.id);
+		});
+
+		await registerPersistedSubagents(registry, rootFile);
+		expect(changed).toEqual([]);
+
+		await fs.appendFile(
+			transcriptFile,
+			`${assistant("a2", "a1", SONNET, "stop", [{ type: "text", text: "more" }], 0.25)}\n`,
+		);
+		await registerPersistedSubagents(registry, rootFile);
+		expect(changed).toEqual(["Worker"]);
+		expect(ref.history?.directCost).toBeCloseTo(0.75);
+	});
+
+	it("does not replace a newer generation's history after an earlier scan yields", async () => {
+		using tempDir = TempDir.createSync("@omp-history-generation-");
+		const rootFile = path.join(tempDir.path(), "main.jsonl");
+		const transcriptFile = path.join(tempDir.path(), "main", "Worker.jsonl");
+		const registry = await historyFor(tempDir.path(), "Worker", [
+			...transcriptHead(),
+			assistant("a1", "si", SONNET, "stop", [{ type: "text", text: "old report" }], 0.5),
+		]);
+		await fs.appendFile(
+			transcriptFile,
+			`${assistant("a2", "a1", SONNET, "stop", [{ type: "text", text: "late old report" }], 0.25)}\n`,
+		);
+		const reading = Promise.withResolvers<void>();
+		const resume = Promise.withResolvers<void>();
+		const stat = fs.stat;
+		function delayedStat(file: PathLike): Promise<Stats>;
+		function delayedStat(
+			file: PathLike,
+			options?: StatOptions & { bigint?: false | undefined; throwIfNoEntry?: true | undefined },
+		): Promise<Stats>;
+		function delayedStat(
+			file: PathLike,
+			options: StatOptions & { bigint: true; throwIfNoEntry?: true | undefined },
+		): Promise<BigIntStats>;
+		function delayedStat(
+			file: PathLike,
+			options: StatOptions & { bigint?: false | undefined; throwIfNoEntry: false },
+		): Promise<Stats | undefined>;
+		function delayedStat(
+			file: PathLike,
+			options: StatOptions & { bigint: true; throwIfNoEntry: false },
+		): Promise<BigIntStats | undefined>;
+		function delayedStat(
+			file: PathLike,
+			options: StatOptions & { throwIfNoEntry?: true | undefined },
+		): Promise<Stats | BigIntStats>;
+		function delayedStat(file: PathLike, options?: StatOptions): Promise<Stats | BigIntStats | undefined>;
+		async function delayedStat(file: PathLike, options?: StatOptions): Promise<Stats | BigIntStats | undefined> {
+			const result = await stat(file, options);
+			if (String(file) === transcriptFile) {
+				reading.resolve();
+				await resume.promise;
+			}
+			return result;
+		}
+		const spy = vi.spyOn(fs, "stat").mockImplementation(delayedStat);
+		const scan = registerPersistedSubagents(registry, rootFile);
+		try {
+			await reading.promise;
+			registry.register({
+				id: "Worker",
+				displayName: "replacement",
+				kind: "sub",
+				session: sessionStub(2),
+				sessionFile: transcriptFile,
+				history: { directCost: 2 },
+				status: "idle",
+			});
+			resume.resolve();
+			await scan;
+			expect(registry.get("Worker")?.history?.directCost).toBe(2);
+		} finally {
+			resume.resolve();
+			await scan;
+			spy.mockRestore();
+		}
 	});
 });

@@ -8,7 +8,7 @@ import type { ExtensionRunner } from "../src/extensibility/extensions/runner";
 import type { RegisteredTool } from "../src/extensibility/extensions/types";
 import { wrapRegisteredTool } from "../src/extensibility/extensions/wrapper";
 import { MCPManager } from "../src/mcp/manager";
-import { DeferredMCPTool, MCPTool } from "../src/mcp/tool-bridge";
+import { MCPTool } from "../src/mcp/tool-bridge";
 import type { MCPServerConnection, MCPToolDefinition } from "../src/mcp/types";
 import { customToolToDefinition } from "../src/sdk";
 import { buildSystemPrompt, projectSystemPromptToolMetadata } from "../src/system-prompt";
@@ -43,31 +43,6 @@ function createCapturedConnection(calls: CapturedRequest[]): MCPServerConnection
 	return createMockConnection({ tools: {} }, transport);
 }
 
-describe("MCP tool strict declaration", () => {
-	it("declares strict:false on DeferredMCPTool", () => {
-		const connection = createCapturedConnection([]);
-		const tool = new DeferredMCPTool("srv", STRICT_TOOL, async () => connection);
-		expect(tool.strict).toBe(false);
-	});
-
-	it("survives the custom-tool → definition bridge into the registered session tool", () => {
-		const manager = new MCPManager(process.cwd());
-		vi.spyOn(manager, "getTools").mockReturnValue([new MCPTool(createCapturedConnection([]), STRICT_TOOL)]);
-		const [proxy] = createMCPProxyTools(manager);
-		if (!proxy) {
-			expect.unreachable("no proxy tool created");
-			return;
-		}
-		const definition = customToolToDefinition(proxy);
-		expect(definition.strict).toBe(false);
-		const adapter = wrapRegisteredTool(
-			{ definition, extensionPath: "<sdk>" } as RegisteredTool,
-			{ createContext: () => ({}) } as unknown as ExtensionRunner,
-		);
-		expect(adapter.strict).toBe(false);
-	});
-});
-
 describe("Skill URI reader capability", () => {
 	const SKILL_READER: CustomTool = {
 		name: "skill-reader",
@@ -83,8 +58,8 @@ describe("Skill URI reader capability", () => {
 	it("preserves the skill catalog and URI guidance through to the rendered prompt", async () => {
 		const definition = customToolToDefinition(SKILL_READER);
 		const adapter = wrapRegisteredTool(
-			{ definition, extensionPath: "<sdk>" } as RegisteredTool,
-			{ createContext: () => ({}) } as unknown as ExtensionRunner,
+			{ definition, extensionPath: "<sdk>", owner: null } as RegisteredTool,
+			{ createContext: () => ({}), getNativeDelegationGuidance: () => "" } as unknown as ExtensionRunner,
 		);
 		const tools = projectSystemPromptToolMetadata(new Map([[definition.name, adapter]]), { mode: "full" });
 		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-custom-reader-bridge-"));

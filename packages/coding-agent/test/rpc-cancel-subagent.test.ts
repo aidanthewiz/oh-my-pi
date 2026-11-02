@@ -213,8 +213,12 @@ describe("handleRpcCancelSubagent", () => {
 		const artifactsDir = sessionDir;
 		const promptEntered = Promise.withResolvers<void>();
 		const listeners: Array<(event: AgentSessionEvent) => void> = [];
+		let disposed = false;
 		// Minimal session whose turn never finishes on its own: only a cancel can end the run.
 		const session = {
+			get isDisposed() {
+				return disposed;
+			},
 			state: { messages: [] },
 			agent: { state: { systemPrompt: ["test"] } },
 			model: undefined,
@@ -242,13 +246,16 @@ describe("handleRpcCancelSubagent", () => {
 			getAsyncJobSnapshot: () => ({ running: [], recent: [] }),
 			settleAsyncWork: async () => {},
 			abort: async () => {},
-			dispose: async () => {},
+			dispose: async () => {
+				disposed = true;
+			},
 			setIrcWakeTurnObserver: () => {},
+			holdIrcWakes: () => () => {},
 			trackIrcReply: () => {},
 			subscribeRunState: () => () => {},
 			addDisposer: () => {},
 		} as unknown as AgentSession;
-		AgentRegistry.global().register({
+		const ref = AgentRegistry.global().register({
 			id,
 			displayName: id,
 			kind: "sub",
@@ -258,6 +265,19 @@ describe("handleRpcCancelSubagent", () => {
 		});
 		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue({
 			session,
+			captureOwnerCurrent:
+				({ allowParked = false } = {}) =>
+				() =>
+					!session.isDisposed &&
+					AgentRegistry.global().get(id) === ref &&
+					ref.session === session &&
+					ref.status !== "aborted" &&
+					(allowParked || ref.status !== "parked"),
+			captureOwnerLifetimeCurrent: () => () =>
+				!session.isDisposed &&
+				AgentRegistry.global().get(id) === ref &&
+				ref.session === session &&
+				ref.status !== "aborted",
 			extensionsResult: {} as unknown as LoadExtensionsResult,
 			setToolUIContext: () => {},
 			eventBus: new EventBus(),

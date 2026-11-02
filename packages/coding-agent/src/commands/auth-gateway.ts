@@ -34,6 +34,10 @@ export default class AuthGateway extends Command {
 		"trust-proxy-headers": Flags.boolean({
 			description: "Trust forwarded peer IP headers from a reverse proxy (serve); off by default.",
 		}),
+		clients: Flags.string({
+			description:
+				"JSON file of scoped client tokens (serve), each limited to its own models and broker accounts; re-read while serving",
+		}),
 		strict: Flags.boolean({
 			description:
 				"For `check`: additionally probe each credential against its provider's chat-completion endpoint. Slower; consumes a tiny amount of quota per credential.",
@@ -48,6 +52,7 @@ export default class AuthGateway extends Command {
 		`# Print the gateway bearer token (creates one on first run)\n  ${CF_COMMAND} auth-gateway token`,
 		`# Rotate the gateway bearer token\n  ${CF_COMMAND} auth-gateway token --regenerate`,
 		`# Run on loopback without any bearer (anyone on this host can call)\n  ${CF_COMMAND} auth-gateway serve --no-auth`,
+		`# Also admit scoped client tokens listed in a file\n  ${CF_COMMAND} auth-gateway serve --clients=/etc/omp/gateway-clients.json`,
 		`# Show local gateway + broker config status\n  ${CF_COMMAND} auth-gateway status`,
 		`# Probe each broker credential to see which one is producing 401s\n  ${CF_COMMAND} auth-gateway check`,
 		`# Same, machine-readable for scripts\n  ${CF_COMMAND} auth-gateway check --json`,
@@ -69,6 +74,7 @@ export default class AuthGateway extends Command {
 				noAuth: flags["no-auth"],
 				trustProxyHeaders: flags["trust-proxy-headers"],
 				strict: flags.strict,
+				clients: flags.clients,
 			},
 		};
 		await initTheme();

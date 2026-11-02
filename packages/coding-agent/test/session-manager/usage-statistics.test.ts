@@ -43,6 +43,43 @@ describe("SessionManager usage statistics", () => {
 		expect(session.buildSessionContext().messages).toEqual([]);
 	});
 
+	it("persists pre-transcript model usage before a session transition", async () => {
+		using tempDir = TempDir.createSync("@omp-pre-transcript-usage-");
+		const session = SessionManager.create(tempDir.path(), tempDir.path());
+		try {
+			const originFile = session.getSessionFile();
+			if (!originFile) throw new Error("Expected the originating session path");
+			expect(await Bun.file(originFile).exists()).toBe(false);
+			session.appendModelUsage(modelUsage, {
+				sessionId: session.getSessionId(),
+				parentId: session.getLeafId(),
+			});
+			const entries = (await Bun.file(originFile).text())
+				.trim()
+				.split("\n")
+				.map(line => JSON.parse(line));
+			expect(entries.filter(entry => entry.type === "model_usage").map(entry => entry.usage)).toEqual([
+				modelUsage.usage,
+			]);
+			expect(session.buildSessionContext().messages).toEqual([]);
+			await session.newSession();
+			expect(session.getUsageStatistics().totalTokens).toBe(0);
+			const reopened = await SessionManager.open(originFile, undefined, undefined, {
+				initialCwd: tempDir.path(),
+				suppressBreadcrumb: true,
+				throwIfMissing: true,
+			});
+			try {
+				expect(reopened.getUsageStatistics()).toMatchObject({ totalTokens: 16, cost: 0.00153 });
+				expect(reopened.buildSessionContext().messages).toEqual([]);
+			} finally {
+				await reopened.close();
+			}
+		} finally {
+			await session.close();
+		}
+	});
+
 	it("records late usage on its initiating branch without moving the active leaf", () => {
 		const session = SessionManager.inMemory();
 		const ownerParent = session.appendMessage({ role: "user", content: "first", timestamp: 1 });

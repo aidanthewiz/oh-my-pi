@@ -139,7 +139,7 @@ describe("createAgentSession cwd after /move", () => {
 				}
 			} finally {
 				await session?.dispose();
-				authStorage.close();
+				await authStorage.close();
 				await server.stop(true);
 			}
 		},
@@ -193,7 +193,7 @@ describe("createAgentSession cwd after /move", () => {
 			try {
 				await session.dispose();
 			} finally {
-				authStorage.close();
+				await authStorage.close();
 			}
 		}
 	});
@@ -270,7 +270,7 @@ describe("createAgentSession cwd after /move", () => {
 			try {
 				await session.dispose();
 			} finally {
-				authStorage.close();
+				await authStorage.close();
 			}
 		}
 	});

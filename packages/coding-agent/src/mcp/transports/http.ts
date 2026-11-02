@@ -19,12 +19,15 @@ import type {
 import { toJsonRpcError } from "../../mcp/types";
 import {
 	createMCPJsonRpcError,
+	createMCPHttpStatusError,
 	type MCPFailureStage,
 	MCPTransportError,
 	mcpTraceIdFromHeaders,
+	nonRetryableMCPTransportError,
 	normalizeMCPTransportError,
 } from "../errors";
 import { RequestIdAllocator } from "../request-id";
+import { routeProgressNotification, withProgressToken } from "../progress";
 import {
 	createMCPTimeout,
 	getNeverAbortSignal,
@@ -86,6 +89,7 @@ export class HttpTransport implements MCPTransport {
 	#sessionId: string | null = null;
 	#sseConnection: AbortController | null = null;
 	readonly #requestIds = new RequestIdAllocator();
+	readonly #progressCallbacks = new Map<string | number, NonNullable<MCPRequestOptions["onProgress"]>>();
 	#lifecycleController = new AbortController();
 	readonly #activeRequests = new Set<Promise<unknown>>();
 	readonly #activeFetches = new Set<Promise<Response>>();
@@ -139,6 +143,12 @@ export class HttpTransport implements MCPTransport {
 	/** Combine caller cancellation with transport shutdown for every HTTP operation. */
 	#operationSignal(signal?: AbortSignal): AbortSignal {
 		return signal ? AbortSignal.any([signal, this.#lifecycleController.signal]) : this.#lifecycleController.signal;
+	}
+
+	#assertRequestOwner(options?: MCPRequestOptions): void {
+		if (options?.mcpOwnerCurrent?.() === false) {
+			throw new DOMException("MCP request owner changed", "AbortError");
+		}
 	}
 
 	/**
@@ -343,12 +353,14 @@ export class HttpTransport implements MCPTransport {
 	 * Failures throw {@link SSEResumeError} so `request()` never replays the
 	 * originating POST in response.
 	 */
-	async #fetchSSEResume(resume: SSEResumeState, signal: AbortSignal): Promise<Response> {
+	async #fetchSSEResume(resume: SSEResumeState, signal: AbortSignal, options?: MCPRequestOptions): Promise<Response> {
 		if (resume.lastEventId === null) {
 			throw new SSEResumeError("SSE stream ended without a resumable event ID");
 		}
 		try {
+			this.#assertRequestOwner(options);
 			await waitForSSERetry(resume.retryMs, signal);
+			this.#assertRequestOwner(options);
 			const generated: Record<string, string> = {
 				Accept: "text/event-stream",
 				"Last-Event-ID": resume.lastEventId,
@@ -358,7 +370,9 @@ export class HttpTransport implements MCPTransport {
 			const refreshAuth = this.onAuthError;
 			if (refreshAuth && (response.status === 401 || response.status === 403)) {
 				await response.body?.cancel();
+				this.#assertRequestOwner(options);
 				const newHeaders = await untilAborted(signal, () => refreshAuth.call(this));
+				this.#assertRequestOwner(options);
 				if (!newHeaders) {
 					throw new SSEResumeError(`HTTP ${response.status} resuming MCP SSE stream: auth refresh failed`);
 				}
@@ -398,6 +412,7 @@ export class HttpTransport implements MCPTransport {
 		}
 		// Notification: has method but no id
 		if ("method" in message && !("id" in message)) {
+			routeProgressNotification(message.method, message.params, token => this.#progressCallbacks.get(token));
 			this.onNotification?.(message.method, message.params);
 		}
 	}
@@ -412,8 +427,11 @@ export class HttpTransport implements MCPTransport {
 		options: MCPRequestOptions | undefined,
 	): Promise<T> {
 		try {
-			return await this.#executeRequest<T>(method, params, options);
+			const result = await this.#executeRequest<T>(method, params, options);
+			this.#assertRequestOwner(options);
+			return result;
 		} catch (error) {
+			this.#assertRequestOwner(options);
 			// Retry once on auth failure if onAuthError is wired. Never replay
 			// after an SSE resume failure: the server already accepted the
 			// original POST and may have executed it — replaying could run a
@@ -425,11 +443,18 @@ export class HttpTransport implements MCPTransport {
 				this.onAuthError &&
 				(status === 401 || status === 403)
 			) {
-				const newHeaders = await this.onAuthError();
+				let newHeaders: Record<string, string> | null;
+				try {
+					newHeaders = await this.onAuthError();
+				} finally {
+					this.#assertRequestOwner(options);
+				}
 				if (newHeaders) {
 					// Persist refreshed headers so subsequent requests use them directly
 					this.config = { ...this.config, headers: newHeaders };
-					return this.#executeRequest<T>(method, params, options);
+					const result = await this.#executeRequest<T>(method, params, options);
+					this.#assertRequestOwner(options);
+					return result;
 				}
 			}
 			throw error;
@@ -441,6 +466,7 @@ export class HttpTransport implements MCPTransport {
 		params: Record<string, unknown> | undefined,
 		options: MCPRequestOptions | undefined,
 	): Promise<T> {
+		this.#assertRequestOwner(options);
 		if (!this.#connected) {
 			throw new MCPTransportError({
 				transport: "http",
@@ -456,7 +482,7 @@ export class HttpTransport implements MCPTransport {
 			jsonrpc: "2.0" as const,
 			id,
 			method,
-			params: params ?? {},
+			params: options?.onProgress ? withProgressToken(params, id) : (params ?? {}),
 		};
 
 		const generated: Record<string, string> = {
@@ -489,6 +515,8 @@ export class HttpTransport implements MCPTransport {
 		let traceId: string | undefined;
 
 		try {
+			if (options?.onProgress) this.#progressCallbacks.set(id, options.onProgress);
+			this.#assertRequestOwner(options);
 			const response = await this.#fetch(
 				{ method: "POST", body: JSON.stringify(body), signal: operation.signal },
 				generated,
@@ -504,23 +532,9 @@ export class HttpTransport implements MCPTransport {
 
 			if (!response.ok) {
 				const text = await response.text();
-				const wwwAuthenticate = response.headers.get("WWW-Authenticate");
-				const mcpAuthServer = response.headers.get("Mcp-Auth-Server");
-				const authHints = [
-					wwwAuthenticate ? `WWW-Authenticate: ${wwwAuthenticate}` : null,
-					mcpAuthServer ? `Mcp-Auth-Server: ${mcpAuthServer}` : null,
-				]
-					.filter(Boolean)
-					.join("; ");
-				const suffix = authHints ? ` [${authHints}]` : "";
-				throw new MCPTransportError({
-					transport: "http",
+				throw createMCPHttpStatusError(response, text, {
 					stage,
-					failure: "http_status",
-					message: `HTTP ${response.status}: ${text}${suffix}`,
 					retryable: response.status === 404 || response.status === 502 || response.status === 503,
-					code: response.status,
-					traceId,
 				});
 			}
 
@@ -530,7 +544,7 @@ export class HttpTransport implements MCPTransport {
 			// share one logical deadline; returning the promise would let finally
 			// clear the fetch timer before the response body is read.
 			if (contentType.includes("text/event-stream")) {
-				return await this.#parseSSEResponse<T>(response, id, operation, timeout, releaseCaller);
+				return await this.#parseSSEResponse<T>(response, id, operation, timeout, releaseCaller, options);
 			}
 
 			stage = "decode";
@@ -569,8 +583,20 @@ export class HttpTransport implements MCPTransport {
 				});
 			}
 			if (error instanceof Error && error.name === "AbortError") throw error;
-			throw normalizeMCPTransportError(error, { transport: "http", stage, traceId });
+			const diagnostic = normalizeMCPTransportError(error, { transport: "http", stage, traceId });
+			const refusedBeforeDispatch =
+				stage === "send" &&
+				diagnostic.failure === "connect" &&
+				(/^(?:ECONNREFUSED|CONNECTIONREFUSED|ENETUNREACH|EHOSTUNREACH|ENOTFOUND|EAI_AGAIN|FAILEDTOOPENSOCKET)$/i.test(
+					String(diagnostic.code),
+				) ||
+					/\b(?:ECONNREFUSED|ConnectionRefused|ENETUNREACH|EHOSTUNREACH|ENOTFOUND|EAI_AGAIN|FailedToOpenSocket)\b/i.test(
+						diagnostic.message,
+					));
+			const staleSession = diagnostic.failure === "http_status" && diagnostic.code === 404;
+			throw refusedBeforeDispatch || staleSession ? diagnostic : nonRetryableMCPTransportError(diagnostic);
 		} finally {
+			this.#progressCallbacks.delete(id);
 			releaseCaller?.();
 			operation.clear();
 		}
@@ -582,6 +608,7 @@ export class HttpTransport implements MCPTransport {
 		operation: MCPTimeoutOperation,
 		timeout: number,
 		releaseCaller?: () => void,
+		options?: MCPRequestOptions,
 	): Promise<T> {
 		const traceId = mcpTraceIdFromHeaders(response.headers);
 		if (!response.body) {
@@ -615,6 +642,7 @@ export class HttpTransport implements MCPTransport {
 					if (!current.body) throw new Error("SSE response did not include a body");
 					try {
 						for await (const event of readSseEvents(current.body, signal)) {
+							this.#assertRequestOwner(options);
 							if (event.id !== undefined) resume.lastEventId = event.id || null;
 							if (event.retry !== undefined) resume.retryMs = event.retry;
 							if (event.data === "") continue;
@@ -628,6 +656,8 @@ export class HttpTransport implements MCPTransport {
 									("result" in message || "error" in message)
 								) {
 									captured = true;
+									// The same SSE batch may contain notifications after this response.
+									this.#progressCallbacks.delete(expectedId);
 									releaseCaller?.();
 									releaseCaller = undefined;
 									operation.clear();
@@ -648,6 +678,7 @@ export class HttpTransport implements MCPTransport {
 						// exists; the request timeout still bounds the total wait.
 						if (captured) return;
 						if (signal.aborted || resume.lastEventId === null) throw error;
+						this.#assertRequestOwner(options);
 						logger.debug("MCP SSE response stream dropped; resuming", {
 							url: this.config.url,
 							error: error instanceof Error ? error.message : String(error),
@@ -667,7 +698,7 @@ export class HttpTransport implements MCPTransport {
 							traceId,
 						});
 					}
-					current = await this.#fetchSSEResume(resume, signal);
+					current = await this.#fetchSSEResume(resume, signal, options);
 				}
 			} catch (error) {
 				if (captured) return;
@@ -700,21 +731,7 @@ export class HttpTransport implements MCPTransport {
 						stage: error instanceof SyntaxError ? "decode" : "receive",
 						traceId,
 					});
-					reject(
-						normalized.retryable
-							? new MCPTransportError({
-									transport: normalized.transport,
-									stage: normalized.stage,
-									failure: normalized.failure,
-									message: normalized.message,
-									retryable: false,
-									code: normalized.code,
-									data: normalized.data,
-									traceId: normalized.traceId,
-									cause: normalized,
-								})
-							: normalized,
-					);
+					reject(nonRetryableMCPTransportError(normalized));
 				}
 			} finally {
 				operation.clear();
@@ -832,14 +849,9 @@ export class HttpTransport implements MCPTransport {
 			// 202 Accepted is success for notifications
 			if (!response.ok && response.status !== 202) {
 				const text = await response.text();
-				throw new MCPTransportError({
-					transport: "http",
+				throw createMCPHttpStatusError(response, text, {
 					stage,
-					failure: "http_status",
-					message: `HTTP ${response.status}: ${text}`,
 					retryable: response.status === 404 || response.status === 502 || response.status === 503,
-					code: response.status,
-					traceId,
 				});
 			}
 

@@ -33,8 +33,8 @@ describe("AgentSession model switch auth pre-flight", () => {
 		registry = new ModelRegistry(authStorage, path.join(sharedDir.path(), "models.yml"));
 	});
 
-	afterAll(() => {
-		authStorage.close();
+	afterAll(async () => {
+		await authStorage.close();
 		sharedDir.removeSync();
 	});
 
@@ -205,7 +205,7 @@ describe("AgentSession model switch auth pre-flight", () => {
 			cacheRead: 100_000,
 			cacheWrite: 0,
 			totalTokens: 100_001,
-			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			cost: { input: 0, output: 0, cacheRead: 0.125, cacheWrite: 0, total: 0.125 },
 		};
 		const partial: AssistantMessage = {
 			role: "assistant",
@@ -253,7 +253,7 @@ describe("AgentSession model switch auth pre-flight", () => {
 		expect(s.sessionManager.getUsageStatistics().cost).toBe(0);
 		expect(originalFile).toBeDefined();
 		const old = await SessionManager.open(originalFile!, undefined, undefined, { throwIfMissing: true });
-		expect(old.getUsageStatistics().cost).toBeGreaterThan(0);
+		expect(old.getUsageStatistics().cost).toBe(usage.cost.total * 2);
 		expect(old.getEntries().filter(entry => entry.type === "model_usage")).toMatchObject([
 			{ purpose: "cache-warm", usage: { totalTokens: usage.totalTokens }, stopReason: "aborted" },
 		]);
@@ -268,7 +268,7 @@ describe("AgentSession model switch auth pre-flight", () => {
 			cacheRead: 100_000,
 			cacheWrite: 0,
 			totalTokens: 100_001,
-			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			cost: { input: 0, output: 0, cacheRead: 0.125, cacheWrite: 0, total: 0.125 },
 		};
 		const partial: AssistantMessage = {
 			role: "assistant",
@@ -317,12 +317,13 @@ describe("AgentSession model switch auth pre-flight", () => {
 			void outcome.then(() => {
 				settled = true;
 			});
+			await new Promise<void>(resolve => setImmediate(resolve));
 			vi.advanceTimersByTime(4_999);
 			await Promise.resolve();
 			expect(settled).toBe(false);
 			expect(manager.getSessionId()).toBe(originalId);
 			vi.advanceTimersByTime(1);
-			expect(await outcome).toHaveProperty("message", "Timed out draining cache warmer before session transition");
+			expect(await outcome).toBeInstanceOf(Error);
 			expect(manager.getSessionId()).toBe(originalId);
 			expect(s.isSessionTransitioning).toBe(false);
 		} finally {
@@ -333,7 +334,7 @@ describe("AgentSession model switch auth pre-flight", () => {
 		expect(manager.getEntries().filter(entry => entry.type === "model_usage")).toMatchObject([
 			{ parentId: ownerLeaf, purpose: "cache-warm", usage: { totalTokens: usage.totalTokens } },
 		]);
-		expect(manager.getUsageStatistics().cost).toBeGreaterThan(0);
+		expect(manager.getUsageStatistics().cost).toBe(usage.cost.total * 2);
 		expect(await s.newSession()).toBe(true);
 		expect(manager.getSessionId()).not.toBe(originalId);
 		expect(manager.getEntries().filter(entry => entry.type === "model_usage")).toEqual([]);
@@ -353,7 +354,7 @@ describe("AgentSession model switch auth pre-flight", () => {
 			cacheRead: 100_000,
 			cacheWrite: 0,
 			totalTokens: 100_001,
-			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			cost: { input: 0, output: 0, cacheRead: 0.125, cacheWrite: 0, total: 0.125 },
 		};
 		const response: AssistantMessage = {
 			role: "assistant",
@@ -395,7 +396,7 @@ describe("AgentSession model switch auth pre-flight", () => {
 		await closing;
 		expect(originalFile).toBeDefined();
 		const old = await SessionManager.open(originalFile!, undefined, undefined, { throwIfMissing: true });
-		expect(old.getUsageStatistics().cost).toBeGreaterThan(0);
+		expect(old.getUsageStatistics().cost).toBe(usage.cost.total * 2);
 		expect(old.getEntries().filter(entry => entry.type === "model_usage")).toMatchObject([
 			{ purpose: "cache-warm", usage: { totalTokens: usage.totalTokens }, stopReason: "aborted" },
 		]);

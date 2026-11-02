@@ -1,10 +1,7 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { createBrowserPrelude } from "@oh-my-pi/pi-coding-agent/tools/browser";
 import { acquireBrowser, holdBrowser, releaseBrowser } from "@oh-my-pi/pi-coding-agent/tools/browser/registry";
 import { acquireTab, releaseTab } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
 import { pickTernBlock, type TernBlockEntry } from "@oh-my-pi/pi-coding-agent/tools/browser/tern/blocks";
-import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools/index";
 import { type FakeAnswer, type FakeDaemon, startFakeDaemon } from "./tern-fake-daemon";
 
 const PANE = 3;
@@ -268,58 +265,5 @@ describe("Tern block adoption", () => {
 				await releaseBrowser(browser, { kill: false });
 			}
 		}
-	});
-});
-
-describe("Tern open result", () => {
-	const saved = {
-		socket: process.env.TERN_PANE_SOCKET,
-		pane: process.env.TERN_PANE,
-		flag: process.env.PI_BROWSER_TERN,
-	};
-
-	afterEach(() => {
-		for (const [key, value] of [
-			["TERN_PANE_SOCKET", saved.socket],
-			["TERN_PANE", saved.pane],
-			["PI_BROWSER_TERN", saved.flag],
-		] as const) {
-			if (value === undefined) delete process.env[key];
-			else process.env[key] = value;
-		}
-	});
-
-	async function open(fake: FakeDaemon, name: string, app?: { target: string }): Promise<string> {
-		process.env.TERN_PANE_SOCKET = fake.socketPath;
-		process.env.TERN_PANE = String(PANE);
-		delete process.env.PI_BROWSER_TERN;
-		const session: ToolSession = {
-			cwd: "/tmp",
-			hasUI: false,
-			getSessionFile: () => null,
-			getSessionSpawns: () => null,
-			settings: Settings.isolated({ "browser.enabled": true, "browser.relay": false, "tools.maxTimeout": 0 }),
-		};
-		opened.push(name);
-		const result = await createBrowserPrelude(session).invoke(
-			{ action: "open", name, timeout: 5, ...(app ? { app } : {}) },
-			{ session, toolCallId: "tern-open-result" },
-		);
-		return result.content.map(part => (part.type === "text" ? part.text : "")).join("\n");
-	}
-
-	it("tells the agent a PiP is not on screen and where it shows", async () => {
-		const text = await open(await startWindow({ shown: false }), "hidden-pip");
-		expect(text).toStartWith('Opened tab "hidden-pip" on Tern browser picture-in-picture (pane 3)');
-		expect(text).toContain("Not on screen");
-		expect(text).toContain("this omp pane (block 3)");
-	});
-
-	it("names the user's adopted block and that closing releases it", async () => {
-		const text = await open(await startWindow({ shown: true }), "adopted", { target: "Docs C" });
-		expect(text).toStartWith('Opened tab "adopted" on the user\'s Tern browser block 7 (docked)');
-		expect(text).toContain("user's own Tern browser block 7");
-		expect(text).toContain("releases it");
-		expect(text).not.toContain("Not on screen");
 	});
 });

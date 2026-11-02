@@ -32,9 +32,9 @@ const model = buildModel({
 } as ModelSpec<Api>) as Model<Api>;
 authStorage.keys.setRuntime(model.provider, "test-key");
 
-afterAll(() => {
+afterAll(async () => {
 	clearCustomApis();
-	authStorage.close();
+	await authStorage.close();
 });
 
 // An ACP client keeps several `session/new` sessions alive at once, each possibly for a

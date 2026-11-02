@@ -26,7 +26,7 @@ describe("AuthBrokerRefresher", () => {
 
 	afterEach(async () => {
 		vi.restoreAllMocks();
-		storage?.close();
+		await storage?.close();
 		store?.close();
 		await removeWithRetries(tempDir);
 		for (const key of ANTHROPIC_ENV) {

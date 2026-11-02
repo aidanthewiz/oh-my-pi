@@ -26,8 +26,8 @@ const model = buildModel({
 	maxTokens: 16_384,
 });
 
-afterAll(() => {
-	authStorage.close();
+afterAll(async () => {
+	await authStorage.close();
 });
 
 function makeFetchMock(response: Record<string, unknown>): FetchImpl {
@@ -723,7 +723,7 @@ describe("XAI_BASE_URL credential routing agrees across chat, images, and search
 					search: `${routing.expected}/responses`,
 				});
 			} finally {
-				routingAuth.close();
+				await routingAuth.close();
 			}
 		});
 	}

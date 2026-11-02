@@ -92,6 +92,15 @@ describe("annotations API: submit", () => {
 		expect(result.text).toContain("rename this");
 	});
 
+	it("names the source line, so notes on repeated blank lines stay distinguishable", async () => {
+		const { api } = createContext();
+		const result = await api.submit({
+			source: { kind: "text", text: "alpha\r\n\r\nbeta\r\n\r\n" },
+			notes: [{ line: 4, note: "TESTING 3" }],
+		});
+		expect(result.text).toContain('Feedback on line 4:\n""\nTESTING 3');
+	});
+
 	it("rejects a note whose line is outside the source instead of quoting nothing", async () => {
 		const { api, pasteToEditor } = createContext();
 
@@ -256,10 +265,10 @@ ${DIFF}`;
 	});
 
 	it("resolves a PR reference through the central fetcher and rejects a malformed reference", async () => {
-		spyOn(review, "fetchPrReviewTarget").mockImplementation(async (cwd, ref) =>
+		const fetchTarget = spyOn(review, "fetchPrReviewTarget").mockImplementation(async (cwd, ref) =>
 			createResolvedReviewTarget("pr", `PR ${ref.repo}#${ref.number} in ${cwd}`, DIFF, "empty"),
 		);
-		const { api } = createContext({ cwd: "/live-worktree" });
+		const { api, sendUserMessage, pasteToEditor } = createContext({ cwd: "/live-worktree" });
 
 		const result = await api.submit({
 			source: { kind: "pr", ref: "https://github.com/acme/project/pull/42" },
@@ -270,9 +279,13 @@ ${DIFF}`;
 
 		expect(result.text).toContain("PR acme/project#42 in /live-worktree");
 		expect(result.text).toContain("pr note");
+		fetchTarget.mockClear();
 		await expect(
 			api.submit({ source: { kind: "pr", ref: "not a pr" }, notes: [{ path: "x", note: "y" }] }),
-		).rejects.toThrow("Not a GitHub pull request reference");
+		).rejects.toBeInstanceOf(Error);
+		expect(fetchTarget).not.toHaveBeenCalled();
+		expect(sendUserMessage).not.toHaveBeenCalled();
+		expect(pasteToEditor).not.toHaveBeenCalled();
 	});
 });
 

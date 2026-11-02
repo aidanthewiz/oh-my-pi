@@ -21,7 +21,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
-import type { ImageContent } from "@oh-my-pi/pi-ai";
+import type { AssistantMessage, AssistantMessageEvent, ImageContent } from "@oh-my-pi/pi-ai";
 import { getConfigRootDir, logger } from "@oh-my-pi/pi-utils";
 import type { AgentHubRemote, AgentHubRemoteTranscript } from "@oh-my-pi/pi-tui/overlays/agent-hub";
 import { createRelayIdentityTokenProvider } from "../identity/relay";
@@ -166,6 +166,45 @@ export function reconcileGuestSnapshotHostState(ctx: GuestSnapshotActivityReconc
 	reconcileGuestIdleHostState(ctx, false);
 }
 
+/** Streamed text of a text or thinking block; `undefined` for blocks speech never reads. */
+function streamedText(block: AssistantMessage["content"][number] | undefined): string | undefined {
+	if (block?.type === "text") return block.text;
+	if (block?.type === "thinking") return block.thinking;
+	return undefined;
+}
+
+/**
+ * Text and thinking deltas that grew `message` past `previous` without arriving
+ * in `own`, the update's own delta. Non-empty only when the host superseded the
+ * updates in between (#16956); one delta per grown block, in block order.
+ */
+function omittedStreamDeltas(
+	previous: AssistantMessage,
+	message: AssistantMessage,
+	own: AssistantMessageEvent,
+): AssistantMessageEvent[] {
+	const omitted: AssistantMessageEvent[] = [];
+	for (const [contentIndex, block] of message.content.entries()) {
+		const text = streamedText(block);
+		if (text === undefined) continue;
+		const prior = previous.content[contentIndex];
+		const start = prior?.type === block.type ? (streamedText(prior)?.length ?? 0) : 0;
+		const ownsTail =
+			(own.type === "text_delta" || own.type === "thinking_delta") &&
+			own.contentIndex === contentIndex &&
+			own.type === `${block.type}_delta`;
+		const end = text.length - (ownsTail ? own.delta.length : 0);
+		if (end <= start) continue;
+		const delta = text.slice(start, end);
+		omitted.push(
+			block.type === "text"
+				? { type: "text_delta", contentIndex, delta, partial: message }
+				: { type: "thinking_delta", contentIndex, delta, partial: message },
+		);
+	}
+	return omitted;
+}
+
 export class CollabGuestLink {
 	#ctx: InteractiveModeContext;
 	#socket: CollabSocket | null = null;
@@ -217,7 +256,8 @@ export class CollabGuestLink {
 	#readOnly = false;
 	/** False until the first assistant message_start (real or synthesized) since (re)sync. */
 	#assistantStreamSynced = false;
-	#lifecycleEmitter = new GuestLifecycleEmitter(event => this.#renderEvent(event));
+	#streamedSnapshot: AssistantMessage | undefined;
+	#lifecycleEmitter = new GuestLifecycleEmitter(event => this.#dispatchEvent(event));
 	state: CollabSessionState | null = null;
 	/** Local mirror of the host's agent ecosystem (refs carry `session: null`). */
 	readonly agentRegistry = new AgentRegistry();
@@ -526,6 +566,7 @@ export class CollabGuestLink {
 		this.#applyAgentSnapshots(pending.agents);
 		this.#ctx.syncRunningSubagentBadge();
 		this.#assistantStreamSynced = false;
+		this.#streamedSnapshot = undefined;
 		setSessionTerminalTitle(pending.state.sessionName ?? pending.header.title, pending.state.cwd);
 		await this.#ctx.eventController.drainSessionEvents();
 		if (this.#left) return;
@@ -687,10 +728,6 @@ export class CollabGuestLink {
 				});
 			}
 		}
-		this.#lifecycleEmitter.emit(this.#ctx.session.extensionRunner, event);
-	}
-
-	#renderEvent(event: AgentSessionLifecycleEvent): void {
 		// Orphan-delta guard: when joining mid-turn the message_start for the
 		// in-flight assistant message predates the snapshot. message_update
 		// carries the full accumulating message, so synthesize the missing start
@@ -698,15 +735,34 @@ export class CollabGuestLink {
 		// unknown anchors (guarded by streamingComponent/pendingTools lookups).
 		if (event.type === "message_start" && event.message.role === "assistant") {
 			this.#assistantStreamSynced = true;
-		} else if (
-			event.type === "message_update" &&
-			event.message.role === "assistant" &&
-			!this.#assistantStreamSynced
-		) {
-			this.#assistantStreamSynced = true;
-			this.#dispatchEvent({ type: "message_start", message: event.message });
+			this.#streamedSnapshot = event.message;
+		} else if (event.type === "message_update" && event.message.role === "assistant") {
+			if (!this.#assistantStreamSynced) {
+				this.#assistantStreamSynced = true;
+				this.#streamedSnapshot = event.message;
+				this.#lifecycleEmitter.emit(session.extensionRunner, { type: "message_start", message: event.message });
+			}
+			// The host supersedes still-queued updates of a streaming message, so
+			// their per-update deltas (speech, extensions) never arrive. Replay the
+			// text they carried, recovered from the cumulative snapshots.
+			if (this.#streamedSnapshot) {
+				for (const omitted of omittedStreamDeltas(
+					this.#streamedSnapshot,
+					event.message,
+					event.assistantMessageEvent,
+				)) {
+					this.#lifecycleEmitter.emit(session.extensionRunner, {
+						type: "message_update",
+						message: event.message,
+						assistantMessageEvent: omitted,
+					});
+				}
+			}
+			this.#streamedSnapshot = event.message;
+		} else if (event.type === "message_end") {
+			this.#streamedSnapshot = undefined;
 		}
-		this.#dispatchEvent(event);
+		this.#lifecycleEmitter.emit(session.extensionRunner, event);
 	}
 
 	#dispatchEvent(event: AgentSessionLifecycleEvent): void {
@@ -864,6 +920,7 @@ export class CollabGuestLink {
 	#clearTransientUi(): void {
 		this.#clearUiRequests();
 		clearGuestTransientStatus(this.#ctx);
+		this.#ctx.pendingShellContainer.clear();
 		this.#ctx.pendingMessagesContainer.clear();
 		this.#ctx.compactionQueuedMessages = [];
 		this.#ctx.streamingComponent = undefined;

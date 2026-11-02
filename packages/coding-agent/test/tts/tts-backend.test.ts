@@ -48,9 +48,9 @@ beforeEach(async () => {
 	tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-tts-chain-"));
 });
 
-afterEach(() => {
+afterEach(async () => {
 	vi.restoreAllMocks();
-	authStorage.close();
+	await authStorage.close();
 	fs.rmSync(tempDir, { recursive: true, force: true });
 });
 

@@ -6,6 +6,7 @@ import { clearCustomApis, registerCustomApi } from "@oh-my-pi/pi-ai/api-registry
 import { stream, streamSimple } from "@oh-my-pi/pi-ai/stream";
 import type { AssistantMessage, FetchImpl, Model, ModelSpec } from "@oh-my-pi/pi-ai/types";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
+import { createRequestDebugSession } from "@oh-my-pi/pi-ai/utils/request-debug";
 import { transportFetch } from "@oh-my-pi/pi-ai/utils/transport-fetch";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { removeWithRetries } from "../../utils/src/temp";
@@ -156,13 +157,111 @@ describe("PI_REQ_DEBUG request/response recording", () => {
 			url: "https://provider.test/v1/messages",
 			body: { model: "debug-model", messages: [{ role: "user", content: "hi" }] },
 		});
-		expect(request.headers).toMatchObject({ authorization: "Bearer test-token", "content-type": "application/json" });
+		expect(request.headers).toMatchObject({ authorization: "[redacted]", "content-type": "application/json" });
+		expect(await fs.readFile(requestPath, "utf8")).not.toContain("test-token");
 
 		const log = splitResponseLog(await fs.readFile(responsePath));
 		expect(log.headers).toContain("HTTP 201 Created");
 		expect(log.headers).toContain("content-type: text/plain");
 		expect(log.headers).toContain("x-request-id: resp-1");
 		expect(log.body).toEqual(responseBody);
+	});
+
+	it("redacts credential headers and URL secrets without changing the dispatched request or response bytes", async () => {
+		Bun.env.PI_REQ_DEBUG = "1";
+		const url = "https://url-user:url-password@provider.test/v1/messages?routing=secret-query#secret-fragment";
+		const headers = {
+			authorization: "Bearer secret-bearer",
+			"X-Goog-Api-Key": "secret-google-key",
+			"X-Amz-Security-Token": "secret-aws-token",
+			cookie: "session=secret-cookie",
+			"Proxy-Authorization": "Basic secret-proxy",
+			"content-type": "application/json",
+		};
+		const responseBytes = new Uint8Array([0, 1, 0xff, 10]);
+		let dispatchedUrl: string | undefined;
+		let dispatchedHeaders: Headers | undefined;
+		const fetchImpl: FetchImpl = async (input, init) => {
+			dispatchedUrl = String(input);
+			dispatchedHeaders = new Headers(init?.headers);
+			return new Response(responseBytes, {
+				headers: { "set-cookie": "session=secret-response-cookie", "x-request-id": "safe-request-id" },
+			});
+		};
+		const response = await transportFetch(debugModel(), fetchImpl)(url, {
+			method: "POST",
+			headers,
+			body: '{"messages":[{"role":"user","content":"intentional debug body"}]}',
+		});
+		expect(new Uint8Array(await response.arrayBuffer())).toEqual(responseBytes);
+		expect(response.headers.get("set-cookie")).toBe("session=secret-response-cookie");
+		expect(dispatchedUrl).toBe(url);
+		for (const [name, value] of Object.entries(headers)) expect(dispatchedHeaders?.get(name)).toBe(value);
+		const { requestPath, responsePath } = await findDebugFiles();
+		const requestText = await fs.readFile(requestPath, "utf8");
+		const responseLog = splitResponseLog(await fs.readFile(responsePath));
+		const persisted = requestText + responseLog.headers;
+		for (const secret of [
+			"url-user",
+			"url-password",
+			"secret-query",
+			"secret-fragment",
+			"secret-bearer",
+			"secret-google-key",
+			"secret-aws-token",
+			"secret-cookie",
+			"secret-proxy",
+			"secret-response-cookie",
+		])
+			expect(persisted).not.toContain(secret);
+		expect(requestText).toContain("intentional debug body");
+		expect(responseLog.headers).toContain("x-request-id: safe-request-id");
+		expect(responseLog.body).toEqual(responseBytes);
+		if (process.platform !== "win32") {
+			expect((await fs.stat(requestPath)).mode & 0o777).toBe(0o600);
+			expect((await fs.stat(responsePath)).mode & 0o777).toBe(0o600);
+		}
+	});
+
+	it("redacts array-valued request and response credentials in direct debug sessions", async () => {
+		const session = await createRequestDebugSession({
+			method: "GET",
+			url: "wss://provider.test/realtime",
+			headers: { "X-Provider-Credential": ["secret-one", "secret-two"], "x-request-id": "request-id" },
+		});
+		const response = await session.openResponseLog("WS 101", { "Set-Cookie": ["secret-three", "secret-four"] });
+		response.write("raw stream");
+		await response.close();
+		const request = await fs.readFile(session.requestPath, "utf8");
+		const log = await fs.readFile(session.responsePath, "utf8");
+		for (const secret of ["secret-one", "secret-two", "secret-three", "secret-four"]) {
+			expect(request + log).not.toContain(secret);
+		}
+		expect(log).toContain("raw stream");
+		expect(request).toContain("request-id");
+	});
+
+	it("retains own header names as data and excludes inherited headers from persisted sessions", async () => {
+		const headers = JSON.parse(
+			'{"__proto__":"safe-prototype-name","constructor":"safe-constructor-name","X-Api-Secret":"synthetic-header-secret"}',
+		);
+		Object.setPrototypeOf(headers, { "x-inherited": "inherited-not-a-header" });
+		const session = await createRequestDebugSession({
+			method: "GET",
+			url: "https://provider.test",
+			headers,
+		});
+		const log = await session.openResponseLog("HTTP 200", headers);
+		await log.close();
+		const dumpText = await fs.readFile(session.requestPath, "utf8");
+		const responseText = await fs.readFile(session.responsePath, "utf8");
+		const persisted = JSON.parse(dumpText).headers;
+		expect(Object.getOwnPropertyDescriptor(persisted, "__proto__")?.value).toBe("safe-prototype-name");
+		expect(Object.getOwnPropertyDescriptor(persisted, "constructor")?.value).toBe("safe-constructor-name");
+		expect(dumpText + responseText).not.toContain("synthetic-header-secret");
+		expect(dumpText + responseText).not.toContain("inherited-not-a-header");
+		expect(responseText).toContain("__proto__: safe-prototype-name");
+		expect(headers["X-Api-Secret"]).toBe("synthetic-header-secret");
 	});
 
 	it("keeps the partial response log when the response body is cancelled", async () => {

@@ -44,7 +44,7 @@ describe("AgentSession video attachments", () => {
 
 	afterEach(async () => {
 		await session?.dispose();
-		authStorage?.close();
+		await authStorage?.close();
 	});
 
 	it("hides the source path from the user message while retaining it in model context", async () => {

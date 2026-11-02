@@ -26,7 +26,7 @@ describe("ModelRegistry default custom models config", () => {
 	});
 
 	afterEach(async () => {
-		authStorage.close();
+		await authStorage.close();
 		setAgentDir(originalAgentDir);
 		if (originalAgentDirEnv === undefined) delete process.env.PI_CODING_AGENT_DIR;
 		else process.env.PI_CODING_AGENT_DIR = originalAgentDirEnv;
@@ -72,7 +72,7 @@ describe("ModelRegistry default custom models config", () => {
 			modelId: "us.anthropic.claude-opus-4-8",
 		});
 
-		expect(model?.compat).toEqual({
+		const expectedCompat = {
 			promptCacheMode: "explicit",
 			supportsLongPromptCacheRetention: false,
 			promptCacheMinimumTokens: 1024,
@@ -86,7 +86,10 @@ describe("ModelRegistry default custom models config", () => {
 			supportsSamplingParams: false,
 			// Bedrock Converse keeps thinking-binding controls on unless an override opts out.
 			supportsThinkingBindingControls: true,
-		});
+			// Converse on an AWS host supports native Claude server compaction (provider rule).
+			supportsServerCompaction: true,
+		} as const;
+		expect(model?.compat).toEqual(expectedCompat);
 	});
 
 	test("applies provider and model binding-control precedence to the serialized Bedrock request", async () => {

@@ -31,6 +31,26 @@ describe("legacy shim upstream-root bridges", () => {
 		expect(caShim.parseSkillBlock('<skill name="x" location="y">no trailing newline</skill>')).toBeNull();
 	});
 
+	it("does not disclose hidden skills or inject metadata as prompt elements", () => {
+		const skill = (name: string, extra: Record<string, unknown> = {}) => ({
+			name,
+			description: "<untrusted>secret directive</untrusted>",
+			filePath: "/skills/<untrusted>.md",
+			baseDir: "/skills",
+			source: "user",
+			...extra,
+		});
+		const output = caShim.formatSkillsForPrompt([
+			skill("visible<untrusted>"),
+			skill("HIDDEN_SENTINEL", { hide: true }),
+			skill("DISABLED_SENTINEL", { disableModelInvocation: true }),
+		]);
+		expect(output).not.toContain("HIDDEN_SENTINEL");
+		expect(output).not.toContain("DISABLED_SENTINEL");
+		expect(output).not.toContain("<untrusted>");
+		expect(output).toContain("visible&lt;untrusted&gt;");
+	});
+
 	it("compositeTuiLine matches upstream splice geometry and OSC-8 reset semantics", () => {
 		const strip = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "").replace(/\x1b\]8;;[^\x07\x1b]*(\x07|\x1b\\)/g, "");
 

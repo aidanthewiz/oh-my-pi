@@ -1,8 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import { type } from "@oh-my-pi/omptype";
 import { getSeriesColor } from "../../utils/src/vendor/mermaid-ascii/xychart/colors";
-import { defaultThemes } from "@oh-my-pi/pi-tui/theme/defaults";
-import coreforceTheme from "../../tui/src/theme/defaults/coreforce.json" with { type: "json" };
+import defaultThemes from "../../tui/src/theme/defaults.json" with { type: "json" };
 import {
 	getMarkdownTheme,
 	getThemeByName,
@@ -11,6 +10,7 @@ import {
 } from "@oh-my-pi/pi-tui/theme";
 import themeSchema from "../../tui/src/theme/theme-schema.json" with { type: "json" };
 
+const coreforceTheme = defaultThemes.coreforce;
 const requiredColorKeys = themeSchema.properties.colors.required as string[];
 const colorSchema = Object.fromEntries(requiredColorKeys.map(key => [key, "string | number"]));
 const themeValidator = type({
@@ -25,7 +25,6 @@ describe("coreforce theme", () => {
 
 		const parsed = themeValidator(coreforceTheme);
 		expect(parsed).not.toBeInstanceOf(type.errors);
-		expect(defaultThemes.coreforce).toEqual(coreforceTheme);
 	});
 
 	it("uses the active theme accent and light/dark polarity for Mermaid chart series", async () => {

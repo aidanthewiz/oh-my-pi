@@ -338,19 +338,19 @@ function typescriptPackageDir(tscPath: string): string | null {
 /**
  * Whether the `tsc` at `tscPath` speaks LSP itself. TypeScript 7 dropped the JS
  * `lib/tsserver.js` that typescript-language-server wraps and exposes
- * `tsc --lsp --stdio` from its native binary instead; older releases reject the
- * flag with TS5023.
+ * `tsc --lsp --stdio` instead; older releases reject the flag with TS5023.
+ * Package-less installs use the native invocation only when the client starts;
+ * configuration discovery never executes a compiler or version-manager shim.
  */
 function typescriptSpeaksLsp(tscPath: string): boolean {
 	const packageDir = typescriptPackageDir(tscPath);
-	return packageDir !== null && !fs.existsSync(path.join(packageDir, "lib", "tsserver.js"));
+	return packageDir === null || !fs.existsSync(path.join(packageDir, "lib", "tsserver.js"));
 }
 
 /**
  * Keep exactly one TypeScript server. `typescript-language-server` needs
  * `lib/tsserver.js`, which a TypeScript 7 workspace no longer ships, so it fails
- * at initialize there; `tsc --lsp` exits on older TypeScript. Pick by inspecting
- * the resolved `tsc` install rather than spawning both.
+ * at initialize there; `tsc --lsp` exits on older TypeScript.
  */
 function selectTypescriptServer(servers: Record<string, ServerConfig>): void {
 	const native = servers["typescript-native"];

@@ -49,7 +49,7 @@ describe("newSession() atomic boundary vs queued hidden steer", () => {
 		try {
 			await session?.dispose();
 		} finally {
-			for (const authStorage of authStorages.splice(0)) authStorage.close();
+			for (const authStorage of authStorages.splice(0)) await authStorage.close();
 			await tempDir?.remove();
 		}
 	});

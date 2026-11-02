@@ -4,9 +4,39 @@
  * Artifacts are stored in a directory alongside the session file,
  * accessible via artifact:// URLs.
  */
+import type { BigIntStats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { isRecord, logger, toError } from "@oh-my-pi/pi-utils";
 import { replaceFileAtomically } from "../utils/atomic-file";
+import { withArtifactPublicationLock } from "./artifact-publication";
+
+const TASK_STRUCTURED_SIDECAR_SCHEMA = "coreforge.task-structured-sidecar.v1";
+
+/** File identity and content metadata for the primary's current published path. */
+export function artifactFileGeneration(stat: BigIntStats): string {
+	if (!stat.isFile()) throw new Error("Artifact is not a regular file.");
+	return `${stat.dev}:${stat.ino}:${stat.birthtimeNs}:${stat.mtimeNs}:${stat.size}`;
+}
+
+export function serializeStructuredArtifactSidecar(serializedData: string, primaryGeneration: string): string {
+	return `{"schema":${JSON.stringify(TASK_STRUCTURED_SIDECAR_SCHEMA)},"primaryGeneration":${JSON.stringify(primaryGeneration)},"data":${serializedData}}\n`;
+}
+
+export function parseStructuredArtifactSidecar(
+	content: string,
+	primaryGeneration: string,
+): { data: unknown } | undefined {
+	const envelope: unknown = JSON.parse(content);
+	if (
+		!isRecord(envelope) ||
+		envelope.schema !== TASK_STRUCTURED_SIDECAR_SCHEMA ||
+		envelope.primaryGeneration !== primaryGeneration ||
+		!Object.hasOwn(envelope, "data")
+	)
+		return undefined;
+	return { data: envelope.data };
+}
 
 /**
  * Sanitize a tool name for safe use as the middle segment of the artifact
@@ -42,24 +72,28 @@ function sanitizeToolType(toolType: string): string {
  * Returns the verified UTF-8 byte count.
  */
 export async function writeArtifact(path: string, content: string): Promise<number> {
-	const expectedBytes = Buffer.byteLength(content);
-	const tempPath = `${path}.tmp-${crypto.randomUUID()}`;
-	try {
-		const writtenBytes = await Bun.write(tempPath, content);
-		if (writtenBytes !== expectedBytes) {
-			throw new Error(`Artifact write incomplete: wrote ${writtenBytes} of ${expectedBytes} bytes`);
+	return withArtifactPublicationLock(async () => {
+		const expectedBytes = Buffer.byteLength(content);
+		const tempPath = `${path}.tmp-${crypto.randomUUID()}`;
+		try {
+			const writtenBytes = await Bun.write(tempPath, content);
+			if (writtenBytes !== expectedBytes) {
+				throw new Error(`Artifact write incomplete: wrote ${writtenBytes} of ${expectedBytes} bytes`);
+			}
+			const file = Bun.file(tempPath);
+			if (file.size !== expectedBytes) {
+				throw new Error(`Artifact size mismatch: found ${file.size} of ${expectedBytes} bytes`);
+			}
+			await file.slice(0, Math.min(expectedBytes, 1)).arrayBuffer();
+			await replaceFileAtomically(tempPath, path);
+		} catch (error) {
+			await fs.rm(tempPath, { force: true }).catch(cleanupError => {
+				logger.warn("Failed to remove staged artifact", { tempPath, error: toError(cleanupError).message });
+			});
+			throw error;
 		}
-		const file = Bun.file(tempPath);
-		if (file.size !== expectedBytes) {
-			throw new Error(`Artifact size mismatch: found ${file.size} of ${expectedBytes} bytes`);
-		}
-		await file.slice(0, Math.min(expectedBytes, 1)).arrayBuffer();
-		await replaceFileAtomically(tempPath, path);
-	} catch (error) {
-		await fs.rm(tempPath, { force: true });
-		throw error;
-	}
-	return expectedBytes;
+		return expectedBytes;
+	});
 }
 
 /**
@@ -78,16 +112,21 @@ export class ArtifactManager {
 	#dirCreated = false;
 	#initPromise: Promise<void> | null = null;
 	readonly #ready: Promise<void> | undefined;
+	readonly #reservedIdsDir: string | undefined;
 
 	/**
 	 * @param dir Directory that will hold artifact files. Created lazily on first save.
 	 * @param ready Settles once `dir` is seeded (a session move copying the previous
 	 *   session's artifacts in the background). Id scans and lookups wait for it,
 	 *   so new ids never collide with copied ones. Must not reject.
+	 * @param reservedIdsDir Read-only directory whose ids stay reserved: a seance
+	 *   fork allocates past its source's ids so `artifact://<n>` from the inherited
+	 *   transcript keeps naming the source artifact.
 	 */
-	constructor(dir: string, ready?: Promise<void>) {
+	constructor(dir: string, ready?: Promise<void>, reservedIdsDir?: string) {
 		this.#dir = dir;
 		this.#ready = ready;
+		this.#reservedIdsDir = reservedIdsDir;
 	}
 
 	get ready(): Promise<void> | undefined {
@@ -121,6 +160,13 @@ export class ArtifactManager {
 	 */
 	async #scanExistingIds(): Promise<void> {
 		const files = await this.listFiles();
+		if (this.#reservedIdsDir) {
+			try {
+				files.push(...(await fs.readdir(this.#reservedIdsDir)));
+			} catch {
+				// A missing source artifacts dir reserves nothing.
+			}
+		}
 		let maxId = -1;
 		for (const file of files) {
 			// Files are named: {id}.{toolType}.log

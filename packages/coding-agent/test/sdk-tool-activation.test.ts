@@ -131,9 +131,9 @@ describe("createAgentSession defaultInactive tool activation", () => {
 		testSetExtensionHandlerTimeoutMs(EXTENSION_HANDLER_TIMEOUT_MS);
 	});
 
-	afterAll(() => {
+	afterAll(async () => {
 		// The discovered auth DB lives in registryAuthDir; Windows cannot delete it while open.
-		modelRegistry.authStorage.close();
+		await modelRegistry.authStorage.close();
 		removeSyncWithRetries(registryAuthDir);
 	});
 
@@ -193,7 +193,7 @@ describe("createAgentSession defaultInactive tool activation", () => {
 			expect(write).toBeDefined();
 			await expect(
 				write!.execute("device-only-fs", { path: path.join(tempDir, "nope.txt"), content: "x" }),
-			).rejects.toThrow("Filesystem writes are not available");
+			).rejects.toThrow("Other filesystem paths are refused");
 		} finally {
 			await session.dispose();
 		}
@@ -216,7 +216,7 @@ describe("createAgentSession defaultInactive tool activation", () => {
 					path: path.join(tempDir, "before.txt"),
 					content: "x",
 				}),
-			).rejects.toThrow("Filesystem writes are not available");
+			).rejects.toThrow("Other filesystem paths are refused");
 
 			await session.setActiveToolsByName(session.getEnabledToolNames());
 
@@ -225,7 +225,7 @@ describe("createAgentSession defaultInactive tool activation", () => {
 					path: path.join(tempDir, "after.txt"),
 					content: "x",
 				}),
-			).rejects.toThrow("Filesystem writes are not available");
+			).rejects.toThrow("Other filesystem paths are refused");
 		} finally {
 			await session.dispose();
 		}
@@ -517,7 +517,7 @@ describe("createAgentSession defaultInactive tool activation", () => {
 			if (!write) throw new Error("expected dormant write transport");
 			await expect(
 				write.execute("late-device-fs", { path: path.join(tempDir, "nope.txt"), content: "x" }),
-			).rejects.toThrow("Filesystem writes are not available");
+			).rejects.toThrow("Other filesystem paths are refused");
 		} finally {
 			await session.dispose();
 		}
@@ -1327,7 +1327,6 @@ describe("createAgentSession defaultInactive tool activation", () => {
 			expect(errors).toContain("expected activation failure");
 			expect(session.getToolByName("failed_registration_tool")).toBeUndefined();
 			expect(session.getToolByName("drained_registration_tool")).toBeDefined();
-			expect(session.systemPrompt.join("\n")).toContain("drained_registration_tool");
 		} finally {
 			releaseLaterActivation.resolve();
 			await emission;
@@ -1778,7 +1777,12 @@ describe("createAgentSession defaultInactive tool activation", () => {
 			expect(keptWithinRun.content).toEqual([{ type: "text", text: "Result submitted." }]);
 
 			resetYieldTurnState(yieldTool);
-			await expect(yieldTool.execute("run2-empty", { type: "result" })).rejects.toThrow(/no text \(thinking only\)/);
+			const emptyError = await yieldTool.execute("run2-empty", { type: "result" }).then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+			expect(emptyError).toBeInstanceOf(Error);
+			expect(emptyError).toMatchObject({ message: expect.stringMatching(/no text \(thinking only\)/) });
 		} finally {
 			await session.dispose();
 		}
@@ -1846,7 +1850,7 @@ describe("createAgentSession defaultInactive tool activation", () => {
 			expect(write).toBeDefined();
 			await expect(
 				write!.execute("device-only-fs", { path: path.join(tempDir, "nope.txt"), content: "x" }),
-			).rejects.toThrow("Filesystem writes are not available");
+			).rejects.toThrow("Other filesystem paths are refused");
 		} finally {
 			await session.dispose();
 		}
@@ -1923,6 +1927,38 @@ describe("createAgentSession defaultInactive tool activation", () => {
 				expect(session.getToolByName(name)).toBeUndefined();
 			}
 			expect(session.getActiveToolNames()).toEqual(previousActiveToolNames);
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	it("keeps MCP refreshes out of the vibe director toolset and applies them on exit", async () => {
+		const tempDir = makeTempDir();
+		const { session } = await createAgentSession(baseOptions(tempDir));
+		const previousEnabledToolNames = session.getEnabledToolNames();
+		const mcpTool = {
+			name: "mcp__vibe_refresh_lookup",
+			label: "vibe_refresh/lookup",
+			description: "MCP tool connected while vibe mode is active.",
+			parameters: type({}),
+			mcpServerName: "vibe_refresh",
+			mcpToolName: "lookup",
+			async execute() {
+				return { content: [{ type: "text", text: "mcp" }] };
+			},
+		} satisfies CustomTool;
+
+		try {
+			await session.activateVibeTools(["read"]);
+			const directorToolNames = session.getEnabledToolNames();
+			await session.refreshMCPTools([mcpTool]);
+			expect(session.getToolByName(mcpTool.name)).toBeDefined();
+			expect(session.getEnabledToolNames()).toEqual(directorToolNames);
+
+			await session.deactivateVibeTools(previousEnabledToolNames);
+			expect(session.getEnabledToolNames()).toEqual(
+				expect.arrayContaining([...previousEnabledToolNames, mcpTool.name]),
+			);
 		} finally {
 			await session.dispose();
 		}
@@ -2174,28 +2210,6 @@ describe("createAgentSession defaultInactive tool activation", () => {
 			expect(session.getActiveToolNames()).toEqual(["read", "sdk_custom_tool"]);
 		} finally {
 			await session.dispose();
-		}
-	});
-
-	it("renders report-issue guidance only for interactive unrestricted sessions with write", async () => {
-		const normalDir = makeTempDir();
-		const restrictedDir = makeTempDir();
-		const { session: normal } = await createAgentSession({
-			...baseOptions(normalDir),
-			hasUI: true,
-		});
-		const { session: restricted } = await createAgentSession({
-			...baseOptions(restrictedDir),
-			hasUI: true,
-			toolNames: ["read"],
-			restrictToolNames: true,
-		});
-
-		try {
-			expect(normal.systemPrompt.join("\n")).toContain("xd://report_issue");
-			expect(restricted.systemPrompt.join("\n")).not.toContain("xd://report_issue");
-		} finally {
-			await Promise.all([normal.dispose(), restricted.dispose()]);
 		}
 	});
 

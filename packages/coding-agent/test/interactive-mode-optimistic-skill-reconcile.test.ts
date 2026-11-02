@@ -85,7 +85,7 @@ describe("InteractiveMode optimistic skill reconcile (#11217)", () => {
 		// composer status through the native VCS status line — unrelated to the
 		// reconcile contract under test.
 		await session.dispose();
-		authStorage.close();
+		await authStorage.close();
 		tempDir.removeSync();
 		resetSettingsForTest();
 	});

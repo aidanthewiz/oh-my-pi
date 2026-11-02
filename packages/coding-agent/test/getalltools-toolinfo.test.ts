@@ -81,7 +81,7 @@ describe("AgentSession.getAllToolInfos", () => {
 			expect(byName.get("my_ext_tool")?.sourceInfo.path).toBe("<extension:my_ext_tool>");
 		} finally {
 			await session.dispose();
-			authStorage.close();
+			await authStorage.close();
 			tempDir.removeSync();
 		}
 	});
@@ -119,19 +119,21 @@ describe("AgentSession.getAllToolInfos", () => {
 			builtInToolNames: [],
 			rebuildSystemPrompt: async toolNames => ({ systemPrompt: [toolNames.join(",")] }),
 			extensionRunner: {
-				getRegisteredTool: (name: string) =>
-					name === "git"
-						? {
-								extensionPath: "./extension.ts",
-								definition: { sourcePath: "./tools/git.ts" },
-								sourceInfo: {
-									path: sourcePath,
-									source: "extension",
-									scope: "temporary",
-									origin: "top-level",
-								},
-							}
-						: undefined,
+				toolRegistrations: new WeakMap([
+					[
+						custom,
+						{
+							extensionPath: "./extension.ts",
+							definition: { sourcePath: "./tools/git.ts" },
+							sourceInfo: {
+								path: sourcePath,
+								source: "extension",
+								scope: "temporary",
+								origin: "top-level",
+							},
+						},
+					],
+				]),
 			} as never,
 		});
 
@@ -141,7 +143,7 @@ describe("AgentSession.getAllToolInfos", () => {
 			expect(info?.sourceInfo.path).toBe(sourcePath);
 		} finally {
 			await session.dispose();
-			authStorage.close();
+			await authStorage.close();
 			tempDir.removeSync();
 		}
 	});

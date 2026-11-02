@@ -90,6 +90,7 @@ export interface MemoryBackendStartOptions {
 	taskDepth: number;
 	parentHindsightSessionState?: HindsightSessionState;
 	parentMnemopiSessionState?: MnemopiSessionState;
+	inheritedMnemopiRecall?: Pick<MnemopiSessionState, "hasRecalledForFirstTurn" | "lastRecallSnippet">;
 }
 
 /** A successful recall, including an empty result, staged until user-turn delivery. */
@@ -120,9 +121,11 @@ export interface MemoryBackend {
 	/**
 	 * Markdown injected as the system-prompt append section.
 	 * Returned on every prompt rebuild via `refreshBaseSystemPrompt()`.
+	 * `cwd` is the session's project directory and selects project-scoped memory.
 	 */
 	buildDeveloperInstructions(
 		agentDir: string,
+		cwd: string,
 		settings: Settings,
 		session?: AgentSession,
 	): Promise<string | undefined>;
@@ -175,12 +178,14 @@ export interface MemoryBackend {
 	 * Returning a string appends one entry to the compaction's `extraContext`
 	 * list (which becomes part of the summarization prompt). Return `undefined`
 	 * to inject nothing — the local backend takes this branch because its
-	 * summary is already part of the system prompt.
+	 * summary is already part of the system prompt. `signal` aborts when the
+	 * compaction pass is cancelled or superseded.
 	 */
 	preCompactionContext?(
 		messages: AgentMessage[],
 		settings: Settings,
 		session?: AgentSession,
+		signal?: AbortSignal,
 	): Promise<string | undefined>;
 
 	/**

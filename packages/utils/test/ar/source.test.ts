@@ -51,7 +51,7 @@ describe("ar remote sources", () => {
 		const source = await httpByteSource(String(rangedServer.url));
 		expect(source.size).toBe(zipBytes.byteLength);
 
-		const archive = await openArchive({ source, format: "zip", path: "remote.zip" });
+		await using archive = await openArchive({ source, format: "zip", path: "remote.zip" });
 		const names = archive.listDirectory("docs").map(entry => entry.name);
 		expect(names).toEqual(["data.bin", "pad.bin", "readme.md"]);
 
@@ -64,7 +64,7 @@ describe("ar remote sources", () => {
 	it("falls back to one bounded buffered download when Range is ignored", async () => {
 		const source = await httpByteSource(String(ignoringServer.url));
 		expect(source.size).toBe(zipBytes.byteLength);
-		const archive = await openArchive({ source, format: "zip" });
+		await using archive = await openArchive({ source, format: "zip" });
 		const file = await archive.readFile("docs/data.bin");
 		expect(file.bytes.byteLength).toBe(640);
 	});

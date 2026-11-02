@@ -4,7 +4,7 @@
  * map each rendered turn to a selectable target, and compose gutter-prefixed
  * columns with a dotted outline around the selected target.
  */
-import { type Component } from "../tui";
+import { Container, type Component } from "../tui";
 import { visibleWidth } from "../utils";
 import {
 	isUserRequestEntry,
@@ -17,6 +17,7 @@ import { type ThemeColor, theme } from "../theme";
 import type { ChatTranscriptBuilder } from "./chat-transcript-builder";
 import { padToWidth } from "../render/utils";
 import { isUsageRowBlock } from "../overlays/usage-row";
+import type { DescribeContext, NativeChild, NativeNode } from "../native/node";
 
 /** One selectable transcript item: a message entry plus its rendered block range. */
 export interface OutlineTarget {
@@ -146,6 +147,40 @@ export function outlineVisibility(
 		}
 		return false;
 	});
+}
+
+/**
+ * Per-target "describes something that shows" flags: {@link outlineVisibility}
+ * for a TSP page, where blocks describe nodes instead of rendering rows. An
+ * empty `col`/`row` (an interrupted turn with no output) shows nothing.
+ */
+export function describedVisibility(
+	blocks: readonly Component[],
+	targets: readonly OutlineTarget[],
+	cx: DescribeContext,
+): boolean[] {
+	return targets.map(target => {
+		for (let index = target.start; index < target.end; index++) {
+			if (shows(blocks[index]!, cx)) return true;
+		}
+		return false;
+	});
+}
+
+/** Whether `child` describes a node that shows: a layout `col`/`row` only through a child that does. */
+function shows(child: NativeChild, cx: DescribeContext): boolean {
+	let node: NativeNode | null | undefined;
+	if ("k" in child) {
+		node = child;
+	} else {
+		const inherited = child.describe === Container.prototype.describe && child.render !== Container.prototype.render;
+		node = inherited ? undefined : child.describe?.(cx);
+		if (!node) return child.render(Math.max(1, cx.cols)).some(row => /\S/.test(row));
+	}
+	if (node.p?.hidden) return false;
+	if (node.k === "rows") return node.p?.lines.some(row => /\S/.test(row)) ?? false;
+	if (node.k !== "col" && node.k !== "row") return true;
+	return (node.c ?? []).some(grandchild => shows(grandchild, cx));
 }
 
 /** Dotted horizontal rule with rounded corners, spanning the outline width. */

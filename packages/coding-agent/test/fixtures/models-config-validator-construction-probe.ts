@@ -47,7 +47,7 @@ async function measureMissing(): Promise<ProbeResult> {
 				thinking: found.thinking,
 			};
 		} finally {
-			authStorage.close();
+			await authStorage.close();
 		}
 	}
 	return { retainedHeapNodes: retainedHeapNodes(), model };
@@ -106,7 +106,7 @@ async function measureCustom(configPath: string): Promise<ProbeResult> {
 			const secondSchema = ModelsConfigFile.relocate(path.join(root, "second", "models.yml")).schema;
 			schemaIdentityStable = firstSchema === secondSchema;
 		} finally {
-			authStorage.close();
+			await authStorage.close();
 		}
 	}
 	return {

@@ -53,8 +53,8 @@ function resolveSource(input: ArchiveSource): ResolvedArchiveSource {
 
 /**
  * Open an archive for browsing and member reads. File- and source-backed
- * containers with random-access layouts (ZIP, ASAR, RAR, 7z, ISO, CAB) index
- * lazily; stream containers (tar family, cpio, ar) buffer once under limits.
+ * containers with random-access layouts (ZIP, ASAR, RAR, 7z, ISO, CAB) index lazily.
+ * Buffering and streaming containers enforce their respective limits. Dispose the reader after use.
  */
 export async function openArchive(input: ArchiveSource, options: OpenArchiveOptions = {}): Promise<ArchiveReader> {
 	const { source, format, archivePath } = resolveSource(input);
@@ -110,7 +110,7 @@ export async function listArchiveRoot(
 	format: ArchiveFormat,
 	opts: { limit?: number } = {},
 ): Promise<string> {
-	const archive = await openArchive({ bytes, format });
+	await using archive = await openArchive({ bytes, format });
 	const entries = archive.listDirectory("");
 	const limitedEntries = opts.limit !== undefined && opts.limit > 0 ? entries.slice(0, opts.limit) : entries;
 	const lines = formatArchiveEntryLines(limitedEntries);
@@ -127,7 +127,7 @@ export async function readArchiveEntries(
 	input: ArchiveSource,
 	options: OpenArchiveOptions = {},
 ): Promise<Map<string, Uint8Array>> {
-	const archive = await openArchive(input, options);
+	await using archive = await openArchive(input, options);
 	const entries = new Map<string, Uint8Array>();
 	let total = 0;
 	for (const entry of archive.indexEntries()) {
@@ -166,7 +166,7 @@ export async function extractArchive(
 	destDir: string,
 	options: OpenArchiveOptions = {},
 ): Promise<number> {
-	const archive = await openArchive(input, options);
+	await using archive = await openArchive(input, options);
 	const extractRoot = path.resolve(destDir);
 	await fs.mkdir(extractRoot, { recursive: true });
 	let count = 0;
@@ -234,7 +234,8 @@ export async function extractArchive(
 				// privilege; skip the entry so the rest still extracts.
 				const extracted = await archive.readFile(link.path).catch(() => undefined);
 				if (!extracted) continue;
-				await Bun.write(outputPath, extracted.bytes);
+				// Keep symlink creation's exclusive destination semantics.
+				await fs.writeFile(outputPath, extracted.bytes, { flag: "wx" });
 				const permissions = (extracted.mode ?? 0) & 0o777;
 				if (permissions) await fs.chmod(outputPath, permissions);
 			}

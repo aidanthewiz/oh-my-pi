@@ -183,7 +183,7 @@ describe("Perplexity browser SSO login", () => {
 				expect((await storage.oauth.access("perplexity"))?.accessToken).toBe(token);
 			});
 		} finally {
-			storage.close();
+			await storage.close();
 		}
 	});
 
@@ -289,7 +289,7 @@ describe("Perplexity browser SSO login", () => {
 				expect(storage.credentials.all().perplexity).toBeUndefined();
 			});
 		} finally {
-			storage.close();
+			await storage.close();
 		}
 	});
 });

@@ -40,6 +40,7 @@ import {
 import { RegisteredToolAdapter } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/wrapper";
 import { initializeExtensions } from "@oh-my-pi/pi-coding-agent/modes/runtime-init";
 import * as memoryBackend from "@oh-my-pi/pi-coding-agent/memory-backend";
+import * as imageVisionFallback from "@oh-my-pi/pi-coding-agent/utils/image-vision-fallback";
 import { MEMORY_RECALL_CHANGES_MESSAGE_TYPE } from "@oh-my-pi/pi-coding-agent/memory-backend/recall-entry";
 import type { MemoryBackend } from "@oh-my-pi/pi-coding-agent/memory-backend/types";
 import { type MnemopiSessionState, setMnemopiSessionState } from "@oh-my-pi/pi-coding-agent/mnemopi/state";
@@ -51,10 +52,12 @@ import {
 } from "@oh-my-pi/pi-coding-agent/sdk";
 import { obfuscateProviderContext, SecretObfuscator } from "@oh-my-pi/pi-coding-agent/secrets";
 import { AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import type { EphemeralTurnResult } from "@oh-my-pi/pi-coding-agent/session/agent-session-types";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { convertToLlm, wrapSteeringForModel } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
+import { requestBodyText } from "@oh-my-pi/pi-ai/utils/request-body";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
 
@@ -135,6 +138,36 @@ describe("AgentSession message pipeline", () => {
 		});
 		sessions.push(session);
 		return session;
+	}
+
+	function capturingAnthropicSideSession(model: Model) {
+		const bodies: Array<{
+			messages: Array<{ role: string; content: string | Array<{ text?: string; cache_control?: unknown }> }>;
+		}> = [];
+		const session = new AgentSession({
+			agent: new Agent({
+				initialState: {
+					model,
+					systemPrompt: ["system prompt"],
+					messages: [{ role: "user", content: "Fix the issue", timestamp: 1 }, createAssistantMessage("Fixed.")],
+					tools: [],
+				},
+			}),
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry: createModelRegistryStub() as never,
+			sideStreamFn: (target, context, options) =>
+				streamSimple(target, context, {
+					...options,
+					apiKey: "test-key",
+					fetch: async (_url, init) => {
+						bodies.push(JSON.parse(requestBodyText(init) ?? "{}"));
+						return new Response(JSON.stringify({ error: { message: "Request captured" } }), { status: 400 });
+					},
+				}),
+		});
+		sessions.push(session);
+		return { session, bodies };
 	}
 
 	it.each([false, true])("awaits ordered async delivery, final flush=%s", async finalFlush => {
@@ -873,7 +906,7 @@ describe("AgentSession message pipeline", () => {
 			expect(Buffer.from(historicalImage.data.slice(0, 16), "base64").toString("ascii", 8, 12)).toBe("WEBP");
 		} finally {
 			await session.dispose();
-			authStorage.close();
+			await authStorage.close();
 		}
 	});
 
@@ -947,7 +980,7 @@ describe("AgentSession message pipeline", () => {
 			]);
 		} finally {
 			await session.dispose();
-			authStorage.close();
+			await authStorage.close();
 		}
 	});
 
@@ -979,33 +1012,6 @@ describe("AgentSession message pipeline", () => {
 		expect(convertedText).toContain("steer with <xml> & ampersand");
 		expect(convertedText).not.toContain("&lt;xml&gt;");
 		expect(convertedText).not.toContain("&amp;");
-	});
-
-	it("composes session payload hooks into direct side-request options", async () => {
-		const sessionOnPayload = vi.fn(async (payload: unknown) => ({
-			...(payload as Record<string, unknown>),
-			session: true,
-		}));
-		const requestOnPayload = vi.fn(async () => undefined);
-		const session = new AgentSession({
-			agent: createAgent(),
-			sessionManager: SessionManager.inMemory(),
-			settings: Settings.isolated({ "compaction.enabled": false }),
-			modelRegistry: {} as never,
-			onPayload: sessionOnPayload,
-		});
-		sessions.push(session);
-		const options: SimpleStreamOptions = {
-			apiKey: "key",
-			onPayload: requestOnPayload,
-		};
-
-		const prepared = session.prepareSimpleStreamOptions(options);
-		const result = await prepared.onPayload?.({ original: true });
-
-		expect(sessionOnPayload).toHaveBeenCalledWith({ original: true }, undefined);
-		expect(requestOnPayload).toHaveBeenCalledWith({ original: true, session: true }, undefined);
-		expect(result).toEqual({ original: true, session: true });
 	});
 
 	it("does not dispatch a provider payload after its hook aborts the request", async () => {
@@ -1212,6 +1218,291 @@ describe("AgentSession message pipeline", () => {
 		expect(session.sessionManager.getEntries()).toEqual(journalSnapshot);
 	});
 
+	it.each([
+		["sends the image to a vision model", ["text", "image"]],
+		["describes the image for a text-only model", ["text"]],
+	] as const)("ephemeral prompt and history images: %s", async (_label, input) => {
+		const describe = vi
+			.spyOn(imageVisionFallback, "describeAttachedImagesForTextModel")
+			.mockResolvedValue([{ type: "text", text: "A red square." }]);
+		const model = buildModel({
+			id: "side-stream-model",
+			name: "Side Stream Model",
+			api: "anthropic",
+			provider: "test-provider",
+			baseUrl: "",
+			reasoning: false,
+			input: [...input],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 4096,
+			maxTokens: 1024,
+		} as ModelSpec<Api>) as Model<Api>;
+		const contexts: Context[] = [];
+		const sideStreamFn: StreamFn = (_model, context) => {
+			contexts.push({ ...context, messages: structuredClone(context.messages) });
+			const stream = new AssistantMessageEventStream();
+			queueMicrotask(() => stream.push({ type: "done", reason: "stop", message: createAssistantMessage("Red") }));
+			return stream;
+		};
+		const agent = new Agent({
+			initialState: { model, systemPrompt: ["system prompt"], messages: [], tools: [] },
+		});
+		const session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry: createModelRegistryStub() as never,
+			sideStreamFn,
+		});
+		sessions.push(session);
+		const screenshot: ImageContent = { type: "image", data: "c2NyZWVuc2hvdA==", mimeType: "image/png" };
+
+		await session.runEphemeralTurn({ promptText: "What colour is this?", promptImages: [screenshot] });
+
+		const request = JSON.stringify(contexts[0]?.messages);
+		expect(contexts[0]?.messages.at(-1)?.content).toContainEqual(expect.objectContaining({ type: "image" }));
+		expect(request.includes("A red square.")).toBe(input.length === 1);
+		expect(describe).toHaveBeenCalledTimes(input.length === 1 ? 1 : 0);
+
+		// A follow-up replays the image from history with the same handling.
+		await session.runEphemeralTurn({
+			promptText: "And the border?",
+			history: [
+				{ role: "user", content: [{ type: "text", text: "What colour is this?" }, screenshot], timestamp: 1 },
+				createAssistantMessage("Red"),
+			],
+		});
+		expect(JSON.stringify(contexts[1]?.messages).includes("A red square.")).toBe(input.length === 1);
+		expect(describe).toHaveBeenCalledTimes(input.length === 1 ? 2 : 0);
+		expect(agent.state.messages).toEqual([]);
+	});
+
+	it.each(["prompt", "history"] as const)(
+		"cancels an ephemeral %s image description before side inference",
+		async source => {
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			const caller = new AbortController();
+			let descriptionCancelled = false;
+			vi.spyOn(imageVisionFallback, "describeAttachedImagesForTextModel").mockImplementation(
+				async (_images, _options, signal) => {
+					entered.resolve();
+					await Promise.race([
+						release.promise,
+						new Promise<void>(resolve => {
+							signal?.addEventListener(
+								"abort",
+								() => {
+									descriptionCancelled = true;
+									resolve();
+								},
+								{ once: true },
+							);
+						}),
+					]);
+					return [{ type: "text", text: "A late description." }];
+				},
+			);
+			const model = buildModel({
+				id: "text-only-side-model",
+				name: "Text-only side model",
+				api: "openai-responses",
+				provider: "test-provider",
+				baseUrl: "https://provider.invalid",
+				reasoning: false,
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 4096,
+				maxTokens: 1024,
+			});
+			let sideRequests = 0;
+			const session = new AgentSession({
+				agent: new Agent({ initialState: { model, systemPrompt: [], tools: [], messages: [] } }),
+				sessionManager: SessionManager.inMemory(),
+				settings: Settings.isolated({ "compaction.enabled": false }),
+				modelRegistry: createModelRegistryStub() as never,
+				sideStreamFn: () => {
+					sideRequests++;
+					return new AssistantMessageEventStream();
+				},
+			});
+			sessions.push(session);
+			const image: ImageContent = { type: "image", data: "c2NyZWVuc2hvdA==", mimeType: "image/png" };
+			const pending = session.runEphemeralTurn({
+				promptText: "Describe this.",
+				signal: caller.signal,
+				...(source === "prompt"
+					? { promptImages: [image] }
+					: { history: [{ role: "user" as const, content: [image], timestamp: 1 }] }),
+			});
+			const outcome = pending.then(
+				() => undefined,
+				error => error,
+			);
+			try {
+				await entered.promise;
+				caller.abort(new Error("cancelled image description"));
+				release.resolve();
+				expect(await outcome).toBeInstanceOf(Error);
+				expect(descriptionCancelled).toBe(true);
+				expect(sideRequests).toBe(0);
+				expect(session.agent.state.messages).toEqual([]);
+				expect(session.sessionManager.getBranch()).toEqual([]);
+			} finally {
+				release.resolve();
+			}
+		},
+	);
+
+	it.each(["model change", "cancellation", "unchanged owner"] as const)(
+		"preserves the original ephemeral owner between saved-history captions: %s",
+		async change => {
+			using tempDir = TempDir.createSync("@pi-side-history-owner-");
+			const authStorage = await AuthStorage.create(":memory:");
+			const modelRegistry = new ModelRegistry(authStorage, tempDir.join("models.yml"), {
+				ignoreLocalModelConfig: true,
+			});
+			const textProvider = "side-history-text";
+			const visionProvider = "side-history-vision";
+			const visionApi = "test-side-history-vision";
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			const caller = new AbortController();
+			const visionRequests: Context[] = [];
+			const sideRequests: Context[] = [];
+			let firstDescriptionSignal: AbortSignal | undefined;
+			let session: AgentSession | undefined;
+			let outcome: Promise<{ result?: EphemeralTurnResult; error?: unknown }> | undefined;
+			try {
+				const definition = {
+					name: "Saved-history fixture",
+					reasoning: false,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+					contextWindow: 4096,
+					maxTokens: 1024,
+				};
+				modelRegistry.registerProvider(textProvider, {
+					api: "openai-responses",
+					baseUrl: "https://side-history.invalid/v1",
+					apiKey: "synthetic-history-key",
+					models: [
+						{ ...definition, id: "text-a", input: ["text"] },
+						{ ...definition, id: "text-b", input: ["text"] },
+					],
+				});
+				modelRegistry.registerProvider(visionProvider, {
+					api: visionApi,
+					baseUrl: "https://side-history-vision.invalid/v1",
+					apiKey: "synthetic-vision-key",
+					models: [{ ...definition, id: "vision", input: ["text", "image"] }],
+					streamSimple: (model, context, options) => {
+						visionRequests.push(structuredClone(context));
+						const index = visionRequests.length;
+						const stream = new AssistantMessageEventStream();
+						const finish = () => {
+							const message = {
+								...createAssistantMessage(index === 1 ? "A red square." : "A grey pixel."),
+								api: model.api,
+								provider: model.provider,
+								model: model.id,
+							};
+							stream.push({ type: "done", reason: "stop", message });
+						};
+						if (index === 1) {
+							firstDescriptionSignal = options?.signal;
+							entered.resolve();
+							void release.promise.then(finish);
+						} else {
+							queueMicrotask(finish);
+						}
+						return stream;
+					},
+				});
+				const initialModel = modelRegistry.find(textProvider, "text-a");
+				const replacementModel = modelRegistry.find(textProvider, "text-b");
+				if (!initialModel || !replacementModel) throw new Error("Missing text-only fixture models");
+				const agent = new Agent({
+					initialState: { model: initialModel, systemPrompt: ["system prompt"], tools: [], messages: [] },
+				});
+				session = new AgentSession({
+					agent,
+					sessionManager: SessionManager.create(tempDir.path(), tempDir.join("sessions")),
+					modelRegistry,
+					settings: Settings.isolated({
+						"compaction.enabled": false,
+						"images.describeForTextModels": true,
+						modelRoles: { vision: `${visionProvider}/vision` },
+					}),
+					sideStreamFn: (_model, context) => {
+						sideRequests.push(structuredClone(context));
+						const stream = new AssistantMessageEventStream();
+						queueMicrotask(() => {
+							const message = createAssistantMessage("Both described.");
+							stream.push({ type: "text_delta", contentIndex: 0, delta: "Both described.", partial: message });
+							stream.push({ type: "done", reason: "stop", message });
+						});
+						return stream;
+					},
+				});
+				const images: ImageContent[] = [
+					{
+						type: "image",
+						data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC",
+						mimeType: "image/png",
+					},
+					{
+						type: "image",
+						data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==",
+						mimeType: "image/png",
+					},
+				];
+				const history: Message[] = [
+					{ role: "user", content: [images[0]!], timestamp: 1 },
+					createAssistantMessage("First saved answer."),
+					{ role: "user", content: [images[1]!], timestamp: 2 },
+				];
+				const historySnapshot = structuredClone(history);
+				outcome = session
+					.runEphemeralTurn({ promptText: "Compare the saved images.", history, signal: caller.signal })
+					.then(
+						result => ({ result }),
+						error => ({ error }),
+					);
+				await entered.promise;
+				expect(visionRequests).toHaveLength(1);
+				if (change === "model change") agent.setModel(replacementModel);
+				if (change === "cancellation") caller.abort(new Error("Cancelled saved-history replay"));
+				release.resolve();
+				const completed = await outcome;
+				if (change === "unchanged owner") {
+					expect(completed.error).toBeUndefined();
+					expect(completed.result?.replyText).toBe("Both described.");
+					expect(visionRequests).toHaveLength(2);
+					expect(sideRequests).toHaveLength(1);
+					const outbound = JSON.stringify(sideRequests[0]!.messages);
+					expect(outbound).toContain("A red square.");
+					expect(outbound).toContain("A grey pixel.");
+					expect(outbound.indexOf("A red square.")).toBeLessThan(outbound.indexOf("A grey pixel."));
+				} else {
+					expect(completed.error).toBeInstanceOf(Error);
+					expect(visionRequests).toHaveLength(1);
+					expect(sideRequests).toEqual([]);
+				}
+				if (change === "cancellation") expect(firstDescriptionSignal?.aborted).toBe(true);
+				expect(history).toEqual(historySnapshot);
+				expect(agent.state.messages).toEqual([]);
+				expect(session.sessionManager.getEntries().filter(entry => entry.type === "message")).toEqual([]);
+			} finally {
+				release.resolve();
+				await outcome;
+				await session?.dispose();
+				modelRegistry.unregisterProvider(visionProvider);
+				modelRegistry.unregisterProvider(textProvider);
+				await authStorage.close();
+			}
+		},
+	);
+
 	it.each(["anthropic-messages", "ollama-chat", "openai-responses"])(
 		"encodes the output cap and omits tools in the %s HTTP request",
 		async api => {
@@ -1253,7 +1544,7 @@ describe("AgentSession message pipeline", () => {
 						...options,
 						apiKey: "test-key",
 						fetch: async (_url, init) => {
-							bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+							bodies.push(JSON.parse(requestBodyText(init) ?? "{}") as Record<string, unknown>);
 							// Exercise the real encoder but stop at the HTTP boundary, without inference.
 							return new Response(JSON.stringify({ error: { message: "Request captured" } }), { status: 400 });
 						},
@@ -1269,6 +1560,106 @@ describe("AgentSession message pipeline", () => {
 			else expect(bodies[0][api === "anthropic-messages" ? "max_tokens" : "max_output_tokens"]).toBe(321);
 		},
 	);
+
+	it("caches the persisted reply rather than the prediction-only prompt on Anthropic side turns", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		const { session, bodies } = capturingAnthropicSideSession(model);
+		await expect(session.runEphemeralTurn({ promptText: "Predict the next user message." })).rejects.toThrow();
+		expect(bodies).toHaveLength(1);
+		const cached = bodies[0].messages.flatMap((message, index) =>
+			Array.isArray(message.content) && message.content.some(block => block.cache_control != null) ? [index] : [],
+		);
+		// The side-only reminder and prediction prompt are absent from the next real turn.
+		expect(cached.filter(index => index >= 1)).toEqual([1]);
+	});
+
+	it("caches reusable /btw topic history through its latest side question", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		const { session, bodies } = capturingAnthropicSideSession(model);
+		await expect(
+			session.runEphemeralTurn({ promptText: "First question", conversationKey: "btw:topic" }),
+		).rejects.toThrow();
+		await expect(
+			session.runEphemeralTurn({
+				promptText: "Follow-up",
+				conversationKey: "btw:topic",
+				history: [
+					{ role: "user", content: [{ type: "text", text: "First question" }], timestamp: 2 },
+					{ ...createAssistantMessage("First answer"), model: model.id },
+				],
+			}),
+		).rejects.toThrow();
+
+		expect(bodies).toHaveLength(2);
+		expect(
+			bodies.map(body => {
+				const content = body.messages.at(-1)?.content;
+				return Array.isArray(content) && content.some(block => block.cache_control != null);
+			}),
+		).toEqual([true, true]);
+		const [firstWire, nextWire] = [bodies[0].messages, bodies[1].messages.slice(0, bodies[0].messages.length)].map(
+			messages => JSON.stringify(messages, (key, value) => (key === "cache_control" ? undefined : value)),
+		);
+		expect(nextWire).toEqual(firstWire);
+	});
+
+	it("does not cache keyed side history beyond regenerated image descriptions", async () => {
+		const describe = vi
+			.spyOn(imageVisionFallback, "describeAttachedImagesForTextModel")
+			.mockResolvedValueOnce([{ type: "text", text: "A red square." }])
+			.mockResolvedValueOnce([{ type: "text", text: "A blue square." }]);
+		const model = buildModel({
+			id: "text-only-side-test",
+			name: "Text Only",
+			api: "anthropic-messages",
+			provider: "anthropic",
+			baseUrl: "https://api.anthropic.com",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 200_000,
+			maxTokens: 8192,
+		});
+		const { session, bodies } = capturingAnthropicSideSession(model);
+		const image: ImageContent = { type: "image", data: "c2NyZWVuc2hvdA==", mimeType: "image/png" };
+		const stableHistory: Message[] = [
+			{ role: "user", content: [{ type: "text", text: "First question" }], timestamp: 1 },
+			{ ...createAssistantMessage("First answer"), model: model.id },
+		];
+		await expect(
+			session.runEphemeralTurn({
+				promptText: "Which color?",
+				promptImages: [image],
+				conversationKey: "btw:topic",
+				history: stableHistory,
+			}),
+		).rejects.toThrow();
+		await expect(
+			session.runEphemeralTurn({
+				promptText: "What next?",
+				conversationKey: "btw:topic",
+				history: [
+					...stableHistory,
+					{ role: "user", content: [{ type: "text", text: "Which color?" }, image], timestamp: 2 },
+					{ ...createAssistantMessage("Red"), model: model.id },
+				],
+			}),
+		).rejects.toThrow();
+
+		expect(describe).toHaveBeenCalledTimes(2);
+		expect(bodies).toHaveLength(2);
+		for (const [index, body] of bodies.entries()) {
+			const description = index === 0 ? "A red square." : "A blue square.";
+			const noticeIndex = body.messages.findIndex(message => JSON.stringify(message.content).includes(description));
+			const cached = body.messages.flatMap((message, index) =>
+				Array.isArray(message.content) && message.content.some(block => block.cache_control != null) ? [index] : [],
+			);
+			expect(noticeIndex).toBeGreaterThan(1);
+			expect(cached).toContain(1);
+			expect(cached.some(index => index > 1 && index < noticeIndex)).toBe(true);
+			expect(cached.every(index => index < noticeIndex)).toBe(true);
+		}
+	});
 
 	it.each([
 		...(["openai-codex", "custom"] as const).map(
@@ -1479,7 +1870,7 @@ describe("AgentSession message pipeline", () => {
 						...options,
 						apiKey: "test-key",
 						fetch: async (_url, init) => {
-							bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+							bodies.push(JSON.parse(requestBodyText(init) ?? "{}") as Record<string, unknown>);
 							return new Response(JSON.stringify({ error: { message: "Request captured" } }), { status: 400 });
 						},
 					}),
@@ -1493,7 +1884,10 @@ describe("AgentSession message pipeline", () => {
 			const history = (body: Record<string, unknown>) =>
 				(body.messages as { role: string; content: unknown }[]).slice(0, 2).map(({ role, content }) => ({
 					role,
-					content: JSON.stringify(content).replaceAll(',"cache_control":{"type":"ephemeral"}', ""),
+					content: JSON.stringify(
+						typeof content === "string" ? [{ type: "text", text: content }] : content,
+						(key, value) => (key === "cache_control" ? undefined : value),
+					),
 				}));
 			// Cache keys: tools, system, thinking, top-level effort, and the history before the side prompt.
 			for (const key of ["tools", "system", "thinking", "output_config"]) expect(minimized[key]).toEqual(plain[key]);
@@ -2258,7 +2652,7 @@ describe("AgentSession message pipeline", () => {
 			]);
 		} finally {
 			await session.dispose();
-			authStorage.close();
+			await authStorage.close();
 		}
 	});
 	it("rewrites finalized assistant text before it reaches history and session persistence", async () => {
@@ -2325,7 +2719,7 @@ describe("AgentSession message pipeline", () => {
 			expect(persisted.message.content).toEqual([{ type: "text", text: "original rewritten" }]);
 		} finally {
 			await session.dispose();
-			authStorage.close();
+			await authStorage.close();
 		}
 	});
 	it("retains completed assistant text in history when aborted during a pending rewrite", async () => {
@@ -2408,7 +2802,7 @@ describe("AgentSession message pipeline", () => {
 		} finally {
 			release.resolve();
 			await session.dispose();
-			authStorage.close();
+			await authStorage.close();
 		}
 	});
 	it("applies a tool_call input revision at arg-prep time across events, execution, and history", async () => {
@@ -2513,7 +2907,7 @@ describe("AgentSession message pipeline", () => {
 			expect(text).not.toContain("original");
 		} finally {
 			await session.dispose();
-			authStorage.close();
+			await authStorage.close();
 		}
 	});
 	it.each([
@@ -2637,7 +3031,7 @@ describe("AgentSession message pipeline", () => {
 				}
 			} finally {
 				await session.dispose();
-				authStorage.close();
+				await authStorage.close();
 			}
 		},
 	);
@@ -2761,7 +3155,7 @@ describe("AgentSession message pipeline", () => {
 			]);
 		} finally {
 			await session.dispose();
-			authStorage.close();
+			await authStorage.close();
 		}
 	});
 	it("exposes ctx.invokeTool to a re-registered built-in so it can delegate to the native tool", async () => {
@@ -2860,7 +3254,7 @@ describe("AgentSession message pipeline", () => {
 			expect(delegatedText).not.toContain("from-model");
 		} finally {
 			await session.dispose();
-			authStorage.close();
+			await authStorage.close();
 		}
 	});
 
@@ -2958,7 +3352,7 @@ describe("AgentSession message pipeline", () => {
 			expect(persisted?.content).toEqual(expected);
 		} finally {
 			await session.dispose();
-			authStorage.close();
+			await authStorage.close();
 		}
 	});
 
@@ -3073,7 +3467,7 @@ describe("AgentSession message pipeline", () => {
 			expect(delegatedText).not.toContain("from-model");
 		} finally {
 			await session.dispose();
-			authStorage.close();
+			await authStorage.close();
 		}
 	});
 
@@ -3168,7 +3562,7 @@ describe("AgentSession message pipeline", () => {
 			expect(text?.type === "text" ? text.text : "").toBe("custom-web-search-result");
 		} finally {
 			await session.dispose();
-			authStorage.close();
+			await authStorage.close();
 		}
 	});
 
@@ -3261,6 +3655,7 @@ describe("AgentSession message pipeline", () => {
 				resetConversationTracking() {
 					remembered = false;
 				},
+				async consolidate() {},
 				async dispose() {},
 			} as unknown as MnemopiSessionState);
 
@@ -3359,6 +3754,7 @@ describe("AgentSession message pipeline", () => {
 			resetConversationTracking() {
 				remembered = false;
 			},
+			async consolidate() {},
 			async dispose() {},
 		} as unknown as MnemopiSessionState);
 
@@ -3457,6 +3853,7 @@ describe("AgentSession message pipeline", () => {
 				resetConversationTracking() {
 					remembered = false;
 				},
+				async consolidate() {},
 				async dispose() {},
 			} as unknown as MnemopiSessionState);
 

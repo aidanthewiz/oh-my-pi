@@ -20,6 +20,7 @@
  * - agent://<id>?q=<query> - JSON extraction with jq-style field syntax
  *   (`agent://Parent.Child?q=.reports[0].data`)
  */
+import { statSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
@@ -33,6 +34,7 @@ import agentPromptDoc from "../prompts/internal-urls/agent.md" with { type: "tex
 import agentProgressTemplate from "../prompts/tools/agent-url-progress.md" with { type: "text" };
 import agentSupersededTemplate from "../prompts/tools/agent-url-superseded.md" with { type: "text" };
 import { loadSessionMessagesReadOnly } from "../session/session-loader";
+import { artifactFileGeneration, parseStructuredArtifactSidecar } from "../session/artifacts";
 import { artifactsDirsFromRegistry } from "./registry-helpers";
 import type {
 	InternalResource,
@@ -166,8 +168,12 @@ export class AgentProtocolHandler implements ProtocolHandler {
 		const outputId = url.rawHost || url.hostname;
 		if (!outputId) throw new Error("agent:// URL requires an output ID: agent://<id>");
 		if (outputId === "all" || hasPathExtraction(url) || url.searchParams.has("q")) return null;
-		if (isSuperseded(context?.agentRegistry ?? context?.session?.agentRegistry ?? AgentRegistry.global(), outputId))
+		if (
+			!context?.session?.seanceSourceArtifactsDir &&
+			isSuperseded(context?.agentRegistry ?? context?.session?.agentRegistry ?? AgentRegistry.global(), outputId)
+		) {
 			return null;
+		}
 		const dirs = await this.#outputDirs(context);
 		if (dirs.length === 0) return null;
 		return (await this.#findOutput(dirs, outputId)).foundPath ?? null;
@@ -191,13 +197,15 @@ export class AgentProtocolHandler implements ProtocolHandler {
 		if (hasPathExtraction(url)) {
 			throw new Error("agent:// message target cannot have a JSON-path suffix.");
 		}
+		const progress = url.searchParams.has("progress");
+		if (progress && to === "all") throw new Error("agent://all broadcasts cannot be ?progress updates.");
 		if (!content.trim()) throw new Error("agent:// messages require non-empty content.");
 		const deliverySignal = context?.signal
 			? AbortSignal.any([context.signal, AbortSignal.timeout(120_000)])
 			: AbortSignal.timeout(120_000);
 		const result = await executeSend(
 			{ registry, senderId, sessionFileHint: session.getSessionFile?.(), signal: deliverySignal },
-			{ to, message: content },
+			{ to, message: content, progress },
 		);
 		return {
 			content: [
@@ -227,19 +235,22 @@ export class AgentProtocolHandler implements ProtocolHandler {
 
 		const dirs = await this.#outputDirs(context);
 		const scan = dirs.length > 0 ? await this.#findOutput(dirs, outputId) : undefined;
-		const registry = context?.agentRegistry ?? context?.session?.agentRegistry ?? AgentRegistry.global();
+		const registry = context?.session?.seanceSourceArtifactsDir
+			? undefined
+			: (context?.agentRegistry ?? context?.session?.agentRegistry ?? AgentRegistry.global());
 		if (!scan?.foundPath) {
 			// No published output yet. A registered agent (running, idle after a
 			// non-terminal yield, or parked before publishing) is the same
 			// registry `write agent://<id>` delivers to: answer with its progress.
-			const ref = registry.get(outputId);
+			const ref = registry?.get(outputId);
 			if (ref && ref.kind !== "advisor") return this.#resolveProgress(url, ref, extraction);
 			if (!scan) throw new Error("No session - agent outputs unavailable");
 			if (!scan.anyDirExists) throw new Error("No artifacts directory found");
-			const registered = registry
-				.list()
-				.filter(candidate => candidate.kind !== "advisor")
-				.map(candidate => candidate.id);
+			const registered =
+				registry
+					?.list()
+					.filter(candidate => candidate.kind !== "advisor")
+					.map(candidate => candidate.id) ?? [];
 			throw notFoundError(outputId, [...scan.availableIds, ...registered]);
 		}
 
@@ -252,13 +263,26 @@ export class AgentProtocolHandler implements ProtocolHandler {
 			}
 		});
 
-		const rawContent = await Bun.file(scan.foundPath).text();
+		const primary = await fs.open(scan.foundPath, "r");
+		let snapshot: { content: string; generation: string; ctime: bigint };
+		try {
+			const before = await primary.stat({ bigint: true });
+			const generation = artifactFileGeneration(before);
+			const content = await primary.readFile("utf8");
+			const after = await primary.stat({ bigint: true });
+			if (artifactFileGeneration(after) !== generation || after.ctimeNs !== before.ctimeNs)
+				throw new Error(`Output ${outputId} changed while reading`);
+			snapshot = { content, generation, ctime: after.ctimeNs };
+		} finally {
+			await primary.close();
+		}
+		const rawContent = snapshot.content;
 		const notes: string[] = [];
 		let content = rawContent;
 		// A published file belongs to a finished run. If the agent is streaming
 		// again (follow-up or IRC wake), the file is the previous run's result;
 		// unmarked, a reader takes it as the current state.
-		if (isSuperseded(registry, outputId)) {
+		if (registry && isSuperseded(registry, outputId)) {
 			if (!extraction && !hasQueryExtraction) {
 				const publishedAt = (await fs.stat(scan.foundPath)).mtimeMs;
 				content = `${prompt.render(agentSupersededTemplate, {
@@ -271,16 +295,33 @@ export class AgentProtocolHandler implements ProtocolHandler {
 		let contentType: InternalResource["contentType"] = "text/markdown";
 
 		let extractedFrom = scan.foundPath;
+		let sidecarSnapshot: { generation: string; ctime: bigint } | undefined;
 		if (extraction || hasQueryExtraction) {
 			let jsonValue: unknown;
 			let parsed = false;
 			if (scan.jsonPath) {
 				try {
-					jsonValue = JSON.parse(await Bun.file(scan.jsonPath).text());
-					extractedFrom = scan.jsonPath;
-					parsed = true;
+					const sidecar = await fs.open(scan.jsonPath, "r");
+					try {
+						const before = await sidecar.stat({ bigint: true });
+						const generation = artifactFileGeneration(before);
+						const envelope = parseStructuredArtifactSidecar(await sidecar.readFile("utf8"), snapshot.generation);
+						const after = await sidecar.stat({ bigint: true });
+						if (
+							artifactFileGeneration(after) === generation &&
+							after.ctimeNs === before.ctimeNs &&
+							envelope !== undefined
+						) {
+							jsonValue = envelope.data;
+							extractedFrom = scan.jsonPath;
+							sidecarSnapshot = { generation, ctime: after.ctimeNs };
+							parsed = true;
+						}
+					} finally {
+						await sidecar.close();
+					}
 				} catch {
-					// Corrupt or partially written sidecar: fall back to <id>.md.
+					// Invalid or stale optional data cannot override the primary artifact.
 				}
 			}
 			if (!parsed) {
@@ -309,6 +350,17 @@ export class AgentProtocolHandler implements ProtocolHandler {
 			}
 			notes.push(`Extracted: ${hasQueryExtraction ? queryParam : `/${decodedSegments.join("/")}`}`);
 			if (parsed) notes.push(`Source: ${path.basename(extractedFrom!)}`);
+		}
+		const currentPrimary = statSync(scan.foundPath, { bigint: true });
+		if (artifactFileGeneration(currentPrimary) !== snapshot.generation || currentPrimary.ctimeNs !== snapshot.ctime)
+			throw new Error(`Output ${outputId} changed while reading`);
+		if (sidecarSnapshot && scan.jsonPath) {
+			const currentSidecar = statSync(scan.jsonPath, { bigint: true });
+			if (
+				artifactFileGeneration(currentSidecar) !== sidecarSnapshot.generation ||
+				currentSidecar.ctimeNs !== sidecarSnapshot.ctime
+			)
+				throw new Error(`Output ${outputId} structured data changed while reading`);
 		}
 
 		return {
@@ -375,6 +427,9 @@ export class AgentProtocolHandler implements ProtocolHandler {
 	 * pre-existing global scan untouched.
 	 */
 	async #outputDirs(context: ResolveContext | undefined): Promise<string[]> {
+		// A seance reads the consulted source's agent outputs in place, nothing else.
+		const seanceDir = context?.session?.seanceSourceArtifactsDir;
+		if (seanceDir) return [seanceDir];
 		const rootSessionFile = context?.sessionFile
 			? await ensurePersistedRoster(AgentRegistry.global(), context.sessionFile)
 			: undefined;
@@ -422,9 +477,10 @@ export class AgentProtocolHandler implements ProtocolHandler {
 		return { foundPath, jsonPath, anyDirExists, availableIds };
 	}
 
-	async complete(): Promise<UrlCompletion[]> {
+	async complete(_query?: string, context?: ResolveContext): Promise<UrlCompletion[]> {
 		const ids = new Set<string>();
-		for (const dir of artifactsDirsFromRegistry()) {
+		const seanceDir = context?.session?.seanceSourceArtifactsDir ?? context?.seanceSourceArtifactsDir;
+		for (const dir of seanceDir ? [seanceDir] : artifactsDirsFromRegistry()) {
 			let files: string[];
 			try {
 				files = await fs.readdir(dir);

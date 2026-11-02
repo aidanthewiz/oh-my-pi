@@ -28,7 +28,7 @@ afterEach(async () => {
 	else Bun.env.PI_NO_TITLE = previousNoTitle;
 	vi.restoreAllMocks();
 	await session?.dispose();
-	authStorage?.close();
+	await authStorage?.close();
 	session = undefined;
 	authStorage = undefined;
 });
@@ -38,6 +38,8 @@ afterEach(async () => {
  * title model takes over (the path these tests cover).
  */
 const declineTitleFork = createMockModel({ handler: { content: ["<title/>"] } }).stream;
+
+const PLAIN_TITLES = { "title.generator": "tiny" };
 
 /** Assistant reply long enough (>= 40 words) to trigger a deferred retitle. */
 const TOKENIZER_REPLY =
@@ -171,6 +173,7 @@ describe("AgentSession title generation disposal", () => {
 		const settings = Settings.isolated({
 			"compaction.enabled": false,
 			modelRoles: { tiny: `${model.provider}/${model.id}` },
+			...PLAIN_TITLES,
 		});
 		const agent = new Agent({
 			getApiKey: () => "test-key",
@@ -233,6 +236,7 @@ describe("AgentSession title generation disposal", () => {
 		const settings = Settings.isolated({
 			"compaction.enabled": false,
 			modelRoles: { tiny: `${model.provider}/${model.id}` },
+			...PLAIN_TITLES,
 		});
 		const agent = new Agent({
 			getApiKey: () => "test-key",
@@ -275,6 +279,7 @@ describe("AgentSession title generation disposal", () => {
 		const settings = Settings.isolated({
 			"compaction.enabled": false,
 			modelRoles: { tiny: `${model.provider}/${model.id}` },
+			...PLAIN_TITLES,
 		});
 		const agent = new Agent({
 			getApiKey: () => "test-key",

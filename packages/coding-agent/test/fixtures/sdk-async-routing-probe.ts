@@ -194,5 +194,5 @@ try {
 	await AgentLifecycleManager.global().dispose();
 	for (const session of sessions.toReversed()) await session.dispose();
 	unregisterCustomApis("repro-sdk-async-routing");
-	auth.close();
+	await auth.close();
 }

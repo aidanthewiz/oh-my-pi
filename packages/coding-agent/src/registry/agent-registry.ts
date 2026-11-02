@@ -11,6 +11,7 @@
 
 import { logger } from "@oh-my-pi/pi-utils";
 import type { AgentSession } from "../session/agent-session";
+import { AgentAwaits } from "./agent-awaits";
 import { oneLineLabel } from "@oh-my-pi/pi-tui/tools/task";
 
 import { MAIN_AGENT_ID, type AgentStatus, type AgentMetricsSummary } from "@oh-my-pi/pi-tui/overlays/agent-hub-types";
@@ -83,6 +84,16 @@ export interface AgentRef {
 
 export type AgentRefExpectation = AgentRef | AgentSession;
 
+/**
+ * Whether messaging `ref` resumes it: a live `idle` agent, or a `parked` or
+ * killed one whose transcript is on disk. Task summaries use it to tell the
+ * parent to resume a stopped agent instead of redoing its work.
+ */
+export function isResumable(ref: AgentRef | undefined): boolean {
+	if (ref?.status === "idle") return true;
+	return (ref?.status === "parked" || ref?.status === "aborted") && ref.sessionFile !== null;
+}
+
 export type RegistryEvent =
 	| { type: "registered"; ref: AgentRef }
 	| { type: "status_changed"; ref: AgentRef }
@@ -128,6 +139,24 @@ export class AgentRegistry {
 
 	readonly #refs = new Map<string, AgentRef>();
 	readonly #listeners = new Set<RegistryListener>();
+	readonly #awaitIdentities = new Map<string, { sessionId?: string }>();
+	/** Which of these agents are blocked until others finish. */
+	readonly awaits = new AgentAwaits(id => this.#awaitIdentity(id));
+
+	#awaitIdentity(id: string): object {
+		const sessionId = this.#refs.get(id)?.session?.sessionManager?.getSessionId();
+		let identity = this.#awaitIdentities.get(id);
+		if (
+			!identity ||
+			(sessionId !== undefined && identity.sessionId !== undefined && identity.sessionId !== sessionId)
+		) {
+			identity = { sessionId };
+			this.#awaitIdentities.set(id, identity);
+		} else if (sessionId !== undefined) {
+			identity.sessionId = sessionId;
+		}
+		return identity;
+	}
 
 	#matchesExpected(ref: AgentRef, expected?: AgentRefExpectation): boolean {
 		return expected === undefined || ref === expected || ref.session === expected;
@@ -139,6 +168,7 @@ export class AgentRegistry {
 	}
 
 	register(input: RegisterInput): AgentRef {
+		if (this.#refs.has(input.id)) this.#awaitIdentities.delete(input.id);
 		const now = Date.now();
 		const ref: AgentRef = {
 			id: input.id,
@@ -169,6 +199,29 @@ export class AgentRegistry {
 		const current = this.#refs.get(input.id);
 		if (expected === null) return current ? undefined : this.register(input);
 		return current === expected && current.status === "parked" && !current.session ? current : undefined;
+	}
+
+	/**
+	 * Start a fresh `parked` generation for a killed (`aborted`, detached) ref so
+	 * {@link AgentLifecycleManager.ensureLive} can rebuild it from its transcript.
+	 * The killed ref object is retired, not mutated, so delayed work bound to it
+	 * still fails every expected-ref check. Returns undefined when `expected` is
+	 * no longer this id's detached tombstone.
+	 */
+	reopen(id: string, expected: AgentRef): AgentRef | undefined {
+		const current = this.#refs.get(id);
+		if (current !== expected || current.status !== "aborted" || current.session) return undefined;
+		return this.register({
+			id,
+			displayName: current.displayName,
+			kind: current.kind,
+			parentId: current.parentId,
+			session: null,
+			sessionFile: current.sessionFile,
+			status: "parked",
+			createdAt: current.createdAt,
+			history: current.history,
+		});
 	}
 
 	/** Attach transcript-derived identity and telemetry without changing lifecycle state. */
@@ -205,14 +258,16 @@ export class AgentRegistry {
 		if (!this.#matchesExpected(ref, expected)) {
 			return this.#rejectStatusUpdate(id, status, "session-ownership-changed");
 		}
-		// `aborted` is terminal: delayed progress/revival work from the killed
-		// generation must never transition the tombstone back to a live status.
+		// `aborted` is terminal for its generation: delayed progress/revival work
+		// from the killed ref must never transition it back to a live status. A
+		// deliberate revival goes through `reopen`, which mints a new ref.
 		if (ref.status === "aborted") {
 			return status === "aborted" || this.#rejectStatusUpdate(id, status, "aborted-is-terminal");
 		}
 		if (ref.status === status) return true;
 		const leftRunning = ref.status === "running";
 		ref.status = status;
+		if (status === "aborted") this.#awaitIdentities.delete(id);
 		// Activity describes current work; it is meaningless once the agent
 		// leaves `running`, so drop it to avoid showing stale work in rosters.
 		if (status !== "running") ref.activity = undefined;
@@ -332,6 +387,7 @@ export class AgentRegistry {
 		const ref = this.#refs.get(id);
 		if (!ref || !this.#matchesExpected(ref, expected)) return false;
 		this.#refs.delete(id);
+		this.#awaitIdentities.delete(id);
 		this.#emit({ type: "removed", ref });
 		return true;
 	}

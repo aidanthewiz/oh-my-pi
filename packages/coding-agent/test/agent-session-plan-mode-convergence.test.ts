@@ -114,8 +114,8 @@ describe("AgentSession plan-mode convergence", () => {
 		modelRegistry = new ModelRegistry(authStorage, authDir.join("models.yml"));
 	});
 
-	afterAll(() => {
-		authStorage.close();
+	afterAll(async () => {
+		await authStorage.close();
 		authDir.removeSync();
 	});
 

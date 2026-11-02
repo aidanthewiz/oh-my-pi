@@ -1,6 +1,7 @@
 import { describe, expect, it, type Mock, vi } from "bun:test";
 import { InputController } from "@oh-my-pi/pi-coding-agent/modes/controllers/input-controller";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
+import { createSessionDefaults } from "./helpers/session-defaults";
 type Spy = Mock<(...args: unknown[]) => unknown>;
 
 function createLoopContext(options: {
@@ -40,6 +41,8 @@ function createLoopContext(options: {
 		editor,
 		ui: { requestRender: vi.fn() },
 		session: {
+			...createSessionDefaults(),
+			sessionId: "loop-main",
 			isStreaming: options.isStreaming,
 			isCompacting: options.isCompacting ?? false,
 			isBashRunning: false,

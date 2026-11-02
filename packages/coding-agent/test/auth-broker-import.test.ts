@@ -229,7 +229,7 @@ describe("auth-broker import (broker-routed)", () => {
 
 	afterEach(async () => {
 		await handle?.close();
-		brokerStorage?.close();
+		await brokerStorage?.close();
 		brokerStore?.close();
 		await removeWithRetries(agentDir);
 		await removeWithRetries(brokerAgentDir);

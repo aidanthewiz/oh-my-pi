@@ -81,11 +81,16 @@ function weakRefToLiveSession(id: string): WeakRef<AgentSession> {
 	return new WeakRef(session);
 }
 
+function collectionPass(ref: WeakRef<object>): boolean {
+	Bun.gc(true);
+	return ref.deref() === undefined;
+}
+
 async function collected(ref: WeakRef<object>, deadlineMs: number): Promise<boolean> {
 	const deadline = Date.now() + deadlineMs;
 	for (;;) {
-		Bun.gc(true);
-		if (ref.deref() === undefined) return true;
+		// Keep the dereferenced target out of the suspended polling frame.
+		if (collectionPass(ref)) return true;
 		if (Date.now() > deadline) return false;
 		await Bun.sleep(100);
 	}
@@ -100,7 +105,7 @@ function writeAndObserveLiveSettings(id: string): WeakRef<Settings> {
 }
 
 /** Runs `AGENT_ID` to a finished keep-alive state; `release` drops the mock's session-bound recordings. */
-async function runKeptAliveSubagent(): Promise<{ release(): void; close(): void }> {
+async function runKeptAliveSubagent(): Promise<{ release(): void; close(): Promise<void> }> {
 	// Under the isolated HOME: project discovery walks up from cwd and stops at os.homedir(). On Windows
 	// os.tmpdir() lives under the real home, so a cwd outside the fake HOME would walk into the real
 	// ~/.omp and load the developer's installed plugins as project plugins.
@@ -150,7 +155,8 @@ async function runKeptAliveSubagent(): Promise<{ release(): void; close(): void 
 		});
 		expect(result.exitCode).toBe(0);
 	} catch (error) {
-		authStorage.close();
+		await AgentLifecycleManager.global().dispose();
+		await authStorage.close();
 		throw error;
 	}
 	return {
@@ -159,7 +165,10 @@ async function runKeptAliveSubagent(): Promise<{ release(): void; close(): void 
 			mock.reset();
 			availableSpy.mockRestore();
 		},
-		close: () => authStorage.close(),
+		close: async () => {
+			await AgentLifecycleManager.global().dispose();
+			await authStorage.close();
+		},
 	};
 }
 
@@ -176,7 +185,7 @@ it("releases a parked keep-alive subagent's session while the agent stays reviva
 		// Still adopted after collection: the release did not come from dropping the reviver.
 		expect(AgentLifecycleManager.global().has(AGENT_ID)).toBe(true);
 	} finally {
-		run.close();
+		await run.close();
 	}
 }, 30_000);
 
@@ -195,6 +204,6 @@ it("parks without retaining the run's settings overlay and revives with the sett
 		const revived = await AgentLifecycleManager.global().ensureLive(AGENT_ID);
 		expect(cfgContextPromotionEnabled.get(revived)).toBe(true);
 	} finally {
-		run.close();
+		await run.close();
 	}
 }, 30_000);

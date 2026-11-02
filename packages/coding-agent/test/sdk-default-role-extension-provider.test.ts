@@ -31,9 +31,9 @@ describe("issue #3569 fresh launch default role from extension provider", () => 
 		fs.mkdirSync(tempDir, { recursive: true });
 	});
 
-	afterEach(() => {
+	afterEach(async () => {
 		for (const authStorage of authStoragesToClose) {
-			authStorage.close();
+			await authStorage.close();
 		}
 		authStoragesToClose.length = 0;
 		if (tempDir && fs.existsSync(tempDir)) {

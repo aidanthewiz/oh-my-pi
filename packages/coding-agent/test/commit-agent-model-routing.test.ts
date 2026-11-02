@@ -15,8 +15,8 @@ import * as vcs from "@oh-my-pi/pi-natives/vcs";
 
 let authStorage: AuthStorage | undefined;
 
-afterEach(() => {
-	authStorage?.close();
+afterEach(async () => {
+	await authStorage?.close();
 	authStorage = undefined;
 	vi.restoreAllMocks();
 });

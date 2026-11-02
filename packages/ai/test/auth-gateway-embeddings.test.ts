@@ -96,7 +96,7 @@ async function boot(trustProxyHeaders = false): Promise<Harness> {
 async function close(harness: Harness | undefined): Promise<void> {
 	if (!harness) return;
 	await harness.handle.close();
-	harness.storage.close();
+	await harness.storage.close();
 	await fs.rm(harness.dir, { recursive: true, force: true });
 }
 

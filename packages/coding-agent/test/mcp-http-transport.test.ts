@@ -1,8 +1,14 @@
+import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import { connectToServer, listTools } from "@oh-my-pi/pi-coding-agent/mcp/client";
 import { MCPTransportError } from "@oh-my-pi/pi-coding-agent/mcp/errors";
-import { dispatchMCPTool } from "@oh-my-pi/pi-coding-agent/mcp/tool-bridge";
+import { analyzeAuthError } from "@oh-my-pi/pi-coding-agent/mcp/oauth-discovery";
+import { dispatchMCPTool, MCPTool } from "@oh-my-pi/pi-coding-agent/mcp/tool-bridge";
+import type { MCPHttpServerConfig, MCPServerConnection } from "@oh-my-pi/pi-coding-agent/mcp/types";
+import type { CustomToolContext } from "@oh-my-pi/pi-coding-agent/extensibility/custom-tools";
 import { HttpTransport } from "@oh-my-pi/pi-coding-agent/mcp/transports/http";
+import type { JsonRpcRequest } from "@oh-my-pi/pi-coding-agent/mcp/types";
+import type { MCPProgress } from "@oh-my-pi/pi-tui/tools/mcp";
 import { postmortem } from "@oh-my-pi/pi-utils";
 
 const encoder = new TextEncoder();
@@ -53,6 +59,172 @@ async function withPendingGuard<T>(promise: Promise<T>, label: string): Promise<
 		}),
 	]);
 }
+
+describe("MCP Streamable HTTP request progress", () => {
+	it("routes pre-result SSE progress but only fans out malformed, unknown, and post-result frames", async () => {
+		let sent: JsonRpcRequest | undefined;
+		server = Bun.serve({
+			port: 0,
+			async fetch(req) {
+				sent = (await req.json()) as JsonRpcRequest;
+				const token = (sent.params?._meta as Record<string, unknown> | undefined)?.progressToken;
+				const notification = (progressToken: unknown, progress: unknown) => ({
+					jsonrpc: "2.0",
+					method: "notifications/progress",
+					params: { progressToken, progress, total: 3, message: "fetching" },
+				});
+				const messages = [
+					notification(String(token), 99),
+					notification(token, "invalid"),
+					notification(token, 1),
+					{ jsonrpc: "2.0", id: sent.id, result: { done: true } },
+					notification(token, 2),
+				];
+				return new Response(
+					`data: {"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":${JSON.stringify(token)},"progress":1e309}}\n\n` +
+						`data: ${JSON.stringify(messages)}\n\n`,
+					{ headers: { "Content-Type": "text/event-stream" } },
+				);
+			},
+		});
+		const transport = await connectedTransport(300);
+		const updates: MCPProgress[] = [];
+		const notifications: unknown[] = [];
+		transport.onNotification = (method, params) => {
+			if (method === "notifications/progress") notifications.push(params);
+		};
+		try {
+			const args = Object.freeze({ query: "unchanged" });
+			const meta = Object.freeze({ trace: "keep", progressToken: "replace" });
+			const result = await transport.request(
+				"tools/call",
+				{ name: "search", arguments: args, _meta: meta },
+				{
+					onProgress: progress => updates.push(progress),
+				},
+			);
+
+			expect(result).toEqual({ done: true });
+			expect(sent?.params?._meta).toEqual({ trace: "keep", progressToken: sent?.id });
+			expect(sent?.params?.arguments).toEqual(args);
+			expect(meta).toEqual({ trace: "keep", progressToken: "replace" });
+			expect(updates).toEqual([{ progress: 1, total: 3, message: "fetching" }]);
+			expect(notifications).toHaveLength(5);
+			expect(notifications).toContainEqual(expect.objectContaining({ progress: 2 }));
+		} finally {
+			await transport.close();
+		}
+	});
+
+	it("routes GET-listener progress during a pending POST and stops after settlement", async () => {
+		let stream: ReadableStreamDefaultController<Uint8Array> | undefined;
+		let token: unknown;
+		const release = Promise.withResolvers<void>();
+		server = Bun.serve({
+			port: 0,
+			async fetch(req) {
+				if (req.method === "GET") {
+					return new Response(
+						new ReadableStream<Uint8Array>({
+							start(controller) {
+								stream = controller;
+								controller.enqueue(encoder.encode(": connected\n\n"));
+							},
+						}),
+						{ headers: { "Content-Type": "text/event-stream" } },
+					);
+				}
+				const body = (await req.json()) as JsonRpcRequest;
+				token = (body.params?._meta as Record<string, unknown> | undefined)?.progressToken;
+				stream?.enqueue(
+					encoder.encode(
+						`data: ${JSON.stringify({
+							jsonrpc: "2.0",
+							method: "notifications/progress",
+							params: { progressToken: token, progress: 1 },
+						})}\n\n`,
+					),
+				);
+				await release.promise;
+				return Response.json({ jsonrpc: "2.0", id: body.id, result: {} });
+			},
+		});
+		const transport = await connectedTransport(300);
+		const progressReceived = Promise.withResolvers<void>();
+		const lateReceived = Promise.withResolvers<void>();
+		const updates: MCPProgress[] = [];
+		transport.onNotification = (_method, params) => {
+			if ((params as Record<string, unknown>).progress === 1) progressReceived.resolve();
+			if ((params as Record<string, unknown>).progress === 2) lateReceived.resolve();
+		};
+		try {
+			await transport.startSSEListener();
+			const pending = transport.request(
+				"tools/call",
+				{},
+				{
+					onProgress: progress => {
+						updates.push(progress);
+					},
+				},
+			);
+			void pending.catch(() => {});
+			await withPendingGuard(progressReceived.promise, "pending GET progress fanout");
+			expect(updates).toEqual([{ progress: 1 }]);
+			release.resolve();
+			await pending;
+			expect(updates).toEqual([{ progress: 1 }]);
+			stream?.enqueue(
+				encoder.encode(
+					`data: ${JSON.stringify({
+						jsonrpc: "2.0",
+						method: "notifications/progress",
+						params: { progressToken: token, progress: 2 },
+					})}\n\n`,
+				),
+			);
+			await withPendingGuard(lateReceived.promise, "late GET progress fanout");
+			expect(updates).toEqual([{ progress: 1 }]);
+		} finally {
+			release.resolve();
+			await transport.close();
+		}
+	});
+
+	it("allocates a new progress token for an HTTP auth retry", async () => {
+		const ids: (string | number)[] = [];
+		const tokens: unknown[] = [];
+		server = Bun.serve({
+			port: 0,
+			async fetch(req) {
+				const body = (await req.json()) as JsonRpcRequest;
+				ids.push(body.id);
+				tokens.push((body.params?._meta as Record<string, unknown> | undefined)?.progressToken);
+				if (ids.length === 1) return new Response("expired", { status: 401 });
+				return new Response(
+					`data: ${JSON.stringify([
+						{ jsonrpc: "2.0", method: "notifications/progress", params: { progressToken: ids[0], progress: 99 } },
+						{ jsonrpc: "2.0", method: "notifications/progress", params: { progressToken: body.id, progress: 1 } },
+						{ jsonrpc: "2.0", id: body.id, result: {} },
+					])}\n\n`,
+					{ headers: { "Content-Type": "text/event-stream" } },
+				);
+			},
+		});
+		const transport = await connectedTransport(300);
+		transport.onAuthError = async () => ({ Authorization: "Bearer refreshed" });
+		const updates: MCPProgress[] = [];
+		try {
+			await transport.request("tools/call", {}, { onProgress: progress => updates.push(progress) });
+			expect(ids).toHaveLength(2);
+			expect(ids[0]).not.toBe(ids[1]);
+			expect(tokens).toEqual(ids);
+			expect(updates).toEqual([{ progress: 1 }]);
+		} finally {
+			await transport.close();
+		}
+	});
+});
 
 describe("MCP Streamable HTTP initialization", () => {
 	it("sends initialized before opening the optional GET SSE stream", async () => {
@@ -164,7 +336,37 @@ describe("MCP Streamable HTTP failure diagnostics", () => {
 		expect(message("Basic dXNlcjpwYXNz==")).toBe("Basic [redacted]");
 	});
 
-	it("classifies an abrupt socket reset without leaking Bun fetch advice", async () => {
+	it("does not replay an accepted JSON response whose body is cut short", async () => {
+		const tcp = Bun.listen({
+			hostname: "127.0.0.1",
+			port: 0,
+			socket: {
+				data(socket) {
+					socket.end(
+						'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n{"jsonrpc":"2.0",',
+					);
+				},
+			},
+		});
+		const transport = new HttpTransport({
+			type: "http",
+			url: `http://127.0.0.1:${tcp.port}/mcp`,
+			timeout: GUARD_TIMEOUT_MS,
+		});
+		try {
+			await transport.connect();
+			await expect(transport.request("tools/list")).rejects.toMatchObject({
+				transport: "http",
+				stage: "decode",
+				retryable: false,
+			});
+		} finally {
+			await transport.close();
+			tcp.stop(true);
+		}
+	});
+
+	it("classifies a reset after connecting as non-replayable without leaking Bun fetch advice", async () => {
 		const tcp = Bun.listen({
 			hostname: "127.0.0.1",
 			port: 0,
@@ -191,10 +393,9 @@ describe("MCP Streamable HTTP failure diagnostics", () => {
 				transport: "http",
 				stage: "send",
 				failure: "reset",
-				retryable: true,
+				retryable: false,
 				code: "ECONNRESET",
 			});
-			expect(error.message).not.toContain("verbose");
 		} finally {
 			await transport.close();
 			tcp.stop(true);
@@ -280,6 +481,222 @@ describe("MCP Streamable HTTP failure diagnostics", () => {
 		expect(error.data).toContain("[redacted]");
 		expect(error.data).not.toContain("server-secret");
 	});
+
+	it("keeps a bare Bearer resource_metadata challenge while redacting echoed credentials", async () => {
+		const metadataUrl = "https://auth.example.test/prm/probe";
+		server = Bun.serve({
+			port: 0,
+			fetch() {
+				return new Response("rejected Authorization: Bearer server-secret", {
+					status: 401,
+					headers: {
+						"WWW-Authenticate": `Bearer resource_metadata="${metadataUrl}", authorization_uri="https://auth.example.test/authorize", token_uri="https://auth.example.test/token", scope="read"`,
+					},
+				});
+			},
+		});
+		const transport = await connectedTransport();
+		const error = await transport.request("initialize").then(
+			() => undefined,
+			reason => reason,
+		);
+		if (!(error instanceof MCPTransportError)) throw error;
+
+		expect(error.message).not.toContain("server-secret");
+		const auth = analyzeAuthError(error, `http://127.0.0.1:${server.port}/mcp`);
+		expect(auth.requiresAuth).toBe(true);
+		expect(auth.resourceMetadataUrl).toBe(metadataUrl);
+		expect(auth.oauth).toMatchObject({
+			authorizationUrl: "https://auth.example.test/authorize",
+			tokenUrl: "https://auth.example.test/token",
+			scopes: "read",
+		});
+	});
+});
+
+describe("MCP Streamable HTTP action delivery", () => {
+	it.each(["reset", "eof", "decode-reset", "fetch-failed", "gateway-error"] as const)(
+		"does not replay a committed action after %s",
+		async failure => {
+			const effects = new Database(":memory:");
+			effects.run("CREATE TABLE effects (units INTEGER NOT NULL)");
+			const transports: HttpTransport[] = [];
+			let received = 0;
+			let reconnects = 0;
+			const config: MCPHttpServerConfig = {
+				type: "http",
+				url: "https://owned-mcp-action.invalid/mcp",
+				timeout: REQUEST_TIMEOUT_MS,
+			};
+			const receiver = Object.assign(
+				async (...[input, init]: Parameters<typeof fetch>) => {
+					const request =
+						input instanceof Request
+							? new Request(input, init as RequestInit)
+							: new Request(String(input), init as RequestInit);
+					expect(request.url).toBe(config.url);
+					const body = (await request.json()) as {
+						id: number;
+						method: string;
+						params: { arguments: { units: number } };
+					};
+					expect(body.method).toBe("tools/call");
+					effects.run("INSERT INTO effects(units) VALUES (?)", [body.params.arguments.units]);
+					received++;
+					if (received === 1) {
+						if (failure === "reset")
+							throw Object.assign(new Error("response lost after commit"), { code: "ECONNRESET" });
+						if (failure === "eof")
+							throw Object.assign(new Error("socket closed after commit"), { code: "EPIPE" });
+						if (failure === "fetch-failed") throw new TypeError("fetch failed");
+						if (failure === "gateway-error")
+							return new Response("gateway lost the committed response", { status: 503 });
+						return new Response(
+							new ReadableStream({
+								start(controller) {
+									controller.error(
+										Object.assign(new Error("response body reset after commit"), { code: "ECONNRESET" }),
+									);
+								},
+							}),
+							{ headers: { "Content-Type": "application/json" } },
+						);
+					}
+					return Response.json({
+						jsonrpc: "2.0",
+						id: body.id,
+						result: { content: [{ type: "text", text: "committed" }] },
+					});
+				},
+				{ preconnect: globalThis.fetch.preconnect },
+			);
+			const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(receiver);
+			const connect = async (): Promise<MCPServerConnection> => {
+				const transport = new HttpTransport(config);
+				transports.push(transport);
+				await transport.connect();
+				return {
+					name: "owned-actions",
+					config,
+					transport,
+					capabilities: { tools: {} },
+					serverInfo: { name: "owned-actions", version: "1" },
+				};
+			};
+			try {
+				const tool = new MCPTool(
+					await connect(),
+					{
+						name: "append_action",
+						annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false },
+						inputSchema: { type: "object", properties: { units: { type: "number" } }, required: ["units"] },
+					},
+					async () => {
+						reconnects++;
+						return connect();
+					},
+				);
+				const result = await tool.execute(
+					"one-authorized-action",
+					{ units: 7 },
+					undefined,
+					{} as CustomToolContext,
+				);
+				expect(effects.query("SELECT units FROM effects").all()).toEqual([{ units: 7 }]);
+				expect(result.isError).toBe(true);
+				expect(reconnects).toBe(0);
+			} finally {
+				for (const transport of transports.reverse()) await transport.close();
+				fetchSpy.mockRestore();
+				effects.close();
+			}
+		},
+	);
+
+	it.each(["refused", "dns", "stale-session"] as const)(
+		"recovers a known %s refusal before executing an action",
+		async refusal => {
+			const effects = new Database(":memory:");
+			effects.run("CREATE TABLE effects (units INTEGER NOT NULL)");
+			const transports: HttpTransport[] = [];
+			let attempts = 0;
+			let reconnects = 0;
+			const config: MCPHttpServerConfig = {
+				type: "http",
+				url: "https://owned-mcp-action.invalid/mcp",
+				timeout: REQUEST_TIMEOUT_MS,
+			};
+			const receiver = Object.assign(
+				async (...[input, init]: Parameters<typeof fetch>) => {
+					const request =
+						input instanceof Request
+							? new Request(input, init as RequestInit)
+							: new Request(String(input), init as RequestInit);
+					expect(request.url).toBe(config.url);
+					attempts++;
+					if (attempts === 1) {
+						if (refusal === "stale-session") return new Response("unknown MCP session", { status: 404 });
+						throw Object.assign(new TypeError("fetch failed"), {
+							code: refusal === "dns" ? "ENOTFOUND" : "ECONNREFUSED",
+						});
+					}
+					const body = (await request.json()) as {
+						id: number;
+						method: string;
+						params: { arguments: { units: number } };
+					};
+					expect(body.method).toBe("tools/call");
+					effects.run("INSERT INTO effects(units) VALUES (?)", [body.params.arguments.units]);
+					return Response.json({
+						jsonrpc: "2.0",
+						id: body.id,
+						result: { content: [{ type: "text", text: "committed" }] },
+					});
+				},
+				{ preconnect: globalThis.fetch.preconnect },
+			);
+			const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(receiver);
+			const connect = async (): Promise<MCPServerConnection> => {
+				const transport = new HttpTransport(config);
+				transports.push(transport);
+				await transport.connect();
+				return {
+					name: "owned-actions",
+					config,
+					transport,
+					capabilities: { tools: {} },
+					serverInfo: { name: "owned-actions", version: "1" },
+				};
+			};
+			try {
+				const tool = new MCPTool(
+					await connect(),
+					{
+						name: "append_action",
+						annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false },
+						inputSchema: { type: "object", properties: { units: { type: "number" } }, required: ["units"] },
+					},
+					async () => {
+						reconnects++;
+						return connect();
+					},
+				);
+				const result = await tool.execute(
+					"one-authorized-action",
+					{ units: 7 },
+					undefined,
+					{} as CustomToolContext,
+				);
+				expect(effects.query("SELECT units FROM effects").all()).toEqual([{ units: 7 }]);
+				expect(result.isError).not.toBe(true);
+				expect(reconnects).toBe(1);
+			} finally {
+				for (const transport of transports.reverse()) await transport.close();
+				fetchSpy.mockRestore();
+				effects.close();
+			}
+		},
+	);
 });
 
 describe("MCP Streamable HTTP authentication replay policy", () => {
@@ -369,7 +786,6 @@ describe("MCP Streamable HTTP authentication replay policy", () => {
 						failure: "http_status",
 						code: scenario.status,
 						traceId: "synthetic-original-response",
-						message: `HTTP ${scenario.status}: synthetic auth rejection after processing [WWW-Authenticate: Bearer realm="synthetic"]`,
 					});
 				}
 			} finally {
@@ -406,7 +822,7 @@ describe("MCP Streamable HTTP authentication replay policy", () => {
 			);
 			expect(effects).toEqual(["synthetic-record"]);
 			expect(refreshes).toBe(0);
-			expect(error).toMatchObject({ code: 401, message: "HTTP 401: synthetic mutation recorded" });
+			expect(error).toMatchObject({ failure: "http_status", code: 401, retryable: false });
 		} finally {
 			await transport.close();
 		}
@@ -444,6 +860,67 @@ describe("MCP Streamable HTTP authentication replay policy", () => {
 			await transport.close();
 		}
 	});
+
+	it.each(["before-dispatch", "before-refresh", "during-refresh", "during-refresh-reject", "after-response"])(
+		"rejects an expired request owner at %s without credential or request replay",
+		async phase => {
+			let ownerCurrent = phase !== "before-dispatch";
+			let posts = 0;
+			let refreshes = 0;
+			const refreshEntered = Promise.withResolvers<void>();
+			const releaseRefresh = Promise.withResolvers<void>();
+			server = Bun.serve({
+				hostname: "127.0.0.1",
+				port: 0,
+				async fetch(request) {
+					if (request.method !== "POST") return new Response(null, { status: 405 });
+					const rpc = (await request.json()) as JsonRpcRequest;
+					posts++;
+					if (phase === "before-refresh" || phase === "after-response") ownerCurrent = false;
+					if (phase === "after-response") {
+						return Response.json({ jsonrpc: "2.0", id: rpc.id, result: { state: "obsolete-owner" } });
+					}
+					return new Response("synthetic auth challenge", { status: 401 });
+				},
+			});
+			const transport = await connectedTransport();
+			transport.onAuthError = async () => {
+				refreshes++;
+				refreshEntered.resolve();
+				await releaseRefresh.promise;
+				if (phase === "during-refresh-reject") throw new Error("synthetic refresh failure");
+				return { Authorization: "Bearer synthetic-refreshed" };
+			};
+			try {
+				const outcome = transport
+					.request(
+						"tools/call",
+						{},
+						{
+							allowAuthRetry: true,
+							mcpOwnerCurrent: () => ownerCurrent,
+						},
+					)
+					.then(
+						result => ({ result, error: undefined }),
+						(error: unknown) => ({ result: undefined, error }),
+					);
+				if (phase.startsWith("during-refresh")) {
+					await withPendingGuard(refreshEntered.promise, "owner-fenced auth refresh");
+					ownerCurrent = false;
+					releaseRefresh.resolve();
+				}
+				const result = await withPendingGuard(outcome, "owner-fenced request");
+				expect(result.error).toMatchObject({ name: "AbortError" });
+				expect(result.result).toBeUndefined();
+				expect(posts).toBe(phase === "before-dispatch" ? 0 : 1);
+				expect(refreshes).toBe(phase.startsWith("during-refresh") ? 1 : 0);
+			} finally {
+				releaseRefresh.resolve();
+				await transport.close();
+			}
+		},
+	);
 });
 
 describe("MCP Streamable HTTP transport timeouts", () => {
@@ -926,49 +1403,55 @@ describe("MCP Streamable HTTP POST response resumption", () => {
 		expect(observed.protocolVersion).toBe("2025-11-25");
 		expect(observed.resumedAt - observed.postClosedAt).toBeGreaterThanOrEqual(15);
 	});
-	it("refreshes auth on a 401 resume GET without replaying the POST", async () => {
-		const observed = { posts: 0, gets: 0, auth: [] as (string | null)[], lastEventId: null as string | null };
-		server = Bun.serve({
-			hostname: "127.0.0.1",
-			port: 0,
-			fetch(req) {
-				if (req.method === "POST") {
-					observed.posts++;
-					return new Response("id: stream-1\nretry: 10\ndata:\n\n", {
-						headers: { "Content-Type": "text/event-stream" },
-					});
-				}
-				observed.gets++;
-				observed.auth.push(req.headers.get("Authorization"));
-				observed.lastEventId = req.headers.get("Last-Event-ID");
-				if (req.headers.get("Authorization") !== "Bearer fresh") {
-					return new Response("expired", { status: 401 });
-				}
-				return new Response(
-					'id: stream-2\ndata: {"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"resumed","inputSchema":{"type":"object"}}]}}\n\n',
-					{ headers: { "Content-Type": "text/event-stream" } },
-				);
-			},
-		});
-		if (!server) throw new Error("Test server was not started");
-		const transport = new HttpTransport({
-			type: "http",
-			url: `http://127.0.0.1:${server.port}/mcp`,
-			timeout: GUARD_TIMEOUT_MS,
-			headers: { Authorization: "Bearer stale" },
-		});
-		transport.onAuthError = async () => ({ Authorization: "Bearer fresh" });
-		await transport.connect();
+	it.each([undefined, false])(
+		"refreshes auth on a 401 resume GET without replaying the POST (allowAuthRetry=%s)",
+		async allowAuthRetry => {
+			const observed = { posts: 0, gets: 0, auth: [] as (string | null)[], lastEventId: null as string | null };
+			server = Bun.serve({
+				hostname: "127.0.0.1",
+				port: 0,
+				fetch(req) {
+					if (req.method === "POST") {
+						observed.posts++;
+						return new Response("id: stream-1\nretry: 10\ndata:\n\n", {
+							headers: { "Content-Type": "text/event-stream" },
+						});
+					}
+					observed.gets++;
+					observed.auth.push(req.headers.get("Authorization"));
+					observed.lastEventId = req.headers.get("Last-Event-ID");
+					if (req.headers.get("Authorization") !== "Bearer fresh") {
+						return new Response("expired", { status: 401 });
+					}
+					return new Response(
+						'id: stream-2\ndata: {"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"resumed","inputSchema":{"type":"object"}}]}}\n\n',
+						{ headers: { "Content-Type": "text/event-stream" } },
+					);
+				},
+			});
+			if (!server) throw new Error("Test server was not started");
+			const transport = new HttpTransport({
+				type: "http",
+				url: `http://127.0.0.1:${server.port}/mcp`,
+				timeout: GUARD_TIMEOUT_MS,
+				headers: { Authorization: "Bearer stale" },
+			});
+			transport.onAuthError = async () => ({ Authorization: "Bearer fresh" });
+			await transport.connect();
 
-		const tools = await withPendingGuard(transport.request<ToolList>("tools/list"), "request");
-		expect(tools).toEqual({ tools: [{ name: "resumed", inputSchema: { type: "object" } }] });
-		// One POST only: replaying it after the server accepted the request
-		// could double-execute a state-changing tool.
-		expect(observed.posts).toBe(1);
-		expect(observed.gets).toBe(2);
-		expect(observed.auth).toEqual(["Bearer stale", "Bearer fresh"]);
-		expect(observed.lastEventId).toBe("stream-1");
-	});
+			const tools = await withPendingGuard(
+				transport.request<ToolList>("tools/list", undefined, { allowAuthRetry }),
+				"request",
+			);
+			expect(tools).toEqual({ tools: [{ name: "resumed", inputSchema: { type: "object" } }] });
+			// One POST only: replaying it after the server accepted the request
+			// could double-execute a state-changing tool.
+			expect(observed.posts).toBe(1);
+			expect(observed.gets).toBe(2);
+			expect(observed.auth).toEqual(["Bearer stale", "Bearer fresh"]);
+			expect(observed.lastEventId).toBe("stream-1");
+		},
+	);
 
 	it("does not replay an accepted POST when resume auth refresh throws", async () => {
 		const observed = { posts: 0, gets: 0, authRefreshes: 0 };

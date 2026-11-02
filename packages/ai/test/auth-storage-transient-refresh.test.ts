@@ -40,9 +40,9 @@ describe("AuthStorage transient OAuth refresh failure", () => {
 		}
 	});
 
-	afterEach(() => {
+	afterEach(async () => {
 		vi.restoreAllMocks();
-		storage?.close();
+		await storage?.close();
 		storage = undefined;
 		for (const key of ENV_KEYS) {
 			if (saved[key] === undefined) delete process.env[key];

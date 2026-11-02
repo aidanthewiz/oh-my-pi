@@ -65,7 +65,7 @@ async function resolveDiffTarget(ctx: AnnotationContext, source: AnnotationDiffS
 			break;
 		case "pr": {
 			const ref = parseReviewPrRef(source.ref);
-			if (!ref) throw new Error(`Not a GitHub pull request reference: ${source.ref}`);
+			if (!ref) throw new Error(`Not a GitHub pull request or GitLab merge request reference: ${source.ref}`);
 			target = await fetchPrReviewTarget(cwd, ref);
 			break;
 		}
@@ -237,7 +237,7 @@ export function createAnnotationsAPI(
 			const target = await resolveDiffTarget(ctx, request.source);
 			// The overlay defaults to a review request; reject before the operator writes notes it would drop.
 			assertReviewablePatchSize(target);
-			const result = await showCodeReviewOverlay(ctx, target);
+			const result = await showCodeReviewOverlay(ctx, target, request.focus);
 			if (!result) return undefined;
 			const review = result.action === "review";
 			const text = buildCodeReviewFeedback(target, result.annotations, review, request.focus);

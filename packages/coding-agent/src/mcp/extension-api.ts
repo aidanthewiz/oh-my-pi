@@ -15,13 +15,22 @@ export function createExtensionMCPContext(
 	getManager: () => MCPManager | undefined,
 	runner: ExtensionRunner,
 	getToolContext: () => AgentToolContext,
+	captureOwnerCurrent: () => () => boolean,
 ): ExtensionMCPContext {
 	return {
 		async callTool(serverName, toolName, args = {}, options = {}) {
-			const { signal } = options;
+			const { signal, retry } = options;
 			throwIfAborted(signal);
 			const manager = getManager();
 			if (!manager) throw new Error("MCP is disabled for this session");
+			const isOwnerCurrent = captureOwnerCurrent();
+			const assertOwnerCurrent = () => {
+				throwIfAborted(signal);
+				if (getManager() !== manager || !isOwnerCurrent()) {
+					throw new Error("MCP call owner changed");
+				}
+			};
+			assertOwnerCurrent();
 			let original!: CustomToolResult<MCPToolDetails>;
 			let policyResult!: CustomToolResult<MCPToolDetails>;
 			const tool: AgentTool & { mcpServerName: string; mcpToolName: string; legacyName?: string } = {
@@ -36,21 +45,29 @@ export function createExtensionMCPContext(
 				mcpServerName: serverName,
 				mcpToolName: toolName,
 				async execute(_toolCallId, input, _signal, _onUpdate, context) {
-					throwIfAborted(signal);
+					assertOwnerCurrent();
 					if (!isRecord(input)) throw new Error("MCP tool arguments must be an object");
 					if (!context) throw new Error("MCP tool execution context is unavailable");
 					try {
 						original = buildResult(
-							await manager.callTool(serverName, toolName, input, options, {
-								...context,
-								hasUI: runner.hasUI(),
-								ui: runner.getUIContext(),
-							}),
+							await manager.callTool(
+								serverName,
+								toolName,
+								input,
+								{ retry, signal },
+								{
+									...context,
+									hasUI: runner.hasUI(),
+									ui: runner.getUIContext(),
+									mcpOwnerCurrent: () => getManager() === manager && isOwnerCurrent(),
+								},
+							),
 							serverName,
 							toolName,
 						);
+						assertOwnerCurrent();
 					} catch (error) {
-						throwIfAborted(signal);
+						assertOwnerCurrent();
 						if (error instanceof Error && error.name === "AbortError") throw error;
 						original = buildErrorResult(error, serverName, toolName);
 					}
@@ -62,7 +79,7 @@ export function createExtensionMCPContext(
 			const result = await untilAborted(signal, () =>
 				wrapper.execute(crypto.randomUUID(), args, signal, undefined, getToolContext()),
 			);
-			throwIfAborted(signal);
+			assertOwnerCurrent();
 			const details: unknown = result.details;
 			const changed =
 				result.content !== policyResult.content ||

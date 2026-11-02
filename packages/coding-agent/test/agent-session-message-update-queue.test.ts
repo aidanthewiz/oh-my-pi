@@ -96,7 +96,7 @@ test("async message_update handlers finish before the next update starts", async
 	} finally {
 		releaseFirst.resolve();
 		await session.dispose();
-		authStorage.close();
+		await authStorage.close();
 	}
 });
 
@@ -117,7 +117,7 @@ test("a failing message_update handler does not block later updates", async () =
 		expect(received).toEqual(["B"]);
 	} finally {
 		await session.dispose();
-		authStorage.close();
+		await authStorage.close();
 	}
 });
 
@@ -156,6 +156,6 @@ test("terminal lifecycle waits for queued updates and idle drains their handlers
 	} finally {
 		release.resolve();
 		await session.dispose();
-		authStorage.close();
+		await authStorage.close();
 	}
 });

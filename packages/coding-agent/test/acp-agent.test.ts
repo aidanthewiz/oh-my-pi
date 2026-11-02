@@ -1,8 +1,11 @@
 import { afterEach, describe, expect, it, spyOn, vi } from "bun:test";
+import type { Subprocess } from "bun";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { AgentBusyError } from "@oh-my-pi/pi-agent-core";
+import { Database } from "bun:sqlite";
+import { AuthStorage, SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai";
 import type { Model } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -11,7 +14,9 @@ import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-regis
 import type { ExtensionUIContext } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import { ExtensionRuntime } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
+import { buildSkillPromptMessage } from "@oh-my-pi/pi-coding-agent/extensibility/skills";
 import { resolveLocalUrlToPath } from "@oh-my-pi/pi-coding-agent/internal-urls";
+import * as oauthFlowModule from "@oh-my-pi/pi-coding-agent/mcp/oauth-flow";
 import {
 	ACP_BOOTSTRAP_RACE_GUARD_MS,
 	AcpAgent,
@@ -23,18 +28,20 @@ import type {
 	AgentSessionEvent,
 	UsageFallbackConfirmation,
 } from "@oh-my-pi/pi-coding-agent/session/agent-session";
-import { SILENT_ABORT_MARKER } from "@oh-my-pi/pi-coding-agent/session/messages";
-import { resetSessionIndexForTests } from "@oh-my-pi/pi-coding-agent/session/session-index";
+import { SILENT_ABORT_MARKER, USER_INTERRUPT_LABEL } from "@oh-my-pi/pi-coding-agent/session/messages";
+import type { ClientBridge } from "@oh-my-pi/pi-coding-agent/session/client-bridge";
+import { closeSessionIndex } from "@oh-my-pi/pi-coding-agent/session/session-index";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TaskTool } from "@oh-my-pi/pi-coding-agent/task";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
-import { getConfigRootDir, setAgentDir } from "@oh-my-pi/pi-utils";
+import { getAgentDir, getConfigRootDir, setAgentDir } from "@oh-my-pi/pi-utils";
 import type {
 	AgentSideConnection,
 	ClientCapabilities,
 	CreateElicitationRequest,
 	CreateElicitationResponse,
 	PromptRequest,
+	RequestPermissionRequest,
 	SessionNotification,
 	Validator,
 } from "@oh-my-pi/pi-utils/acp";
@@ -47,13 +54,19 @@ import {
 	zSessionNotification,
 } from "@oh-my-pi/pi-utils/acp";
 import { TOOL_NAME as DELAYED_MCP_TOOL_NAME } from "./fixtures/delayed-tool-mcp";
+import type { AcpHandleWriterMessage } from "./fixtures/acp-handle-writer";
 
 import { cfgPlanAutosave, cfgPlanAutosaveDir, cfgPlanEnabled } from "@oh-my-pi/pi-coding-agent/plan-mode/settings";
+import { MCPManager } from "@oh-my-pi/pi-coding-agent/mcp/manager";
 
 /** Validates an ACP wire payload against the in-house protocol schemas. */
 function expectAcpStructure(schema: Validator<unknown>, value: unknown): void {
 	const result = schema.safeParse(value);
 	expect(result.success, result.success ? undefined : JSON.stringify(result.error.issues, null, 2)).toBe(true);
+}
+
+function chunkText({ update }: SessionNotification): string {
+	return update.sessionUpdate === "agent_message_chunk" && update.content.type === "text" ? update.content.text : "";
 }
 
 const TEST_MODELS: Model[] = [
@@ -132,15 +145,46 @@ class FakeAgentSession {
 	systemPrompt = "system";
 	disposed = false;
 	fastMode = false;
+	clientBridge: ClientBridge | undefined;
 	forcedToolChoice: string | undefined;
 	get settings(): Settings {
 		return Settings.instance;
 	}
 	promptCalls: string[] = [];
+	steerCalls: Array<{ text: string; images: unknown[] }> = [];
+	followUpCalls: Array<{ text: string; images: unknown[] }> = [];
+	joinActiveTurnCalls: Array<{ text: string; images: unknown[]; queue: "steering" | "followUp" }> = [];
+	/** Extra refusal switch for the fake `joinActiveTurn`; `isStreaming` remains the busy gate. */
+	joinActiveTurnAdmitted = true;
+	async steer(text: string, images?: unknown[]): Promise<void> {
+		this.steerCalls.push({ text, images: images ?? [] });
+	}
+	async followUp(text: string, images?: unknown[]): Promise<void> {
+		this.followUpCalls.push({ text, images: images ?? [] });
+	}
+	async joinActiveTurn(
+		text: string,
+		images?: unknown[],
+		options?: { queue?: "steering" | "followUp"; isCurrent?: () => boolean },
+	): Promise<boolean> {
+		const queue = options?.queue ?? "steering";
+		this.joinActiveTurnCalls.push({ text, images: images ?? [], queue });
+		const admitted = this.isStreaming && this.joinActiveTurnAdmitted && options?.isCurrent?.() !== false;
+		if (!admitted) {
+			return false;
+		}
+		if (queue === "followUp") {
+			await this.followUp(text, images);
+		} else {
+			await this.steer(text, images);
+		}
+		return true;
+	}
 	customMessages: Array<{ customType: string; content: string; details?: unknown }> = [];
 	customMessageOptions: Array<{ streamingBehavior?: "steer" | "followUp"; queueChipText?: string } | undefined> = [];
 	skillsSettings = { enableSkillCommands: true };
 	skills: Array<{ name: string; description: string; filePath: string; baseDir: string; source: string }> = [];
+	buildUserSkillPrompt = buildSkillPromptMessage;
 	async refreshSkillsAndCommands(): Promise<void> {}
 	subscribeCommandMetadataChanged(_listener: () => void): () => void {
 		return () => {};
@@ -152,6 +196,9 @@ class FakeAgentSession {
 	usageFallbackConfirmer: ((confirmation: UsageFallbackConfirmation) => Promise<boolean>) | undefined;
 	retryResult = false;
 	retryCalls = 0;
+	/** Backs `modelRegistry.authStorage` for `/mcp reauth` credential round-trips. */
+	authStorage?: AuthStorage;
+	#modelRegistry: { getApiKey: (model: Model) => Promise<string>; authStorage?: AuthStorage } | undefined;
 	#listeners = new Set<(event: AgentSessionEvent) => void>();
 
 	constructor(
@@ -173,10 +220,11 @@ class FakeAgentSession {
 		return this.sessionManager.getHeader()?.title ?? `Session ${this.sessionId}`;
 	}
 
-	get modelRegistry(): { getApiKey: (model: Model) => Promise<string> } {
-		return {
+	get modelRegistry(): { getApiKey: (model: Model) => Promise<string>; authStorage?: AuthStorage } {
+		return (this.#modelRegistry ??= {
 			getApiKey: async (_model: Model) => "test-key",
-		};
+			...(this.authStorage ? { authStorage: this.authStorage } : {}),
+		});
 	}
 
 	getAvailableModels(): Model[] {
@@ -306,10 +354,23 @@ class FakeAgentSession {
 		return undefined;
 	}
 
-	async switchSession(sessionPath: string): Promise<boolean> {
-		await this.sessionManager.setSessionFile(sessionPath);
+	readonly #sessionChangeCallbacks = new Set<() => void>();
+
+	registerSessionChangeCallback(callback: () => void): () => void {
+		this.#sessionChangeCallbacks.add(callback);
+		return () => this.#sessionChangeCallbacks.delete(callback);
+	}
+
+	#adoptDurableSession(): void {
+		const previous = this.sessionId;
 		this.sessionId = this.sessionManager.getSessionId();
 		this.agent.sessionId = this.sessionId;
+		if (this.sessionId !== previous) for (const callback of this.#sessionChangeCallbacks) callback();
+	}
+
+	async switchSession(sessionPath: string): Promise<boolean> {
+		await this.sessionManager.setSessionFile(sessionPath);
+		this.#adoptDurableSession();
 		return true;
 	}
 
@@ -322,8 +383,7 @@ class FakeAgentSession {
 
 	async newSession(): Promise<boolean> {
 		await this.sessionManager.newSession();
-		this.sessionId = this.sessionManager.getSessionId();
-		this.agent.sessionId = this.sessionId;
+		this.#adoptDurableSession();
 		return true;
 	}
 
@@ -345,7 +405,11 @@ class FakeAgentSession {
 
 	setActiveToolsByName(_toolNames: string[]): void {}
 
-	setClientBridge(_bridge: unknown): void {}
+	setClientBridge(bridge: ClientBridge): void {
+		this.clientBridge = bridge;
+	}
+
+	setMcpServerInstructionsSource(_source: unknown): void {}
 
 	getPlanModeState(): PlanModeState | undefined {
 		return this.planModeState;
@@ -449,6 +513,7 @@ type SetToolUIContextSpy = (uiContext: ExtensionUIContext, hasUI: boolean) => vo
 interface AgentHarness {
 	agent: AcpAgent;
 	updates: SessionNotification[];
+	extNotifications: Array<{ method: string; params: Record<string, unknown> }>;
 	abortController: AbortController;
 	sessions: FakeAgentSession[];
 	setToolUIContextSpies: SetToolUIContextSpy[];
@@ -470,10 +535,15 @@ function expectAcpNotifications(updates: SessionNotification[]): void {
 }
 
 const cleanupRoots: string[] = [];
+const handleWriters: Array<Subprocess<"ignore", "ignore", "pipe">> = [];
 const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
 const fallbackAgentDir = path.join(getConfigRootDir(), "agent");
 
 afterEach(async () => {
+	for (const writer of handleWriters.splice(0)) {
+		if (writer.exitCode === null) writer.kill();
+		await writer.exited;
+	}
 	vi.useRealTimers();
 	if (originalAgentDir) {
 		setAgentDir(originalAgentDir);
@@ -484,7 +554,7 @@ afterEach(async () => {
 	resetSettingsForTest();
 
 	// Renames index titles in the process-wide `<agentDir>/history.db`; Windows cannot delete it while open.
-	resetSessionIndexForTests();
+	closeSessionIndex();
 	for (const root of cleanupRoots.splice(0)) {
 		await fs.promises.rm(root, { recursive: true, force: true });
 	}
@@ -496,8 +566,12 @@ async function createHarness(
 		clientCapabilities?: ClientCapabilities;
 		/** Runs before a notification is recorded, so a test can delay one delivery. */
 		sessionUpdateHook?: (notification: SessionNotification) => Promise<void> | void;
+		permissionHandler?: (request: RequestPermissionRequest) => void;
 		/** Gives each session the factory creates a real extension runner with no extensions. */
 		extensionRunners?: boolean;
+		/** Exposed to each created session's `modelRegistry` for MCP credential round-trips. */
+		authStorage?: AuthStorage;
+		allowMcpBrowserAuth?: boolean;
 	} = {},
 ): Promise<AgentHarness> {
 	const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "omp-acp-test-"));
@@ -512,6 +586,7 @@ async function createHarness(
 	await Settings.init({ agentDir, inMemory: true });
 
 	const updates: SessionNotification[] = [];
+	const extNotifications: AgentHarness["extNotifications"] = [];
 	const abortController = new AbortController();
 	const sessions: FakeAgentSession[] = [];
 	const setToolUIContextSpies: SetToolUIContextSpy[] = [];
@@ -522,6 +597,13 @@ async function createHarness(
 			// microtask before the push and perturb ordering-sensitive tests.
 			if (options.sessionUpdateHook) await options.sessionUpdateHook(notification);
 			updates.push(notification);
+		},
+		extNotification: async (method: string, params: Record<string, unknown>) => {
+			extNotifications.push({ method, params });
+		},
+		requestPermissionWithCancel: (request: RequestPermissionRequest) => {
+			options.permissionHandler?.(request);
+			return { promise: Promise.resolve({ outcome: { outcome: "cancelled" } }), cancel: () => {} };
 		},
 		unstable_createElicitation: options.elicitationHandler
 			? async (req: CreateElicitationRequest) => options.elicitationHandler!(req)
@@ -534,6 +616,7 @@ async function createHarness(
 	sessions.push(initialSession);
 	const factory = async (cwd: string, factoryOptions?: { interactivePrompts?: boolean }) => {
 		const session = new FakeAgentSession(cwd);
+		if (options.authStorage) session.authStorage = options.authStorage;
 		if (options.extensionRunners) {
 			session.extensionRunner = new ExtensionRunner(
 				[],
@@ -550,7 +633,9 @@ async function createHarness(
 		return { session: session as unknown as AgentSession, setToolUIContext };
 	};
 
-	const agent = new AcpAgent(connection, factory, initialSession as unknown as AgentSession);
+	const agent = new AcpAgent(connection, factory, initialSession as unknown as AgentSession, {
+		allowMcpBrowserAuth: options.allowMcpBrowserAuth,
+	});
 	const clientCapabilities =
 		options.clientCapabilities ?? (options.elicitationHandler ? { elicitation: { form: {} } } : undefined);
 	if (clientCapabilities) {
@@ -563,6 +648,7 @@ async function createHarness(
 	return {
 		agent,
 		updates,
+		extNotifications,
 		abortController,
 		sessions,
 		setToolUIContextSpies,
@@ -579,7 +665,211 @@ async function advanceBootstrapGuard(): Promise<void> {
 	await Promise.resolve();
 }
 
+async function startHandleWriter(root: string, name: string, mode: string) {
+	const messages: AcpHandleWriterMessage[] = [];
+	const waiters: Array<{
+		events: AcpHandleWriterMessage["event"][];
+		resolve: (message: AcpHandleWriterMessage) => void;
+		reject: (error: Error) => void;
+	}> = [];
+	let failure: Error | undefined;
+	const worker = Bun.spawn(
+		[process.execPath, path.join(import.meta.dir, "fixtures", "acp-handle-writer.ts"), root, name, mode],
+		{
+			cwd: root,
+			env: { ...process.env, PI_CODING_AGENT_DIR: path.join(root, "agent") },
+			stdin: "ignore",
+			stdout: "ignore",
+			stderr: "pipe",
+			ipc(message: AcpHandleWriterMessage) {
+				if (message.event === "error") {
+					failure = new Error(message.error);
+					for (const waiter of waiters.splice(0)) waiter.reject(failure);
+					return;
+				}
+				const index = waiters.findIndex(waiter => waiter.events.includes(message.event));
+				if (index >= 0) waiters.splice(index, 1)[0]!.resolve(message);
+				else messages.push(message);
+			},
+		},
+	);
+	handleWriters.push(worker);
+	void worker.exited.then(async code => {
+		if (code === 0) return;
+		failure = new Error(`ACP handle writer exited ${code}: ${await new Response(worker.stderr).text()}`);
+		for (const waiter of waiters.splice(0)) waiter.reject(failure);
+	});
+	const wait = (...events: AcpHandleWriterMessage["event"][]): Promise<AcpHandleWriterMessage> => {
+		if (failure) return Promise.reject(failure);
+		const index = messages.findIndex(message => events.includes(message.event));
+		if (index >= 0) return Promise.resolve(messages.splice(index, 1)[0]!);
+		const { promise, resolve, reject } = Promise.withResolvers<AcpHandleWriterMessage>();
+		waiters.push({ events, resolve, reject });
+		return promise;
+	};
+	const ready = await wait("ready");
+	return { worker, wait, handle: ready.handle! };
+}
+
 describe("ACP agent", () => {
+	it("keeps the ACP handle after the durable session changes", async () => {
+		const elicitations: CreateElicitationRequest[] = [];
+		const permissions: RequestPermissionRequest[] = [];
+		const harness = await createHarness({
+			extensionRunners: true,
+			elicitationHandler: async request => {
+				elicitations.push(request);
+				return { action: "accept", content: { value: "Yes" } };
+			},
+			permissionHandler: request => permissions.push(request),
+		});
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		await session.extensionRunner!.createCommandContext().newSession();
+		expect(session.sessionId).not.toBe(created.sessionId);
+
+		const response = await harness.agent.prompt({
+			sessionId: created.sessionId,
+			prompt: [{ type: "text", text: "ping" }],
+		});
+		expect(response.stopReason).toBe("end_turn");
+		expect(session.promptCalls).toContain("ping");
+		expect(harness.updates.some(update => update.update.sessionUpdate === "agent_message_chunk")).toBe(true);
+		expect(harness.updates.every(update => update.sessionId === created.sessionId)).toBe(true);
+
+		expect(await session.extensionRunner?.getUIContext().select("Continue?", ["Yes", "No"])).toBe("Yes");
+		expect(elicitations).toHaveLength(1);
+		expect(elicitations[0]).toMatchObject({ sessionId: created.sessionId });
+		await session.clientBridge?.requestPermission?.({ toolCallId: "call", toolName: "test", title: "Run tool" }, []);
+		expect(permissions).toHaveLength(1);
+		expect(permissions[0]?.sessionId).toBe(created.sessionId);
+
+		// After the handle closes (as across an agent restart), loading it reopens the conversation that continued under it.
+		const continued = session.sessionId;
+		await harness.agent.closeSession({ sessionId: created.sessionId });
+		await harness.agent.loadSession({ sessionId: created.sessionId, cwd: harness.cwdA, mcpServers: [] });
+		expect(harness.sessions.at(-1)?.sessionId).toBe(continued);
+		await harness.agent.dispose();
+	});
+
+	it.each([false, true])(
+		"forks a restarted handle's continued conversation with original removed=%s",
+		async removed => {
+			await createHarness();
+			const root = path.dirname(getAgentDir());
+			const original = await startHandleWriter(root, "consumer", "consumer");
+			original.worker.send({ command: "replace" });
+			const replacement = await original.wait("replaced");
+			original.worker.send({ command: "dispose" });
+			await original.wait("done");
+			await original.worker.exited;
+			if (removed) await fs.promises.rm(replacement.originalPath!);
+
+			const restarted = await startHandleWriter(root, "consumer", "consumer");
+			restarted.worker.send({ command: "fork", sessionId: original.handle });
+			const forked = await restarted.wait("forked", "fork-rejected");
+			expect(forked.event, forked.error).toBe("forked");
+			expect(forked.userMessages).toEqual(["continued conversation"]);
+			expect(forked.sessionId).not.toBe(replacement.sessionId);
+			restarted.worker.send({ command: "reopen", sessionId: original.handle });
+			const reopened = await restarted.wait("opened");
+			expect(reopened.reopenedIds).toEqual([replacement.sessionId!, replacement.sessionId!]);
+			restarted.worker.send({ command: "dispose" });
+			await restarted.wait("done");
+		},
+		30_000,
+	);
+
+	it("rejects a fork when its mapped transcript is missing instead of using the original", async () => {
+		await createHarness();
+		const root = path.dirname(getAgentDir());
+		const original = await startHandleWriter(root, "consumer", "consumer");
+		original.worker.send({ command: "replace" });
+		const replacement = await original.wait("replaced");
+		original.worker.send({ command: "dispose" });
+		await original.wait("done");
+		await original.worker.exited;
+		await fs.promises.rm(replacement.continuedPath!);
+
+		const restarted = await startHandleWriter(root, "consumer", "consumer");
+		restarted.worker.send({ command: "fork", sessionId: original.handle });
+		const forked = await restarted.wait("forked", "fork-rejected");
+		expect(forked.event).toBe("fork-rejected");
+		expect(forked.error).toContain(`ACP session not found: ${original.handle}`);
+		restarted.worker.send({ command: "dispose" });
+		await restarted.wait("done");
+	}, 30_000);
+
+	it.each([false, true])(
+		"retains independent process handle updates with existing map=%s",
+		async existing => {
+			await createHarness();
+			const root = path.dirname(getAgentDir());
+			const filePath = path.join(getAgentDir(), "acp-session-handles.json");
+			const seed = existing ? { untouched: "durable-untouched" } : {};
+			if (existing) await fs.promises.writeFile(filePath, JSON.stringify(seed));
+			const first = await startHandleWriter(root, "writer-a", "hold-read");
+			const second = await startHandleWriter(root, "writer-b", "observe-lock");
+			first.worker.send({ command: "replace" });
+			await first.wait("read");
+			const firstReplacement = await first.wait("replaced");
+			second.worker.send({ command: "replace" });
+			const boundary = await second.wait("read", "blocked");
+			const secondReplacement = await second.wait("replaced");
+			second.worker.send({ command: "dispose" });
+			// Without a cross-process lock, publish B before releasing A's stale snapshot.
+			if (boundary.event === "read") await second.wait("done");
+			first.worker.send({ command: "dispose" });
+			first.worker.send({ command: "release" });
+			await first.wait("done");
+			if (boundary.event === "blocked") await second.wait("done");
+			expect(JSON.parse(await fs.promises.readFile(filePath, "utf8"))).toEqual({
+				...seed,
+				[first.handle]: firstReplacement.sessionId,
+				[second.handle]: secondReplacement.sessionId,
+			});
+		},
+		30_000,
+	);
+
+	it("keeps the published handle map complete while another process stages a partial write", async () => {
+		await createHarness();
+		const root = path.dirname(getAgentDir());
+		const filePath = path.join(getAgentDir(), "acp-session-handles.json");
+		const seed = { untouched: "durable-untouched" };
+		await fs.promises.writeFile(filePath, JSON.stringify(seed));
+		const writer = await startHandleWriter(root, "writer", "hold-write");
+		writer.worker.send({ command: "replace" });
+		const replacement = await writer.wait("replaced");
+		await writer.wait("staged");
+		writer.worker.send({ command: "dispose" });
+		try {
+			expect(JSON.parse(await fs.promises.readFile(filePath, "utf8"))).toEqual(seed);
+		} finally {
+			writer.worker.send({ command: "release" });
+		}
+		await writer.wait("done");
+		expect(JSON.parse(await fs.promises.readFile(filePath, "utf8"))).toEqual({
+			...seed,
+			[writer.handle]: replacement.sessionId,
+		});
+		if (process.platform !== "win32") expect((await fs.promises.stat(filePath)).mode & 0o777).toBe(0o600);
+	}, 30_000);
+
+	it("does not publish a handle update after cross-process lock acquisition fails", async () => {
+		await createHarness();
+		const root = path.dirname(getAgentDir());
+		const filePath = path.join(getAgentDir(), "acp-session-handles.json");
+		const seed = { untouched: "durable-untouched" };
+		await fs.promises.writeFile(filePath, JSON.stringify(seed));
+		const writer = await startHandleWriter(root, "writer", "fail-lock");
+		writer.worker.send({ command: "replace" });
+		await writer.wait("replaced");
+		writer.worker.send({ command: "dispose" });
+		await writer.wait("done");
+		expect(JSON.parse(await fs.promises.readFile(filePath, "utf8"))).toEqual(seed);
+	}, 30_000);
+
 	it("supports multiple live ACP sessions with model and lifecycle handlers", async () => {
 		const harness = await createHarness();
 		const first = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
@@ -635,9 +925,11 @@ describe("ACP agent", () => {
 		expect(forkedMessages.some(message => message.role === "user" && message.content === "fork me")).toBe(true);
 
 		await harness.agent.closeSession({ sessionId: forked.sessionId });
-		await expect(harness.agent.setSessionMode({ sessionId: forked.sessionId, modeId: "default" })).rejects.toThrow(
-			"Unsupported ACP session",
-		);
+		await expect(
+			harness.agent.setSessionMode({ sessionId: forked.sessionId, modeId: "default" }),
+		).rejects.toMatchObject({
+			code: -32002,
+		});
 
 		harness.abortController.abort();
 		await Bun.sleep(0);
@@ -902,19 +1194,49 @@ describe("ACP agent", () => {
 		await Bun.sleep(0);
 	});
 
+	it("buffers compaction notifications until the client knows the session", async () => {
+		const harness = await createHarness();
+		vi.useFakeTimers();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		const emit = (event: AgentSessionEvent) => {
+			for (const listener of session.listeners()) listener(event);
+		};
+
+		emit({ type: "auto_compaction_start", reason: "threshold", action: "context-full" });
+		expect(harness.extNotifications).toEqual([]);
+		await advanceBootstrapGuard();
+		emit({ type: "auto_compaction_end", action: "context-full", result: undefined, aborted: false, willRetry: true });
+		await Promise.resolve();
+
+		expect(harness.extNotifications).toEqual([
+			{
+				method: "_omp/compaction/start",
+				params: { sessionId: created.sessionId, reason: "threshold", action: "context-full" },
+			},
+			{
+				method: "_omp/compaction/end",
+				params: expect.objectContaining({
+					sessionId: created.sessionId,
+					action: "context-full",
+					aborted: false,
+					willRetry: true,
+				}),
+			},
+		]);
+	});
+
 	it("pushes config_option_update when thinking level changes internally", async () => {
 		// Internal callers (slash commands, model auto-adjust, extension UI) call
 		// AgentSession.setThinkingLevel directly without going through the ACP
-		// setSessionConfigOption surface. Once the session-lifetime subscription
-		// is installed (after the 50ms bootstrap guard so the response has
-		// reached the client first), those changes must surface to clients as
+		// setSessionConfigOption surface. Once lifetime delivery opens after the
+		// bootstrap guard, those changes must surface to clients as
 		// `config_option_update` so TORTAS-style fleet views stay in sync.
 		const harness = await createHarness();
 		vi.useFakeTimers();
 		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
 		const session = harness.findSession(created.sessionId)!;
-		// Advance past the 50ms bootstrap timer so the lifetime subscription is
-		// installed before we drive an internal thinking-level change.
+		// Open lifetime delivery before driving an internal thinking-level change.
 		await advanceBootstrapGuard();
 
 		const updatesBefore = harness.updates.length;
@@ -961,8 +1283,8 @@ describe("ACP agent", () => {
 		const session = harness.findSession(created.sessionId)!;
 
 		const updatesBefore = harness.updates.length;
-		// Synchronously after `newSession` returns, the bootstrap timer has
-		// not fired yet, so the lifetime subscription is not installed.
+		// Without a prompt or the bootstrap timer firing, lifetime delivery
+		// remains gated even though event capture is already installed.
 		session.setThinkingLevel("high");
 
 		const beforeBootstrap = harness.updates
@@ -973,8 +1295,7 @@ describe("ACP agent", () => {
 					notification.update.sessionUpdate === "config_option_update",
 			);
 		expect(beforeBootstrap.length).toBe(0);
-		// After advancing through the 50ms bootstrap timer, the subscription is
-		// installed and subsequent changes do surface.
+		// Opening delivery lets subsequent internal changes reach the client.
 		await advanceBootstrapGuard();
 		const baseline = harness.updates.length;
 		session.setThinkingLevel("medium");
@@ -1000,9 +1321,8 @@ describe("ACP agent", () => {
 		const harness = await createHarness();
 		vi.useFakeTimers();
 		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
-		// Wait past the bootstrap guard so the lifetime subscription is
-		// installed and the client-driven setSessionConfigOption produces
-		// exactly one notification through it.
+		// Open lifetime delivery so setSessionConfigOption produces exactly one
+		// notification through the session listener.
 		await advanceBootstrapGuard();
 
 		const updatesBefore = harness.updates.length;
@@ -1116,15 +1436,14 @@ describe("ACP agent", () => {
 		}
 	});
 
-	it("still pushes config_option_update for /effort before the lifetime subscription exists", async () => {
-		// Pre-bootstrap there is no lifetime subscription, so the explicit
-		// notifyConfigChanged is the only path that tells the client — same
-		// contract as `setSessionConfigOption`'s pre-bootstrap push.
+	it("pushes config_option_update for /effort before the bootstrap timer fires", async () => {
+		// An early client prompt opens lifetime delivery; /effort must emit
+		// exactly one config update without waiting for the bootstrap timer.
 		const harness = await createHarness();
 		vi.useFakeTimers();
 		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
-		// Deliberately do not advance the 50ms bootstrap guard: the lifetime
-		// subscription is not installed yet.
+		// Do not advance the guard: the prompt itself establishes that
+		// the client already knows this session.
 
 		const updatesBefore = harness.updates.length;
 		await harness.agent.prompt({
@@ -1149,8 +1468,8 @@ describe("ACP agent", () => {
 	it("pushes config_option_update when the model changes internally", async () => {
 		// Internal callers (prewalk hand-offs, retry-fallback, model cycling)
 		// change AgentSession's model directly without going through the ACP
-		// setSessionConfigOption surface. Once the session-lifetime subscription
-		// is installed, those changes must surface to clients as
+		// setSessionConfigOption surface. Once lifetime delivery is ready,
+		// those changes must surface to clients as
 		// `config_option_update` — otherwise a client's model indicator (e.g.
 		// Zed's status bar) goes stale the moment prewalk hands off to a
 		// cheaper model mid-session.
@@ -1270,12 +1589,9 @@ describe("ACP agent", () => {
 				speedRange: { min: 0.5, max: 2.5 },
 			},
 		});
-		expect(result.speechToText.models.map(model => model.value)).toEqual([
-			"local/whisper-base",
-			"local/whisper-small",
-			"local/whisper-large-v3-turbo",
-			"local/parakeet-tdt-0.6b-v3",
-		]);
+		expect(result.speechToText.models).toContainEqual(
+			expect.objectContaining({ value: "local/nemotron-streaming-en-0.6b" }),
+		);
 		expect(result.textToSpeech.models.map(model => model.value)).toEqual(["local/kokoro"]);
 		expect(result.textToSpeech.models[0]?.voices).toEqual(result.textToSpeech.voices);
 		// Speed presets are numbers so clients can write them straight into the numeric settings.
@@ -1295,6 +1611,277 @@ describe("ACP agent", () => {
 		await expect(harness.agent.extMethod("omp/sessions/listAll", { limit: 2 })).rejects.toThrow(
 			"Unknown ACP ext method",
 		);
+
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
+	it("returns autonomous steering to the host without creating or modifying a client turn", async () => {
+		const harness = await createHarness();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		session.isStreaming = true;
+		for (const queue of ["steering", "followUp"]) {
+			const result = await harness.agent.extMethod("_session/steering", {
+				sessionId: created.sessionId,
+				prompt: [{ type: "text", text: "new user work" }],
+				_meta: { steering: { queue } },
+			});
+			expect(result).toEqual({ outcome: "promptRequired", queue });
+		}
+		expect(session.promptCalls).toEqual([]);
+		expect(session.steerCalls).toEqual([]);
+		expect(session.followUpCalls).toEqual([]);
+		await harness.agent.dispose();
+	});
+
+	it("steers a turn whose prompt is still dispatching instead of queueing a second prompt", async () => {
+		const harness = await createHarness();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		// Hold the turn inside AgentSession.prompt — the same window the real
+		// session occupies in flight (#beginInFlight at prompt entry), so
+		// joinActiveTurn classifies it live and the steer joins it.
+		const dispatchHeld = Promise.withResolvers<void>();
+		session.prompt = async (text: string) => {
+			session.promptCalls.push(text);
+			session.isStreaming = true;
+			await dispatchHeld.promise;
+			return true;
+		};
+
+		const clientPrompt = harness.agent.prompt({
+			sessionId: created.sessionId,
+			prompt: [{ type: "text", text: "original task" }],
+		});
+		void clientPrompt.catch(() => undefined);
+		await Bun.sleep(1);
+
+		const result = await harness.agent.extMethod("_session/steering", {
+			sessionId: created.sessionId,
+			prompt: [{ type: "text", text: "use the existing parser" }],
+		});
+
+		expect(result).toEqual({ outcome: "injected", queue: "steering" });
+		expect(session.steerCalls).toEqual([{ text: "use the existing parser", images: [] }]);
+		// Only the client's own prompt was ever started — the steer joins that
+		// turn rather than queueing a second prompt behind it.
+		expect(session.promptCalls).toEqual(["original task"]);
+
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
+	it("does not deliver a held steer to a replacement client turn", async () => {
+		const harness = await createHarness();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		const dispatches = [Promise.withResolvers<boolean>(), Promise.withResolvers<boolean>()];
+		const started = [Promise.withResolvers<void>(), Promise.withResolvers<void>()];
+		let dispatchIndex = 0;
+		session.prompt = async () => {
+			const index = dispatchIndex++;
+			session.isStreaming = true;
+			started[index]!.resolve();
+			return await dispatches[index]!.promise;
+		};
+		const first = harness.agent.prompt({
+			sessionId: created.sessionId,
+			prompt: [{ type: "text", text: "first task" }],
+		});
+		await started[0]!.promise;
+		const admitting = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const join = session.joinActiveTurn.bind(session);
+		session.joinActiveTurn = async (text, images, options) => {
+			admitting.resolve();
+			await release.promise;
+			return await join(text, images, options);
+		};
+		const steer = harness.agent.extMethod("_session/steering", {
+			sessionId: created.sessionId,
+			prompt: [{ type: "text", text: "belongs only to first" }],
+		});
+		await admitting.promise;
+		await harness.agent.cancel({ sessionId: created.sessionId });
+		expect((await first).stopReason).toBe("cancelled");
+		const second = harness.agent.prompt({
+			sessionId: created.sessionId,
+			prompt: [{ type: "text", text: "second task" }],
+		});
+		await started[1]!.promise;
+		release.resolve();
+		expect(await steer).toEqual({ outcome: "promptRequired", queue: "steering" });
+		expect(session.steerCalls).toEqual([]);
+		await harness.agent.cancel({ sessionId: created.sessionId });
+		expect((await second).stopReason).toBe("cancelled");
+		for (const dispatch of dispatches) dispatch.resolve(false);
+		await harness.agent.dispose();
+	});
+
+	it("leaves an idle prompt unconsumed whether or not idleBehavior is set", async () => {
+		const harness = await createHarness();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+
+		// agent-shell sends idleBehavior: "promptRequired"; a client that omits
+		// it must not get a detached startedNewTurn turn it cannot observe or
+		// cancel — idle steering is always the host's to submit.
+		const withMeta = await harness.agent.extMethod("_session/steering", {
+			sessionId: created.sessionId,
+			prompt: [{ type: "text", text: "fresh task" }],
+			_meta: { steering: { idleBehavior: "promptRequired" } },
+		});
+		const withoutMeta = await harness.agent.extMethod("_session/steering", {
+			sessionId: created.sessionId,
+			prompt: [{ type: "text", text: "another task" }],
+		});
+
+		expect(withMeta).toEqual({ outcome: "promptRequired", queue: "steering" });
+		expect(withoutMeta).toEqual({ outcome: "promptRequired", queue: "steering" });
+		expect(session.steerCalls).toEqual([]);
+		expect(session.followUpCalls).toEqual([]);
+		expect(session.promptCalls).toEqual([]);
+
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
+	it("reports a failed outcome when the session refuses the steer", async () => {
+		const harness = await createHarness();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		session.isStreaming = true;
+		const dispatch = Promise.withResolvers<boolean>();
+		const started = Promise.withResolvers<void>();
+		session.prompt = async () => {
+			started.resolve();
+			return await dispatch.promise;
+		};
+		const prompt = harness.agent.prompt({
+			sessionId: created.sessionId,
+			prompt: [{ type: "text", text: "owned task" }],
+		});
+		await started.promise;
+		session.steer = async () => {
+			throw new Error("cannot steer");
+		};
+
+		const result = await harness.agent.extMethod("_session/steering", {
+			sessionId: created.sessionId,
+			prompt: [{ type: "text", text: "please" }],
+		});
+
+		expect(result).toEqual({ outcome: "failed", reason: "cannot steer" });
+		await harness.agent.cancel({ sessionId: created.sessionId });
+		dispatch.resolve(false);
+		expect((await prompt).stopReason).toBe("cancelled");
+
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
+	it("rejects _session/steering for unknown sessions and empty or malformed prompts", async () => {
+		const harness = await createHarness();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+
+		// An unknown session is a client error, not a server fault: it must
+		// surface as -32602 invalid params, not the generic -32603 a plain
+		// Error becomes.
+		await expect(
+			harness.agent.extMethod("_session/steering", {
+				sessionId: "missing-session",
+				prompt: [{ type: "text", text: "hi" }],
+			}),
+		).rejects.toThrow("unknown session");
+		// Null/non-object params map to the method's -32602 contract, not the
+		// -32603 a TypeError dereference would surface as.
+		for (const badParams of [null, "steer", 42] as never[]) {
+			const error = await harness.agent.extMethod("_session/steering", badParams).then(
+				() => undefined,
+				(rejection: unknown) => rejection,
+			);
+			expect(error).toBeInstanceOf(RequestError);
+			expect((error as RequestError).code).toBe(-32602);
+		}
+		await expect(
+			harness.agent.extMethod("_session/steering", { sessionId: created.sessionId, prompt: 42 }),
+		).rejects.toThrow("Invalid params");
+		await expect(
+			harness.agent.extMethod("_session/steering", { sessionId: created.sessionId, prompt: [] }),
+		).rejects.toThrow("Invalid params");
+		await expect(
+			harness.agent.extMethod("_session/steering", { prompt: [{ type: "text", text: "hi" }] }),
+		).rejects.toThrow("Invalid params");
+
+		// Block-level malformations must surface as typed invalid-params errors
+		// on the wire (code -32602), not TypeErrors or silently queued
+		// undefined fields — including inherited names like `constructor`.
+		for (const prompt of [
+			[null],
+			[{ type: "image" }],
+			[{ type: "text" }],
+			[{ type: "resource" }],
+			[{ type: "resource", resource: { uri: "file:///x" } }],
+			[{ type: "resource", resource: { uri: "file:///x", mimeType: "text/plain" } }],
+			// A non-string arm that used to pass validation as long as the
+			// *other* arm was a string: the converter selects whichever arm
+			// it sees, so `text: 7` would have replaced the image blob with
+			// the raw number in model input. Each malformed arm rejects on
+			// its own row.
+			[{ type: "resource", resource: { uri: "file:///x", blob: "<base64>", mimeType: "image/png", text: 7 } }],
+			[{ type: "resource", resource: { uri: "file:///x", text: 7 } }],
+			// Optional resource.mimeType is typed string (never null): a
+			// present non-string value must reject instead of slipping into
+			// the converter's image arm.
+			[{ type: "resource", resource: { uri: "file:///x", blob: "<base64>", mimeType: 7 } }],
+			[{ type: "nope", text: "hi" }],
+			[{ type: "constructor" }],
+			[{ type: "resource_link", uri: "file:///x", title: 5 }],
+			// resource_link optional fields per the ACP schema: mimeType and
+			// description are string|null, size is number|null — anything
+			// else present rejects.
+			[{ type: "resource_link", uri: "file:///x", mimeType: 7 }],
+			[{ type: "resource_link", uri: "file:///x", description: 7 }],
+			[{ type: "resource_link", uri: "file:///x", size: "large" }],
+		] as unknown[]) {
+			const error = await harness.agent
+				.extMethod("_session/steering", { sessionId: created.sessionId, prompt })
+				.then(
+					() => undefined,
+					(rejection: unknown) => rejection,
+				);
+			expect(error).toBeInstanceOf(RequestError);
+			expect((error as RequestError).code).toBe(-32602);
+		}
+
+		// Both arms present and string is legal: only a malformed *selected*
+		// arm rejects — never simultaneous valid arms. The text arm wins
+		// conversion and the steer queues normally.
+		const bothArms = await harness.agent.extMethod("_session/steering", {
+			sessionId: created.sessionId,
+			prompt: [{ type: "resource", resource: { uri: "file:///x", blob: "<base64>", text: "text wins" } }],
+		});
+		expect(bothArms).toEqual({ outcome: "promptRequired", queue: "steering" });
+		// A `resource_link` `title`/`name` of `null` is legal (the ACP schema
+		// types them `string | null`): treated exactly like an absent field,
+		// never rejected as malformed.
+		const nullTitle = await harness.agent.extMethod("_session/steering", {
+			sessionId: created.sessionId,
+			prompt: [{ type: "resource_link", uri: "file:///x", title: null }],
+		});
+		expect(nullTitle).toEqual({ outcome: "promptRequired", queue: "steering" });
+		const unknownSessionError = await harness.agent
+			.extMethod("_session/steering", {
+				sessionId: "missing-session",
+				prompt: [{ type: "text", text: "hi" }],
+			})
+			.then(
+				() => undefined,
+				(rejection: unknown) => rejection,
+			);
+		expect(unknownSessionError).toBeInstanceOf(RequestError);
+		expect((unknownSessionError as RequestError).code).toBe(-32602);
 
 		harness.abortController.abort();
 		await Bun.sleep(0);
@@ -2217,8 +2804,7 @@ describe("ACP agent", () => {
 		expect(firstResponse.stopReason).toBe("cancelled");
 
 		const queuedError = await secondPrompt;
-		expect(queuedError).toBeInstanceOf(Error);
-		expect((queuedError as Error).message).toBe("ACP cancel cleanup timed out");
+		expect(queuedError).toMatchObject({ code: -32002 });
 
 		// The fire-and-forget close runs off the same cleanup rejection; give it a
 		// few ticks to settle before asserting.
@@ -2232,9 +2818,153 @@ describe("ACP agent", () => {
 				messageId: "00000000-0000-4000-8000-000000000047",
 				prompt: [{ type: "text", text: "after stuck implicit cancel" }],
 			} as PromptRequest),
-		).rejects.toThrow("Unsupported ACP session");
+		).rejects.toMatchObject({ code: -32002 });
 
 		finishPrompt();
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+	it("resolves a prompt queued at cancel time as cancelled without starting it", async () => {
+		const harness = await createHarness();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		// First abort (the live turn's cancel cleanup) parks until released;
+		// the queued prompt's own pre-start cleanup later reuses normal
+		// (immediately resolving) aborts.
+		let abortCalls = 0;
+		const firstAbortBlocked = Promise.withResolvers<void>();
+		session.abort = async () => {
+			abortCalls++;
+			if (abortCalls === 1) {
+				await firstAbortBlocked.promise;
+			}
+			session.isStreaming = false;
+		};
+		const finishPrompt = holdPromptStreaming(session);
+
+		const firstPrompt = harness.agent.prompt({
+			sessionId: created.sessionId,
+			messageId: "00000000-0000-4000-8000-000000000048",
+			prompt: [{ type: "text", text: "long running" }],
+		} as PromptRequest);
+		for (let i = 0; i < 20 && session.promptCalls.length === 0; i++) {
+			await Bun.sleep(0);
+		}
+		expect(session.promptCalls).toEqual(["long running"]);
+
+		// Cancel the live turn: its wire response settles immediately, but its
+		// cleanup parks behind the blocked first abort.
+		const firstCancel = harness.agent.cancel({ sessionId: created.sessionId });
+		for (let i = 0; i < 20 && abortCalls === 0; i++) {
+			await Bun.sleep(0);
+		}
+		expect(abortCalls).toBe(1);
+
+		// A second prompt arrives while the first turn is settled but its
+		// cleanup is still in flight: the queue callback parks on
+		// `previousTurn.cleanup` before creating its turn slot.
+		const secondPrompt = harness.agent.prompt({
+			sessionId: created.sessionId,
+			messageId: "00000000-0000-4000-8000-000000000049",
+			prompt: [{ type: "text", text: "queued behind the running turn" }],
+		} as PromptRequest);
+		await Bun.sleep(0);
+
+		// The user cancels again while the first cleanup is still unwinding
+		// and that second prompt is still inside its dispatch window: the
+		// stop must mark the queued prompt, and it must REUSE the first
+		// cleanup's barrier (the turn is settled but still in flight) rather
+		// than starting a second, uncoalesced abort that could reset a
+		// replacement prompt.
+		const secondCancel = harness.agent.cancel({ sessionId: created.sessionId });
+		await Bun.sleep(20);
+		expect(abortCalls).toBe(1);
+
+		// Let the first cleanup finish; the queued prompt must resolve
+		// cancelled without ever starting a run.
+		firstAbortBlocked.resolve();
+		finishPrompt();
+		const firstResponse = await firstPrompt;
+		expect(firstResponse.stopReason).toBe("cancelled");
+		const secondResponse = await secondPrompt;
+		expect(secondResponse.stopReason).toBe("cancelled");
+		expect(session.promptCalls).toEqual(["long running"]);
+		await firstCancel;
+		await secondCancel;
+
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
+	it("aborts an autonomous run when cancel arrives with no client promptTurn", async () => {
+		const harness = await createHarness();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		const abortReasons: Array<string | undefined> = [];
+		session.abort = async (options?: { reason?: string }) => {
+			abortReasons.push(options?.reason);
+			session.isStreaming = false;
+		};
+
+		// Autonomous wake (steer-triggered follow-up, IRC, scheduler): streaming
+		// with no client promptTurn owning the run.
+		session.isStreaming = true;
+		await harness.agent.cancel({ sessionId: created.sessionId });
+
+		expect(abortReasons).toEqual([USER_INTERRUPT_LABEL]);
+		expect(session.isStreaming).toBe(false);
+
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
+	it("closes the session when a cancelled pre-start prompt's cleanup times out", async () => {
+		const harness = await createHarness();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		harness.agent.setCancelCleanupTimeoutForTesting(10);
+		// The live turn's cancel abort resolves so the queued prompt can
+		// start; the second abort — the queued prompt's own pre-start
+		// cleanup — hangs so its barrier rejects at the timeout.
+		let abortCalls = 0;
+		const neverSettles = Promise.withResolvers<void>();
+		session.abort = async () => {
+			abortCalls++;
+			session.isStreaming = false;
+			if (abortCalls >= 2) {
+				return neverSettles.promise;
+			}
+		};
+		const finishPrompt = holdPromptStreaming(session);
+
+		const firstPrompt = harness.agent.prompt({
+			sessionId: created.sessionId,
+			messageId: "00000000-0000-4000-8000-000000000050",
+			prompt: [{ type: "text", text: "long running" }],
+		} as PromptRequest);
+		for (let i = 0; i < 20 && session.promptCalls.length === 0; i++) {
+			await Bun.sleep(0);
+		}
+		const secondPrompt = harness.agent.prompt({
+			sessionId: created.sessionId,
+			messageId: "00000000-0000-4000-8000-000000000051",
+			prompt: [{ type: "text", text: "queued behind the running turn" }],
+		} as PromptRequest);
+
+		await harness.agent.cancel({ sessionId: created.sessionId });
+		finishPrompt();
+
+		const firstResponse = await firstPrompt;
+		expect(firstResponse.stopReason).toBe("cancelled");
+		const secondResponse = await secondPrompt;
+		expect(secondResponse.stopReason).toBe("cancelled");
+		// The pre-start cleanup's rejection is observed: the session closes
+		// instead of the rejection surfacing unhandled.
+		for (let i = 0; i < 40 && !session.disposed; i++) {
+			await Bun.sleep(5);
+		}
+		expect(session.disposed).toBe(true);
+
 		harness.abortController.abort();
 		await Bun.sleep(0);
 	});
@@ -2710,6 +3440,114 @@ describe("ACP agent", () => {
 		}
 	});
 
+	it("rejects timed-out persistent cancellation instead of acknowledging work that can still mutate", async () => {
+		const harness = await createHarness();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const started = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const completed = Promise.withResolvers<void>();
+		let mutated = false;
+		const backend: memoryBackend.MemoryBackend = {
+			id: "local",
+			start() {},
+			async buildDeveloperInstructions() {
+				return undefined;
+			},
+			async clear(_agentDir, _cwd, _session, signal) {
+				started.resolve();
+				try {
+					await release.promise;
+					signal?.throwIfAborted();
+					mutated = true;
+				} finally {
+					completed.resolve();
+				}
+			},
+			async enqueue() {},
+		};
+		const resolveSpy = spyOn(memoryBackend, "resolveMemoryBackend").mockResolvedValue(backend);
+		vi.useFakeTimers();
+		try {
+			harness.agent.setCancelCleanupTimeoutForTesting(1);
+			const prompt = harness.agent.prompt({
+				sessionId: created.sessionId,
+				prompt: [{ type: "text", text: "/memory clear" }],
+			});
+			const result = prompt.then(
+				response => ({ response, error: undefined }),
+				error => ({ response: undefined, error }),
+			);
+			await started.promise;
+			const cancellation = harness.agent.cancel({ sessionId: created.sessionId });
+			vi.advanceTimersByTime(1);
+			const terminal = await result;
+			expect(terminal.response).toBeUndefined();
+			expect(terminal.error).toMatchObject({ code: -32002 });
+			await cancellation;
+			release.resolve();
+			await completed.promise;
+			expect(mutated).toBe(false);
+			await expect(
+				harness.agent.prompt({
+					sessionId: created.sessionId,
+					prompt: [{ type: "text", text: "replacement work" }],
+				}),
+			).rejects.toMatchObject({ code: -32002 });
+		} finally {
+			release.resolve();
+			vi.useRealTimers();
+			resolveSpy.mockRestore();
+			await harness.agent.dispose();
+		}
+	});
+
+	it("accepts a new prompt after Python's five-second interrupt escalation", async () => {
+		const harness = await createHarness();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		const abortRelease = Promise.withResolvers<void>();
+		const promptStarted = Promise.withResolvers<void>();
+		const nextPromptStarted = Promise.withResolvers<void>();
+		session.abort = async () => {
+			await abortRelease.promise;
+			session.isStreaming = false;
+		};
+		const finishPrompt = holdPromptStreaming(session);
+		const heldPrompt = session.prompt;
+		session.prompt = async text => {
+			(text === "interrupt a stuck Python cell" ? promptStarted : nextPromptStarted).resolve();
+			return heldPrompt(text);
+		};
+
+		const firstPrompt = harness.agent.prompt({
+			sessionId: created.sessionId,
+			prompt: [{ type: "text", text: "interrupt a stuck Python cell" }],
+		});
+		await promptStarted.promise;
+		vi.useFakeTimers();
+		try {
+			const cancelPrompt = harness.agent.cancel({ sessionId: created.sessionId });
+			expect((await firstPrompt).stopReason).toBe("cancelled");
+			vi.advanceTimersByTime(5_200);
+			abortRelease.resolve();
+			await cancelPrompt;
+			expect(session.disposed).toBe(false);
+
+			const secondPrompt = harness.agent.prompt({
+				sessionId: created.sessionId,
+				prompt: [{ type: "text", text: "continue after interrupt escalation" }],
+			});
+			await nextPromptStarted.promise;
+			finishPrompt();
+			expect((await secondPrompt).stopReason).toBe("end_turn");
+		} finally {
+			abortRelease.resolve();
+			finishPrompt();
+			vi.useRealTimers();
+			harness.abortController.abort();
+		}
+	});
+
 	it("closes the ACP session when cancel cleanup times out", async () => {
 		const harness = await createHarness();
 		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
@@ -2736,7 +3574,7 @@ describe("ACP agent", () => {
 				messageId: "00000000-0000-4000-8000-000000000042",
 				prompt: [{ type: "text", text: "after stuck cancel" }],
 			} as PromptRequest),
-		).rejects.toThrow("Unsupported ACP session");
+		).rejects.toMatchObject({ code: -32002 });
 
 		finishPrompt();
 		harness.abortController.abort();
@@ -2770,8 +3608,7 @@ describe("ACP agent", () => {
 
 		await cancelPrompt;
 		const queuedError = await queuedPrompt;
-		expect(queuedError).toBeInstanceOf(Error);
-		expect(queuedError.message).toBe("ACP cancel cleanup timed out");
+		expect(queuedError).toMatchObject({ code: -32002 });
 		expect(session.promptCalls).toEqual(["stuck cancel before queued"]);
 
 		finishPrompt();
@@ -3384,6 +4221,19 @@ describe("ACP agent", () => {
 			});
 		});
 
+		it("refuses secret input requests without emitting a plaintext form elicitation", async () => {
+			const { connection, calls } = createElicitConnection(async () => ({
+				action: "accept",
+				content: { value: "shh" },
+			}));
+			const ctx = createAcpExtensionUiContext(connection, () => "session-secret-input", FORM_CAPABILITIES);
+
+			const result = await ctx.input("API key", "sk-...", { secret: true });
+
+			expect(result).toBeUndefined();
+			expect(calls).toHaveLength(0);
+		});
+
 		it("translates editor to a string elicitation with the prefill as default", async () => {
 			const { connection, calls } = createElicitConnection(async () => ({
 				action: "accept",
@@ -3612,43 +4462,42 @@ describe("ACP agent", () => {
 
 			expect(result).toBeUndefined();
 		});
-
-		it("reads the sessionId getter on every elicitation so mid-flight session changes are reflected", async () => {
-			// `record.session.sessionId` mutates when an extension command calls
-			// `ctx.switchSession` / `ctx.newSession`. Snapshotting it once at
-			// factory time would route later elicitations to the pre-switch id.
-			const { connection, calls } = createElicitConnection(async () => ({
-				action: "accept",
-				content: { value: "ok" },
-			}));
-			let currentSessionId = "session-before-switch";
-			const ctx = createAcpExtensionUiContext(connection, () => currentSessionId, FORM_CAPABILITIES);
-
-			await ctx.select("Pick", ["a"]);
-			currentSessionId = "session-after-switch";
-			await ctx.confirm("Continue?", "post-switch");
-			await ctx.input("Name?");
-
-			expect(calls).toHaveLength(3);
-			// Each call must be a session-scoped form elicitation. Spelled as three
-			// separate narrows because `mode === "form"` alone leaves both
-			// `ElicitationRequestScope` and `ElicitationSessionScope` in the union —
-			// only `"sessionId" in call` picks the session-scoped variant — and
-			// loop-style narrows don't propagate to the assertions below.
-			const [first, second, third] = calls;
-			if (first?.mode !== "form" || !("sessionId" in first)) throw new Error("first call missing sessionId");
-			if (second?.mode !== "form" || !("sessionId" in second)) throw new Error("second call missing sessionId");
-			if (third?.mode !== "form" || !("sessionId" in third)) throw new Error("third call missing sessionId");
-			expect(first.sessionId).toBe("session-before-switch");
-			expect(second.sessionId).toBe("session-after-switch");
-			expect(third.sessionId).toBe("session-after-switch");
-		});
 	});
 });
 
 describe("ACP agent MCP server configuration (late-connecting servers)", () => {
 	const FIXTURE_PATH = path.join(import.meta.dir, "fixtures", "delayed-tool-mcp.ts");
 	const BUN_EXEC = process.execPath;
+	const retainedResources: Array<{ authStorage: AuthStorage; manager?: MCPManager; restore: () => void }> = [];
+	afterEach(async () => {
+		for (const resource of retainedResources.splice(0)) {
+			resource.restore();
+			await resource.manager?.disconnectAll();
+			await resource.authStorage.close();
+		}
+	});
+
+	async function credentialedMcpHarness(serverName: string) {
+		const authStorage = new AuthStorage(new SqliteAuthCredentialStore(new Database(":memory:")));
+		const resource: (typeof retainedResources)[number] = { authStorage, restore: () => capture.mockRestore() };
+		const original = MCPManager.prototype.connectServers;
+		const capture = spyOn(MCPManager.prototype, "connectServers").mockImplementation(function (
+			this: MCPManager,
+			...args: Parameters<MCPManager["connectServers"]>
+		) {
+			if (Object.hasOwn(args[0], serverName)) resource.manager = this;
+			return original.apply(this, args);
+		});
+		retainedResources.push(resource);
+		const harness = await createHarness({ authStorage });
+		return {
+			harness,
+			getManager: () => {
+				if (!resource.manager) throw new Error("Real client manager was not constructed");
+				return resource.manager;
+			},
+		};
+	}
 
 	// Real polling, not fake timers: the fixture is a genuine child process
 	// racing MCPManager's own `Bun.sleep`-based 250ms startup window, and a
@@ -3697,4 +4546,314 @@ describe("ACP agent MCP server configuration (late-connecting servers)", () => {
 			refreshSpy.mockRestore();
 		}
 	}, 15_000);
+
+	it("keeps a client-declared server whose initial connect fails in a usable record", async () => {
+		const { harness, getManager } = await credentialedMcpHarness("broken");
+		const created = await harness.agent.newSession({
+			cwd: harness.cwdA,
+			mcpServers: [{ name: "broken", command: "/nonexistent/omp-fixture-binary", args: [], env: [] }],
+		});
+		expectAcpStructure(zNewSessionResponse, created);
+		const manager = getManager();
+		const definition = manager.getServerConfig("broken");
+		expect(definition).toMatchObject({ command: "/nonexistent/omp-fixture-binary" });
+		const hasFailureChunk = (): boolean =>
+			harness.updates.some(
+				notification =>
+					notification.sessionId === created.sessionId &&
+					notification.update.sessionUpdate === "agent_message_chunk" &&
+					notification.update.content.type === "text",
+			);
+		expect(hasFailureChunk()).toBe(false);
+		await pollUntil(hasFailureChunk);
+		const response = await harness.agent.prompt({
+			sessionId: created.sessionId,
+			prompt: [{ type: "text", text: "/mcp reauth broken" }],
+		});
+		expect(response.stopReason).toBe("end_turn");
+		expect(manager.getServerConfig("broken")).toBe(definition);
+		expect(manager.getConnectionStatus("broken")).toBe("disconnected");
+		expect(harness.findSession(created.sessionId)?.promptCalls).toEqual([]);
+	}, 15_000);
+
+	it("keeps an HTTP server with an expired client bearer reauthable through the real manager", async () => {
+		const requests: Array<{ method: string; authorization: string | null }> = [];
+		const server = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			async fetch(request) {
+				if (request.method === "POST") {
+					const body = (await request.json()) as { method: string };
+					requests.push({ method: body.method, authorization: request.headers.get("authorization") });
+				}
+				return new Response("expired", { status: 401 });
+			},
+		});
+		try {
+			const { harness, getManager } = await credentialedMcpHarness("expired");
+			const created = await harness.agent.newSession({
+				cwd: harness.cwdA,
+				mcpServers: [
+					{
+						name: "expired",
+						type: "http",
+						url: `http://127.0.0.1:${server.port}/mcp`,
+						headers: [{ name: "Authorization", value: "Bearer stale" }],
+					},
+				],
+			});
+			expectAcpStructure(zNewSessionResponse, created);
+			const manager = getManager(),
+				definition = manager.getServerConfig("expired");
+			await pollUntil(() =>
+				harness.updates.some(
+					notification =>
+						notification.sessionId === created.sessionId &&
+						notification.update.sessionUpdate === "agent_message_chunk" &&
+						notification.update.content.type === "text",
+				),
+			);
+			const before = requests.length;
+			const response = await harness.agent.prompt({
+				sessionId: created.sessionId,
+				prompt: [{ type: "text", text: "/mcp reauth expired" }],
+			});
+			expect(response.stopReason).toBe("end_turn");
+			expect(requests.slice(before).find(request => request.method === "initialize")).toEqual({
+				method: "initialize",
+				authorization: null,
+			});
+			expect(requests.slice(before).map(request => request.authorization)).not.toContain("Bearer stale");
+			expect(manager.getServerConfig("expired")).toBe(definition);
+			expect(manager.getConnectionStatus("expired")).toBe("disconnected");
+			expect(harness.findSession(created.sessionId)?.promptCalls).toEqual([]);
+		} finally {
+			await server.stop(true);
+		}
+	}, 15_000);
+
+	it.each(["success", "rejected", "store-replaced-reconnect", "store-replaced-refresh"] as const)(
+		"observes recovered MCP tool binding before reauth completion: %s",
+		async outcome => {
+			// Regression: the reconnect hook resolved as soon as
+			// `reconnectMcpManagerServer` did, but the tools-changed callback
+			// fired during the reconnect only *enqueued* the session refresh on
+			// `record.mcpRefreshChain`. The reauth prompt could complete — and
+			// the client's immediately following prompt start — while the
+			// recovered tools were still unbound. The hook must await the chain.
+			//
+			// Real wire flow: the fixture answers 401 with OAuth metadata until
+			// the fresh url-keyed bearer arrives, then serves initialize and a
+			// tools/list entry the reauth reconnect registers.
+			const challenge = JSON.stringify({
+				authorization_url: "https://auth.example.com/authorize",
+				token_url: "https://auth.example.com/token",
+			});
+			const reconnectStarted = Promise.withResolvers<void>();
+			const reconnectRelease = Promise.withResolvers<void>();
+			const refreshGate = Promise.withResolvers<void>();
+			const requests: string[] = [];
+			const serveRpc = async (request: Request): Promise<Response> => {
+				// The transport's optional SSE listener GETs first; answer 405 so it
+				// treats server-initiated messages as unsupported and moves on.
+				if (request.method !== "POST") return new Response(null, { status: 405 });
+				if (
+					request.headers.get("x-tenant") !== "original" ||
+					new URL(request.url).searchParams.get("tenant") !== "original"
+				)
+					return new Response("incorrect tenant routing", { status: 400 });
+				const authorization = request.headers.get("authorization") ?? "";
+				requests.push(authorization);
+				if (
+					authorization !== "Bearer fresh-access" &&
+					authorization !== "Bearer second-access" &&
+					authorization !== "Bearer replacement-access"
+				) {
+					return new Response(challenge, { status: 401 });
+				}
+				const body = (await request.json()) as { id?: number; method?: string };
+				if (body.method === "initialize") {
+					if (outcome === "store-replaced-reconnect") {
+						reconnectStarted.resolve();
+						await reconnectRelease.promise;
+					}
+					return Response.json({
+						jsonrpc: "2.0",
+						id: body.id,
+						result: {
+							protocolVersion: "2025-03-26",
+							capabilities: { tools: {} },
+							serverInfo: { name: "fixture", version: "0.0.0" },
+						},
+					});
+				}
+				if (body.method === "tools/list") {
+					return Response.json({
+						jsonrpc: "2.0",
+						id: body.id,
+						result: {
+							tools: [
+								{
+									name:
+										authorization === "Bearer replacement-access"
+											? "replacement_tool"
+											: authorization === "Bearer second-access"
+												? "second_tool"
+												: "recovered_tool",
+									inputSchema: { type: "object" },
+								},
+							],
+						},
+					});
+				}
+				return Response.json({ jsonrpc: "2.0", id: body.id, error: { code: -32601, message: "no method" } });
+			};
+			const server = Bun.serve({ port: 0, fetch: serveRpc });
+			const serverUrl = `http://127.0.0.1:${server.port}/mcp?tenant=original`;
+			const database = new Database(":memory:");
+			const authStorage = new AuthStorage(new SqliteAuthCredentialStore(database));
+			// No browser in CI: the flow's token exchange is stubbed at the login
+			// boundary, exactly like the dispatcher-level reauth tests.
+			const loginSpy = spyOn(oauthFlowModule.MCPOAuthFlow.prototype, "login").mockResolvedValue({
+				access: "fresh-access",
+				refresh: "fresh-refresh",
+				expires: Date.now() + 3_600_000,
+			});
+			try {
+				const harness = await createHarness({ authStorage, allowMcpBrowserAuth: true });
+				const created = await harness.agent.newSession({
+					cwd: harness.cwdA,
+					mcpServers: [
+						{
+							name: "expired",
+							type: "http",
+							url: serverUrl,
+							headers: [
+								{ name: "Authorization", value: "Bearer stale" },
+								{ name: "X-Tenant", value: "original" },
+							],
+						},
+					],
+				});
+				expectAcpStructure(zNewSessionResponse, created);
+				const credentialId = oauthFlowModule.mcpOAuthCredentialId(serverUrl);
+				const originalPool = authStorage.credentials;
+				const replacementPath = path.join(harness.cwdA, "replacement-auth.db");
+				const seeded = new AuthStorage(new SqliteAuthCredentialStore(new Database(replacementPath)));
+				await seeded.credentials.set(credentialId, {
+					type: "oauth",
+					access: "replacement-access",
+					refresh: "replacement-refresh",
+					expires: Date.now() + 3_600_000,
+				});
+				await seeded.close();
+				const session = harness.findSession(created.sessionId)!;
+
+				// Gate non-empty refreshes so the completion order is observable:
+				// with the fix, the reauth prompt cannot settle while the
+				// (enqueued) refresh is still in flight.
+				const events: string[] = [];
+				session.refreshMCPTools = async (tools: Array<{ name: string }>) => {
+					const names = tools.map(tool => tool.name);
+					if (names.length === 0) return;
+					events.push(`refresh:start:${names.join(",")}`);
+					await refreshGate.promise;
+					events.push("refresh:done");
+				};
+
+				let reauthSettled = false;
+				const reauth = harness.agent
+					.prompt({
+						sessionId: created.sessionId,
+						prompt: [{ type: "text", text: "/mcp reauth expired" }],
+					})
+					.then(response => {
+						reauthSettled = true;
+						return response;
+					});
+
+				if (outcome === "store-replaced-reconnect") {
+					await reconnectStarted.promise;
+					expect(originalPool.get(credentialId)).toMatchObject({ access: "fresh-access" });
+					expect(reauthSettled).toBe(false);
+					await authStorage.replaceStore(new SqliteAuthCredentialStore(new Database(replacementPath)));
+					expect(authStorage.credentials).not.toBe(originalPool);
+					reconnectRelease.resolve();
+					await reauth;
+					expect(requests).not.toContain("Bearer replacement-access");
+					expect(events).toEqual([]);
+					expect(harness.updates.map(chunkText).join("\n")).not.toContain('Reauthorized "expired"');
+					expect(authStorage.credentials.get(credentialId)).toMatchObject({ access: "replacement-access" });
+					expect(session.promptCalls).toEqual([]);
+					return;
+				}
+				// Wait for the recovered tool's refresh to start, then let pending
+				// work settle: the prompt must still be pending — the hook is
+				// holding it on the gated refresh chain.
+				await pollUntil(() => events.some(event => event.includes("mcp__expired_recovered_tool")));
+				await Bun.sleep(25);
+				expect(reauthSettled).toBe(false);
+				expect(events.some(event => event.includes("mcp__expired_recovered_tool"))).toBe(true);
+
+				if (outcome === "store-replaced-refresh") {
+					expect(originalPool.get(credentialId)).toMatchObject({ access: "fresh-access" });
+					await authStorage.replaceStore(new SqliteAuthCredentialStore(new Database(replacementPath)));
+					expect(authStorage.credentials).not.toBe(originalPool);
+				}
+				if (outcome === "rejected") refreshGate.reject(new Error("recovered tools unavailable"));
+				else refreshGate.resolve();
+				const response = await reauth;
+				events.push("prompt:done");
+				expect(response.stopReason).toBe("end_turn");
+				// The refresh completed before the prompt resolved.
+				if (outcome === "success") {
+					expect(events.indexOf("refresh:done")).toBeLessThan(events.indexOf("prompt:done"));
+					expect(harness.updates.map(chunkText).join("\n")).toContain('Reauthorized "expired"');
+				} else if (outcome === "store-replaced-refresh") {
+					expect(events.indexOf("refresh:done")).toBeLessThan(events.indexOf("prompt:done"));
+					expect(requests).not.toContain("Bearer replacement-access");
+					expect(harness.updates.map(chunkText).join("\n")).not.toContain('Reauthorized "expired"');
+					expect(session.promptCalls).toEqual([]);
+				} else {
+					const text = harness.updates.map(chunkText).join("\n");
+					expect(text).toContain("recovered tools unavailable");
+					expect(text).not.toContain('Reauthorized "expired"');
+					expect(session.promptCalls).toEqual([]);
+				}
+				// And the reauth truly reconnected the server through the manager.
+				expect(authStorage.credentials.get(credentialId)).toMatchObject({
+					access: outcome === "store-replaced-refresh" ? "replacement-access" : "fresh-access",
+				});
+				if (outcome === "success") {
+					loginSpy.mockResolvedValue({
+						access: "second-access",
+						refresh: "second-refresh",
+						expires: Date.now() + 3_600_000,
+					});
+					const updatesBefore = harness.updates.length;
+					const requestsBefore = requests.length;
+					const second = await harness.agent.prompt({
+						sessionId: created.sessionId,
+						prompt: [{ type: "text", text: "/mcp reauth expired" }],
+					});
+					expect(second.stopReason).toBe("end_turn");
+					expect(requests.slice(requestsBefore)).toContain("Bearer second-access");
+					expect(requests.slice(requestsBefore)).not.toContain("Bearer stale");
+					expect(events.some(event => event.includes("mcp__expired_second_tool"))).toBe(true);
+					expect(harness.updates.slice(updatesBefore).map(chunkText).join("\n")).toContain(
+						'Reauthorized "expired"',
+					);
+					expect(authStorage.credentials.get(credentialId)).toMatchObject({ access: "second-access" });
+					expect(session.promptCalls).toEqual([]);
+				}
+			} finally {
+				reconnectRelease.resolve();
+				refreshGate.resolve();
+				loginSpy.mockRestore();
+				await server.stop(true);
+				await authStorage.close();
+			}
+		},
+		20_000,
+	);
 });

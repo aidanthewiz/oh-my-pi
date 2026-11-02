@@ -77,6 +77,6 @@ test("excluded providers stay out of usage and credential health", async () => {
 		expect(check.credentials.map(row => [row.id, row.provider])).toEqual([[1, "anthropic"]]);
 	} finally {
 		await handle.close();
-		storage.close();
+		await storage.close();
 	}
 });

@@ -53,6 +53,7 @@ export type SourceMeta =
 export interface DiagnosticMeta {
 	summary: string;
 	messages: string[];
+	unreported?: string[];
 }
 
 /**
@@ -87,7 +88,7 @@ export interface OutputMeta {
 	/** Capture failure of this output itself; aggregate reports keep source failures on their entries. */
 	artifactError?: OutputArtifactError;
 	source?: SourceMeta;
-	/** The output is a bounded page of session artifact storage its `source` re-reads with line selectors; spill-to-artifact skips it. */
+	/** The output is a bounded page of a file or session artifact its `source` re-reads with line selectors; spill-to-artifact skips it. */
 	pagedSource?: true;
 	diagnostics?: DiagnosticMeta;
 	limits?: LimitsMeta;
@@ -357,9 +358,10 @@ export function formatOutputNotice(meta: OutputMeta | undefined): string {
 
 	// Diagnostics
 	let diagnosticsNotice = "";
-	if (meta.diagnostics && meta.diagnostics.messages.length > 0) {
+	if (meta.diagnostics && (meta.diagnostics.messages.length > 0 || meta.diagnostics.unreported?.length)) {
 		const d = meta.diagnostics;
-		diagnosticsNotice = `\n\nLSP Diagnostics (${d.summary}):\n${formatGroupedDiagnosticMessages(d.messages)}`;
+		diagnosticsNotice = `\n\nLSP Diagnostics (${d.summary})`;
+		if (d.messages.length > 0) diagnosticsNotice += `:\n${formatGroupedDiagnosticMessages(d.messages)}`;
 	}
 
 	const notice = parts.length ? `\n\n[${parts.join(". ")}]` : "";

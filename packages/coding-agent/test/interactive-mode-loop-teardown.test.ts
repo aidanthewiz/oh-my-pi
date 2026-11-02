@@ -61,7 +61,7 @@ describe("InteractiveMode shutdown during a loop condition gate", () => {
 	afterEach(async () => {
 		vi.useRealTimers();
 		vi.restoreAllMocks();
-		authStorage.close();
+		await authStorage.close();
 		tempDir.removeSync();
 		resetSettingsForTest();
 	});

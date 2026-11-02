@@ -21,11 +21,10 @@ import {
 	pickElectronTarget,
 	probeCdpStatus,
 	resolveSpawnArgs,
-	shouldPreserveConnectedBrowserFocus,
 	waitForCdp,
 	waitForMainFrame,
 } from "@oh-my-pi/pi-coding-agent/tools/browser/attach";
-import { ensureChromiumExecutable } from "@oh-my-pi/pi-coding-agent/tools/browser/launch";
+import { ensureChromiumExecutable, loadPuppeteer } from "@oh-my-pi/pi-coding-agent/tools/browser/launch";
 import {
 	acquireBrowser,
 	type BrowserHandle,
@@ -36,7 +35,14 @@ import { acquireTab, getTab } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-
 import { Process, ProcessStatus } from "@oh-my-pi/pi-natives";
 import { ToolAbortError } from "@oh-my-pi/pi-coding-agent/tools/tool-errors";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
-import type { Browser, HTTPRequest, Page, Target } from "puppeteer-core";
+import {
+	type Browser,
+	type ConnectionTransport,
+	type HTTPRequest,
+	type Page,
+	type Target,
+	TimeoutError,
+} from "puppeteer-core";
 import { rejectionOf } from "../helpers/rejection";
 import { chromiumAvailable } from "./chromium-probe";
 
@@ -82,6 +88,7 @@ function makeTarget(id: string, page: Page | null = null, pageDelayMs = 0) {
 		type: () => "page",
 		page: pageSpy,
 	} as unknown as Target & { _targetId: string };
+	if (page) Object.assign(page, { target: () => target });
 	return { target, pageSpy };
 }
 
@@ -117,6 +124,7 @@ const RELAY_ENTRIES = [
 interface FakePageOptions {
 	url: string;
 	title: string;
+	id?: string;
 	visible?: boolean;
 }
 
@@ -124,6 +132,7 @@ function fakePage(options: FakePageOptions): Page {
 	return {
 		url: () => options.url,
 		title: async () => options.title,
+		target: () => ({ _targetId: options.id ?? "" }),
 		evaluate: async () => options.visible === true,
 	} as unknown as Page;
 }
@@ -292,15 +301,34 @@ describe("pickElectronTarget", () => {
 		30_000,
 	);
 
-	test("reports available pages when the matcher misses", async () => {
-		const page = fakePage({ url: "https://example.com/", title: "Example" });
+	test("adopts a fresh blank CDP page by its exact id when URLs and titles repeat", async () => {
+		const first = fakePage({ id: "PAGE_FIRST", url: "about:blank", title: "" });
+		const fresh = fakePage({ id: "PAGE_FRESH", url: "about:blank", title: "" });
 		const browser = {
-			targets: () => [fakeTarget("page", page)],
-			pages: async () => [],
+			targets: () => [fakeTarget("page", first), fakeTarget("page", fresh)],
 		} as unknown as Browser;
 
-		await expect(pickElectronTarget(browser, { matcher: "missing" })).rejects.toThrow(
-			'No page target matched "missing". Available pages:\n- Example  https://example.com/',
+		await expect(pickElectronTarget(browser, { matcher: "PAGE_FRESH" })).resolves.toBe(fresh);
+	});
+
+	test("prioritizes an exact CDP id over a URL substring on another page", async () => {
+		const first = fakePage({ id: "PAGE_FIRST", url: "https://example.com/PAGE_SECOND", title: "First" });
+		const second = fakePage({ id: "PAGE_SECOND", url: "about:blank", title: "" });
+		const browser = {
+			targets: () => [fakeTarget("page", first), fakeTarget("page", second)],
+		} as unknown as Browser;
+
+		await expect(pickElectronTarget(browser, { matcher: "PAGE_SECOND" })).resolves.toBe(second);
+	});
+
+	test("reports page ids with their URLs when a target id is missing", async () => {
+		const page = fakePage({ id: "PAGE_AVAILABLE", url: "https://example.com/", title: "Example" });
+		const browser = {
+			targets: () => [fakeTarget("page", page)],
+		} as unknown as Browser;
+
+		await expect(pickElectronTarget(browser, { matcher: "PAGE_MISSING" })).rejects.toThrow(
+			'No page target matched "PAGE_MISSING". Available pages:\n- PAGE_AVAILABLE  Example  https://example.com/',
 		);
 	});
 
@@ -325,11 +353,6 @@ describe("pickElectronTarget", () => {
 		} as unknown as Browser;
 
 		await expect(pickElectronTarget(browser, { preferVisible: true })).resolves.toBe(first);
-	});
-
-	test("preserves connected-browser focus only for automatic target selection", () => {
-		expect(shouldPreserveConnectedBrowserFocus()).toBe(true);
-		expect(shouldPreserveConnectedBrowserFocus("example.com")).toBe(false);
 	});
 
 	test("rejects websocket cdp_url values with an actionable diagnostic", () => {
@@ -504,6 +527,13 @@ describe("pickElectronTarget", () => {
 			const ownedName = `owned-${crypto.randomUUID()}`;
 			try {
 				await waitForCdp(`http://127.0.0.1:${port}`, 15_000);
+				const existing = await acquireBrowser(
+					{ kind: "spawned", path: exe, args: [...flags, `--user-data-dir=${borrowedProfile}`] },
+					{ cwd: session.cwd },
+				);
+				if (!("browser" in existing)) throw new Error("Expected Chromium browser");
+				const original = await existing.browser.newPage();
+				await original.goto("data:text/html,<title>Original user tab</title>");
 				await invoke({
 					action: "open",
 					name: borrowedName,
@@ -526,6 +556,7 @@ describe("pickElectronTarget", () => {
 				expect(ownedTab.browser.subprocess).toBeDefined();
 				const ownedTitle = await invoke({ action: "run", name: ownedName, code: "return await tab.title();" });
 				expect(ownedTitle.details).toMatchObject({ value: "Owned" });
+				expect(await original.title()).toBe("Original user tab");
 				const title = await invoke({ action: "run", name: borrowedName, code: "return await tab.title();" });
 				expect(title.details).toMatchObject({ value: "Borrowed" });
 				await invoke({ action: "close", name: borrowedName, kill: true });
@@ -535,6 +566,52 @@ describe("pickElectronTarget", () => {
 				await invoke({ action: "close", name: borrowedName, kill: true }).catch(() => {});
 				child.kill();
 				await child.exited;
+				await fs.rm(root, { recursive: true, force: true });
+			}
+		},
+		30_000,
+	);
+
+	test.skipIf(!CHROMIUM_AVAILABLE)(
+		"opens and owns a page in an empty custom Chrome profile",
+		async () => {
+			const exe = await ensureChromiumExecutable();
+			if (!exe) throw new Error("Expected a Chromium executable");
+			const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-browser-empty-profile-"));
+			const profile = path.join(root, "fresh");
+			const flags = [
+				"--headless=new",
+				"--no-sandbox",
+				"--no-startup-window",
+				"--no-first-run",
+				"--use-mock-keychain",
+				"--password-store=basic",
+				`--user-data-dir=${profile}`,
+			];
+			const session = makeSession();
+			const prelude = createBrowserPrelude(session);
+			const invoke = (parameters: unknown) => prelude.invoke(parameters, { session, toolCallId: "empty-profile" });
+			const name = `empty-profile-${crypto.randomUUID()}`;
+			try {
+				const handle = await acquireBrowser({ kind: "spawned", path: exe, args: flags }, { cwd: session.cwd });
+				if (!("browser" in handle)) throw new Error("Expected Chromium browser");
+				for (const page of await handle.browser.pages()) await page.close();
+				expect(handle.browser.targets().filter(target => String(target.type()) === "page")).toEqual([]);
+				await invoke({
+					action: "open",
+					name,
+					app: { path: exe, args: flags },
+					url: "data:text/html,<title>Fresh profile</title>",
+				});
+				const tab = getTab(name);
+				if (tab?.backend !== "worker") throw new Error("Expected Chromium worker tab");
+				expect(tab.ownsPage).toBe(true);
+				expect(tab.browser).toBe(handle);
+				expect((await invoke({ action: "run", name, code: "return await tab.title();" })).details).toMatchObject({
+					value: "Fresh profile",
+				});
+			} finally {
+				await invoke({ action: "close", name, kill: true }).catch(() => {});
 				await fs.rm(root, { recursive: true, force: true });
 			}
 		},
@@ -706,15 +783,23 @@ describe("pickElectronTarget", () => {
 		30_000,
 	);
 
-	test("names the refused CDP websocket instead of reporting [object ErrorEvent]", async () => {
+	test("identifies the refused CDP websocket without exposing discovered credentials", async () => {
 		// `/json/version` answers, but its debugger websocket refuses the upgrade.
+		const token = "synthetic discovered&secret";
+		const received: { token: string | null } = { token: null };
 		const cdp = Bun.serve({
 			hostname: "127.0.0.1",
 			port: 0,
-			fetch: (request, server) =>
-				new URL(request.url).pathname === "/json/version"
-					? Response.json({ webSocketDebuggerUrl: `ws://127.0.0.1:${server.port}/devtools/browser/gone` })
-					: new Response("gone", { status: 404 }),
+			fetch: (request, server) => {
+				const url = new URL(request.url);
+				if (url.pathname === "/json/version") {
+					const endpoint = new URL(`ws://127.0.0.1:${server.port}/devtools/browser/gone`);
+					endpoint.searchParams.set("token", token);
+					return Response.json({ webSocketDebuggerUrl: endpoint.toString() });
+				}
+				received.token = url.searchParams.get("token");
+				return new Response("gone", { status: 404 });
+			},
 		});
 		const session = makeSession();
 		const prelude = createBrowserPrelude(session);
@@ -730,11 +815,11 @@ describe("pickElectronTarget", () => {
 				),
 			);
 			expect(error).toBeInstanceOf(Error);
-			expect(error).toMatchObject({
-				message: expect.stringContaining(
-					`WebSocket connection to 'ws://127.0.0.1:${cdp.port}/devtools/browser/gone'`,
-				),
-			});
+			expect((error as Error).message).toContain(`ws://127.0.0.1:${cdp.port}/devtools/browser/gone`);
+			expect(received.token).toBe(token);
+			expect((error as Error).message).not.toContain(token);
+			expect((error as Error).message).not.toContain(encodeURIComponent(token));
+			expect((error as Error).message).not.toContain(encodeURIComponent(token).replaceAll("%20", "+"));
 		} finally {
 			cdp.stop(true);
 		}
@@ -862,6 +947,60 @@ describe("pickElectronTarget relay path", () => {
 		expect(second.pageSpy).not.toHaveBeenCalled();
 	});
 
+	it("adopts an exact relay id before a URL substring on another tab", async () => {
+		relayEntries = [
+			{
+				id: "PAGE_FIRST",
+				type: "page",
+				title: "First",
+				url: "https://example.com/PAGE_SECOND",
+				active: "false",
+				discarded: "false",
+			},
+			{ id: "PAGE_SECOND", type: "page", title: "Second", url: "about:blank", active: "false", discarded: "false" },
+		];
+		const first = makeTarget("PAGE_FIRST", makePage([() => {}], relayEntries[0]!.url).page);
+		const blank = makePage([() => {}], "about:blank").page;
+		const second = makeTarget("PAGE_SECOND", blank);
+
+		expect(
+			await pickElectronTarget(makeBrowser([first.target, second.target]), {
+				relayJson,
+				matcher: "PAGE_SECOND",
+			}),
+		).toBe(blank);
+		expect(first.pageSpy).not.toHaveBeenCalled();
+	});
+
+	it("does not adopt another relay tab when an exact id names a discarded tab", async () => {
+		relayEntries = [
+			{
+				id: "PAGE_FIRST",
+				type: "page",
+				title: "First",
+				url: "https://example.com/PAGE_DISCARDED",
+				active: "false",
+				discarded: "false",
+			},
+			{
+				id: "PAGE_DISCARDED",
+				type: "page",
+				title: "Second",
+				url: "about:blank",
+				active: "false",
+				discarded: "true",
+			},
+		];
+		const browser = makeBrowser([
+			makeTarget("PAGE_FIRST", makePage([() => {}]).page).target,
+			makeTarget("PAGE_DISCARDED", makePage([() => {}]).page).target,
+		]);
+
+		await expect(pickElectronTarget(browser, { relayJson, matcher: "PAGE_DISCARDED" })).rejects.toThrow(
+			"was discarded by Chrome",
+		);
+	});
+
 	it("waits for a just-opened tab to reach /json before failing the matcher", async () => {
 		const opened = {
 			id: "PAGE_NEW",
@@ -895,6 +1034,16 @@ describe("pickElectronTarget relay path", () => {
 		expect(other.pageSpy).not.toHaveBeenCalled();
 	});
 
+	it("lists relay page ids with their URLs when a target id is missing", async () => {
+		const error = await rejectionOf(pickElectronTarget(makeBrowser([]), { relayJson, matcher: "PAGE_MISSING" }));
+
+		expect(error).toBeInstanceOf(Error);
+		const message = (error as Error).message;
+		expect(message).toContain('No page target matched "PAGE_MISSING"');
+		expect(message).toContain("PAGE10  Docs  https://docs.example.com");
+		expect(message).toContain("PAGE11  Whole Foods Market Shopping Cart  https://www.amazon.com/cart/localmarket");
+	});
+
 	it("waits for Puppeteer to see a tab that /json already lists", async () => {
 		const cartPage = makePage([() => {}], RELAY_ENTRIES[1]!.url).page;
 		const late = makeTarget("PAGE11", cartPage);
@@ -909,18 +1058,36 @@ describe("pickElectronTarget relay path", () => {
 		expect(await pickElectronTarget(browser, { relayJson, matcher: "whole foods" })).toBe(cartPage);
 	});
 
-	it("rejects an unavailable selected target without adopting a different page", async () => {
-		const other = makeTarget("PAGE10", fakePage({ url: RELAY_ENTRIES[0]!.url, title: "Docs" }));
-		const browser = Object.assign(makeBrowser([other.target]), {
-			waitForTarget: async () => {
-				throw Object.assign(new Error("Waiting for target failed"), { name: "TimeoutError" });
+	it("does not adopt another page when the selected target times out with a minified error class", async () => {
+		const transport: ConnectionTransport = {
+			send(message) {
+				const { id, method } = JSON.parse(message) as { id: number; method: string };
+				const result = method === "Target.getBrowserContexts" ? { browserContextIds: [] } : {};
+				queueMicrotask(() => transport.onmessage?.(JSON.stringify({ id, result })));
 			},
-		});
+			close() {
+				transport.onclose?.();
+			},
+		};
+		const puppeteerBrowser = await (await loadPuppeteer()).connect({ transport, defaultViewport: null });
+		const nameDescriptor = Object.getOwnPropertyDescriptor(TimeoutError, "name")!;
+		// Release builds minify class names, so Puppeteer names its timeout like this there.
+		Object.defineProperty(TimeoutError, "name", { ...nameDescriptor, value: "Og" });
+		try {
+			const other = makeTarget("PAGE10", fakePage({ url: RELAY_ENTRIES[0]!.url, title: "Docs" }));
+			const browser = Object.assign(makeBrowser([other.target]), {
+				waitForTarget: (predicate: (target: Target) => boolean) =>
+					puppeteerBrowser.waitForTarget(predicate, { timeout: 50 }),
+			});
 
-		const error = await rejectionOf(pickElectronTarget(browser, { relayJson, matcher: "whole foods" }));
+			const error = await rejectionOf(pickElectronTarget(browser, { relayJson, matcher: "whole foods" }));
 
-		expect(error).toBeInstanceOf(ToolError);
-		expect(other.pageSpy).not.toHaveBeenCalled();
+			expect(error).toBeInstanceOf(ToolError);
+			expect(other.pageSpy).not.toHaveBeenCalled();
+		} finally {
+			Object.defineProperty(TimeoutError, "name", nameDescriptor);
+			await puppeteerBrowser.disconnect();
+		}
 	});
 
 	it("keeps cancellation during metadata settling distinct from a missing target", async () => {

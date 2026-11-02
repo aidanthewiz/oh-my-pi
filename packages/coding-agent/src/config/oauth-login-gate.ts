@@ -1,45 +1,38 @@
 import type { OAuthProviderInfo } from "@oh-my-pi/pi-ai/oauth/types";
 import type { GeneratedProvider } from "@oh-my-pi/pi-catalog/models";
 import { getBundledModels } from "@oh-my-pi/pi-catalog/models";
-import { cfgEnabledModels } from "./model-settings";
-import { Settings } from "./settings";
+import { cfgDisabledProviders, cfgEnabledModels } from "./model-settings";
+import type { Settings } from "./settings";
 
 /**
- * Login-list gate for managed installs: when `enabledModels` is configured,
- * a model provider whose models can never be selected has no reason to offer
- * OAuth sign-in — a stored credential would be dead weight on a provider the
- * org never audited. Non-model providers (search, local runtimes: no bundled
- * catalog entry) stay.
- *
- * LOGIN-ONLY by contract: callers apply this to login lists exclusively.
- * Logout paths (`OAuthSelectorComponent` logout mode, `/logout`) enumerate
- * stored credentials unfiltered, so a provider signed in before the allowlist
- * narrowed always remains sign-out-able (covered in oauth-selector.test.ts).
- *
- * Provider eligibility is derived from the `provider/` prefixes of the
- * allowlist patterns. A pattern without a provider prefix cannot be attributed
- * to a provider, so the gate turns itself off rather than guess.
+ * Login admission uses the consuming session's current policy. Omitted settings
+ * mean an unmanaged SDK host; logout never uses this gate.
  */
-export function filterOAuthLoginProviders(providers: OAuthProviderInfo[]): OAuthProviderInfo[] {
-	let patterns: readonly string[];
-	try {
-		patterns = cfgEnabledModels.get(Settings.instance);
-	} catch {
-		return providers; // before Settings.init(): unmanaged context
+export function isOAuthLoginProviderAllowed(provider: OAuthProviderInfo, settings?: Settings): boolean {
+	if (settings === undefined) return true;
+	const credentialTarget = provider.storeCredentialsAs ?? provider.id;
+	const disabled = cfgDisabledProviders.get(settings);
+	if (disabled.includes(provider.id) || disabled.includes(credentialTarget)) return false;
+	const patterns = cfgEnabledModels.get(settings);
+	if (patterns.length === 0 || patterns.some(pattern => pattern.indexOf("/") <= 0)) return true;
+	if (
+		patterns.some(pattern => {
+			const prefix = pattern.slice(0, pattern.indexOf("/"));
+			return prefix === provider.id || prefix === credentialTarget;
+		})
+	) {
+		return true;
 	}
-	if (patterns.length === 0) return providers;
+	return getBundledModels(credentialTarget as GeneratedProvider).length === 0;
+}
 
-	const allowedProviders = new Set<string>();
-	for (const pattern of patterns) {
-		const slash = pattern.indexOf("/");
-		if (slash <= 0) return providers; // bare-id pattern: provider unknowable, gate off
-		allowedProviders.add(pattern.slice(0, slash));
+export function assertOAuthLoginProviderAllowed(provider: OAuthProviderInfo, settings?: Settings): void {
+	if (!isOAuthLoginProviderAllowed(provider, settings)) {
+		throw new Error(`Provider '${provider.id}' is excluded by the current login policy.`);
 	}
+}
 
-	return providers.filter(provider => {
-		const credentialTarget = provider.storeCredentialsAs ?? provider.id;
-		if (allowedProviders.has(credentialTarget) || allowedProviders.has(provider.id)) return true;
-		// No bundled models -> not a model provider (search key, local runtime).
-		return getBundledModels(credentialTarget as GeneratedProvider).length === 0;
-	});
+/** Login lists and direct login actions share one policy; logout lists remain unfiltered. */
+export function filterOAuthLoginProviders(providers: OAuthProviderInfo[], settings?: Settings): OAuthProviderInfo[] {
+	return providers.filter(provider => isOAuthLoginProviderAllowed(provider, settings));
 }

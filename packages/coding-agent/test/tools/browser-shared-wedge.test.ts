@@ -37,7 +37,12 @@ import {
 import type { BrowserHandle } from "@oh-my-pi/pi-coding-agent/tools/browser/registry";
 import * as sharedDaemon from "@oh-my-pi/pi-coding-agent/tools/browser/shared-daemon";
 import { stopSharedBrowserIfUnreachable } from "@oh-my-pi/pi-coding-agent/tools/browser/shared-daemon";
-import { getTabsMapForTest, releaseTab, runInTab } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
+import {
+	acquireTab,
+	getTabsMapForTest,
+	releaseTab,
+	runInTab,
+} from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
 import type { TabSession } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools/index";
 import type { DaemonSnapshot } from "@oh-my-pi/pi-tui/tools/daemon";
@@ -85,7 +90,7 @@ async function ownedTargets(scope: SharedTargetScope): Promise<string[]> {
 interface WedgeOptions {
 	/** Whether the handle carries the shared-daemon scope (`false` = private launch). */
 	shared?: boolean;
-	close?: "hang" | "fail" | "gate";
+	close?: "hang" | "fail" | "gate" | "accepted";
 	/** Held by a `gate` close until the test releases it. */
 	gate?: Promise<void>;
 	/** Fires when a `gate` close starts, so the test can interleave a release. */
@@ -98,7 +103,11 @@ interface WedgeOptions {
 function makeWedgeHandle(scope: SharedTargetScope, options: WedgeOptions = {}): BrowserHandle {
 	const { shared = true, close = "hang", gate, entered } = options;
 	const session = {
-		send: async (): Promise<never> => {
+		send: async (method: string): Promise<unknown> => {
+			if (close === "accepted") {
+				if (method === "Target.getTargets") return { targetInfos: [{ targetId: TARGET_ID }] };
+				return { success: true };
+			}
 			if (close === "fail") throw new Error("CDP target session unavailable");
 			if (close === "gate") {
 				entered?.();
@@ -107,6 +116,8 @@ function makeWedgeHandle(scope: SharedTargetScope, options: WedgeOptions = {}): 
 			}
 			return await new Promise<never>(() => {});
 		},
+		on: (): void => undefined,
+		off: (): void => undefined,
 		detach: async (): Promise<void> => undefined,
 	};
 	const handle: Record<string, unknown> = {
@@ -119,6 +130,7 @@ function makeWedgeHandle(scope: SharedTargetScope, options: WedgeOptions = {}): 
 		browser: {
 			connected: true,
 			targets: () => [],
+			wsEndpoint: () => "ws://127.0.0.1/devtools/browser/synthetic",
 			target: () => ({ createCDPSession: async () => session }),
 			disconnect: () => undefined,
 		},
@@ -138,6 +150,7 @@ function makeWedgeTab(scope: SharedTargetScope, options: WedgeOptions = {}): Tab
 		info: {},
 		pending: new Map(),
 		kindTag: "headless",
+		ownsPage: true,
 		ownerSessionId: "session-wedge",
 		persist: false,
 		lastActivityAt: Date.now(),
@@ -258,18 +271,74 @@ describe("browser cleanup — timed-out target close in a shared browser", () =>
 		expect(await ownedTargets(scope)).toEqual([]);
 	});
 
-	it("still forgets a tab that was already dead when it was released", async () => {
+	it("does not treat a dead tab state as proof its owned target disappeared", async () => {
 		const scope = trackedScope();
 		const healthCheck = spyOn(sharedDaemon, "stopSharedBrowserIfUnreachable").mockResolvedValue(false);
 		await recordSharedTarget(scope, TARGET_ID);
-		const tab = makeWedgeTab(scope);
+		const tab = makeWedgeTab(scope, { close: "fail" });
 		tab.state = "dead";
 		getTabsMapForTest().set("logos-b2b", tab);
 
 		await expect(releaseTab("logos-b2b", { timeoutMs: 60 })).resolves.toBe(true);
 
-		expect(await ownedTargets(scope)).toEqual([]);
-		expect(healthCheck).not.toHaveBeenCalled();
+		expect(await ownedTargets(scope)).toEqual([TARGET_ID]);
+		expect(healthCheck).toHaveBeenCalledTimes(1);
+	});
+
+	it("retains ownership when Chrome accepts close but still lists the target", async () => {
+		const scope = trackedScope();
+		const healthCheck = spyOn(sharedDaemon, "stopSharedBrowserIfUnreachable").mockResolvedValue(false);
+		await recordSharedTarget(scope, TARGET_ID);
+		getTabsMapForTest().set("logos-b2b", makeWedgeTab(scope, { close: "accepted" }));
+
+		await expect(releaseTab("logos-b2b", { timeoutMs: 60 })).resolves.toBe(true);
+
+		expect(getTabsMapForTest().has("logos-b2b")).toBe(false);
+		expect(await ownedTargets(scope)).toEqual([TARGET_ID]);
+		expect(healthCheck).toHaveBeenCalledTimes(1);
+	});
+
+	it("keeps a failed startup's created target durable when its cleanup cannot be confirmed", async () => {
+		const scope = trackedScope();
+		const checked = Promise.withResolvers<void>();
+		spyOn(sharedDaemon, "stopSharedBrowserIfUnreachable").mockImplementation(async () => {
+			checked.resolve();
+			return false;
+		});
+		class FailedStartupWorker extends EventTarget {
+			postMessage(): void {
+				queueMicrotask(() => {
+					this.dispatchEvent(new MessageEvent("message", { data: { type: "setup" } }));
+					this.dispatchEvent(new MessageEvent("message", { data: { type: "page-created", targetId: TARGET_ID } }));
+					this.dispatchEvent(
+						new MessageEvent("message", {
+							data: {
+								type: "init-failed",
+								error: {
+									name: "Error",
+									message: "page initialization failed",
+									isToolError: false,
+									isAbort: false,
+								},
+							},
+						}),
+					);
+				});
+			}
+			terminate(): void {}
+		}
+		const RealWorker = globalThis.Worker;
+		try {
+			globalThis.Worker = FailedStartupWorker as unknown as typeof Worker;
+			await expect(
+				acquireTab("failed-startup", makeWedgeHandle(scope, { close: "fail" }), { timeoutMs: 1_000 }),
+			).rejects.toThrow("page initialization failed");
+			await checked.promise;
+			expect(getTabsMapForTest().has("failed-startup")).toBe(false);
+			expect(await ownedTargets(scope)).toEqual([TARGET_ID]);
+		} finally {
+			globalThis.Worker = RealWorker;
+		}
 	});
 
 	it("force-kills a wedged tab without forgetting the target it could not close", async () => {
@@ -279,13 +348,20 @@ describe("browser cleanup — timed-out target close in a shared browser", () =>
 		// `runInTab` reaching its grace period is one of the two real entry points
 		// into `forceKillTab` (the other is a failed worker recycle — the
 		// incident's "Failed to recycle browser tab worker; killing tab").
-		getTabsMapForTest().set("logos-b2b", makeWedgeTab(scope, { close: "fail" }));
+		const tab = makeWedgeTab(scope, { close: "fail" });
+		if (tab.backend !== "worker") throw new Error("Expected a worker tab");
+		const hostCall = new AbortController();
+		tab.worker.send = message => {
+			if (message.type === "run") tab.pending.get(message.id)?.toolCalls.set("host-call", hostCall);
+		};
+		getTabsMapForTest().set("logos-b2b", tab);
 
 		await expect(
 			runInTab("logos-b2b", { code: "await wait(60_000);", timeoutMs: 20, session: makeSession() }),
 		).rejects.toThrow("hung past grace");
 
 		expect(getTabsMapForTest().has("logos-b2b")).toBe(false);
+		expect(hostCall.signal.aborted).toBe(true);
 		expect(await ownedTargets(scope)).toEqual([TARGET_ID]);
 		expect(healthCheck).toHaveBeenCalledTimes(1);
 		expect(healthCheck.mock.calls[0]?.[0]).toEqual(scope);

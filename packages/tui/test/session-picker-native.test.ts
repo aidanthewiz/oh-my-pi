@@ -1,5 +1,7 @@
 import { beforeAll, describe, expect, it } from "bun:test";
 import type { TspPickerProps } from "@oh-my-pi/pi-wire";
+import { OverlayPanel } from "../src/chrome/overlay-box";
+import { TextFormField } from "../src/components/form";
 import type { DescribeContext, NativeNode } from "../src/native/node";
 import { type HistorySearchEntry, HistorySearchComponent } from "../src/overlays/history-search";
 import { type SessionSelectorEntry, SessionSelectorComponent } from "../src/overlays/session-selector";
@@ -47,7 +49,8 @@ function type(component: { handleInput(data: string): void }, text: string): voi
 function renderedWhen(selector: SessionSelectorComponent, ready: (p: TspPickerProps) => boolean): Promise<void> {
 	const { promise, resolve } = Promise.withResolvers<void>();
 	selector.setOnRequestRender(() => {
-		if (ready(props(selector.describe(withPicker)))) resolve();
+		const root = selector.describe(withPicker);
+		if (root.k === "picker" && ready(props(root))) resolve();
 	});
 	return promise;
 }
@@ -62,6 +65,7 @@ describe("session selector picker", () => {
 			() => {},
 			() => {},
 			() => {},
+			{ onDelete: async () => true },
 		);
 		try {
 			for (const label of ["🧪 TITLE: Plain title", "Plain title", "🧪 TITLE: Plain title"]) {
@@ -248,6 +252,166 @@ describe("session selector picker", () => {
 			{ t: "/work/", s: "path dim" },
 			{ t: "other", s: "path" },
 		]);
+	});
+});
+
+describe("session selector rename", () => {
+	interface RenameCall {
+		id: string;
+		title: string;
+	}
+
+	function makeRename(renamed?: { calls: RenameCall[]; result?: string | null }) {
+		// Fresh entries per test: rename mutates the shared entry in place.
+		const entries = [session("a", "Alpha", 0), session("b", "Beta", 1), session("c", "Gamma", 40 * 24 * HOUR)];
+		const selector = new SessionSelectorComponent(
+			entries,
+			() => {},
+			() => {},
+			() => {},
+			{
+				...(renamed
+					? {
+							onRename: async (s, title) => {
+								renamed.calls.push({ id: s.id, title });
+								return renamed.result === undefined ? title : renamed.result;
+							},
+						}
+					: {}),
+				currentSessionPath: entries[1]!.path,
+			},
+		);
+		return { selector, beta: entries[1]! };
+	}
+
+	/** The open rename dialog and its field, via the ANSI card (the native picker props have no text-input affordance). */
+	function renameDialogOf(selector: SessionSelectorComponent) {
+		const card = selector.describe(withoutPicker);
+		const dialog = (card.c ?? []).find(
+			(child): child is OverlayPanel => child instanceof OverlayPanel && child.title === "Rename Session",
+		);
+		if (!dialog) return undefined;
+		const field = dialog.children.find((child): child is TextFormField => child instanceof TextFormField);
+		if (!field) return undefined;
+		return { dialog, field };
+	}
+
+	it("shows the rename action only when onRename is set", () => {
+		const withHook = makeRename({ calls: [] });
+		expect(props(withHook.selector.describe(withPicker)).actions?.find(a => a.id === "rename")?.label).toBe("Rename");
+		const withoutHook = makeRename();
+		expect(props(withoutHook.selector.describe(withPicker)).actions?.some(a => a.id === "rename")).toBe(false);
+	});
+
+	it("opens the rename dialog prefilled with the current title on F2", () => {
+		const { selector, beta } = makeRename({ calls: [] });
+		selector.handleInput("\x1bOQ");
+		const opened = renameDialogOf(selector);
+		expect(opened).toBeDefined();
+		expect(opened!.field.getValue()).toBe(beta.title ?? "");
+	});
+	it("commits on Enter via onRename and updates the row in place", async () => {
+		const renamed = { calls: [] as RenameCall[] };
+		const { selector, beta } = makeRename(renamed);
+		selector.handleInput("\x1bOQ");
+		type(selector, " Prime");
+		const updated = renderedWhen(selector, p => p.items?.find(item => item.id === beta.path)?.label === "Beta Prime");
+		selector.handleInput("\r");
+		await updated;
+		expect(renamed.calls).toEqual([{ id: "b", title: "Beta Prime" }]);
+		const after = props(selector.describe(withPicker));
+		expect(after.selected).toBe(beta.path);
+		expect(renameDialogOf(selector)).toBeUndefined();
+	});
+
+	it("cancels on Esc without changes", () => {
+		const renamed = { calls: [] as RenameCall[] };
+		const { selector, beta } = makeRename(renamed);
+		selector.handleInput("\x1bOQ");
+		expect(renameDialogOf(selector)).toBeDefined();
+		type(selector, " Prime");
+		selector.handleInput("\x1b");
+		expect(renameDialogOf(selector)).toBeUndefined();
+		const after = props(selector.describe(withPicker));
+		expect(after.items?.find(item => item.id === beta.path)?.label).toBe("Beta");
+		expect(after.selected).toBe(beta.path);
+	});
+
+	it("renders the rename editor instead of the picker while it is open", () => {
+		const { selector } = makeRename({ calls: [] });
+		// The picker kind has no text-input affordance: while renaming, the
+		// component must describe the card path so the field is visible.
+		expect(selector.describe(withPicker).k).toBe("picker");
+		selector.handleInput("\x1bOQ");
+		expect(selector.describe(withPicker).k).toBe("card");
+		expect(selector.nativeSheet(withPicker)).toBe(false);
+		expect(renameDialogOf(selector)).toBeDefined();
+	});
+
+	it.each(["keyboard", "native"] as const)(
+		"resumes the same selected path after rename changes filtered ranking (%s)",
+		async action => {
+			const alpha = { ...session("a", "Alpha", 0), allMessagesText: "needle" };
+			const beta = { ...session("b", "Beta", 0), allMessagesText: "needle" };
+			alpha.modified = new Date("2025-06-01T12:00:01.000Z");
+			beta.modified = new Date("2025-06-01T12:00:00.000Z");
+			const resumed: string[] = [];
+			const selector = new SessionSelectorComponent(
+				[alpha, beta],
+				selected => resumed.push(selected.path),
+				() => {},
+				() => {},
+				{ onRename: async () => "needle" },
+			);
+			try {
+				type(selector, "needle");
+				expect(props(selector.describe(withPicker)).order).toEqual([alpha.path, beta.path]);
+				selector.handleInput("\x1b[B");
+				expect(props(selector.describe(withPicker)).selected).toBe(beta.path);
+				if (action === "keyboard") selector.handleInput("\x1bOQ");
+				else selector.handleNativeEvent({ type: "action", key: "", act: "rename", mods: [] });
+				for (let index = 0; index < 4; index++) selector.handleInput("\x7f");
+				type(selector, "needle");
+				const updated = renderedWhen(selector, p => p.order?.[0] === beta.path);
+				selector.handleInput("\r");
+				await updated;
+				const after = props(selector.describe(withPicker));
+				expect(after.order).toEqual([beta.path, alpha.path]);
+				expect(after.selected).toBe(beta.path);
+				if (action === "keyboard") selector.handleInput("\r");
+				else selector.handleNativeEvent({ type: "action", key: "", act: "resume", mods: [] });
+				expect(resumed).toEqual([beta.path]);
+			} finally {
+				selector.dispose();
+			}
+		},
+	);
+
+	it("filters the canonical renamed title rather than its stale cached title", async () => {
+		const beta = { ...session("b", "Beta", 0), firstMessage: "shared", allMessagesText: "shared" };
+		const selector = new SessionSelectorComponent(
+			[beta],
+			() => {},
+			() => {},
+			() => {},
+			{ onRename: async () => "Zebra" },
+		);
+		try {
+			type(selector, "Beta");
+			expect(props(selector.describe(withPicker)).order).toEqual([beta.path]);
+			selector.handleInput("\x1bOQ");
+			for (let index = 0; index < 4; index++) selector.handleInput("\x7f");
+			type(selector, "Zebra");
+			const updated = renderedWhen(selector, p => p.items?.find(item => item.id === beta.path)?.label === "Zebra");
+			selector.handleInput("\r");
+			await updated;
+			expect(props(selector.describe(withPicker)).order).toEqual([]);
+			selector.handleNativeEvent({ type: "action", key: "", act: "clear", mods: [] });
+			type(selector, "Zebra");
+			expect(props(selector.describe(withPicker)).order).toEqual([beta.path]);
+		} finally {
+			selector.dispose();
+		}
 	});
 });
 

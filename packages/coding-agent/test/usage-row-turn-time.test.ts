@@ -459,8 +459,8 @@ describe("AgentSession synthetic follow-up marking", () => {
 		authStorage.keys.setRuntime("anthropic", "test-key");
 		modelRegistry = new ModelRegistry(authStorage, path.join(sharedDir, "models.yml"));
 	});
-	afterAll(() => {
-		authStorage.close();
+	afterAll(async () => {
+		await authStorage.close();
 		removeSyncWithRetries(sharedDir);
 	});
 

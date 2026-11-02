@@ -1,11 +1,18 @@
-import { describe, expect, it } from "bun:test";
-import { encodeResponse, encodeStream, parseRequest } from "@oh-my-pi/pi-ai/providers/openai-chat-server";
+import { describe, expect, it, vi } from "bun:test";
+import {
+	adoptReplayedGeminiSignatures,
+	encodeResponse,
+	encodeStream,
+	parseRequest,
+} from "@oh-my-pi/pi-ai/providers/openai-chat-server";
+import { transformMessages } from "@oh-my-pi/pi-ai/providers/transform-messages";
 import type {
 	AssistantMessage,
 	AssistantMessageEvent,
 	AssistantMessageEventStream,
 	ToolCall,
 } from "@oh-my-pi/pi-ai/types";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 
 function makeEventStream(events: AssistantMessageEvent[], final: AssistantMessage): AssistantMessageEventStream {
 	async function* iter() {
@@ -145,6 +152,45 @@ describe("auth-gateway openai-chat: parseRequest", () => {
 		expect(parsed.options.toolChoice).toEqual({ name: "lookup" });
 		expect(parsed.options.responseFormat).toEqual({ type: "json_object" });
 		expect(parsed.options.extra).toEqual({ includeStreamingUsage: true });
+	});
+
+	it("replays a client's Gemini signature to the resolved model in the form its transport sends", () => {
+		const signedTurn = () =>
+			parseRequest({
+				model: "gemini",
+				messages: [
+					{ role: "user", content: "hi" },
+					{
+						role: "assistant",
+						content: null,
+						tool_calls: [
+							{
+								id: "call_1",
+								type: "function",
+								function: { name: "lookup", arguments: "{}" },
+								extra_content: { google: { thought_signature: "sig-123" } },
+							},
+						],
+					},
+					{ role: "tool", tool_call_id: "call_1", content: "ok" },
+				],
+			}).context;
+		const replayedSignature = (model: NonNullable<ReturnType<typeof getBundledModel>>) => {
+			const context = signedTurn();
+			adoptReplayedGeminiSignatures(context, model);
+			const assistant = transformMessages(context.messages, model).find(message => message.role === "assistant");
+			const call =
+				assistant?.role === "assistant" ? assistant.content.find(part => part.type === "toolCall") : undefined;
+			return call?.type === "toolCall" ? call.thoughtSignature : undefined;
+		};
+
+		const native = getBundledModel("google", "gemini-2.5-pro");
+		const compatible = getBundledModel("kilo", "google/gemini-2.5-pro");
+		if (!native || !compatible) throw new Error("expected bundled Gemini models");
+		expect(replayedSignature(native)).toBe("sig-123");
+		expect(JSON.parse(replayedSignature(compatible) ?? "null")).toEqual({
+			perCall: { google: { thought_signature: "sig-123" } },
+		});
 	});
 
 	it("coerces content:null to empty content for non-function roles (Codex #10956)", () => {
@@ -337,6 +383,34 @@ describe("auth-gateway openai-chat: encodeResponse", () => {
 		});
 	});
 
+	it("emits Google thought signatures in tool-call metadata", () => {
+		const message: AssistantMessage = {
+			...emptyAssistant(),
+			content: [
+				{
+					type: "toolCall",
+					id: "call_google",
+					name: "check",
+					arguments: { value: "test" },
+					thoughtSignature: "sig-google",
+				},
+			],
+			stopReason: "toolUse",
+		};
+		const out = encodeResponse(message, "gemini-test");
+		const choices = out.choices as Array<{
+			message: { tool_calls?: Array<Record<string, unknown>> };
+		}>;
+		expect(choices[0].message.tool_calls).toEqual([
+			{
+				id: "call_google",
+				type: "function",
+				function: { name: "check", arguments: '{"value":"test"}' },
+				extra_content: { google: { thought_signature: "sig-google" } },
+			},
+		]);
+	});
+
 	it("maps length stop reason and emits null content when text is empty", () => {
 		const message: AssistantMessage = { ...emptyAssistant(), stopReason: "length" };
 		const out = encodeResponse(message, "gpt-test");
@@ -352,7 +426,13 @@ describe("auth-gateway openai-chat: encodeStream", () => {
 		// Pre-populate partial.content so toolcall_start can look up id/name by contentIndex.
 		partial.content = [
 			{ type: "text", text: "" },
-			{ type: "toolCall", id: "call_A", name: "tool_a", arguments: {} },
+			{
+				type: "toolCall",
+				id: "call_A",
+				name: "tool_a",
+				arguments: {},
+				thoughtSignature: "sig-stream",
+			},
 			{ type: "toolCall", id: "call_B", name: "tool_b", arguments: {} },
 		];
 		const events: AssistantMessageEvent[] = [
@@ -400,7 +480,12 @@ describe("auth-gateway openai-chat: encodeStream", () => {
 		expect(textDeltas.join("")).toBe("Hi there");
 
 		// Collect tool_call deltas; verify index sequence.
-		const toolDeltas: Array<{ index: number; id?: string; function?: { name?: string; arguments?: string } }> = [];
+		const toolDeltas: Array<{
+			index: number;
+			id?: string;
+			function?: { name?: string; arguments?: string };
+			extra_content?: unknown;
+		}> = [];
 		for (const c of chunks) {
 			const tc = c.choices[0].delta.tool_calls;
 			if (Array.isArray(tc)) toolDeltas.push(...(tc as typeof toolDeltas));
@@ -410,6 +495,7 @@ describe("auth-gateway openai-chat: encodeStream", () => {
 		expect(starts.map(s => s.index)).toEqual([0, 1]);
 		expect(starts[0].id).toBe("call_A");
 		expect(starts[0].function?.name).toBe("tool_a");
+		expect(starts[0].extra_content).toEqual({ google: { thought_signature: "sig-stream" } });
 		expect(starts[1].id).toBe("call_B");
 		expect(starts[1].function?.name).toBe("tool_b");
 
@@ -472,6 +558,73 @@ describe("auth-gateway openai-chat: encodeStream", () => {
 		expect(lines).toHaveLength(2); // role chunk + error envelope
 		const payloads = lines.map(parseSseLine) as Array<Record<string, unknown>>;
 		expect(payloads[1]).toEqual({ error: { message: "upstream went away", type: "upstream_error" } });
+	});
+
+	it.each(["abort", "cancel"] as const)("retires silent-stream keepalives immediately on %s", async ending => {
+		vi.useFakeTimers();
+		const baselineTimers = vi.getTimerCount();
+		const release = Promise.withResolvers<void>();
+		const heldEvents: AsyncIterable<AssistantMessageEvent> = {
+			[Symbol.asyncIterator]: () => ({
+				next: async () => {
+					await release.promise;
+					return { done: true as const, value: undefined };
+				},
+			}),
+		};
+		const requestController = new AbortController();
+		const stream = encodeStream(heldEvents as unknown as AssistantMessageEventStream, "gpt-test", undefined, {
+			signal: requestController.signal,
+		});
+		const reader = stream.getReader();
+		try {
+			const role = await reader.read();
+			expect(new TextDecoder().decode(role.value)).toContain('"role":"assistant"');
+			expect(vi.getTimerCount()).toBe(baselineTimers + 1);
+			let receivedKeepalive = false;
+			const keepalive = reader.read().then(chunk => {
+				receivedKeepalive = true;
+				return chunk;
+			});
+			vi.advanceTimersByTime(14_999);
+			await Promise.resolve();
+			expect(receivedKeepalive).toBe(false);
+			vi.advanceTimersByTime(1);
+			expect(new TextDecoder().decode((await keepalive).value)).toBe(": keepalive\n\n");
+
+			if (ending === "abort") requestController.abort("request ended");
+			else await reader.cancel("client timeout");
+			expect(vi.getTimerCount()).toBe(baselineTimers);
+		} finally {
+			release.resolve();
+			await reader.cancel();
+			vi.useRealTimers();
+		}
+	});
+
+	it.each(["done", "error", "throw"] as const)("retires keepalives when the upstream ends with %s", async ending => {
+		vi.useFakeTimers();
+		const baselineTimers = vi.getTimerCount();
+		const message = emptyAssistant();
+		async function* terminalEvents(): AsyncGenerator<AssistantMessageEvent> {
+			if (ending === "throw") throw new Error("upstream failed");
+			if (ending === "error") {
+				yield { type: "error", reason: "error", error: { ...message, errorMessage: "upstream failed" } };
+			} else {
+				yield { type: "done", reason: "stop", message };
+			}
+		}
+		try {
+			const lines = await collectStream(
+				encodeStream(terminalEvents() as unknown as AssistantMessageEventStream, "gpt-test"),
+			);
+			const terminal = parseSseLine(lines.at(-1)!);
+			if (ending === "done") expect(terminal).toBe("[DONE]");
+			else expect(terminal).toEqual({ error: { message: "upstream failed", type: "upstream_error" } });
+			expect(vi.getTimerCount()).toBe(baselineTimers);
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 
 	it("aborts the upstream gateway request when the client cancels the response body", async () => {

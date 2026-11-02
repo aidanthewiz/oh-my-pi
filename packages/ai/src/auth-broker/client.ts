@@ -20,6 +20,7 @@ import type {
 	CredentialBlocksDeleteRequest,
 	CredentialDisableRequest,
 	CredentialDisableResponse,
+	CredentialRefreshRequest,
 	CredentialRefreshResponse,
 	CredentialUploadRequest,
 	CredentialUploadResponse,
@@ -266,10 +267,12 @@ export class AuthBrokerClient {
 	}
 
 	/**
-	 * Fetch aggregate broker usage with a timeout sized for serialized
-	 * same-provider account probes.
+	 * Fetch broker usage, optionally for one provider, with a timeout sized
+	 * for serialized same-provider account probes.
 	 */
-	fetchUsage(options: { signal?: AbortSignal; maxAccountsPerProvider?: number } = {}): Promise<UsageResponse> {
+	fetchUsage(
+		options: { signal?: AbortSignal; maxAccountsPerProvider?: number; provider?: string } = {},
+	): Promise<UsageResponse> {
 		const requestedAccountCount = options.maxAccountsPerProvider;
 		const accountCount =
 			typeof requestedAccountCount === "number" && Number.isFinite(requestedAccountCount)
@@ -277,7 +280,8 @@ export class AuthBrokerClient {
 				: 1;
 		const perAccountTimeoutMs = Math.max(DEFAULT_TIMEOUT_MS, this.#timeoutMs);
 		const timeoutMs = perAccountTimeoutMs * (accountCount + 1);
-		return this.#request<UsageResponse>("GET", "/v1/usage", {
+		const query = options.provider !== undefined ? `?${new URLSearchParams({ provider: options.provider })}` : "";
+		return this.#request<UsageResponse>("GET", `/v1/usage${query}`, {
 			schema: "usageResponseSchema",
 			signal: options.signal,
 			timeoutMs,
@@ -330,9 +334,13 @@ export class AuthBrokerClient {
 		id: number,
 		signal?: AbortSignal,
 		reason?: OAuthRefreshReason,
+		rejectedAccess?: string,
 	): Promise<CredentialRefreshResponse> {
-		const suffix = reason === "auth-recovery" ? "?reason=auth-recovery" : "";
+		const suffix = reason ? `?reason=${reason}` : "";
+		const body: CredentialRefreshRequest | undefined =
+			reason === "auth-recovery" && rejectedAccess !== undefined ? { rejectedAccess } : undefined;
 		return this.#request<CredentialRefreshResponse>("POST", `/v1/credential/${id}/refresh${suffix}`, {
+			body,
 			schema: "credentialRefreshResponseSchema",
 			signal,
 		});

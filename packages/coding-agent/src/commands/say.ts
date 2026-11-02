@@ -154,7 +154,7 @@ export default class Say extends Command {
 			const registry = new ModelRegistry(authStorage, undefined, { settings });
 			return resolveLocalSpeechModelId({ settings, registry });
 		} finally {
-			authStorage.close();
+			await authStorage.close();
 		}
 	}
 

@@ -1,0 +1,178 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import { createHash, randomUUID } from 'node:crypto';
+
+const [manifestFile, portText] = process.argv.slice(2);
+const port = Number(portText);
+assert(Number.isInteger(port) && port > 1024 && port < 65536);
+const home = await fs.realpath(process.env.HOME);
+assert.equal(path.dirname(home), '/private/tmp');
+assert.match(path.basename(home), /^cf-[A-Za-z0-9]+$/);
+const manifest = JSON.parse(await fs.readFile(manifestFile, 'utf8'));
+const engine = path.resolve(import.meta.dirname, '../..');
+const hash = bytes => createHash('sha256').update(bytes).digest('hex');
+assert.equal(hash(JSON.stringify(manifest.records)), manifest.sourceDigest);
+const criticalPaths = ['packages/ai/src/auth-storage.ts', 'packages/ai/src/auth/oauth.ts', 'packages/ai/src/auth/rotation.ts', 'packages/ai/src/auth/refresh.ts', 'packages/ai/src/auth/select.ts'];
+async function unchanged() {
+  for (const relative of criticalPaths) {
+    const record = manifest.records.find(row => row.root === engine && row.path === relative);
+    assert(record);
+    assert.equal(hash(await fs.readFile(path.join(engine, relative))), record.state.sha256, relative);
+  }
+  assert.equal(hash(await fs.readFile(path.join(engine, 'packages/natives/native/pi_natives.darwin-arm64.node'))), manifest.native.sha256);
+}
+await unchanged();
+const previousFetch = globalThis.fetch;
+const brokerOrigin = `http://127.0.0.1:${port}`;
+let unexpectedNetwork = 0;
+globalThis.fetch = (input, init) => {
+  const url = new URL(input instanceof Request ? input.url : String(input));
+  if (url.origin !== brokerOrigin) {
+    unexpectedNetwork++;
+    throw new Error('Only the exact isolated broker origin is permitted');
+  }
+  return previousFetch(input, init);
+};
+const { AuthStorage, SqliteAuthCredentialStore } = await import('../../packages/ai/src/auth-storage.ts');
+const registry = await import('../../packages/ai/src/registry/oauth/index.ts');
+const { AuthBrokerClient, RemoteAuthCredentialStore, startAuthBroker } = await import('../../packages/ai/src/auth-broker/index.ts');
+const root = await fs.mkdtemp(path.join(home, 'auth-review-races-'));
+const owner = randomUUID();
+await fs.writeFile(path.join(root, '.owner'), owner, { flag: 'wx', mode: 0o600 });
+const results = [];
+const deadline = setTimeout(() => { console.error('AUTH_REVIEW_RACE_DEADLINE'); process.exit(124); }, 60_000);
+function observeStore(store) {
+  let closed = false;
+  const calls = [], restores = [];
+  for (const method of ['listAuthCredentials', 'tryUpdateAuthCredentialIfMatches', 'getCache', 'setCache', 'upsertCredentialBlock', 'getCredentialBlock', 'close']) {
+    const original = store[method];
+    if (typeof original !== 'function') continue;
+    const descriptor = Object.getOwnPropertyDescriptor(store, method);
+    Object.defineProperty(store, method, { configurable: true, writable: true, value: function (...args) {
+      const row = { method, afterClose: closed };
+      calls.push(row);
+      try {
+        const value = Reflect.apply(original, this, args);
+        if (method === 'close') closed = true;
+        return value;
+      } catch (error) { row.error = String(error); throw error; }
+    } });
+    restores.push(() => descriptor ? Object.defineProperty(store, method, descriptor) : Reflect.deleteProperty(store, method));
+  }
+  return { calls, restore() { for (const fn of restores.reverse()) fn(); } };
+}
+const settled = work => work.then(value => ({ fulfilled: true, value }), error => ({ fulfilled: false, error: String(error) }));
+try {
+  for (const operation of ['accessById', 'accessAll', 'rotate', 'markReached', 'invalidateMatching']) {
+    for (const boundary of ['close', 'replace']) {
+      const label = `${operation}-${boundary}`;
+      const provider = `owned-auth-review-${label}`;
+      const sourceId = `${owner}-${label}`;
+      let refreshes = 0;
+      registry.registerOAuthProvider({
+        id: provider, name: provider, sourceId,
+        async login() { throw new Error('Seeded proof must not invoke login'); },
+        async refreshToken(credential) {
+          refreshes++;
+          return { ...credential, access: label + '-rotated-access', refresh: label + '-rotated-refresh', expires: Date.now() + 3_600_000 };
+        },
+        getApiKey(credential) { return credential.access; },
+      });
+      const store = await SqliteAuthCredentialStore.open(path.join(root, label + '-old.db'));
+      const storage = new AuthStorage(store);
+      const oauthOperation = operation === 'accessById' || operation === 'accessAll';
+      const credentials = oauthOperation
+        ? [{ type: 'oauth', access: label + '-old-access', refresh: label + '-old-refresh', expires: Date.now() - 60_000 }]
+        : [{ type: 'api_key', key: label + '-key-a' }, { type: 'api_key', key: label + '-key-b' }];
+      await storage.credentials.set(provider, credentials);
+      const id = store.listAuthCredentials(provider)[0].id;
+      if (oauthOperation) { await storage.oauth.refresh(id); assert.equal(refreshes, 1); }
+      const observer = observeStore(store);
+      let nextStore, request, transition;
+      try {
+        if (boundary === 'replace') {
+          nextStore = await SqliteAuthCredentialStore.open(path.join(root, label + '-next.db'));
+          await nextStore.replaceAuthCredentials(provider, [{ type: 'api_key', key: label + '-replacement-key' }]);
+        }
+        let work;
+        if (operation === 'accessById') work = storage.oauth.accessById(provider, id, { forceRefresh: true, refreshReason: 'auth-recovery' });
+        else if (operation === 'accessAll') work = storage.oauth.accessAll(provider, { forceRefresh: true, refreshReason: 'auth-recovery' });
+        else if (operation === 'rotate') work = storage.limits.rotate(provider, undefined, { credentialId: id, error: Object.assign(new Error('Generic unauthorized response'), { status: 401 }) });
+        else if (operation === 'markReached') work = storage.limits.markReached(provider, undefined, { credentialId: id, retryAfterMs: 1000 });
+        else work = storage.limits.invalidateMatching(provider, label + '-key-a');
+        request = settled(work);
+        transition = boundary === 'replace' ? storage.replaceStore(nextStore) : storage.close();
+        const [outcome] = await Promise.all([request, transition]);
+        const afterClose = observer.calls.filter(row => row.afterClose && row.method !== 'close');
+        const operationSucceeded = outcome.fulfilled && (operation === 'accessById' ? outcome.value?.ok === true
+          : operation === 'accessAll' ? outcome.value?.length === 1 && outcome.value[0]?.ok === true
+          : operation === 'invalidateMatching' ? outcome.value === true : outcome.value?.switched === true);
+        const replacementRows = nextStore?.listAuthCredentials(provider);
+        const checks = {
+          completePublicOperationSucceeded: operationSucceeded,
+          noPostCloseStoreAccess: afterClose.length === 0,
+          recentMintReused: !oauthOperation || refreshes === 1,
+          replacementUntouched: !replacementRows || replacementRows.length === 1 && replacementRows[0].credential.type === 'api_key' && replacementRows[0].credential.key === label + '-replacement-key',
+        };
+        results.push({ label, checks, outcome, afterCloseStoreCalls: afterClose, refreshes });
+      } finally {
+        if (request) await request;
+        if (transition) await transition;
+        await storage.close();
+        nextStore?.close();
+        observer.restore();
+        registry.unregisterOAuthProviders(sourceId);
+      }
+    }
+  }
+  const provider = 'owned-auth-review-delegated';
+  const sourceId = owner + '-delegated';
+  let closing = false;
+  const exchanges = [];
+  registry.registerOAuthProvider({
+    id: provider, name: provider, sourceId,
+    async login() { throw new Error('Delegated proof must not invoke login'); },
+    async refreshToken(credential) {
+      exchanges.push({ afterGatewayCloseAdmission: closing });
+      return { ...credential, access: 'delegated-rotated-access', refresh: 'delegated-rotated-refresh', expires: Date.now() + 3_600_000 };
+    },
+    getApiKey(credential) { return credential.access; },
+  });
+  const serverStore = await SqliteAuthCredentialStore.open(path.join(root, 'delegated-broker.db'));
+  const serverStorage = new AuthStorage(serverStore);
+  let broker, gateway, remote;
+  try {
+    await serverStorage.credentials.set(provider, [{ type: 'oauth', access: 'delegated-old-access', refresh: 'delegated-old-refresh', expires: Date.now() - 60_000 }]);
+    broker = startAuthBroker({ storage: serverStorage, bind: `127.0.0.1:${port}`, bearerTokens: [owner], disableRefresher: true });
+    assert.equal(new URL(broker.url).origin, brokerOrigin);
+    const client = new AuthBrokerClient({ url: broker.url, token: owner });
+    const initial = await client.fetchSnapshot();
+    assert.equal(initial.status, 200);
+    remote = new RemoteAuthCredentialStore({ client, initialSnapshot: initial.snapshot, streamSnapshots: false });
+    gateway = new AuthStorage(remote);
+    await gateway.credentials.reload();
+    const id = remote.snapshot.credentials.find(row => row.provider === provider).id;
+    const request = settled(gateway.oauth.refresh(id));
+    closing = true;
+    const transition = gateway.close();
+    const [outcome] = await Promise.all([request, transition]);
+    results.push({ label: 'delegated-mint-admission-close', checks: { noExchangeStartedAfterCloseAdmission: exchanges.every(row => !row.afterGatewayCloseAdmission), zeroNewExchanges: exchanges.length === 0 }, outcome, exchanges });
+  } finally {
+    await gateway?.close();
+    remote?.close();
+    await broker?.close();
+    await serverStorage.close();
+    registry.unregisterOAuthProviders(sourceId);
+  }
+} finally {
+  clearTimeout(deadline);
+  globalThis.fetch = previousFetch;
+  await unchanged();
+  assert.equal(await fs.readFile(path.join(root, '.owner'), 'utf8'), owner);
+  await fs.rm(root, { recursive: true });
+}
+assert.equal(results.length, 11);
+assert.equal(unexpectedNetwork, 0);
+console.log(JSON.stringify({ schema: 'CoreforgeCompletePublicAuthShutdownRaces', complete: true, sourceDigest: manifest.sourceDigest, nativeSha256: manifest.native.sha256, results, fixtureRemoved: true, exactLoopbackBrokerPort: port, providerTrafficSynthetic: true, unexpectedNetwork, paidRequests: 0 }, null, 2));
+if (results.some(row => Object.values(row.checks).some(value => !value))) process.exitCode = 1;

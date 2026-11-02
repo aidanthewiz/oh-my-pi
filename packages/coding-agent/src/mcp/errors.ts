@@ -1,6 +1,7 @@
 import { isRecord } from "@oh-my-pi/pi-utils";
 import type { JsonRpcError } from "./types";
 import type { MCPProtocolDiagnostic } from "@oh-my-pi/pi-tui/tools/mcp";
+import { preserveOAuthDiscoveryHints } from "./oauth-discovery";
 
 /** MCP transport used by a failed operation. */
 export type MCPTransportKind = "http" | "stdio" | "unknown";
@@ -68,8 +69,19 @@ export class MCPTransportError extends Error {
 	constructor(options: MCPTransportErrorOptions) {
 		super(
 			sanitizeDiagnosticText(options.message, MAX_MESSAGE_CHARS),
-			options.cause === undefined ? undefined : { cause: options.cause },
+			options.cause === undefined
+				? undefined
+				: {
+						cause: new Error(
+							sanitizeDiagnosticText(
+								options.cause instanceof Error ? options.cause.message : String(options.cause),
+								MAX_MESSAGE_CHARS,
+							),
+						),
+					},
 		);
+		preserveOAuthDiscoveryHints(this, { name: "Error", message: options.message });
+		if (options.cause instanceof Error) preserveOAuthDiscoveryHints(this, options.cause);
 		this.name = "MCPTransportError";
 		this.transport = options.transport;
 		this.stage = options.stage;
@@ -86,6 +98,22 @@ export class MCPTransportError extends Error {
 		}
 		this.traceId = safeTraceId(options.traceId);
 	}
+}
+
+/** Prevent replay once a request may have reached the server. */
+export function nonRetryableMCPTransportError(error: MCPTransportError): MCPTransportError {
+	if (!error.retryable) return error;
+	return new MCPTransportError({
+		transport: error.transport,
+		stage: error.stage,
+		failure: error.failure,
+		message: error.message,
+		retryable: false,
+		code: error.code,
+		data: error.data,
+		traceId: error.traceId,
+		cause: error,
+	});
 }
 
 function errorCode(error: unknown): string | number | undefined {
@@ -184,6 +212,31 @@ export function mcpTraceIdFromHeaders(headers: Headers): string | undefined {
 	return undefined;
 }
 
+/** Preserve public OAuth challenges separately from redacted HTTP diagnostics. */
+export function createMCPHttpStatusError(
+	response: Response,
+	text: string,
+	options: { stage: MCPFailureStage; retryable: boolean },
+): MCPTransportError {
+	const wwwAuthenticate = response.headers.get("WWW-Authenticate");
+	const mcpAuthServer = response.headers.get("Mcp-Auth-Server");
+	const hints = [
+		wwwAuthenticate ? `WWW-Authenticate: ${wwwAuthenticate}` : null,
+		mcpAuthServer ? `Mcp-Auth-Server: ${mcpAuthServer}` : null,
+	]
+		.filter(Boolean)
+		.join("; ");
+	return new MCPTransportError({
+		transport: "http",
+		stage: options.stage,
+		failure: "http_status",
+		message: `HTTP ${response.status}: ${text}${hints ? ` [${hints}]` : ""}`,
+		retryable: options.retryable,
+		code: response.status,
+		traceId: mcpTraceIdFromHeaders(response.headers),
+	});
+}
+
 /** Preserve a server-provided JSON-RPC error without exposing credential-shaped data. */
 export function createMCPJsonRpcError(
 	transport: MCPTransportKind,
@@ -220,8 +273,17 @@ export function normalizeMCPTransportError(
 		normalizedCode === "CONNECTIONREFUSED" ||
 		normalizedCode === "ENETUNREACH" ||
 		normalizedCode === "EHOSTUNREACH" ||
-		/\b(?:ECONNREFUSED|ConnectionRefused|ENETUNREACH|EHOSTUNREACH)\b/i.test(message)
+		normalizedCode === "ENOTFOUND" ||
+		normalizedCode === "EAI_AGAIN" ||
+		normalizedCode === "FAILEDTOOPENSOCKET" ||
+		/\b(?:ECONNREFUSED|ConnectionRefused|ENETUNREACH|EHOSTUNREACH|ENOTFOUND|EAI_AGAIN|FailedToOpenSocket)\b/i.test(
+			message,
+		)
 	) {
+		code ??=
+			/\b(?:ECONNREFUSED|ConnectionRefused|ENETUNREACH|EHOSTUNREACH|ENOTFOUND|EAI_AGAIN|FailedToOpenSocket)\b/i.exec(
+				message,
+			)?.[0];
 		failure = "connect";
 		retryable = true;
 	} else if (normalizedCode === "ECONNRESET" || /\bECONNRESET\b/i.test(message)) {
@@ -251,7 +313,7 @@ export function normalizeMCPTransportError(
 		transport: options.transport,
 		stage: failure === "connect" ? "connect" : failure === "malformed_response" ? "decode" : options.stage,
 		failure,
-		message: message || "Unknown MCP transport failure",
+		message: (error instanceof Error ? error.message : String(error)) || "Unknown MCP transport failure",
 		retryable,
 		code,
 		traceId: safeTraceId(options.traceId),
@@ -260,6 +322,16 @@ export function normalizeMCPTransportError(
 }
 
 function nextStep(error: MCPTransportError): string {
+	if (
+		!error.retryable &&
+		(error.failure === "connect" ||
+			error.failure === "eof" ||
+			error.failure === "reset" ||
+			error.failure === "closed" ||
+			(error.failure === "http_status" && (error.code === 502 || error.code === 503)))
+	) {
+		return "The request may already have run; inspect its effect before retrying.";
+	}
 	switch (error.failure) {
 		case "connect":
 			return "Check server availability and reconcile mutation outcomes before retrying.";

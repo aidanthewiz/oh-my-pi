@@ -258,6 +258,6 @@ describe("SDK AWS startup timing fixture", () => {
 	}, 20_000);
 });
 
-afterAll(() => {
-	authStorage.close();
+afterAll(async () => {
+	await authStorage.close();
 });

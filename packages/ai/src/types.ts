@@ -41,7 +41,7 @@ import type { ApiKey } from "./auth-retry";
 import type { OAuthRequestIdentity } from "./auth/types";
 import type { BedrockOptions } from "./providers/amazon-bedrock";
 import type { AnthropicOptions } from "./providers/anthropic";
-import type { FallbackParam, StopDetails } from "./providers/anthropic-wire";
+import type { FallbackParam, MessageCreateParamsStreaming, StopDetails } from "./providers/anthropic-wire";
 import type { AzureOpenAIResponsesOptions } from "./providers/azure-openai-responses";
 import type { CursorOptions } from "./providers/cursor";
 import type { AppleFoundationModelsOptions } from "./providers/apple-foundation-models";
@@ -244,8 +244,10 @@ export function resolveModelServiceTier(
  * `service_tier_for_request`); an empty or missing list counts as "not
  * reported" — accounts whose `/models` lists no tiers keep `/fast` — so the
  * provider-level answer stands. `flex` and `default` are never gated.
- * First-party OpenAI takes `ultrafast` as-is. A bare provider string cannot
- * carry the list, so it answers for the provider alone.
+ * First-party OpenAI takes `ultrafast` as-is. An OpenAI-family relay on the
+ * Responses/Completions APIs gets `ultrafast` only when its discovered
+ * `service_tiers` lists it. A bare provider string cannot carry the list, so
+ * it answers for the provider alone.
  */
 export function shouldSendServiceTier(
 	serviceTier: ServiceTier | null | undefined,
@@ -272,7 +274,11 @@ export function shouldSendServiceTier(
 		if (advertised !== undefined && advertised.length > 0) return advertised.includes(serviceTier);
 	}
 	if (serviceTier === "ultrafast") {
-		return provider === "openai" || (typeof target === "string" && provider === "openai-codex");
+		if (typeof target === "string") return provider === "openai" || provider === "openai-codex";
+		if (provider === "openai") return true;
+		return (
+			target !== undefined && isOpenAIServiceTierModel(target) && target.serviceTiers?.includes(serviceTier) === true
+		);
 	}
 	if (provider === "openai" || provider === "openai-codex") return true;
 	if (provider === "openrouter") {
@@ -473,8 +479,12 @@ export interface AnthropicCompactionRequest {
 export interface OpenAIPromptCacheOptions {
 	/** `explicit` disables OpenAI's automatic latest-message breakpoint. */
 	mode: "implicit" | "explicit";
-	/** The only currently supported minimum breakpoint lifetime. */
-	ttl?: "30m";
+	/**
+	 * Minimum cache lifetime. `30m` is OpenAI's default; `12h` (Responses API only)
+	 * bills writes at 2.5× input instead of 1.25×. Defaults to `12h` when
+	 * `cacheRetention` resolves to `long`, otherwise `30m`.
+	 */
+	ttl?: "30m" | "12h";
 	/** By default, mark one existing block from stable history; `none` suppresses that marker. */
 	breakpoint?: "latest-stable-message" | "none";
 }
@@ -509,6 +519,11 @@ export interface StreamOptions {
 	frequencyPenalty?: number;
 	maxTokens?: number;
 	signal?: AbortSignal;
+	/**
+	 * OpenAI chat-completions HTTP attempt budget. When set, transient provider
+	 * errors are not replayed above the transport, so retries share this limit.
+	 */
+	maxHttpAttempts?: number;
 	apiKey?: string;
 	/** @internal Stored credential row serving this request, when known. */
 	credentialId?: number;
@@ -605,6 +620,13 @@ export interface StreamOptions {
 	 * without the capability.
 	 */
 	storeResponses?: boolean;
+	/**
+	 * Request the Daybreak Blue cyber access program on Codex when the account
+	 * is eligible (see `openai-codex/access-programs.ts`). `false` omits
+	 * `access_programs`. Unset falls back to the host's
+	 * `configureCodexAccessPrograms` default, else on. Ignored elsewhere.
+	 */
+	codexAccessPrograms?: boolean;
 	/**
 	 * Disable native reasoning when the caller supplies an external scratchpad.
 	 * OpenAI Responses emits `reasoning: { effort: "none" }`; Anthropic and
@@ -814,7 +836,7 @@ export interface SimpleStreamOptions extends Omit<StreamOptions, "apiKey"> {
 	 * A rejecting transformer is swallowed and the reserved payload stands in.
 	 */
 	cursorOnToolResult?: CursorToolResultHandler;
-	/** Cursor hands unhandled MCP calls to an external executor instead of reporting them as missing. */
+	/** The caller's client runs every tool: Cursor offers them all as MCP tools and hands each call off to it. */
 	cursorExternalToolExecutor?: boolean;
 	/**
 	 * Amazon Bedrock Guardrail settings forwarded through transports that do not
@@ -866,6 +888,8 @@ export interface SimpleStreamOptions extends Omit<StreamOptions, "apiKey"> {
 	 * provider. Non-Anthropic providers ignore the field.
 	 */
 	fallbacks?: FallbackParam[];
+	/** Factory Droid only: omit refusal fallbacks and reject responses served by another model. */
+	disableServerSideFallback?: boolean;
 }
 
 // Generic StreamFunction with typed options
@@ -903,6 +927,13 @@ export interface ThinkingContent {
 	 * replay natively on another host.
 	 */
 	summary?: boolean;
+	/**
+	 * `true`: the block is narration — prose the model addressed to the user
+	 * between tool calls, which the provider returned as a signed thinking block
+	 * (Anthropic connector-text summarization). It stays a thinking block for
+	 * replay; user-facing surfaces present it as answer text.
+	 */
+	narration?: boolean;
 }
 
 export interface RedactedThinkingContent {
@@ -912,11 +943,12 @@ export interface RedactedThinkingContent {
 
 /**
  * Anthropic server-side-fallback boundary marker persisted on assistant
- * turns whose provider request opted into
- * `AnthropicOptions.fallbacks`. Consumers other than the Anthropic
- * provider MUST ignore it — `transformMessages` strips the block on any
- * cross-provider hop and on non-official Anthropic replays, so downstream
- * converters never see it.
+ * turns whose response switched models mid-stream, whether the request
+ * opted into `AnthropicOptions.fallbacks` or a gateway opted in on its
+ * behalf. Consumers other than the Anthropic provider MUST ignore it —
+ * `transformMessages` strips the block on any non-Anthropic hop, and
+ * `convertAnthropicMessages` only puts it on the wire for an opted-in
+ * request to the official endpoint.
  */
 export interface AnthropicFallbackContent {
 	type: "fallback";
@@ -1116,6 +1148,8 @@ export interface AnthropicCompactionPayload {
 	content: string;
 	/** Signature of an on-demand block; replayed verbatim. */
 	signature?: string;
+	/** Net tool changes across the summarized range; covered by the signature, replayed verbatim. */
+	toolChanges?: Record<string, unknown>[];
 	/** Legacy threshold block state (`compact-2026-01-12`); replay-only. */
 	encryptedContent?: string;
 	/**
@@ -1240,6 +1274,14 @@ export type AssistantRetryRecovery =
 export interface ContextSnapshot {
 	promptTokens: number; // authoritative provider prompt/input tokens
 	nonMessageTokens: number; // estimated non-message total at send time
+	/**
+	 * Estimated tool-schema tokens included in `nonMessageTokens` (0 when the
+	 * model defers schemas server-side). Lets a later model whose schema policy
+	 * differs rebase the provider anchor instead of inheriting its schemas.
+	 */
+	toolSchemaTokens?: number;
+	/** Pruning-aware schema estimator; absent on historical full-schema estimates. */
+	toolSchemaEstimateVersion?: 1;
 	/** Estimated prompt tokens removed by local history rewrites after this provider snapshot was recorded. */
 	historyRewriteTokensRemoved?: number;
 	/**
@@ -1677,7 +1719,8 @@ export type AssistantMessageEvent =
 export interface AnthropicFallbackCreditHandle {
 	token: string;
 	prefillClaim?: boolean | null;
-	params: unknown;
+	/** The refused request's body, replayed with the credit token on the fallback model. */
+	params: MessageCreateParamsStreaming;
 	betas?: readonly string[];
 	betaHeader?: string;
 	expiresAt: number;

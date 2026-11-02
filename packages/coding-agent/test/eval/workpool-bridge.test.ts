@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
+import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { AsyncJobManager } from "../../src/async";
 import { Settings } from "../../src/config/settings";
 import { runEvalWorkpool } from "../../src/eval/workpool-bridge";
@@ -17,7 +18,7 @@ const SCOUT: AgentDefinition = {
 
 const managers = new Set<AsyncJobManager>();
 
-function makeSession(): ToolSession {
+function makeSession(settings: Record<string, unknown> = {}): ToolSession {
 	const manager = new AsyncJobManager({ retentionMs: 0 });
 	managers.add(manager);
 	return {
@@ -28,6 +29,7 @@ function makeSession(): ToolSession {
 			"task.maxRecursionDepth": 2,
 			"task.isolation.enabled": false,
 			"task.enableLsp": false,
+			...settings,
 		}),
 		asyncJobManager: manager,
 		getAgentId: () => "Main",
@@ -88,4 +90,40 @@ describe("runEvalWorkpool", () => {
 			'unknown workpool operation "wait"',
 		);
 	});
+});
+
+describe("workpool model validation", () => {
+	it("eval mode admits an approved pinned worker and rejects an unapproved model before creating a pool", async () => {
+		const approved = createMockModel();
+		const unapproved = createMockModel({ id: "unapproved" });
+		// A project agent's frontmatter never grants its own model.
+		const agent: AgentDefinition = { ...SCOUT, source: "project", model: ["mock/unapproved"] };
+		vi.spyOn(discovery, "discoverAgents").mockResolvedValue({ agents: [agent], projectAgentsDir: null });
+		const session = Object.assign(
+			makeSession({ "task.perCallModel": "eval", modelRoles: { review: "mock/mock-model" } }),
+			{ modelRegistry: { getAll: () => [approved, unapproved], getAvailable: () => [approved, unapproved] } },
+		);
+		await expect(
+			runEvalWorkpool({ op: "create", name: "denied", agent: "scout", model: "mock/unapproved" }, { session }),
+		).rejects.toThrow(/not approved/);
+		expect(WorkPoolRegistry.global().get("Main", "denied")).toBeUndefined();
+		await expect(
+			runEvalWorkpool({ op: "create", name: "approved", agent: "scout", model: "mock/mock-model" }, { session }),
+		).resolves.toEqual({ name: "approved", agent: "scout", limit: 2 });
+	});
+
+	for (const { mode, model, reason } of [
+		// The gate wins over the selector check, so an invalid selector still reports the disabled gate.
+		{ mode: "off", model: "@smol", reason: /task\.perCallModel: off/ },
+		{ mode: "on", model: "@smol", reason: /invalid `model` value/ },
+	]) {
+		it(`rejects ${JSON.stringify(model)} under ${mode} before registering a pool`, async () => {
+			vi.spyOn(discovery, "discoverAgents").mockResolvedValue({ agents: [SCOUT], projectAgentsDir: null });
+			const session = makeSession({ "task.perCallModel": mode });
+			await expect(
+				runEvalWorkpool({ op: "create", name: "invalid", agent: "scout", model }, { session }),
+			).rejects.toThrow(reason);
+			expect(WorkPoolRegistry.global().get("Main", "invalid")).toBeUndefined();
+		});
+	}
 });

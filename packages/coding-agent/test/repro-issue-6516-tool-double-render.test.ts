@@ -96,8 +96,8 @@ describe("issue #6516 — tool output appears twice", () => {
 		tempDir?.removeSync();
 	});
 
-	afterAll(() => {
-		authStorage.close();
+	afterAll(async () => {
+		await authStorage.close();
 		settingsDir.removeSync();
 		resetSettingsForTest();
 	});

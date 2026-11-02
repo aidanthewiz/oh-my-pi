@@ -63,7 +63,7 @@ describe("AgentSession extension-root discovery (post-startup)", () => {
 
 	afterEach(async () => {
 		for (const session of sessions.splice(0)) await session.dispose();
-		for (const authStorage of authStorages.splice(0)) authStorage.close();
+		for (const authStorage of authStorages.splice(0)) await authStorage.close();
 		setActiveSkills([]);
 		removeSyncWithRetries(tempDir);
 	});

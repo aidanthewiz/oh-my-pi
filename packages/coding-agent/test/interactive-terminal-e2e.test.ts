@@ -55,7 +55,7 @@ describe("libkitty end-to-end", () => {
 	afterEach(async () => {
 		mode?.stop();
 		await session?.dispose();
-		authStorage?.close();
+		await authStorage?.close();
 		tempDir?.removeSync();
 		resetSettingsForTest();
 	});
@@ -336,5 +336,88 @@ describe("libkitty end-to-end", () => {
 		expect(mode.hideToolActivity).toBe(true);
 		expect(plainRows(term.getScrollBuffer()).some(row => row.includes(TOOL_MARKER))).toBe(false);
 		expect(plainRows(term.getViewport()).some(row => row.includes("LIVE_EDITOR_DRAFT"))).toBe(true);
+	});
+	it("replaces retired history after /shake and restores covered reply rows when the Todo HUD clears", async () => {
+		const usage: Usage = {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		};
+		const answer = Array.from({ length: 35 }, (_, index) => `Answer marker ${index + 1}`);
+		const message: AssistantMessage = {
+			role: "assistant",
+			content: [
+				{ type: "thinking", thinking: "SHAKE_RETIRED_REASONING" },
+				{ type: "text", text: answer.join("\n") },
+			],
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: "claude-sonnet",
+			usage,
+			stopReason: "stop",
+			timestamp: 1,
+		};
+		term = new VirtualTerminal(120, 16);
+		mode = new InteractiveMode(
+			session,
+			"test",
+			undefined,
+			() => {},
+			undefined,
+			undefined,
+			undefined,
+			new Composer({ terminal: term }),
+		);
+		session.sessionManager.appendMessage({ role: "user", content: "Show the answer", timestamp: 0 });
+		session.sessionManager.appendMessage(message);
+		await mode.init({ suppressWelcomeIntro: true });
+		mode.noteDisplayableThinkingContent(message);
+		mode.setTodos([{ content: "Review answer", status: "in_progress" }]);
+		await mode.renderInitialMessages({ clearTerminalHistory: true });
+		await term.waitForRender(() =>
+			plainRows(term.getScrollBuffer()).some(row => row.includes("SHAKE_RETIRED_REASONING")),
+		);
+
+		const buffer = () => plainRows(term.getScrollBuffer());
+		const answerRows = () =>
+			buffer()
+				.map(row => row.trim())
+				.filter(row => row.startsWith("Answer marker "));
+		const replyVisible = () => {
+			const shown = answerRows();
+			return shown[0] === answer[0] && shown.at(-1) === answer.at(-1);
+		};
+		expect(buffer().some(row => row.includes("SHAKE_RETIRED_REASONING"))).toBe(true);
+		await mode.handleShakeCommand("thinking");
+		await term.waitForRender(replyVisible);
+
+		const rows = buffer();
+		expect(rows.some(row => row.includes("SHAKE_RETIRED_REASONING"))).toBe(false);
+		expect(answerRows().filter(row => row === answer[0])).toHaveLength(1);
+		expect(answerRows().filter(row => row === answer.at(-1))).toHaveLength(1);
+		expect(plainRows(term.getViewport()).some(row => row.includes("Review answer"))).toBe(true);
+
+		for (const errorMessage of [undefined, "Auto-shake only partially reclaimed context"]) {
+			await mode.eventController.handleEvent({
+				type: "auto_compaction_end",
+				action: "shake",
+				result: undefined,
+				aborted: false,
+				willRetry: true,
+				skipped: false,
+				...(errorMessage ? { errorMessage } : {}),
+			});
+			await term.waitForRender(replyVisible);
+			expect(answerRows().filter(row => row === answer[0])).toHaveLength(1);
+			expect(answerRows().filter(row => row === answer.at(-1))).toHaveLength(1);
+			expect(plainRows(term.getViewport()).some(row => row.includes("Review answer"))).toBe(true);
+		}
+		mode.setTodos([]);
+		await term.waitForRender(() => answerRows().length === answer.length);
+		expect(answerRows()).toEqual(answer);
+		expect(plainRows(term.getViewport()).some(row => row.includes("Review answer"))).toBe(false);
 	});
 });

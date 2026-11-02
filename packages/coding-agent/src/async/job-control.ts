@@ -8,14 +8,14 @@ import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
 
 import type { AsyncJob, AsyncJobDetails, AsyncJobManager, AsyncJobType } from "./job-manager";
 
-import { renderStructuredJson, structuredStatusLabel } from "../session/async-job-delivery";
+import { renderStructuredJson, structuredStatusLabel, taskAgentHandles } from "../session/async-job-delivery";
 import { USER_INTERRUPT_LABEL } from "../session/messages";
 import type { StructuredSubagentOutput } from "@oh-my-pi/pi-tui/tools/task";
 import { parseConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 
 import type { ToolSession } from "../tools";
 
-import { formatDuration } from "@oh-my-pi/pi-tui/render/render-utils";
+import { formatDuration, formatNumber } from "@oh-my-pi/pi-tui/render/render-utils";
 import type {
 	AgentActivitySnapshot,
 	CancelOutcome,
@@ -24,7 +24,6 @@ import type {
 } from "@oh-my-pi/pi-tui/tools/wait";
 
 import { isWaitingPollDetails } from "@oh-my-pi/pi-tui/tools/wait";
-import { formatArtifactErrorNotice } from "@oh-my-pi/pi-tui/tools/output-meta";
 
 /**
  * Resolve a list of job ids to job records visible to the calling agent.
@@ -112,7 +111,7 @@ export function runningAgentsOutsideJobs(session: ToolSession): AgentActivitySna
 
 /**
  * Suffix flagging a claimed-running agent with no turn in flight; empty for a
- * live one. Shared by `jobs`, empty-wait results, and the `proc://` roster so
+ * live one. Shared by empty-wait results and the `proc://` roster so
  * every surface tells a finished-but-unterminalized run (#11079) from real work.
  */
 export function agentStaleNote(agent: AgentActivitySnapshot): string {
@@ -125,7 +124,7 @@ export function agentStaleNote(agent: AgentActivitySnapshot): string {
 		: " — no turn in flight (stale registration?)";
 }
 
-/** Model-facing lines for the running-agents section shared by `jobs` and empty-wait results. */
+/** Model-facing lines for the running-agents section of empty-wait results. */
 function describeAgents(agents: AgentActivitySnapshot[]): string[] {
 	const lines = [`## Running Agents (${agents.length}) — not job-backed\n`];
 	for (const agent of agents) {
@@ -150,39 +149,49 @@ interface TrackedJobLike {
 	type: AsyncJobType;
 	status: string;
 	label: string;
+	/** See {@link AsyncJob.intent}. */
+	intent?: string;
 	startTime: number;
 	endTime?: number;
 	latestDetails?: AsyncJobDetails;
 	resultText?: string;
 	errorText?: string;
 	structured?: StructuredSubagentOutput;
+	agentId?: string;
+	/** See {@link AsyncJob.agentOutputPublished}. */
+	agentOutputPublished?: boolean;
 }
 
-export function snapshotJobs(
-	session: ToolSession,
-	jobs: TrackedJobLike[],
-	options: { includeResults?: boolean } = {},
-): JobSnapshot[] {
+export function snapshotJobs(session: ToolSession, jobs: TrackedJobLike[]): JobSnapshot[] {
 	const now = Date.now();
 	return jobs.map(j => {
-		const current = session.asyncJobManager?.getJob(j.id);
-		const latest = current ?? j;
-		const resultConsumed = session.asyncJobManager?.isJobResultConsumed(latest.id) === true;
+		const retained = session.asyncJobManager?.getJob(j.id);
+		const current = retained === j ? retained : undefined;
+		const latest = j;
+		const resultConsumed = current !== undefined && session.asyncJobManager?.isJobResultConsumed(latest.id) === true;
 		let resolvedModel: string | undefined;
 		const exitCode = typeof latest.latestDetails?.exitCode === "number" ? latest.latestDetails.exitCode : undefined;
 		let resolvedModelIdentity: string | undefined;
 		let resolvedThinkingLevel: JobSnapshot["resolvedThinkingLevel"];
 		let advisor = false;
 		let completionPercent: number | undefined;
+		let stage: string | undefined;
+		let requests: number | undefined;
+		let cost: number | undefined;
+		let contextTokens: number | undefined;
+		let contextWindow: number | undefined;
 		if (latest.type === "task") {
 			const progressValue = latest.latestDetails?.progress;
 			if (Array.isArray(progressValue)) {
+				// A batch job's progress lists every spawn of the call, keyed by agent id.
+				// A collided job id is suffixed (`Foo-2`) while its agent id stays `Foo`.
+				const agentId = latest.agentId ?? latest.id;
 				let progressRecord: Record<string, unknown> | undefined;
 				for (const item of progressValue) {
 					if (!item || typeof item !== "object") continue;
 					const candidate = item as Record<string, unknown>;
 					if (!progressRecord) progressRecord = candidate;
-					if (candidate.id === latest.id) {
+					if (candidate.id === agentId) {
 						progressRecord = candidate;
 						break;
 					}
@@ -206,41 +215,83 @@ export function snapshotJobs(
 				if (typeof completionValue === "number" && Number.isFinite(completionValue)) {
 					completionPercent = completionValue;
 				}
+				const stageValue = progressRecord?.stage;
+				if (typeof stageValue === "string") {
+					const trimmed = stageValue.trim();
+					if (trimmed) stage = trimmed;
+				}
+				requests = finiteNumber(progressRecord?.requests);
+				cost = finiteNumber(progressRecord?.cost);
+				contextTokens = finiteNumber(progressRecord?.contextTokens);
+				contextWindow = finiteNumber(progressRecord?.contextWindow);
 			}
 		}
+		const running = latest.status === "running";
+		const widget = current && !resultConsumed ? session.asyncJobManager?.widgets?.view(current) : undefined;
 		return {
 			id: latest.id,
 			type: latest.type,
 			status: latest.status as JobSnapshot["status"],
 			label: latest.label,
+			...(latest.intent ? { intent: latest.intent } : {}),
 			durationMs: Math.max(0, (latest.endTime ?? now) - latest.startTime),
 			...(exitCode !== undefined ? { exitCode } : {}),
 			...(resolvedModel ? { resolvedModel } : {}),
 			...(resolvedModelIdentity ? { resolvedModelIdentity } : {}),
 			...(resolvedThinkingLevel !== undefined ? { resolvedThinkingLevel } : {}),
 			...(advisor ? { advisor: true } : {}),
-			...(completionPercent !== undefined && latest.status === "running" ? { completionPercent } : {}),
-			...(!resultConsumed && options.includeResults !== false && latest.resultText
-				? { resultText: latest.resultText }
-				: {}),
-			...(!resultConsumed && options.includeResults !== false && latest.errorText
-				? { errorText: latest.errorText }
-				: {}),
-			...((options.includeResults === false || !resultConsumed) && latest.latestDetails?.meta
-				? { meta: latest.latestDetails.meta }
-				: {}),
-			...(!resultConsumed && options.includeResults !== false && latest.structured
-				? { structured: latest.structured }
-				: {}),
-			...(latest.type === "task" ? { agentUrlId: current?.agentId ?? latest.id } : {}),
+			...(completionPercent !== undefined && running ? { completionPercent } : {}),
+			...(stage ? { stage } : {}),
+			...(requests !== undefined && running ? { requests } : {}),
+			...(cost !== undefined && running ? { cost } : {}),
+			...(contextTokens !== undefined && running ? { contextTokens } : {}),
+			...(contextWindow !== undefined && running ? { contextWindow } : {}),
+			...(widget ? { widget } : {}),
+			...(!resultConsumed && latest.resultText ? { resultText: latest.resultText } : {}),
+			...(!resultConsumed && latest.errorText ? { errorText: latest.errorText } : {}),
+			...(!resultConsumed && latest.latestDetails?.meta ? { meta: latest.latestDetails.meta } : {}),
+			...(!resultConsumed && latest.structured ? { structured: latest.structured } : {}),
+			...(latest.type === "task" ? { agentUrlId: latest.agentId ?? latest.id } : {}),
+			...(latest.agentOutputPublished !== undefined ? { agentOutputPublished: latest.agentOutputPublished } : {}),
 		};
 	});
+}
+
+function finiteNumber(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+/**
+ * Progress suffix for a running task row, e.g.
+ * ` — 5h7m · 90 req · $18.40 · ctx 160K/1M · stage: implementing`, from the
+ * fields {@link snapshotJobs} copies out of the task's latest progress record.
+ * Returns `""` for any other row and for a running task without progress
+ * fields, so those rows keep their plain shape; duration alone never makes a
+ * suffix. Pass `duration: false` where the row already shows the run time.
+ */
+export function runningTaskProgressSuffix(job: JobSnapshot, options: { duration: boolean }): string {
+	if (job.type !== "task" || job.status !== "running") return "";
+	const parts: string[] = [];
+	if (job.requests !== undefined && job.requests > 0) parts.push(`${job.requests} req`);
+	if (job.cost !== undefined && job.cost > 0) parts.push(job.cost < 0.005 ? "<$0.01" : `$${job.cost.toFixed(2)}`);
+	if (job.contextTokens !== undefined && job.contextTokens > 0) {
+		parts.push(
+			job.contextWindow !== undefined && job.contextWindow > 0
+				? `ctx ${formatNumber(job.contextTokens)}/${formatNumber(job.contextWindow)}`
+				: `ctx ${formatNumber(job.contextTokens)}`,
+		);
+	}
+	if (job.completionPercent !== undefined) parts.push(`~${job.completionPercent}%`);
+	if (job.stage) parts.push(`stage: ${job.stage.replace(/\s+/g, " ")}`);
+	if (parts.length === 0) return "";
+	if (options.duration) parts.unshift(formatDuration(job.durationMs));
+	return ` — ${parts.join(" · ")}`;
 }
 
 export function buildJobResult(
 	session: ToolSession,
 	manager: AsyncJobManager,
-	op: "wait" | "cancel" | "jobs",
+	op: "wait" | "cancel",
 	jobs: TrackedJobLike[],
 	cancelOutcomes: CancelOutcome[],
 	agents: AgentActivitySnapshot[] = [],
@@ -252,12 +303,17 @@ export function buildJobResult(
 		seen.add(j.id);
 		return true;
 	});
-	const jobResults = snapshotJobs(session, uniqueJobs, { includeResults: op !== "jobs" });
-	const alreadyConsumed = new Set(jobResults.filter(job => manager.isJobResultConsumed(job.id)).map(job => job.id));
-
-	if (op !== "jobs") {
-		manager.consumeJobResults(jobResults.filter(j => j.status !== "running").map(j => j.id));
-	}
+	const jobResults = snapshotJobs(session, uniqueJobs);
+	const currentJobs = uniqueJobs.filter(job => manager.getJob(job.id) === job);
+	const alreadyConsumed = new Set(currentJobs.filter(job => manager.isJobResultConsumed(job.id)).map(job => job.id));
+	const watchedByWait = new Set(
+		op === "wait"
+			? currentJobs
+					.filter(job => !alreadyConsumed.has(job.id) && manager.isDeliverySuppressed(job.id))
+					.map(job => job.id)
+			: [],
+	);
+	manager.consumeJobResults(currentJobs.filter(job => job.status !== "running").map(job => job.id));
 
 	const completed = jobResults.filter(j => j.status !== "running");
 	const running = jobResults.filter(j => j.status === "running");
@@ -270,33 +326,27 @@ export function buildJobResult(
 		lines.push("");
 	}
 
-	if (op === "jobs" && jobResults.length > 0) {
-		lines.push(`## Jobs (${jobResults.length})\n`);
-		for (const j of jobResults) {
-			const exit = j.exitCode === undefined ? "" : ` — exit ${j.exitCode}`;
-			const artifactId = j.meta?.truncation?.artifactId;
-			const artifact = artifactId ? ` — artifact://${artifactId}` : "";
-			const capture =
-				j.meta?.artifactError === undefined ? "" : ` — ${formatArtifactErrorNotice(j.meta.artifactError)}`;
-			const delivery =
-				j.status === "running" || j.status === "cancelled"
-					? ""
-					: ` — delivery ${alreadyConsumed.has(j.id) ? "delivered" : "pending"}`;
-			const agent = j.agentUrlId ? ` — agent://${j.agentUrlId}` : "";
-			lines.push(
-				`- \`${j.id}\` [${j.type}] — ${j.status} — ${j.label.replace(/\s+/g, " ")}${exit}${artifact}${capture}${delivery}${agent}`,
-			);
-		}
-	} else if (completed.length > 0) {
+	if (completed.length > 0) {
 		lines.push(`## Completed (${completed.length})\n`);
 		for (const j of completed) {
 			lines.push(`### ${j.id} [${j.type}] — ${j.status}`);
+			if (j.intent) lines.push(`Intent: ${j.intent}`);
 			lines.push(`Label: ${j.label}`);
+			const handles = taskAgentHandles(j.id, j, j.agentUrlId);
+			if (handles) {
+				lines.push(
+					handles === "agent"
+						? `Agent: agent://${j.agentUrlId}, history://${j.agentUrlId}`
+						: `Agent: history://${j.agentUrlId}`,
+				);
+			}
 			if (j.status !== "cancelled") {
 				lines.push(
 					alreadyConsumed.has(j.id)
 						? "Delivery: already delivered or recovered."
-						: "Delivery: not auto-delivered; recovered by this snapshot.",
+						: watchedByWait.has(j.id)
+							? "Delivery: delivered directly to wait."
+							: "Delivery: not auto-delivered; recovered by this snapshot.",
 				);
 			}
 			if (j.resultText) {
@@ -313,7 +363,7 @@ export function buildJobResult(
 				// `<output>` block above (or breaks mid-JSON once truncated at
 				// 4k), which contradicts async-result.md's contract of pointing
 				// to `agent://<id>` instead (PR #10625 review).
-				if (hasData)
+				if (hasData && j.status === "completed" && j.agentOutputPublished !== false)
 					header += `; full payload at agent://${j.agentUrlId}, fields via agent://${j.agentUrlId}/<field>`;
 				lines.push(header);
 				if (j.structured.status !== "valid") {
@@ -325,10 +375,13 @@ export function buildJobResult(
 		}
 	}
 
-	if (op !== "jobs" && running.length > 0) {
+	if (running.length > 0) {
 		lines.push(`## Still Running (${running.length})\n`);
 		for (const j of running) {
-			lines.push(`- \`${j.id}\` [${j.type}] — ${j.label}`);
+			const intent = j.intent ? `${j.intent} — ` : "";
+			lines.push(
+				`- \`${j.id}\` [${j.type}] — ${intent}${j.label}${runningTaskProgressSuffix(j, { duration: true })}`,
+			);
 		}
 	}
 
@@ -430,16 +483,17 @@ export async function cancelAgentRegistration(
 	if (ref.parentId !== ownerId) {
 		return { id, status: "not_found", message: `Agent ${id} was not spawned by you and cannot be cancelled.` };
 	}
+	const live = ref.session;
 	const lifecycle = session.agentLifecycle?.();
 	try {
-		if (ref.status === "running" && ref.session) {
-			await ref.session.abort({ reason: USER_INTERRUPT_LABEL });
+		if (ref.status === "running" && live) {
+			await live.abort({ reason: USER_INTERRUPT_LABEL });
 		}
 		if (lifecycle) {
-			await lifecycle.release(id);
+			if (!(await lifecycle.release(id, ref))) await live?.dispose();
 		} else {
-			await ref.session?.dispose();
-			registry?.unregister(id);
+			await live?.dispose();
+			registry?.unregister(id, ref);
 		}
 	} catch (error) {
 		return {

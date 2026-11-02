@@ -1,16 +1,125 @@
 import { describe, expect, it } from "bun:test";
 import type { FetchImpl } from "@oh-my-pi/pi-ai/types";
+import { inspect } from "node:util";
+import {
+	MCPTransportError,
+	formatMCPToolFailure,
+	nonRetryableMCPTransportError,
+	normalizeMCPTransportError,
+} from "@oh-my-pi/pi-coding-agent/mcp/errors";
 import {
 	analyzeAuthError,
 	discoverOAuthEndpoints,
 	extractMcpAuthServerUrl,
 	extractOAuthChallengeScopes,
 	fetchResourceMetadataScopes,
+	OAuthIssuerMismatchError,
 	rfc9728ProtectedResourceMetadataUrl,
 } from "@oh-my-pi/pi-coding-agent/mcp/oauth-discovery";
 import { type FetchInput, mockFetch } from "./helpers/fetch-mock";
 
 describe("mcp oauth discovery", () => {
+	it.each([
+		["authorization_url", "token_url"],
+		["authorizationUrl", "tokenUrl"],
+		["authorization_endpoint", "token_endpoint"],
+		["authorizationEndpoint", "tokenEndpoint"],
+		["authorization_uri", "token_uri"],
+		["authorizationUri", "tokenUri"],
+	])("recovers %s/%s JSON discovery without exposing credential bodies", (authorizationKey, tokenKey) => {
+		for (const container of [undefined, "oauth", "authorization", "auth"]) {
+			const metadata = {
+				[authorizationKey]: "https://auth.example/authorize?client_id=public-client&scope=read",
+				[tokenKey]: "https://auth.example/token?tenant=original",
+				issuer: "https://auth.example",
+				registration_endpoint: "https://auth.example/register",
+				resource: "https://mcp.example/service",
+				client_secret: "wire-secret",
+			};
+			const body = {
+				access_token: "wire-secret",
+				padding: "x".repeat(1_100),
+				...(container ? { [container]: metadata } : metadata),
+			};
+			const normalized = normalizeMCPTransportError(new Error(`HTTP 401: ${JSON.stringify(body)}`), {
+				transport: "http",
+				stage: "receive",
+			});
+			const cloned = new MCPTransportError({
+				transport: "http",
+				stage: "receive",
+				failure: "http_status",
+				message: normalized.message,
+				code: 401,
+				retryable: true,
+				cause: normalized,
+			});
+			const error = nonRetryableMCPTransportError(cloned);
+			const auth = analyzeAuthError(error, "https://mcp.example/service");
+			expect(auth.oauth).toEqual({
+				authorizationUrl: metadata[authorizationKey],
+				tokenUrl: metadata[tokenKey],
+				issuerUrl: metadata.issuer,
+				registrationUrl: metadata.registration_endpoint,
+				resource: metadata.resource,
+				clientId: "public-client",
+				scopes: "read",
+			});
+			expect(error.retryable).toBe(false);
+			for (const printed of [
+				inspect(error, { depth: 10 }),
+				JSON.stringify(error),
+				formatMCPToolFailure(error, "server", "tool"),
+			]) {
+				expect(printed).not.toContain("wire-secret");
+			}
+		}
+	});
+
+	it.each([
+		["authorization_uri", "token_uri"],
+		["authorization_url", "token_url"],
+		["authorization_endpoint", "token_endpoint"],
+		["authorize_url", "token_url"],
+		["realm", "token_url"],
+	])("preserves %s/%s challenge endpoints through redaction and normalization", (authorizationKey, tokenKey) => {
+		const error = normalizeMCPTransportError(
+			new Error(
+				`HTTP 403: {"client_secret":"wire-secret"} [WWW-Authenticate: Bearer ${authorizationKey}="https://auth.example/authorize", ${tokenKey}="https://auth.example/token", scope="read write", issuer="https://auth.example", registration_uri="https://auth.example/register", resource_uri="https://mcp.example/service", resource_metadata="https://mcp.example/metadata"; Mcp-Auth-Server: /tenant/oauth]`,
+			),
+			{ transport: "http", stage: "receive" },
+		);
+		const auth = analyzeAuthError(error, "https://mcp.example/service");
+		expect(auth).toMatchObject({
+			requiresAuth: true,
+			authType: "oauth",
+			authServerUrl: "https://mcp.example/tenant/oauth",
+			resourceMetadataUrl: "https://mcp.example/metadata",
+			scopes: "read write",
+			oauth: {
+				authorizationUrl: "https://auth.example/authorize",
+				tokenUrl: "https://auth.example/token",
+				issuerUrl: "https://auth.example",
+				registrationUrl: "https://auth.example/register",
+				resource: "https://mcp.example/service",
+				scopes: "read write",
+			},
+		});
+		expect(inspect(error, { depth: 10 })).not.toContain("wire-secret");
+	});
+
+	it.each(["[redacted]", "javascript:alert(1)", "https://user:secret@auth.example/token"])(
+		"does not treat an unusable token endpoint as discovery: %s",
+		tokenUrl => {
+			const auth = analyzeAuthError(
+				new Error(
+					`HTTP 401: ${JSON.stringify({ authorization_url: "https://auth.example/authorize", token_url: tokenUrl })}`,
+				),
+			);
+			expect(auth.oauth).toBeUndefined();
+		},
+	);
+
 	it("extracts Mcp-Auth-Server from transport error headers", () => {
 		const error = new Error(
 			'HTTP 401: unauthorized [WWW-Authenticate: Bearer resource_metadata="https://mcp.figma.com/.well-known/oauth-protected-resource"; Mcp-Auth-Server: https://www.figma.com]',
@@ -22,22 +131,111 @@ describe("mcp oauth discovery", () => {
 		expect(auth.authServerUrl).toBe("https://www.figma.com/");
 	});
 
-	it("discovers oauth endpoints from auth server metadata", async () => {
+	it.each(["standard", "nested"])(
+		"retains scopes from protected-resource metadata with %s inline endpoints",
+		async format => {
+			const fetchImpl = mockFetch((input: FetchInput) => {
+				if (String(input) !== "https://mcp.example.com/.well-known/oauth-protected-resource/mcp") {
+					return new Response("not found", { status: 404 });
+				}
+				const endpoints =
+					format === "standard"
+						? {
+								authorization_endpoint: "https://auth.example.com/authorize",
+								token_endpoint: "https://auth.example.com/token",
+							}
+						: {
+								oauth: {
+									authorization_url: "https://auth.example.com/authorize",
+									token_url: "https://auth.example.com/token",
+								},
+							};
+				return Response.json({
+					resource: "https://mcp.example.com/mcp",
+					scopes_supported: ["mcp.read"],
+					...endpoints,
+				});
+			});
+
+			const oauth = await discoverOAuthEndpoints("https://mcp.example.com/mcp", undefined, undefined, {
+				fetch: fetchImpl,
+			});
+
+			expect(oauth?.scopes).toBe("mcp.read");
+		},
+	);
+
+	it.each([
+		["/oauth/metadata", "standard"],
+		["/oauth/metadata", "oauth"],
+		["/oauth/metadata", "authorization"],
+		["/oauth/metadata", "auth"],
+		["/.mcp/auth", "standard"],
+		["/.mcp/auth", "oauth"],
+		["/.mcp/auth", "authorization"],
+		["/.mcp/auth", "auth"],
+	] as const)("keeps resource scopes but not issuer catalogues at %s (%s)", async (metadataPath, format) => {
+		const authorizationUrl = "https://issuer.example.com/authorize";
+		const tokenUrl = "https://issuer.example.com/token";
+		const fetchImpl = mockFetch((input: FetchInput) => {
+			if (String(input) !== `https://legacy.example.com${metadataPath}`) {
+				return new Response("not found", { status: 404 });
+			}
+			return Response.json(
+				format === "standard"
+					? {
+							authorization_endpoint: authorizationUrl,
+							token_endpoint: tokenUrl,
+							scopes_supported: ["mcp.read"],
+						}
+					: {
+							[format]: {
+								authorization_url: authorizationUrl,
+								token_url: tokenUrl,
+								scopes_supported: ["mcp.read"],
+							},
+						},
+			);
+		});
+
+		const resource = await discoverOAuthEndpoints("https://legacy.example.com/mcp", undefined, undefined, {
+			fetch: fetchImpl,
+		});
+		expect(resource?.scopes).toBe("mcp.read");
+
+		const issuer = await discoverOAuthEndpoints(
+			"https://other-resource.example.com/mcp",
+			"https://legacy.example.com",
+			undefined,
+			{ fetch: fetchImpl },
+		);
+		expect(issuer).toMatchObject({ authorizationUrl, tokenUrl, scopes: undefined });
+	});
+
+	it.each(["standard", "nested"])("does not request the %s authorization server's scope catalogue", async format => {
 		const calls: string[] = [];
 		const fetchImpl = mockFetch((input: FetchInput) => {
 			const url = String(input);
 			calls.push(url);
 
 			if (url === "https://www.figma.com/.well-known/oauth-authorization-server") {
-				return new Response(
-					JSON.stringify({
-						authorization_endpoint: "https://www.figma.com/oauth",
-						token_endpoint: "https://api.figma.com/v1/oauth/token",
-						client_id: "figma-client-id",
-						scopes_supported: ["file_read", "file_write"],
-					}),
-					{ status: 200, headers: { "Content-Type": "application/json" } },
-				);
+				const metadata =
+					format === "standard"
+						? {
+								authorization_endpoint: "https://www.figma.com/oauth",
+								token_endpoint: "https://api.figma.com/v1/oauth/token",
+								client_id: "figma-client-id",
+								scopes_supported: ["file_read", "file_write"],
+							}
+						: {
+								oauth: {
+									authorization_url: "https://www.figma.com/oauth",
+									token_url: "https://api.figma.com/v1/oauth/token",
+									client_id: "figma-client-id",
+									scopes_supported: ["file_read", "file_write"],
+								},
+							};
+				return Response.json(metadata);
 			}
 
 			return new Response("not found", { status: 404 });
@@ -51,7 +249,7 @@ describe("mcp oauth discovery", () => {
 			authorizationUrl: "https://www.figma.com/oauth",
 			tokenUrl: "https://api.figma.com/v1/oauth/token",
 			clientId: "figma-client-id",
-			scopes: "file_read file_write",
+			scopes: undefined,
 		});
 		expect(calls[0]).toBe("https://www.figma.com/.well-known/oauth-authorization-server");
 	});
@@ -512,7 +710,10 @@ describe("resource_metadata chain", () => {
 		expect(calls[0]).toBe("https://gateway.example.com/my-service/.well-known/oauth-protected-resource");
 	});
 
-	it("carries resource from fallback protected-resource discovery", async () => {
+	it.each([
+		["matching", "https://gateway.example.com/my-service/mcp", true],
+		["unrelated", "https://gateway.example.com/my-service/custom-resource", false],
+	] as const)("binds fallback protected-resource discovery to the %s resource", async (_label, resource, accepted) => {
 		const calls: string[] = [];
 		const fetchImpl = mockFetch((input: FetchInput) => {
 			const url = String(input);
@@ -525,7 +726,7 @@ describe("resource_metadata chain", () => {
 				return new Response(
 					JSON.stringify({
 						authorization_servers: ["https://auth.example.com/my-service"],
-						resource: "https://gateway.example.com/my-service/custom-resource",
+						resource,
 					}),
 					{ status: 200, headers: { "Content-Type": "application/json" } },
 				);
@@ -553,11 +754,16 @@ describe("resource_metadata chain", () => {
 			fetch: fetchImpl,
 		});
 
-		expect(oauth).toEqual({
-			authorizationUrl: "https://auth.example.com/my-service/oauth",
-			tokenUrl: "https://auth.example.com/my-service/token",
-			resource: "https://gateway.example.com/my-service/custom-resource",
-		});
+		if (accepted) {
+			expect(oauth).toMatchObject({
+				authorizationUrl: "https://auth.example.com/my-service/oauth",
+				tokenUrl: "https://auth.example.com/my-service/token",
+				resource,
+			});
+		} else {
+			expect(oauth).toBeNull();
+			expect(calls).not.toContain("https://auth.example.com/my-service/.well-known/oauth-authorization-server");
+		}
 		expect(calls).toContain("https://gateway.example.com/my-service/.well-known/oauth-protected-resource");
 	});
 });
@@ -655,6 +861,264 @@ describe("RFC 9728 path-inserted protected resource", () => {
 		expect(calls[0]).toBe(pathfulPr);
 		expect(calls).toContain(tenantOidc);
 		expect(calls).not.toContain(originAs);
+	});
+
+	it("uses an authorization server advertised at the resource's own URL", async () => {
+		const serverUrl = "https://host.example";
+		const metadataUrl = `${serverUrl}/.well-known/oauth-protected-resource`;
+		const fetchImpl = mockFetch((input: FetchInput) => {
+			if (String(input) === metadataUrl) {
+				return Response.json({ resource: serverUrl, authorization_servers: [serverUrl] });
+			}
+			if (String(input) === `${serverUrl}/.well-known/oauth-authorization-server`) {
+				return Response.json({
+					issuer: serverUrl,
+					authorization_endpoint: `${serverUrl}/authorize`,
+					token_endpoint: `${serverUrl}/token`,
+				});
+			}
+			return new Response("not found", { status: 404 });
+		});
+
+		for (const resourceMetadataUrl of [undefined, metadataUrl]) {
+			const oauth = await discoverOAuthEndpoints(serverUrl, undefined, resourceMetadataUrl, { fetch: fetchImpl });
+			expect(oauth).toMatchObject({
+				authorizationUrl: `${serverUrl}/authorize`,
+				tokenUrl: `${serverUrl}/token`,
+				issuerUrl: serverUrl,
+				resource: serverUrl,
+			});
+		}
+	});
+
+	it("reports the advertised AS issuer mismatch instead of falling back to an unadvertised origin-root AS", async () => {
+		// LiteLLM-style gateway: `/slack/mcp` advertises `https://gw.example/slack`,
+		// whose AS metadata wrongly claims the origin as issuer. The origin-root
+		// protected-resource metadata advertises the gateway's generic AS, which
+		// validates but was never listed for this resource.
+		const gw = "https://gw.example";
+		const slackAs = {
+			issuer: gw,
+			authorization_endpoint: `${gw}/slack/authorize`,
+			token_endpoint: `${gw}/slack/token`,
+		};
+		const rootAs = {
+			issuer: gw,
+			authorization_endpoint: `${gw}/v1/mcp/oauth/authorize`,
+			token_endpoint: `${gw}/v1/mcp/oauth/token`,
+		};
+		const routes: Record<string, unknown> = {
+			[`${gw}/.well-known/oauth-protected-resource/slack/mcp`]: { authorization_servers: [`${gw}/slack`] },
+			[`${gw}/.well-known/oauth-authorization-server/slack`]: slackAs,
+			[`${gw}/slack/.well-known/oauth-authorization-server`]: slackAs,
+			[`${gw}/.well-known/oauth-protected-resource`]: { resource: gw, authorization_servers: [gw] },
+			[`${gw}/.well-known/oauth-authorization-server`]: rootAs,
+			[`${gw}/.well-known/openid-configuration`]: rootAs,
+		};
+		const fetchImpl = mockFetch((input: FetchInput) => {
+			const body = routes[String(input)];
+			return body
+				? new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } })
+				: new Response("not found", { status: 404 });
+		});
+		const serverUrl = `${gw}/slack/mcp`;
+
+		// Advertised via the 401 resource_metadata hint, and found by resource-server probing.
+		for (const resourceMetadataUrl of [rfc9728ProtectedResourceMetadataUrl(serverUrl), undefined]) {
+			const discovery = discoverOAuthEndpoints(serverUrl, undefined, resourceMetadataUrl, { fetch: fetchImpl });
+			await expect(discovery).rejects.toBeInstanceOf(OAuthIssuerMismatchError);
+			await expect(discovery).rejects.toThrow(
+				"Could not discover OAuth endpoints: authorization server https://gw.example/slack " +
+					"(advertised by https://gw.example/.well-known/oauth-protected-resource/slack/mcp) " +
+					"returned metadata with issuer https://gw.example (RFC 8414 §3.3 requires an exact match).",
+			);
+		}
+
+		// A challenge naming both the resource metadata and an `Mcp-Auth-Server` hint for the
+		// valid but unadvertised origin AS: the advertised list wins, so the hint is not a way around it.
+		await expect(
+			discoverOAuthEndpoints(serverUrl, gw, rfc9728ProtectedResourceMetadataUrl(serverUrl), { fetch: fetchImpl }),
+		).rejects.toBeInstanceOf(OAuthIssuerMismatchError);
+	});
+
+	it.each(["/oauth/metadata", "/.mcp/auth", "/authorize"])(
+		"rejects a successful unrelated legacy document at %s after the advertised path issuer fails",
+		async legacyPath => {
+			for (const legacyIssuer of [
+				undefined,
+				"https://gateway.example",
+				"not-an-issuer",
+				"https://gateway.example/tenant?other=1",
+			]) {
+				const origin = "https://gateway.example";
+				const server = `${origin}/tenant/mcp`;
+				const issuer = `${origin}/tenant`;
+				const metadataUrl = rfc9728ProtectedResourceMetadataUrl(server)!;
+				for (const legacyResource of [origin, server]) {
+					const calls: string[] = [];
+					const fetchImpl = mockFetch((input: FetchInput) => {
+						const url = String(input);
+						calls.push(url);
+						if (url === metadataUrl) return Response.json({ resource: server, authorization_servers: [issuer] });
+						if (url === `${origin}/.well-known/oauth-authorization-server/tenant`) {
+							return Response.json({
+								issuer: origin,
+								authorization_endpoint: `${origin}/authorize`,
+								token_endpoint: `${origin}/token`,
+							});
+						}
+						if (url === `${origin}${legacyPath}`) {
+							return Response.json({
+								...(legacyIssuer === undefined ? {} : { issuer: legacyIssuer }),
+								oauth: {
+									authorization_url: `${origin}/unrelated/authorize`,
+									token_url: `${origin}/unrelated/token`,
+									resource: legacyResource,
+								},
+							});
+						}
+						return new Response("not found", { status: 404 });
+					});
+					await expect(
+						discoverOAuthEndpoints(server, undefined, metadataUrl, { fetch: fetchImpl }),
+					).rejects.toBeInstanceOf(OAuthIssuerMismatchError);
+					expect(calls).toContain(`${origin}${legacyPath}`);
+				}
+			}
+		},
+	);
+
+	it.each(["/oauth/metadata", "/.mcp/auth", "/authorize"])(
+		"accepts a successful legacy %s document bound to the advertised issuer and resource",
+		async legacyPath => {
+			const origin = "https://gateway.example";
+			const server = `${origin}/tenant/mcp`;
+			const issuer = `${origin}/tenant`;
+			const metadataUrl = rfc9728ProtectedResourceMetadataUrl(server)!;
+			const fetchImpl = mockFetch((input: FetchInput) => {
+				const url = String(input);
+				if (url === metadataUrl)
+					return Response.json({
+						resource: server,
+						authorization_servers: [issuer],
+						scopes_supported: ["mcp.read"],
+					});
+				if (url === `${origin}${legacyPath}`) {
+					return Response.json({
+						oauth: {
+							issuer,
+							resource: server,
+							authorization_url: `${issuer}/authorize`,
+							token_url: `${issuer}/token`,
+						},
+					});
+				}
+				return new Response("not found", { status: 404 });
+			});
+			expect(await discoverOAuthEndpoints(server, undefined, metadataUrl, { fetch: fetchImpl })).toMatchObject({
+				issuerUrl: issuer,
+				resource: server,
+				authorizationUrl: `${issuer}/authorize`,
+				tokenUrl: `${issuer}/token`,
+				scopes: "mcp.read",
+			});
+		},
+	);
+
+	it("does not escape a failed header issuer through successful resource-server legacy discovery", async () => {
+		const origin = "https://gateway.example";
+		const server = `${origin}/tenant/mcp`;
+		const fetchImpl = mockFetch((input: FetchInput) =>
+			String(input) === `${origin}/oauth/metadata`
+				? Response.json({
+						issuer: origin,
+						authorization_endpoint: `${origin}/authorize`,
+						token_endpoint: `${origin}/token`,
+					})
+				: new Response("not found", { status: 404 }),
+		);
+		expect(await discoverOAuthEndpoints(server, `${origin}/tenant`, undefined, { fetch: fetchImpl })).toBeNull();
+	});
+
+	it("retains issuer-less legacy discovery at the complete multi-segment issuer location", async () => {
+		const issuer = "https://gateway.example/tenants/acme";
+		const server = "https://resource.example/mcp";
+		const metadataUrl = rfc9728ProtectedResourceMetadataUrl(server)!;
+		const fetchImpl = mockFetch((input: FetchInput) => {
+			const url = String(input);
+			if (url === metadataUrl) return Response.json({ resource: server, authorization_servers: [issuer] });
+			if (url === `${issuer}/oauth/metadata`) {
+				return Response.json({
+					authorization_endpoint: `${issuer}/authorize`,
+					token_endpoint: `${issuer}/token`,
+					resource: server,
+				});
+			}
+			return new Response("not found", { status: 404 });
+		});
+		expect(await discoverOAuthEndpoints(server, undefined, metadataUrl, { fetch: fetchImpl })).toMatchObject({
+			authorizationUrl: `${issuer}/authorize`,
+			tokenUrl: `${issuer}/token`,
+			resource: server,
+		});
+	});
+
+	it("does not let a legacy document replace the canonical resource captured from the exact challenge metadata", async () => {
+		const server = "https://resource.example/tenant/mcp";
+		const resource = "https://resource.example";
+		const issuer = "https://gateway.example/tenant";
+		const metadataUrl = rfc9728ProtectedResourceMetadataUrl(server)!;
+		for (const legacyResource of [resource, "https://resource.example/unrelated"]) {
+			const fetchImpl = mockFetch((input: FetchInput) => {
+				const url = String(input);
+				if (url === metadataUrl) return Response.json({ resource, authorization_servers: [issuer] });
+				if (url === "https://gateway.example/oauth/metadata") {
+					return Response.json({
+						issuer,
+						resource: legacyResource,
+						authorization_endpoint: `${issuer}/authorize`,
+						token_endpoint: `${issuer}/token`,
+					});
+				}
+				return new Response("not found", { status: 404 });
+			});
+			const result = await discoverOAuthEndpoints(server, undefined, metadataUrl, { fetch: fetchImpl });
+			if (legacyResource === resource) expect(result).toMatchObject({ resource, issuerUrl: issuer });
+			else expect(result).toBeNull();
+		}
+	});
+
+	it("does not replace a captured canonical resource when metadata changes during discovery", async () => {
+		const server = "https://resource.example/tenant/mcp";
+		const metadataUrl = rfc9728ProtectedResourceMetadataUrl(server)!;
+		let reads = 0;
+		const calls: string[] = [];
+		const fetchImpl = mockFetch((input: FetchInput) => {
+			const url = String(input);
+			calls.push(url);
+			if (url === metadataUrl) {
+				reads++;
+				return Response.json(
+					reads === 1
+						? { resource: "https://resource.example" }
+						: {
+								resource: "https://resource.example/unrelated",
+								authorization_servers: ["https://issuer.example"],
+							},
+				);
+			}
+			if (url === "https://issuer.example/.well-known/oauth-authorization-server") {
+				return Response.json({
+					issuer: "https://issuer.example",
+					authorization_endpoint: "https://issuer.example/authorize",
+					token_endpoint: "https://issuer.example/token",
+				});
+			}
+			return new Response("not found", { status: 404 });
+		});
+		expect(await discoverOAuthEndpoints(server, undefined, metadataUrl, { fetch: fetchImpl })).toBeNull();
+		expect(reads).toBe(2);
+		expect(calls).not.toContain("https://issuer.example/.well-known/oauth-authorization-server");
 	});
 });
 

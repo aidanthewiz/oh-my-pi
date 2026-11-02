@@ -17,20 +17,16 @@ import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
 const LANE = "cred:slow-command-test";
 
 describe("/slow", () => {
-	const cleanups: Array<() => void> = [];
+	const cleanups: Array<() => Promise<void>> = [];
 
-	afterEach(() => {
-		for (const cleanup of cleanups.splice(0)) cleanup();
+	afterEach(async () => {
+		for (const cleanup of cleanups.splice(0)) await cleanup();
 		anthropicSlowModeLanes.lane(LANE).reset();
 	});
 
 	function createSession(provider: string, api: Api, settings = Settings.isolated()): AgentSession {
 		const tempDir = TempDir.createSync("@slow-command-");
 		const authStorage = createInMemoryAuthStorage();
-		cleanups.push(() => {
-			authStorage.close();
-			tempDir.removeSync();
-		});
 		const model = buildModel({
 			id: "test-model",
 			name: "test-model",
@@ -43,12 +39,18 @@ describe("/slow", () => {
 			contextWindow: 8192,
 			maxTokens: 2048,
 		});
-		return new AgentSession({
+		const session = new AgentSession({
 			agent: new Agent({ initialState: { model, systemPrompt: ["test"], tools: [] } }),
 			sessionManager: SessionManager.inMemory(tempDir.path()),
 			settings,
 			modelRegistry: new ModelRegistry(authStorage, path.join(tempDir.path(), "models.yml")),
 		});
+		cleanups.push(async () => {
+			await session.dispose();
+			await authStorage.close();
+			tempDir.removeSync();
+		});
+		return session;
 	}
 
 	async function slow(session: AgentSession, args: string): Promise<string> {

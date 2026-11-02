@@ -215,7 +215,7 @@ async function createSessionHarness(options: SessionHarnessOptions = {}): Promis
 		session,
 		cleanup: async () => {
 			await session.dispose();
-			authStorage.close();
+			await authStorage.close();
 			server.stop(true);
 			tempDir.removeSync();
 		},

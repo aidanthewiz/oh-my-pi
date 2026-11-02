@@ -12,22 +12,36 @@
  *    item; with `async.enabled=false`, it blocks and returns merged results.
  *    Both modes forward the shared `context`; the flat form stays accepted at
  *    runtime for internal callers.
+ * 4. `task.enableEffort` gates stale runtime effort fields in both shapes.
+ *    Disabled effort preserves configured, automatic, and explicit model thinking.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
-import { Agent, type AgentTool } from "@oh-my-pi/pi-agent-core";
+import * as path from "node:path";
+import { Agent, type AgentTool, validateAgentToolArguments } from "@oh-my-pi/pi-agent-core";
+import { Effort } from "@oh-my-pi/pi-ai";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
+import { getSupportedEfforts } from "@oh-my-pi/pi-catalog/model-thinking";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
+import * as autoThinkingClassifier from "@oh-my-pi/pi-coding-agent/auto-thinking/classifier";
+import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
+import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TaskTool } from "@oh-my-pi/pi-coding-agent/task";
 import * as discoveryModule from "@oh-my-pi/pi-coding-agent/task/discovery";
 import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
+import { loadBundledAgents } from "@oh-my-pi/pi-coding-agent/task/agents";
 import type { SingleResult, TaskParams } from "@oh-my-pi/pi-tui/tools/task";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
-import { isRecord } from "@oh-my-pi/pi-utils";
+import { AUTO_THINKING, type ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
+import { isRecord, TempDir } from "@oh-my-pi/pi-utils";
+import { createInMemoryAuthStorage } from "../helpers/agent-session-setup";
 
 import { cfgTaskEnableEffort } from "@oh-my-pi/pi-coding-agent/task/settings";
 
@@ -144,20 +158,16 @@ describe("task.batch schema gating", () => {
 		const flatSession = createSession({ settings: { "task.batch": false } });
 		const flat = await TaskTool.create(flatSession);
 		expect(getSchemaProperties(flat).effort).toBeUndefined();
-		expect(flat.description).not.toContain("`effort`");
 
 		cfgTaskEnableEffort.override(flatSession.settings, true);
 		expect(getSchemaProperties(flat).effort).toBeDefined();
-		expect(flat.description).toContain("`effort`");
 
 		const batchSession = createSession({ settings: { "task.batch": true } });
 		const batch = await TaskTool.create(batchSession);
 		expect(getBatchItemProperties(batch).effort).toBeUndefined();
-		expect(batch.description).not.toContain("`effort`");
 
 		cfgTaskEnableEffort.override(batchSession.settings, true);
 		expect(getBatchItemProperties(batch).effort).toBeDefined();
-		expect(batch.description).toContain("`effort`");
 	});
 
 	it("keeps isolation boolean-only in the batch item schema", async () => {
@@ -187,7 +197,6 @@ describe("task.batch schema gating", () => {
 		);
 		const itemProperties = getBatchItemProperties(tool);
 		expect(itemProperties.isolated).toBeUndefined();
-		expect(tool.description).not.toContain("`isolated`");
 	});
 
 	it("exposes outputSchema but never the stale schema field", async () => {
@@ -226,6 +235,17 @@ describe("task.batch validation", () => {
 		return getFirstText(result);
 	}
 
+	it("reports missing tasks as a failed tool result instead of a successful refusal", async () => {
+		mockDiscovery();
+		const tool = await TaskTool.create(createSession({ settings: { "task.batch": true } }));
+		const result = await tool.execute("missing-tasks", {
+			context: "<tasks><task>Inspect the project</task></tasks>",
+		});
+
+		expect(getFirstText(result)).toContain("Missing `tasks`");
+		expect(result.isError).toBe(true);
+	});
+
 	it("rejects the stale schema argument regardless of batch mode", async () => {
 		for (const batch of [false, true]) {
 			const text = await executeText(
@@ -248,6 +268,19 @@ describe("task.batch validation", () => {
 	it("rejects top-level task in the batch shape", async () => {
 		const text = await executeText({ task: "Work.", tasks: [{ task: "Other." }] }, { "task.batch": true });
 		expect(text).toContain("not part of the batch shape");
+	});
+
+	it("rejects a misplaced specialist before spawning any agent", async () => {
+		mockDiscovery();
+		const run = vi.spyOn(executorModule, "runSubprocess");
+		const tool = await TaskTool.create(createSession({ settings: { "task.batch": true, "async.enabled": false } }));
+		const result = await tool.execute("misplaced-specialist", {
+			context: "Inspect changes without edits",
+			agent: "custom-auditor",
+			tasks: [{ task: "Inspect the patch" }],
+		});
+		expect(getFirstText(result)).toContain("tasks[].agent");
+		expect(run).not.toHaveBeenCalled();
 	});
 
 	it("rejects empty task arrays and items without tasks", async () => {
@@ -274,26 +307,6 @@ describe("task.batch validation", () => {
 			{ "task.batch": true },
 		);
 		expect(text).toContain("Duplicate task name");
-	});
-
-	it("marks lenientArgValidation so execute() surfaces the actionable shape error", async () => {
-		// Regression (#6039): the flat single-spawn wire schema carries
-		// `"+": "delete"`, so a batch `{ context, tasks[] }` payload is stripped
-		// by arktype and rejected as `task must be a string (was missing)` in the
-		// agent loop — preempting the tool's own actionable message. The lenient
-		// flag makes the loop forward the raw args to execute() on that failure.
-		mockDiscovery();
-		const tool = await TaskTool.create(createSession({ settings: { "task.batch": false } }));
-		expect(tool.lenientArgValidation).toBe(true);
-
-		// The raw batch payload the loop would forward reaches execute() and
-		// yields the actionable reason, never arktype's misleading missing-`task`.
-		const text = await executeText(
-			{ context: "Background.", tasks: [{ name: "Alpha", task: "Work." }] },
-			{ "task.batch": false },
-		);
-		expect(text).toContain("task.batch is disabled");
-		expect(text).not.toContain("was missing");
 	});
 
 	it("advertises solutionSpace as required but still spawns a model call that omits it", async () => {
@@ -337,6 +350,82 @@ describe("task.batch validation", () => {
 		const toolResult = agent.state.messages.find(message => message.role === "toolResult");
 		expect(toolResult?.role === "toolResult" && toolResult.isError).toBe(false);
 	});
+
+	// The agent loop validates arguments against the wire schema before execute(),
+	// and that schema deletes undeclared keys. With per-call model off, `model` and
+	// `sourceSession` on an ordinary agent must still be refused by every call form
+	// instead of being dropped, leaving the child on its own model while the caller
+	// believes it pinned another.
+	// `task.structured` and `task.isolation.enabled` choose between the prebuilt and
+	// generated batch schemas, each with and without `isolated`.
+	it.each([
+		{ form: "batch", seance: "hidden", batch: true, structured: false, isolation: false, field: "model" },
+		{ form: "batch", seance: "hidden", batch: true, structured: true, isolation: false, field: "model" },
+		{ form: "batch", seance: "hidden", batch: true, structured: false, isolation: true, field: "model" },
+		{ form: "batch", seance: "hidden", batch: true, structured: true, isolation: true, field: "model" },
+		{ form: "batch", seance: "hidden", batch: true, structured: false, isolation: false, field: "sourceSession" },
+		{ form: "batch", seance: "hidden", batch: true, structured: true, isolation: false, field: "sourceSession" },
+		{ form: "batch", seance: "hidden", batch: true, structured: false, isolation: true, field: "sourceSession" },
+		{ form: "batch", seance: "hidden", batch: true, structured: true, isolation: true, field: "sourceSession" },
+		{ form: "batch", seance: "advertised", batch: true, structured: false, isolation: false, field: "model" },
+		{ form: "flat", seance: "hidden", batch: false, structured: false, isolation: false, field: "model" },
+	])(
+		"refuses $field on an ordinary agent in the $form form with seance $seance (structured: $structured, isolation: $isolation)",
+		async ({ seance, batch, structured, isolation, field }) => {
+			const bundledSeance = loadBundledAgents().find(agent => agent.name === "seance")!;
+			mockDiscovery(seance === "advertised" ? [taskAgent, bundledSeance] : taskAgent);
+			const run = vi
+				.spyOn(executorModule, "runSubprocess")
+				.mockImplementation(async options => makeResult(options.id ?? "?"));
+			const tool = await TaskTool.create(
+				createSession({
+					settings: {
+						"async.enabled": false,
+						"task.batch": batch,
+						"task.structured": structured,
+						"task.isolation.enabled": isolation,
+					},
+				}),
+			);
+			const item = { name: "Alpha", agent: "task", task: "Do A.", solutionSpace: "c", [field]: "stub/model-b" };
+			const mock = createMockModel({
+				responses: [
+					{
+						content: [
+							{
+								type: "toolCall",
+								id: "tc-model-pin",
+								name: "task",
+								arguments: batch ? { context: "# Goal\nX", tasks: [item] } : item,
+							},
+						],
+					},
+					{ content: ["done"] },
+				],
+			});
+			const agent = new Agent({
+				initialState: {
+					model: mock.model,
+					systemPrompt: ["Test"],
+					tools: [tool as unknown as AgentTool],
+					messages: [],
+				},
+				streamFn: mock.stream,
+			});
+			await agent.prompt("go");
+
+			const toolResult = agent.state.messages.find(message => message.role === "toolResult");
+			const text = toolResult?.role === "toolResult" ? getFirstText(toolResult) : "";
+			// `model` doubles as the per-call selector, whose disabled gate is reported first.
+			expect(text).toContain(
+				field === "model"
+					? "Per-call model is disabled for task calls (task.perCallModel: off)."
+					: `\`${field}\` is only accepted for the \`seance\` agent.`,
+			);
+			expect(toolResult?.role === "toolResult" && toolResult.isError).toBe(true);
+			expect(run).not.toHaveBeenCalled();
+		},
+	);
 });
 
 describe("task.batch spawning", () => {
@@ -649,6 +738,161 @@ describe("task.batch spawning", () => {
 		]);
 	});
 
+	it.each([
+		[false, false],
+		[false, true],
+		[true, false],
+		[true, true],
+	] as const)(
+		"selects real child thinking with batch=%s and enableEffort=%s",
+		async (batch, enableEffort) => {
+			using directory = TempDir.createSync("@omp-task-effort-");
+			const authStorage = createInMemoryAuthStorage();
+			const sessions: AgentSession[] = [];
+			const createAgentSession = sdkModule.createAgentSession;
+			vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("Network is disabled in task effort tests"));
+			vi.spyOn(autoThinkingClassifier, "classifyDifficulty").mockResolvedValue(Effort.Medium);
+			try {
+				const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+				if (!model) throw new Error("Expected bundled task effort model");
+				const lowestEffort = getSupportedEfforts(model)[0];
+				authStorage.keys.setRuntime("anthropic", "synthetic-task-effort-key");
+				const source = authStorage.keys.source.bind(authStorage.keys);
+				vi.spyOn(authStorage.keys, "source").mockImplementation((provider, options) =>
+					provider === "anthropic" ? source(provider, options) : undefined,
+				);
+				const modelRegistry = new ModelRegistry(authStorage, directory.join("models.yml"));
+				const modelSelector = `${model.provider}/${model.id}`;
+				mockDiscovery([
+					{ ...taskAgent, tools: [], thinkingLevel: Effort.Medium },
+					{ ...taskAgent, name: "automatic", tools: [], thinkingLevel: AUTO_THINKING },
+					{ ...taskAgent, name: "model-thinking", tools: [], model: [`${modelSelector}:low`] },
+				]);
+				const parent = await createAgentSession({
+					cwd: directory.path(),
+					agentDir: directory.path(),
+					hasUI: false,
+					agentId: `${path.basename(directory.path())}-parent`,
+					authStorage,
+					modelRegistry,
+					model,
+					settings: Settings.isolated({
+						"async.enabled": false,
+						"task.batch": batch,
+						"task.enableEffort": enableEffort,
+						"task.maxEffort": Effort.High,
+						"task.structured": false,
+						"task.isolation.enabled": false,
+						"task.enableLsp": false,
+						"memory.backend": "off",
+						"compaction.enabled": false,
+						"retry.enabled": false,
+						"todo.enabled": false,
+						"advisor.enabled": false,
+						modelRoles: { default: modelSelector, task: modelSelector, smol: modelSelector },
+					}),
+					sessionManager: SessionManager.inMemory(directory.path()),
+					toolNames: ["task"],
+					spawns: "*",
+					contextFiles: [],
+					skills: [],
+					rules: [],
+					promptTemplates: [],
+					slashCommands: [],
+					disableExtensionDiscovery: true,
+					enableMCP: false,
+					enableLsp: false,
+					enableIrc: false,
+					skipPythonPreflight: true,
+					cacheWarming: false,
+				});
+				sessions.push(parent.session);
+				const observed = new Map<
+					string,
+					{
+						configured: ConfiguredThinkingLevel | undefined;
+						effective: AgentSession["thinkingLevel"];
+						reasoning: Effort | undefined;
+					}
+				>();
+				vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
+					const child = await createAgentSession({
+						...options,
+						agentDir: directory.path(),
+						slashCommands: [],
+						disableExtensionDiscovery: true,
+						skipPythonPreflight: true,
+					});
+					sessions.push(child.session);
+					const transport = createMockModel({ handler: { content: ["synthetic task complete"] } });
+					child.session.agent.streamFn = (requestModel, context, streamOptions) => {
+						const id = child.session.getAgentId();
+						if (!id) throw new Error("Child session has no agent identity");
+						observed.set(id, {
+							configured: child.session.configuredThinkingLevel(),
+							effective: child.session.thinkingLevel,
+							reasoning: streamOptions?.reasoning,
+						});
+						return transport.stream(requestModel, context, streamOptions);
+					};
+					return child;
+				});
+				const tool = parent.session.getToolByName("task") as TaskTool | undefined;
+				if (!tool) throw new Error("Parent task tool is unavailable");
+				const items = [
+					{ name: "Fixed", task: "Return the synthetic report.", effort: "hi" as const },
+					{ name: "Auto", agent: "automatic", task: "Return the synthetic report.", effort: "lo" as const },
+					{
+						name: "Model",
+						agent: "model-thinking",
+						task: "Return the synthetic report.",
+						effort: "hi" as const,
+					},
+					{ name: "Default", task: "Return the synthetic report." },
+				].map(item => ({ ...item, solutionSpace: "One fixed synthetic report." }));
+				const results: SingleResult[] = [];
+				if (batch) {
+					const result = await tool.execute("effort-batch", {
+						context: "Independent synthetic reports.",
+						effort: "hi",
+						tasks: items,
+					} as TaskParams);
+					expect(result.isError, getFirstText(result)).not.toBe(true);
+					results.push(...(result.details?.results ?? []));
+				} else {
+					for (const item of items) {
+						const result = await tool.execute(`effort-${item.name}`, item);
+						expect(result.isError, getFirstText(result)).not.toBe(true);
+						results.push(...(result.details?.results ?? []));
+					}
+				}
+				expect(results.map(result => [result.id, result.exitCode, result.output]).sort()).toEqual(
+					items.map(item => [item.name, 0, "synthetic task complete"]).sort(),
+				);
+				const fixed = enableEffort ? Effort.High : Effort.Medium;
+				const automatic = enableEffort ? lowestEffort : Effort.Medium;
+				const selectedModel = enableEffort ? Effort.High : Effort.Low;
+				expect(Object.fromEntries(observed)).toEqual({
+					Fixed: { configured: fixed, effective: fixed, reasoning: fixed },
+					Auto: {
+						configured: enableEffort ? lowestEffort : AUTO_THINKING,
+						effective: automatic,
+						reasoning: automatic,
+					},
+					Model: { configured: selectedModel, effective: selectedModel, reasoning: selectedModel },
+					Default: { configured: Effort.Medium, effective: Effort.Medium, reasoning: Effort.Medium },
+				});
+			} finally {
+				try {
+					await Promise.all(sessions.map(session => session.dispose()));
+				} finally {
+					await authStorage.close();
+				}
+			}
+		},
+		20_000,
+	);
+
 	it("keeps a long result inline when no readable output artifact exists", async () => {
 		mockDiscovery();
 		const fullOutput = `REPORT:${"x".repeat(6_000)}:END`;
@@ -739,4 +983,50 @@ describe("task.batch spawning", () => {
 		expect(last?.progress?.find(p => p.id === "Second")?.status).toBe("aborted");
 		expect(last?.progress?.find(p => p.id === "First")?.status).toBe("completed");
 	});
+});
+
+describe("batch model placement", () => {
+	afterEach(() => vi.restoreAllMocks());
+	it("rejects a top-level model before dispatch even when wire validation is bypassed", async () => {
+		mockDiscovery();
+		const run = vi.spyOn(executorModule, "runSubprocess").mockResolvedValue(makeResult("Unexpected"));
+		const tool = await TaskTool.create(createSession({ settings: { "task.batch": true, "async.enabled": false } }));
+		const result = await tool.execute("batch-model", {
+			context: "Shared context",
+			model: "p/requested",
+			tasks: [{ task: "Do work" }],
+		});
+		expect(getFirstText(result)).toMatch(/model.*tasks|model.*item/i);
+		expect(result.isError).toBe(true);
+		expect(run).not.toHaveBeenCalled();
+	});
+
+	// `off` and `eval` refuse task calls through the same gate; one mode per shape covers it.
+	it.each([
+		["off", "batch"],
+		["eval", "flat"],
+	] as const)(
+		"rejects a task call's model before dispatch while task.perCallModel is %s (%s call)",
+		async (mode, shape) => {
+			const batch = shape === "batch";
+			mockDiscovery();
+			const run = vi.spyOn(executorModule, "runSubprocess").mockResolvedValue(makeResult("Unexpected"));
+			const tool = await TaskTool.create(
+				createSession({ settings: { "task.batch": batch, "async.enabled": false, "task.perCallModel": mode } }),
+			);
+			// A role alias is not an exact selector, but the disabled gate is what the caller must hear first.
+			const work = { task: "Do work", solutionSpace: "c", model: "@smol" };
+			// Through shared argument validation, as a model's tool call arrives: `model` must reach preflight in both shapes.
+			const args = validateAgentToolArguments(tool as unknown as AgentTool, {
+				type: "toolCall",
+				id: "task-model",
+				name: tool.name,
+				arguments: batch ? { context: "Shared context", tasks: [work] } : work,
+			});
+			const result = await tool.execute("task-model", args as TaskParams);
+			expect(getFirstText(result)).toMatch(/per-call model is disabled/i);
+			expect(result.isError).toBe(true);
+			expect(run).not.toHaveBeenCalled();
+		},
+	);
 });

@@ -73,8 +73,8 @@ describe("AgentSession mid-run threshold compaction", () => {
 		sharedModelRegistry = new ModelRegistry(sharedAuthStorage, path.join(sharedDir.path(), "models.yml"));
 	});
 
-	afterAll(() => {
-		sharedAuthStorage.close();
+	afterAll(async () => {
+		await sharedAuthStorage.close();
 		sharedDir.removeSync();
 	});
 

@@ -176,6 +176,60 @@ describe("SessionAnonymizer", () => {
 		expect(at(result, "message", "details")).toEqual({ wallTimeNoticeEmitted: false });
 	});
 
+	test("keeps historical eval display metadata opaque without trusting embedded tool shapes", () => {
+		const anonymizer = new SessionAnonymizer();
+		const result = anonymizer.entry({
+			type: "message",
+			message: {
+				role: "toolResult",
+				toolName: "eval",
+				details: {
+					jsonOutputs: [
+						{
+							"/home/alice/acme/private.ts": 123456789,
+							name: "grep",
+							arguments: { status: "customer-acme", path: "/home/alice/acme/private.ts" },
+						},
+					],
+					cells: [
+						{
+							index: 0,
+							output: "display[1]: customer-acme",
+							textOutput: "customer-acme",
+							status: "complete",
+						},
+					],
+				},
+			},
+		});
+		const details = at(result, "message", "details");
+		const opaqueKey = anonymizer.placeholder("jsonOutputs");
+		expect(at(details, opaqueKey)).toMatch(/^\[redacted #\d+: \d+ chars, 1 line\]$/);
+		expect(at(details, "cells", 0, "output")).toMatch(/^\[redacted #\d+:/);
+		const serialized = JSON.stringify(result);
+		for (const secret of ["alice", "acme", "123456789", "private.ts"]) {
+			expect(serialized).not.toContain(secret);
+		}
+		expect(serialized).not.toContain('"name":"grep"');
+		expect(serialized).not.toContain('"status":"customer-acme"');
+	});
+
+	test.each([null, "high"])("preserves per-call revival metadata with %s thinking", perCallThinkingLevel => {
+		const anonymizer = new SessionAnonymizer();
+		const metadata = {
+			type: "session_init",
+			perCallModel: true,
+			perCallModelIdentity: "openrouter/anthropic/claude-sonnet-4-5@anthropic",
+			perCallThinkingLevel,
+		};
+
+		expect(anonymizer.entry(metadata)).toEqual(metadata);
+		expect(anonymizer.entry({ type: "session_init", perCallModel: false })).toEqual({
+			type: "session_init",
+			perCallModel: false,
+		});
+	});
+
 	test("rewrites shell commands keeping programs, flags, and operators", () => {
 		const anonymizer = new SessionAnonymizer();
 		const out = anonymizer.command(
@@ -219,14 +273,26 @@ describe("SessionAnonymizer", () => {
 					role: "toolResult",
 					toolName: "eval",
 					details: {
-						jsonOutputs: {
-							"/home/alice/acme/x.ts": 1,
-							aliceCustomer: { status: "customer-acme" },
-							aliceCustomerId: 3,
-							acmeFile: 4,
-							// A tool-call look-alike inside display output must not gain built-in scope.
-							forged: { name: "grep", arguments: { status: "customer-acme" } },
-						},
+						cells: [
+							{
+								views: [
+									{
+										text: "aliceCustomer",
+										view: {
+											kind: "json",
+											value: {
+												"/home/alice/acme/x.ts": 1,
+												aliceCustomer: { status: "customer-acme" },
+												aliceCustomerId: 3,
+												acmeFile: 4,
+												// A tool-call look-alike inside printed output must not gain built-in scope.
+												forged: { name: "grep", arguments: { status: "customer-acme" } },
+											},
+										},
+									},
+								],
+							},
+						],
 					},
 				},
 			}),
@@ -266,7 +332,7 @@ describe("SessionAnonymizer", () => {
 		expect(json).toContain('"op":"start"');
 		expect(json).not.toContain('"status"');
 		expect(json).toMatch(/"arguments":"\[redacted #\d+: \d+ chars, 1 line\]"/);
-		expect(json).toMatch(/"jsonOutputs":"\[redacted #\d+/);
+		expect(json).toMatch(/"views":"\[redacted #\d+/);
 		expect(json).toMatch(/"data":"\[redacted #\d+/);
 		expect(json).toMatch(/"preserveData":"\[redacted #\d+/);
 		// A dotted task name and its agent:// URI share one token index.
@@ -391,13 +457,18 @@ describe("SessionAnonymizer", () => {
 					toolCallId: "toolu_01abcdef",
 					toolName: "mcp__crm_lookup",
 					details: 987654321,
-					content: [{ type: "image", data: "AAAA", mimeType: "image/png", status: "customer-acme" }],
+					content: [
+						{ type: "image", data: "AAAA", mimeType: "image/png", status: "customer-acme" },
+						{ type: "acmeBlock", text: "s" },
+					],
 				},
 			}),
 			// Usage counters stay even though `input` is also the tool-call arguments key.
 			anonymizer.entry({ type: "message", message: { role: "assistant", usage: { input: 120, output: 30 } } }),
 		]);
 		for (const secret of ["123456789", "987654321", "acme", "status"]) expect(json).not.toContain(secret);
+		// Replay tells text from image blocks by `type`; an unknown block type stays opaque.
+		expect(json).toContain('{"type":"image",');
 		expect(json).toContain('"mimeType":"image/png"');
 		expect(json).toContain('"usage":{"input":120,"output":30}');
 	});
@@ -446,5 +517,36 @@ describe("SessionAnonymizer", () => {
 		expect(json).not.toContain("account_12345");
 		expect(json).toContain('"op":"start"');
 		expect(json).toContain('"progress":[{"status":"completed","tokens":12}]');
+	});
+
+	test("keeps the build version and commit of a runtime stamp and tokenizes the rest consistently", () => {
+		const anonymizer = new SessionAnonymizer();
+		const runtime = {
+			version: "18.10.4",
+			commit: "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+			branch: "alice/acme-billing",
+			diff: "3f2a9c0112345678",
+			label: "customer-acme",
+		};
+		const [first, second] = [
+			anonymizer.entry({ type: "message", runtime }),
+			anonymizer.entry({ type: "label", runtime }),
+		];
+		expect(at(first, "runtime", "version")).toBe("18.10.4");
+		expect(at(first, "runtime", "commit")).toBe(runtime.commit);
+		expect(JSON.stringify(first)).not.toMatch(/acme|3f2a9c01/);
+		// Equal stamps stay comparable after anonymization, so build changes remain visible.
+		expect(at(second, "runtime")).toEqual(at(first, "runtime"));
+	});
+
+	test("keeps an edit's error kind and replaces a value outside the engine's kinds", () => {
+		const anonymizer = new SessionAnonymizer();
+		const result = (errorKind: string) =>
+			anonymizer.entry({
+				type: "message",
+				message: { role: "toolResult", toolName: "edit", isError: true, details: { diff: "", errorKind } },
+			});
+		expect(at(result("unseen_lines"), "message", "details", "errorKind")).toBe("unseen_lines");
+		expect(JSON.stringify(result("customer-acme"))).not.toContain("acme");
 	});
 });

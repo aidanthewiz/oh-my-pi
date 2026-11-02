@@ -4,7 +4,6 @@ import { getEnvApiKey } from "../env-api-key";
 import * as AIError from "../error";
 import type { OAuthCredentials } from "../registry/oauth/types";
 import type { Provider } from "../types";
-import { resolveUsedFraction } from "../usage";
 import type {
 	ClientUsageReport,
 	ClientUsageSummary,
@@ -18,11 +17,20 @@ import type {
 	UsageProvider,
 	UsageReport,
 } from "../usage";
+import { resolveUsedFraction } from "../usage";
+import type { RankingStrategyResolver } from "../usage/registry";
 import { DEFAULT_USAGE_PROVIDERS } from "../usage/registry";
 import { raceSignal } from "./abort";
 import type { SessionAffinity } from "./affinity";
 import type { CredentialBlocks } from "./blocks";
 import type { KeyOverrides } from "./cascade";
+import type { CredentialPool } from "./pool";
+import type { OAuthRefresher } from "./refresh";
+import { mergeRefreshedOrganizationScope, OAUTH_REFRESH_SKEW_MS } from "./refresh";
+import { USAGE_REPORT_TTL_MS } from "./sqlite-credential-store";
+import type { AuthCredentialStore } from "./store";
+import type { AuthCredential, OAuthCredential, ObservedUsageInput, UsageApi } from "./types";
+import type { UsageCache, UsageRequestDescriptor } from "./usage-cache";
 import {
 	buildUsageCredential,
 	oauthUsageRequest,
@@ -31,14 +39,6 @@ import {
 	usageCacheIdentity,
 	usageRequest,
 } from "./usage-cache";
-import type { UsageCache, UsageRequestDescriptor } from "./usage-cache";
-import type { CredentialPool } from "./pool";
-import type { RankingStrategyResolver } from "../usage/registry";
-import { mergeRefreshedOrganizationScope, OAUTH_REFRESH_SKEW_MS } from "./refresh";
-import type { OAuthRefresher } from "./refresh";
-import { USAGE_REPORT_TTL_MS } from "./sqlite-credential-store";
-import type { AuthCredentialStore } from "./store";
-import type { AuthCredential, OAuthCredential, ObservedUsageInput, UsageApi } from "./types";
 import {
 	dedupeUsageReports,
 	isUsageLimitExhausted,
@@ -106,6 +106,7 @@ export interface UsageServiceDeps {
 }
 
 type UsageReportsOptions = {
+	provider?: Provider;
 	baseUrlResolver?: (provider: Provider) => string | undefined;
 	signal?: AbortSignal;
 };
@@ -231,6 +232,7 @@ export class UsageService implements UsageApi {
 						refreshableCredential,
 						refreshableCredentialId,
 						timeoutSignal,
+						"usage-probe",
 					);
 					const refreshedCredential = mergeRefreshedUsageCredential(request.credential, refreshed);
 					this.persistRefreshedCredential(
@@ -334,7 +336,7 @@ export class UsageService implements UsageApi {
 
 		const failure = this.#deps.cache.get<null>(failureKey);
 		if (failure && failure.expiresAt > now) {
-			return this.#deps.cache.getStale<UsageReport | null>(cacheKey)?.value ?? null;
+			return this.#deps.cache.lastGood(cacheKey);
 		}
 
 		// Invalidation must not fork an already-running credential probe. Share it;
@@ -350,52 +352,59 @@ export class UsageService implements UsageApi {
 		const usageCacheEpoch = this.#deps.cache.epoch;
 		const refreshEpoch = this.#deps.cache.refreshEpoch(request.provider);
 		const recoveryEpoch = this.#deps.cache.recoveryEpoch(request.provider);
-		const promise = (async () => {
-			const report = await this.#fetchUsageUncached(request, timeoutMs);
-			// Block marks bump the generation too: a report racing a fresh 429 may
-			// predate it, so it answers this probe but is neither cached nor used
-			// to heal blocks.
-			const invalidated = usageCacheEpoch !== this.#deps.cache.epoch;
-			if (report !== null) {
-				if (invalidated) return report;
-				this.#deps.blocks.reconcileRequest(request, report);
-				const ttlJitter = USAGE_REPORT_TTL_MS * (Math.random() * 0.5 - 0.25);
-				// Success: stagger per-credential cache expiry so all accounts don't
-				// refresh in the same window — Anthropic / OpenAI rate-limit `/usage`
-				// per source IP regardless of account, and synchronized 5-credential
-				// fan-out trips 429s every cycle. With ±25% jitter on TTL the refresh
-				// times decorrelate within a few cycles.
-				this.#deps.cache.set(cacheKey, {
-					value: report,
-					expiresAt: Date.now() + USAGE_REPORT_TTL_MS + ttlJitter,
-				});
-				this.#recordUsageHistory(request, report);
-				return report;
-			}
-			// Failure: apply a short jittered cool-down so the credential doesn't
-			// re-hit the endpoint on every poll. Most providers serve the last good
-			// value through transient failures. Session-cookie providers can opt out
-			// so an expired login does not display stale quota indefinitely.
-			const providerImpl = this.providerFor(request.provider);
-			const retainLastGood = !invalidated && providerImpl?.retainLastGoodOnFailure !== false;
-			const lastGood = retainLastGood
-				? (this.#deps.cache.getStale<UsageReport | null>(cacheKey)?.value ?? null)
-				: null;
-			const failureBackoffMs = providerImpl?.failureBackoffMs ?? USAGE_FAILURE_BACKOFF_MS;
-			const backoffJitter = failureBackoffMs * (Math.random() * 0.5 - 0.25);
-			const coolDown = Date.now() + failureBackoffMs + backoffJitter;
-			// Dropping snapshots is not recovery from a failed endpoint. Persist its
-			// cooldown even if a manual refresh or block update raced this probe.
-			// A confirmed reset is the exception: the old failure cannot suppress
-			// the first post-reset probe.
-			if (recoveryEpoch === this.#deps.cache.recoveryEpoch(request.provider)) {
-				this.#deps.cache.set(failureKey, { value: null, expiresAt: coolDown });
-			}
-			if (!invalidated) this.#deps.cache.set(cacheKey, { value: lastGood, expiresAt: coolDown });
-			return lastGood;
-		})().finally(() => {
-			this.#usageRequestInFlight.delete(cacheKey);
-		});
+		const promise = this.#deps.refresher
+			.runWithLifetime(async () => {
+				const report = await this.#fetchUsageUncached(request, timeoutMs);
+				// Block marks bump the generation too: a report racing a fresh 429 may
+				// predate it, so it answers this probe but is neither cached nor used
+				// to heal blocks.
+				const invalidated = usageCacheEpoch !== this.#deps.cache.epoch;
+				if (report !== null) {
+					if (invalidated) return report;
+					this.#deps.blocks.reconcileRequest(request, report);
+					const ttlJitter = USAGE_REPORT_TTL_MS * (Math.random() * 0.5 - 0.25);
+					// Success: stagger per-credential cache expiry so all accounts don't
+					// refresh in the same window — Anthropic / OpenAI rate-limit `/usage`
+					// per source IP regardless of account, and synchronized 5-credential
+					// fan-out trips 429s every cycle. With ±25% jitter on TTL the refresh
+					// times decorrelate within a few cycles.
+					this.#deps.cache.set(cacheKey, {
+						value: report,
+						expiresAt: Date.now() + USAGE_REPORT_TTL_MS + ttlJitter,
+					});
+					this.#recordUsageHistory(request, report);
+					return report;
+				}
+				// Failure: apply a short jittered cool-down so the credential doesn't
+				// re-hit the endpoint on every poll. Most providers serve the last good
+				// value through transient failures. Session-cookie providers can opt out
+				// so an expired login does not display stale quota indefinitely.
+				const providerImpl = this.providerFor(request.provider);
+				const retainLastGood = !invalidated && providerImpl?.retainLastGoodOnFailure !== false;
+				const lastGood = retainLastGood ? this.#deps.cache.lastGood(cacheKey) : null;
+				const failureBackoffMs = providerImpl?.failureBackoffMs ?? USAGE_FAILURE_BACKOFF_MS;
+				const backoffJitter = failureBackoffMs * (Math.random() * 0.5 - 0.25);
+				const coolDown = Date.now() + failureBackoffMs + backoffJitter;
+				// Dropping snapshots is not recovery from a failed endpoint. Persist its
+				// cooldown even if a manual refresh or block update raced this probe.
+				// A confirmed reset is the exception: the old failure cannot suppress
+				// the first post-reset probe.
+				if (recoveryEpoch === this.#deps.cache.recoveryEpoch(request.provider)) {
+					this.#deps.cache.set(failureKey, {
+						value: null,
+						expiresAt: coolDown,
+					});
+				}
+				if (!invalidated)
+					this.#deps.cache.set(cacheKey, {
+						value: lastGood,
+						expiresAt: coolDown,
+					});
+				return lastGood;
+			})
+			.finally(() => {
+				this.#usageRequestInFlight.delete(cacheKey);
+			});
 
 		this.#usageRequestInFlight.set(cacheKey, { refreshEpoch, promise });
 		const report = await promise;
@@ -510,7 +519,9 @@ export class UsageService implements UsageApi {
 
 		const cacheKey = this.#deps.cache.reportKey(oauthUsageRequest(provider, credential, options?.baseUrl));
 		const now = Date.now();
-		const parsedReport = parseHeaders(headers, now, { responseStatus: options?.responseStatus });
+		const parsedReport = parseHeaders(headers, now, {
+			responseStatus: options?.responseStatus,
+		});
 		if (!parsedReport) return false;
 		// Throttled to one ingest per interval — except when a window reads
 		// exhausted: persist that snapshot immediately. A full-backed cache can
@@ -768,17 +779,22 @@ export class UsageService implements UsageApi {
 			// dispatch + credential selection) coalesce into one upstream call.
 			// Each caller's `signal` only cancels THAT caller's await; the
 			// shared upstream fetch runs to completion so peers aren't punished.
-			const overrideKey = `__override__\0${this.#deps.cache.epoch}`;
+			const scope = options?.provider === undefined ? "*" : `provider:${options.provider}`;
+			const overrideKey = `__override__\0${this.#deps.cache.epoch}\0${scope}`;
 			let shared = this.#usageReportsInFlight.get(overrideKey);
 			if (!shared) {
 				// Don't forward the caller signal into the shared fetch — first caller's
 				// abort would otherwise cancel the upstream for every peer.
-				shared = storeOverride().finally(() => {
+				shared = storeOverride(undefined, options?.provider).finally(() => {
 					this.#usageReportsInFlight.delete(overrideKey);
 				});
 				this.#usageReportsInFlight.set(overrideKey, shared);
 			}
-			const reports = await raceSignal(shared, options?.signal, "usage fetch aborted");
+			const fetched = await raceSignal(shared, options?.signal, "usage fetch aborted");
+			const reports =
+				fetched && options?.provider !== undefined
+					? fetched.filter(report => report.provider === options.provider)
+					: fetched;
 			if (reports) this.#deps.blocks.reconcileReports(reports);
 			if (!reports || this.#runtimeUsageProviderOverrides.size === 0) return reports;
 
@@ -787,13 +803,17 @@ export class UsageService implements UsageApi {
 			const brokerProviders = new Set(reports.map(report => report.provider));
 			const localProviders = new Set<Provider>();
 			for (const provider of this.#runtimeUsageProviderOverrides.keys()) {
+				if (options?.provider !== undefined && provider !== options.provider) continue;
 				if (!brokerProviders.has(provider)) localProviders.add(provider);
 			}
 			if (localProviders.size === 0) return reports;
 			const localReports = await this.#fetchLocalReports(options, localProviders);
 			return localReports?.length ? [...reports, ...localReports] : reports;
 		}
-		return this.#fetchLocalReports(options);
+		return this.#fetchLocalReports(
+			options,
+			options?.provider !== undefined ? new Set([options.provider]) : undefined,
+		);
 	}
 
 	/** Probe only the selected providers locally, preserving per-credential caching and cooldowns. */

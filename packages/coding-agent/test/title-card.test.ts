@@ -65,6 +65,23 @@ describe("portable session cards", () => {
 		expect(parseCardTitleReply("<title>Fix: the parser</title>")).toEqual({ title: "Fix: the parser" });
 	});
 
+	it("recovers an attributed leading code without removing ordinary title words", () => {
+		expect(parseCardTitleReply('<title emoji="⏳">WAIT Observe agent waits</title>')).toEqual({
+			title: "Observe agent waits",
+			card: { code: "WAIT", emoji: "⏳" },
+		});
+		expect(parseCardTitleReply("<title>CI pipeline fails on arm64</title>")).toEqual({
+			title: "CI pipeline fails on arm64",
+		});
+		expect(parseCardTitleReply('<title emoji="📝">A new parser for imports</title>')).toEqual({
+			title: "A new parser for imports",
+		});
+		expect(parseCardTitleReply('<title emoji="⏳" code="KEEP">WAIT Observe agent waits</title>')).toEqual({
+			title: "WAIT Observe agent waits",
+			card: { code: "KEEP", emoji: "⏳" },
+		});
+	});
+
 	it("reconciles generated casing and rejects declined or invalid titles", () => {
 		expect(
 			parseCardTitleReply('<title emoji="🦀" code="VMM">Port tinyvmm to arm64</title>', "port TinyVMM to arm64"),

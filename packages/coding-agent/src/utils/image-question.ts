@@ -104,14 +104,16 @@ export async function askImageQuestion(
 	}
 
 	const { model, selectedPattern } = resolved;
-	const apiKey = await modelRegistry.getApiKey(model);
-	if (!apiKey) {
-		throw new ToolError(
-			`No API key available for ${model.provider}/${model.id}. Configure credentials for this provider or choose another vision-capable model.`,
-		);
-	}
-
-	const telemetry = resolveTelemetry(session.getTelemetry?.(), session.getSessionId?.() ?? undefined);
+	const sessionId = session.getSessionId?.() ?? undefined;
+	const credentialSessionId = session.getCredentialSourceSessionId?.() ?? sessionId;
+	const isCurrent = session.captureOwnerCurrent?.() ?? (() => session.isDisposed?.() !== true);
+	const costGate = session.costGate;
+	const manager = session.sessionManager;
+	const usageOwner =
+		manager?.getSessionId && manager.getLeafId
+			? { sessionId: manager.getSessionId(), parentId: manager.getLeafId() }
+			: undefined;
+	const telemetry = resolveTelemetry(session.getTelemetry?.(), sessionId);
 	const timeoutMs = cfgImagesQuestionTimeoutMs.get(session.settings);
 	const hasTimeout = typeof timeoutMs === "number" && Number.isFinite(timeoutMs) && timeoutMs > 0;
 	const timeoutSignal = hasTimeout ? AbortSignal.timeout(timeoutMs) : undefined;
@@ -121,6 +123,12 @@ export async function askImageQuestion(
 		const seconds = timeoutMs % 1000 === 0 ? `${timeoutMs / 1000}` : (timeoutMs / 1000).toFixed(1);
 		return `Image question timed out after ${seconds}s. Increase images.questionTimeoutMs (currently ${timeoutMs}ms; 0 disables) or check the vision model provider.`;
 	};
+	const assertCurrent = (): void => {
+		effectiveSignal?.throwIfAborted();
+		if (!isCurrent()) throw new ToolError("Image question owner is no longer current.");
+	};
+	assertCurrent();
+	costGate?.admit();
 
 	const configuredThinking = concreteThinkingLevel(
 		extractExplicitThinkingSelector(selectedPattern, session.settings, {
@@ -135,8 +143,23 @@ export async function askImageQuestion(
 	);
 	const reasoning = toReasoningEffort(resolveThinkingLevelForModel(model, configuredThinking));
 
+	const streamOptions = session.prepareSimpleStreamOptions?.(
+		{ signal: effectiveSignal, reasoning },
+		model.provider,
+	) ?? {
+		signal: effectiveSignal,
+		reasoning,
+	};
+	const resolveCredential = modelRegistry.resolver(model, credentialSessionId);
 	let response: AssistantMessage;
 	try {
+		const apiKey = await modelRegistry.getApiKey(model, credentialSessionId, { signal: effectiveSignal });
+		assertCurrent();
+		if (!apiKey) {
+			throw new ToolError(
+				`No API key available for ${model.provider}/${model.id}. Configure credentials for this provider or choose another vision-capable model.`,
+			);
+		}
 		response = await instrumentedCompleteSimple(
 			model,
 			{
@@ -153,12 +176,49 @@ export async function askImageQuestion(
 				],
 			},
 			{
-				apiKey: modelRegistry.resolver(model, session.getSessionId?.() ?? undefined),
-				signal: effectiveSignal,
-				reasoning,
+				...streamOptions,
+				apiKey: async context => {
+					assertCurrent();
+					const credential = await resolveCredential(context);
+					assertCurrent();
+					return credential;
+				},
+				onPayload: async (payload, requestModel, requestSignal) => {
+					assertCurrent();
+					requestSignal?.throwIfAborted();
+					const replacement = await streamOptions.onPayload?.(payload, requestModel, requestSignal);
+					assertCurrent();
+					requestSignal?.throwIfAborted();
+					costGate?.admit();
+					return replacement ?? payload;
+				},
+				onResponse: async (response, requestModel, requestSignal) => {
+					if (!effectiveSignal?.aborted && isCurrent()) {
+						await streamOptions.onResponse?.(response, requestModel, requestSignal);
+					}
+				},
+				onSseEvent: (event, requestModel) => {
+					if (!effectiveSignal?.aborted && isCurrent()) streamOptions.onSseEvent?.(event, requestModel);
+				},
 			},
 			{ telemetry, oneshotKind: "image_question", completeImpl },
 		);
+		costGate?.record(response.usage.cost.total);
+		if (usageOwner) {
+			manager?.appendModelUsage?.(
+				{
+					purpose: "image-question",
+					api: response.api,
+					provider: response.provider,
+					model: response.model,
+					usage: response.usage,
+					stopReason: response.stopReason,
+					errorMessage: response.errorMessage,
+				},
+				usageOwner,
+			);
+		}
+		assertCurrent();
 	} catch (error) {
 		if (error instanceof Error && (error.name === "AbortError" || error.name === "TimeoutError")) {
 			if (timedOut()) throw new ToolError(formatTimeoutMessage());

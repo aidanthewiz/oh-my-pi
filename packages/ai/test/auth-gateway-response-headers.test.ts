@@ -31,7 +31,7 @@ async function bootGateway(): Promise<GatewayHarness> {
 		mock,
 		close: async () => {
 			await handle.close();
-			storage.close();
+			await storage.close();
 			await fs.rm(dir, { recursive: true, force: true });
 		},
 	};

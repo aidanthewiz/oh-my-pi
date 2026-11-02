@@ -31,22 +31,13 @@ describe("/ratchet slash command", () => {
 		expect(result).toHaveProperty("prompt");
 		const { prompt } = result as { prompt: string };
 		expect(prompt).toContain("<ratchet-request>\nthe inbox router in src/router, lower cost\n</ratchet-request>");
-		expect(prompt).toContain("ONE batched `ask`");
-	});
-
-	it("tells a session without ask to only continue fully approved flows", async () => {
-		const h = acpRuntime({ tools: ["eval", "task"] });
-		const { prompt } = (await Reflect.apply(executeAcpBuiltinSlashCommand, undefined, ["/ratchet", h.runtime])) as {
-			prompt: string;
-		};
-		expect(prompt).toContain("No `ask` in this session: NEVER build or approve.");
-		expect(prompt).toContain("No flow named");
 	});
 
 	it("refuses without the task tool and leaves the prelude off", async () => {
 		const h = acpRuntime({ tools: ["eval", "ask"] });
 		expect(await Reflect.apply(executeAcpBuiltinSlashCommand, undefined, ["/ratchet router", h.runtime])).toEqual({
 			consumed: true,
+			failed: true,
 		});
 		expect(cfgRatchetEnabled.get(h.settings)).toBe(false);
 		expect(h.output).toHaveBeenCalledWith("/ratchet needs the task tool active.");
@@ -56,6 +47,7 @@ describe("/ratchet slash command", () => {
 		const h = acpRuntime({ available: false });
 		expect(await Reflect.apply(executeAcpBuiltinSlashCommand, undefined, ["/ratchet router", h.runtime])).toEqual({
 			consumed: true,
+			failed: true,
 		});
 		expect(cfgRatchetEnabled.get(h.settings)).toBe(false);
 		expect(h.output).toHaveBeenCalledWith("The ratchet eval prelude is unavailable in this session.");

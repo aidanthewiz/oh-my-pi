@@ -89,6 +89,19 @@ function recorderDefinition(session: ToolSession, calls: unknown[]): EvalPrelude
 	};
 }
 
+function recordingFacade() {
+	const calls: unknown[] = [];
+	const context = createContext({
+		__omp_log__: () => {},
+		__omp_prelude__: async (_name: string, parameters: unknown) => {
+			calls.push(parameters);
+			return responseFor(parameters);
+		},
+	});
+	runInContext(createBrowserPrelude(makeSession()).javascript, context);
+	return { calls, context };
+}
+
 afterAll(async () => {
 	await Promise.all([disposeAllVmContexts(), disposeAllKernelSessions()]);
 });
@@ -100,7 +113,7 @@ describe("browser JavaScript facade", () => {
 		const session = makeSession();
 		const prelude = createBrowserPrelude(session);
 		const context = createContext({
-			__omp_display__: (value: unknown) => displays.push(value),
+			__omp_log__: (_level: string, value: unknown) => displays.push(value),
 			__omp_prelude__: async (name: string, parameters: unknown) => {
 				expect(name).toBe("browser");
 				calls.push(parameters);
@@ -178,6 +191,50 @@ describe("browser JavaScript facade", () => {
 			{ action: "call", name: "other", chain: [{ method: "title", args: [] }] },
 			{ action: "close", name: "docs" },
 		]);
+	});
+
+	it("refuses run args it would drop before anything runs, and still runs empty or null args", async () => {
+		const { calls, context } = recordingFacade();
+
+		await expect(
+			runInContext(
+				'browser.tab("docs").run(async (_scope, url) => url, { args: { url: "https://example.test" } })',
+				context,
+			),
+		).rejects.toThrow("tab.run() args must be an array of the function's arguments after its scope");
+		await expect(runInContext('browser.tab("docs").run("return 1;", { args: [1] })', context)).rejects.toThrow(
+			"tab.run() passes args only to a function; a code string receives none",
+		);
+		expect(calls).toEqual([]);
+
+		expect(await runInContext('browser.tab("docs").run("return 1;", { args: [] })', context)).toEqual({ ok: true });
+		expect(await runInContext('browser.tab("docs").run(async () => 1, { args: null })', context)).toBe(8);
+		expect(calls).toEqual([
+			{ name: "docs", code: "return 1;", action: "run" },
+			{ name: "docs", fn: "async () => 1", args: [], action: "run" },
+		]);
+	});
+
+	it("rejects invalid tab.run options before dispatching any browser action", async () => {
+		const { calls, context } = recordingFacade();
+
+		await expect(
+			runInContext('browser.tab("docs").run(async (_scope, url) => url, ["https://example.test"])', context),
+		).rejects.toThrow();
+		for (const call of ['run(async () => 1, "fast")', 'run("return 1;", [1])']) {
+			await expect(runInContext(`browser.tab("docs").${call}`, context)).rejects.toThrow();
+		}
+		expect(calls).toEqual([]);
+	});
+
+	it("rejects invalid browser.open options before dispatching any browser action", async () => {
+		const { calls, context } = recordingFacade();
+
+		await expect(
+			runInContext('browser.open("https://example.test", { viewport: { width: 1280, height: 900 } })', context),
+		).rejects.toThrow();
+		await expect(runInContext("browser.open(42)", context)).rejects.toThrow();
+		expect(calls).toEqual([]);
 	});
 });
 
@@ -325,7 +382,7 @@ describe("browser facade Chromium helper E2E", () => {
 			const context = createContext({
 				__name__: name,
 				__url__: `data:text/html,${encodeURIComponent(html)}`,
-				__omp_display__: (value: unknown) => displayed.push(value),
+				__omp_log__: (_level: string, value: unknown) => displayed.push(value),
 				__omp_prelude__: async (preludeName: string, parameters: unknown) => {
 					expect(preludeName).toBe("browser");
 					const result = await prelude.invoke(parameters, {
@@ -354,9 +411,9 @@ describe("browser facade Chromium helper E2E", () => {
 				expect(title).toBe("Clicked");
 				expect(await runInContext("__e2eTab.run((_scope, value) => value + 1, { args: [7] })", context)).toBe(8);
 				expect(
-					await runInContext("__e2eTab.run('display(\"worker display text\"); return { value: 3 };')", context),
+					await runInContext("__e2eTab.run('print(\"worker print text\"); return { value: 3 };')", context),
 				).toEqual({ value: 3 });
-				expect(displayed).toContain("worker display text");
+				expect(displayed).toContain("worker print text");
 
 				const observation = await runInContext("__e2eTab.observe()", context);
 				expect(field(observation, "elements")).toBeArray();

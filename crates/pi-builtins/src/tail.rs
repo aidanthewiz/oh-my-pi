@@ -884,12 +884,9 @@ mod chunks {
 				self.chunks.push_back(chunk);
 
 				let mut reusable = None;
-				while self
-					.chunks
-					.front()
-					.is_some_and(|first| self.bytes - first.bytes as u64 >= self.num_print)
+				while let Some(discarded) =
+					self.chunks.pop_front_if(|first| self.bytes - first.bytes as u64 >= self.num_print)
 				{
-					let discarded = self.chunks.pop_front().unwrap();
 					self.bytes -= discarded.bytes as u64;
 					if reusable.is_none() {
 						reusable = Some(discarded);
@@ -1163,9 +1160,10 @@ mod chunks {
 				self.lines += chunk.lines as u64;
 				self.chunks.push_back(chunk.clone());
 
-				let first = &self.chunks[0];
-				if self.lines - first.lines as u64 > self.num_print {
-					chunk = self.chunks.pop_front().unwrap();
+				if let Some(first) =
+					self.chunks.pop_front_if(|first| self.lines - first.lines as u64 > self.num_print)
+				{
+					chunk = first;
 
 					self.lines -= chunk.lines as u64;
 				} else {
@@ -1482,11 +1480,7 @@ mod follow {
 			/// printed
 			pub fn needs_header(&self, path: &Path, verbose: bool) -> bool {
 				if verbose {
-					if let Some(ref last) = self.last {
-						!last.eq(&path)
-					} else {
-						true
-					}
+					self.last.as_ref().is_none_or(|last| !last.eq(&path))
 				} else {
 					false
 				}
@@ -3737,7 +3731,7 @@ fn backwards_thru_file(file: &mut (impl Read + Seek), num_delimiters: u64, delim
 				// cursor in the file is at the *beginning* of the
 				// block, so seeking forward by `i + 1` bytes puts
 				// us right after the found delimiter.
-				file.seek(SeekFrom::Current((i + 1) as i64)).unwrap();
+				file.seek_relative((i + 1) as i64).unwrap();
 				return;
 			}
 		}

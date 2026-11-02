@@ -24,8 +24,8 @@ describe("ModelRegistry LM Studio Fixes", () => {
 		authStorage = await AuthStorage.create(path.join(tempDir, "testauth.db"));
 	});
 
-	afterEach(() => {
-		authStorage.close();
+	afterEach(async () => {
+		await authStorage.close();
 		if (tempDir && fs.existsSync(tempDir)) {
 			removeSyncWithRetries(tempDir);
 		}

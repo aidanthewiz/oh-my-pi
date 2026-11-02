@@ -30,7 +30,7 @@ describe("issue #986 compaction auth fallback", () => {
 		if (session) {
 			await session.dispose();
 		}
-		authStorage?.close();
+		await authStorage?.close();
 		tempDir.removeSync();
 	});
 

@@ -1,5 +1,8 @@
 import { describe, expect, it } from "bun:test";
 import { isProviderRetryableError } from "@oh-my-pi/pi-ai/error";
+import type { AssistantMessage, AssistantMessageEvent } from "@oh-my-pi/pi-ai/types";
+import { withReplaySafeStreamRetry } from "@oh-my-pi/pi-ai/utils/empty-completion-retry";
+import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 
 describe("isProviderRetryableError", () => {
 	it("retries known transient rate-limit errors", () => {
@@ -18,6 +21,87 @@ describe("isProviderRetryableError", () => {
 		expect(
 			isProviderRetryableError(new Error("Anthropic stream envelope error: stream ended before message_start")),
 		).toBe(true);
+		expect(
+			isProviderRetryableError(new Error("Anthropic stream envelope error: stream ended before message_delta")),
+		).toBe(true);
+	});
+
+	it("retries gateway stream drops before message_delta", () => {
+		expect(
+			isProviderRetryableError(new Error("Claude upstream stream ended before message_delta, reason=scanner_error")),
+		).toBe(true);
+		expect(
+			isProviderRetryableError(new Error("Claude upstream stream ended before message_start, reason=scanner_error")),
+		).toBe(true);
+	});
+
+	it("retries a gateway message_delta drop only before text or tool arguments commit", async () => {
+		for (const committed of ["none", "text", "tool"] as const) {
+			let attempts = 0;
+			const output = withReplaySafeStreamRetry(
+				{},
+				{ messages: [] },
+				{ providerRetryWait: async () => {} },
+				() => {
+					attempts++;
+					const message: AssistantMessage = {
+						role: "assistant",
+						api: "anthropic-messages",
+						provider: "synthetic",
+						model: "synthetic",
+						timestamp: 1,
+						stopReason: attempts === 1 ? "error" : "stop",
+						content: [],
+						usage: {
+							input: 1,
+							output: 1,
+							cacheRead: 0,
+							cacheWrite: 0,
+							totalTokens: 2,
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+						},
+						...(attempts === 1
+							? { errorMessage: "Claude upstream stream ended before message_delta, reason=scanner_error" }
+							: {}),
+					};
+					const stream = new AssistantMessageEventStream();
+					stream.push({ type: "start", partial: message });
+					if (attempts > 1 || committed === "text") {
+						const text = attempts > 1 ? "recovered" : "committed";
+						message.content.push({ type: "text", text });
+						stream.push({ type: "text_delta", contentIndex: 0, delta: text, partial: message });
+					} else if (committed === "tool") {
+						message.content.push({
+							type: "toolCall",
+							id: "call-1",
+							name: "read",
+							arguments: { path: "safe.txt" },
+						});
+						stream.push({
+							type: "toolcall_delta",
+							contentIndex: 0,
+							delta: '{"path":"safe.txt"}',
+							partial: message,
+						});
+					}
+					if (attempts === 1) stream.push({ type: "error", reason: "error", error: message });
+					else stream.push({ type: "done", reason: "stop", message });
+					return stream;
+				},
+				{ retryProviderErrors: true, maxProviderErrorRetries: 1 },
+			);
+			const events: AssistantMessageEvent[] = [];
+			for await (const event of output) events.push(event);
+			const result = await output.result();
+			expect(attempts).toBe(committed === "none" ? 2 : 1);
+			expect(result.stopReason).toBe(committed === "none" ? "stop" : "error");
+			expect(events.filter(event => event.type === "text_delta").map(event => event.delta)).toEqual(
+				committed === "none" ? ["recovered"] : committed === "text" ? ["committed"] : [],
+			);
+			expect(events.filter(event => event.type === "toolcall_delta").map(event => event.delta)).toEqual(
+				committed === "tool" ? ['{"path":"safe.txt"}'] : [],
+			);
+		}
 	});
 
 	it("does not classify post-content envelope failures as provider-retryable", () => {
@@ -97,5 +181,19 @@ describe("isProviderRetryableError", () => {
 			const err = Object.assign(new Error(`400 ${JSON.stringify(body)}`), { status: 400, code, error: body });
 			expect(isProviderRetryableError(err)).toBe(false);
 		}
+	});
+
+	it("retries Aliyun multimodal-gateway 400s (flaky, byte-identical replay succeeds)", () => {
+		for (const text of [
+			"The provided URL does not appear to be valid. Ensure it is correctly formatted.",
+			"Download multimodal file timed out",
+		]) {
+			const message = `400 <400> InternalError.Algo.InvalidParameter: ${text}\n<400> InternalError.Algo.InvalidParameter: ${text} (type=invalid_request_error param=invalid_parameter_error)`;
+			const err = Object.assign(new Error(message), { status: 400 });
+			expect(isProviderRetryableError(err)).toBe(true);
+		}
+		// A genuine validation 400 stays terminal.
+		const bad = Object.assign(new Error("400 invalid_request_error: unknown field 'temperaturee'"), { status: 400 });
+		expect(isProviderRetryableError(bad)).toBe(false);
 	});
 });

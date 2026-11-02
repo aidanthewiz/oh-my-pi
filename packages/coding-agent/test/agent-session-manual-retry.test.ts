@@ -13,7 +13,7 @@ import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensi
 import { initializeExtensions } from "@oh-my-pi/pi-coding-agent/modes/runtime-init";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
-import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
+import { convertToLlm, USER_INTERRUPT_LABEL } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { buildSessionContext } from "@oh-my-pi/pi-coding-agent/session/session-context";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
@@ -47,8 +47,8 @@ describe("AgentSession manual retry", () => {
 		}
 	});
 
-	afterAll(() => {
-		authStorage.close();
+	afterAll(async () => {
+		await authStorage.close();
 		tempDir.removeSync();
 	});
 
@@ -283,16 +283,55 @@ describe("AgentSession manual retry", () => {
 		expect(provider.calls).toHaveLength(2);
 	});
 
-	it("does not retry an older failure through an unrelated custom message", async () => {
+	it.each(["live", "copied", "reopened"] as const)(
+		"does not retry an older %s failure through unrelated custom context and an eval snapshot",
+		async state => {
+			const { active, manager, provider } = await createWithStopDiagnostic([{ throw: "original failure" }]);
+			await active.prompt("fail once");
+			await active.waitForIdle();
+			await active.sendCustomMessage(
+				{ customType: "unrelated-context", content: "A different context update", display: false },
+				{ triggerTurn: false },
+			);
+			manager.appendCustomMessageEntry("eval-state-context", "Retained eval state", false);
+			active.agent.replaceMessages(active.buildDisplaySessionContext().messages);
+			if (state === "copied") {
+				active.agent.replaceMessages(active.agent.state.messages.map(message => ({ ...message })));
+			}
+			let current = active;
+			if (state === "reopened") {
+				const sessionFile = path.join(tempDir.path(), "unrelated-retry-context.jsonl");
+				fs.writeFileSync(
+					sessionFile,
+					[manager.getHeader(), ...manager.getEntries()].map(entry => JSON.stringify(entry)).join("\n") + "\n",
+				);
+				await active.dispose();
+				const reopened = await SessionManager.open(sessionFile, tempDir.path());
+				current = (await createWithStopDiagnostic([], [], undefined, { manager: reopened, provider })).active;
+			}
+			const before = current.agent.state.messages.slice();
+			await expect(current.retry()).resolves.toBe(false);
+			expect(current.hasAbortedToolCallTail).toBe(false);
+			expect(current.agent.state.messages).toEqual(before);
+			expect(provider.calls).toHaveLength(1);
+		},
+	);
+
+	it("does not borrow a persisted failure across newer active custom context", async () => {
 		const { active, provider } = await createWithStopDiagnostic([{ throw: "original failure" }]);
 		await active.prompt("fail once");
 		await active.waitForIdle();
-		await active.sendCustomMessage(
-			{ customType: "unrelated-context", content: "A different context update", display: false },
-			{ triggerTurn: false },
-		);
+		active.agent.appendMessage({
+			role: "custom",
+			customType: "active-context",
+			content: "Newer context not in the persisted failure branch",
+			display: false,
+			timestamp: Date.now(),
+		});
+		const before = active.agent.state.messages.slice();
 		await expect(active.retry()).resolves.toBe(false);
 		expect(active.hasAbortedToolCallTail).toBe(false);
+		expect(active.agent.state.messages).toEqual(before);
 		expect(provider.calls).toHaveLength(1);
 	});
 
@@ -337,7 +376,7 @@ describe("AgentSession manual retry", () => {
 						expect(results.map(result => result.toolCallId).sort()).toEqual(
 							partial ? ["failed-call", "successful-call"] : ["failed-call"],
 						);
-						expect(results.find(result => result.toolCallId === "failed-call")?.isError).toBe(partial);
+						expect(results.find(result => result.toolCallId === "failed-call")?.isError).toBe(true);
 						return { content: ["tool retry recovered"] };
 					},
 				],
@@ -346,10 +385,26 @@ describe("AgentSession manual retry", () => {
 			await active.prompt("run the probe");
 			await active.waitForIdle();
 			const failedLeaf = manager.getLeafId();
+			const completedResults = active.agent.state.messages.filter(message => message.role === "toolResult");
+			const diagnostic = active.agent.state.messages.at(-1);
+			if (!diagnostic) throw new Error("Expected retry diagnostic");
+			expect(diagnostic).toMatchObject({ role: "custom", customType: "retry-diagnostic" });
 			expect(active.hasAbortedToolCallTail).toBe(!partial);
 			await expect(active.retry()).resolves.toBe(true);
 			await active.waitForIdle();
-			expect(executed).toEqual(partial ? ["fail", "success"] : ["fail", "fail"]);
+			expect(executed).toEqual(partial ? ["fail", "success"] : ["fail"]);
+			expect(active.agent.state.messages.filter(message => message.role === "toolResult")).toEqual(completedResults);
+			expect(active.agent.state.messages).toContainEqual(diagnostic);
+			const transcript = manager.buildSessionContext({ transcript: true }).messages;
+			expect(transcript.filter(message => message.role === "toolResult")).toEqual(completedResults);
+			expect(transcript).toContainEqual(diagnostic);
+			expect(transcript).toContainEqual(
+				expect.objectContaining({
+					role: "assistant",
+					stopReason: "error",
+					errorMessage: "provider failed after tool execution",
+				}),
+			);
 			expect(provider.calls).toHaveLength(3);
 			expect(lastAgentMessage(active).content).toContainEqual({ type: "text", text: "tool retry recovered" });
 			expect(
@@ -672,6 +727,106 @@ describe("AgentSession manual retry", () => {
 		expect(lastAgentMessage(session).content).toContainEqual({ type: "text", text: "done after replay" });
 	});
 
+	it("retries an aborted tool-call turn past a background-job result folded in after the interrupt", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) {
+			throw new Error("Expected bundled Anthropic test model to exist");
+		}
+
+		const toolSchema = type({ question: type("string") });
+		const executed: string[] = [];
+		const askTool: AgentTool<typeof toolSchema, { question: string }> = {
+			name: "ask",
+			label: "Ask",
+			description: "Ask tool",
+			parameters: toolSchema,
+			async execute(_toolCallId, params) {
+				executed.push(params.question);
+				return { content: [{ type: "text", text: "answered" }], details: params };
+			},
+		};
+		const mock = createMockModel({ responses: [{ content: ["retried with job result"], stopReason: "stop" }] });
+		const zeroUsage = {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		};
+		// #17266: the user cancelled `ask`, then a background job finished while
+		// idle and its async-result was folded in behind the aborted boundary.
+		const agent = new Agent({
+			getApiKey: model => `${model.provider}-test-key`,
+			initialState: {
+				model,
+				systemPrompt: ["Test"],
+				tools: [askTool],
+				messages: [
+					{ role: "user", content: "start the job, then ask me", timestamp: Date.now() },
+					{
+						role: "assistant",
+						content: [{ type: "toolCall", id: "call_ask", name: "ask", arguments: { question: "which?" } }],
+						api: model.api,
+						provider: model.provider,
+						model: model.id,
+						usage: zeroUsage,
+						stopReason: "toolUse",
+						timestamp: Date.now(),
+					},
+					{
+						role: "toolResult",
+						toolCallId: "call_ask",
+						toolName: "ask",
+						content: [{ type: "text", text: "Ask tool was cancelled by the user" }],
+						isError: true,
+						timestamp: Date.now(),
+					},
+					{
+						role: "assistant",
+						content: [{ type: "text", text: "" }],
+						api: model.api,
+						provider: model.provider,
+						model: model.id,
+						usage: zeroUsage,
+						stopReason: "aborted",
+						errorMessage: "Interrupted by user",
+						timestamp: Date.now(),
+					},
+					{
+						role: "custom",
+						customType: "async-result",
+						content: "Background job bg_1 finished: build ok",
+						display: true,
+						timestamp: Date.now(),
+					},
+				],
+			},
+			streamFn: mock.stream,
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "compaction.enabled": false, "retry.enabled": false }),
+			modelRegistry,
+		});
+		session.subscribe(() => {});
+
+		expect(session.hasAbortedToolCallTail).toBe(true);
+		await expect(session.retry()).resolves.toBe(true);
+		await session.waitForIdle();
+
+		// A tool replay would cut the job result out of history; the retry
+		// re-attempts the model call with the result still in context instead.
+		expect(executed).toEqual([]);
+		expect(mock.calls.length).toBe(1);
+		const messages = session.agent.state.messages;
+		expect(messages.map(message => message.role)).toEqual(["user", "assistant", "toolResult", "custom", "assistant"]);
+		const delivery = messages[3];
+		expect(delivery.role === "custom" ? delivery.customType : undefined).toBe("async-result");
+		expect(lastAgentMessage(session).content).toContainEqual({ type: "text", text: "retried with job result" });
+	});
+
 	it("retries a persisted failed turn after rebuilding provider context", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) {
@@ -762,5 +917,82 @@ describe("AgentSession manual retry", () => {
 			type: "text",
 			text: "recovered after session reopen",
 		});
+	});
+
+	it("lets an idle aside start a turn after the user resumes an interrupted run with retry", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) {
+			throw new Error("Expected bundled Anthropic test model to exist");
+		}
+
+		const toolSchema = type({});
+		const firstRunStarted = Promise.withResolvers<void>();
+		let probeRuns = 0;
+		const probeTool: AgentTool<typeof toolSchema> = {
+			name: "probe",
+			label: "Probe",
+			description: "Probe tool",
+			parameters: toolSchema,
+			async execute(_toolCallId, _params, signal) {
+				probeRuns++;
+				if (probeRuns === 1) {
+					// Blocks until the user interrupt aborts it, like a pending `ask`.
+					const aborted = Promise.withResolvers<never>();
+					signal?.addEventListener("abort", () => aborted.reject(new Error("aborted")), { once: true });
+					firstRunStarted.resolve();
+					await aborted.promise;
+				}
+				return { content: [{ type: "text", text: "probed" }] };
+			},
+		};
+		const mock = createMockModel({
+			handler: context => {
+				const transcript = JSON.stringify(context.messages);
+				if (transcript.includes("LATE_ASIDE")) return { content: ["handled late aside"] };
+				if (context.messages.at(-1)?.role === "user") {
+					return { content: [{ type: "toolCall", name: "probe", arguments: {} }] };
+				}
+				if (transcript.includes("probed")) return { content: ["done after retry"] };
+				// The interrupted run's follow-up call after the aborted tool; the abort cancels it.
+				return { content: ["unreachable"], delayMs: 60_000 };
+			},
+		});
+		const agent = new Agent({
+			convertToLlm,
+			getApiKey: model => `${model.provider}-test-key`,
+			initialState: { model, systemPrompt: ["Test"], tools: [probeTool], messages: [] },
+			streamFn: mock.stream,
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "compaction.enabled": false, "retry.enabled": false }),
+			modelRegistry,
+			toolRegistry: new Map([[probeTool.name, probeTool]]),
+		});
+		session.subscribe(() => {});
+
+		// The user presses Esc while the tool runs, then resumes with /retry.
+		const run = session.prompt("run the probe");
+		await firstRunStarted.promise;
+		await session.abort({ reason: USER_INTERRUPT_LABEL });
+		await run.catch(() => {});
+		await session.waitForIdle();
+		await expect(session.retry()).resolves.toBe(true);
+		await session.waitForIdle();
+		expect(probeRuns).toBe(2);
+		expect(lastAgentMessage(session).content).toContainEqual({ type: "text", text: "done after retry" });
+
+		// The resumed run finished; a late aside must wake the agent, not stay folded
+		// as if the earlier interrupt were still in effect.
+		const dispatched = await session.sendCustomMessage(
+			{ customType: "ext-aside", content: "LATE_ASIDE", display: false, attribution: "agent" },
+			{ deliverAs: "aside" },
+		);
+		await session.waitForIdle();
+
+		expect(dispatched).toBe(true);
+		expect(mock.calls.filter(call => JSON.stringify(call.context.messages).includes("LATE_ASIDE"))).toHaveLength(1);
+		expect(lastAgentMessage(session).content).toContainEqual({ type: "text", text: "handled late aside" });
 	});
 });

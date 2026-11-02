@@ -41,7 +41,7 @@ describe("commit role thinking selection", () => {
 			expect(smol.model.id).toBe(defaultModel.id);
 			expect(smol.thinkingLevel).toBe(Effort.Minimal);
 		} finally {
-			authStorage.close();
+			await authStorage.close();
 		}
 	});
 });

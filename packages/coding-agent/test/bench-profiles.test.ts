@@ -87,7 +87,7 @@ async function runProfiled(flags: Record<string, unknown>, messages?: AssistantM
 	const summary = await runBenchCommand(
 		{ models: ["acme/bench-model"], flags: { json: true, ...flags } },
 		{
-			createRuntime: async () => ({ modelRegistry: registry, close: () => {} }),
+			createRuntime: async () => ({ modelRegistry: registry }),
 			randomSessionId: () => `sess-${session++}`,
 			writeStdout: () => {},
 			writeStderr: () => {},
@@ -210,7 +210,7 @@ describe("bench challenge mix", () => {
 			await runBenchCommand(
 				{ models: ["acme/tiny-model"], flags: { json: true, profile: "prefill", runs: 1, par: 1, ...flags } },
 				{
-					createRuntime: async () => ({ modelRegistry: registry, close: () => {} }),
+					createRuntime: async () => ({ modelRegistry: registry }),
 					writeStdout: () => {},
 					writeStderr: () => {},
 					setExitCode: () => {},
@@ -245,7 +245,7 @@ describe("bench --detailed", () => {
 		const summary = await runBenchCommand(
 			{ models: ["acme/bench-model"], flags: { json: true, detailed: true, ...flags } },
 			{
-				createRuntime: async () => ({ modelRegistry: registry, close: () => {} }),
+				createRuntime: async () => ({ modelRegistry: registry }),
 				randomSessionId: () => `sess-${session++}`,
 				writeStdout: () => {},
 				writeStderr: () => {},

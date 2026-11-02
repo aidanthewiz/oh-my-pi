@@ -21,7 +21,7 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
-	authStorage.close();
+	await authStorage.close();
 	await tempDir.remove();
 });
 

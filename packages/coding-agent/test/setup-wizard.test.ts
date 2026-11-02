@@ -42,6 +42,7 @@ function testScene(id: string, minVersion: number, shouldRun?: () => boolean): S
 	return {
 		id,
 		title: id,
+		step: id,
 		minVersion,
 		shouldRun,
 		mount: () => ({
@@ -229,6 +230,7 @@ describe("setup wizard persistence", () => {
 		const scene: SetupScene = {
 			id: "providers",
 			title: "providers",
+			step: "providers",
 			minVersion: 1,
 			mount: host => ({
 				title: "providers",
@@ -268,6 +270,7 @@ describe("setup wizard mouse routing", () => {
 		const scene: SetupScene = {
 			id: "scrollable",
 			title: "scrollable",
+			step: "scrollable",
 			minVersion: 1,
 			mount: () => ({
 				title: "scrollable",
@@ -306,6 +309,7 @@ describe("setup wizard mouse routing", () => {
 		const scene: SetupScene = {
 			id: "mouse",
 			title: "mouse",
+			step: "mouse",
 			minVersion: 1,
 			mount: () => ({
 				title: "mouse",
@@ -501,31 +505,6 @@ describe("setup wizard glyph scene", () => {
 });
 
 describe("omp setup onboarding trigger", () => {
-	it("starts the normal interactive command with forced setup wizard and forwarded managed flags", async () => {
-		let forceSetupWizard: boolean | undefined;
-		let parsedExtensions: string[] | undefined;
-		let parsedMcpProviders: string[] | undefined;
-		let receivedRawArgs: string[] | undefined;
-		const rawArgs = ["--extension", "/managed/l3.ts", "--mcp-providers", "native"];
-		await runOnboardingSetup(
-			{
-				stdinIsTTY: true,
-				stdoutIsTTY: true,
-				runRoot: async (parsed, forwardedRawArgs, deps) => {
-					forceSetupWizard = deps?.forceSetupWizard;
-					parsedExtensions = parsed.extensions;
-					parsedMcpProviders = parsed.mcpProviders;
-					receivedRawArgs = forwardedRawArgs;
-				},
-			},
-			rawArgs,
-		);
-		expect(forceSetupWizard).toBe(true);
-		expect(parsedExtensions).toEqual(["/managed/l3.ts"]);
-		expect(parsedMcpProviders).toEqual(["native"]);
-		expect(receivedRawArgs).toEqual(rawArgs);
-	});
-
 	it("rejects onboarding setup without an interactive TTY", async () => {
 		let stderr = "";
 		let exitCode: number | undefined;

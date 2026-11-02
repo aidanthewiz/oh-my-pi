@@ -93,8 +93,8 @@ describe("AgentSession steer idle drain", () => {
 		vi.useRealTimers();
 		vi.restoreAllMocks();
 	});
-	afterAll(() => {
-		authStorage.close();
+	afterAll(async () => {
+		await authStorage.close();
 		tempDir.removeSync();
 	});
 

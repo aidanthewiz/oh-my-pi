@@ -4,12 +4,14 @@
  * `AgentSession`) can route through the client when it advertises the
  * relevant capabilities at `initialize` time.
  */
+import { RequestError } from "@oh-my-pi/pi-utils/acp";
 import type {
 	PermissionOption as AcpPermissionOption,
 	TerminalHandle as AcpTerminalHandle,
 	AgentSideConnection,
 	ClientCapabilities,
 	RequestPermissionRequest,
+	RequestPermissionResponse,
 	ToolCallUpdate,
 } from "@oh-my-pi/pi-utils/acp";
 import type {
@@ -65,8 +67,8 @@ export function createAcpClientBridge(
 			createTerminalHandle(connection, sessionId, params);
 	}
 
-	bridge.requestPermission = (toolCall, options, signal) =>
-		requestPermission(connection, sessionId, toolCall, options, signal);
+	bridge.requestPermission = (toolCall, options, signal, steeringSignal) =>
+		requestPermission(connection, sessionId, toolCall, options, signal, steeringSignal);
 
 	return bridge;
 }
@@ -117,6 +119,7 @@ async function requestPermission(
 	toolCall: ClientBridgePermissionToolCall,
 	options: ClientBridgePermissionOption[],
 	signal: AbortSignal | undefined,
+	steeringSignal: AbortSignal | undefined,
 ): Promise<ClientBridgePermissionOutcome> {
 	const update: ToolCallUpdate = {
 		toolCallId: toolCall.toolCallId,
@@ -137,10 +140,34 @@ async function requestPermission(
 		toolCall: update,
 		options: acpOptions,
 	};
-	if (signal?.aborted) {
+	if (signal?.aborted || steeringSignal?.aborted) {
 		return { outcome: "cancelled" };
 	}
-	const response = await connection.requestPermission(request);
+	// Steering admission belongs to the session; either admitted steering or
+	// host cancellation must also terminate the client's permission dialog.
+	const { promise, cancel } = connection.requestPermissionWithCancel(request);
+	signal?.addEventListener("abort", cancel, { once: true });
+	steeringSignal?.addEventListener("abort", cancel, { once: true });
+	try {
+		if (signal?.aborted || steeringSignal?.aborted) cancel();
+		const response = await promise;
+		if (signal?.aborted || steeringSignal?.aborted) return { outcome: "cancelled" };
+		return permissionOutcomeFromResponse(response, options);
+	} catch (error) {
+		if (signal?.aborted || steeringSignal?.aborted || (error instanceof RequestError && error.code === -32800)) {
+			return { outcome: "cancelled" };
+		}
+		throw error;
+	} finally {
+		signal?.removeEventListener("abort", cancel);
+		steeringSignal?.removeEventListener("abort", cancel);
+	}
+}
+
+function permissionOutcomeFromResponse(
+	response: RequestPermissionResponse,
+	options: ClientBridgePermissionOption[],
+): ClientBridgePermissionOutcome {
 	const outcome = response.outcome;
 	if (outcome.outcome === "cancelled") {
 		return { outcome: "cancelled" };

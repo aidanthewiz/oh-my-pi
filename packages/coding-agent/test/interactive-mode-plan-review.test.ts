@@ -9,6 +9,7 @@ import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { ExtensionRuntime } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
+import { cfgExtensionHandlersModeControl } from "@oh-my-pi/pi-coding-agent/extensibility/settings";
 import { resolveLocalUrlToPath } from "@oh-my-pi/pi-coding-agent/internal-urls";
 import { AssistantMessageComponent } from "@oh-my-pi/pi-tui/chat/assistant-message";
 import type { HookSelectorSlider } from "@oh-my-pi/pi-tui/overlays/hook-selector";
@@ -107,6 +108,8 @@ function planReviewExtension(
 		handlers,
 		tools: new Map(),
 		assistantThinkingRenderers: [],
+		assistantTextRenderers: [],
+		linkSchemes: [],
 		fileWriteFallbackHandlers: [],
 		fileDeleteFallbackHandlers: [],
 		messageRenderers: new Map(),
@@ -166,8 +169,8 @@ describe("InteractiveMode plan review rendering", () => {
 		modelRegistry = new ModelRegistry(authStorage);
 	});
 
-	afterAll(() => {
-		authStorage?.close();
+	afterAll(async () => {
+		await authStorage?.close();
 		sharedTempDir?.removeSync();
 	});
 
@@ -378,10 +381,14 @@ describe("InteractiveMode plan review rendering", () => {
 			"# Plan\n\nKeep host authority.",
 		);
 		mode.planModeEnabled = true;
+		cfgExtensionHandlersModeControl.override(session.settings, true);
 		const prompt = vi.spyOn(session, "prompt").mockResolvedValue(undefined as never);
 		const recorder = planReviewRecorder("host-observer");
 		const attempts: boolean[] = [];
 		let guestPending: PlanReviewRequestedEvent | undefined;
+		let guestModeCode: string | undefined;
+		const initialModeState = mode.sessionModes.getState();
+		let guestModeState = initialModeState;
 		const answers = planReviewExtension("guest-guard", async (event, ctx) => {
 			if (event.type !== "plan_review_requested") return;
 			Object.defineProperty(mode, "collabGuest", { configurable: true, value: {} });
@@ -389,6 +396,10 @@ describe("InteractiveMode plan review rendering", () => {
 				guestPending = ctx.getPendingPlanReview();
 				attempts.push(ctx.resolvePlanReview(event.reviewId, "refine", { feedback: "guest feedback" }));
 				attempts.push(await ctx.openPlanReview());
+				if (!ctx.sessionModes) throw new Error("Interactive modes are unavailable");
+				const result = await ctx.sessionModes.set({ mode: "plan", action: "exit" });
+				guestModeCode = result.ok ? "accepted" : result.code;
+				guestModeState = result.state;
 			} finally {
 				Reflect.deleteProperty(mode, "collabGuest");
 			}
@@ -399,6 +410,8 @@ describe("InteractiveMode plan review rendering", () => {
 		const resolved = await recorder.resolved;
 		expect(guestPending).toBeUndefined();
 		expect(attempts).toEqual([false, false, true]);
+		expect(guestModeCode).toBe("disabled");
+		expect(guestModeState).toEqual(initialModeState);
 		expect(prompt).toHaveBeenCalledWith("host feedback");
 		expect(prompt).not.toHaveBeenCalledWith("guest feedback");
 		expect(resolved).toMatchObject({ choice: "refine", by: "extension" });
@@ -1003,7 +1016,11 @@ describe("InteractiveMode plan review rendering", () => {
 		await mode.handlePlanApproval({ planFilePath, planExists: true, title: "PLAN" });
 
 		const resolved = events.find((event): event is PlanReviewResolvedEvent => event.type === "plan_review_resolved");
-		expect(events.map(event => event.type)).toEqual(["plan_review_requested", "plan_review_resolved"]);
+		// `mode_changed` also fires here (the test flips plan mode on directly); this asserts review order.
+		expect(events.map(event => event.type).filter(type => type !== "mode_changed")).toEqual([
+			"plan_review_requested",
+			"plan_review_resolved",
+		]);
 		expect(resolved).toMatchObject({ choice: "execute", by: "local" });
 	});
 

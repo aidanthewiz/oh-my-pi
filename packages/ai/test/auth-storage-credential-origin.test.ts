@@ -103,4 +103,71 @@ describe("AuthStorage.keys.source", () => {
 			expect(auth.keys.source("openai")).toEqual({ kind: "runtime", concrete: true });
 		});
 	});
+
+	test("a refused mutation leaves the existing durable credential and snapshot intact", async () => {
+		if (!auth || !store) throw new Error("test setup failed");
+		const previous = { type: "api_key" as const, key: "synthetic-previous-key" };
+		await auth.credentials.set("openai", previous);
+		const before = store.listAuthCredentials("openai");
+		const controller = new AbortController();
+		controller.abort();
+		await expect(
+			auth.credentials.set(
+				"openai",
+				{ type: "api_key", key: "synthetic-refused-key" },
+				{ assertCurrent: () => controller.signal.throwIfAborted() },
+			),
+		).rejects.toHaveProperty("name", "AbortError");
+		expect(store.listAuthCredentials("openai")).toEqual(before);
+		expect(auth.credentials.get("openai")).toEqual(previous);
+	});
+
+	test("an accepted durable mutation drains its acknowledgement after caller cancellation", async () => {
+		const backing = await SqliteAuthCredentialStore.open(path.join(tempDir, "accepted.db"));
+		const committed = Promise.withResolvers<void>();
+		const acknowledge = Promise.withResolvers<void>();
+		const acceptedStore = new Proxy(backing, {
+			get(target, property) {
+				if (property === "replaceAuthCredentials") {
+					return async (...args: Parameters<AuthCredentialStore["replaceAuthCredentials"]>) => {
+						const rows = await target.replaceAuthCredentials(...args);
+						committed.resolve();
+						await acknowledge.promise;
+						return rows;
+					};
+				}
+				const value = Reflect.get(target, property);
+				return typeof value === "function" ? value.bind(target) : value;
+			},
+		});
+		const acceptedAuth = new AuthStorage(acceptedStore);
+		const controller = new AbortController();
+		const next = { type: "api_key" as const, key: "synthetic-accepted-key" };
+		let settled = false;
+		const saving = acceptedAuth.credentials.set("openai", next, {
+			assertCurrent: () => controller.signal.throwIfAborted(),
+		});
+		void saving.then(
+			() => {
+				settled = true;
+			},
+			() => {
+				settled = true;
+			},
+		);
+		try {
+			await committed.promise;
+			expect(backing.listAuthCredentials("openai").map(row => row.credential)).toEqual([next]);
+			controller.abort();
+			await Promise.resolve();
+			expect(settled).toBe(false);
+			acknowledge.resolve();
+			await saving;
+			expect(acceptedAuth.credentials.get("openai")).toEqual(next);
+			expect(backing.listAuthCredentials("openai").map(row => row.credential)).toEqual([next]);
+		} finally {
+			acknowledge.resolve();
+			await saving.finally(() => acceptedAuth.close());
+		}
+	});
 });

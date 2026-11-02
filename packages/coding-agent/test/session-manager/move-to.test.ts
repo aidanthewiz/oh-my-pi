@@ -5,7 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { SessionHeader } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { loadEntriesFromFile } from "@oh-my-pi/pi-coding-agent/session/session-loader";
-import { resetSessionIndexForTests } from "@oh-my-pi/pi-coding-agent/session/session-index";
+import { closeSessionIndex } from "@oh-my-pi/pi-coding-agent/session/session-index";
 import { resolveResumableSession } from "@oh-my-pi/pi-coding-agent/session/session-listing";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { stripOuterDoubleQuotes } from "@oh-my-pi/pi-coding-agent/tools/path-utils";
@@ -76,7 +76,7 @@ describe("SessionManager.moveTo", () => {
 
 	afterEach(async () => {
 		// Title changes open history.db under testAgentDir; Windows cannot delete an open file.
-		resetSessionIndexForTests();
+		closeSessionIndex();
 		if (originalAgentDir) {
 			setAgentDir(originalAgentDir);
 		} else {
@@ -960,25 +960,17 @@ describe("SessionManager.moveTo", () => {
 		const id = (await session.saveArtifact("written while away", "bash"))!;
 		await fsp.writeFile(path.join(awayArtifactsDir, "stuck.md"), "cannot move");
 		await fsp.writeFile(path.join(homeArtifactsDir, "stale.md"), "already here");
-		// Both the no-replace link and its exclusive-copy fallback refuse this one
-		// entry; everything else, including the session file rename, goes through.
 		const denied = Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" });
-		const link = fs.promises.link.bind(fs.promises);
-		const copyFile = fs.promises.copyFile.bind(fs.promises);
-		const linkSpy = spyOn(fs.promises, "link").mockImplementation(async (existing, target) => {
-			if (path.basename(existing.toString()) === "stuck.md") throw denied;
-			return link(existing, target);
-		});
-		const copySpy = spyOn(fs.promises, "copyFile").mockImplementation(async (source, target, mode) => {
+		const rename = fs.promises.rename.bind(fs.promises);
+		const renameSpy = spyOn(fs.promises, "rename").mockImplementation(async (source, target) => {
 			if (path.basename(source.toString()) === "stuck.md") throw denied;
-			return copyFile(source, target, mode);
+			return rename(source, target);
 		});
 
 		try {
 			await session.moveTo(cwdA);
 		} finally {
-			linkSpy.mockRestore();
-			copySpy.mockRestore();
+			renameSpy.mockRestore();
 		}
 
 		expect(session.getSessionFile()!.slice(0, -6)).toBe(homeArtifactsDir);

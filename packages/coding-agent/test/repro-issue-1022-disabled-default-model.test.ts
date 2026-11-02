@@ -100,7 +100,7 @@ describe("issue #1022 — path-scoped enabledModels respected by default fallbac
 				await session.dispose();
 			}
 		} finally {
-			authStorage.close();
+			await authStorage.close();
 		}
 	});
 });

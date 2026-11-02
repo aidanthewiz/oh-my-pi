@@ -89,7 +89,7 @@ describe("auth-broker wire surface", () => {
 	async function closeFixture(): Promise<void> {
 		await handle?.close();
 		handle = undefined;
-		storage?.close();
+		await storage?.close();
 		storage = undefined;
 		store?.close();
 		store = undefined;
@@ -213,7 +213,7 @@ describe("auth-broker wire surface", () => {
 		const bindUrl = new URL(handle!.url);
 		const bind = `${bindUrl.hostname}:${bindUrl.port}`;
 		await handle!.close();
-		storage!.close();
+		await storage!.close();
 		store!.close();
 		store = await SqliteAuthCredentialStore.open(path.join(tempDir, "agent.db"));
 		storage = new AuthStorage(store);
@@ -423,6 +423,40 @@ describe("auth-broker wire surface", () => {
 			expect(error).toBeInstanceOf(AuthBrokerError);
 			expect(error).toMatchObject({ status: 401 });
 		}
+	});
+
+	test("GET /v1/usage isolates an encoded provider and preserves aggregate coverage", async () => {
+		const provider = "custom/provider + alias";
+		let unrelatedProbes = 0;
+		await storage!.credentials.set("anthropic", [mintOAuthCredential("a", Date.now() + 3_600_000)]);
+		storage!.usage.setProvider("anthropic", {
+			id: "anthropic",
+			async fetchUsage() {
+				unrelatedProbes += 1;
+				return null;
+			},
+		});
+		for (const id of [provider, "wire-sibling"]) {
+			storage!.usage.setProvider(
+				id,
+				{
+					id,
+					async fetchUsage() {
+						if (id !== provider) unrelatedProbes += 1;
+						return { provider: id, fetchedAt: Date.now(), limits: [], metadata: { accountId: id } };
+					},
+				},
+				"wire-test-key",
+			);
+		}
+		const client = new AuthBrokerClient({ url: handle!.url, token });
+		const scoped = await client.fetchUsage({ provider });
+		expect(scoped.reports.map(report => [report.provider, report.metadata?.accountId])).toEqual([
+			[provider, provider],
+		]);
+		expect(unrelatedProbes).toBe(0);
+		const aggregate = await client.fetchUsage();
+		expect(aggregate.reports.map(report => report.provider).sort()).toEqual([provider, "wire-sibling"].sort());
 	});
 
 	test("GET /v1/usage outlives the base timeout for a serialized account batch", async () => {
@@ -1268,7 +1302,7 @@ describe("auth-broker wire surface", () => {
 		} finally {
 			controller.abort();
 			await localHandle.close();
-			localStorage.close();
+			await localStorage.close();
 			localStore.close();
 		}
 	});

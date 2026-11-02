@@ -88,7 +88,7 @@ describe("Codex web search broker auth", () => {
 			expect(openSpy).not.toHaveBeenCalled();
 		} finally {
 			vi.restoreAllMocks();
-			authStorage.close();
+			await authStorage.close();
 		}
 	});
 });

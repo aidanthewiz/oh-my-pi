@@ -6,6 +6,7 @@
  */
 
 import type { Api, ApiKey, AssistantMessage, Context, Model, SimpleStreamOptions } from "@oh-my-pi/pi-ai";
+import { resolveCatalogPolicy } from "@oh-my-pi/pi-catalog/compat/catalog-policy";
 import { preferredDialect } from "@oh-my-pi/pi-catalog/identity";
 import { prompt } from "@oh-my-pi/pi-utils";
 import * as snapcompact from "@oh-my-pi/snapcompact";
@@ -27,6 +28,7 @@ import {
 	createFileOps,
 	extractFileOpsFromMessage,
 	type FileOperations,
+	incompleteOutputError,
 	SUMMARIZATION_SYSTEM_PROMPT,
 	serializeConversationForSummary,
 	stripReadSelector,
@@ -346,7 +348,11 @@ export async function generateBranchSummary(
 	// Transform to LLM-compatible messages, then serialize to text
 	// Serialization prevents the model from treating it as a conversation to continue
 	const llmMessages = (options.convertToLlm ?? defaultConvertToLlm)(messages);
-	const conversationText = serializeConversationForSummary(llmMessages, preferredDialect(model.id));
+	const conversationText = serializeConversationForSummary(
+		llmMessages,
+		preferredDialect(model.id),
+		resolveCatalogPolicy(model).classifierCotExtraction === true,
+	);
 
 	// Build prompt
 	const instructions = customInstructions || BRANCH_SUMMARY_PROMPT;
@@ -380,6 +386,9 @@ export async function generateBranchSummary(
 	}
 	if (response.stopReason === "error") {
 		return { error: response.errorMessage || "Summarization failed" };
+	}
+	if (response.stopReason === "length") {
+		return { error: incompleteOutputError("Summarization failed") };
 	}
 
 	let summary = response.content

@@ -380,6 +380,35 @@ fn prompt_wait_ends_on_its_own_result_only() {
 }
 
 #[test]
+fn prompt_wait_includes_signed_narration_in_order() {
+	let (client, _events, mut server) = connect(ready_v2(), Vec::new());
+	let script = thread::spawn(move || {
+		let frame = server.expect("prompt");
+		let mut message = assistant("answer");
+		message["content"] = json!([
+			{"type": "thinking", "thinking": "private", "narration": false},
+			{"type": "thinking", "thinking": "First ", "narration": true, "thinkingSignature": "signed-one"},
+			{"type": "text", "text": "answer"},
+			{"type": "thinking", "thinking": " last", "narration": true, "thinkingSignature": "signed-two"}
+		]);
+		server.respond(&frame, json!({"agentInvoked": true}));
+		server.send(&json!({"type": "message_end", "message": message}));
+		server.send(&json!({"type": "agent_end", "messages": [message]}));
+		server.send(&json!({"type": "prompt_result", "id": frame["id"], "agentInvoked": true, "status": "completed", "sessionSettled": true}));
+		server
+	});
+	let turn = client
+		.prompt_and_wait(&prompt("hi"), Duration::from_secs(5))
+		.unwrap();
+	let _server = script.join().unwrap();
+	assert_eq!(turn.assistant_text.as_deref(), Some("First answer last"));
+	let raw = serde_json::to_value(turn.assistant_message.unwrap()).unwrap();
+	assert_eq!(raw["content"][1]["type"], "thinking");
+	assert_eq!(raw["content"][1]["thinkingSignature"], "signed-one");
+	assert_eq!(raw["content"][3]["thinkingSignature"], "signed-two");
+}
+
+#[test]
 fn prompt_wait_returns_immediately_without_the_agent() {
 	let (client, _events, mut server) = connect(ready_v2(), Vec::new());
 	let script = thread::spawn(move || {

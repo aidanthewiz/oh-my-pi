@@ -55,7 +55,7 @@ describe("issue #816 — plan mode pendingModelSwitch leak", () => {
 		mode?.stop();
 		HistoryStorage.close();
 		await session?.dispose();
-		authStorage?.close();
+		await authStorage?.close();
 		tempDir?.removeSync();
 		resetSettingsForTest();
 	});

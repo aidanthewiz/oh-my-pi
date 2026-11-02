@@ -1,0 +1,1055 @@
+{
+  "schema": "CoreforgeHistoricalVisualReferences",
+  "historicalReferenceOnly": true,
+  "currentQualificationClaimed": false,
+  "historicalPassReused": false,
+  "manualInspectionPassed": false,
+  "evidenceId": "coreforge-upstream-post95-v18126-evidence/post95-series-domain-v18126-base101-bun144-r5",
+  "version": "18.12.6",
+  "sourceSha": "25b3ef6eab233d96f9efa0a5b395b1cc6a6c9ef8",
+  "mergeHead": "45c35e40c46166dc726ccc52f5d27f40f2449f99",
+  "sourceDigest": "c7494660c2e5a54eeaf462c63077f68b4a1e2c2297c58f0c11cdfdf4e9e991b4",
+  "nativeSha256": "2f40587a4b924f2ebeb7e7618c0b47c494d2f487ef878913c2d88a29c5934ca0",
+  "sourceManifest": {
+    "file": "post95-v18126-base101-bun144-r5-after-native-source-inputs.json",
+    "sha256": "9fac6a4f661d30de676261eee9fe6a1b5a391e884e430d96bf8b99cd3e0a7e4a"
+  },
+  "fonts": {
+    "family": "Menlo,DejaVu Sans Mono,monospace",
+    "selection": "Available historical host fonts selected by native SVG rasterizer",
+    "fileIdentitiesRecorded": false,
+    "unmet": "Original reports did not record individual font files; font or physical-terminal equivalence is not established"
+  },
+  "reports": [
+    {
+      "file": "post95-series-domain-v18126-base101-bun144-r5-source-ansi-visual.json",
+      "sha256": "925359c68961b4c891b7535991c84889e7330d679c37f7ebadce793adbad94fd",
+      "schema": "CoreforgeActualSeriesAnsiVisual",
+      "rendererSource": {
+        "file": "post95-series-domain-series-ansi-visual-proof.ts",
+        "sha256": "3db0b7767b8009022eb84a09a434120bb191239d107a1ed255713b7bfde7c73d"
+      },
+      "rendererExecutionChannel": "source-only offline artifact renderer",
+      "visualMaterialization": {
+        "file": "post95-series-domain-v18126-base101-bun144-r5-visual-materialized.json",
+        "sha256": "17aa5c5608cc12b79bf2189f3bf8d2952e323e5641a3bb92e651673908d95bfc"
+      },
+      "sourceManifest": {
+        "file": "post95-v18126-base101-bun144-r5-after-native-source-inputs.json",
+        "sha256": "9fac6a4f661d30de676261eee9fe6a1b5a391e884e430d96bf8b99cd3e0a7e4a"
+      },
+      "qualificationInputs": {
+        "file": "post95-series-base101-bun144-r5-f203-noreplay-qualification-inputs.json",
+        "sha256": "bbd3da6754d47cd5cf6ea57443a23fa4a52dc4c74c9deda28a470443d60afccb"
+      },
+      "domainPlan": {
+        "file": "post95-v18126-base101-bun144-r5-domain-plan.json",
+        "sha256": "d6816ed5e5fc15ce2375002885eb82bc805e3f0983198cb01247a331e0f36a5c"
+      },
+      "inputs": [
+        {
+          "domain": "presentation",
+          "boundFile": "post95-series-domain-v18126-base101-bun144-r5-presentation-source-bound.json",
+          "sha256": "baf260ecaae171a6725c19f82834348b2f1d97c742ab53a976b47106ab3a7ab7"
+        },
+        {
+          "domain": "async-media",
+          "boundFile": "post95-series-domain-v18126-base101-bun144-r5-async-media-source-bound.json",
+          "sha256": "f7ca14f4b7dbb1800fabe97672bc323591b0b041e65075cef6e1bd5ed912fe3b"
+        }
+      ],
+      "normalization": "Strip synchronized-paint and OSC controls; expand bare captured component-row LF into terminal CRLF. Replay all other captured ANSI in Kitty VT before rasterizing actual cells.",
+      "emulatorFiles": [
+        {
+          "file": "node_modules/kitty-vt-wasm/dist/index.js",
+          "sha256": "1e4858388ba3eae438f531bfe201951759266dcea72ea8f9f01ae9f73835aa43"
+        },
+        {
+          "file": "node_modules/kitty-vt-wasm/dist/terminal.js",
+          "sha256": "01e53d3436cf1fb3ca231325d7689c7e90763b1cea061f12aa1ccd9d3216a435"
+        },
+        {
+          "file": "node_modules/kitty-vt-wasm/dist/cells.js",
+          "sha256": "edbf5af5a31c7cd0ff95b46647ed3a93f74d2cdfb0af89bd0fab353418f411f9"
+        },
+        {
+          "file": "node_modules/kitty-vt-wasm/dist/screen.js",
+          "sha256": "8b1c37ae0e386d3653db595f07279e6f913bfe9cd3d50bace055c1c8d3e3430c"
+        },
+        {
+          "file": "node_modules/kitty-vt-wasm/dist/wasm.js",
+          "sha256": "47cbf543cbd539da52243952dfd2fb489973d6489284476055c05ca5a4962cd7"
+        },
+        {
+          "file": "node_modules/kitty-vt-wasm/dist/events.js",
+          "sha256": "4e8dddcb09595aa03960675bc16ca7b4adca051412b210cb60d4b7d140f34d3b"
+        },
+        {
+          "file": "node_modules/kitty-vt-wasm/dist/input.js",
+          "sha256": "89cf52d96e06d351ab44a0ca086b5df1567efc1acec98e5ab096b0d66de93a3e"
+        },
+        {
+          "file": "node_modules/kitty-vt-wasm/dist/kitty-vt.wasm",
+          "sha256": "e85c89f6d22231c4ad753c3d6ed30f69b4526d6f5fd4fdc84ef16ebc8ee2dec1"
+        }
+      ]
+    },
+    {
+      "file": "post95-series-domain-v18126-base101-bun144-r5-compiled-ansi-visual.json",
+      "sha256": "202c866f6c7824133ca80b7e68da9d6bdbf138e2759015fb2530825b2cb2277c",
+      "schema": "CoreforgeActualSeriesAnsiVisual",
+      "rendererSource": {
+        "file": "post95-series-domain-series-ansi-visual-proof.ts",
+        "sha256": "3db0b7767b8009022eb84a09a434120bb191239d107a1ed255713b7bfde7c73d"
+      },
+      "rendererExecutionChannel": "source-only offline artifact renderer",
+      "visualMaterialization": {
+        "file": "post95-series-domain-v18126-base101-bun144-r5-visual-materialized.json",
+        "sha256": "17aa5c5608cc12b79bf2189f3bf8d2952e323e5641a3bb92e651673908d95bfc"
+      },
+      "sourceManifest": {
+        "file": "post95-v18126-base101-bun144-r5-after-native-source-inputs.json",
+        "sha256": "9fac6a4f661d30de676261eee9fe6a1b5a391e884e430d96bf8b99cd3e0a7e4a"
+      },
+      "qualificationInputs": {
+        "file": "post95-series-base101-bun144-r5-f203-noreplay-qualification-inputs.json",
+        "sha256": "bbd3da6754d47cd5cf6ea57443a23fa4a52dc4c74c9deda28a470443d60afccb"
+      },
+      "domainPlan": {
+        "file": "post95-v18126-base101-bun144-r5-domain-plan.json",
+        "sha256": "d6816ed5e5fc15ce2375002885eb82bc805e3f0983198cb01247a331e0f36a5c"
+      },
+      "inputs": [
+        {
+          "domain": "presentation",
+          "boundFile": "post95-series-domain-v18126-base101-bun144-r5-presentation-compiled-bound.json",
+          "sha256": "ec9770034bf7e8a77b27bae2ea1520f75387c85d225ea8a390eaa7afa5df5462"
+        },
+        {
+          "domain": "async-media",
+          "boundFile": "post95-series-domain-v18126-base101-bun144-r5-async-media-compiled-bound.json",
+          "sha256": "0a67f0f7dee489ba17267d2ce5737d162752b260d6fb67f1abfa07077c38ec64"
+        }
+      ],
+      "normalization": "Strip synchronized-paint and OSC controls; expand bare captured component-row LF into terminal CRLF. Replay all other captured ANSI in Kitty VT before rasterizing actual cells.",
+      "emulatorFiles": [
+        {
+          "file": "node_modules/kitty-vt-wasm/dist/index.js",
+          "sha256": "1e4858388ba3eae438f531bfe201951759266dcea72ea8f9f01ae9f73835aa43"
+        },
+        {
+          "file": "node_modules/kitty-vt-wasm/dist/terminal.js",
+          "sha256": "01e53d3436cf1fb3ca231325d7689c7e90763b1cea061f12aa1ccd9d3216a435"
+        },
+        {
+          "file": "node_modules/kitty-vt-wasm/dist/cells.js",
+          "sha256": "edbf5af5a31c7cd0ff95b46647ed3a93f74d2cdfb0af89bd0fab353418f411f9"
+        },
+        {
+          "file": "node_modules/kitty-vt-wasm/dist/screen.js",
+          "sha256": "8b1c37ae0e386d3653db595f07279e6f913bfe9cd3d50bace055c1c8d3e3430c"
+        },
+        {
+          "file": "node_modules/kitty-vt-wasm/dist/wasm.js",
+          "sha256": "47cbf543cbd539da52243952dfd2fb489973d6489284476055c05ca5a4962cd7"
+        },
+        {
+          "file": "node_modules/kitty-vt-wasm/dist/events.js",
+          "sha256": "4e8dddcb09595aa03960675bc16ca7b4adca051412b210cb60d4b7d140f34d3b"
+        },
+        {
+          "file": "node_modules/kitty-vt-wasm/dist/input.js",
+          "sha256": "89cf52d96e06d351ab44a0ca086b5df1567efc1acec98e5ab096b0d66de93a3e"
+        },
+        {
+          "file": "node_modules/kitty-vt-wasm/dist/kitty-vt.wasm",
+          "sha256": "e85c89f6d22231c4ad753c3d6ed30f69b4526d6f5fd4fdc84ef16ebc8ee2dec1"
+        }
+      ]
+    },
+    {
+      "file": "post95-series-domain-v18126-base101-bun144-r5-approval-source-ansi-visual.json",
+      "sha256": "b1986e070441573aebe3806a30bd0a60760739f652c184584c3648f38a42423c",
+      "schema": "CoreforgeActualApprovalAnsiVisual",
+      "rendererSource": {
+        "file": "post95-series-domain-approval-ansi-visual.ts",
+        "sha256": "12409632ee46ee883f17ff31ee83aad7a7f3d5fdc9f3a746dbcc7197d7172058"
+      },
+      "rendererExecutionChannel": "source-only offline artifact renderer",
+      "visualMaterialization": {
+        "file": "post95-series-domain-v18126-base101-bun144-r5-visual-materialized.json",
+        "sha256": "17aa5c5608cc12b79bf2189f3bf8d2952e323e5641a3bb92e651673908d95bfc"
+      },
+      "sourceManifest": {
+        "file": "post95-v18126-base101-bun144-r5-after-native-source-inputs.json",
+        "sha256": "9fac6a4f661d30de676261eee9fe6a1b5a391e884e430d96bf8b99cd3e0a7e4a"
+      },
+      "qualificationInputs": {
+        "file": "post95-series-base101-bun144-r5-f203-noreplay-qualification-inputs.json",
+        "sha256": "bbd3da6754d47cd5cf6ea57443a23fa4a52dc4c74c9deda28a470443d60afccb"
+      },
+      "domainPlan": {
+        "file": "post95-v18126-base101-bun144-r5-domain-plan.json",
+        "sha256": "d6816ed5e5fc15ce2375002885eb82bc805e3f0983198cb01247a331e0f36a5c"
+      },
+      "inputs": [],
+      "boundReceipt": {
+        "file": "post95-series-domain-v18126-base101-bun144-r5-approval-source-bound.json",
+        "sha256": "f0aa480bbbe88fbc8dd2bfd6d40b669e497a4fa86f1c478a313153cfd1c9e90c"
+      },
+      "limits": "Actual component ANSI replayed in Kitty VT and rasterized with available host fonts. Native protocol layout and physical Tern/font pixels are not inferred.",
+      "emulatorFiles": [
+        {
+          "file": "node_modules/kitty-vt-wasm/dist/index.js",
+          "sha256": "1e4858388ba3eae438f531bfe201951759266dcea72ea8f9f01ae9f73835aa43"
+        },
+        {
+          "file": "node_modules/kitty-vt-wasm/dist/terminal.js",
+          "sha256": "01e53d3436cf1fb3ca231325d7689c7e90763b1cea061f12aa1ccd9d3216a435"
+        },
+        {
+          "file": "node_modules/kitty-vt-wasm/dist/cells.js",
+          "sha256": "edbf5af5a31c7cd0ff95b46647ed3a93f74d2cdfb0af89bd0fab353418f411f9"
+        },
+        {
+          "file": "node_modules/kitty-vt-wasm/dist/screen.js",
+          "sha256": "8b1c37ae0e386d3653db595f07279e6f913bfe9cd3d50bace055c1c8d3e3430c"
+        },
+        {
+          "file": "node_modules/kitty-vt-wasm/dist/wasm.js",
+          "sha256": "47cbf543cbd539da52243952dfd2fb489973d6489284476055c05ca5a4962cd7"
+        },
+        {
+          "file": "node_modules/kitty-vt-wasm/dist/events.js",
+          "sha256": "4e8dddcb09595aa03960675bc16ca7b4adca051412b210cb60d4b7d140f34d3b"
+        },
+        {
+          "file": "node_modules/kitty-vt-wasm/dist/input.js",
+          "sha256": "89cf52d96e06d351ab44a0ca086b5df1567efc1acec98e5ab096b0d66de93a3e"
+        },
+        {
+          "file": "node_modules/kitty-vt-wasm/dist/kitty-vt.wasm",
+          "sha256": "e85c89f6d22231c4ad753c3d6ed30f69b4526d6f5fd4fdc84ef16ebc8ee2dec1"
+        }
+      ]
+    },
+    {
+      "file": "post95-series-domain-v18126-base101-bun144-r5-approval-compiled-ansi-visual.json",
+      "sha256": "1f77535e2ef61bd4c6cb154e9bf7fdb2e7214b666329b56d421ba7871db082a7",
+      "schema": "CoreforgeActualApprovalAnsiVisual",
+      "rendererSource": {
+        "file": "post95-series-domain-approval-ansi-visual.ts",
+        "sha256": "12409632ee46ee883f17ff31ee83aad7a7f3d5fdc9f3a746dbcc7197d7172058"
+      },
+      "rendererExecutionChannel": "source-only offline artifact renderer",
+      "visualMaterialization": {
+        "file": "post95-series-domain-v18126-base101-bun144-r5-visual-materialized.json",
+        "sha256": "17aa5c5608cc12b79bf2189f3bf8d2952e323e5641a3bb92e651673908d95bfc"
+      },
+      "sourceManifest": {
+        "file": "post95-v18126-base101-bun144-r5-after-native-source-inputs.json",
+        "sha256": "9fac6a4f661d30de676261eee9fe6a1b5a391e884e430d96bf8b99cd3e0a7e4a"
+      },
+      "qualificationInputs": {
+        "file": "post95-series-base101-bun144-r5-f203-noreplay-qualification-inputs.json",
+        "sha256": "bbd3da6754d47cd5cf6ea57443a23fa4a52dc4c74c9deda28a470443d60afccb"
+      },
+      "domainPlan": {
+        "file": "post95-v18126-base101-bun144-r5-domain-plan.json",
+        "sha256": "d6816ed5e5fc15ce2375002885eb82bc805e3f0983198cb01247a331e0f36a5c"
+      },
+      "inputs": [],
+      "boundReceipt": {
+        "file": "post95-series-domain-v18126-base101-bun144-r5-approval-compiled-bound.json",
+        "sha256": "5ff614cae381c1e2f53ba302c4ce050f820464124f4a231717a69b56f46e0bb7"
+      },
+      "limits": "Actual component ANSI replayed in Kitty VT and rasterized with available host fonts. Native protocol layout and physical Tern/font pixels are not inferred.",
+      "emulatorFiles": [
+        {
+          "file": "node_modules/kitty-vt-wasm/dist/index.js",
+          "sha256": "1e4858388ba3eae438f531bfe201951759266dcea72ea8f9f01ae9f73835aa43"
+        },
+        {
+          "file": "node_modules/kitty-vt-wasm/dist/terminal.js",
+          "sha256": "01e53d3436cf1fb3ca231325d7689c7e90763b1cea061f12aa1ccd9d3216a435"
+        },
+        {
+          "file": "node_modules/kitty-vt-wasm/dist/cells.js",
+          "sha256": "edbf5af5a31c7cd0ff95b46647ed3a93f74d2cdfb0af89bd0fab353418f411f9"
+        },
+        {
+          "file": "node_modules/kitty-vt-wasm/dist/screen.js",
+          "sha256": "8b1c37ae0e386d3653db595f07279e6f913bfe9cd3d50bace055c1c8d3e3430c"
+        },
+        {
+          "file": "node_modules/kitty-vt-wasm/dist/wasm.js",
+          "sha256": "47cbf543cbd539da52243952dfd2fb489973d6489284476055c05ca5a4962cd7"
+        },
+        {
+          "file": "node_modules/kitty-vt-wasm/dist/events.js",
+          "sha256": "4e8dddcb09595aa03960675bc16ca7b4adca051412b210cb60d4b7d140f34d3b"
+        },
+        {
+          "file": "node_modules/kitty-vt-wasm/dist/input.js",
+          "sha256": "89cf52d96e06d351ab44a0ca086b5df1567efc1acec98e5ab096b0d66de93a3e"
+        },
+        {
+          "file": "node_modules/kitty-vt-wasm/dist/kitty-vt.wasm",
+          "sha256": "e85c89f6d22231c4ad753c3d6ed30f69b4526d6f5fd4fdc84ef16ebc8ee2dec1"
+        }
+      ]
+    },
+    {
+      "file": "post95-series-domain-v18126-base101-bun144-r5-title-ansi-visual.json",
+      "sha256": "cb57476836c10941af85bbeea6fab437bef16f38799a2640b284007b4757fd74",
+      "schema": "CoreforgeSeriesTitleCapturedAnsiVisual",
+      "rendererSource": {
+        "file": "post95-series-domain-series-title-ansi-visual-proof.ts",
+        "sha256": "88ba3198f556ac34d8c321eb89a7ebddc3778ed4b8c2446c27cdf94dce22e665"
+      },
+      "rendererExecutionChannel": "Source-only offline renderer of exact captured source/compiled ANSI; no UI reconstruction",
+      "visualMaterialization": {
+        "file": "post95-series-domain-v18126-base101-bun144-r5-visual-materialized.json",
+        "sha256": "17aa5c5608cc12b79bf2189f3bf8d2952e323e5641a3bb92e651673908d95bfc"
+      },
+      "sourceManifest": {
+        "file": "post95-v18126-base101-bun144-r5-after-native-source-inputs.json",
+        "sha256": "9fac6a4f661d30de676261eee9fe6a1b5a391e884e430d96bf8b99cd3e0a7e4a"
+      },
+      "qualificationInputs": {
+        "file": "post95-series-base101-bun144-r5-f203-noreplay-qualification-inputs.json",
+        "sha256": "bbd3da6754d47cd5cf6ea57443a23fa4a52dc4c74c9deda28a470443d60afccb"
+      },
+      "domainPlan": {
+        "file": "post95-v18126-base101-bun144-r5-domain-plan.json",
+        "sha256": "d6816ed5e5fc15ce2375002885eb82bc805e3f0983198cb01247a331e0f36a5c"
+      },
+      "inputs": [
+        {
+          "mode": "source",
+          "boundFile": "post95-series-domain-v18126-base101-bun144-r5-title-source-bound.json",
+          "sha256": "effc0447250d64d78f9735d2d92322d988a7b9590b2acb5a22047000ac2302f8"
+        },
+        {
+          "mode": "compiled",
+          "boundFile": "post95-series-domain-v18126-base101-bun144-r5-title-compiled-bound.json",
+          "sha256": "0aa6fe6b2e7a5cf91a01e575a090b27809b9a03ed0fdcb920b2f8ccbccf7b728"
+        }
+      ],
+      "emulatorFiles": [
+        {
+          "file": "node_modules/kitty-vt-wasm/dist/index.js",
+          "sha256": "1e4858388ba3eae438f531bfe201951759266dcea72ea8f9f01ae9f73835aa43"
+        },
+        {
+          "file": "node_modules/kitty-vt-wasm/dist/terminal.js",
+          "sha256": "01e53d3436cf1fb3ca231325d7689c7e90763b1cea061f12aa1ccd9d3216a435"
+        },
+        {
+          "file": "node_modules/kitty-vt-wasm/dist/cells.js",
+          "sha256": "edbf5af5a31c7cd0ff95b46647ed3a93f74d2cdfb0af89bd0fab353418f411f9"
+        },
+        {
+          "file": "node_modules/kitty-vt-wasm/dist/screen.js",
+          "sha256": "8b1c37ae0e386d3653db595f07279e6f913bfe9cd3d50bace055c1c8d3e3430c"
+        },
+        {
+          "file": "node_modules/kitty-vt-wasm/dist/wasm.js",
+          "sha256": "47cbf543cbd539da52243952dfd2fb489973d6489284476055c05ca5a4962cd7"
+        },
+        {
+          "file": "node_modules/kitty-vt-wasm/dist/events.js",
+          "sha256": "4e8dddcb09595aa03960675bc16ca7b4adca051412b210cb60d4b7d140f34d3b"
+        },
+        {
+          "file": "node_modules/kitty-vt-wasm/dist/input.js",
+          "sha256": "89cf52d96e06d351ab44a0ca086b5df1567efc1acec98e5ab096b0d66de93a3e"
+        },
+        {
+          "file": "node_modules/kitty-vt-wasm/dist/kitty-vt.wasm",
+          "sha256": "e85c89f6d22231c4ad753c3d6ed30f69b4526d6f5fd4fdc84ef16ebc8ee2dec1"
+        }
+      ]
+    }
+  ],
+  "images": [
+    {
+      "mode": "source",
+      "domain": "presentation",
+      "index": 0,
+      "id": "presentation/tree.ansi",
+      "file": "source-presentation-tree.png",
+      "sha256": "397fb111b82111c6a5875eb16f1c68feb480c18094f1f8595a6175ee91812b9e",
+      "bytes": 15247,
+      "columns": 120,
+      "rows": 15,
+      "report": 0,
+      "originalFile": "presentation-0-0-tree.png",
+      "originalLabel": "presentation-0-0-tree",
+      "ansiSha256": "2d7dd1b012f57f4e42a825fcaa87b13c359e38e6c2ee48b6e4bbd7746db0493e",
+      "svgSha256": "7292074f9887af7c30c76249a12c422d0d45a794923fff4298ded5bb29c93d83",
+      "cellsSha256": "4a5f5a4d9238ada2de9faf8af85e000f36f8fbee7c72fc636942268fcf4d7408"
+    },
+    {
+      "mode": "source",
+      "domain": "presentation",
+      "index": 1,
+      "id": "presentation/model-picker.ansi",
+      "file": "source-presentation-model-picker.png",
+      "sha256": "7c1cf27838472bc7aaff9b7dbbb7ab3367aa128f29dc655a3c24a3026ffe8149",
+      "bytes": 32722,
+      "columns": 150,
+      "rows": 42,
+      "report": 0,
+      "originalFile": "presentation-1-1-model-picker.png",
+      "originalLabel": "presentation-1-1-model-picker",
+      "ansiSha256": "d0851660cf5c7cb5fbb4da045f08c59991e931cbfa6512359fbde9d312baea88",
+      "svgSha256": "85852effb38fa78573ccf581e981fc5ea8db0302e78236a025679524e8bb8f5b",
+      "cellsSha256": "6e2c03341f2a1674eb9008a89960bdd103d756a0ce71963f269e08f2b5141a88"
+    },
+    {
+      "mode": "source",
+      "domain": "presentation",
+      "index": 2,
+      "id": "presentation/image-diff.ansi",
+      "file": "source-presentation-image-diff.png",
+      "sha256": "fa28b4e478f43410d85b24d018bb6c1ead6fd74643dd4fb37129d21cdadb2d96",
+      "bytes": 5453,
+      "columns": 100,
+      "rows": 14,
+      "report": 0,
+      "originalFile": "presentation-2-3-image-diff.png",
+      "originalLabel": "presentation-2-3-image-diff",
+      "ansiSha256": "121893c22e7a42178b7d9c3a62d15014db6c3e011528face62dcad057c0e01d2",
+      "svgSha256": "29e973d87fc032b88f70c7c64ca7bc1a84b199bdccbb34816315903a9af7ce73",
+      "cellsSha256": "07145c074c91f58f3c5bfd5165c93178378978f72c6b5be013101e1e743ba19f"
+    },
+    {
+      "mode": "source",
+      "domain": "presentation",
+      "index": 3,
+      "id": "presentation/binary-diff.ansi",
+      "file": "source-presentation-binary-diff.png",
+      "sha256": "9087e0c8544edeee50204d747dfe7a893e91ad76d88111b47d7b8839adb53447",
+      "bytes": 5629,
+      "columns": 100,
+      "rows": 14,
+      "report": 0,
+      "originalFile": "presentation-3-4-binary-diff.png",
+      "originalLabel": "presentation-3-4-binary-diff",
+      "ansiSha256": "996673b0dda7a40e9f1bf986e948ed4415bdec814391b745fc578596ff0a45a5",
+      "svgSha256": "2cfd77bae327fce64dbd1ca864d2077d6dda505cb2c6557e899876088f5b8a06",
+      "cellsSha256": "b749f80d5ef42ca0f978fe49e0318a70630596454368c0e1e178494ac9cf0973"
+    },
+    {
+      "mode": "source",
+      "domain": "async-media",
+      "index": 0,
+      "id": "async-media/bash-completed.ansi",
+      "file": "source-async-media-bash-completed.png",
+      "sha256": "e0055ba213a9513260aa17390d8a0e56ea535e6b5eac12e48dd7f1effc12d20a",
+      "bytes": 33435,
+      "columns": 108,
+      "rows": 14,
+      "report": 0,
+      "originalFile": "async-media-0-1-cfpd_a11f6f006fba433286fcf3686ec73e94-bash-completed.png",
+      "originalLabel": "async-media-0-1-cfpd_a11f6f006fba433286fcf3686ec73e94-bash-completed",
+      "ansiSha256": "9d6bffe4423fb784f69964393ad3d70b7192756877903cc8d0ab891b0d346c1a",
+      "svgSha256": "4c1c3da3903611a9889fc2854ab6efc709f216e91b9abec5304b867cc6ca6809",
+      "cellsSha256": "c98594ccf8e02b71ca0796fe4fec94d60954a89123d16a6d730d014665e7cdd0"
+    },
+    {
+      "mode": "source",
+      "domain": "async-media",
+      "index": 1,
+      "id": "async-media/bash-failed.ansi",
+      "file": "source-async-media-bash-failed.png",
+      "sha256": "616fd47a14dc7d51b542ff09bae87d63dd50be1e71bad34217dcacb3534460be",
+      "bytes": 32726,
+      "columns": 108,
+      "rows": 14,
+      "report": 0,
+      "originalFile": "async-media-1-3-cfpd_a11f6f006fba433286fcf3686ec73e94-bash-failed.png",
+      "originalLabel": "async-media-1-3-cfpd_a11f6f006fba433286fcf3686ec73e94-bash-failed",
+      "ansiSha256": "c06f05295b75931f974f7116e041e8088adefd258cacfa3bbc3cdf0b176a468d",
+      "svgSha256": "dab100cacea52d7ef532d10734a201d5084affbb6052c833634f6b096e9c5896",
+      "cellsSha256": "b854f7f9251a9c958ad002bb96d0a2a395be276e35baa6fcb50eea2df0748d3e"
+    },
+    {
+      "mode": "source",
+      "domain": "async-media",
+      "index": 2,
+      "id": "async-media/bash-cancelled.ansi",
+      "file": "source-async-media-bash-cancelled.png",
+      "sha256": "0897f6d0db02c554c70ad636a7a65d7fc0e2f6ea1856d69639e5e082ed5dd794",
+      "bytes": 30050,
+      "columns": 108,
+      "rows": 14,
+      "report": 0,
+      "originalFile": "async-media-2-5-cfpd_a11f6f006fba433286fcf3686ec73e94-bash-cancelled.png",
+      "originalLabel": "async-media-2-5-cfpd_a11f6f006fba433286fcf3686ec73e94-bash-cancelled",
+      "ansiSha256": "61092023a50d94e023c7a6471850dab9e051f5b428743d7b5e194248f5559aa2",
+      "svgSha256": "7e860e9983203fca149a769ad8e6a33418d7d5375c298237b68e1aff4017b5d6",
+      "cellsSha256": "698c3108f4840f7ec4adb11a2ba6d3ab8fe54dd0fda0575f6100e21d25b5b087"
+    },
+    {
+      "mode": "source",
+      "domain": "async-media",
+      "index": 3,
+      "id": "async-media/bash-disposed.ansi",
+      "file": "source-async-media-bash-disposed.png",
+      "sha256": "e8e0fc8004f73dd976f3bd9a32576211b498a3748afac216dfab76576cb39c96",
+      "bytes": 30290,
+      "columns": 108,
+      "rows": 14,
+      "report": 0,
+      "originalFile": "async-media-3-7-cfpd_a11f6f006fba433286fcf3686ec73e94-bash-disposed.png",
+      "originalLabel": "async-media-3-7-cfpd_a11f6f006fba433286fcf3686ec73e94-bash-disposed",
+      "ansiSha256": "7fdd6ac575add2549eae20b9133567e1d54fce68c6e638763a2657b7c9063827",
+      "svgSha256": "ba9a8827f747559209a854e1fa5ab73f982055f37d83edc73ffd2c8de42c50ad",
+      "cellsSha256": "79853dee6e8a6e1201d344e445a093418ebaa655f36b2461a065f5ddb70c81e7"
+    },
+    {
+      "mode": "source",
+      "domain": "async-media",
+      "index": 4,
+      "id": "async-media/eval-completed.ansi",
+      "file": "source-async-media-eval-completed.png",
+      "sha256": "eb5f6dedf6445402a3057a518cd215f3e42a4363631cef30145cceb11027a86b",
+      "bytes": 67041,
+      "columns": 108,
+      "rows": 29,
+      "report": 0,
+      "originalFile": "async-media-4-10-cfpd_a11f6f006fba433286fcf3686ec73e94-eval-completed.png",
+      "originalLabel": "async-media-4-10-cfpd_a11f6f006fba433286fcf3686ec73e94-eval-completed",
+      "ansiSha256": "c850191bf97bef70f6c697d895c8068ae277397083ea8d32998ad677046f4233",
+      "svgSha256": "4f89e5dc7b5df5daf0ceca2eb1ab8cf9dca3afa05704a40d18238f7a8ed0f9ef",
+      "cellsSha256": "7b63913ee91b3575b7fa98664331bb79f148c3dc4a50d5b734d0b9ba500342b8"
+    },
+    {
+      "mode": "source",
+      "domain": "async-media",
+      "index": 5,
+      "id": "async-media/eval-failed.ansi",
+      "file": "source-async-media-eval-failed.png",
+      "sha256": "0f386fdc82749657322352ca54d678f61da2a33e22632c5f0f30a7591ad52522",
+      "bytes": 110923,
+      "columns": 108,
+      "rows": 44,
+      "report": 0,
+      "originalFile": "async-media-5-13-cfpd_a11f6f006fba433286fcf3686ec73e94-eval-failed.png",
+      "originalLabel": "async-media-5-13-cfpd_a11f6f006fba433286fcf3686ec73e94-eval-failed",
+      "ansiSha256": "4033019ea41fb9e69fba714d8816a9c640cae6075c106dd07c9ac7fbf69b7dec",
+      "svgSha256": "eae367b16ad41592a67c29c64a20f7a677e2412d83dc036f55b1251918cb5eb3",
+      "cellsSha256": "c7645fc6227e29977964932394156a5c28bea788e8bf8f20f169a1a3ba4a98bd"
+    },
+    {
+      "mode": "source",
+      "domain": "async-media",
+      "index": 6,
+      "id": "async-media/eval-cancelled.ansi",
+      "file": "source-async-media-eval-cancelled.png",
+      "sha256": "dedee74f6f38228651a76b9f33646875cffa5984d8af1b81f7ccdfc4f0bbafb5",
+      "bytes": 57265,
+      "columns": 108,
+      "rows": 24,
+      "report": 0,
+      "originalFile": "async-media-6-15-cfpd_a11f6f006fba433286fcf3686ec73e94-eval-cancelled.png",
+      "originalLabel": "async-media-6-15-cfpd_a11f6f006fba433286fcf3686ec73e94-eval-cancelled",
+      "ansiSha256": "f0fa26fb9fe58143ae23f7ba09a95e6ed1a4e5297a8fa0641f55f05c4b372478",
+      "svgSha256": "df3a8429df653b4d9abda5985e5092b6e1eaf9d9f3c355b5ab7128b6627f41fe",
+      "cellsSha256": "d68c3631e4cbc90fef8bd9e35cf0cbb02978f98fc0c7cc8a00291b745700dfa8"
+    },
+    {
+      "mode": "source",
+      "domain": "async-media",
+      "index": 7,
+      "id": "async-media/eval-disposed.ansi",
+      "file": "source-async-media-eval-disposed.png",
+      "sha256": "c36f82f8c731170d4ef4d8a77efb9b0b16dd4613d2947548e4711377a79a44d8",
+      "bytes": 59448,
+      "columns": 108,
+      "rows": 26,
+      "report": 0,
+      "originalFile": "async-media-7-18-cfpd_a11f6f006fba433286fcf3686ec73e94-eval-disposed.png",
+      "originalLabel": "async-media-7-18-cfpd_a11f6f006fba433286fcf3686ec73e94-eval-disposed",
+      "ansiSha256": "c9a90c42a3d523c4915b2d12d483a1395926cbc17b874770c4b1a28f740d1bdc",
+      "svgSha256": "52f37827560324db2afef81f4925b96a9044fb3e2672587eb725b21355badadd",
+      "cellsSha256": "81e004dee5b7fe4723270ca2b1b443b9f1c05fc7f9a2f4f4a6d9cf10039ed0c6"
+    },
+    {
+      "mode": "source",
+      "domain": "async-media",
+      "index": 8,
+      "id": "async-media/assistant.ansi",
+      "file": "source-async-media-assistant.png",
+      "sha256": "6c7b708e7c8ea119d4a1669b3e4244afa81d64c2d51dc0ff07d1ad7c00f95a7b",
+      "bytes": 5429,
+      "columns": 108,
+      "rows": 14,
+      "report": 0,
+      "originalFile": "async-media-8-26-assistant.png",
+      "originalLabel": "async-media-8-26-assistant",
+      "ansiSha256": "948186483ce7a9801821261507df4a9df07a931f814eb5e95fb602cd9f747021",
+      "svgSha256": "2e4d617b2246594a2b8a627e405b8d4ab095e8b515f960fc4f39e82e4b698d1a",
+      "cellsSha256": "07c03d2b272a1e0d8852957412dc77c863d6279fd4d3dd9af038c82d2ae5e7c5"
+    },
+    {
+      "mode": "compiled",
+      "domain": "presentation",
+      "index": 0,
+      "id": "presentation/tree.ansi",
+      "file": "compiled-presentation-tree.png",
+      "sha256": "397fb111b82111c6a5875eb16f1c68feb480c18094f1f8595a6175ee91812b9e",
+      "bytes": 15247,
+      "columns": 120,
+      "rows": 15,
+      "report": 1,
+      "originalFile": "presentation-0-0-tree.png",
+      "originalLabel": "presentation-0-0-tree",
+      "ansiSha256": "2d7dd1b012f57f4e42a825fcaa87b13c359e38e6c2ee48b6e4bbd7746db0493e",
+      "svgSha256": "7292074f9887af7c30c76249a12c422d0d45a794923fff4298ded5bb29c93d83",
+      "cellsSha256": "4a5f5a4d9238ada2de9faf8af85e000f36f8fbee7c72fc636942268fcf4d7408"
+    },
+    {
+      "mode": "compiled",
+      "domain": "presentation",
+      "index": 1,
+      "id": "presentation/model-picker.ansi",
+      "file": "compiled-presentation-model-picker.png",
+      "sha256": "7c1cf27838472bc7aaff9b7dbbb7ab3367aa128f29dc655a3c24a3026ffe8149",
+      "bytes": 32722,
+      "columns": 150,
+      "rows": 42,
+      "report": 1,
+      "originalFile": "presentation-1-1-model-picker.png",
+      "originalLabel": "presentation-1-1-model-picker",
+      "ansiSha256": "d0851660cf5c7cb5fbb4da045f08c59991e931cbfa6512359fbde9d312baea88",
+      "svgSha256": "85852effb38fa78573ccf581e981fc5ea8db0302e78236a025679524e8bb8f5b",
+      "cellsSha256": "6e2c03341f2a1674eb9008a89960bdd103d756a0ce71963f269e08f2b5141a88"
+    },
+    {
+      "mode": "compiled",
+      "domain": "presentation",
+      "index": 2,
+      "id": "presentation/image-diff.ansi",
+      "file": "compiled-presentation-image-diff.png",
+      "sha256": "fa28b4e478f43410d85b24d018bb6c1ead6fd74643dd4fb37129d21cdadb2d96",
+      "bytes": 5453,
+      "columns": 100,
+      "rows": 14,
+      "report": 1,
+      "originalFile": "presentation-2-3-image-diff.png",
+      "originalLabel": "presentation-2-3-image-diff",
+      "ansiSha256": "121893c22e7a42178b7d9c3a62d15014db6c3e011528face62dcad057c0e01d2",
+      "svgSha256": "29e973d87fc032b88f70c7c64ca7bc1a84b199bdccbb34816315903a9af7ce73",
+      "cellsSha256": "07145c074c91f58f3c5bfd5165c93178378978f72c6b5be013101e1e743ba19f"
+    },
+    {
+      "mode": "compiled",
+      "domain": "presentation",
+      "index": 3,
+      "id": "presentation/binary-diff.ansi",
+      "file": "compiled-presentation-binary-diff.png",
+      "sha256": "9087e0c8544edeee50204d747dfe7a893e91ad76d88111b47d7b8839adb53447",
+      "bytes": 5629,
+      "columns": 100,
+      "rows": 14,
+      "report": 1,
+      "originalFile": "presentation-3-4-binary-diff.png",
+      "originalLabel": "presentation-3-4-binary-diff",
+      "ansiSha256": "996673b0dda7a40e9f1bf986e948ed4415bdec814391b745fc578596ff0a45a5",
+      "svgSha256": "2cfd77bae327fce64dbd1ca864d2077d6dda505cb2c6557e899876088f5b8a06",
+      "cellsSha256": "b749f80d5ef42ca0f978fe49e0318a70630596454368c0e1e178494ac9cf0973"
+    },
+    {
+      "mode": "compiled",
+      "domain": "async-media",
+      "index": 0,
+      "id": "async-media/bash-completed.ansi",
+      "file": "compiled-async-media-bash-completed.png",
+      "sha256": "dcbbce241c80ca15c66f42d2ab47bd949621221fab3c8b98b99d221ad46a12cf",
+      "bytes": 33650,
+      "columns": 108,
+      "rows": 14,
+      "report": 1,
+      "originalFile": "async-media-0-1-cfpd_a39c9a010a624f989718911bf4b564a4-bash-completed.png",
+      "originalLabel": "async-media-0-1-cfpd_a39c9a010a624f989718911bf4b564a4-bash-completed",
+      "ansiSha256": "9f67ad9ea143a4dc990d719b20a5bb41cb80a624f616299a36deb4f39fbef8e8",
+      "svgSha256": "18f6cd7b64158796fa6f25f49eabdff3fa67c49f7d94209805c1c5e7c90d6c80",
+      "cellsSha256": "933f156433e30a43153b9ae1bc34a0f68a567a547762e767a14acfe6a1bbf79f"
+    },
+    {
+      "mode": "compiled",
+      "domain": "async-media",
+      "index": 1,
+      "id": "async-media/bash-failed.ansi",
+      "file": "compiled-async-media-bash-failed.png",
+      "sha256": "74fa9861f234d271d245066c96de61df16d78a2f83796fd1bf7c091dc1ded9ea",
+      "bytes": 33090,
+      "columns": 108,
+      "rows": 14,
+      "report": 1,
+      "originalFile": "async-media-1-3-cfpd_a39c9a010a624f989718911bf4b564a4-bash-failed.png",
+      "originalLabel": "async-media-1-3-cfpd_a39c9a010a624f989718911bf4b564a4-bash-failed",
+      "ansiSha256": "4bd448f50e3471d62c52163b1cc27618992105177dd2eb005850b803ead82cf4",
+      "svgSha256": "838ceb485358d2eeb2f54f267f9028c269906f1cbd976ffbcba16863c66646b2",
+      "cellsSha256": "50257ca362d7f0466acead3e895dbe33541d1db62bf6c41259c1656781a7bb93"
+    },
+    {
+      "mode": "compiled",
+      "domain": "async-media",
+      "index": 2,
+      "id": "async-media/bash-cancelled.ansi",
+      "file": "compiled-async-media-bash-cancelled.png",
+      "sha256": "005671580ce722585fd714851f5002e8e886579b0b8996270689010fa2306d70",
+      "bytes": 30323,
+      "columns": 108,
+      "rows": 14,
+      "report": 1,
+      "originalFile": "async-media-2-5-cfpd_a39c9a010a624f989718911bf4b564a4-bash-cancelled.png",
+      "originalLabel": "async-media-2-5-cfpd_a39c9a010a624f989718911bf4b564a4-bash-cancelled",
+      "ansiSha256": "5225269863380c83233e72de87c4c88044f1574a0b33c20a9136feb04c0d8cd8",
+      "svgSha256": "7fc7eeb888390b8a00070c5a9afeab8489bb167ee5473f01f4f001766e5ef61b",
+      "cellsSha256": "9607cbbca9acf6bedc3fd522e6bf885c1e7465b51a55232f8b2a2c4f1a298880"
+    },
+    {
+      "mode": "compiled",
+      "domain": "async-media",
+      "index": 3,
+      "id": "async-media/bash-disposed.ansi",
+      "file": "compiled-async-media-bash-disposed.png",
+      "sha256": "f1c8b94dd7dc7f29720485dae6fcfbdacaeed3b666d5cc54731bb3ff98c0df04",
+      "bytes": 30503,
+      "columns": 108,
+      "rows": 14,
+      "report": 1,
+      "originalFile": "async-media-3-7-cfpd_a39c9a010a624f989718911bf4b564a4-bash-disposed.png",
+      "originalLabel": "async-media-3-7-cfpd_a39c9a010a624f989718911bf4b564a4-bash-disposed",
+      "ansiSha256": "1a6438ccc71384cac63189c7f3dabac3b0380c581275968db1ac67eea60009ce",
+      "svgSha256": "986819ac71f6768a127edfc80c94992f459541a708e7974dc1bfb8a62cfbe307",
+      "cellsSha256": "a0834c44cd48d235e5dc662882356abb76eac5352702918b0c901346ec11e2cc"
+    },
+    {
+      "mode": "compiled",
+      "domain": "async-media",
+      "index": 4,
+      "id": "async-media/eval-completed.ansi",
+      "file": "compiled-async-media-eval-completed.png",
+      "sha256": "1f0f12928f07e65df97daf7a40e8e68c1546b7662cb3fb7e63f34c2a7fde4c4f",
+      "bytes": 67433,
+      "columns": 108,
+      "rows": 29,
+      "report": 1,
+      "originalFile": "async-media-4-10-cfpd_a39c9a010a624f989718911bf4b564a4-eval-completed.png",
+      "originalLabel": "async-media-4-10-cfpd_a39c9a010a624f989718911bf4b564a4-eval-completed",
+      "ansiSha256": "6b7d754bd9213602a56989c2995d5731fdb2b1fa3896b48793a2c3389e18276b",
+      "svgSha256": "9b880cd69f0d9fdd55db2fbd315a9f9493016061eb713e621dfff088049b9f60",
+      "cellsSha256": "1c4441d7b1f103c14534534b529cc2b0cd04c2e51b93242caf17b88e183e1a86"
+    },
+    {
+      "mode": "compiled",
+      "domain": "async-media",
+      "index": 5,
+      "id": "async-media/eval-failed.ansi",
+      "file": "compiled-async-media-eval-failed.png",
+      "sha256": "ffc570705bbffcccf31adf21f91c27cce36e32b021d36356e7ba531c3c76d9de",
+      "bytes": 114987,
+      "columns": 108,
+      "rows": 44,
+      "report": 1,
+      "originalFile": "async-media-5-13-cfpd_a39c9a010a624f989718911bf4b564a4-eval-failed.png",
+      "originalLabel": "async-media-5-13-cfpd_a39c9a010a624f989718911bf4b564a4-eval-failed",
+      "ansiSha256": "3bfb9bdc5e380e1f365b908042f00d27243eb804067034dc10b433452975d78a",
+      "svgSha256": "1a3aaa83c18b37fdb1207096fc968dc4edd6f017061b54fb7f82250296a55ce6",
+      "cellsSha256": "b3605bf544ec4b72defc82a527f83331534a5e2b724f1a414321020d0ec697ca"
+    },
+    {
+      "mode": "compiled",
+      "domain": "async-media",
+      "index": 6,
+      "id": "async-media/eval-cancelled.ansi",
+      "file": "compiled-async-media-eval-cancelled.png",
+      "sha256": "11e6651d8a96135ef1557587bbe2e4df257380762dc94853ed4afd71abb91a2a",
+      "bytes": 57669,
+      "columns": 108,
+      "rows": 24,
+      "report": 1,
+      "originalFile": "async-media-6-15-cfpd_a39c9a010a624f989718911bf4b564a4-eval-cancelled.png",
+      "originalLabel": "async-media-6-15-cfpd_a39c9a010a624f989718911bf4b564a4-eval-cancelled",
+      "ansiSha256": "fb1fd9b99e38eee960fdeb5ef38724e30dd043825b182652e7ba85950cb5930c",
+      "svgSha256": "b7e101b5438b3ef7c59493a10eb9d2c88a1f43997df1e8ccda9cfda93e9d5bcf",
+      "cellsSha256": "d35cc36030f041924b1917d7ee169128847b05e0f02363c63e12761c490fe5be"
+    },
+    {
+      "mode": "compiled",
+      "domain": "async-media",
+      "index": 7,
+      "id": "async-media/eval-disposed.ansi",
+      "file": "compiled-async-media-eval-disposed.png",
+      "sha256": "450b651b75e8834583b3a17b41197881e005ebe85e2cb04a1c25bfbef90f3ff2",
+      "bytes": 59773,
+      "columns": 108,
+      "rows": 26,
+      "report": 1,
+      "originalFile": "async-media-7-18-cfpd_a39c9a010a624f989718911bf4b564a4-eval-disposed.png",
+      "originalLabel": "async-media-7-18-cfpd_a39c9a010a624f989718911bf4b564a4-eval-disposed",
+      "ansiSha256": "40057431462109992335ba39f2c878c37f1566c21a685136bac9af354132a8e0",
+      "svgSha256": "3bc8f1143be611c5417c5ea10509545af2a88a62fc4126afd8ead090dbde0be5",
+      "cellsSha256": "5eae92b1065677508df43808131cc674ae6fe7acde36f10535c04007dd5cc83b"
+    },
+    {
+      "mode": "compiled",
+      "domain": "async-media",
+      "index": 8,
+      "id": "async-media/assistant.ansi",
+      "file": "compiled-async-media-assistant.png",
+      "sha256": "a2077a244c50dbd771026f72581eed4126f7cea390a1e1d742f78e96f277b168",
+      "bytes": 5522,
+      "columns": 108,
+      "rows": 14,
+      "report": 1,
+      "originalFile": "async-media-8-26-assistant.png",
+      "originalLabel": "async-media-8-26-assistant",
+      "ansiSha256": "0a7543acd05ee21a674ad4428c8303be16ad896cb1cb07efe45d38c9fde5dc26",
+      "svgSha256": "068f236cb6e083d792fb6ba0696f5e18660101b02bd345dc70129415eaf2b0bd",
+      "cellsSha256": "0662209b8a3bbbb5c3be98a98456135ad1d38287a9db630d56cef9814ac12bfe"
+    },
+    {
+      "mode": "source",
+      "domain": "approval",
+      "index": 0,
+      "id": "approval/approval-dialog.ansi",
+      "file": "source-approval-approval-dialog.png",
+      "sha256": "8d48e93a3b4469ebc89817599bca1f62bf9e20ce08a8d2ba223e3b65075ca53f",
+      "bytes": 9358,
+      "columns": 100,
+      "rows": 10,
+      "report": 2,
+      "originalFile": "approval-dialog.png",
+      "ansiSha256": "fc3be27f0094772e3b7426bfed26703590225cbcf614f0d6cd978b6788ad8aa5",
+      "svgSha256": "7b18b75bcbb6bababed425bf7a24991ed75d23d28ac2bb07f2429150a4d70a06",
+      "cellsSha256": "03febba43830474e8e653d3c9586d59ca3891eaed44581ac1c46929169d4d0dc"
+    },
+    {
+      "mode": "compiled",
+      "domain": "approval",
+      "index": 0,
+      "id": "approval/approval-dialog.ansi",
+      "file": "compiled-approval-approval-dialog.png",
+      "sha256": "8d48e93a3b4469ebc89817599bca1f62bf9e20ce08a8d2ba223e3b65075ca53f",
+      "bytes": 9358,
+      "columns": 100,
+      "rows": 10,
+      "report": 3,
+      "originalFile": "approval-dialog.png",
+      "ansiSha256": "fc3be27f0094772e3b7426bfed26703590225cbcf614f0d6cd978b6788ad8aa5",
+      "svgSha256": "7b18b75bcbb6bababed425bf7a24991ed75d23d28ac2bb07f2429150a4d70a06",
+      "cellsSha256": "03febba43830474e8e653d3c9586d59ca3891eaed44581ac1c46929169d4d0dc"
+    },
+    {
+      "mode": "source",
+      "domain": "title",
+      "index": 0,
+      "id": "title/nerd-nf+emoji",
+      "file": "source-title-nerd-nf-emoji.png",
+      "sha256": "4d3912624dbf6ebffbe181513317de8145fe241327fdba72d13d5c7bddbd9b51",
+      "bytes": 12491,
+      "columns": 120,
+      "rows": 14,
+      "report": 4,
+      "originalFile": "source-nerd-nf-emoji.png",
+      "originalLabel": "source-nerd-nf-emoji",
+      "ansiSha256": "6c09b5c5d81aa83b14fb855eec75ff0bdf54558e704d3eaf3ab5911e4d46b32b",
+      "svgSha256": "d5b9d3e6e6d53b4d6d898e64e6e003e640f1b9cff910817e34130f8a223269d4",
+      "cellsSha256": "f31773199ee41f3e084c6ca0b0de63b538cb445c3319bc72250af290906c0942"
+    },
+    {
+      "mode": "source",
+      "domain": "title",
+      "index": 1,
+      "id": "title/nerd-emoji",
+      "file": "source-title-nerd-emoji.png",
+      "sha256": "2f3165b32b3796ee9331602dfe0b8ca87f6ee583ebcaba76ce59b6a62cdfbc12",
+      "bytes": 13039,
+      "columns": 120,
+      "rows": 14,
+      "report": 4,
+      "originalFile": "source-nerd-emoji.png",
+      "originalLabel": "source-nerd-emoji",
+      "ansiSha256": "713a01c244be4e14dccd7a3458cf5e00e475e606e5d1b4c5290d8fec94d21939",
+      "svgSha256": "12ff2a03dcde4e6f0b34d83699e643fadb6053ec56cdd3514dd82ac5e8a80ee5",
+      "cellsSha256": "bb1265ec3c9bf9fc290fb8af9b3791ded2fc5eedf02ffe9b267c4ff7331ce253"
+    },
+    {
+      "mode": "source",
+      "domain": "title",
+      "index": 2,
+      "id": "title/nerd-boring",
+      "file": "source-title-nerd-boring.png",
+      "sha256": "d716f1a854b37aca7e1392f2593188f7758657273eaa5607364c37b3202ec760",
+      "bytes": 12235,
+      "columns": 120,
+      "rows": 14,
+      "report": 4,
+      "originalFile": "source-nerd-boring.png",
+      "originalLabel": "source-nerd-boring",
+      "ansiSha256": "2a0913f03fb0d84935f059be1cb34b1289c04cdff399e844360c370ba09151a7",
+      "svgSha256": "12a5c0e9ad119e1c6ab55db5b1cf063f0339cb41e7a71b4115332ee2af17bfa0",
+      "cellsSha256": "8f885d0f927ee439397157302b5646c573e3672e0c7a84ec63bf664a86db91d4"
+    },
+    {
+      "mode": "source",
+      "domain": "title",
+      "index": 3,
+      "id": "title/unicode-nf+emoji",
+      "file": "source-title-unicode-nf-emoji.png",
+      "sha256": "6b47a0c4f282c533049925d54096de64b70f0a2f779a99b1f9447b9532fa586d",
+      "bytes": 13454,
+      "columns": 120,
+      "rows": 14,
+      "report": 4,
+      "originalFile": "source-unicode-nf-emoji.png",
+      "originalLabel": "source-unicode-nf-emoji",
+      "ansiSha256": "a4ca94c92b316066c762b5faee5143cdcb465d3b5cb79f14eec50286da98931e",
+      "svgSha256": "feb06bb51f2fb362215bfe07e407bb91caa7d80baf16c4e4bcc005986924fd4f",
+      "cellsSha256": "7b6ac462b6ef9ef2748ce4b2d7273be638d63240c3525923ce60a1d317eceac4"
+    },
+    {
+      "mode": "source",
+      "domain": "title",
+      "index": 4,
+      "id": "title/unicode-emoji",
+      "file": "source-title-unicode-emoji.png",
+      "sha256": "6b47a0c4f282c533049925d54096de64b70f0a2f779a99b1f9447b9532fa586d",
+      "bytes": 13454,
+      "columns": 120,
+      "rows": 14,
+      "report": 4,
+      "originalFile": "source-unicode-emoji.png",
+      "originalLabel": "source-unicode-emoji",
+      "ansiSha256": "a4ca94c92b316066c762b5faee5143cdcb465d3b5cb79f14eec50286da98931e",
+      "svgSha256": "feb06bb51f2fb362215bfe07e407bb91caa7d80baf16c4e4bcc005986924fd4f",
+      "cellsSha256": "7b6ac462b6ef9ef2748ce4b2d7273be638d63240c3525923ce60a1d317eceac4"
+    },
+    {
+      "mode": "source",
+      "domain": "title",
+      "index": 5,
+      "id": "title/unicode-boring",
+      "file": "source-title-unicode-boring.png",
+      "sha256": "e6c2f63020ab5780318309984ab8b8f5c01f0cc43f469159170543fd1244ec9d",
+      "bytes": 12658,
+      "columns": 120,
+      "rows": 14,
+      "report": 4,
+      "originalFile": "source-unicode-boring.png",
+      "originalLabel": "source-unicode-boring",
+      "ansiSha256": "b44eb642df7c8d2217e83c8fe5cf1d9bcc6bf5e5017281a47d3e9cda1b1cb003",
+      "svgSha256": "f0bed30dd90e8dd882bd402aa05985443bb03227e2779e55ce557d440f0e57f0",
+      "cellsSha256": "09d8635b63ea399303d0dc0aaeecec52ccebdafe0fcce19a2d8f54d341b789c8"
+    },
+    {
+      "mode": "compiled",
+      "domain": "title",
+      "index": 0,
+      "id": "title/nerd-nf+emoji",
+      "file": "compiled-title-nerd-nf-emoji.png",
+      "sha256": "6daea5df6b30de769aea2e86b22dd9a642b55fdd0ea07a52a35035cfb27077db",
+      "bytes": 12555,
+      "columns": 120,
+      "rows": 14,
+      "report": 4,
+      "originalFile": "compiled-nerd-nf-emoji.png",
+      "originalLabel": "compiled-nerd-nf-emoji",
+      "ansiSha256": "4725609c5d209a2546454b010d9915b81a771325217ccd2c1871196f0e36b153",
+      "svgSha256": "c1e1e8667205388bc716c1229a67c8ec381b5fe5049dc78ad58ad7a76e7e6571",
+      "cellsSha256": "c42d0e14df0f78a419196a7443f42b572c94c66645e17d31d5713918e5c0efaa"
+    },
+    {
+      "mode": "compiled",
+      "domain": "title",
+      "index": 1,
+      "id": "title/nerd-emoji",
+      "file": "compiled-title-nerd-emoji.png",
+      "sha256": "f06478234ad3d8edff380ff210d527f6c6ee8d27c72733603f4ecc8724ac66e5",
+      "bytes": 13101,
+      "columns": 120,
+      "rows": 14,
+      "report": 4,
+      "originalFile": "compiled-nerd-emoji.png",
+      "originalLabel": "compiled-nerd-emoji",
+      "ansiSha256": "00017689be33794fe75e9d950729e9da032ebb496f9133404e3ba80c96ba7fee",
+      "svgSha256": "e70bc6762d3dd70e935ed18b7c4d76d851d1e5cdaec9074ed7b8e17f756b4b3a",
+      "cellsSha256": "207a9b8ce86d176d2403a8c3ca066c449fbdb21cc366adeed316972235a712b3"
+    },
+    {
+      "mode": "compiled",
+      "domain": "title",
+      "index": 2,
+      "id": "title/nerd-boring",
+      "file": "compiled-title-nerd-boring.png",
+      "sha256": "4c0e30884a3430db48dd8a522f56731d170e157a885d835e9972bcd2761af29c",
+      "bytes": 12297,
+      "columns": 120,
+      "rows": 14,
+      "report": 4,
+      "originalFile": "compiled-nerd-boring.png",
+      "originalLabel": "compiled-nerd-boring",
+      "ansiSha256": "e9301ef43b27e9258a8d63f9099bb861ec38133e95086cbfa57e57bd98b0768f",
+      "svgSha256": "94e5e158f48365ed470109cf4aaeb10b14681ffbbca755e06046d7472ce7e79c",
+      "cellsSha256": "119704433b774b930d779020d83099e6b4bf8a2c96641fd77cb079b332221382"
+    },
+    {
+      "mode": "compiled",
+      "domain": "title",
+      "index": 3,
+      "id": "title/unicode-nf+emoji",
+      "file": "compiled-title-unicode-nf-emoji.png",
+      "sha256": "2d8a3aca461bf824dabe11628a14d305bdd0dc6709e50bd306703d1ccdfaa858",
+      "bytes": 13462,
+      "columns": 120,
+      "rows": 14,
+      "report": 4,
+      "originalFile": "compiled-unicode-nf-emoji.png",
+      "originalLabel": "compiled-unicode-nf-emoji",
+      "ansiSha256": "b4f80dad64cade87fe7364209d075e1a0ef289b74e391f3ce4b553060f97889b",
+      "svgSha256": "8ab58936657b9f2df8fbf3d6dc88c8c46ffb55b8a6c33826c9dc6c500d463a06",
+      "cellsSha256": "187851164b69ef1145d1033e8ccdb8f79e16c6a9f93b603eaaa7968ef20b7f13"
+    },
+    {
+      "mode": "compiled",
+      "domain": "title",
+      "index": 4,
+      "id": "title/unicode-emoji",
+      "file": "compiled-title-unicode-emoji.png",
+      "sha256": "2d8a3aca461bf824dabe11628a14d305bdd0dc6709e50bd306703d1ccdfaa858",
+      "bytes": 13462,
+      "columns": 120,
+      "rows": 14,
+      "report": 4,
+      "originalFile": "compiled-unicode-emoji.png",
+      "originalLabel": "compiled-unicode-emoji",
+      "ansiSha256": "b4f80dad64cade87fe7364209d075e1a0ef289b74e391f3ce4b553060f97889b",
+      "svgSha256": "8ab58936657b9f2df8fbf3d6dc88c8c46ffb55b8a6c33826c9dc6c500d463a06",
+      "cellsSha256": "187851164b69ef1145d1033e8ccdb8f79e16c6a9f93b603eaaa7968ef20b7f13"
+    },
+    {
+      "mode": "compiled",
+      "domain": "title",
+      "index": 5,
+      "id": "title/unicode-boring",
+      "file": "compiled-title-unicode-boring.png",
+      "sha256": "eb143796bfb7ddce4fee8c1304cad0b78322c34b29c1813eebeb4dd825d3b6f1",
+      "bytes": 12663,
+      "columns": 120,
+      "rows": 14,
+      "report": 4,
+      "originalFile": "compiled-unicode-boring.png",
+      "originalLabel": "compiled-unicode-boring",
+      "ansiSha256": "6f8951b3ee5a694e0da0f85d5c41abfc07cc42abae265a88a7eb42c65a28c7fb",
+      "svgSha256": "6ab82e6bc85127cab72c8f9154dd410fd0e2ee38240094e00787a0ae65bf2484",
+      "cellsSha256": "5351c1c1307674d4d8f3a3acbb130d3c2f01df5b01a3d130f0df19e013d4e6ba"
+    }
+  ]
+}

@@ -126,7 +126,7 @@ test("omp usage skips ambient hook factories but retains configured usage provid
 });
 
 test("omp usage combines broker reports with locally registered extension usage", async () => {
-	authStorage.close();
+	await authStorage.close();
 	authStorage = new AuthStorage(new BrokerUsageStore(new Database(":memory:")));
 	await authStorage.credentials.reload();
 	await authStorage.credentials.set("ext-usage", { type: "api_key", key: "sk-test" });

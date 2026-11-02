@@ -1,6 +1,8 @@
+import type { ToolTier } from "@oh-my-pi/pi-agent-core";
 import { extractUriScheme } from "../internal-urls/parse";
 import { type LineRange } from "@oh-my-pi/pi-tui/tools/line-ranges";
 import { splitPathAndSel, isReadableUrlPath } from "@oh-my-pi/pi-tui/tools/read";
+import { toPathList } from "@oh-my-pi/pi-tui/render/render-utils";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -10,6 +12,7 @@ import {
 	hasFsCode,
 	isEnoent,
 	isEnotdir,
+	isRecord,
 	isWsl,
 	stripWindowsExtendedLengthPathPrefix,
 	windowsPathToWslMount,
@@ -256,7 +259,9 @@ export async function probeLiteralPathExists(filePath: string, cwd: string): Pro
  * filenames or NTFS alternate data streams, so a confirmed `lstat` always
  * preserves the literal path. Ambiguous probe errors preserve the literal on
  * POSIX, where colon filenames are valid, but fall back to the strict split on
- * Windows, where only a confirmed alternate data stream can be literal.
+ * Windows, where only a confirmed alternate data stream can be literal. A list
+ * repeating its colon (`a:1-30,:-30`) folds into one selector unless the path
+ * before the last colon (`a:1-30,`) names an existing file.
  */
 export async function splitPathAndSelPreferringLiteral(
 	rawPath: string,
@@ -265,7 +270,11 @@ export async function splitPathAndSelPreferringLiteral(
 	const strict = splitPathAndSel(rawPath);
 	if (strict.sel === undefined) return strict;
 	const probe = await probeLiteralPathExists(rawPath, cwd);
-	return probe === "exists" || (probe === "unknown" && process.platform !== "win32") ? { path: rawPath } : strict;
+	if (probe === "exists" || (probe === "unknown" && process.platform !== "win32")) return { path: rawPath };
+	const unfolded = splitPathAndSel(rawPath, { foldListColons: false });
+	if (unfolded.path !== strict.path && (await probeLiteralPathExists(unfolded.path, cwd)) === "exists")
+		return unfolded;
+	return strict;
 }
 
 /**
@@ -294,7 +303,10 @@ export function splitPathAndSelPreferringLiteralSync(rawPath: string, cwd: strin
 	const strict = splitPathAndSel(rawPath);
 	if (strict.sel === undefined) return strict;
 	const probe = probeLiteralPathExistsSync(rawPath, cwd);
-	return probe === "exists" || (probe === "unknown" && process.platform !== "win32") ? { path: rawPath } : strict;
+	if (probe === "exists" || (probe === "unknown" && process.platform !== "win32")) return { path: rawPath };
+	const unfolded = splitPathAndSel(rawPath, { foldListColons: false });
+	if (unfolded.path !== strict.path && probeLiteralPathExistsSync(unfolded.path, cwd) === "exists") return unfolded;
+	return strict;
 }
 
 function assertNotInternalUrl(expanded: string, original: string): void {
@@ -701,6 +713,18 @@ async function tryDelimitedPathSplit(
  * string. Existing paths are kept intact, so real filenames containing spaces,
  * commas, or semicolons win over delimiter recovery.
  */
+/** A `!glob` exclusion part of a path list, which search tools take beside URLs. */
+function isExclusionPart(part: string): boolean {
+	return part.length > 1 && part.startsWith("!") && !part.includes("://");
+}
+
+function isOpaquePathListUri(entry: string, parts: readonly string[]): boolean {
+	return (
+		extractUriScheme(entry, { allowSelectorList: false }) !== undefined &&
+		!parts.every(part => splitPathAndSel(normalizePathLikeInput(part)).sel !== undefined)
+	);
+}
+
 export async function splitDelimitedPathEntry(
 	entry: string,
 	cwd: string,
@@ -708,6 +732,7 @@ export async function splitDelimitedPathEntry(
 		splitter?: PathEntrySplitter;
 		routedUrlPredicate?: (entry: string) => boolean;
 		queryOwner?: (part: string) => Promise<boolean>;
+		exclusionParts?: boolean;
 	} = {},
 ): Promise<string[] | null> {
 	const normalizedEntry = normalizePathLikeInput(entry);
@@ -717,9 +742,11 @@ export async function splitDelimitedPathEntry(
 		options.routedUrlPredicate ??
 		((part: string) =>
 			isReadableUrlPath(part) || /^(?:ftp|wss?):\/\//i.test(part) || InternalUrlRouter.instance().canResolve(part));
-	const urlParts = await splitMixedUrlPathList(normalizedEntry, cwd, isUrl, options.queryOwner);
+	const isBoundary = (part: string) => isUrl(part) || (options.exclusionParts === true && isExclusionPart(part));
+	const urlParts = await splitMixedUrlPathList(normalizedEntry, cwd, isBoundary, options.queryOwner);
 	if (urlParts || isInternalUrlPath(normalizedEntry)) return urlParts;
-	const opaqueUrl = isUrl(normalizedEntry);
+	const semicolonParts = await splitTopLevelDelimitedPath(normalizedEntry, "semicolon", isUrl, options.queryOwner);
+	const opaqueUrl = isUrl(normalizedEntry) || isOpaquePathListUri(normalizedEntry, semicolonParts);
 	// A real POSIX file may contain a delimiter and a selector-shaped tail
 	// (`a;b:1-2`, `a b:1-2`). Preserve the raw entry whenever the full literal
 	// resolves — or is only ambiguous — so downstream literal-preferring
@@ -731,6 +758,9 @@ export async function splitDelimitedPathEntry(
 	// with glob syntax (`a;b[1].md:1-2`). Check the exact peeled path before the
 	// search splitter interprets those characters and semicolon fan-out wins.
 	if (selectorSplit.sel !== undefined && (await probeLiteralPathExists(peeledEntry, cwd)) !== "missing") return null;
+	// `a:1-30,:-30` may name a literal `a:1-30,` with a tail selector instead of `a` with a list.
+	const unfoldedPath = splitPathAndSel(normalizedEntry, { foldListColons: false }).path;
+	if (unfoldedPath !== peeledEntry && (await probeLiteralPathExists(unfoldedPath, cwd)) !== "missing") return null;
 	if (!hasGlobPathChars(peeledEntry) && (await delimitedPathPartResolves(normalizedEntry, cwd, splitter))) {
 		return null;
 	}
@@ -795,8 +825,13 @@ export async function splitMixedUrlPathList(
 	const normalizedEntry = normalizePathLikeInput(entry);
 	if (!normalizedEntry.includes(";")) return null;
 	const rawParts = await splitTopLevelDelimitedPath(normalizedEntry, "semicolon", isUrl, queryOwner);
-	if (rawParts.length < 2 || (!isUrl(normalizedEntry) && !rawParts.some(part => isUrl(normalizePathLikeInput(part)))))
+	const opaqueUri = isOpaquePathListUri(normalizedEntry, rawParts);
+	if (
+		rawParts.length < 2 ||
+		(!opaqueUri && !isUrl(normalizedEntry) && !rawParts.some(part => isUrl(normalizePathLikeInput(part))))
+	) {
 		return null;
+	}
 	if (!isInternalUrlPath(normalizedEntry)) {
 		if ((await probeLiteralPathExists(normalizedEntry, cwd)) !== "missing") return null;
 		const selectorSplit = splitPathAndSel(normalizedEntry);
@@ -810,7 +845,9 @@ export async function splitMixedUrlPathList(
 	let pendingLiteral: { path: string; end: number } | null = null;
 	while (index < rawParts.length) {
 		const part = normalizePathLikeInput(rawParts[index]);
-		if (isUrl(part)) {
+		const opaquePrefix =
+			index === 0 && opaqueUri && !isUrl(part) && !(await findLiteralPathListPart(rawParts, index, cwd, isUrl));
+		if (isUrl(part) || opaquePrefix) {
 			hasResolvedTarget = true;
 			let end = index + 1;
 			while (end < rawParts.length) {
@@ -861,7 +898,7 @@ async function findLiteralPathListPart(
 export async function expandDelimitedPathEntries(
 	entries: readonly string[],
 	cwd: string,
-	options: { splitter?: PathEntrySplitter } = {},
+	options: { splitter?: PathEntrySplitter; exclusionParts?: boolean } = {},
 ): Promise<string[]> {
 	const expanded: string[] = [];
 	for (const entry of entries) {
@@ -882,6 +919,8 @@ export interface ParsedFindPattern {
 	basePath: string;
 	globPattern: string;
 	hasGlob: boolean;
+	/** A trailing separator restricts glob matches to directories. */
+	directoryOnly?: boolean;
 }
 
 export interface ResolvedSearchTarget {
@@ -902,6 +941,7 @@ export interface ResolvedFindTarget {
 	basePath: string;
 	globPattern: string;
 	hasGlob: boolean;
+	directoryOnly?: boolean;
 }
 
 export interface ResolvedMultiFindPattern {
@@ -998,6 +1038,12 @@ export async function parseSearchPathPreferringLiteral(filePath: string, cwd: st
 	}
 }
 
+function globFindPattern(basePath: string, globPattern: string): ParsedFindPattern {
+	return globPattern.endsWith("/")
+		? { basePath, globPattern: globPattern.replace(/\/+$/, ""), hasGlob: true, directoryOnly: true }
+		: { basePath, globPattern, hasGlob: true };
+}
+
 // Parse a find pattern into a base directory path and a glob pattern.
 // Examples:
 //   src/app/**/\*.tsx -> { basePath: "src/app", globPattern: "**/*.tsx", hasGlob: true }
@@ -1012,7 +1058,7 @@ export function parseFindPattern(pattern: string): ParsedFindPattern {
 		// A URL names its root explicitly, so its glob stays anchored there like `dir/*`.
 		return urlPath.glob === undefined
 			? { basePath: urlPath.basePath, globPattern: "**/*", hasGlob: false }
-			: { basePath: urlPath.basePath, globPattern: urlPath.glob, hasGlob: true };
+			: globFindPattern(urlPath.basePath, urlPath.glob);
 	}
 	const normalizedPattern = normalizePathSeparators(pattern);
 	const segments = normalizedPattern.split("/");
@@ -1024,18 +1070,10 @@ export function parseFindPattern(pattern: string): ParsedFindPattern {
 
 	if (firstGlobIndex === 0) {
 		const needsRecursive = !normalizedPattern.startsWith("**/");
-		return {
-			basePath: ".",
-			globPattern: needsRecursive ? `**/${normalizedPattern}` : normalizedPattern,
-			hasGlob: true,
-		};
+		return globFindPattern(".", needsRecursive ? `**/${normalizedPattern}` : normalizedPattern);
 	}
 
-	return {
-		basePath: segments.slice(0, firstGlobIndex).join("/"),
-		globPattern: segments.slice(firstGlobIndex).join("/"),
-		hasGlob: true,
-	};
+	return globFindPattern(segments.slice(0, firstGlobIndex).join("/"), segments.slice(firstGlobIndex).join("/"));
 }
 
 export function combineSearchGlobs(prefixGlob?: string, suffixGlob?: string): string | undefined {
@@ -1222,6 +1260,7 @@ async function resolveFindPatternItems(
 			basePath: resolveSearchBase(parsedPattern.basePath, cwd),
 			globPattern: parsedPattern.globPattern,
 			hasGlob: parsedPattern.hasGlob,
+			directoryOnly: parsedPattern.directoryOnly,
 		};
 	});
 
@@ -1494,6 +1533,32 @@ export interface ToolScopeResolution {
 	immutableSourcePaths: Set<string>;
 }
 
+/** Approval tier for a search tool's raw `path` (or legacy `paths`) input: the highest scheme read tier named anywhere in it. */
+export function searchPathTier(args: unknown): ToolTier {
+	const raw = isRecord(args) ? (args.path ?? args.paths) : undefined;
+	// The tools decode JSON-encoded arrays (`["ssh:\/\/host"]`) the same way before resolving.
+	const entries =
+		typeof raw === "string"
+			? toPathList(raw)
+			: Array.isArray(raw)
+				? raw.filter(entry => typeof entry === "string")
+				: [];
+	// Substring scan over the raw entries: delimited lists are only split after approval.
+	return InternalUrlRouter.instance().readTier(entries.join("\n"));
+}
+
+/** Strict URLs fetch; fuzzy URL spellings fetch only when no literal filesystem entry exists. */
+export async function isExternalSearchUrl(rawPath: string, cwd: string): Promise<boolean> {
+	if (/^(?:https?|ftp|ws|wss):\/\//i.test(rawPath)) return true;
+	if (!isReadableUrlPath(rawPath) || hasGlobPathChars(rawPath)) return false;
+	try {
+		await fs.promises.stat(resolveToCwd(rawPath, cwd));
+		return false;
+	} catch (error) {
+		return isEnoent(error) || isEnotdir(error);
+	}
+}
+
 /**
  * Shared path-input pipeline for `search`, `ast_grep`, and `ast_edit`:
  *  1. normalize + reject empty paths,
@@ -1512,29 +1577,11 @@ export async function resolveToolSearchScope(opts: ToolScopeOptions): Promise<To
 	if (rawPaths.some(rawPath => rawPath.length === 0)) {
 		throw new ToolError("Search scope entries must be non-empty paths or globs");
 	}
-	// Strict external-URL schemes. `file://` is intentionally absent: it has
-	// local-path semantics (expandPath strips it downstream), so it flows through
-	// the ordinary filesystem pipeline instead of the external-URL resolver.
-	const strictExternalUrlRe = /^(?:https?|ftp|ws|wss):\/\//i;
 	const internalRouter = InternalUrlRouter.instance();
 	const resolvedPathInputs: string[] = [];
 	const immutableSourcePaths = new Set<string>();
 	for (const rawPath of rawPaths) {
-		let externalUrl = strictExternalUrlRe.test(rawPath);
-		if (!externalUrl && isReadableUrlPath(rawPath) && !hasGlobPathChars(rawPath)) {
-			// Fuzzy spelling the read parser accepts (`www.host/…`, collapsed
-			// `https:/host/…`). An existing local path wins over URL
-			// interpretation so a directory literally named `www.foo` stays
-			// searchable; only a definitive ENOENT/ENOTDIR flips to URL handling
-			// (any other stat error means the path exists — let the local
-			// pipeline surface it).
-			try {
-				await fs.promises.stat(resolveToCwd(rawPath, cwd));
-			} catch (err) {
-				externalUrl = isEnoent(err) || isEnotdir(err);
-			}
-		}
-		if (externalUrl) {
+		if (await isExternalSearchUrl(rawPath, cwd)) {
 			const resolved = opts.resolveExternalUrl ? await opts.resolveExternalUrl(rawPath) : undefined;
 			if (resolved) {
 				resolvedPathInputs.push(resolved.sourcePath);

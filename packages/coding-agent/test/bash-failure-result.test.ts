@@ -188,6 +188,66 @@ describe("BashTool execution results", () => {
 		expect(await Bun.file(artifactPath).text()).toBe("abcdefghijklmnopqrstuvwxyz\n");
 	});
 
+	it("exposes the session identity to the command over a stale value in its shell", async () => {
+		const tool = new BashTool({
+			...makeSession(),
+			getSessionId: () => "session-fg-shell",
+			sessionManager: { getSessionId: () => "session-fg" },
+		} as unknown as ToolSession);
+		// The session's persistent shell carries a value an earlier command (or a parent omp) left behind.
+		await tool.execute("call-stale", { command: "export PI_SESSION_FILE=/stale/parent.jsonl" });
+		const result = await tool.execute("call-env", {
+			command: `printf '%s|%s|' "$PI_SESSION_ID" "$PI_SESSION_FILE"`,
+		});
+		const [id, file] = (result.content.find(c => c.type === "text")?.text ?? "").split("|");
+		expect(id).toBe("session-fg");
+		// Empty, not the stale path: the session is not persisted.
+		expect(file).toBe("");
+	});
+
+	it.each([false, true])("gives each command its tool call identity (prepared: %s)", async prepared => {
+		const tool = new BashTool(makeSession());
+		// An earlier command in the session's persistent shell (or a parent omp) left a value behind.
+		await tool.execute("call-stale", { command: "export PI_TOOL_CALL_ID=toolu_stale" });
+		for (const id of ["toolu_first", "toolu_second"]) {
+			const input = { command: `printf '%s|' "$PI_TOOL_CALL_ID"` };
+			if (prepared) await tool.prepareRuntimeApproval(id, input);
+			const result = await tool.execute(id, input);
+			expect((result.content.find(c => c.type === "text")?.text ?? "").split("|")[0]).toBe(id);
+		}
+	});
+
+	it("gives a call the identity of the session it started in, even if the session changes before it runs", async () => {
+		let sessionId = "session-a";
+		const gate = Promise.withResolvers<void>();
+		let allocating = Promise.withResolvers<void>();
+		const tool = new BashTool({
+			...makeSession(),
+			getSessionId: () => sessionId,
+			getSessionFile: () => path.resolve(`/sessions/${sessionId}.jsonl`),
+			allocateOutputArtifact: async () => {
+				allocating.resolve();
+				await gate.promise;
+				return {};
+			},
+		} as unknown as ToolSession);
+		const probe = `printf '%s|%s|' "$PI_SESSION_ID" "$PI_SESSION_FILE"`;
+		const fields = (result: { content: readonly { type: string; text?: string }[] }) =>
+			(result.content.find(c => c.type === "text")?.text ?? "").split("|").slice(0, 2);
+
+		const pending = tool.execute("call-a", { command: probe });
+		await allocating.promise;
+		sessionId = "session-b"; // e.g. `/fork` while the call waits on its artifact
+		gate.resolve();
+		expect(fields(await pending)).toEqual(["session-a", path.resolve("/sessions/session-a.jsonl")]);
+
+		allocating = Promise.withResolvers<void>();
+		expect(fields(await tool.execute("call-b", { command: probe }))).toEqual([
+			"session-b",
+			path.resolve("/sessions/session-b.jsonl"),
+		]);
+	});
+
 	it("keeps the raw diagnostics when a minimized failure cannot be persisted as an artifact", async () => {
 		// The native minimizer streams the raw bytes live, then reports a lossy
 		// summary. This session has no artifact allocator (the `ToolSession`

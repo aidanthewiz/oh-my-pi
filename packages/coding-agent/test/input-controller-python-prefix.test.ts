@@ -2,12 +2,15 @@ import { describe, expect, it, vi } from "bun:test";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { InputController } from "@oh-my-pi/pi-coding-agent/modes/controllers/input-controller";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
+import { createSessionDefaults } from "./helpers/session-defaults";
 
 type FakeEditor = {
 	onSubmit?: (text: string) => Promise<void>;
 	imageLinks?: readonly (string | undefined)[];
 	setText(text: string): void;
 	getText(): string;
+	getExpandedText(): string;
+	setCollapsedText(text: string): void;
 	addToHistory(text: string): void;
 	setActionKeys(action: string, keys: string[]): void;
 	setCustomKeyHandler(key: string, handler: () => void): void;
@@ -32,6 +35,12 @@ function createContext() {
 		getText() {
 			return editorText;
 		},
+		getExpandedText() {
+			return editorText;
+		},
+		setCollapsedText(text: string) {
+			editorText = text;
+		},
 		addToHistory: vi.fn(),
 		setActionKeys: vi.fn(),
 		setCustomKeyHandler: vi.fn(),
@@ -44,6 +53,8 @@ function createContext() {
 		editor: editor as unknown as InteractiveModeContext["editor"],
 		ui: { requestRender: vi.fn() } as unknown as InteractiveModeContext["ui"],
 		session: {
+			...createSessionDefaults(),
+			sessionId: "python-prefix-main",
 			isStreaming: false,
 			isCompacting: false,
 			isBashRunning: false,

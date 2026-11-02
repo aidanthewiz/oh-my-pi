@@ -183,6 +183,31 @@ func TestPromptAndWaitWaitsForItsOwnResult(t *testing.T) {
 	nextFrame[AgentStartEvent](t, c)
 }
 
+func TestPromptAndWaitIncludesSignedNarrationInOrder(t *testing.T) {
+	c, s := startFake(t, readyV1, nil)
+	command, outcome := prompt(t, c, s, 0)
+	message := strings.Replace(assistantHello, `"content":[{"type":"thinking","thinking":"hmm"},{"type":"text","text":"hel"},{"type":"text","text":"lo"}]`,
+		`"content":[{"type":"thinking","thinking":"private","narration":false},{"type":"thinking","thinking":"First ","narration":true,"thinkingSignature":"signed-one"},{"type":"text","text":"answer"},{"type":"thinking","thinking":" last","narration":true,"thinkingSignature":"signed-two"}]`, 1)
+	s.respond(command, `{"agentInvoked":true}`)
+	s.send(`{"type":"message_end","message":`+message+`}`,
+		`{"type":"agent_end","messages":[`+message+`]}`,
+		`{"type":"prompt_result","id":"`+command.str("id")+`","agentInvoked":true,"status":"completed","sessionSettled":true}`)
+	result := await(t, outcome)
+	if result.err != nil {
+		t.Fatal(result.err)
+	}
+	if result.turn.AssistantText == nil || *result.turn.AssistantText != "First answer last" {
+		t.Fatalf("visible answer: %#v", result.turn.AssistantText)
+	}
+	content := result.turn.AssistantMessage.Content
+	for index, signature := range map[int]string{1: "signed-one", 3: "signed-two"} {
+		block, ok := content[index].Value.(ThinkingContent)
+		if !ok || block.ThinkingSignature == nil || *block.ThinkingSignature != signature {
+			t.Fatalf("signed thinking changed: %#v", content[index])
+		}
+	}
+}
+
 func TestPromptAndWaitResultBeforeAck(t *testing.T) {
 	c, s := startFake(t, readyV1, nil)
 	command, outcome := prompt(t, c, s, 0)

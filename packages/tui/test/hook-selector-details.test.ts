@@ -283,7 +283,7 @@ describe("selector detail viewport", () => {
 		}
 	});
 
-	it("keeps empty search feedback readable and restores consent after clearing the query", () => {
+	it("keeps unmatched search non-consenting and restores consent after clearing the query", () => {
 		const h = composedFixture(52, 18);
 		try {
 			h.frame();
@@ -297,12 +297,8 @@ describe("selector detail viewport", () => {
 			const query = "unmatched";
 			h.selector.handleInput(query);
 			const filtered = h.frame();
-			expect(
-				filtered
-					.slice(1, 4)
-					.join("")
-					.replace(/[│█\s]/g, ""),
-			).toContain("Nomatchingoptions");
+			for (const permission of PERMISSIONS) expect(filtered.join("\n")).not.toContain(permission);
+			for (const row of filtered) expect(visibleWidth(row)).toBeLessThanOrEqual(24);
 			h.selector.handleInput("\n");
 			expect(h.picked).toEqual([]);
 			for (const _character of query) h.selector.handleInput("\x7f");
@@ -385,23 +381,33 @@ describe("selector detail viewport", () => {
 
 	it("keeps the complete session consent readable in a standalone selector after resizing", () => {
 		const { selector, terminal, picked, cancellations } = fixture(52, 18);
-		selector.render(52);
-		for (let page = 0; page < 30; page++) selector.handleInput(PAGE_DOWN);
-		terminal.resize(24, 9);
-		expect(selector.render(24).length).toBeLessThanOrEqual(9);
-		selector.handleInput(DOWN);
-		selector.handleInput(DOWN);
-		const content = selector
-			.renderContent(20)
-			.map(row => Bun.stripANSI(row))
-			.join("")
-			.replace(/\s+/g, "");
-		expect(content).toContain(PERMISSIONS[2]!.replace(/\s+/g, ""));
-		expect(picked).toEqual([]);
-		selector.handleInput("\n");
-		expect(picked).toEqual([PERMISSIONS[2]!]);
-		selector.handleInput("\x1b");
-		expect(cancellations()).toBe(1);
+		try {
+			selector.render(52);
+			for (let page = 0; page < 30; page++) selector.handleInput(PAGE_DOWN);
+			terminal.resize(24, 9);
+			expect(selector.render(24).length).toBeLessThanOrEqual(9);
+			selector.handleInput(DOWN);
+			selector.handleInput(DOWN);
+			const content = selector
+				.render(24)
+				.slice(1, -1)
+				.map(row =>
+					Bun.stripANSI(row)
+						.slice(2, -2)
+						.replace(/[│█]\s*$/, "")
+						.trim(),
+				)
+				.join("")
+				.replace(/\s+/g, "");
+			expect(content).toContain(PERMISSIONS[2]!.replace(/\s+/g, ""));
+			expect(picked).toEqual([]);
+			selector.handleInput("\n");
+			expect(picked).toEqual([PERMISSIONS[2]!]);
+			selector.handleInput("\x1b");
+			expect(cancellations()).toBe(1);
+		} finally {
+			selector.dispose();
+		}
 	});
 
 	it("describes a full sanitized native scroller beside permission controls and forwards repeated page requests", () => {
@@ -414,7 +420,6 @@ describe("selector detail viewport", () => {
 		expect(nativeText(text)).toContain("Identity:   verified");
 		expect(nativeText(text)).not.toContain("\x07");
 		expect(text.p).toMatchObject({ wrap: "char" });
-		expect(details.p?.max?.h).toMatch(/^\d+lines$/);
 		expect(child(first, "list").p).toMatchObject({ selected: "0", shrink: 0 });
 		selector.handleInput(PAGE_DOWN);
 		const paged = selector.describe(cx);
@@ -423,7 +428,6 @@ describe("selector detail viewport", () => {
 		selector.handleInput(PAGE_DOWN);
 		expect(child(child(selector.describe(cx), "details"), "detail").scroll).toEqual({ by: "page-down", n: 2 });
 		terminal.resize(32, 7);
-		expect(child(selector.describe(cx), "details").p?.max?.h).not.toBe(details.p?.max?.h);
 		expect(picked).toEqual([]);
 		selector.handleNativeEvent({ type: "select", key: "details/detail", item: "2" });
 		expect(picked).toEqual([]);

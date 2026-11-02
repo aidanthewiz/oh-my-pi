@@ -3,6 +3,7 @@ import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { InputController } from "@oh-my-pi/pi-coding-agent/modes/controllers/input-controller";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import { USER_INTERRUPT_LABEL } from "@oh-my-pi/pi-coding-agent/session/messages";
+import { createSessionDefaults } from "./helpers/session-defaults";
 
 function createContext(options?: {
 	hasInterruptibleInput?: boolean;
@@ -28,6 +29,9 @@ function createContext(options?: {
 			getText() {
 				return editorText;
 			},
+			getExpandedText() {
+				return editorText;
+			},
 			addToHistory: vi.fn(),
 			pendingImages: options?.pendingImages ? [...options.pendingImages] : ([] as ImageContent[]),
 			pendingImageLinks:
@@ -37,6 +41,8 @@ function createContext(options?: {
 		},
 		ui: { requestRender },
 		session: {
+			...createSessionDefaults(),
+			sessionId: "interrupt-main",
 			isStreaming: true,
 			isCompacting: false,
 			isBashRunning: false,

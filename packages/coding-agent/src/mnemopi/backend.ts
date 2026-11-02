@@ -2,14 +2,14 @@ import { rm } from "node:fs/promises";
 import * as path from "node:path";
 import { type ApiKeyResolver, completeSimple, retryTransientCompletion } from "@oh-my-pi/pi-ai";
 import { hostMatchesUrl } from "@oh-my-pi/pi-catalog/hosts";
+import { clampThinkingLevelForModel } from "@oh-my-pi/pi-catalog/model-thinking";
 import type { Mnemopi } from "@oh-my-pi/pi-mnemopi";
 import type { MnemopiLlmCompleteOptions } from "@oh-my-pi/pi-mnemopi/core/runtime-options";
 import type * as MnemopiDiagnoseNs from "@oh-my-pi/pi-mnemopi/diagnose";
 import type { DiagnosticSummary } from "@oh-my-pi/pi-mnemopi/diagnose";
 import { logger, prompt, withLoopPhase } from "@oh-my-pi/pi-utils";
 import type { ModelRegistry } from "../config/model-registry";
-import { resolveRoleChain, roleCandidatePool } from "../config/model-resolver";
-import { type JudgmentUsageLedger, journalJudgmentUsage } from "../judgment";
+import { isModelEnabledBySettings, resolveRoleChain, roleCandidatePool } from "../config/model-resolver";
 import type {
 	MemoryBackend,
 	MemoryBackendSaveInput,
@@ -25,6 +25,7 @@ import mnemopiInstructions from "../prompts/system/mnemopi-instructions.md" with
 import type { AgentSession } from "../session/agent-session";
 import { tinyModelClient } from "../tiny/title-client";
 import { shortenPath } from "@oh-my-pi/pi-tui/render/render-utils";
+import { concreteThinkingLevel, shouldDisableReasoning, toReasoningEffort } from "@oh-my-pi/pi-tui/thinking";
 import {
 	loadMnemopiConfig,
 	type MnemopiBackendConfig,
@@ -32,12 +33,14 @@ import {
 	truncateApproxTokens,
 } from "./config";
 import {
+	captureMnemopiRequestOwner,
 	getMnemopiScopedBanks,
 	getMnemopiScopedDbPaths,
 	getMnemopiSessionState,
 	loadMnemopi,
 	loadMnemopiCore,
 	MnemopiSessionState,
+	mnemopiRequestOwner,
 	requireMnemopi,
 	requireMnemopiCore,
 	setMnemopiSessionState,
@@ -78,8 +81,22 @@ export function resolveMemoryCompletionInput(
 	return { prompt };
 }
 
-async function installMnemopiState(session: AgentSession, config: MnemopiBackendConfig): Promise<MnemopiSessionState> {
-	const state = new MnemopiSessionState({ sessionId: session.sessionId, config, session });
+/**
+ * Installs session-owned state. A prompt clone supplies the recall snapshot
+ * captured with its copied prompt, not a mutable parent backend.
+ */
+async function installMnemopiState(
+	session: AgentSession,
+	config: MnemopiBackendConfig,
+	inherited?: Pick<MnemopiSessionState, "hasRecalledForFirstTurn" | "lastRecallSnippet">,
+): Promise<MnemopiSessionState> {
+	const state = new MnemopiSessionState({
+		sessionId: session.sessionId,
+		config,
+		session,
+		hasRecalledForFirstTurn: inherited?.hasRecalledForFirstTurn,
+	});
+	state.lastRecallSnippet = inherited?.lastRecallSnippet;
 	const previous = setMnemopiSessionState(session, state);
 	await previous?.dispose();
 	try {
@@ -121,21 +138,15 @@ export const mnemopiBackend: MemoryBackend = {
 		}
 
 		try {
-			const config = await loadMnemopiConfigWithProviders(
-				settings,
-				agentDir,
-				modelRegistry,
-				sessionId,
-				session.sessionManager,
-			);
+			const config = await loadMnemopiConfigWithProviders(settings, agentDir, modelRegistry, sessionId, session);
 			await Promise.all([loadMnemopi(), loadMnemopiCore()]);
-			await installMnemopiState(session, config);
+			await installMnemopiState(session, config, options.inheritedMnemopiRecall);
 		} catch (error) {
 			logger.warn("Mnemopi: backend startup failed; memory backend inert.", { error: String(error) });
 		}
 	},
 
-	async buildDeveloperInstructions(_agentDir, settings, session): Promise<string | undefined> {
+	async buildDeveloperInstructions(_agentDir, _cwd, settings, session): Promise<string | undefined> {
 		return withLoopPhase("mnemopi.recall", () => {
 			const state = getMnemopiSessionState(session);
 			const primary = state?.aliasOf ?? state;
@@ -202,7 +213,7 @@ export const mnemopiBackend: MemoryBackend = {
 					agentDir,
 					session.modelRegistry,
 					session.sessionId,
-					session.sessionManager,
+					session,
 				);
 				signal?.throwIfAborted();
 				await Promise.all([loadMnemopi(), loadMnemopiCore()]);
@@ -330,7 +341,7 @@ export const mnemopiBackend: MemoryBackend = {
 				scope: "bank",
 				extract: true,
 				extractEntities: true,
-				veracity: "user",
+				veracity: "stated",
 				memoryType: "fact",
 			});
 		} catch (error) {
@@ -340,9 +351,9 @@ export const mnemopiBackend: MemoryBackend = {
 		return { backend: "mnemopi", stored: 1, ids: [id] };
 	},
 
-	async preCompactionContext(messages, _settings, session): Promise<string | undefined> {
+	async preCompactionContext(messages, _settings, session, signal): Promise<string | undefined> {
 		const state = getMnemopiSessionState(session);
-		return await state?.recallForCompaction(messages);
+		return await state?.recallForCompaction(messages, signal);
 	},
 };
 
@@ -508,7 +519,7 @@ async function loadMnemopiConfigWithProviders(
 	agentDir: string,
 	modelRegistry: ModelRegistry,
 	sessionId: string,
-	usageLedger: Partial<JudgmentUsageLedger>,
+	ownerSession: AgentSession,
 ): Promise<MnemopiBackendConfig> {
 	const config = loadMnemopiConfig(settings, agentDir);
 	config.providerOptions = await resolveMnemopiProviderOptions(
@@ -516,7 +527,7 @@ async function loadMnemopiConfigWithProviders(
 		settings,
 		modelRegistry,
 		sessionId,
-		usageLedger,
+		ownerSession,
 	);
 	return config;
 }
@@ -545,7 +556,7 @@ async function resolveMnemopiProviderOptions(
 	settings: MemoryBackendStartOptions["settings"],
 	modelRegistry: ModelRegistry,
 	sessionId: string,
-	usageLedger: Partial<JudgmentUsageLedger>,
+	ownerSession: AgentSession,
 ): Promise<MnemopiProviderOptions> {
 	const base: MnemopiProviderOptions = {
 		noEmbeddings: config.providerOptions.noEmbeddings,
@@ -585,21 +596,28 @@ async function resolveMnemopiProviderOptions(
 		}
 
 		const complete = async (prompt: string, opts?: MnemopiLlmCompleteOptions): Promise<string | null> => {
-			// journalJudgmentUsage snapshots the session id. /new, fork, and session
-			// switch keep this function, so bind inside each call. An in-flight call
-			// keeps the callback it already created and still journals to its start.
-			const { onUsage, request, signal } = {
-				onUsage: journalJudgmentUsage(usageLedger),
-				request: resolveMemoryCompletionInput(prompt, opts),
-				signal:
-					typeof opts?.timeout === "number" && Number.isFinite(opts.timeout) && opts.timeout > 0
-						? AbortSignal.timeout(opts.timeout)
-						: undefined,
+			const queuedOwner = mnemopiRequestOwner.getStore();
+			if (opts?.task?.kind === "memory-extraction" && !queuedOwner) return null;
+			const owner = queuedOwner ?? captureMnemopiRequestOwner(ownerSession);
+			if (owner.manager !== ownerSession.sessionManager || !owner.isCurrent()) return null;
+			const sessionId = owner.sessionId;
+			const usageOwner = { sessionId, parentId: owner.parentId };
+			const candidates = resolveRoleChain("memory", settings, roleCandidatePool("memory", settings, modelRegistry));
+			const request = resolveMemoryCompletionInput(prompt, opts);
+			const signal =
+				typeof opts?.timeout === "number" && Number.isFinite(opts.timeout) && opts.timeout > 0
+					? AbortSignal.timeout(opts.timeout)
+					: undefined;
+			const assertOwnerCurrent = (model: (typeof candidates)[number]["model"]): void => {
+				signal?.throwIfAborted();
+				if (!owner.isCurrent() || !isModelEnabledBySettings(model, settings, modelRegistry))
+					throw new Error("Memory completion owner changed before provider dispatch.");
 			};
 
-			for (const { model } of candidates) {
+			for (const { model, thinkingLevel } of candidates) {
 				if (signal?.aborted) return null;
 				try {
+					assertOwnerCurrent(model);
 					if (model.api === "local-inference") {
 						const result = await tinyModelClient.complete(model.id, request.prompt, {
 							maxTokens: opts?.maxTokens,
@@ -615,7 +633,8 @@ async function resolveMnemopiProviderOptions(
 						continue;
 					}
 
-					const hasApiKey = await modelRegistry.getApiKey(model, sessionId);
+					const hasApiKey = await modelRegistry.getApiKey(model, sessionId, { signal });
+					assertOwnerCurrent(model);
 					if (!hasApiKey) {
 						logger.warn("Mnemopi: memory completion model has no current API key; trying the next fallback.", {
 							provider: model.provider,
@@ -623,35 +642,63 @@ async function resolveMnemopiProviderOptions(
 						});
 						continue;
 					}
+					const accounts = () =>
+						modelRegistry.authStorage.oauth
+							.accounts(model.provider, sessionId)
+							.filter(account => account.active)
+							.map(account => [account.credentialId, account.accountId, account.orgId, account.projectId]);
+					const accountSnapshot = accounts();
+					const resolver = modelRegistry.resolver(model, sessionId);
+					// `auto` has no per-request classifier here, so it sends no effort, like an omitted suffix.
+					const level = concreteThinkingLevel(thinkingLevel);
 					const message = await retryTransientCompletion(
 						() =>
-							withLoopPhase("mnemopi.extract", () =>
-								completeSimple(
+							withLoopPhase("mnemopi.extract", () => {
+								assertOwnerCurrent(model);
+								if (!Bun.deepEquals(accountSnapshot, accounts()))
+									throw new Error("Memory completion account changed before provider dispatch.");
+								return completeSimple(
 									model,
 									{
 										...(request.systemPrompt ? { systemPrompt: [request.systemPrompt] } : {}),
 										messages: [{ role: "user", content: request.prompt, timestamp: Date.now() }],
 									},
 									{
-										apiKey: modelRegistry.resolver(model, sessionId),
+										apiKey: async request => {
+											assertOwnerCurrent(model);
+											if (!Bun.deepEquals(accountSnapshot, accounts()))
+												throw new Error("Memory completion account changed before provider dispatch.");
+											const resolved = await resolver(request);
+											assertOwnerCurrent(model);
+											if (!Bun.deepEquals(accountSnapshot, accounts()))
+												throw new Error("Memory completion account changed before provider dispatch.");
+											return resolved;
+										},
 										sessionId,
 										maxTokens: opts?.maxTokens,
 										temperature: opts?.temperature,
+										reasoning: clampThinkingLevelForModel(model, toReasoningEffort(level)),
+										disableReasoning: shouldDisableReasoning(level) ? true : undefined,
 										signal,
-										onAttempt: message =>
-											onUsage?.({
-												purpose: "memory",
-												role: "memory",
-												api: model.api,
-												provider: model.provider,
-												model: model.id,
-												usage: message.usage,
-												stopReason: message.stopReason,
-												errorMessage: message.errorMessage,
-											}),
+										onAttempt: message => {
+											const entryId = owner.manager.appendModelUsage(
+												{
+													purpose: "memory",
+													role: "memory",
+													api: model.api,
+													provider: model.provider,
+													model: model.id,
+													usage: message.usage,
+													stopReason: message.stopReason,
+													errorMessage: message.errorMessage,
+												},
+												usageOwner,
+											);
+											if (entryId !== undefined) usageOwner.parentId = entryId;
+										},
 									},
-								),
-							),
+								);
+							}),
 						{ provider: model.provider, signal },
 					);
 					if (message.stopReason === "aborted" || signal?.aborted) return null;
@@ -672,7 +719,7 @@ async function resolveMnemopiProviderOptions(
 						.join("\n")
 						.trim();
 				} catch (error) {
-					if (signal?.aborted) return null;
+					if (signal?.aborted || !owner.isCurrent()) return null;
 					logger.warn("Mnemopi: memory completion model threw; trying the next configured fallback.", {
 						provider: model.provider,
 						model: model.id,

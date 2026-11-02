@@ -96,7 +96,7 @@ async function createTransport(
 
 	switch (serverType) {
 		case "stdio":
-			return createStdioTransport(config as MCPStdioServerConfig, options);
+			return createStdioTransport(config as MCPStdioServerConfig, options, signal);
 		case "http":
 			return createHttpTransport(config as MCPHttpServerConfig);
 		case "sse":
@@ -144,6 +144,7 @@ async function initializeConnection(
 	// reject or terminate sessions that receive session traffic before this
 	// notification; POST response streams already carry messages during setup.
 	await transport.notify("notifications/initialized");
+	options?.signal?.throwIfAborted();
 
 	await options?.onInitialized?.();
 
@@ -185,7 +186,14 @@ export async function connectToServer(
 	options?.signal?.throwIfAborted();
 	const timeoutMs = resolveMCPTimeoutMs(config.timeout);
 	const timeoutError = new MCPConnectionTimeoutError(name, timeoutMs);
+	const controller = new AbortController();
+	const signal = options?.signal ? AbortSignal.any([options.signal, controller.signal]) : controller.signal;
 	let transport: MCPTransport | undefined;
+	let closePromise: Promise<void> | undefined;
+	const closeTransport = () => {
+		if (transport) closePromise ??= transport.close();
+		return closePromise;
+	};
 
 	let availableAwsProfiles: string[] | undefined;
 	let operationalAwsProfiles: string[] | undefined;
@@ -219,7 +227,7 @@ export async function connectToServer(
 				: availableAwsProfiles;
 	}
 	const connect = async (): Promise<MCPServerConnection> => {
-		options?.signal?.throwIfAborted();
+		signal.throwIfAborted();
 		transport = await createTransport(
 			config,
 			{
@@ -227,7 +235,7 @@ export async function connectToServer(
 				preserveOperationalAws: options?.preserveOperationalAws,
 				operationalAwsProfiles,
 			},
-			options?.signal,
+			signal,
 		);
 		if (options?.onNotification) {
 			transport.onNotification = options.onNotification;
@@ -239,8 +247,9 @@ export async function connectToServer(
 		transport.onRequest = options?.onRequest ?? defaultRequestHandler;
 
 		try {
+			signal.throwIfAborted();
 			const initResult = await initializeConnection(transport, {
-				signal: options?.signal,
+				signal,
 				async onInitialized() {
 					// Open the optional GET SSE stream only after the initialized
 					// notification makes the session ready for further traffic.
@@ -263,7 +272,7 @@ export async function connectToServer(
 				instructions: initResult.instructions,
 			};
 		} catch (error) {
-			await transport.close();
+			await closeTransport();
 			throw error;
 		}
 	};
@@ -276,11 +285,9 @@ export async function connectToServer(
 		}
 		return await withTimeout(connect(), timeoutMs, timeoutError, options?.signal);
 	} catch (error) {
-		// If the timeout or the signal won while connect() was still pending,
-		// the transport may be alive with an open SSE listener. Close it.
-		if (transport) {
-			void transport.close().catch(() => {});
-		}
+		controller.abort(error);
+		// Close an existing transport; in-flight creation observes the aborted signal.
+		void closeTransport()?.catch(() => {});
 		throw error instanceof LegacySseConnectionTimeoutError ? timeoutError : error;
 	}
 }
@@ -374,6 +381,7 @@ export async function callTool(
 	options?: MCPRequestOptions,
 ): Promise<MCPToolCallResult> {
 	options?.signal?.throwIfAborted();
+	if (options?.mcpOwnerCurrent?.() === false) throw new DOMException("MCP call owner changed", "AbortError");
 	if (connection.awsAnonymousBootstrap && isAuthenticatedAwsTool(connection.name, toolName)) {
 		throw new Error("AUTH_REQUIRED: authenticated AWS calls require a signed proxy connection.");
 	}

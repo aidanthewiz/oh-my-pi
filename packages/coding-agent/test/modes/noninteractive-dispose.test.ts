@@ -30,6 +30,7 @@ describe("print mode disposes the session before terminating", () => {
 			errorMessage: "boom",
 			timestamp: 1,
 		};
+		let completed = false;
 		const session = {
 			extensionRunner: undefined,
 			subscribe: () => {},
@@ -41,10 +42,14 @@ describe("print mode disposes the session before terminating", () => {
 				onPersistenceError: () => () => {},
 				onPersistenceNotice: () => () => {},
 			},
-			state: { messages: [errorMsg] },
-			getLastAssistantMessage: () => errorMsg,
+			prompt: async () => {
+				completed = true;
+				return true;
+			},
+			getLastAssistantMessage: () => (completed ? errorMsg : undefined),
 			disableStopTimeTodoReminders: () => {},
 			prepareForHeadlessAdvisorDrain: () => {},
+			waitForIdle: async () => {},
 			setTextOutputCommitted: () => {},
 			waitForAdvisorCatchup: async () => {
 				order.push("catchup");
@@ -68,13 +73,15 @@ describe("print mode disposes the session before terminating", () => {
 		try {
 			// No `process.exit` spy: the contract is that runPrintMode never exits
 			// the process itself, it returns the code for the caller to use.
-			expect(await runPrintMode(session, { mode: "text" })).toBe(1);
+			expect(await runPrintMode(session, { mode: "text", messages: ["continue"] })).toBe(1);
 		} finally {
 			stderrSpy.mockRestore();
 			flushSpy.mockRestore();
 		}
 
-		expect(order).toEqual(["catchup", "flush", "dispose", "stderr"]);
+		// "Working..." (the text-mode admission indicator) precedes the
+		// terminal error line; dispose still lands before the error stderr.
+		expect(order).toEqual(["stderr", "catchup", "flush", "dispose", "stderr"]);
 		expect(stderrLines.join("")).toContain("boom");
 	});
 
@@ -112,6 +119,7 @@ describe("print mode disposes the session before terminating", () => {
 
 		let signalCallback: ((reason: postmortem.Reason) => void | Promise<void>) | undefined;
 		let disposeReason: postmortem.Reason | "dispose" | undefined;
+		let completed = false;
 		const session = {
 			extensionRunner: undefined,
 			subscribe: () => {},
@@ -122,9 +130,10 @@ describe("print mode disposes the session before terminating", () => {
 				onPersistenceError: () => () => {},
 				onPersistenceNotice: () => () => {},
 			},
-			getLastAssistantMessage: () => abortedMsg,
+			getLastAssistantMessage: () => (completed ? abortedMsg : undefined),
 			disableStopTimeTodoReminders: () => {},
 			prepareForHeadlessAdvisorDrain: () => {},
+			waitForIdle: async () => {},
 			setTextOutputCommitted: () => {},
 			waitForAdvisorCatchup: async () => true,
 			// Mimic a real mid-turn signal: the postmortem teardown fires (which
@@ -132,6 +141,8 @@ describe("print mode disposes the session before terminating", () => {
 			// settle with an aborted assistant message.
 			prompt: async () => {
 				await signalCallback?.(postmortem.Reason.SIGTERM);
+				completed = true;
+				return true;
 			},
 			dispose: async (options: { reason?: postmortem.Reason } = {}) => {
 				disposeReason ??= options.reason ?? "dispose";

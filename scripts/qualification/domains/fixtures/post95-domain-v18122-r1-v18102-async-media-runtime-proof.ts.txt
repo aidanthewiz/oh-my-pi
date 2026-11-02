@@ -1,0 +1,424 @@
+import assert from "node:assert/strict";
+import { createHash, randomUUID } from "node:crypto";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
+import * as os from "node:os";
+import type { AssistantMessage } from "../../packages/ai/src/types";
+import type { Terminal, TspHelloHandler } from "../../packages/tui/src/terminal";
+import type { TspEvent, TspFrame, TspNode } from "../../packages/wire/src/index";
+import type { ToolSession } from "../../packages/coding-agent/src/tools";
+import type { AgentEvent } from "../../packages/agent/src/types";
+import type { EvalToolDetails } from "../../packages/tui/src/tools/eval";
+
+function required(name: string): string {
+	const value = process.env[name];
+	assert(value, `missing ${name}`);
+	return value;
+}
+const digest = (bytes: string | Uint8Array) => createHash("sha256").update(bytes).digest("hex");
+const runtimeRoot = await fs.realpath(required("CF19_RUNTIME_ROOT"));
+const home = await fs.realpath(required("HOME"));
+assert(home.startsWith(`${runtimeRoot}${path.sep}`));
+assert.equal(await fs.realpath(os.homedir()), home, "HOME must be private before Bun starts");
+const marker = required("CF19_MARKER");
+assert.match(marker, /^[A-Za-z0-9_-]{8,80}$/);
+const version = required("CF_UPSTREAM_CANDIDATE_VERSION");
+const manifestPath = await fs.realpath(required("V1890_SOURCE_INPUT_MANIFEST"));
+assert(manifestPath.startsWith(`${runtimeRoot}${path.sep}`), "use the copied runtime manifest");
+const manifestBytes = await fs.readFile(manifestPath);
+assert.equal(digest(manifestBytes), required("V1890_SOURCE_INPUT_SHA256"));
+const manifest = JSON.parse(manifestBytes.toString());
+assert.equal(manifest.schema, "CoreforgeCandidateSourceSnapshot");
+assert.equal(digest(JSON.stringify(manifest.records)), manifest.sourceDigest);
+assert.equal(manifest.native.sha256, required("V1890_NATIVE_SHA256"));
+for (const key of ["TERN_BLOB_DIR", "OMP_CF_VERSION", "PI_PROFILE", "OMP_PROFILE", "PI_TUI_TSP_RECORD", "OMP_TUI_DEBUG"]) {
+	delete process.env[key]; delete Bun.env[key];
+}
+for (const [key, value] of Object.entries({ PI_CODING_AGENT_DIR: path.join(home, "agent"), TMPDIR: path.join(home, "tmp"),
+	XDG_CONFIG_HOME: path.join(home, "config"), XDG_DATA_HOME: path.join(home, "data"), XDG_CACHE_HOME: path.join(home, "cache") })) {
+	process.env[key] = Bun.env[key] = value;
+	await fs.mkdir(value, { recursive: true });
+}
+// These modules capture roots at import; bind the private environment before exercising their loading boundary.
+const { nativeAddonStatus } = await import("../../packages/natives/native/loader-state.js");
+await import("../../packages/natives/native/index.js");
+const native = nativeAddonStatus();
+assert(native && !native.stale);
+assert.equal(native.version, version);
+assert.equal(native.packageVersion, version);
+assert.equal(digest(await fs.readFile(native.path)), required("V1890_NATIVE_SHA256"));
+const { Agent } = await import("../../packages/agent/src/agent");
+const { AssistantMessageEventStream } = await import("../../packages/ai/src/utils/event-stream");
+const { buildModel } = await import("../../packages/catalog/src/build");
+const { AsyncJobManager } = await import("../../packages/coding-agent/src/async");
+const { Settings } = await import("../../packages/coding-agent/src/config/settings");
+const { SessionManager } = await import("../../packages/coding-agent/src/session/session-manager");
+const { BashTool } = await import("../../packages/coding-agent/src/tools/bash");
+const { EvalTool } = await import("../../packages/coding-agent/src/tools/eval");
+const { ReadTool } = await import("../../packages/coding-agent/src/tools/read");
+const { disposeVmContextsByOwner } = await import("../../packages/coding-agent/src/eval/js/context-manager");
+const { EventController } = await import("../../packages/coding-agent/src/modes/controllers/event-controller");
+const { mapAgentSessionEventToAcpSessionUpdates } = await import("../../packages/coding-agent/src/modes/acp/acp-event-mapper");
+const { ToolExecutionComponent, asyncJobState } = await import("../../packages/tui/src/chat/tool-execution");
+const { AssistantMessageComponent } = await import("../../packages/tui/src/chat/assistant-message");
+const { setTranscriptActionHandler } = await import("../../packages/tui/src/chat/transcript-actions");
+const { NativeImageCache, getNativeBlob } = await import("../../packages/tui/src/native/blobs");
+const { assumedTspHello } = await import("../../packages/tui/src/native/backend");
+const { waitToolRenderer } = await import("../../packages/tui/src/tools/wait");
+const { TUI } = await import("../../packages/tui/src/tui");
+const { TspDocument } = await import("../../packages/tui/src/native/apply");
+const { splitTspMessage } = await import("../../packages/tui/src/native/encode");
+const { TSP_KINDS } = await import("../../packages/wire/src/index");
+const { setNativeRendering } = await import("../../packages/tui/src/native/state");
+const { resizeImage } = await import("../../packages/coding-agent/src/utils/image-resize");
+const { encodeRawPng } = await import("../../packages/coding-agent/src/utils/png-encode");
+const { decodePng } = await import("../../packages/coding-agent/src/tools/browser/screenshot");
+const themeModule = await import("../../packages/tui/src/theme/theme");
+await Settings.init({ inMemory: true });
+await themeModule.initTheme(false);
+const fixtureRoot = await fs.mkdtemp(path.join(runtimeRoot, `${marker}-async-media-`));
+const artifactRoot = await fs.mkdtemp(path.join(runtimeRoot, `${marker}-async-media-artifacts-`));
+const owner = randomUUID();
+await fs.writeFile(path.join(fixtureRoot, ".owner"), owner, { flag: "wx", mode: 0o600 });
+await fs.writeFile(path.join(artifactRoot, ".owner"), owner, { flag: "wx", mode: 0o600 });
+
+// This adapter records production ANSI/TSP bytes and applies frames with the production wire consumer.
+class WireConsumer implements Terminal {
+	readonly columns = 108;
+	readonly rows = 40;
+	readonly kittyProtocolActive = false;
+	readonly kittyEnableSequence = null;
+	readonly appearance = "dark" as const;
+	readonly docs = new Map<string, InstanceType<typeof TspDocument>>();
+	readonly frames: TspFrame[] = [];
+	readonly errors: unknown[] = [];
+	readonly wire: { verb: string; body: unknown }[] = [];
+	readonly chunks = new Map<string, string>();
+	readonly blobs = new Set<string>();
+	bytes = "";
+	surface: string | undefined;
+	input: ((data: string) => void) | undefined;
+	started = false;
+	constructor(readonly media: boolean, readonly nativeMode = true) {}
+	start(input: (data: string) => void): void { this.input = input; this.started = true; }
+	stop(): void { this.input = undefined; this.started = false; }
+	async drainInput(): Promise<void> { await Bun.sleep(0); }
+	onTspHello(callback: TspHelloHandler): void {
+		queueMicrotask(() => {
+			if (this.started) callback(this.nativeMode ? { r: "hello", v: 1, term: "coreforge-owned-proof",
+				kinds: this.media ? TSP_KINDS : TSP_KINDS.filter(k => k !== "media"), features: ["blobs", "settle", "dock"],
+				cols: this.columns, dark: true, reduceMotion: true, hour12: false } : null);
+		});
+	}
+	send(event: TspEvent): void { assert(this.input); this.input(`\x1b_tsp;e;${JSON.stringify(event)}\x1b\\`); }
+	write(bytes: string): void {
+		this.bytes += bytes;
+		let at = 0;
+		for (;;) {
+			const start = bytes.indexOf("\x1b_tsp;", at);
+			if (start < 0) break;
+			const end = bytes.indexOf("\x1b\\", start);
+			assert(end >= 0);
+			const message = splitTspMessage(bytes.slice(start, end + 2)); assert(message);
+			at = end + 2;
+			let body = message.body;
+			if (message.params.c !== undefined) {
+				const id = message.params.c;
+				body = (this.chunks.get(id) ?? "") + body;
+				if (message.params.m === "1") { this.chunks.set(id, body); continue; }
+				this.chunks.delete(id);
+			}
+			if (message.verb === "b") { this.blobs.add(digest(Buffer.from(body, "base64"))); continue; }
+			const data = JSON.parse(body); this.wire.push({ verb: message.verb, body: data });
+			if (message.verb === "q" && data.q === "blobs") {
+				queueMicrotask(() => this.input?.(`\x1b_tsp;r;${JSON.stringify({ r: "blobs", have: data.ids.filter((id: string) => this.blobs.has(id)) })}\x1b\\`));
+			} else if (message.verb === "o") {
+				this.docs.set(data.id, new TspDocument(data.id)); this.surface = data.id;
+			} else if (message.verb === "f") {
+				this.frames.push(data);
+				const doc = this.docs.get(data.sf); assert(doc); this.errors.push(...doc.applyFrame(data));
+				queueMicrotask(() => this.input && this.send({ ev: "ack", sf: data.sf, s: data.s }));
+			} else if (message.verb === "x") {
+				if (data.keep) this.docs.get(data.id)?.close(); else this.docs.delete(data.id);
+			}
+		}
+	}
+	moveBy(n: number): void { this.write(n < 0 ? `\x1b[${-n}A` : `\x1b[${n}B`); }
+	hideCursor(): void { this.write("\x1b[?25l"); }
+	showCursor(): void { this.write("\x1b[?25h"); }
+	clearLine(): void { this.write("\x1b[2K"); }
+	clearFromCursor(): void { this.write("\x1b[J"); }
+	clearScreen(): void { this.write("\x1b[2J\x1b[H"); }
+	setTitle(title: string): void { this.write(`\x1b]2;${title}\x07`); }
+	setProgress(active: boolean): void { this.write(`\x1b]9;4;${active ? 3 : 0};\x07`); }
+	onAppearanceChange(callback: (appearance: "dark" | "light") => void): void { callback("dark"); }
+	find(predicate: (node: TspNode) => boolean): TspNode[] {
+		const doc = this.surface && this.docs.get(this.surface); assert(doc);
+		const out: TspNode[] = [];
+		const visit = (node: TspNode): void => { if (predicate(node)) out.push(node); for (const child of node.c ?? []) visit(child); };
+		visit(doc.snapshot()); return out;
+	}
+}
+const cases: { id: string; status: "passed"; evidence: unknown }[] = [];
+const artifacts: { file: string; sha256: string; bytes: number; kind: string }[] = [];
+const managers: InstanceType<typeof AsyncJobManager>[] = [];
+const controllers: InstanceType<typeof EventController>[] = [];
+const components: InstanceType<typeof ToolExecutionComponent>[] = [];
+const agents: InstanceType<typeof Agent>[] = [];
+const sessions: string[] = [];
+const uis: InstanceType<typeof TUI>[] = [];
+const consumers: WireConsumer[] = [];
+const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+const model = buildModel({ id: "owned-local", name: "owned-local", api: "anthropic-messages", provider: "owned-local", baseUrl: "http://invalid.invalid",
+	reasoning: false, input: ["text", "image"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 200000,
+	maxTokens: 1024 });
+function message(content: AssistantMessage["content"], stopReason: AssistantMessage["stopReason"]): AssistantMessage {
+	return { role: "assistant", api: "anthropic-messages", provider: "owned-local", model: "owned-local", content, usage, stopReason, timestamp: 1 };
+}
+async function eventually(predicate: () => boolean | Promise<boolean>, label: string): Promise<void> {
+	const end = Date.now() + 15000;
+	while (!(await predicate())) { assert(Date.now() < end, `deadline: ${label}`); await Bun.sleep(20); }
+}
+async function capture(name: string, bytes: string | Uint8Array, kind: string): Promise<void> {
+	const file = path.join(artifactRoot, name); await fs.writeFile(file, bytes, { mode: 0o600 });
+	artifacts.push({ file, sha256: digest(bytes), bytes: Buffer.byteLength(bytes), kind });
+}
+function sessionFor(settings: InstanceType<typeof Settings>, manager: InstanceType<typeof AsyncJobManager>, id: string): ToolSession {
+	return { cwd: fixtureRoot, hasUI: false, settings, asyncJobManager: manager, getSessionId: () => id, getAgentId: () => id,
+		getSessionFile: () => null, getSessionSpawns: () => null, getEvalKernelOwnerId: () => id, getActiveModel: () => model, getModelString: () => "owned-local/owned-local",
+		getActiveModelString: () => "owned-local/owned-local" } as ToolSession;
+}
+function cardContentState(card: InstanceType<typeof ToolExecutionComponent>): string {
+	return JSON.stringify(card.describe(), (_key, value) => {
+		const props = value?.p;
+		const liveElapsed = value?.k === "elapsed" && props?.stopped === undefined;
+		const liveTool = value?.k === "tool" && (props?.status === "running" || props?.status === "pending");
+		return props && (liveElapsed || liveTool) ? { ...value, p: { ...props, age: undefined } } : value;
+	});
+}
+let failure: unknown;
+try {
+	const evalImage = encodeRawPng(Uint8Array.of(255, 255, 255, 128), 1, 1, 4).toString("base64");
+	for (const kind of ["bash", "eval"] as const) {
+		for (const outcome of ["completed", "failed", "cancelled", "disposed"] as const) {
+			const terminalState = outcome === "disposed" ? "completed" : outcome;
+			const id = `${marker}-${kind}-${outcome}`; sessions.push(id);
+			const gate = path.join(fixtureRoot, `${id}.release`);
+			const first = `${id}-FIRST`, last = `${id}-LAST`;
+			const deliveries: string[] = [];
+			const manager = new AsyncJobManager({ onJobComplete: (_jobId, text) => { deliveries.push(text); } }); managers.push(manager);
+			const settings = Settings.isolated({ "async.enabled": true, "bash.autoBackground.enabled": true,
+				"bash.autoBackground.thresholdMs": 0, "bashInterceptor.enabled": false, "bash.direnv": "off",
+				"eval.autoBackground.enabled": true, "eval.autoBackground.thresholdMs": 0, "tools.approvalMode": "yolo" });
+			const session = sessionFor(settings, manager, id);
+			const tool = kind === "bash" ? new BashTool(session) : new EvalTool(session);
+			const quoted = `'${gate.replaceAll("'", "'\\''")}'`;
+			const args = kind === "bash" ? { command: `printf '%s\\n' '${first}'; while [ ! -f ${quoted} ]; do sleep 0.02; done; printf '%s\\n' '${last}'; exit ${outcome === "failed" ? 7 : 0}`, async: true, timeout: 0 }
+				: { language: "js", timeout: 0, code: `var f = await import('node:fs/promises'); console.log(${JSON.stringify(first)}); while (!(await f.access(${JSON.stringify(gate)}).then(()=>true,()=>false))) { const delay = Promise.withResolvers(); setTimeout(delay.resolve,20); await delay.promise; } console.log(${JSON.stringify(last)}); print({type:'image',data:${JSON.stringify(evalImage)},mimeType:'image/png'}); ${outcome === "failed" ? "throw new Error('OWNED_EVAL_FAILURE')" : ""}` };
+			const consumer = new WireConsumer(true); consumers.push(consumer);
+			const ui = new TUI(consumer, false); uis.push(ui); ui.start(); await Bun.sleep(80); setNativeRendering(true);
+			const pendingTools = new Map<string, InstanceType<typeof ToolExecutionComponent>>();
+			const sessionManager = SessionManager.inMemory(fixtureRoot);
+			const context = { isInitialized: true, settings, session: { settings, sessionManager, isStreaming: false, isAborting: false },
+				viewSession: { settings, sessionManager, isStreaming: false, getToolByName: (name: string) => name === kind ? tool : undefined, hasBuiltInTool: (name: string) => name === kind },
+				ui, chatContainer: ui, pendingTools, sessionManager, tableChartsVisible: false, toolOutputExpanded: true };
+			const controller = new EventController(context as never); controllers.push(controller);
+			let turn = 0, ended = false;
+			const agent = new Agent({ initialState: { model, tools: [tool], systemPrompt: ["Owned local stream fixture; no provider transport."] },
+				streamFn: () => {
+					const stream = new AssistantMessageEventStream();
+					const final = turn++ === 0 ? message([{ type: "toolCall", id, name: kind, arguments: args }], "toolUse") : message([{ type: "text", text: "local turn ended" }], "stop");
+					queueMicrotask(() => { stream.push({ type: "start", partial: final }); stream.push({ type: "done", reason: final.stopReason as "stop" | "toolUse", message: final }); });
+					return stream;
+				} }); agents.push(agent);
+			const updates: { event: Extract<AgentEvent, { type: "tool_execution_update" }>; afterEnd: boolean }[] = [];
+			const acp: unknown[] = [];
+			let routing = Promise.resolve();
+			let card: InstanceType<typeof ToolExecutionComponent> | undefined;
+			agent.subscribe(event => {
+				if (event.type === "agent_end") ended = true;
+				if (!event.type.startsWith("tool_execution_")) return;
+				if (event.type === "tool_execution_update") updates.push({ event, afterEnd: ended });
+				acp.push(...mapAgentSessionEventToAcpSessionUpdates(event as never, id));
+				routing = routing.then(async () => {
+					await controller.dispatchSessionEvent(event as never);
+					if (event.type === "tool_execution_start") { card = pendingTools.get(id); assert(card); components.push(card); }
+				});
+			});
+			await agent.prompt("Run the owned local tool."); await routing;
+			assert(ended, `${id}: agent_end missing`); assert(card, `${id}: tool card missing; messages=${JSON.stringify(agent.state.messages)}`); assert(pendingTools.has(id), `${id}: returned background call must retain its card`);
+			const job = manager.getAllJobs()[0]; assert(job && job.status === "running");
+			await eventually(() => updates.some(({ event }) => JSON.stringify(event.partialResult.content).includes(first)), "first live output");
+			await routing;
+			if (kind === "eval") assert(updates.some(({ event }) => (event.partialResult.details as EvalToolDetails | undefined)?.cells?.some(cell => cell.status === "running" && cell.output.includes(first) && !cell.output.includes(last))), "active eval cell lost FIRST output before release");
+			let beforeDispose: string | undefined;
+			if (outcome === "disposed") {
+				controller.dispose();
+				beforeDispose = cardContentState(card);
+			}
+			if (outcome === "cancelled") assert(manager.cancel(job.id)); else await fs.writeFile(gate, "release", { flag: "wx" });
+			await job.promise; await manager.drainDeliveries({ timeoutMs: 5000 }); await routing;
+			await eventually(() => updates.some(({ event }) => asyncJobState(event.partialResult.details) === terminalState), "terminal live frame"); await routing;
+			const final = updates.findLast(({ event }) => asyncJobState(event.partialResult.details) === terminalState)!;
+			assert(final.afterEnd, "job update must survive agent_end");
+			const finalText = final.event.partialResult.content.filter(b => b.type === "text").map(b => b.text).join("\n");
+			assert(finalText.includes(first), "terminal frame lost exact earlier output");
+			if (outcome !== "cancelled") assert(finalText.includes(last), "terminal frame lost final output");
+			if (kind === "eval" && outcome !== "cancelled") {
+				const cells = (final.event.partialResult.details as EvalToolDetails | undefined)?.cells; assert(cells); assert.equal(cells.length, 1);
+				const cell = cells[0]!; assert(cell.output.includes(first)); assert(cell.output.includes(last)); assert(cell.output.indexOf(first) < cell.output.indexOf(last));
+				assert.equal(cell.status, outcome === "failed" ? "error" : "complete");
+				if (outcome === "failed") assert(cell.output.includes("OWNED_EVAL_FAILURE"), "eval cell lost its execution error");
+			}
+			const finalImages = final.event.partialResult.content.filter(block => block.type === "image");
+			if (kind === "eval" && outcome === "cancelled") { assert.equal(finalImages.length, 0); assert(!finalText.includes(last)); }
+			if (kind === "eval" && outcome !== "cancelled") {
+				assert.equal(finalImages.length, 1, "background eval final frame lost or duplicated its actual display image");
+				const decoded = decodePng(await new Bun.Image(Buffer.from(finalImages[0]!.data, "base64")).png().bytes());
+				assert(decoded.width >= 1); assert.equal(decoded.width, decoded.height, "image admission distorted the square source");
+				assert.equal(decoded.pixels.length, decoded.width * decoded.height * 4);
+				for (let pixel = 0; pixel < decoded.pixels.length; pixel += 4) {
+					assert.equal(decoded.pixels[pixel], 255); assert.equal(decoded.pixels[pixel + 1], 255);
+					assert.equal(decoded.pixels[pixel + 2], 255); assert.equal(decoded.pixels[pixel + 3], 128);
+				}
+				await capture(`${id}-final-image.png`, await new Bun.Image(Buffer.from(finalImages[0]!.data, "base64")).png().bytes(), "png");
+			}
+			if (outcome === "disposed") {
+				assert.equal(pendingTools.get(id), card);
+				assert.equal(cardContentState(card), beforeDispose, "disposed owner accepted actual later job frames");
+			} else {
+				assert.equal(pendingTools.has(id), false);
+				assert(card.isTranscriptBlockFinalized());
+			}
+			const notification = acp.at(-1);
+			assert(notification && typeof notification === "object" && "update" in notification);
+			const update = notification.update;
+			assert(update && typeof update === "object" && "status" in update);
+			const status = update.status; assert.equal(status, terminalState === "completed" ? "completed" : "failed");
+			ui.requestRender(); await Bun.sleep(90); assert.deepEqual(consumer.errors, []);
+			assert(JSON.stringify(card.describe()).includes(first));
+			if (kind === "eval" && outcome !== "cancelled" && outcome !== "disposed") {
+				assert.equal(consumer.find(node => node.k === "image").length, 1, "card renderer duplicated the final image");
+			}
+			const view = waitToolRenderer.describeResult!({ content: [{ type: "text", text: "" }], details: { op: "wait", jobs: [{ id: job.id,
+				type: kind, status: job.status, label: id, durationMs: 100, resultText: finalText }] } }, { expanded: true, isPartial: false });
+			assert(!JSON.stringify(view).includes(first), "wait duplicated originating card output");
+			await capture(`${id}.wire.json`, JSON.stringify({ frames: consumer.frames, acp, updates, document: consumer.docs.get(consumer.surface!)?.snapshot() }, null, 2), "wire");
+			await capture(`${id}.ansi`, card.render(108).join("\n"), "ansi");
+			controller.dispose();
+			cases.push({ id: `${kind}-${outcome}-after-agent-end`, status: "passed", evidence: { jobId: job.id, state: job.status, finalText, finalImages: finalImages.length, acpStatus: status, updates: updates.length, outputRetained: true, disposedOwnerIgnored: outcome === "disposed" } });
+			ui.stop(); await manager.dispose();
+		}
+	}
+	const side = 64, pixels = new Uint8Array(side * side * 4);
+	for (let y = 0; y < side; y++) for (let x = 0; x < side; x++) {
+		const coverage = Math.min(1, Math.max(0, side / 2 - 4 - Math.hypot(x + 0.5 - side / 2, y + 0.5 - side / 2) + 0.5));
+		if (coverage > 0) pixels.set([255, 255, 255, Math.round(coverage * 255)], (y * side + x) * 4);
+	}
+	const png = encodeRawPng(pixels, side, side, 4);
+	const imagePath = path.join(fixtureRoot, "owned-transparent.png"); await fs.writeFile(imagePath, png);
+	for (const excludeWebP of [false, true]) for (const maxBytes of [512000, 1]) {
+		const result = await resizeImage({ bytes: png, mimeType: "image/png" }, { maxWidth: 32, maxHeight: 32, excludeWebP, maxBytes });
+		assert.notEqual(result.mimeType, "image/jpeg"); if (excludeWebP) assert.equal(result.mimeType, "image/png");
+		const decoded = decodePng(await new Bun.Image(result.buffer).png().bytes());
+		assert.equal(decoded.pixels[3], 0); assert.equal(decoded.pixels[((decoded.height >> 1) * decoded.width + (decoded.width >> 1)) * 4 + 3], 255);
+		let darkest = 255; for (let i = 0; i < decoded.pixels.length; i += 4) if (decoded.pixels[i + 3] >= 32) darkest = Math.min(darkest, decoded.pixels[i], decoded.pixels[i + 1], decoded.pixels[i + 2]);
+		assert(darkest > 230);
+		await capture(`alpha-${excludeWebP}-${maxBytes}.png`, await new Bun.Image(result.buffer).png().bytes(), "png");
+		cases.push({ id: `alpha-${excludeWebP}-${maxBytes}`, status: "passed", evidence: { mime: result.mimeType, width: decoded.width, height: decoded.height, darkest, transparentCorner: true, opaqueCenter: true } });
+	}
+	const manager = new AsyncJobManager({ onJobComplete: () => {} }); managers.push(manager);
+	const readSession = sessionFor(Settings.isolated({ "images.autoResize": false }), manager, `${marker}-read`);
+	const read = new ReadTool(readSession);
+	const raster = await read.execute("raster", { path: imagePath });
+	assert.equal(Object.hasOwn(raster.details ?? {}, "mediaPath"), false);
+	await fs.writeFile(imagePath, '<svg xmlns="http://www.w3.org/2000/svg"><image href="file:///NEVER_READ"/></svg>');
+	await fs.writeFile(path.join(fixtureRoot, "model.obj"), "mtllib NEVER_READ.mtl\nv 0 0 0\n");
+	await fs.writeFile(path.join(fixtureRoot, "renamed.png"), '<svg xmlns="http://www.w3.org/2000/svg"><image href="file:///NEVER_READ"/></svg>');
+	await fs.writeFile(path.join(fixtureRoot, "logo.svg"), '<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"><rect width="8" height="8" fill="red"/></svg>');
+	for (const name of ["model.obj", "logo.svg", "renamed.png", "model.obj:1-2"]) {
+		const result = await read.execute(name, { path: name }); assert.equal(Object.hasOwn(result.details ?? {}, "mediaPath"), false, name);
+	}
+	const cache = new NativeImageCache(); const image = raster.content.find(b => b.type === "image"); assert(image?.type === "image");
+	const cached = cache.get("slot", image.data, image.mimeType);
+	const props = cached.p; assert(props && "blob" in props && typeof props.blob === "string");
+	const blobId = props.blob;
+	assert.equal(blobId, digest(Buffer.from(image.data, "base64"))); assert.equal(getNativeBlob(blobId)?.mime, image.mimeType);
+	assert.equal(cache.get("slot", image.data, image.mimeType), cached);
+	assert(!assumedTspHello(new WireConsumer(true)).kinds.includes("media"));
+	for (const media of [false, true]) {
+		const terminal = new WireConsumer(media); consumers.push(terminal); const ui = new TUI(terminal, false); uis.push(ui);
+		const card = new ToolExecutionComponent("read", { path: imagePath }, { showImages: true }, undefined, ui); components.push(card);
+		card.updateResult({ ...raster, details: { ...raster.details, mediaPath: "/private/UNAPPROVED_TRANSLATED_IMAGE.png", mediaMimeType: "image/png" } });
+		ui.addChild(card); ui.start(); await Bun.sleep(100); ui.requestRender(); await Bun.sleep(100);
+		assert.deepEqual(terminal.errors, []);
+		assert.equal(terminal.find(n => n.k === "media").length, 0, "mutable Read path must never reopen through the host");
+		const images = terminal.find(n => n.k === "image"); assert.equal(images.length, 1);
+		assert.equal(images[0]?.p?.blob, blobId, "file replacement must not change admitted display bytes");
+		assert.equal(Buffer.from(getNativeBlob(blobId)!.bytes).equals(Buffer.from(image.data, "base64")), true);
+		assert(!JSON.stringify(terminal.docs.get(terminal.surface!)?.snapshot()).includes("UNAPPROVED_TRANSLATED_IMAGE"));
+		await capture(`raster-${media}.wire.json`, JSON.stringify({ frames: terminal.frames, document: terminal.docs.get(terminal.surface!)?.snapshot() }, null, 2), "wire");
+		ui.stop();
+	}
+	const narrated = message([{ type: "thinking", thinking: "PRIVATE_REASONING_MUST_STAY_HIDDEN", thinkingSignature: "synthetic-reasoning-signature" }, { type: "thinking", thinking: "VISIBLE_NARRATION_" + marker, thinkingSignature: "synthetic-narration-signature", narration: true }], "stop");
+	const signedNarration = JSON.stringify(narrated.content);
+	const narrationText = Bun.stripANSI(new AssistantMessageComponent(narrated, true).render(100).join("\n"));
+	assert(narrationText.includes("VISIBLE_NARRATION_" + marker));
+	assert(!narrationText.includes("PRIVATE_REASONING_MUST_STAY_HIDDEN"));
+	assert.equal(JSON.stringify(narrated.content), signedNarration, "Presentation changed signed replay thinking");
+	const ansiTerminal = new WireConsumer(false, false); consumers.push(ansiTerminal); const ansiUi = new TUI(ansiTerminal, false); uis.push(ansiUi);
+	const actions: unknown[] = []; setTranscriptActionHandler(action => actions.push(action));
+	const copyTerminal = new WireConsumer(true); consumers.push(copyTerminal);
+	const copyUi = new TUI(copyTerminal, false); uis.push(copyUi);
+	const copyAssistant = new AssistantMessageComponent(message([
+		{ type: "text", text: `  ${marker} visible first\n` },
+		{ type: "thinking", thinking: "PRIVATE_NOT_COPYABLE" },
+		{ type: "text", text: " visible last " },
+	], "stop"));
+	copyAssistant.setTurnUsage({ elapsedMs: 100, input: 0, output: 0, cost: 0 });
+	copyUi.addChild(copyAssistant); copyUi.start(); await Bun.sleep(90); copyUi.requestRender(); await Bun.sleep(90);
+	const copy = copyTerminal.find(n => n.p?.role === "omp.turn.copy")[0]; assert(copy && copyTerminal.surface);
+	copyTerminal.send({ ev: "action", sf: copyTerminal.surface, id: copy.id, act: "copy-answer" }); await Bun.sleep(30);
+	assert.deepEqual(actions, [{ act: "copy", text: `${marker} visible first\n\nvisible last` }]);
+	copyAssistant.updateContent(message([{ type: "text", text: "👨‍" }], "stop"), { transient: true });
+	copyUi.requestRender(); await Bun.sleep(90);
+	assert.equal(copyTerminal.find(n => n.p?.role === "omp.turn.copy").length, 0, "pending display draft must not copy a previous answer");
+	copyTerminal.send({ ev: "action", sf: copyTerminal.surface, id: copy.id, act: "copy-answer" }); await Bun.sleep(30);
+	assert.equal(actions.length, 1);
+	await capture("assistant-copy.wire.json", JSON.stringify({ frames: copyTerminal.frames, actions, document: copyTerminal.docs.get(copyTerminal.surface)?.snapshot() }, null, 2), "wire");
+	copyUi.stop(); copyAssistant.dispose();
+	cases.push({ id: "displayed-copy-and-pending-draft", status: "passed", evidence: { actions, hiddenThinkingExcluded: true, staleCopyRejected: true } });
+	const assistant = new AssistantMessageComponent(message([{ type: "text", text: `${marker} displayed answer` }], "stop"));
+	ansiUi.addChild(assistant); ansiUi.start(); await Bun.sleep(90); ansiUi.requestRender(); await Bun.sleep(90);
+	assert(Bun.stripANSI(ansiTerminal.bytes).includes(`${marker} displayed answer`)); await capture("assistant.ansi", ansiTerminal.bytes, "ansi"); ansiUi.stop(); assistant.dispose();
+	cases.push({ id: "raster-identity-negotiation-and-gates", status: "passed", evidence: { imagePath, blobId, actualRead: true, sourceReplacedWithUnsafeContent: true, assumedMedia: false, canonicalBlobWithAndWithoutMediaCapability: true, sidecarAndRenamedContentFallback: true } });
+	const disabled = new EvalTool(sessionFor(Settings.isolated({ "eval.autoBackground.enabled": false }), manager, `${marker}-inline`)); sessions.push(`${marker}-inline`);
+	const inlineValue = { marker: "OWNED_INLINE_ONLY", rows: Array.from({ length: 6 }, (_, index) => ({ index, label: `owned-row-${index}` })) };
+	const inline = await disabled.execute("inline", { language: "js", code: `if (typeof display !== "undefined") throw new Error("REMOVED_DISPLAY_ALIAS"); console.log('OWNED_INLINE_ONLY'); print(${JSON.stringify(inlineValue)});` });
+	const inlineCell = inline.details?.cells?.[0]; assert(inlineCell); assert.equal(inlineCell.status, "complete");
+	const inlineView = inlineCell.views?.find(entry => entry.view.kind === "json"); assert(inlineView);
+	if (inlineView.view.kind === "json") assert.deepEqual(inlineView.view.value, inlineValue);
+	assert(inlineCell.output.includes(inlineView.text));
+	assert(inline.content.some(block => block.type === "text" && block.text.includes(inlineView.text)));
+	assert.equal(inline.details?.async, undefined); assert(JSON.stringify(inline.content).includes("OWNED_INLINE_ONLY")); assert.equal(manager.getAllJobs().length, 0);
+	cases.push({ id: "disabled-background-owner", status: "passed", evidence: { output: inline.content, jobs: 0 } });
+} catch (error) { failure = error; }
+finally {
+	for (const agent of agents) agent.abort();
+	for (const controller of controllers) controller.dispose();
+	for (const manager of managers) await manager.dispose({ timeoutMs: 10000 });
+	for (const id of sessions) await disposeVmContextsByOwner(id);
+	for (const manager of managers) assert(await manager.dispose({ timeoutMs: 10000 }), "owned jobs did not stop");
+	for (const card of components) card.dispose();
+	for (const ui of uis) ui.stop();
+	setNativeRendering(false); setTranscriptActionHandler(undefined);
+	assert.equal(await fs.readFile(path.join(fixtureRoot, ".owner"), "utf8"), owner);
+	await fs.rm(fixtureRoot, { recursive: true });
+}
+assert.equal(await fs.access(fixtureRoot).then(() => true, () => false), false);
+console.log(JSON.stringify({ schema: "CoreforgeFrozen19DomainProof", domain: "async-media", complete: !failure, passed: !failure,
+	mode: process.env.PI_COMPILED ? "compiled" : "source", version, sourceDigest: manifest.sourceDigest,
+	nativeSha256: required("V1890_NATIVE_SHA256"), cases, cleanupVerified: true, fixtureRootRemoved: true, paidRequests: 0,
+	artifactRoot, artifacts, error: failure ? String(failure instanceof Error ? failure.stack : failure) : undefined }));
+if (failure) throw failure;

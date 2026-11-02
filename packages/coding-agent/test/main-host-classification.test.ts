@@ -1,9 +1,14 @@
-import { expect, it } from "bun:test";
+import { afterEach, expect, it } from "bun:test";
 import { discoverAuthStorage } from "@oh-my-pi/pi-coding-agent/sdk";
 import { parseArgs } from "@oh-my-pi/pi-coding-agent/cli/args";
 import { resetSettingsForTest } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { clearOmpExtensionCliRoots } from "@oh-my-pi/pi-coding-agent/discovery/omp-extension-roots";
 import { runRootCommand } from "@oh-my-pi/pi-coding-agent/main";
 import { getDbBusyTimeoutMs, setInteractiveHost, TempDir } from "@oh-my-pi/pi-utils";
+
+afterEach(() => {
+	clearOmpExtensionCliRoots();
+});
 
 it("classifies auth storage and restores headless database waits after a failed interactive launch", async () => {
 	const previous = setInteractiveHost(false);
@@ -78,7 +83,7 @@ it("standalone auth discovery routes by PI_CONFIG_FILES policy over main config"
 			]);
 			expect(await storage.keys.get("test-provider", "standalone-policy-session")).toBe("preferred-token");
 		} finally {
-			storage.close();
+			await storage.close();
 		}
 	} finally {
 		if (previousOverlay === undefined) delete process.env.PI_CONFIG_FILES;

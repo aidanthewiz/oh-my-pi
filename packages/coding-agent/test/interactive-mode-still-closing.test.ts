@@ -47,7 +47,7 @@ describe("InteractiveMode long shutdown status", () => {
 		mode.stop();
 		vi.restoreAllMocks();
 		await session.dispose();
-		authStorage.close();
+		await authStorage.close();
 		tempDir.removeSync();
 		resetSettingsForTest();
 	});

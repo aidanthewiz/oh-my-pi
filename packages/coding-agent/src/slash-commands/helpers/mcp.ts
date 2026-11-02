@@ -9,11 +9,19 @@ import {
 	setServerDisabled,
 	updateMCPServer,
 } from "../../mcp/config-writer";
+import { cfgMcpEnableProjectConfig } from "../../mcp/settings";
 import { MCPManager } from "../../mcp/manager";
+import {
+	findMcpServerForAuth,
+	MCPOAuthCancelledError,
+	McpReauthRefusalError,
+	reauthorizeMcpServer,
+} from "../../mcp/oauth-reauth";
 import { getSmitheryApiKey } from "../../mcp/smithery-auth";
 import { searchSmitheryRegistry } from "../../mcp/smithery-registry";
 import type { MCPServerConfig, MCPServerConnection } from "../../mcp/types";
 import { parseCommandArgs } from "../../utils/command-args";
+import { openPath } from "../../utils/open";
 import type { ParsedSlashCommand, SlashCommandResult, SlashCommandRuntime } from "../types";
 import { commandConsumed, errorMessage, parseNamedScopeArgs, parseSubcommand, usage } from "./parse";
 
@@ -471,6 +479,129 @@ async function handleRemoveCommand(rest: string, runtime: SlashCommandRuntime): 
 	}
 }
 
+/**
+ * `/mcp reauth <name>` for ACP/text/RPC mode: the shared engine in
+ * `mcp/oauth-reauth.ts` (same browser flow, client-credential assembly, and
+ * persistence policy as the TUI) presented as plain text.
+ *
+ * omp usually runs on the user's machine when driven over ACP (emacs via
+ * agent-shell, Zed), so opening the browser works like the TUI. No clipboard
+ * copy: OSC 52 escape sequences would corrupt the ACP JSON-RPC stream on
+ * stdout, so the URL is emitted as text for the client to render. No
+ * manual-code input either (ACP has no composer to claim), so the OAuth
+ * redirect must reach this machine's local callback server: the printed URL
+ * helps when the browser fails to open, not when omp runs on a remote host.
+ */
+async function handleReauthCommand(rest: string, runtime: SlashCommandRuntime): Promise<SlashCommandResult> {
+	// `reauth` takes no other flags, so the entire rest is the server name —
+	// `validateServerName` permits spaces, and splitting on whitespace (or
+	// un-quoting) would truncate "MaaS Slack" to "MaaS".
+	const name = rest.trim();
+	if (!name) return usage("Usage: /mcp reauth <name>", runtime);
+	const modelRegistry = runtime.session.modelRegistry;
+	const sessionId = runtime.session.sessionId;
+	const model = runtime.session.model;
+	const authStorage = modelRegistry?.authStorage;
+	const credentialPool = authStorage?.credentials;
+	const isCurrent = (): boolean =>
+		!runtime.signal?.aborted &&
+		!runtime.session.isDisposed &&
+		runtime.session.model === model &&
+		runtime.session.modelRegistry?.authStorage === authStorage &&
+		authStorage?.credentials === credentialPool &&
+		runtime.isCurrent?.() !== false &&
+		runtime.session.sessionManager === runtime.sessionManager &&
+		runtime.session.sessionId === sessionId &&
+		runtime.session.modelRegistry === modelRegistry;
+	if (!isCurrent()) return commandConsumed();
+	const found = await findMcpServerForAuth(name, runtime.cwd, runtime.mcpManager, {
+		preferManager: true,
+		// `mcp.enableProjectConfig: false` opts the project out of project-scoped
+		// config; the lookup must not resurrect (or write bindings for) an
+		// opted-out entry.
+		enableProjectConfig: cfgMcpEnableProjectConfig.get(runtime.settings),
+	});
+	if (!isCurrent()) return commandConsumed();
+	if (!found) return usage(`Server "${name}" not found. Run /mcp list to see configured servers.`, runtime);
+	if (!authStorage) return usage("MCP browser authorization requires the original session credential store.", runtime);
+
+	const emit = (text: string): void => {
+		if (isCurrent()) void Promise.resolve(runtime.output(text)).catch(() => {});
+	};
+	const run = async (): Promise<SlashCommandResult> => {
+		try {
+			if (!isCurrent()) return commandConsumed();
+			const outcome = await reauthorizeMcpServer(name, found, {
+				authStorage,
+				signal: runtime.signal,
+				isCurrent,
+				mcpManager: runtime.mcpManager,
+				cwd: runtime.cwd,
+				onReauthorizing: () => {
+					if (runtime.allowMcpBrowserAuth !== true) {
+						throw new McpReauthRefusalError(
+							"MCP browser authorization requires explicit browser consent from this host.",
+						);
+					}
+					if (!isCurrent()) throw new MCPOAuthCancelledError();
+					emit(`Reauthorizing "${name}"… opening your browser (5 minute timeout).`);
+				},
+				onAuth: info => {
+					if (!isCurrent()) throw new MCPOAuthCancelledError();
+					openPath(info.url);
+					emit(
+						[
+							"━━━ OAuth Authorization Required ━━━",
+							"Opening your browser to authorize. If it did not open:",
+							info.url,
+							...(info.instructions ? ["", info.instructions] : []),
+						].join("\n"),
+					);
+				},
+				onProgress: message => emit(message),
+			});
+			if (!isCurrent()) return commandConsumed();
+			const state = await runtime.reconnectMcpServer?.(name, found, outcome.config);
+			if (!isCurrent()) return commandConsumed();
+			const suffix =
+				state === "connected"
+					? " Server reconnected."
+					: state === "connecting"
+						? " Server reconnecting…"
+						: state === "disconnected"
+							? " Server still disconnected; no background retry is armed for a server that never connected — restart the session (or reconnect it interactively) to use the fresh credential."
+							: " Credentials apply on the next connection; restart the session if the server stays disconnected.";
+			emit(`✓ Reauthorized "${name}" (${found.scope} config).${suffix}`);
+			return commandConsumed();
+		} catch (error) {
+			if (error instanceof McpReauthRefusalError) {
+				return usage(error.message, runtime);
+			}
+			if (error instanceof MCPOAuthCancelledError) {
+				emit(`Reauthorization cancelled for "${name}".`);
+				return commandConsumed();
+			}
+			return usage(`Failed to reauthorize server "${name}": ${errorMessage(error)}`, runtime);
+		}
+	};
+	const runGuarded = (): Promise<SlashCommandResult> =>
+		runtime.runCancellationBarrier ? runtime.runCancellationBarrier(run) : run();
+
+	// RPC's prompt API must return immediately and keep its serialized command
+	// queue free for `abort`; a browser wait would otherwise park it for up to
+	// five minutes (same dispatch as /compact and /handoff use).
+	if (runtime.runCommandInBackground) {
+		runtime.runCommandInBackground(() =>
+			runGuarded().then(
+				() => undefined,
+				() => undefined,
+			),
+		);
+		return commandConsumed();
+	}
+	return await runGuarded();
+}
+
 const MCP_HELP_TEXT = [
 	"MCP server management (ACP mode)",
 	"  /mcp list                                               List configured servers",
@@ -481,13 +612,14 @@ const MCP_HELP_TEXT = [
 	"  /mcp resources                                          List resources from all servers",
 	"  /mcp prompts                                            List prompts from all servers",
 	"  /mcp test <name>                                        Test connection to a server",
+	"  /mcp reauth <name>                                      Reauthorize OAuth for a server (opens browser)",
 	"  /mcp add <name> [--scope project|user] [--url <url>]    Add a server (non-interactive)",
 	"  /mcp add <name> [-- <command...>]                       Add a stdio server",
 	"  /mcp smithery-search <kw> [--scope project|user]        Search Smithery registry",
 	"  /mcp help                                               Show this help",
 ].join("\n");
 
-const TUI_ONLY_MCP_VERBS = new Set(["reauth", "unauth", "smithery-login", "smithery-logout", "reconnect"]);
+const TUI_ONLY_MCP_VERBS = new Set(["unauth", "smithery-login", "smithery-logout", "reconnect"]);
 
 /** ACP/text-mode `/mcp` handler. Shared by both dispatchers via the spec. */
 export async function handleMcpAcp(
@@ -515,6 +647,8 @@ export async function handleMcpAcp(
 			return await handlePromptsCommand(runtime);
 		case "test":
 			return await handleTestCommand(rest, runtime);
+		case "reauth":
+			return await handleReauthCommand(rest, runtime);
 		case "add":
 			return await handleAddCommand(rest, runtime);
 		case "smithery-search":

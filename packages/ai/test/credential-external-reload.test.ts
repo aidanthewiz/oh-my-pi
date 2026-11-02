@@ -88,8 +88,8 @@ function makeExternallyMutableStore(rows: StoredAuthCredential[]): ExternalStore
 
 describe("credential pool visibility across processes", () => {
 	const storages: AuthStorage[] = [];
-	afterEach(() => {
-		for (const storage of storages) storage.close();
+	afterEach(async () => {
+		for (const storage of storages) await storage.close();
 		storages.length = 0;
 	});
 

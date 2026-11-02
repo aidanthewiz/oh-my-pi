@@ -45,7 +45,7 @@ describe("createAgentSession auto-learn tool activation", () => {
 
 	afterAll(async () => {
 		await Promise.all(sessions.map(session => session.dispose().catch(() => {})));
-		authStorage.close();
+		await authStorage.close();
 		if (fs.existsSync(registryDir)) removeSyncWithRetries(registryDir);
 	});
 

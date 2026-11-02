@@ -39,7 +39,7 @@ describe("AuthStorage Z.AI API-key usage ranking", () => {
 	});
 
 	afterEach(async () => {
-		authStorage?.close();
+		await authStorage?.close();
 		store?.close();
 		store = null;
 		authStorage = null;

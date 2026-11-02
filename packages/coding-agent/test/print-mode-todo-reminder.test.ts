@@ -47,7 +47,7 @@ it("prints the requested answer without continuing stale todos in print mode", a
 		expect(model.calls).toHaveLength(1);
 	} finally {
 		await session.dispose();
-		auth.close();
+		await auth.close();
 		await dir.remove();
 	}
 });

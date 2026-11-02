@@ -1064,11 +1064,46 @@ describe("OutputSink maxColumns (per-line cap)", () => {
 			spillThreshold: 100_000,
 		});
 		await sink.push("one\ntwo\n");
-		sink.replace("rewritten\n");
+		sink.replace("rewrote\n");
 		await sink.push(`${"z".repeat(50)}\n`);
 		const dumped = await sink.dump();
 		expect(dumped.columnTruncatedLines).toBe(1);
 		expect(dumped.columnTruncatedRange).toBeUndefined();
+	});
+
+	test("replace() holds the replacement to the column cap", async () => {
+		const sink = new OutputSink({ maxColumns: 8, spillThreshold: 100_000 });
+		await sink.push("raw\n");
+		const replacement = `ok\n${"x".repeat(50)}\n`;
+		sink.replace(replacement);
+		const dumped = await sink.dump();
+		expect(dumped.output).toBe("ok\nxxxxx…\n");
+		expect(dumped.truncated).toBe(false);
+		expect(dumped.columnTruncatedLines).toBe(1);
+		expect(dumped.totalBytes).toBe(byteLength(replacement));
+	});
+
+	test("replacement keeps UTF-8 boundaries and carries a clipped partial line into later chunks", async () => {
+		const sink = new OutputSink({ maxColumns: 8, spillThreshold: 100_000 });
+		sink.replace("界".repeat(20));
+		await sink.push("hidden continuation\nnext\n");
+		const dumped = await sink.dump();
+		expect(dumped.output).toBe("界…\nnext\n");
+		expect(dumped.output).not.toContain("\uFFFD");
+		expect(dumped.totalBytes).toBe(byteLength("界".repeat(20) + "hidden continuation\nnext\n"));
+		expect(dumped.columnTruncatedRange).toBeUndefined();
+		sink.replace("again\n");
+		const replaced = await sink.dump();
+		expect(replaced.output).toBe("again\n");
+	});
+
+	test("replacement leaves full multibyte output intact when the column cap is disabled", async () => {
+		const sink = new OutputSink({ maxColumns: 0, spillThreshold: 100_000 });
+		const text = "界".repeat(200);
+		sink.replace(text);
+		const dumped = await sink.dump();
+		expect(dumped.output).toBe(text);
+		expect(dumped.totalBytes).toBe(600);
 	});
 
 	test("multibyte line: cap counts UTF-8 bytes and the notice says bytes", async () => {

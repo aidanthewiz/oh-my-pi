@@ -59,7 +59,7 @@ describe("issue #2510 — /plan toggles plan → plan_paused → none", () => {
 		mode?.stop();
 		HistoryStorage.close();
 		await session?.dispose();
-		authStorage?.close();
+		await authStorage?.close();
 		tempDir?.removeSync();
 		resetSettingsForTest();
 	});

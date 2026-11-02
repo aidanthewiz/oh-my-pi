@@ -36,8 +36,8 @@ describe("AgentSession.switchSession previous-context build", () => {
 		model = bundled;
 	});
 
-	afterAll(() => {
-		authStorage.close();
+	afterAll(async () => {
+		await authStorage.close();
 	});
 
 	afterEach(async () => {

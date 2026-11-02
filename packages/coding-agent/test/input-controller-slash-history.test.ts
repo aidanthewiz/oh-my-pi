@@ -6,6 +6,7 @@ import { InputController } from "@oh-my-pi/pi-coding-agent/modes/controllers/inp
 import { cfgBareExitOnEmptySession, cfgBareSlashCommands } from "@oh-my-pi/pi-coding-agent/modes/settings";
 import { isQueuedMessageList, splitQueuedMessages } from "@oh-my-pi/pi-tui/prompt/queue-input";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
+import { createSessionDefaults } from "./helpers/session-defaults";
 
 // Drives the real editor submit handler through the builtin slash dispatch
 // path. Before #3148 only a handful of commands recorded their text (each
@@ -25,6 +26,7 @@ function makeCtx(isStreaming = false, messages: AgentMessage[] = []) {
 	const editor = {
 		onSubmit: undefined as undefined | ((t: string) => Promise<void>),
 		getText: () => text,
+		getExpandedText: () => text,
 		setText: (t: string) => {
 			text = t;
 		},
@@ -52,6 +54,10 @@ function makeCtx(isStreaming = false, messages: AgentMessage[] = []) {
 		editor,
 		sessionManager,
 		session: {
+			...createSessionDefaults(),
+			get sessionId() {
+				return sessionManager.getSessionId();
+			},
 			messages,
 			isStreaming,
 			isCompacting: false,

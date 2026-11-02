@@ -44,7 +44,7 @@ describe("AgentSession todo blocker clone", () => {
 
 	afterEach(async () => {
 		await session.dispose();
-		authStorage.close();
+		await authStorage.close();
 	});
 
 	it("preserves a blocker reason across a setTodoPhases/getTodoPhases round-trip", () => {

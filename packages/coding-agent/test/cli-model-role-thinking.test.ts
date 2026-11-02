@@ -25,8 +25,8 @@ describe("--model role override thinking suffix", () => {
 		modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
 	});
 
-	afterAll(() => {
-		authStorage.close();
+	afterAll(async () => {
+		await authStorage.close();
 		if (tempDir && fs.existsSync(tempDir)) removeSyncWithRetries(tempDir);
 	});
 

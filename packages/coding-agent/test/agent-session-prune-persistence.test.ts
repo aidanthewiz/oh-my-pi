@@ -130,7 +130,7 @@ describe("AgentSession per-turn prune persistence", () => {
 		try {
 			await session?.dispose();
 		} finally {
-			authStorage?.close();
+			await authStorage?.close();
 			await tempDir?.remove();
 		}
 	});

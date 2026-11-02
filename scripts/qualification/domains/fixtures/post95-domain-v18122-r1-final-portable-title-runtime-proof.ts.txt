@@ -1,0 +1,295 @@
+import assert from "node:assert/strict";
+import { createHash, randomUUID } from "node:crypto";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
+import type { SessionManager as Manager } from "../../packages/coding-agent/src/session/session-manager";
+import type { SessionSelectorComponent as Selector } from "../../packages/tui/src/overlays/session-selector";
+import type { TspPickerProps } from "@oh-my-pi/pi-wire";
+
+const roots = [process.env.CF_QUAL_CHECKOUT!]; assert(roots[0] && path.isAbsolute(roots[0]));
+const compiled = process.env.PI_COMPILED === "true";
+const version = process.env.CF_UPSTREAM_CANDIDATE_VERSION;
+const nativeSha256 = process.env.V1890_NATIVE_SHA256;
+const sourceInputSha256 = process.env.V1890_SOURCE_INPUT_SHA256;
+const manifestPath = process.env.V1890_SOURCE_INPUT_MANIFEST;
+const databaseAdapter = process.env.TITLE_PROOF_DB_ADAPTER;
+const databaseEndpoint = process.env.TITLE_PROOF_DB_URL;
+assert(!databaseAdapter || databaseAdapter === "sqlite" || databaseEndpoint, "Explicit loopback database URL required");
+const identity = {
+ engineHead: process.env.CF_UPSTREAM_ENGINE_HEAD,
+ mergeHead: process.env.CF_UPSTREAM_MERGE_HEAD && process.env.CF_UPSTREAM_MERGE_HEAD !== "null" ? process.env.CF_UPSTREAM_MERGE_HEAD : null,
+ companionHead: null,
+};
+assert(version && /^\d+\.\d+\.\d+$/.test(version));
+assert(nativeSha256 && /^[a-f0-9]{64}$/.test(nativeSha256));
+assert(sourceInputSha256 && /^[a-f0-9]{64}$/.test(sourceInputSha256));
+assert(identity.engineHead && /^[a-f0-9]{40}$/.test(identity.engineHead));
+assert(identity.mergeHead === null || /^[a-f0-9]{40}$/.test(identity.mergeHead));
+assert(manifestPath && path.isAbsolute(manifestPath));
+const outsideSources = (file: string) => roots.every(root => file !== root && !file.startsWith(root + path.sep));
+const copiedManifest = await fs.realpath(manifestPath);
+assert(outsideSources(copiedManifest), "Manifest must be copied outside both checkouts");
+assert((await fs.lstat(copiedManifest)).isFile());
+const digest = (bytes: string | Uint8Array) => createHash("sha256").update(bytes).digest("hex");
+const manifestBytes = await fs.readFile(copiedManifest);
+assert.equal(digest(manifestBytes), sourceInputSha256, "File SHA256, not sourceDigest, binds the copied manifest");
+const manifest = JSON.parse(manifestBytes.toString());
+assert.equal(manifest.schema, "CoreforgeCandidateSourceSnapshot");
+for (const [key, expected] of Object.entries(identity)) assert.equal(manifest[key], expected);
+assert.equal(manifest.native.sha256, nativeSha256);
+assert(Array.isArray(manifest.records) && manifest.records.length > 0);
+assert.match(manifest.sourceDigest, /^[a-f0-9]{64}$/);
+assert(process.env.HOME && process.env.TMPDIR, "Parent must supply isolated HOME and TMPDIR");
+const startCwd = process.cwd();
+if (compiled) assert(outsideSources(startCwd));
+const root = await fs.mkdtemp(path.join(await fs.realpath(process.env.TMPDIR), "final-portable-title-"));
+const owner = randomUUID();
+await fs.writeFile(path.join(root, ".owner"), owner, { flag: "wx", mode: 0o600 });
+const home = path.join(root, "home"), tmp = path.join(root, "tmp");
+await fs.mkdir(home); await fs.mkdir(tmp);
+for (const key of new Set([...Object.keys(process.env), ...Object.keys(Bun.env)])) {
+ if (!["PATH", "SYSTEMROOT", "WINDIR", "PI_COMPILED"].includes(key)) { delete process.env[key]; delete Bun.env[key]; }
+}
+for (const [key, value] of Object.entries({ HOME: home, USERPROFILE: home, TMPDIR: tmp, TMP: tmp, TEMP: tmp, PI_CODING_AGENT_DIR: path.join(home, "agent"), GIT_OPTIONAL_LOCKS: "0", GIT_NO_REPLACE_OBJECTS: "1", LANG: "en_US.UTF-8", TERM: "xterm-256color" })) {
+ process.env[key] = value; Bun.env[key] = value;
+}
+process.chdir(root);
+const originalFetch = globalThis.fetch;
+let fetchAttempts = 0;
+const denyNetwork = () => { fetchAttempts++; throw new Error("Portable-title proof forbids fetch requests"); };
+globalThis.fetch = Object.assign(denyNetwork, { preconnect: denyNetwork }) as typeof fetch;
+const managers: Manager[] = [];
+const selectors: Selector[] = [];
+const observed: Array<Record<string, unknown>> = [];
+const output: string[] = [];
+const originalWrite = process.stdout.write;
+const ttyDescriptor = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
+let restoreHeadless: (() => void) | undefined;
+let restoreNative: (() => void) | undefined;
+let disposeTitles: (() => void) | undefined;
+let stopTheme: (() => void) | undefined;
+let closeTitleIndex: (() => void) | undefined;
+let complete = false;
+let cleanup = false;
+const deadline = setTimeout(() => { console.error("FINAL_PORTABLE_TITLE_DEADLINE"); process.exit(124); }, 60000);
+const drain = () => new Promise<void>(resolve => setImmediate(resolve));
+try {
+ // Runtime imports follow environment isolation; static initialization could read ambient user configuration.
+ await import("../../packages/natives/native/index.js");
+ const { nativeAddonStatus } = await import("../../packages/natives/native/loader-state.js");
+ const native = nativeAddonStatus(); assert(native);
+ assert.equal(native.version, version); assert.equal(native.packageVersion, version); assert.equal(native.stale, false);
+ assert.equal(digest(await fs.readFile(native.path)), nativeSha256);
+ if (compiled) assert(outsideSources(await fs.realpath(native.path)), "Compiled native must be extracted, not loaded from a checkout");
+ const { SessionManager } = await import("../../packages/coding-agent/src/session/session-manager");
+ const { FileSessionStorage } = await import("../../packages/coding-agent/src/session/session-storage");
+ const { parseCardTitleReply } = await import("../../packages/coding-agent/src/utils/title-card");
+ const { parseTitleSlotFromContent, serializeTitleSlot } = await import("../../packages/coding-agent/src/session/session-title-slot");
+ const { getRecentSessions, readSessionInfo } = await import("../../packages/coding-agent/src/session/session-listing");
+ const { closeSessionIndex } = await import("../../packages/coding-agent/src/session/session-index");
+ closeTitleIndex = closeSessionIndex;
+ const { Settings, withActiveSettings } = await import("../../packages/coding-agent/src/config/settings");
+ const { cfgTitleIcons } = await import("../../packages/coding-agent/src/utils/title-settings");
+ const titles = await import("../../packages/coding-agent/src/utils/title-generator");
+ const { setTerminalHeadless } = await import("../../packages/utils/src/env");
+ const nativeState = await import("../../packages/tui/src/native/state");
+ const theme = await import("../../packages/tui/src/theme");
+ const { SessionSelectorComponent } = await import("../../packages/tui/src/overlays/session-selector");
+ await theme.initTheme(false, "nerd"); stopTheme = theme.stopThemeWatcher;
+ const previousNative = nativeState.isNativeRendering();
+ restoreNative = () => nativeState.setNativeRendering(previousNative);
+ const previousHeadless = setTerminalHeadless(false); restoreHeadless = () => { setTerminalHeadless(previousHeadless); };
+ Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true });
+ process.stdout.write = ((chunk: string | Uint8Array, encoding?: BufferEncoding | ((error?: Error | null) => void), callback?: (error?: Error | null) => void) => {
+  output.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+  (typeof encoding === "function" ? encoding : callback)?.();
+  return true;
+ }) as typeof process.stdout.write;
+ titles.initTerminalTitleState(); disposeTitles = () => { titles.setTerminalSessionSource(undefined); titles.disposeTerminalTitleState(); };
+ const a = path.join(root, "project-a"), b = path.join(root, "project-b"), sessions = path.join(root, "sessions-a");
+ await fs.mkdir(a); await fs.mkdir(b);
+ const storage = new FileSessionStorage();
+ const own = (manager: Manager) => { managers.push(manager); return manager; };
+ const manager = own(SessionManager.create(a, sessions, storage));
+ manager.appendMessage({ role: "user", content: "Synthetic portable title fixture", timestamp: 1 });
+ await manager.ensureOnDisk();
+ const admitted = parseCardTitleReply('<title nf="nf-md-flask" emoji="🧪" code="TITLE">Portable title</title>');
+ assert(admitted && typeof admitted === "object");
+ const card = { code: "TITLE", emoji: "🧪", nf: "nf-md-flask" };
+ assert.deepEqual(admitted.card, card);
+ assert.equal(await manager.setSessionName(admitted.title, "auto", undefined, admitted.card), true);
+ await manager.flush();
+ const originalFile = manager.getSessionFile()!;
+ const originalBytes = await fs.readFile(originalFile, "utf8");
+ const slot = parseTitleSlotFromContent(originalBytes)!;
+ assert.equal(Buffer.byteLength(originalBytes.split("\n")[0] + "\n", "utf8"), 256);
+ assert.equal(slot.title, "Portable title"); assert.equal(slot.card?.emoji, "🧪"); assert.equal(slot.card?.nf, "nf-md-flask");
+ observed.push({ case: "file-bytes", title: slot.title, slotBytes: 256, card: { code: slot.card?.code, emoji: slot.card?.emoji, nf: slot.card?.nf } });
+ await manager.close();
+ const cold = own(await SessionManager.open(originalFile));
+ assert.equal(cold.getSessionName(), "Portable title"); assert.deepEqual(cold.getSessionTitleCard(), card);
+ const info = await readSessionInfo(originalFile); assert(info); assert.equal(info.title, "Portable title");
+ const settings = Settings.isolated({ "title.icons": "nf+emoji" });
+ const selector = new SessionSelectorComponent([info], () => {}, () => {}, () => {}); selectors.push(selector);
+ const cx = { cols: 120, reduceMotion: false, dark: true, supports: () => true, feature: () => true };
+ let preference: "nf+emoji" | "emoji" | "boring" = "nf+emoji";
+ titles.setTerminalSessionSource({ file: () => cold.getSessionFile(), cwd: () => cold.getCwd(), title: () => ({ name: cold.getSessionName(), card: cold.getSessionTitleCard(), icons: preference }) });
+ for (const preset of ["nerd", "unicode"] as const) {
+  await theme.setSymbolPreset(preset);
+  for (const icons of ["nf+emoji", "emoji", "boring"] as const) {
+   preference = icons; cfgTitleIcons.override(settings, icons);
+   const rootNode = withActiveSettings(settings, () => selector.describe(cx));
+   const pickerProps = rootNode.p as TspPickerProps;
+   const label = pickerProps.items?.find(item => item.id === info.path)?.label;
+   const expectedGrid = icons === "boring" ? "Portable title" : icons === "nf+emoji" && preset === "nerd" ? "\u{f0093} TITLE: Portable title" : "🧪 TITLE: Portable title";
+   assert.equal(label, expectedGrid);
+   assert.equal(info.title, "Portable title");
+   const previousRendering = nativeState.isNativeRendering();
+   nativeState.setNativeRendering(false);
+   const ansi = withActiveSettings(settings, () => selector.render(cx.cols)).join("\r\n");
+   nativeState.setNativeRendering(previousRendering);
+   for (const native of [false, true]) {
+    nativeState.setNativeRendering(native);
+    // Real sink deduplication needs a distinct previous title, not a mocked formatter.
+    titles.setSessionTerminalTitle("synthetic transient"); await drain(); output.length = 0;
+    titles.setSessionTerminalTitle(cold.getSessionName(), cold.getCwd()); await drain();
+    const payloads = [...output.join("").matchAll(/\x1b\]0;([^\x07]*)\x07/g)].map(match => match[1]!);
+    assert(payloads.length > 0, "Actual OSC sink must emit");
+    const portable = icons === "boring" ? "Portable title" : "🧪 TITLE: Portable title";
+    assert(payloads.some(payload => payload.includes(portable)));
+    assert(payloads.every(payload => !/\p{Co}/u.test(payload)));
+    observed.push({ case: "display", preset, icons, native, grid: label, ansi, osc: payloads });
+   }
+  }
+ }
+ preference = "emoji"; output.length = 0;
+ titles.refreshSessionTerminalTitle(); await drain();
+ assert(output.join("").includes("🧪 TITLE: Portable title"));
+ titles.setExtensionTerminalTitle("Synthetic extension owner"); await drain(); output.length = 0;
+ preference = "boring"; titles.refreshSessionTerminalTitle(); await drain();
+ assert.equal(output.join(""), "", "Preference refresh must not release extension ownership");
+ titles.setSessionTerminalTitle(cold.getSessionName(), cold.getCwd()); await drain();
+ observed.push({ case: "live-preference-extension-override", preferenceApplied: true, extensionOverridePreserved: true });
+ // OS surfaces must not invent a PUA fallback when the validated emoji is absent.
+ await cold.setSessionName("NF only", "auto", undefined, { code: "ONLY", nf: "nf-md-flask" });
+ preference = "nf+emoji";
+ titles.setSessionTerminalTitle("synthetic transient"); await drain(); output.length = 0;
+ titles.setSessionTerminalTitle(cold.getSessionName(), cold.getCwd()); await drain();
+ const nfOnlyPayload = output.join("");
+ assert(nfOnlyPayload.includes("NF only")); assert(!/\p{Co}/u.test(nfOnlyPayload));
+ observed.push({ case: "nf-only-portable", osc: nfOnlyPayload });
+ await cold.setSessionName("Portable title", "auto", undefined, card);
+ const clone = own(cold.cloneCurrentSession({ persist: false }));
+ assert.equal(clone.getSessionName(), "Portable title"); assert.deepEqual(clone.getSessionTitleCard(), card);
+ assert.equal(clone.titleUpdatedAt, cold.titleUpdatedAt); await clone.close();
+ const copied = own(await cold.persistCopy({ sessionDir: path.join(root, "copies"), suppressBreadcrumb: true }));
+ const copiedFile = copied.getSessionFile()!; assert.equal(copied.titleUpdatedAt, cold.titleUpdatedAt); await copied.close();
+ await cold.fork(); const fullForkFile = cold.getSessionFile()!;
+ cold.createBranchedSession(cold.getLeafId()!, { copyArtifacts: false }); await cold.flush();
+ await cold.moveTo(b, path.join(root, "sessions-b")); const movedFile = cold.getSessionFile()!;
+ await cold.close();
+ const forkFrom = own(await SessionManager.forkFrom(originalFile, a, sessions, undefined, { copyArtifacts: false, suppressBreadcrumb: true }));
+ const importedForkFile = forkFrom.getSessionFile()!; await forkFrom.close();
+ for (const file of [originalFile, copiedFile, fullForkFile, movedFile, importedForkFile]) {
+  for (let pass = 0; pass < 2; pass++) {
+   const reopened = own(await SessionManager.open(file));
+   assert.equal(reopened.getSessionName(), "Portable title"); assert.deepEqual(reopened.getSessionTitleCard(), card);
+   await reopened.flush(); await reopened.close();
+  }
+ }
+ observed.push({ case: "fork-move-cold-reopen", files: 5, cloneChecked: true, passesPerFile: 2, name: "Portable title", card });
+ const manual = own(await SessionManager.open(movedFile));
+ await manual.setSessionName("Portable title", "user");
+ assert.equal(manual.getSessionTitleCard(), undefined);
+ assert.equal(await manual.setSessionName("Late automatic", "auto", undefined, card), false);
+ await manual.close();
+ const cleared = own(await SessionManager.open(movedFile));
+ assert.equal(cleared.getSessionName(), "Portable title"); assert.equal(cleared.getSessionTitleCard(), undefined); await cleared.close();
+ observed.push({ case: "same-title-manual-clear", source: "user", lateAutoApplied: false, card: null });
+ const boundary = { title: "", source: "user" as const, updatedAt: "2026-01-01T00:00:00.000Z" };
+ const budget = parseTitleSlotFromContent(serializeTitleSlot(boundary))!.pad.length;
+ for (const name of ["界".repeat(35), "x".repeat(budget), "x".repeat(budget + 1), "界".repeat(150)]) {
+  const long = own(SessionManager.create(a, sessions)); await long.ensureOnDisk();
+  await long.setSessionName(name, "user", undefined, card); const file = long.getSessionFile()!; await long.close();
+  const bytes = await fs.readFile(file, "utf8");
+  assert.equal(Buffer.byteLength(bytes.split("\n")[0] + "\n", "utf8"), 256);
+  const physical = parseTitleSlotFromContent(bytes)!;
+  if (Buffer.byteLength(name, "utf8") <= budget) assert.equal(physical.title, name);
+  else { assert.equal(physical.title, ""); assert.match(physical.ref!, /^[a-f0-9]{16}$/); }
+  const reopened = own(await SessionManager.open(file)); assert.equal(reopened.getSessionName(), name); assert.equal(reopened.getSessionTitleCard(), undefined); await reopened.close();
+  observed.push({ case: "byte-boundary", nameBytes: Buffer.byteLength(name), recoveredBytes: Buffer.byteLength(name), slotBytes: 256, card: null });
+ }
+ const headerLine = originalBytes.split("\n")[1]!;
+ const staleFile = path.join(root, "stale.jsonl");
+ await fs.writeFile(staleFile, serializeTitleSlot({ title: "Winning plain title", source: "user", updatedAt: "2026-01-02T00:00:00.000Z" }) + headerLine + "\n");
+ const stale = own(await SessionManager.open(staleFile));
+ assert.equal(stale.getSessionName(), "Winning plain title"); assert.equal(stale.getSessionTitleCard(), undefined); await stale.close();
+ observed.push({ case: "stale-header", title: "Winning plain title", card: null });
+ const legacy = own(SessionManager.create(a, sessions)); await legacy.ensureOnDisk();
+ await legacy.setSessionName("\u{f0093} LEGACY: Opaque title", "user");
+ titles.setTerminalSessionSource({ file: () => legacy.getSessionFile(), cwd: () => legacy.getCwd(), title: () => ({ name: legacy.getSessionName(), card: legacy.getSessionTitleCard(), icons: "nf+emoji" }) });
+ titles.setSessionTerminalTitle("synthetic transient"); await drain(); output.length = 0;
+ titles.setSessionTerminalTitle(legacy.getSessionName(), legacy.getCwd()); await drain();
+ assert(output.join("").includes("Opaque title")); assert(!/\p{Co}/u.test(output.join("")));
+ assert.equal(legacy.getSessionName(), "\u{f0093} LEGACY: Opaque title");
+ observed.push({ case: "legacy-pua-os-sink", storedNameUnchanged: true, noPrivateUseOutput: true });
+ await legacy.close();
+ const compact = own(SessionManager.create(a, sessions));
+ compact.appendMessage({ role: "user", content: "Synthetic compact-header fixture", timestamp: 1 });
+ await compact.ensureOnDisk();
+ await compact.setSessionName("界".repeat(1800), "auto");
+ await compact.setSessionName("Short", "auto", undefined, { code: "RCODE", emoji: "🧪" });
+ const compactFile = compact.getSessionFile()!;
+ await compact.close();
+ const compactInfo = await readSessionInfo(compactFile); assert(compactInfo);
+ assert.equal(compactInfo.title, "Short");
+ assert.equal(compactInfo.titlePresentation?.(), "🧪 RCODE: Short");
+ const recent = await getRecentSessions(sessions);
+ assert.equal(recent.find(item => item.path === compactFile)?.name, "🧪 RCODE: Short");
+ observed.push({ case: "clipped-header-slot-card-and-unscoped-default", title: compactInfo.title, card: compactInfo.titleCard, displayed: compactInfo.titlePresentation?.() });
+ const titled = { ...compactInfo, modified: new Date("2025-06-01T12:00:00.000Z") };
+ const transcript = { ...compactInfo, id: "transcript-match", path: path.join(root, "transcript-match.jsonl"), title: "Investigate writes", titleCard: undefined, titlePresentation: undefined, firstMessage: "RCODE appears in the transcript", allMessagesText: "RCODE appears in the transcript", modified: new Date("2025-06-01T12:00:01.000Z") };
+ const search = new SessionSelectorComponent([transcript, titled], () => {}, () => {}, () => {}); selectors.push(search);
+ for (const icons of ["emoji", "boring", "emoji"] as const) {
+  cfgTitleIcons.override(settings, icons);
+  const order = withActiveSettings(settings, () => {
+   search.handleNativeEvent({ type: "action", key: "", act: "clear", mods: [] });
+   for (const character of "RCODE") search.handleInput(character);
+   return (search.describe(cx).p as TspPickerProps).order;
+  });
+  assert.deepEqual(order, icons === "boring" ? [transcript.path] : [titled.path, transcript.path]);
+ }
+ assert.equal(titled.title, "Short");
+ observed.push({ case: "visible-card-code-search-and-presentation-cache", query: "RCODE", orderedTitleBeforeTranscript: true, presentationChanges: ["emoji", "boring", "emoji"], authoritativeTitleUnchanged: true });
+ if (databaseAdapter) {
+  // Import after HOME/environment isolation; production modules can capture configuration at initialization.
+  const { runPortableTitleDatabaseProof } = await import("./post95-domain-v18122-r1-final-portable-title-database-proof");
+  observed.push({ case: "actual-database", result: await runPortableTitleDatabaseProof(databaseAdapter, databaseEndpoint ?? "", root) });
+ }
+ complete = true;
+} finally {
+ for (const selector of selectors) selector.dispose();
+ disposeTitles?.(); restoreNative?.(); stopTheme?.();
+ for (const manager of managers.reverse()) await manager.close();
+ closeTitleIndex?.();
+ await drain();
+ process.stdout.write = originalWrite;
+ if (ttyDescriptor) Object.defineProperty(process.stdout, "isTTY", ttyDescriptor); else Reflect.deleteProperty(process.stdout, "isTTY");
+ restoreHeadless?.(); globalThis.fetch = originalFetch;
+ clearTimeout(deadline);
+ process.chdir(startCwd);
+ assert.equal(await fs.readFile(path.join(root, ".owner"), "utf8"), owner);
+ await fs.rm(root, { recursive: true, force: true });
+ await assert.rejects(fs.lstat(root), (error: NodeJS.ErrnoException) => error.code === "ENOENT");
+ cleanup = true;
+}
+// All owned storage handles, timers, watcher callbacks, and output drains close before final acceptance.
+assert(complete && cleanup);
+assert.equal(fetchAttempts, 0);
+assert.equal(observed.filter(item => item.case === "display").length, 12);
+assert.equal(observed.filter(item => item.case === "byte-boundary").length, 4);
+assert(observed.filter(item => item.case === "display").every(item => {
+ const payloads = item.osc as string[];
+ return payloads.every(payload => !/\p{Co}/u.test(payload));
+}));
+console.log(JSON.stringify({ proof: "final-portable-title-real-file-picker-osc", status: "passed", compiled, version, nativeSha256, sourceInputSha256, identity, observed, cleanup: { complete: cleanup, managersClosed: managers.length, selectorsDisposed: selectors.length, fetchAttempts, ownedChildren: 0, ownedServers: 0, rootRemoved: true, outputDrained: true }, qualificationBoundary: "Parent must attach strict OS checkout-read denials with actual negative controls for compiled qualification; optional database observations use only explicitly supplied loopback fixtures. This probe does not claim font pixels or Windows execution." }));

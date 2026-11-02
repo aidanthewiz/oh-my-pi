@@ -191,6 +191,112 @@ ${scenario}
 }
 
 describe("WorkerCore", () => {
+	it("delivers a completion handle id after its creating cell finishes", async () => {
+		const harness = createWorkerHarness();
+		const snapshot = { cwd: process.cwd(), sessionId: `late-handle-${crypto.randomUUID()}`, localRoots: {} };
+		await initializeWorker(harness, snapshot);
+		const toolCall = waitForMessage(
+			harness,
+			message => message.type === "tool-call" && message.name === "__completion__",
+		);
+		const firstResult = waitForMessage(
+			harness,
+			message => message.type === "result" && message.runId === "create-handle",
+		);
+		try {
+			harness.send({
+				type: "run",
+				runId: "create-handle",
+				code: 'var lateHandle = completion("hi"); print("started");',
+				filename: "[create-handle].js",
+				snapshot,
+			});
+			const call = await toolCall;
+			expect(await firstResult).toMatchObject({ type: "result", ok: true });
+			if (call.type !== "tool-call") throw new Error("expected completion bridge call");
+			harness.send({ type: "tool-reply", id: call.id, reply: { ok: true, value: { id: "late-1" } } });
+
+			const text = waitForMessage(harness, message => message.type === "text" && message.runId === "read-handle");
+			const result = waitForMessage(
+				harness,
+				message => message.type === "result" && message.runId === "read-handle",
+			);
+			harness.send({
+				type: "run",
+				runId: "read-handle",
+				code: "print((await globalThis.lateHandle).id);",
+				filename: "[read-handle].js",
+				snapshot,
+			});
+			expect(await text).toMatchObject({ chunk: "late-1\n" });
+			expect(await result).toMatchObject({ ok: true });
+		} finally {
+			harness.send({ type: "close" });
+		}
+	});
+
+	it.each(["completion", "agent"] as const)(
+		"delivers a rejected late %s allocation to the awaiting successor cell",
+		async helper => {
+			const harness = createWorkerHarness();
+			const snapshot = { cwd: process.cwd(), sessionId: `late-rejected-${crypto.randomUUID()}`, localRoots: {} };
+			await initializeWorker(harness, snapshot);
+			const toolCall = waitForMessage(
+				harness,
+				message => message.type === "tool-call" && message.name === `__${helper}__`,
+			);
+			const firstResult = waitForMessage(
+				harness,
+				message => message.type === "result" && message.runId === "create-rejected",
+			);
+			try {
+				harness.send({
+					type: "run",
+					runId: "create-rejected",
+					code: `var rejectedHandle = ${helper}("hi"); print("started");`,
+					filename: "[create-rejected].js",
+					snapshot,
+				});
+				const call = await toolCall;
+				expect(await firstResult).toMatchObject({ type: "result", ok: true });
+				if (call.type !== "tool-call") throw new Error("expected handle allocation");
+				const waiting = waitForMessage(
+					harness,
+					message =>
+						message.type === "text" && message.runId === "catch-rejected" && message.chunk === "waiting\n",
+				);
+				const text = waitForMessage(
+					harness,
+					message =>
+						message.type === "text" &&
+						message.runId === "catch-rejected" &&
+						message.chunk.startsWith("ToolError:"),
+				);
+				const secondResult = waitForMessage(
+					harness,
+					message => message.type === "result" && message.runId === "catch-rejected",
+				);
+				harness.send({
+					type: "run",
+					runId: "catch-rejected",
+					code: "print('waiting'); try { await rejectedHandle; } catch (error) { print(error.name + ': ' + error.message); }",
+					filename: "[catch-rejected].js",
+					snapshot,
+				});
+				await waiting;
+				harness.send({
+					type: "tool-reply",
+					id: call.id,
+					reply: { ok: false, error: { name: "ToolError", message: "allocation cancelled", isToolError: true } },
+				});
+				expect(await text).toMatchObject({ chunk: "ToolError: allocation cancelled\n" });
+				expect(await secondResult).toMatchObject({ ok: true });
+			} finally {
+				harness.send({ type: "close" });
+			}
+		},
+	);
+
 	it("re-init while a same-realm run is live does not crash the process", async () => {
 		const first = createWorkerHarness();
 		const second = createWorkerHarness();
@@ -629,17 +735,16 @@ for (const mode of ["cell", "invocation"]) {
 	const barrier = waitForMessage(message => message.type === "result" && message.runId === barrierId);
 	send({ type: "run", runId: barrierId, snapshot, filename: "[barrier].js", code: "undefined;" });
 	await barrier;
-	const premature = outbound.some(message => message.runId === runId &&
-		(message.type === "result" || (message.type === "display" && message.output.type === "json")));
+	const premature = outbound.some(message => message.runId === runId && message.type === "result");
 	send({ type: "tool-reply", id: call.id, reply: { ok: false, error: { message: "delayed host failure" } } });
 	const result = await completed;
 	outcomes.push({
 		mode, premature, ok: result.ok, error: result.error?.message,
-		successDisplay: outbound.some(message => message.runId === runId &&
-			message.type === "display" && message.output.type === "json"),
+		successEnvelope: outbound.some(message => message.runId === runId &&
+			message.type === "result" && "value" in message),
 	});
 }
-await finish(outcomes, outcomes.every(result => !result.premature && !result.ok && !result.successDisplay));
+await finish(outcomes, outcomes.every(result => !result.premature && !result.ok && !result.successEnvelope));
 `);
 		expect(output).toEqual(
 			["cell", "invocation"].map(mode => ({
@@ -647,7 +752,7 @@ await finish(outcomes, outcomes.every(result => !result.premature && !result.ok 
 				premature: false,
 				ok: false,
 				error: "Unhandled rejection (missing await?): delayed host failure",
-				successDisplay: false,
+				successEnvelope: false,
 			})),
 		);
 		expect(exitCode).toBe(0);
@@ -672,7 +777,7 @@ await finish(outcomes, outcomes.every(result => !result.premature && !result.ok 
 				runId: "chain",
 				snapshot,
 				filename: "[chain].js",
-				code: 'void tool.first({}).then(() => tool.second({})).catch(() => display("recovered"));',
+				code: 'void tool.first({}).then(() => tool.second({})).catch(() => print("recovered"));',
 			});
 			const first = await firstCall;
 			if (first.type !== "tool-call") throw new Error("expected first tool call");
@@ -700,7 +805,7 @@ await finish(outcomes, outcomes.every(result => !result.premature && !result.ok 
 		}
 	});
 
-	it("fails a tool invocation with a floated read rejection before displaying success", async () => {
+	it("fails a tool invocation with a floated read rejection before publishing success", async () => {
 		const { output, stderr, exitCode } = await runWorkerCoreRejectionProbe(`
 const registered = waitForMessage(message => message.type === "result" && message.runId === "register-tools");
 send({
@@ -721,25 +826,29 @@ for (const name of ["floatedRead", "caughtRead", "awaitedRead", "failedRead"]) {
 const result = {
 	floatedFailed: results.floatedRead.ok === false &&
 		results.floatedRead.error?.message.includes("Unhandled rejection (missing await?)"),
-	floatedDisplayed: outbound.some(message => message.type === "display" && message.output.type === "json" && message.runId === "floatedRead"),
-	caughtValue: outbound.find(message => message.type === "display" && message.output.type === "json" && message.runId === "caughtRead")?.output.data.value,
-	awaitedValue: outbound.find(message => message.type === "display" && message.output.type === "json" && message.runId === "awaitedRead")?.output.data.value,
+	floatedHasValue: "value" in results.floatedRead,
+	caughtValue: results.caughtRead.value?.value,
+	awaitedValue: results.awaitedRead.value?.value,
+	caughtEnvelopeOk: results.caughtRead.value?.ok === true,
+	awaitedEnvelopeOk: results.awaitedRead.value?.ok === true,
 	caughtOk: results.caughtRead.ok,
 	awaitedOk: results.awaitedRead.ok,
 	failedOk: results.failedRead.ok,
-	failedDisplayed: outbound.some(message => message.type === "display" && message.output.type === "json" && message.runId === "failedRead"),
+	failedHasValue: "value" in results.failedRead,
 };
-await finish(result, result.floatedFailed && !result.floatedDisplayed && result.caughtOk && result.awaitedOk && !result.failedOk && !result.failedDisplayed);
+await finish(result, result.floatedFailed && !result.floatedHasValue && result.caughtOk && result.awaitedOk && result.caughtEnvelopeOk && result.awaitedEnvelopeOk && !result.failedOk && !result.failedHasValue);
 `);
 		expect(output).toEqual({
 			floatedFailed: true,
-			floatedDisplayed: false,
+			floatedHasValue: false,
 			caughtValue: "caught",
 			awaitedValue: "awaited",
+			caughtEnvelopeOk: true,
+			awaitedEnvelopeOk: true,
 			caughtOk: true,
 			awaitedOk: true,
 			failedOk: false,
-			failedDisplayed: false,
+			failedHasValue: false,
 		});
 		expect(exitCode).toBe(0);
 		expect(stderr).not.toContain("[Unhandled Rejection]");
@@ -935,6 +1044,63 @@ await finish(result, result.ownerOk && result.attacherFailed && !result.ownerWar
 			expect(await run("artifact-b", dirB)).toBe("from B");
 		} finally {
 			delete probe.__omp_artifact_probe;
+			harness.send({ type: "close" });
+			await fs.rm(dirA, { recursive: true, force: true });
+			await fs.rm(dirB, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps a suspended run on its own artifact root while an overlapping run uses another", async () => {
+		const dirA = await fs.mkdtemp(path.join(os.tmpdir(), "omp-artifacts-a-"));
+		const dirB = await fs.mkdtemp(path.join(os.tmpdir(), "omp-artifacts-b-"));
+		await Bun.write(path.join(dirA, "5.eval.log"), "from A");
+		await Bun.write(path.join(dirB, "5.eval.log"), "from B");
+		const harness = createWorkerHarness();
+		const gate = Promise.withResolvers<void>();
+		const entered = Promise.withResolvers<void>();
+		const probe = globalThis as {
+			__omp_roots_gate?: { entered(): void; wait: Promise<void> };
+			__omp_roots_probe?: Record<string, unknown>;
+		};
+		probe.__omp_roots_gate = { entered: () => entered.resolve(), wait: gate.promise };
+		probe.__omp_roots_probe = {};
+		const snapshot = (artifacts: string): SessionSnapshot => ({
+			cwd: process.cwd(),
+			sessionId: "artifact-roots-overlap",
+			localRoots: { artifact: artifacts },
+		});
+		try {
+			await initializeWorker(harness, snapshot(dirA));
+			const holdResult = waitForMessage(harness, message => message.type === "result" && message.runId === "hold");
+			harness.send({
+				type: "run",
+				runId: "hold",
+				code: `globalThis.__omp_roots_gate.entered(); await globalThis.__omp_roots_gate.wait; globalThis.__omp_roots_probe.hold = await read("artifact://5");`,
+				filename: "[roots-hold].js",
+				snapshot: snapshot(dirA),
+			});
+			await entered.promise;
+
+			const overlapResult = waitForMessage(
+				harness,
+				message => message.type === "result" && message.runId === "overlap",
+			);
+			harness.send({
+				type: "run",
+				runId: "overlap",
+				code: `globalThis.__omp_roots_probe.overlap = await read("artifact://5");`,
+				filename: "[roots-overlap].js",
+				snapshot: snapshot(dirB),
+			});
+			expect(await overlapResult).toMatchObject({ type: "result", runId: "overlap", ok: true });
+
+			gate.resolve();
+			expect(await holdResult).toMatchObject({ type: "result", runId: "hold", ok: true });
+			expect(probe.__omp_roots_probe).toEqual({ overlap: "from B", hold: "from A" });
+		} finally {
+			gate.resolve();
+			delete probe.__omp_roots_gate;
+			delete probe.__omp_roots_probe;
 			harness.send({ type: "close" });
 			await fs.rm(dirA, { recursive: true, force: true });
 			await fs.rm(dirB, { recursive: true, force: true });

@@ -1,9 +1,15 @@
 import { logger } from "@oh-my-pi/pi-utils";
 import type { Settings } from "../config/settings";
 import { github } from "../utils/github";
+import { captureForgeCliEnvironment, ForgeCredentialsChangedError } from "../utils/forge-cli";
 import { appendRepoFlag, ghApiHostArgs, parseRepoRef } from "./gh-common";
 import type { ViewLookupResult } from "./gh-view";
-import { getOrFetchView, resolveGithubCacheAuthKey } from "./github-cache";
+import {
+	getOrFetchView,
+	getRetainedGeneration,
+	retainCachedGeneration,
+	resolveGithubCacheAuthKey,
+} from "./github-cache";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 
 export const PR_DIFF_FILES_PAGE_SIZE = 100;
@@ -44,6 +50,7 @@ export interface PrDiffLookupOptions {
 	signal?: AbortSignal;
 	settings?: Settings;
 	cacheAuthKey?: string | null;
+	env?: Readonly<Record<string, string | undefined>>;
 }
 /**
  * Split `gh pr diff` output on `^diff --git ` boundaries and parse per-file
@@ -372,13 +379,14 @@ export async function fetchPrDiffViaFilesApi(
 	repo: string,
 	number: number,
 	signal: AbortSignal | undefined,
+	env: Readonly<Record<string, string | undefined>> = captureForgeCliEnvironment(cwd, "gh"),
 ): Promise<string> {
 	const ref = parseRepoRef(repo);
 	const pull = await github.json<GhPrApi>(
 		cwd,
 		["api", ...ghApiHostArgs(ref), "--method", "GET", `/repos/${ref.slug}/pulls/${number}`],
 		signal,
-		{ repoProvided: true },
+		{ repoProvided: true, env },
 	);
 	if ((pull.changed_files ?? 0) > PR_DIFF_FILES_MAX) {
 		throw new ToolError(
@@ -403,7 +411,7 @@ export async function fetchPrDiffViaFilesApi(
 				`page=${page}`,
 			],
 			signal,
-			{ repoProvided: true },
+			{ repoProvided: true, env },
 		);
 		for (const file of response) {
 			const section = buildSyntheticDiffSection(file);
@@ -424,12 +432,13 @@ export async function fetchPrDiffFresh(
 	repo: string,
 	number: number,
 	signal: AbortSignal | undefined,
+	env: Readonly<Record<string, string | undefined>> = captureForgeCliEnvironment(cwd, "gh"),
 ): Promise<{ rendered: string; sourceUrl: string | undefined; payload: PrDiffPayload }> {
 	const args = ["pr", "diff", String(number), "--color", "never"];
 	appendRepoFlag(args, repo, String(number));
 	let text: string;
 	try {
-		text = await github.text(cwd, args, signal, { repoProvided: true, trimOutput: false });
+		text = await github.text(cwd, args, signal, { repoProvided: true, trimOutput: false, env });
 	} catch (err) {
 		if (!isPrDiffTooLargeError(err)) throw err;
 		logger.debug("gh pr diff exceeded GitHub's aggregate line limit; falling back to per-file API", {
@@ -437,7 +446,7 @@ export async function fetchPrDiffFresh(
 			number,
 			err: String(err),
 		});
-		text = await fetchPrDiffViaFilesApi(cwd, repo, number, signal);
+		text = await fetchPrDiffViaFilesApi(cwd, repo, number, signal, env);
 	}
 	const payload = parsePrUnifiedDiff(text);
 	// `rendered` already carries the verbatim diff; blank the payload copy so
@@ -453,8 +462,24 @@ export async function fetchPrDiffFresh(
  * invocation.
  */
 export async function getOrFetchPrDiff(options: PrDiffLookupOptions): Promise<ViewLookupResult<PrDiffPayload>> {
-	const authKey = options.cacheAuthKey === undefined ? (resolveGithubCacheAuthKey() ?? null) : options.cacheAuthKey;
-	const doFetch = () => fetchPrDiffFresh(options.cwd, options.repo, options.number, options.signal);
+	const env = options.env ?? captureForgeCliEnvironment(options.cwd, "gh");
+	const credentialIdentity = resolveGithubCacheAuthKey(undefined, env);
+	const authKey =
+		options.cacheAuthKey === undefined
+			? (resolveGithubCacheAuthKey(parseRepoRef(options.repo).host, env) ?? null)
+			: options.cacheAuthKey;
+	const doFetch = async () => {
+		if (resolveGithubCacheAuthKey(undefined, env) !== credentialIdentity) {
+			throw new ForgeCredentialsChangedError("GitHub credentials changed before the request.");
+		}
+		const fresh = await fetchPrDiffFresh(options.cwd, options.repo, options.number, options.signal, env);
+		if (resolveGithubCacheAuthKey(undefined, env) !== credentialIdentity) {
+			throw new ForgeCredentialsChangedError(
+				"GitHub credentials changed during the request; no cache entry was written.",
+			);
+		}
+		return fresh;
+	};
 	const lookup = await getOrFetchView<PrDiffPayload>({
 		repo: options.repo,
 		kind: "pr-diff",
@@ -471,5 +496,63 @@ export async function getOrFetchPrDiff(options: PrDiffLookupOptions): Promise<Vi
 		payload: { unified: lookup.rendered, files: lookup.payload.files },
 		status: lookup.status,
 		fetchedAt: lookup.fetchedAt,
+	};
+}
+
+export interface PrDiffGenerationOptions {
+	repo: string;
+	number: number;
+	fetchedAt: number;
+	rendered: string;
+	files: PrDiffFile[];
+	cacheAuthKey?: string | null;
+}
+
+/**
+ * Persist the exact diff `/review` froze. Writes the generation table only,
+ * so a later live refresh cannot replace this snapshot.
+ * Returns the stored generation id (which can differ from `fetchedAt` when that
+ * id already belongs to a different snapshot), or null when the cache identity
+ * or database is unavailable.
+ */
+export function retainPrDiffGeneration(options: PrDiffGenerationOptions): number | null {
+	const authKey = options.cacheAuthKey === undefined ? (resolveGithubCacheAuthKey() ?? null) : options.cacheAuthKey;
+	if (authKey === null) return null;
+	return retainCachedGeneration<PrDiffPayload>({
+		authKey,
+		repo: options.repo,
+		kind: "pr-diff",
+		number: options.number,
+		includeComments: false,
+		payload: { unified: "", files: options.files },
+		rendered: options.rendered,
+		fetchedAt: options.fetchedAt,
+	});
+}
+
+/** Load one retained generation. Does not refresh the live row. */
+export function getPinnedPrDiff(
+	options: Pick<PrDiffGenerationOptions, "repo" | "number" | "fetchedAt" | "cacheAuthKey"> & {
+		settings?: Settings;
+	},
+): ViewLookupResult<PrDiffPayload> | undefined {
+	const authKey = options.cacheAuthKey === undefined ? (resolveGithubCacheAuthKey() ?? null) : options.cacheAuthKey;
+	if (authKey === null) return undefined;
+	const row = getRetainedGeneration<PrDiffPayload>(
+		options.repo,
+		"pr-diff",
+		options.number,
+		false,
+		options.fetchedAt,
+		authKey,
+		options.settings,
+	);
+	if (!row) return undefined;
+	return {
+		rendered: row.rendered,
+		sourceUrl: row.sourceUrl,
+		payload: { unified: row.rendered, files: row.payload.files },
+		status: "fresh",
+		fetchedAt: row.fetchedAt,
 	};
 }

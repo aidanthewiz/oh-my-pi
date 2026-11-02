@@ -1,7 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import { streamOpenAICodexResponses } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
+import { streamSimple } from "@oh-my-pi/pi-ai/stream";
 import type { Context, FetchImpl, Model } from "@oh-my-pi/pi-ai/types";
 import { __resetProxyCache } from "@oh-my-pi/pi-ai/utils/proxy";
+import { resetRequestCompressionForTesting } from "@oh-my-pi/pi-ai/utils/request-compression";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import * as piUtils from "@oh-my-pi/pi-utils";
 import { withEnv } from "./helpers";
@@ -15,6 +17,7 @@ beforeEach(() => {
 
 afterEach(() => {
 	__resetProxyCache();
+	resetRequestCompressionForTesting();
 	vi.restoreAllMocks();
 });
 
@@ -51,6 +54,7 @@ function createCodexTestContext(): Context {
 
 function createCompletedCodexSse(text: string): string {
 	return `${[
+		`data: ${JSON.stringify({ type: "response.output_item.added", item: { type: "message", id: "msg_1", role: "assistant", status: "in_progress", content: [] } })}`,
 		`data: ${JSON.stringify({ type: "response.content_part.added", part: { type: "output_text", text: "" } })}`,
 		`data: ${JSON.stringify({ type: "response.output_text.delta", delta: text })}`,
 		`data: ${JSON.stringify({ type: "response.output_item.done", item: { type: "message", id: "msg_1", role: "assistant", status: "completed", content: [{ type: "output_text", text }] } })}`,
@@ -59,12 +63,14 @@ function createCompletedCodexSse(text: string): string {
 }
 
 // A fixed replacement payload pins the outgoing wire body so the serialized
-// JSON is byte-deterministic across the compress/decompress round-trip.
+// JSON is byte-deterministic across the compress/decompress round-trip, and
+// keeps it above the 1 KiB compression floor.
 const PINNED_PAYLOAD: Record<string, unknown> = {
 	model: "gpt-5.3-codex-spark",
 	input: [{ role: "user", content: [{ type: "input_text", text: "Say hello" }] }],
 	stream: true,
 	prompt_cache_key: "zstd-test-cache-key",
+	instructions: "Be helpful. ".repeat(100),
 };
 
 interface CapturedRequest {
@@ -107,7 +113,7 @@ async function runAndCaptureRequest(): Promise<CapturedRequest> {
 
 describe("codex SSE request body zstd compression", () => {
 	it("compresses the request body with zstd and sets content-encoding by default", async () => {
-		await withEnv({ PI_CODEX_ZSTD: undefined }, async () => {
+		await withEnv({ PI_REQUEST_COMPRESSION: undefined }, async () => {
 			const { body, headers } = await runAndCaptureRequest();
 
 			expect(headers.get("content-encoding")).toBe("zstd");
@@ -124,8 +130,8 @@ describe("codex SSE request body zstd compression", () => {
 		});
 	});
 
-	it("sends the plain JSON string without content-encoding when PI_CODEX_ZSTD=0", async () => {
-		await withEnv({ PI_CODEX_ZSTD: "0" }, async () => {
+	it("sends the plain JSON string without content-encoding when PI_REQUEST_COMPRESSION=0", async () => {
+		await withEnv({ PI_REQUEST_COMPRESSION: "0" }, async () => {
 			const { body, headers } = await runAndCaptureRequest();
 
 			expect(headers.has("content-encoding")).toBe(false);
@@ -136,7 +142,7 @@ describe("codex SSE request body zstd compression", () => {
 	});
 
 	it("keeps custom Codex-compatible endpoints on plain JSON", async () => {
-		await withEnv({ PI_CODEX_ZSTD: undefined }, async () => {
+		await withEnv({ PI_REQUEST_COMPRESSION: undefined }, async () => {
 			const [captured] = await runAndCaptureRequests({ baseUrl: "https://relay.example/v1" });
 			if (captured === undefined) throw new Error("expected the SSE request to reach fetch");
 
@@ -146,8 +152,9 @@ describe("codex SSE request body zstd compression", () => {
 	});
 
 	it("retries once with plain JSON when an official endpoint rejects zstd", async () => {
-		await withEnv({ PI_CODEX_ZSTD: undefined }, async () => {
+		await withEnv({ PI_REQUEST_COMPRESSION: undefined }, async () => {
 			for (const rejectedStatus of [400, 415]) {
+				resetRequestCompressionForTesting();
 				const captured = await runAndCaptureRequests({ statuses: [rejectedStatus, 200] });
 
 				expect(captured).toHaveLength(2);
@@ -159,8 +166,58 @@ describe("codex SSE request body zstd compression", () => {
 		});
 	});
 
+	it("keeps one logical credential and payload preparation across the plain physical resend", async () => {
+		await withEnv({ PI_REQUEST_COMPRESSION: "1" }, async () => {
+			const token = createCodexTestToken("admitted-account");
+			let resolutions = 0;
+			let preparations = 0;
+			const requests: Array<{
+				headers: Headers;
+				body: RequestInit["body"];
+				signal: AbortSignal | null | undefined;
+			}> = [];
+			const fetch: FetchImpl = async (_input, init) => {
+				requests.push({ headers: new Headers(init?.headers), body: init?.body, signal: init?.signal });
+				return requests.length === 1
+					? new Response("unsupported content encoding", { status: 415 })
+					: new Response(createCompletedCodexSse("admitted answer"), {
+							headers: { "content-type": "text/event-stream" },
+						});
+			};
+			const result = await streamSimple(createCodexTestModel(), createCodexTestContext(), {
+				apiKey: async () => {
+					resolutions++;
+					return { apiKey: token, credentialId: 42 };
+				},
+				fetch,
+				preferWebsockets: false,
+				onPayload: () => {
+					preparations++;
+					return PINNED_PAYLOAD;
+				},
+			}).result();
+			expect(result.stopReason).toBe("stop");
+			expect(result.content).toContainEqual(expect.objectContaining({ type: "text", text: "admitted answer" }));
+			expect(result.usage.input).toBe(5);
+			expect(requests).toHaveLength(2);
+			expect(resolutions).toBe(1);
+			expect(preparations).toBe(1);
+			for (const request of requests) {
+				expect(request.headers.get("authorization")).toBe(`Bearer ${token}`);
+				expect(request.headers.get("chatgpt-account-id")).toBe("admitted-account");
+			}
+			expect(requests[1].signal).toBe(requests[0].signal);
+			const compressedBody = requests[0].body;
+			const plainBody = requests[1].body;
+			if (!(compressedBody instanceof Uint8Array) || typeof plainBody !== "string") {
+				throw new Error("Compressed and plain inference resends must retain their wire body types");
+			}
+			expect(new TextDecoder().decode(Bun.zstdDecompressSync(compressedBody))).toBe(plainBody);
+		});
+	});
+
 	it("falls back to plain JSON when local compression fails", async () => {
-		await withEnv({ PI_CODEX_ZSTD: undefined }, async () => {
+		await withEnv({ PI_REQUEST_COMPRESSION: undefined }, async () => {
 			vi.spyOn(Bun, "zstdCompress").mockImplementation(async () => {
 				throw new Error("zstd unavailable");
 			});
@@ -172,7 +229,7 @@ describe("codex SSE request body zstd compression", () => {
 	});
 
 	it("replays the compressed bytes on transient HTTP retries", async () => {
-		await withEnv({ PI_CODEX_ZSTD: undefined }, async () => {
+		await withEnv({ PI_REQUEST_COMPRESSION: undefined }, async () => {
 			const captured = await runAndCaptureRequests({ statuses: [500, 200] });
 
 			expect(captured).toHaveLength(2);

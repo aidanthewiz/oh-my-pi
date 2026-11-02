@@ -200,6 +200,8 @@ function createSettingsSelectField(
 	requestRender?: () => void,
 	picker?: SelectPickerOptions,
 ): SelectFormField {
+	let selectedValue = currentValue;
+	const showOptionDescription = !getPreview && options.some(option => Boolean(option.description));
 	return new SelectFormField({
 		theme: formTheme,
 		label: title,
@@ -208,8 +210,18 @@ function createSettingsSelectField(
 		currentValue,
 		maxVisible: 10,
 		selectTheme: getSelectListTheme(),
-		getPreview,
-		onSelectionChange,
+		getPreview:
+			getPreview ??
+			(showOptionDescription
+				? () => options.find(option => option.value === selectedValue)?.description ?? ""
+				: undefined),
+		previewLabel: showOptionDescription ? "" : undefined,
+		onSelectionChange: showOptionDescription
+			? value => {
+					selectedValue = value;
+					return onSelectionChange?.(value);
+				}
+			: onSelectionChange,
 		onSubmit: onSelect,
 		onCancel,
 		hint: `  ${editorKey("tui.select.confirm")} to select · ${editorKey("tui.select.cancel")} to go back`,
@@ -1101,6 +1113,9 @@ export class SettingsSelectorComponent implements Component {
 				const open = list.openSubmenu;
 				if (open?.id === id && open.component instanceof MultiSelectSubmenu) {
 					open.component.setValues(value);
+					// The native page applies a chip toggle without closing its
+					// editor, so the row and its tab badge only update here.
+					this.#refreshItems();
 					return;
 				}
 				const next = [...value];

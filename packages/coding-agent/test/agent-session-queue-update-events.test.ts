@@ -45,7 +45,7 @@ describe("AgentSession queue_update events", () => {
 
 	afterEach(async () => {
 		await session?.dispose();
-		authStorage.close();
+		await authStorage.close();
 		removeSyncWithRetries(tempDir);
 	});
 

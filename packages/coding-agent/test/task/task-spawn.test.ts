@@ -193,7 +193,7 @@ describe("task spawn routing", () => {
 				["anthropic/claude-opus-5-5"],
 			]);
 		} finally {
-			auth.close();
+			await auth.close();
 		}
 	});
 

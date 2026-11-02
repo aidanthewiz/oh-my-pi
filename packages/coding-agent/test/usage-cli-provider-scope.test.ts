@@ -29,9 +29,9 @@ beforeEach(async () => {
 	});
 });
 
-afterEach(() => {
+afterEach(async () => {
 	vi.restoreAllMocks();
-	authStorage.close();
+	await authStorage.close();
 	process.exitCode = 0;
 });
 
@@ -65,6 +65,6 @@ test.each([
 		expect(stderr).toBe("");
 		expect(process.exitCode).toBe(0);
 	} finally {
-		writer.close();
+		await writer.close();
 	}
 });

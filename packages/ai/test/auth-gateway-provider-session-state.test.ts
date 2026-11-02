@@ -170,7 +170,7 @@ async function startGateway(
 		stop,
 		cleanup: async () => {
 			await stop();
-			storage.close();
+			await storage.close();
 			await fs.rm(dir, { recursive: true, force: true });
 		},
 	};
@@ -279,7 +279,7 @@ it.each(["/v1/pi/stream", "/v1/chat/completions"])(
 		} finally {
 			bearerSpy.mockRestore();
 			await gateway.close();
-			storage.close();
+			await storage.close();
 		}
 	},
 );
@@ -327,7 +327,7 @@ it.each(["/v1/pi/stream", "/v1/chat/completions"])(
 			expect(captured[0].headers).not.toHaveProperty("x-factory-org-id");
 		} finally {
 			await gateway.close();
-			storage.close();
+			await storage.close();
 		}
 	},
 );

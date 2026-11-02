@@ -386,21 +386,66 @@ process.exit(1);
 		}
 	});
 
-	it("invalidates approval when the execution input changes during review", async () => {
+	it("does not execute either command when review rejects changed input", async () => {
 		const sendNotification = spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
-		const args: BashToolInput = { command: "printf original-command", cwd: tempDir };
+		const originalPath = path.join(tempDir, "rejected-original.txt");
+		const changedPath = path.join(tempDir, "rejected-changed.txt");
+		const originalCommand = `printf original > ${JSON.stringify(originalPath)}`;
+		const changedCommand = `printf changed > ${JSON.stringify(changedPath)}`;
+		const args: BashToolInput = { command: originalCommand, cwd: tempDir };
+		const reviews: string[] = [];
 		const wrapped = new ExtensionToolWrapper(
 			tool as unknown as AgentTool,
-			runner(() => {
-				args.command = "printf changed-command";
-				return "Approve once";
+			runner(prompt => {
+				reviews.push(prompt);
+				if (reviews.length === 1) {
+					args.command = changedCommand;
+					return "Approve once";
+				}
+				return "Deny";
 			}),
 		);
 
 		try {
 			await expect(
-				wrapped.execute("changed-call", args, undefined, undefined, { settings } as AgentToolContext),
-			).rejects.toThrow(/requires interactive approval/u);
+				wrapped.execute("changed-denied-call", args, undefined, undefined, { settings } as AgentToolContext),
+			).rejects.toThrow(/denied by user/u);
+			expect(reviews).toHaveLength(2);
+			expect(reviews[0]).toContain(JSON.stringify(originalCommand));
+			expect(reviews[1]).toContain(JSON.stringify(changedCommand));
+			expect(fs.existsSync(originalPath)).toBeFalse();
+			expect(fs.existsSync(changedPath)).toBeFalse();
+		} finally {
+			sendNotification.mockRestore();
+		}
+	});
+
+	it("executes only changed input after its separate approval", async () => {
+		const sendNotification = spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
+		const originalPath = path.join(tempDir, "approved-original.txt");
+		const changedPath = path.join(tempDir, "approved-changed.txt");
+		const originalCommand = `printf original > ${JSON.stringify(originalPath)}`;
+		const changedCommand = `printf changed > ${JSON.stringify(changedPath)}`;
+		const args: BashToolInput = { command: originalCommand, cwd: tempDir };
+		const reviews: string[] = [];
+		const wrapped = new ExtensionToolWrapper(
+			tool as unknown as AgentTool,
+			runner(prompt => {
+				reviews.push(prompt);
+				if (reviews.length === 1) args.command = changedCommand;
+				return "Approve once";
+			}),
+		);
+
+		try {
+			await wrapped.execute("changed-approved-call", args, undefined, undefined, {
+				settings,
+			} as AgentToolContext);
+			expect(reviews).toHaveLength(2);
+			expect(reviews[0]).toContain(JSON.stringify(originalCommand));
+			expect(reviews[1]).toContain(JSON.stringify(changedCommand));
+			expect(fs.existsSync(originalPath)).toBeFalse();
+			expect(fs.readFileSync(changedPath, "utf8")).toBe("changed");
 		} finally {
 			sendNotification.mockRestore();
 		}

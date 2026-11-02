@@ -26,6 +26,11 @@ Release preparation and packaging also use Bun 1.4.4 without changing the embedd
 The release binary compiler and container runtime have separate version contracts.
 Qualify those distributions separately before changing their runtime versions.
 
+`cf-verify` retains exact-head native and binary inputs for full engine qualification.
+Hosted jobs run complete TypeScript and Rust checks, SDK consumers, synthetic databases, and isolated source/compiled runtime fixtures.
+Visual artifacts retain current, historical reference, and peer images; inspection remains a separate evidence requirement.
+Coreforge companion qualification runs in its own repository. Engine qualification needs no companion credentials.
+
 ## Dependency releases
 
 A verified pull request merged into `coreforge` triggers `.github/workflows/cf-release.yml`.

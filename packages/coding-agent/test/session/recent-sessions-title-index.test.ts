@@ -7,7 +7,7 @@ import { cfgTitleIcons } from "@oh-my-pi/pi-coding-agent/utils/title-settings";
 import { admitTitleCard, serializeTitleSlot } from "@oh-my-pi/pi-coding-agent/session/session-title-slot";
 import { getRecentSessions, readSessionInfo } from "@oh-my-pi/pi-coding-agent/session/session-listing";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { recordSessionTitle, resetSessionIndexForTests } from "@oh-my-pi/pi-coding-agent/session/session-index";
+import { closeSessionIndex, recordSessionTitle } from "@oh-my-pi/pi-coding-agent/session/session-index";
 import { getConfigRootDir, removeSyncWithRetries, setAgentDir } from "@oh-my-pi/pi-utils";
 import { makeAssistantMessage } from "../session-manager/helpers";
 
@@ -22,11 +22,11 @@ describe("recent session title presentation", () => {
 		cwd = path.join(testAgentDir, "cwd");
 		fs.mkdirSync(cwd, { recursive: true });
 		setAgentDir(testAgentDir);
-		resetSessionIndexForTests();
+		closeSessionIndex();
 	});
 
 	afterEach(() => {
-		resetSessionIndexForTests();
+		closeSessionIndex();
 		if (originalAgentDir) {
 			setAgentDir(originalAgentDir);
 		} else {

@@ -24,8 +24,8 @@ import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
 const authStorage = createInMemoryAuthStorage();
 const modelRegistry = new ModelRegistry(authStorage);
 
-afterAll(() => {
-	authStorage.close();
+afterAll(async () => {
+	await authStorage.close();
 });
 
 describe("createAcpSessionFactory MCP isolation (issue #1234)", () => {
@@ -33,12 +33,22 @@ describe("createAcpSessionFactory MCP isolation (issue #1234)", () => {
 		const tempDir = TempDir.createSync("@pi-acp-mcp-isolation-");
 		try {
 			const settings = Settings.isolated({});
-			const fakeSession = {} as AgentSession;
+			let disposed = false;
+			const fakeSession = {
+				get isDisposed() {
+					return disposed;
+				},
+				dispose: async () => {
+					disposed = true;
+				},
+			} as AgentSession;
 			const captured: CreateAgentSessionOptions[] = [];
 			const createSession = async (options: CreateAgentSessionOptions): Promise<CreateAgentSessionResult> => {
 				captured.push(options);
 				return {
 					session: fakeSession,
+					captureOwnerCurrent: () => () => !fakeSession.isDisposed,
+					captureOwnerLifetimeCurrent: () => () => !fakeSession.isDisposed,
 					extensionsResult: {
 						extensions: [],
 						errors: [],
@@ -94,7 +104,12 @@ describe("createAcpSessionFactory MCP isolation (issue #1234)", () => {
 				modelRegistry,
 				parsedArgs: { tools: ["read", "missing"], invalidFlagValues: [] },
 				rawArgs: ["--tools", "read,missing"],
-				createSession: async () => ({ session: fakeSession }) as CreateAgentSessionResult,
+				createSession: async () =>
+					({
+						session: fakeSession,
+						captureOwnerCurrent: () => () => !disposed,
+						captureOwnerLifetimeCurrent: () => () => !disposed,
+					}) as CreateAgentSessionResult,
 			});
 
 			await expect(factory(tempDir.path())).rejects.toThrow(/Unknown tool in --tools: missing/);
@@ -120,7 +135,15 @@ describe("createAcpSessionFactory MCP isolation (issue #1234)", () => {
 				`import { writeFileSync } from "node:fs"; export default function (pi) { pi.events.on("acp-session-live", () => writeFileSync(${JSON.stringify(firedPath)}, "fired")); }`,
 			);
 			let captured: CreateAgentSessionOptions | undefined;
-			const fakeSession = {} as AgentSession;
+			let disposed = false;
+			const fakeSession = {
+				get isDisposed() {
+					return disposed;
+				},
+				dispose: async () => {
+					disposed = true;
+				},
+			} as AgentSession;
 			const factory = createAcpSessionFactory({
 				baseOptions: {
 					disableExtensionDiscovery: true,
@@ -137,6 +160,8 @@ describe("createAcpSessionFactory MCP isolation (issue #1234)", () => {
 					options.eventBus?.emit("acp-session-live", undefined);
 					return {
 						session: fakeSession,
+						captureOwnerCurrent: () => () => !fakeSession.isDisposed,
+						captureOwnerLifetimeCurrent: () => () => !fakeSession.isDisposed,
 						extensionsResult: options.preloadedExtensions,
 						setToolUIContext: () => {},
 						eventBus: options.eventBus,
@@ -196,12 +221,22 @@ describe("createAcpSessionFactory TITLE_SYSTEM.md per-cwd resolution (PR #3736)"
 			const projectDir = tempDir.join("project");
 			await Bun.write(`${projectDir}/.omp/TITLE_SYSTEM.md`, "Project-specific title policy.");
 
-			const fakeSession = {} as AgentSession;
+			let disposed = false;
+			const fakeSession = {
+				get isDisposed() {
+					return disposed;
+				},
+				dispose: async () => {
+					disposed = true;
+				},
+			} as AgentSession;
 			const captured: CreateAgentSessionOptions[] = [];
 			const createSession = async (options: CreateAgentSessionOptions): Promise<CreateAgentSessionResult> => {
 				captured.push(options);
 				return {
 					session: fakeSession,
+					captureOwnerCurrent: () => () => !fakeSession.isDisposed,
+					captureOwnerLifetimeCurrent: () => () => !fakeSession.isDisposed,
 					extensionsResult: {
 						extensions: [],
 						errors: [],

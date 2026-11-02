@@ -69,7 +69,7 @@ describe("context-file prompt refresh", () => {
 			expect(refreshedPrompt).not.toContain(INITIAL_CONTEXT);
 		} finally {
 			await session.dispose();
-			authStorage.close();
+			await authStorage.close();
 		}
 	});
 
@@ -88,7 +88,7 @@ describe("context-file prompt refresh", () => {
 			expect(session.systemPrompt.join("\n")).not.toContain(INITIAL_CONTEXT);
 		} finally {
 			await session.dispose();
-			authStorage.close();
+			await authStorage.close();
 		}
 	});
 
@@ -112,7 +112,7 @@ describe("context-file prompt refresh", () => {
 		} finally {
 			initializeWithSettings(settings);
 			await session.dispose();
-			authStorage.close();
+			await authStorage.close();
 		}
 	});
 
@@ -137,7 +137,7 @@ describe("context-file prompt refresh", () => {
 			expect(refreshed).not.toContain(INITIAL_CONTEXT);
 		} finally {
 			await session.dispose();
-			authStorage.close();
+			await authStorage.close();
 		}
 	});
 
@@ -162,7 +162,7 @@ describe("context-file prompt refresh", () => {
 			expect(refreshedPrompt).not.toContain("old-repo");
 		} finally {
 			await session.dispose();
-			authStorage.close();
+			await authStorage.close();
 		}
 	});
 });

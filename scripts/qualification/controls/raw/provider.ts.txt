@@ -1,0 +1,267 @@
+import assert from "node:assert/strict";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { createHash } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
+import type { AnthropicOptions } from "../../packages/ai/src/providers/anthropic";
+import type { AnthropicFallbackCreditHandle, Context } from "../../packages/ai/src/types";
+import type { Model, Api, ModelPricingStatus } from "../../packages/catalog/src/types";
+import type { ModelManager } from "../../packages/catalog/src/model-manager";
+type ProjectedModel = Pick<Model<Api>, "id" | "provider" | "api" | "baseUrl" | "cost" | "contextWindow" | "maxTokens"> & { pricingStatus: ModelPricingStatus };
+
+declare const PI_COMPILED: boolean;
+const [bindingFile, mode, ...extra] = process.argv.slice(2);
+assert(!extra.length && ["source", "compiled"].includes(mode));
+assert.equal(mode, (typeof PI_COMPILED !== "undefined" ? PI_COMPILED : process.env.PI_COMPILED === "true") ? "compiled" : "source");
+const sha = (bytes: string | Uint8Array) => createHash("sha256").update(bytes).digest("hex");
+const binding = JSON.parse(await fs.readFile(bindingFile, "utf8"));
+assert.equal(binding.schema, "CoreforgePost95V18122ProviderRuntimeBinding");
+assert.equal(binding.mode, mode); assert.equal(binding.version, "18.12.2");
+const home = await fs.realpath(process.env.HOME!);
+assert.equal(await fs.realpath(os.homedir()), home);
+assert.equal(path.dirname(home), "/private/tmp"); assert(/^cf-[A-Za-z0-9]+$/.test(path.basename(home)));
+const sourceBytes = await fs.readFile(binding.sourceManifestCopy);
+const shippingBytes = await fs.readFile(binding.shippingManifestCopy);
+assert.equal(sha(sourceBytes), binding.sourceManifestSha256); assert.equal(sha(shippingBytes), binding.shippingManifestSha256);
+const source = JSON.parse(sourceBytes.toString()), shipping = JSON.parse(shippingBytes.toString());
+assert.equal(sha(JSON.stringify(source.records)), source.sourceDigest);
+assert.equal(source.sourceDigest, binding.sourceDigest); assert.equal(shipping.sourceDigest, source.sourceDigest);
+assert.deepEqual(shipping.records, source.records);
+assert.equal(source.native.sha256, binding.nativeSha256); assert.equal(shipping.native.sha256, binding.nativeSha256);
+assert.equal(shipping.binary.sha256, binding.shippingBinarySha256);
+assert.equal(binding.engineHead, "6f2e6a8de28f26ecd668da3f3f8e1edb9006963d"); assert.equal(binding.mergeHead, "1d5aff90b057ce7dbfe32ea557a527c1b3144b72");
+for (const manifest of [source, shipping]) {
+ assert.equal(manifest.schema, "CoreforgeCandidateSourceSnapshot");
+ assert.equal(manifest.engineHead, binding.engineHead); assert.equal(manifest.mergeHead, binding.mergeHead);
+}
+const fixture = await fs.mkdtemp(path.join(home, "provider-"));
+await fs.writeFile(path.join(fixture, ".owner"), binding.owner, { flag: "wx", mode: 0o600 });
+const originalFetch = globalThis.fetch, originalNow = Date.now;
+const observations: unknown[] = [], violations: unknown[] = [], transportViolations: string[] = [];
+const check = (candidate: string, label: string, condition: boolean, assertion: string, details?: unknown) => {
+ if (!condition) violations.push({ candidate, case: label, assertion, details });
+};
+const deny = (message: string): never => { transportViolations.push(message); throw new Error(message); };
+const setEnv = (key: string, value?: string) => {
+ if (value === undefined) { delete process.env[key]; delete Bun.env[key]; }
+ else { process.env[key] = value; Bun.env[key] = value; }
+};
+const environment = new Map<string, { process?: string; bun?: string }>();
+for (const key of new Set([...Object.keys(process.env), ...Object.keys(Bun.env), "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"])) {
+ if (!/^(?:ANTHROPIC_|CLAUDE_CODE_|FOUNDRY_|SAMBANOVA_)/.test(key)) continue;
+ environment.set(key, { process: process.env[key], bun: Bun.env[key] }); setEnv(key);
+}
+globalThis.fetch = (async input => deny(`global fetch forbidden: ${String(input)}`)) as typeof fetch;
+let closeModelCache: (() => void) | undefined, failure: unknown, nativePath: string | undefined;
+let completed = false, cleanupVerified = false;
+try {
+ assert((await fs.realpath(process.env.PI_NATIVES_DIR!)).startsWith(home + path.sep));
+ // Target imports must follow private environment and network guards; this probe exercises the module-load boundary.
+ await import("../../packages/natives/native/index.js");
+ const { nativeAddonStatus } = await import("../../packages/natives/native/loader-state.js");
+ const native = nativeAddonStatus(); assert(native && !native.stale);
+ assert.equal(native.version, binding.version); nativePath = native.path;
+ assert.equal(sha(await fs.readFile(native.path)), binding.nativeSha256);
+ const cache = await import("../../packages/catalog/src/model-cache"); closeModelCache = cache.closeModelCache;
+ const { buildModel } = await import("../../packages/catalog/src/build");
+ const { streamAnthropic } = await import("../../packages/ai/src/providers/anthropic");
+ const { isRecord } = await import("../../packages/catalog/src/utils");
+ const model = buildModel({ id: "claude-sonnet-5-5", name: "Synthetic beta boundary", api: "anthropic-messages", provider: "anthropic",
+  baseUrl: "https://api.anthropic.com", reasoning: true, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+  contextWindow: 1_000_000, maxTokens: 128_000, compat: { honorsClaudeCodeBetaKillSwitch: true } });
+ const freshText = `fresh:${JSON.parse(binding.owner).id}`;
+ const context: Context = { messages: [{ role: "user", content: freshText, timestamp: 1 }] };
+ const clockStart = 1_900_000_000_000; let clock = clockStart; Date.now = () => clock;
+ const beta = { context: "context-management-2025-06-27", budget: "task-budgets-2026-03-13", effort: "effort-2025-11-24",
+  binding: "thinking-binding-controls-2026-08-01", credit: "fallback-credit-2026-06-01" };
+ const text = `synthetic-sse:${binding.owner}`;
+ const events = [
+  { type: "message_start", message: { id: "msg_private", type: "message", role: "assistant", model: model.id, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 7, output_tokens: 0 } } },
+  { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+  { type: "content_block_delta", index: 0, delta: { type: "text_delta", text } }, { type: "content_block_stop", index: 0 },
+  { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 3 } }, { type: "message_stop" },
+ ];
+ const sse = events.map(event => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join("");
+ interface Body extends Record<string, unknown> {
+  model: string; stream: true; max_tokens: number; messages: unknown[]; output_config?: Record<string, unknown>;
+  thinking?: Record<string, unknown>; anthropic_beta?: string[]; fallback_credit_token?: string;
+ }
+ const capturedBody = (value: unknown): value is Body => {
+  if (!isRecord(value) || typeof value.model !== "string" || value.stream !== true || typeof value.max_tokens !== "number" || !Array.isArray(value.messages)) return false;
+  if (value.output_config !== undefined && !isRecord(value.output_config)) return false;
+  if (value.thinking !== undefined && !isRecord(value.thinking)) return false;
+  if (value.fallback_credit_token !== undefined && typeof value.fallback_credit_token !== "string") return false;
+  return value.anthropic_beta === undefined || (Array.isArray(value.anthropic_beta) && value.anthropic_beta.every(item => typeof item === "string"));
+ };
+ type Wire = { label: string; url: string; headers: Record<string, string>; body: Body; betaUnion: string[]; expiryReads: number[]; clockAdvanced: boolean };
+ const capture = async (label: string, expiry: "none" | "expired" | "during" | "live", killed: boolean, forfeit = false): Promise<Wire> => {
+  clock = clockStart; setEnv("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", killed ? "1" : undefined);
+  const expiryReads: number[] = []; let clockAdvanced = false;
+  const handle: AnthropicFallbackCreditHandle = {
+   token: "synthetic-credit-not-a-real-token", prefillClaim: false,
+   params: { model: model.id, max_tokens: 17, stream: true, messages: [{ role: "user", content: "frozen-old-context" }], ...(forfeit ? { output_config: { task_budget: { type: "tokens", total: 1234 } } } : {}) },
+   betas: killed ? [beta.credit, beta.context, beta.budget, beta.binding] : [beta.credit],
+   get expiresAt() {
+    expiryReads.push(clock);
+    if (expiry === "during" && expiryReads.length === 1) queueMicrotask(() => { clock = clockStart + 2000; clockAdvanced = true; });
+    return expiry === "expired" ? clockStart - 1 : clockStart + 1000;
+   },
+  };
+  const requests: Wire[] = [];
+  const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+   const request = new Request(input, init);
+   if (request.url !== "https://api.anthropic.com/v1/messages" || request.method !== "POST") deny(`unexpected Anthropic request: ${request.method} ${request.url}`);
+   if (request.headers.get("x-api-key") !== "synthetic-official-api-key" || request.headers.has("authorization")) deny("unexpected Anthropic credential route");
+   const body: unknown = JSON.parse(await request.text()); assert(capturedBody(body));
+   const betaUnion = [...new Set([...(request.headers.get("anthropic-beta") ?? "").split(",").map(item => item.trim()).filter(Boolean), ...(body.anthropic_beta ?? [])])].sort();
+   requests.push({ label, url: request.url, headers: Object.fromEntries(request.headers), body, betaUnion, expiryReads: [...expiryReads], clockAdvanced });
+   return new Response(sse, { status: 200, headers: { "content-type": "text/event-stream", "request-id": "req_private" } });
+  }) as typeof globalThis.fetch;
+  const abort = new AbortController(), before = structuredClone(context);
+  try {
+   const options: AnthropicOptions = { apiKey: "synthetic-official-api-key", isOAuth: false, thinkingEnabled: true, effort: "high", maxTokens: 512,
+    taskBudget: { type: "tokens", total: 50_000 }, metadata: { user_id: "synthetic-provider-candidate" }, fetch, signal: abort.signal,
+    streamFirstEventTimeoutMs: 0, streamIdleTimeoutMs: 0, ...(expiry !== "none" ? { fallbackCreditRedemption: handle } : {}) };
+   const stream = streamAnthropic(model, context, options), seen: string[] = [];
+   for await (const event of stream) seen.push(event.type);
+   const result = await stream.result(); assert.equal(result.stopReason, "stop", result.errorMessage);
+   assert.deepEqual(JSON.parse(JSON.stringify(result.content)), [{ type: "text", text }]);
+   assert.equal(result.usage.input, 7); assert.equal(result.usage.output, 3); assert(seen.includes("text_delta") && seen.includes("done"));
+   assert.equal(requests.length, 1, "no retries"); assert.deepEqual(context, before, "caller history stays immutable");
+   observations.push({ candidate: "P22-C1", ...requests[0], seen, result: { content: result.content, usage: result.usage, stopReason: result.stopReason } });
+   return requests[0]!;
+  } finally { abort.abort(); }
+ };
+ const requiredBetas = (wire: Wire) => [
+  ...(wire.body.context_management ? [beta.context] : []), ...(wire.body.output_config?.task_budget ? [beta.budget] : []),
+  ...(wire.body.output_config?.effort ? [beta.effort] : []), ...(wire.body.thinking?.block_binding ? [beta.binding] : []),
+ ];
+ for (const killed of [false, true]) {
+  const baseline = await capture(`no-handle-${killed ? "kill" : "enabled"}`, "none", killed);
+  assert.equal(baseline.body.output_config?.effort, "high"); assert(baseline.betaUnion.includes(beta.effort));
+  if (killed) {
+   assert.equal(baseline.body.context_management, undefined); assert.equal(baseline.body.output_config?.task_budget, undefined); assert.equal(baseline.body.thinking?.block_binding, undefined);
+   for (const withheld of [beta.context, beta.budget, beta.binding]) assert(!baseline.betaUnion.includes(withheld));
+  } else { assert(baseline.body.context_management); assert(baseline.body.output_config?.task_budget); }
+  for (const needed of requiredBetas(baseline)) assert(baseline.betaUnion.includes(needed));
+  for (const expiry of ["expired", "during"] as const) {
+   const wire = await capture(`${expiry}-${killed ? "kill" : "enabled"}`, expiry, killed);
+   assert.equal(wire.body.fallback_credit_token, undefined); assert(JSON.stringify(wire.body.messages).includes(freshText));
+   assert(!JSON.stringify(wire.body).includes("frozen-old-context")); assert.deepEqual(wire.body, baseline.body);
+   if (expiry === "during") {
+    assert(wire.clockAdvanced); assert(wire.expiryReads[0] === clockStart && wire.expiryReads.some(value => value > clockStart + 1000));
+   } else assert(wire.expiryReads.length >= 1 && !wire.clockAdvanced);
+   const needed = requiredBetas(wire), missing = needed.filter(item => !wire.betaUnion.includes(item));
+   check("P22-C1", wire.label, missing.length === 0, "fresh body retains every required beta", { required: needed, missing, baselineBetaUnion: baseline.betaUnion, actualBetaUnion: wire.betaUnion });
+   check("P22-C1", wire.label, wire.betaUnion.includes(beta.effort), "effort survives saved beta replacement");
+   if (killed) for (const withheld of [beta.context, beta.budget, beta.binding]) assert(!wire.betaUnion.includes(withheld));
+  }
+ }
+ const live = await capture("live-credit-frozen-body-control", "live", false);
+ assert.equal(live.body.fallback_credit_token, "synthetic-credit-not-a-real-token"); assert(JSON.stringify(live.body.messages).includes("frozen-old-context"));
+ const forfeited = await capture("live-kill-forfeit-control", "live", true, true);
+ assert.equal(forfeited.body.fallback_credit_token, undefined); assert(JSON.stringify(forfeited.body.messages).includes(freshText));
+ assert.equal(forfeited.body.output_config?.task_budget, undefined); assert(forfeited.betaUnion.includes(beta.effort));
+ Date.now = originalNow; setEnv("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS");
+ const { createModelManager } = await import("../../packages/catalog/src/model-manager");
+ const { sambanovaModelManagerOptions } = await import("../../packages/catalog/src/provider-models/openai-compat");
+ const { resolveModelCacheProviderId } = await import("../../packages/catalog/src/provider-models/cache-provider-id");
+ const { getModelPricingStatus } = await import("../../packages/catalog/src/models");
+ const { Database } = await import("bun:sqlite");
+ const dbPath = path.join(fixture, "models.db"), now = () => 1_900_000_000_000;
+ const official = "https://api.sambanova.ai/v1", custom = "https://sambanova-candidate.invalid/tenant-b/v1";
+ const rosterA = [{ id: "synthetic-account-a-chat", context_length: 65536, max_completion_tokens: 4096, pricing: { prompt: "0.000003", completion: "0.0000045" } }];
+ const rosterB = [{ id: "synthetic-account-b-chat", context_length: 131072, max_completion_tokens: 8192, pricing: { prompt: "0.000007", completion: "0.000011" } }];
+ const configurations = {
+  A: { apiKey: "synthetic-key-a", baseUrl: official, roster: rosterA, cost: { input: 3, output: 4.5, cacheRead: 0, cacheWrite: 0 } },
+  B: { apiKey: "synthetic-key-b", baseUrl: official, roster: rosterB, cost: { input: 7, output: 11, cacheRead: 0, cacheWrite: 0 } },
+  customA: { apiKey: "synthetic-key-a", baseUrl: custom, roster: [{ ...rosterB[0]!, pricing: { prompt: "0.000013", completion: "0.000017" } }], cost: { input: 13, output: 17, cacheRead: 0, cacheWrite: 0 } },
+  customB: { apiKey: "synthetic-key-b", baseUrl: custom, roster: [{ ...rosterA[0]!, pricing: { prompt: "0.000019", completion: "0.000023" } }], cost: { input: 19, output: 23, cacheRead: 0, cacheWrite: 0 } },
+ };
+ const requests: unknown[] = [], managers = new Map<string, ModelManager>(), identities = new Map<string, string>();
+ const project = (models: readonly Model<Api>[]) => models.map(model => ({ id: model.id, provider: model.provider, api: model.api, baseUrl: model.baseUrl,
+  cost: model.cost, pricingStatus: getModelPricingStatus(model), contextWindow: model.contextWindow, maxTokens: model.maxTokens })).sort((a, b) => a.id.localeCompare(b.id));
+ const persisted = () => {
+  const db = new Database(dbPath, { readonly: true });
+  try { return db.query<{ provider_id: string; authoritative: number; updated_at: number; models: string }, []>("SELECT provider_id, authoritative, updated_at, models FROM model_cache ORDER BY provider_id").all().map(raw => ({ providerId: raw.provider_id, authoritative: raw.authoritative, updatedAt: raw.updated_at, models: JSON.parse(raw.models) })); }
+  finally { db.close(); }
+ };
+ for (const [scope, config] of Object.entries(configurations)) {
+  const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+   const request = new Request(input, init);
+   if (request.url !== `${config.baseUrl}/models` || request.method !== "GET") deny(`unexpected SambaNova request: ${request.method} ${request.url}`);
+   if (request.headers.get("authorization") !== `Bearer ${config.apiKey}` || request.headers.has("x-api-key")) deny(`unexpected SambaNova credential for ${scope}`);
+   requests.push({ scope, url: request.url, method: request.method, headers: Object.fromEntries(request.headers), roster: structuredClone(config.roster) });
+   return Response.json({ object: "list", data: config.roster });
+  }) as typeof globalThis.fetch;
+  const options = sambanovaModelManagerOptions({ apiKey: config.apiKey, baseUrl: config.baseUrl, fetch });
+  identities.set(scope, resolveModelCacheProviderId("sambanova", config));
+  managers.set(scope, createModelManager({ ...options, cacheDbPath: dbPath, now }));
+ }
+ for (const [scope, baseUrl] of [["keyless", official], ["keyless-custom", custom]] as const) {
+  const options = sambanovaModelManagerOptions({ baseUrl, fetch: globalThis.fetch });
+  identities.set(scope, resolveModelCacheProviderId("sambanova", { baseUrl }));
+  managers.set(scope, createModelManager({ ...options, cacheDbPath: dbPath, now }));
+ }
+ const resolve = async (scope: string, strategy: "online" | "online-if-uncached", label: string) => {
+  const before = requests.length, result = await managers.get(scope)!.refresh(strategy), rows = project(result.models), namespace = identities.get(scope)!;
+  const cached = cache.readModelCache(namespace, 2 * 60 * 60 * 1000, now, dbPath);
+  observations.push({ candidate: "P22-C2", label, scope, strategy, source: result.source, stale: result.stale, updatedAt: result.updatedAt, models: rows,
+   requests: requests.slice(before), cacheNamespaceDiagnosticOnly: namespace, cacheApi: cached ? { fresh: cached.fresh, authoritative: cached.authoritative, updatedAt: cached.updatedAt, models: project(cached.models) } : null, persisted: persisted() });
+  assert.equal(result.stale, false); assert(requests.length - before <= 1, "no extra discovery destinations or retries");
+  if (scope.startsWith("keyless")) assert.equal(requests.length, before, "keyless discovery never requests credentials");
+  return { rows, calls: requests.length - before, cached };
+ };
+ const cold = await resolve("keyless", "online-if-uncached", "cold-keyless-seed");
+ assert(cold.rows.some(row => row.id === "gpt-oss-120b")); assert(!cold.rows.some(row => row.id.startsWith("synthetic-account-")));
+ const snapshots = new Map<string, ProjectedModel[]>();
+ const forced = async (scope: keyof typeof configurations, label: string) => {
+  const result = await resolve(scope, "online", label), config = configurations[scope];
+  assert.equal(result.calls, 1); assert.deepEqual(result.rows.map(row => row.id), config.roster.map(row => row.id));
+  for (const row of result.rows) {
+   assert.deepEqual(row.cost, config.cost); assert.equal(row.pricingStatus, "fixed"); assert.equal(row.baseUrl, config.baseUrl);
+   assert.equal(row.contextWindow, config.roster[0]!.context_length); assert.equal(row.maxTokens, config.roster[0]!.max_completion_tokens);
+  }
+  assert(result.cached?.authoritative && result.cached.fresh, "actual effective cache rows remain readable");
+  assert.deepEqual(project(result.cached.models), result.rows); snapshots.set(scope, result.rows); return result;
+ };
+ const warm = async (scope: keyof typeof configurations, label: string) => {
+  const result = await resolve(scope, "online-if-uncached", label), config = configurations[scope];
+  const expectedIds = config.roster.map(row => row.id).sort();
+  const correct = isDeepStrictEqual(result.rows.map(row => row.id).sort(), expectedIds) && result.rows.every(row => isDeepStrictEqual(row.cost, config.cost) && row.baseUrl === config.baseUrl && row.pricingStatus === "fixed");
+  check("P22-C2", label, correct, "warm roster, tariffs and endpoint match selected credential and endpoint", { expectedIds, expectedCost: config.cost, expectedBaseUrl: config.baseUrl, actual: result.rows, calls: result.calls });
+  return result;
+ };
+ await forced("A", "prime-a-official-online");
+ const sameA = await warm("A", "same-key-same-endpoint-warm-control"); assert.deepEqual(sameA.rows, snapshots.get("A")); assert.equal(sameA.calls, 0);
+ await warm("B", "different-key-same-endpoint-warm"); await forced("B", "different-key-forced-refresh-control");
+ const sameB = await warm("B", "same-b-key-warm-control"); assert.deepEqual(sameB.rows, snapshots.get("B")); assert.equal(sameB.calls, 0);
+ await warm("A", "return-to-a-after-b-cache-write"); await forced("A", "restore-a-online-before-endpoint-switch");
+ await warm("customA", "same-key-different-endpoint-warm"); await forced("customA", "custom-endpoint-forced-refresh-control");
+ await warm("customB", "different-key-custom-endpoint-warm"); await forced("customB", "custom-b-forced-refresh-control");
+ await warm("A", "official-a-after-custom-b-cache-write");
+ for (const scope of ["keyless", "keyless-custom"]) for (const strategy of ["online-if-uncached", "online"] as const) {
+  const label = `warm-${scope}-${strategy}`, result = await resolve(scope, strategy, label), foreign = result.rows.filter(row => row.id.startsWith("synthetic-account-"));
+  check("P22-C2", label, foreign.length === 0, "keyless startup exposes no credential-only roster or prices", { foreign });
+ }
+ assert.deepEqual(transportViolations, []); completed = true;
+} catch (error) { failure = error; }
+finally {
+ try { closeModelCache?.(); } catch (error) { failure ??= error; }
+ Date.now = originalNow; globalThis.fetch = originalFetch;
+ for (const [key, saved] of environment) {
+  if (saved.process === undefined) delete process.env[key]; else process.env[key] = saved.process;
+  if (saved.bun === undefined) delete Bun.env[key]; else Bun.env[key] = saved.bun;
+ }
+ try {
+  assert.equal(await fs.readFile(path.join(fixture, ".owner"), "utf8"), binding.owner);
+  await fs.rm(fixture, { recursive: true });
+  assert.equal(await fs.stat(fixture).then(() => true, (error: NodeJS.ErrnoException) => { if (error.code === "ENOENT") return false; throw error; }), false);
+  cleanupVerified = true;
+ } catch (error) { failure ??= error; }
+}
+console.log(JSON.stringify({ schema: "CoreforgePost95V18122ProviderConsumer", mode, binding, nativePath, observations, violations, transportViolations,
+ complete: completed && cleanupVerified && !failure, consumerInvariantsSatisfied: completed && cleanupVerified && !failure && violations.length === 0,
+ cleanupVerified, fixture, ...(failure ? { failure: failure instanceof Error ? failure.stack : String(failure) } : {}) }));
+process.exitCode = failure ? 1 : violations.length ? 2 : 0;

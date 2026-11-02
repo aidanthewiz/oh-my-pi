@@ -22,7 +22,7 @@ function makeAnthropicModel(id: string): Model<"anthropic-messages"> {
 
 function makeMiniMaxAnthropicModel(
 	id: string,
-	provider: "minimax" | "minimax-code" = "minimax",
+	provider: "minimax" | "minimax-cn" | "minimax-code" | "minimax-code-cn" = "minimax",
 ): Model<"anthropic-messages"> {
 	return buildModel({
 		id,
@@ -89,6 +89,9 @@ type CapturedPayload = {
 	};
 	tool_choice?: { type: string };
 	output_config?: { effort?: string };
+	temperature?: number;
+	top_p?: number;
+	top_k?: number;
 	system?: Array<{ cache_control?: { type: "ephemeral"; ttl?: "1h" | "5m" } }>;
 	messages?: Array<{
 		role: string;
@@ -412,14 +415,17 @@ describe("MiniMax Anthropic adaptive thinking", () => {
 	it.each([
 		[Effort.High, "high"],
 		[Effort.Max, "max"],
-	] as const)("sends MiniMax-M3.1-Flash-Preview %s effort as output_config.effort", async (effort, wire) => {
-		const payload = await capturePayload(makeMiniMaxAnthropicModel("MiniMax-M3.1-Flash-Preview", "minimax-code"), {
-			reasoning: effort,
-			thinkingEnabled: true,
-		});
-
-		expect(payload.thinking).toEqual({ type: "adaptive" });
-		expect(payload.output_config?.effort).toBe(wire);
+	] as const)("sends MiniMax-M3.1-Flash %s effort as output_config.effort", async (effort, wire) => {
+		for (const provider of ["minimax", "minimax-cn", "minimax-code", "minimax-code-cn"] as const) {
+			for (const id of ["MiniMax-M3.1-Flash", "MiniMax-M3.1-Flash-Preview"]) {
+				const payload = await capturePayload(makeMiniMaxAnthropicModel(id, provider), {
+					reasoning: effort,
+					thinkingEnabled: true,
+				});
+				expect(payload.thinking).toEqual({ type: "adaptive" });
+				expect(payload.output_config?.effort).toBe(wire);
+			}
+		}
 	});
 
 	// The model 400s on `thinking.type: "disabled"` (error 2013), so the row is
@@ -429,9 +435,10 @@ describe("MiniMax Anthropic adaptive thinking", () => {
 		["an effort-less request", {}],
 		["a forced-off request", { forceReasoningOff: true }],
 		["a disabled-reasoning request", { disableReasoning: true }],
-	] as const)("clamps MiniMax-M3.1-Flash-Preview %s to low effort with thinking on", async (_label, opts) => {
-		const model = makeMiniMaxAnthropicModel("MiniMax-M3.1-Flash-Preview", "minimax-code");
+	] as const)("clamps MiniMax-M3.1-Flash %s to low effort with thinking on", async (_label, opts) => {
+		const model = makeMiniMaxAnthropicModel("MiniMax-M3.1-Flash", "minimax-code");
 		expect(model.thinking?.requiresEffort).toBe(true);
+		expect(model.compat.supportsSamplingParams).toBe(false);
 
 		let payload: CapturedPayload | undefined;
 		await streamSimple(model, CONTEXT, {
@@ -445,6 +452,36 @@ describe("MiniMax Anthropic adaptive thinking", () => {
 
 		expect(payload?.thinking).toEqual({ type: "adaptive" });
 		expect(payload?.output_config?.effort).toBe("low");
+	});
+
+	it("removes explicit sampling from launch-model wire requests but retains it for a sampling-capable control", async () => {
+		for (const provider of ["minimax", "minimax-cn", "minimax-code", "minimax-code-cn"] as const) {
+			let payload: CapturedPayload | undefined;
+			await streamSimple(makeMiniMaxAnthropicModel("MiniMax-M3.1-Flash", provider), CONTEXT, {
+				apiKey: "synthetic-minimax-key",
+				signal: abortedSignal(),
+				temperature: 0.3,
+				topP: 0.8,
+				topK: 8,
+				onPayload: captured => {
+					payload = captured as CapturedPayload;
+				},
+			}).result();
+			expect(payload?.thinking).toEqual({ type: "adaptive" });
+			expect(payload?.output_config?.effort).toBe("low");
+			expect(payload?.temperature).toBeUndefined();
+			expect(payload?.top_p).toBeUndefined();
+			expect(payload?.top_k).toBeUndefined();
+		}
+		const control = await capturePayload(makeMiniMaxAnthropicModel("MiniMax-M3"), {
+			thinkingEnabled: false,
+			temperature: 0.3,
+			topP: 0.8,
+			topK: 8,
+		});
+		expect(control.temperature).toBe(0.3);
+		expect(control.top_p).toBe(0.8);
+		expect(control.top_k).toBe(8);
 	});
 
 	it("drives Token Plan MiniMax-M3 through the adaptive tag like the pay-as-you-go host", async () => {

@@ -18,15 +18,18 @@ import {
 	HighlightStream,
 	highlightCode,
 	htmlToMarkdown,
-	invalidateFsScanCache,
+	LineMatcher,
 	listWorkspace,
 	macOSCheckSpelling,
 	macOSSpellCheckerAvailable,
 	matchesKey,
+	normalizePtyDimensions,
 	PowerAssertion,
 	PtySession,
 	parseKey,
 	pdfToMarkdown,
+	PipeStreams,
+	Shell,
 	summarizeCode,
 	supportsLanguage,
 	truncateToWidth,
@@ -104,6 +107,41 @@ describe("countTokens", () => {
 			expect(typeof n).toBe("number");
 			expect(n).toBeGreaterThan(0);
 		}
+	});
+});
+
+describe("LineMatcher", () => {
+	it("returns UTF-16 captures in line and rule order with absent groups", () => {
+		const matcher = new LineMatcher([String.raw`(?<mark>\S) (?<name>\S+) (?<n>\d+)(?<unit>ms)?`, "(?<n>7)"]);
+		expect(matcher.groupNames()).toEqual([["mark", "name", "n", "unit"], ["n"]]);
+		const result = matcher.matchLines("𝄞 x 12\r\nnone\n✓ y 7");
+		expect(result.lines).toEqual(new Uint32Array([0, 2, 2]));
+		expect(result.rules).toEqual(new Uint32Array([0, 0, 1]));
+		expect(result.spans).toEqual(new Int32Array([0, 2, 3, 4, 5, 7, -1, -1, 0, 1, 2, 3, 4, 5, -1, -1, 4, 5]));
+	});
+});
+
+describe("PipeStreams", () => {
+	it("keeps raw completed pipeline bytes isolated between runs of one shell", async () => {
+		const shell = new Shell({ clearEnv: true });
+		const first = new PipeStreams();
+		const second = new PipeStreams();
+		const run = await shell.run({ command: "printf '界𝄞' | cat", streams: first });
+		expect(run.exitCode).toBe(0);
+		expect(first.read(1)).toEqual({ start: 0, end: 7, data: Buffer.from("界𝄞"), open: false });
+		const next = await shell.run({ command: "printf 'next' | cat", streams: second });
+		expect(next.exitCode).toBe(0);
+		expect(second.read(1)).toEqual({ start: 0, end: 4, data: Buffer.from("next"), open: false });
+		expect(first.read(1, 3)).toEqual({ start: 3, end: 7, data: Buffer.from("𝄞"), open: false });
+		expect(first.read(2)).toBeNull();
+	});
+});
+
+describe("normalizePtyDimensions", () => {
+	it("truncates and clamps the screen viewport to native PTY bounds", () => {
+		expect(normalizePtyDimensions(119.9, 39.9)).toEqual({ cols: 119, rows: 39 });
+		expect(normalizePtyDimensions(-50, 0)).toEqual({ cols: 20, rows: 5 });
+		expect(normalizePtyDimensions(1000, 1000)).toEqual({ cols: 400, rows: 200 });
 	});
 });
 
@@ -476,6 +514,31 @@ try {
 			}
 		});
 
+		it("caps matches at maxCountPerFile when the path is a single file", async () => {
+			// Regression: the cap reached only the directory walks, so naming one
+			// explicit file dropped it and a hot file returned the whole global
+			// budget.
+			const scopedDir = await fs.mkdtemp(path.join(os.tmpdir(), "natives-grep-cap-"));
+			try {
+				const hot = path.join(scopedDir, "hot.txt");
+				await fs.writeFile(hot, Array.from({ length: 50 }, (_, i) => `needle ${i}`).join("\n"));
+
+				const result = await grep({
+					pattern: "needle",
+					path: hot,
+					mode: GrepOutputMode.Content,
+					maxCount: 40,
+					maxCountPerFile: 5,
+				});
+
+				expect(result.matches).toHaveLength(5);
+				expect(result.limitReached).toBe(true);
+				expect(result.filesWithMatches).toBe(1);
+			} finally {
+				await fs.rm(scopedDir, { recursive: true, force: true });
+			}
+		});
+
 		it("streams matches through onMatches in bounded batches instead of returning them", async () => {
 			const scopedDir = await fs.mkdtemp(path.join(os.tmpdir(), "natives-grep-stream-"));
 			try {
@@ -691,18 +754,6 @@ try {
 			expect(result.totalMatches).toBe(4);
 		});
 
-		it("should invalidate scan cache when invalidateFsScanCache receives a relative path", async () => {
-			await glob({ pattern: "*.ts", path: testDir, cache: true });
-			const newFile = path.join(testDir, "newly-added.ts");
-			await fs.writeFile(newFile, "export const newer = true;\n");
-
-			const relativePath = path.relative(process.cwd(), newFile);
-			invalidateFsScanCache(relativePath);
-
-			const result = await glob({ pattern: "newly-added.ts", path: testDir, cache: true });
-			expect(result.matches.some(match => match.path === "newly-added.ts")).toBe(true);
-		});
-
 		it("should avoid scan work when maxResults is zero", async () => {
 			const result = await glob({
 				pattern: "**/*",
@@ -762,19 +813,6 @@ try {
 			} finally {
 				await fs.rm(scopedDir, { recursive: true, force: true });
 			}
-		});
-
-		it("should fast-recheck empty cached results when threshold is reached", async () => {
-			const fileName = "cache-empty-recheck-target.txt";
-			const filePath = path.join(testDir, fileName);
-			await fs.rm(filePath, { force: true });
-			invalidateFsScanCache();
-			const first = await glob({ pattern: fileName, path: testDir, hidden: true, gitignore: true, cache: true });
-			expect(first.totalMatches).toBe(0);
-			await fs.writeFile(filePath, "created after empty cached query\n");
-			await Bun.sleep(250);
-			const second = await glob({ pattern: fileName, path: testDir, hidden: true, gitignore: true, cache: true });
-			expect(second.totalMatches).toBe(1);
 		});
 	});
 
@@ -1132,6 +1170,42 @@ try {
 
 			expect(cleaned).toContain("Main content");
 			// Navigation/footer may or may not be removed depending on preprocessing
+		});
+
+		it("keeps collapsed sections only with hiddenContent reachable, never template content", async () => {
+			const html = `<main>
+<h2>Product information</h2>
+<button aria-expanded="false">Item details</button>
+<div style="display:none"><p>Country of Origin: India</p></div>
+<template><p>Template-only claim</p></template>
+</main>`;
+
+			const dropped = await htmlToMarkdown(html);
+			const reachable = await htmlToMarkdown(html, { hiddenContent: "reachable" });
+
+			expect(dropped).toContain("Product information");
+			expect(dropped).not.toContain("Country of Origin: India");
+			expect(reachable).toContain("Country of Origin: India");
+			expect(reachable).not.toContain("Template-only claim");
+		});
+
+		it("includes inert content only with hiddenContent all", async () => {
+			const html =
+				"<main><p>Visible text</p><template><p>Template text</p></template><noscript><p>Fallback text</p></noscript></main>";
+			for (const hiddenContent of ["drop", "reachable"]) {
+				const markdown = await htmlToMarkdown(html, { hiddenContent });
+				expect(markdown).toContain("Visible text");
+				expect(markdown).not.toContain("Template text");
+				expect(markdown).not.toContain("Fallback text");
+			}
+			const markdown = await htmlToMarkdown(html, { hiddenContent: "all" });
+			expect(markdown).toContain("Visible text");
+			expect(markdown).toContain("Template text");
+			expect(markdown).toContain("Fallback text");
+		});
+
+		it("rejects an unknown hiddenContent value", async () => {
+			expect(() => htmlToMarkdown("<p>text</p>", { hiddenContent: "visible" })).toThrow(/hiddenContent/);
 		});
 
 		it("should reject depth-truncated HTML", async () => {

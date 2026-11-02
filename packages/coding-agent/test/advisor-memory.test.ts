@@ -28,8 +28,8 @@ describe("advisor memory context", () => {
 		model = bundled;
 	});
 
-	afterAll(() => {
-		authStorage.close();
+	afterAll(async () => {
+		await authStorage.close();
 	});
 
 	let tempDir: TempDir;

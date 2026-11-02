@@ -19,10 +19,10 @@ exec hosts. Replaces cargo-xwin.
 - **No toolchains_llvm**: it wants to register full host cc toolchains, which
   risks shadowing the zig linux toolchains. Direct LLVM release fetch instead.
 - **Wrappers self-locate from `$0`** (execroot-relative sibling repos), so they
-  work from Bazel actions (cwd = execroot) *and* from build scripts, where
+  work from Bazel actions (cwd = execroot) _and_ from build scripts, where
   rules_rust `${pwd}`-expands `CC`/`AR` to absolute paths and cc-rs/cmake spawn
   tools from other cwds.
-- **CRT: static `/MT` for the shipped addon.** The toolchain *default* is
+- **CRT: static `/MT` for the shipped addon.** The toolchain _default_ is
   dynamic `/MD` (rules_cc's msvc branch default outside `dbg` without the
   `static_link_msvcrt` feature), matching what napi/cc-rs produced under
   cargo-xwin. But `//:natives-win32-x64-baseline` overrides to static CRT:
@@ -105,17 +105,17 @@ exec hosts. Replaces cargo-xwin.
   compiler/linker/rc/mt to the wrappers and selects the static release `/MT`
   runtime, matching the addon's static-CRT policy (issue #8439).
 
-## What to verify on can.internal (linux-x64)
+## What to verify on the Linux CI runners (linux-x64)
 
 1. `bazel build //:natives-win32-x64-baseline` end-to-end link; check the
    produced `pi_natives.win32-x64-baseline.node` imports (dumpbin/llvm-readobj):
    expect **no** `VCRUNTIME140.dll` and **no** `api-ms-win-crt-*` (static CRT);
    only core Windows system DLLs (kernel32, ntdll, advapi32, …) should remain.
 2. LLVM 20.1.7 Linux-X64 binaries are built on a newish Ubuntu: confirm the
-   kata runner image's glibc is ≥ 2.35-ish and has `libtinfo6`/`libstdc++6`
+   CI runner template's glibc is ≥ 2.35-ish and has `libtinfo6`/`libstdc++6`
    (usual LLVM release-binary runtime deps).
 3. `ninja` + `cmake` must be on the `opusic-sys` build-script PATH
-   (`/usr/local/bin:/usr/bin:/bin`) on the kata image.
+   (`/usr/local/bin:/usr/bin:/bin`) on the CI runner template.
 4. `opusic-sys` configure should report "Clang with MSVC-like command-line",
    take `toolchain.cmake`, and produce `opus.lib` with `/MT` objects.
 5. tree-sitter grammar compiles via cc-rs: wrapper is picked up as `CC`

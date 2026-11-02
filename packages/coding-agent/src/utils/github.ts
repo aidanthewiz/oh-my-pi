@@ -1,14 +1,16 @@
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
+import * as vcs from "@oh-my-pi/pi-natives/vcs";
 import { $which, isRecord } from "@oh-my-pi/pi-utils";
-import { REJECT_PROMPT_COMMAND } from "../exec/non-interactive-env";
-import { ToolAbortError, throwIfAborted } from "../tools/tool-errors";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
-
-/** Captured result of a completed `gh` invocation. */
-export interface GhCommandResult {
-	exitCode: number;
-	stdout: string;
-	stderr: string;
-}
+import {
+	captureForgeCliEnvironment,
+	FORGE_NON_INTERACTIVE_ENV,
+	type ForgeCliResult,
+	type ForgeCliSpec,
+	runForgeCli,
+} from "./forge-cli";
 
 /** Options shaping `gh` failure messages and output handling. */
 export interface GhCommandOptions {
@@ -16,45 +18,103 @@ export interface GhCommandOptions {
 	repoProvided?: boolean;
 	/** Trim captured output (default true). */
 	trimOutput?: boolean;
+	/** Credential environment captured by the initiating operation. */
+	env?: Readonly<Record<string, string | undefined>>;
 }
 
 /** Deadline for `gh` subprocesses spawned by the coding agent. */
 export const GH_COMMAND_TIMEOUT_MS = 5 * 60 * 1000;
 
-const GH_OUTPUT_LIMIT_BYTES = 8 * 1024 * 1024;
-const GH_TRUNCATED_MARKER = "\n[gh subprocess output truncated after 8 MiB]\n";
-const GH_NON_INTERACTIVE_ENV = {
-	...process.env,
-	GIT_ASKPASS: "true",
-	GIT_EDITOR: "true",
-	GIT_TERMINAL_PROMPT: "0",
-	LC_ALL: undefined,
-	LC_MESSAGES: "C",
-	SSH_ASKPASS: REJECT_PROMPT_COMMAND,
-	GH_PROMPT_DISABLED: "1",
+const GH_SPEC: ForgeCliSpec = {
+	bin: "gh",
+	displayName: "GitHub CLI",
+	installMessage: "GitHub CLI (gh) is not installed. Install it from https://cli.github.com/.",
+	env: {
+		...FORGE_NON_INTERACTIVE_ENV,
+		GH_PROMPT_DISABLED: "1",
+		GH_TELEMETRY: "false",
+		GH_DEBUG: undefined,
+		DEBUG: undefined,
+		DO_NOT_TRACK: "1",
+		GH_NO_UPDATE_NOTIFIER: "1",
+		GH_NO_EXTENSION_UPDATE_NOTIFIER: "1",
+	},
+	timeoutMs: GH_COMMAND_TIMEOUT_MS,
 };
 
-async function readCappedText(stream: ReadableStream<Uint8Array>): Promise<string> {
-	const reader = stream.getReader();
-	const chunks: Uint8Array[] = [];
-	let captured = 0;
-	let total = 0;
-	try {
-		while (true) {
-			const { done, value } = await reader.read();
-			if (done) break;
-			total += value.byteLength;
-			if (captured < GH_OUTPUT_LIMIT_BYTES) {
-				const take = Math.min(value.byteLength, GH_OUTPUT_LIMIT_BYTES - captured);
-				if (take > 0) chunks.push(value.subarray(0, take));
-				captured += take;
+/** Global credential file selected by the same environment passed to gh. */
+export function getGithubConfigPath(env: Readonly<Record<string, string | undefined>> = process.env): string {
+	const home = env.HOME || env.USERPROFILE || os.homedir();
+	const directory =
+		env.GH_CONFIG_DIR ||
+		(env.XDG_CONFIG_HOME
+			? path.join(env.XDG_CONFIG_HOME, "gh")
+			: process.platform === "win32" && (env.AppData || env.APPDATA)
+				? path.join((env.AppData || env.APPDATA)!, "GitHub CLI")
+				: path.join(home, ".config", "gh"));
+	return path.join(directory, "hosts.yml");
+}
+
+async function assertGithubEnterpriseHosts(
+	cwd: string,
+	args: readonly string[],
+	env: Readonly<Record<string, string | undefined>>,
+	signal?: AbortSignal,
+): Promise<void> {
+	if (!env.GH_ENTERPRISE_TOKEN && !env.GITHUB_ENTERPRISE_TOKEN) return;
+	const candidates = new Set<string>();
+	const addTarget = (value: string, repository = false) => {
+		if (value.includes("://")) candidates.add(new URL(value).host.toLowerCase());
+		else if (repository && value.split("/").length > 2) candidates.add(value.split("/")[0]!.toLowerCase());
+		else if (!repository) candidates.add(value.toLowerCase());
+	};
+	let explicit = false;
+	for (let i = 0; i < args.length; i++) {
+		const arg = args[i]!;
+		if (arg === "--hostname" || arg === "--repo" || arg === "-R") {
+			const value = args[++i];
+			if (value) addTarget(value, arg !== "--hostname");
+			explicit = true;
+		} else if (arg.startsWith("--hostname=") || arg.startsWith("--repo=")) {
+			addTarget(arg.slice(arg.indexOf("=") + 1), arg.startsWith("--repo="));
+			explicit = true;
+		} else if ((i === 1 || i === 2) && /^https?:\/\//.test(arg)) {
+			addTarget(arg);
+			explicit = true;
+		}
+	}
+	if (!explicit && env.GH_REPO) {
+		addTarget(env.GH_REPO, true);
+		explicit = true;
+	}
+	if (!explicit && args[0] !== "api") {
+		const repo = vcs.git(cwd);
+		if (repo) {
+			for (const remote of await repo.remoteList(signal)) {
+				const value = await repo.remoteUrl(remote, signal);
+				if (!value) continue;
+				const scp = /^(?:[^/@:]+@)?([^/:]+):/.exec(value);
+				if (value.includes("://")) addTarget(value);
+				else if (scp) candidates.add(scp[1]!.toLowerCase());
 			}
 		}
-	} finally {
-		reader.releaseLock();
 	}
-	const text = Buffer.concat(chunks).toString("utf8");
-	return total > GH_OUTPUT_LIMIT_BYTES ? `${text}${GH_TRUNCATED_MARKER}` : text;
+	if (candidates.size === 0) candidates.add((env.GH_HOST || "github.com").toLowerCase());
+	const trusted = new Set(["github.com"]);
+	if (env.GH_HOST)
+		trusted.add(new URL(env.GH_HOST.includes("://") ? env.GH_HOST : `https://${env.GH_HOST}`).host.toLowerCase());
+	if ([...candidates].every(host => trusted.has(host) || host.endsWith(".ghe.com"))) return;
+	try {
+		const config = Bun.YAML.parse(await fs.readFile(getGithubConfigPath(env), "utf8")) as unknown;
+		if (isRecord(config)) for (const host of Object.keys(config)) trusted.add(host.toLowerCase());
+	} catch {}
+	for (const host of candidates) {
+		if (!trusted.has(host) && !host.endsWith(".ghe.com")) {
+			throw new ToolError(
+				`Refusing to send GitHub enterprise token environment variables to unconfigured host ${host}. Configure GH_HOST or authenticate that host with gh auth login.`,
+			);
+		}
+	}
 }
 
 function formatGhFailure(args: readonly string[], stdout: string, stderr: string, options?: GhCommandOptions): string {
@@ -130,43 +190,10 @@ export const github = {
 	},
 
 	/** Run a raw `gh` CLI command. Does not throw on non-zero exit. */
-	async run(cwd: string, args: string[], signal?: AbortSignal, options?: GhCommandOptions): Promise<GhCommandResult> {
-		throwIfAborted(signal);
-		if (!$which("gh")) {
-			throw new ToolError("GitHub CLI (gh) is not installed. Install it from https://cli.github.com/.");
-		}
-		const timeoutSignal = AbortSignal.timeout(GH_COMMAND_TIMEOUT_MS);
-		const combinedSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
-		try {
-			const child = Bun.spawn(["gh", ...args], {
-				cwd,
-				env: GH_NON_INTERACTIVE_ENV,
-				stdin: "ignore",
-				stdout: "pipe",
-				stderr: "pipe",
-				windowsHide: true,
-				signal: combinedSignal,
-			});
-			if (!(child.stdout instanceof ReadableStream) || !(child.stderr instanceof ReadableStream)) {
-				throw new ToolError("Failed to capture GitHub CLI output.");
-			}
-			const [stdout, stderr, exitCode] = await Promise.all([
-				readCappedText(child.stdout),
-				readCappedText(child.stderr),
-				child.exited,
-			]);
-			throwIfAborted(signal);
-			const trim = options?.trimOutput !== false;
-			return {
-				exitCode: exitCode ?? 0,
-				stdout: trim ? stdout.trim() : stdout,
-				stderr: trim ? stderr.trim() : stderr,
-			};
-		} catch (error) {
-			if (signal?.aborted) throw new ToolAbortError();
-			if (timeoutSignal.aborted) throw new ToolError(`GitHub CLI command timed out: gh ${args.join(" ")}`);
-			throw error;
-		}
+	async run(cwd: string, args: string[], signal?: AbortSignal, options?: GhCommandOptions): Promise<ForgeCliResult> {
+		const env = options?.env ?? captureForgeCliEnvironment(cwd, "gh");
+		await assertGithubEnterpriseHosts(cwd, args, env, signal);
+		return runForgeCli(GH_SPEC, cwd, args, signal, options?.trimOutput !== false, env);
 	},
 
 	/** Run `gh` and parse stdout as JSON. Throws on non-zero exit or invalid JSON. */

@@ -24,7 +24,7 @@ describe("AgentSession idle custom message render", () => {
 
 	afterEach(async () => {
 		await session?.dispose();
-		authStorage.close();
+		await authStorage.close();
 		tempDir.removeSync();
 	});
 

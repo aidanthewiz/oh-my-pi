@@ -13,7 +13,6 @@ import {
 	FileSessionStorage,
 	SessionLockError,
 	SessionWriteConflictError,
-	type WriteTextAtomicOptions,
 } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { type SessionTitleUpdate, serializeTitleSlot } from "@oh-my-pi/pi-coding-agent/session/session-title-slot";
 
@@ -105,7 +104,7 @@ describe("FileSessionStorage writer", () => {
 	let storage: FileSessionStorage;
 
 	beforeEach(async () => {
-		tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), "omp-session-writer-"));
+		tempDir = await fsp.realpath(await fsp.mkdtemp(path.join(os.tmpdir(), "omp-session-writer-")));
 		storage = new FileSessionStorage();
 	});
 
@@ -356,7 +355,7 @@ describe("FileSessionStorage.writeTextSync", () => {
 	let tempDir: string;
 
 	beforeEach(async () => {
-		tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), "omp-session-storage-"));
+		tempDir = await fsp.realpath(await fsp.mkdtemp(path.join(os.tmpdir(), "omp-session-storage-")));
 	});
 
 	afterEach(async () => {
@@ -393,6 +392,7 @@ describe("FileSessionStorage.writeTextSync", () => {
 		});
 		try {
 			storage.writeTextSync(sessionPath, "replacement snapshot\n");
+			expect(failed).toBe(true);
 			expect(fs.readFileSync(reader, "utf8")).toBe("original snapshot\n");
 			expect(fs.statSync(sessionPath).ino).not.toBe(original.ino);
 			expect(await Bun.file(sessionPath).text()).toBe("replacement snapshot\n");
@@ -603,28 +603,6 @@ describe("FileSessionStorage line streaming", () => {
 		);
 		expect(fs.readdirSync(tempDir).filter(name => name.endsWith(".tmp"))).toEqual([]);
 	});
-
-	it("routes streamed rewrites through overridden text writers", async () => {
-		const seen: string[] = [];
-		class InterceptingStorage extends FileSessionStorage {
-			override writeTextSync(fpath: string, content: string): void {
-				seen.push(`sync:${content}`);
-				super.writeTextSync(fpath, content);
-			}
-			override async writeTextAtomic(fpath: string, content: string, options?: WriteTextAtomicOptions) {
-				seen.push(`atomic:${content}`);
-				await super.writeTextAtomic(fpath, content, options);
-			}
-		}
-		const storage = new InterceptingStorage();
-		const sessionPath = path.join(tempDir, "session.jsonl");
-
-		storage.writeLinesSync(sessionPath, ["a\n", "b\n"]);
-		await storage.writeLinesAtomic(sessionPath, ["c\n", "d\n"]);
-
-		expect(seen).toEqual(["sync:a\nb\n", "atomic:c\nd\n"]);
-		expect(fs.readFileSync(sessionPath, "utf8")).toBe("c\nd\n");
-	});
 });
 
 describe("FileSessionStorage.updateSessionTitle", () => {
@@ -721,6 +699,7 @@ it("reads transcript and title metadata from one committed indexed snapshot afte
 	});
 	expect(await storage.readCommittedState(sessionPath)).toEqual({
 		content: newRaw,
+		rawContent: newRaw,
 		titleMeta: JSON.stringify(newTitle),
 	});
 });

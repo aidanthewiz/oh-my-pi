@@ -2106,6 +2106,73 @@ describe("Tool argument coercion", () => {
 		expect(result.op).toBe("fix");
 	});
 
+	it("keeps unknown root keys a closed schema would drop only when keepUnknownRootKeys is set", () => {
+		// Regression (#16317): a lenient tool (yield) lost root fields the model sent beside
+		// `data` because the unrecognized-key repair deleted them and validation then passed.
+		const tool: Tool = {
+			name: "t-keep-root",
+			description: "",
+			parameters: {
+				type: "object",
+				properties: {
+					count: { type: "number" },
+					nested: { type: "object", properties: { inner: { type: "string" } }, additionalProperties: false },
+				},
+				additionalProperties: false,
+			},
+		};
+		const toolCall: ToolCall = {
+			type: "toolCall",
+			id: "call-keep-root",
+			name: "t-keep-root",
+			arguments: { count: "3", nested: { inner: "v", stray: 1 }, findings: ["a", "b"] },
+		};
+
+		expect(validateToolArguments(tool, toolCall)).toEqual({ count: 3, nested: { inner: "v" } });
+		// Root extra survives; nested extras and type repairs still apply.
+		expect(validateToolArguments(tool, toolCall, { keepUnknownRootKeys: true })).toEqual({
+			count: 3,
+			nested: { inner: "v" },
+			findings: ["a", "b"],
+		});
+
+		// Names that shadow Object.prototype come back as own fields, never as a prototype swap.
+		const special = JSON.parse('{"count":1,"constructor":"c","__proto__":{"polluted":true}}') as Record<
+			string,
+			unknown
+		>;
+		const kept = validateToolArguments(
+			tool,
+			{ ...toolCall, arguments: special },
+			{ keepUnknownRootKeys: true },
+		) as Record<string, unknown>;
+		expect(Object.getOwnPropertyDescriptor(kept, "constructor")?.value).toBe("c");
+		expect(Object.hasOwn(kept, "__proto__")).toBe(true);
+		expect(Object.getPrototypeOf(kept)).toBe(Object.prototype);
+		expect("polluted" in kept).toBe(false);
+	});
+
+	it("coerces own prototype-named fields without treating inherited names as arguments", () => {
+		const tool: Tool = {
+			name: "prototype-fields",
+			description: "",
+			parameters: JSON.parse(
+				'{"type":"object","properties":{"__proto__":{"type":"number"},"constructor":{"type":"number"}},"required":["__proto__","constructor"],"additionalProperties":false}',
+			),
+		};
+		const call: ToolCall = {
+			type: "toolCall",
+			id: "prototype-fields",
+			name: tool.name,
+			arguments: JSON.parse('{"__proto__":"2","constructor":"3"}'),
+		};
+		const result = validateToolArguments(tool, call) as Record<string, unknown>;
+		expect(Object.getOwnPropertyDescriptor(result, "__proto__")?.value).toBe(2);
+		expect(Object.getOwnPropertyDescriptor(result, "constructor")?.value).toBe(3);
+		expect(Object.getPrototypeOf(result)).toBe(Object.prototype);
+		expect(() => validateToolArguments(tool, { ...call, arguments: {} })).toThrow();
+	});
+
 	describe("string|array union (regression: #1788)", () => {
 		// `search` and `gh` tools declare `paths`/`pr` as `union(string, array<string>)`
 		// so the LLM can pass a single path or many. Some providers (Z.AI / GLM)
@@ -2455,6 +2522,28 @@ describe("Tool argument coercion", () => {
 					arguments: { other: 123 },
 				}),
 			).toThrow();
+		});
+
+		it("rejects an ambiguous two-string payload identically in either key order", () => {
+			const tool: Tool = {
+				name: "delete_this_file",
+				description: "",
+				parameters: type({ path: type("string") }),
+			};
+			const orders: Record<string, unknown>[] = [
+				{ alpha: "A.txt", beta: "B.txt" },
+				{ beta: "B.txt", alpha: "A.txt" },
+			];
+			for (const args of orders) {
+				expect(() =>
+					validateToolArguments(tool, {
+						type: "toolCall",
+						id: "c-amb",
+						name: "delete_this_file",
+						arguments: args,
+					}),
+				).toThrow();
+			}
 		});
 	});
 });

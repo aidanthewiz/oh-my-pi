@@ -61,8 +61,8 @@ describe("createAgentSession MCP deferral (B1)", () => {
 		);
 	});
 
-	afterAll(() => {
-		authStorage.close();
+	afterAll(async () => {
+		await authStorage.close();
 	});
 
 	beforeEach(() => {
@@ -240,7 +240,7 @@ describe("createAgentSession MCP catalog handoff", () => {
 				expect(session.getToolByName("mcp__fund_probe")?.description).toBe(expected);
 			} finally {
 				await session.dispose();
-				authStorage.close();
+				await authStorage.close();
 			}
 		},
 		20_000,

@@ -48,7 +48,7 @@ import {
 
 const DEFAULT_MODEL = "openai-codex/gpt-5.6-luna";
 /** Tried in order after the primary model fails (quota exhaustion, auth, hard API errors). */
-const FALLBACK_MODELS = [];
+const FALLBACK_MODELS: readonly string[] = [];
 
 // --------------------------------------------------------------------------
 // Prompts
@@ -115,7 +115,7 @@ async function openModel(modelSpec: string): Promise<RewriteModel> {
 	} finally {
 		// Broker-backed storage runs a background SSE/long-poll loop that keeps
 		// the event loop alive; release it once the key is captured.
-		storage.close();
+		await storage.close();
 	}
 }
 

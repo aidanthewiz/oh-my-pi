@@ -91,7 +91,7 @@ describe("#emit listener isolation", () => {
 
 		afterEach(async () => {
 			await session.dispose();
-			authStorage?.close();
+			await authStorage?.close();
 			authStorage = undefined;
 			if (fs.existsSync(tempDir)) {
 				try {

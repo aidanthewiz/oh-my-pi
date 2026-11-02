@@ -55,8 +55,8 @@ describe("model presets", () => {
 		for (const dir of tempDirs.splice(0)) dir.removeSync();
 	});
 
-	afterAll(() => {
-		authStorage.close();
+	afterAll(async () => {
+		await authStorage.close();
 		fixtureDir.removeSync();
 	});
 

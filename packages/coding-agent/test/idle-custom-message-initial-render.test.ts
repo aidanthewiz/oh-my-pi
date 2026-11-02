@@ -47,7 +47,7 @@ beforeEach(async () => {
 afterEach(async () => {
 	await session?.dispose();
 	session = undefined;
-	authStorage.close();
+	await authStorage.close();
 	tempDir.removeSync();
 });
 

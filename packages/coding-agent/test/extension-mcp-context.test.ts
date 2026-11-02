@@ -1,12 +1,14 @@
+import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import * as path from "node:path";
+import { SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { ExtensionFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { connectToServer, disconnectServer, listTools } from "@oh-my-pi/pi-coding-agent/mcp/client";
 import { MCPManager } from "@oh-my-pi/pi-coding-agent/mcp/manager";
 import { dispatchMCPTool } from "@oh-my-pi/pi-coding-agent/mcp/tool-bridge";
-import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
+import { AgentRegistry, createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
@@ -21,6 +23,7 @@ async function fixture(label = "tenant-a", toolsGate?: Promise<void>) {
 	let failCalls = 0;
 	let protocolError = false;
 	let connectionCount = 0;
+	let nextInitialization: { entered: () => void; wait: Promise<void> } | undefined;
 	const calls: Array<{ name: string; arguments?: Record<string, unknown> }> = [];
 	const initialized = Promise.withResolvers<void>();
 	const server = Bun.serve({
@@ -37,6 +40,10 @@ async function fixture(label = "tenant-a", toolsGate?: Promise<void>) {
 			let result: unknown;
 			if (rpc.method === "initialize") {
 				connectionCount++;
+				const held = nextInitialization;
+				nextInitialization = undefined;
+				held?.entered();
+				if (held) await held.wait;
 				initialized.resolve();
 				result = {
 					protocolVersion: "2025-11-25",
@@ -99,6 +106,11 @@ async function fixture(label = "tenant-a", toolsGate?: Promise<void>) {
 		protocolFailure: () => {
 			protocolError = true;
 		},
+		holdNextInitialization(wait: Promise<void>) {
+			const entered = Promise.withResolvers<void>();
+			nextInitialization = { entered: entered.resolve, wait };
+			return entered.promise;
+		},
 	};
 }
 
@@ -106,6 +118,7 @@ async function session(
 	manager?: MCPManager,
 	extension?: ExtensionFactory,
 	settings = Settings.isolated(),
+	agentRegistry = new AgentRegistry(),
 ): Promise<AgentSession> {
 	const dir = TempDir.createSync("extension-mcp-");
 	cleanup.push(() => dir.removeSync());
@@ -117,6 +130,7 @@ async function session(
 		authStorage,
 		modelRegistry: new ModelRegistry(authStorage, path.join(dir.path(), "models.yml")),
 		settings,
+		agentRegistry,
 		sessionManager: SessionManager.inMemory(),
 		disableExtensionDiscovery: true,
 		extensions: extension ? [extension] : [],
@@ -134,6 +148,23 @@ async function session(
 	});
 	cleanup.push(() => created.session.dispose());
 	return created.session;
+}
+
+async function pinSyntheticAccount(s: AgentSession): Promise<void> {
+	const auth = s.modelRegistry.authStorage;
+	await auth.credentials.set("synthetic-owner", [
+		{
+			type: "oauth",
+			access: "synthetic-access",
+			refresh: "synthetic-refresh",
+			expires: Date.now() + 60_000,
+			accountId: "synthetic-owner-b",
+		},
+	]);
+	const [account] = auth.oauth.accounts("synthetic-owner", s.sessionId);
+	if (!account || !auth.sessions.pin("synthetic-owner", s.sessionId, account.credentialId)) {
+		throw new Error("Synthetic account could not become active");
+	}
 }
 
 describe("session-owned extension MCP", () => {
@@ -246,6 +277,107 @@ describe("session-owned extension MCP", () => {
 		await expect(disabled.extensionRunner!.createContext().mcp!.callTool("minions", "create_task")).rejects.toThrow(
 			"disabled",
 		);
+	});
+
+	it("rejects a retained context when another session replaces its registry owner", async () => {
+		const a = await fixture("tenant-a");
+		const b = await fixture("tenant-b");
+		const registry = new AgentRegistry();
+		const first = await session(a.manager, undefined, Settings.isolated(), registry);
+		const mcp = first.extensionRunner!.createContext().mcp!;
+		await session(b.manager, undefined, Settings.isolated(), registry);
+		await expect(mcp.callTool("minions", "create_task")).rejects.toThrow("owner changed");
+		expect(a.calls).toEqual([]);
+		expect(b.calls).toEqual([]);
+	});
+
+	it("rejects a retained context after its session is disposed", async () => {
+		const f = await fixture();
+		const s = await session(f.manager);
+		const mcp = s.extensionRunner!.createContext().mcp!;
+		await s.dispose();
+		await expect(mcp.callTool("minions", "create_task")).rejects.toThrow("owner changed");
+		expect(f.calls).toEqual([]);
+	});
+
+	it("does not dispatch after a new provider account becomes active during a policy hook", async () => {
+		const f = await fixture();
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const s = await session(f.manager, pi => {
+			pi.on("tool_call", async event => {
+				if (event.mcpServerName !== "minions") return;
+				entered.resolve();
+				await release.promise;
+			});
+		});
+		const pending = s.extensionRunner!.createContext().mcp!.callTool("minions", "create_task");
+		const outcome = pending.catch(error => error);
+		await entered.promise;
+		try {
+			await pinSyntheticAccount(s);
+		} finally {
+			release.resolve();
+		}
+		expect(await outcome).toMatchObject({ message: "MCP call owner changed" });
+		expect(f.calls).toEqual([]);
+	});
+
+	it("does not dispatch under a credential source adopted while discovery is pending", async () => {
+		const gate = Promise.withResolvers<void>();
+		const f = await fixture("tenant-a", gate.promise);
+		const s = await session(f.manager);
+		const waiting = Promise.withResolvers<void>();
+		const waitForConnection = f.manager.waitForConnection.bind(f.manager);
+		const observeWait = spyOn(f.manager, "waitForConnection").mockImplementation((...args) => {
+			waiting.resolve();
+			return waitForConnection(...args);
+		});
+		cleanup.push(() => observeWait.mockRestore());
+		const pending = s.extensionRunner!.createContext().mcp!.callTool("minions", "create_task");
+		const outcome = pending.catch(error => error);
+		await waiting.promise;
+		try {
+			await s.modelRegistry.authStorage.replaceStore(new SqliteAuthCredentialStore(new Database(":memory:")), {
+				sourceIdentity: "synthetic-replacement-source",
+			});
+		} finally {
+			gate.resolve();
+		}
+		expect(await outcome).toMatchObject({ message: "MCP call owner changed" });
+		await f.loading;
+		expect(f.calls).toEqual([]);
+	});
+
+	it("does not dispatch after an account changes while a closed connection is reconnecting", async () => {
+		const f = await fixture();
+		const s = await session(f.manager);
+		await f.manager.getConnection("minions")!.transport.close();
+		const gate = Promise.withResolvers<void>();
+		const reconnecting = f.holdNextInitialization(gate.promise);
+		const pending = s.extensionRunner!.createContext().mcp!.callTool("minions", "create_task");
+		const outcome = pending.catch(error => error);
+		await reconnecting;
+		try {
+			await pinSyntheticAccount(s);
+		} finally {
+			gate.resolve();
+		}
+		expect(await outcome).toMatchObject({ message: "MCP call owner changed" });
+		expect(f.calls).toEqual([]);
+	});
+
+	it("withholds results when a result hook changes the active account without repeating the mutation", async () => {
+		const f = await fixture();
+		const s = await session(f.manager, pi => {
+			pi.on("tool_result", async event => {
+				if (event.mcpServerName === "minions") await pinSyntheticAccount(s);
+			});
+		});
+		await expect(
+			s.extensionRunner!.createContext().mcp!.callTool("minions", "create_task", {}, { retry: "never" }),
+		).rejects.toThrow("owner changed");
+		expect(f.calls).toEqual([{ name: "create_task", arguments: {} }]);
 	});
 
 	for (const policy of ["deny", "prompt"] as const) {

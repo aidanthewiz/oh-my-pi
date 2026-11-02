@@ -465,6 +465,49 @@ describe("SessionManager cross-process rewrite freshness", () => {
 		await reopened.close();
 	});
 
+	it("recovers a foreign append through a symlinked session directory", async () => {
+		using tempDir = TempDir.createSync("@omp-session-recovery-alias-");
+		const directory = path.join(tempDir.path(), "sessions");
+		const aliasDirectory = path.join(tempDir.path(), "alias");
+		await fs.mkdir(directory);
+		await fs.symlink(directory, aliasDirectory, process.platform === "win32" ? "junction" : "dir");
+		const creator = SessionManager.create(directory, directory, new FileSessionStorage());
+		await creator.ensureOnDisk();
+		creator.appendMessage(userTurn("our active turn"));
+		const referent = creator.getSessionFile();
+		if (!referent) throw new Error("Expected session file");
+		await creator.close();
+
+		const alias = path.join(aliasDirectory, path.basename(referent));
+		const theirs = await SessionManager.open(referent, directory, new FileSessionStorage(), {
+			suppressBreadcrumb: true,
+		});
+		const ours = await SessionManager.open(alias, aliasDirectory, new FileSessionStorage(), {
+			suppressBreadcrumb: true,
+		});
+		try {
+			theirs.appendMessage(userTurn("foreign turn"));
+			await theirs.close();
+			await ours.rewriteEntries();
+			expect(ours.getSessionFile()).toBe(alias);
+			ours.appendMessage(userTurn("after recovery"));
+			await ours.close();
+
+			const reopened = await SessionManager.open(referent, directory, new FileSessionStorage(), {
+				suppressBreadcrumb: true,
+			});
+			try {
+				expect(userTurnsOf(reopened.getEntries())).toEqual(["our active turn", "foreign turn", "after recovery"]);
+				expect(userTurnsOf(reopened.getBranch())).toEqual(["our active turn", "after recovery"]);
+			} finally {
+				await reopened.close();
+			}
+		} finally {
+			await theirs.close();
+			await ours.close();
+		}
+	});
+
 	it("restores its selected branch after adopting a foreign turn without another local append", async () => {
 		using tempDir = TempDir.createSync("@omp-session-recovery-leaf-");
 		const creator = SessionManager.create(tempDir.path(), tempDir.path(), new FileSessionStorage());

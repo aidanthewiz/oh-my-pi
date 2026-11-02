@@ -26,7 +26,7 @@ import {
 	setContextHistoryIndex,
 } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import type { KeyId } from "@oh-my-pi/pi-tui";
-import { logger } from "@oh-my-pi/pi-utils";
+import { logger, untilAborted } from "@oh-my-pi/pi-utils";
 import type { AgentLifecycleState } from "@oh-my-pi/pi-wire";
 import { refreshShellConfigCache } from "@oh-my-pi/pi-utils/procmgr";
 import { MAIN_AGENT_RULE_NAME } from "../../capability/rule";
@@ -44,11 +44,14 @@ import type { BranchHandler, NavigateTreeHandler, NewSessionHandler } from "../s
 import { accumulateToolCallResult, buildAggregatedToolCallResult } from "../shared-events";
 import { ManagedTimers } from "./managed-timers";
 import { createExtensionModelQuery } from "./model-api";
+import { trackUserWaits, type UserWaitTracker } from "./user-wait";
 import type { ComposerShapeDefinition } from "@oh-my-pi/pi-tui/overlays/composer-shape-registry";
+import { extensionLinkClicksAvailable } from "@oh-my-pi/pi-tui/render/extension-links";
 import type {
 	AfterProviderResponseEvent,
 	AssistantMessageRewriteEvent,
 	AssistantMessageRewriteResult,
+	AssistantTextRenderer,
 	AssistantThinkingRenderer,
 	BeforeAgentStartEvent,
 	BeforeAgentStartEventResult,
@@ -82,6 +85,7 @@ import type {
 	CacheWarmingAction,
 	CacheWarmingDecisionEvent,
 	CacheWarmingDecisionEventResult,
+	LinkActivateEvent,
 	McpNotificationEvent,
 	MessageRenderer,
 	RegisteredCommand,
@@ -106,7 +110,7 @@ import type {
 	UserPythonEventResult,
 } from "./types";
 
-import { cfgExtensionHandlersToolCallTimeoutMs } from "../settings";
+import { cfgExtensionAssistantTextRenderers, cfgExtensionHandlersToolCallTimeoutMs } from "../settings";
 
 /** Combined result from all before_agent_start handlers */
 interface BeforeAgentStartCombinedResult {
@@ -479,6 +483,10 @@ const noOpUIContext: ExtensionUIContext = {
 	input: async (_title, _placeholder, _dialogOptions) => undefined,
 	notify: () => {},
 	onTerminalInput: () => () => {},
+	rerenderMessage: () => {},
+	// A subagent's runner has no UI of its own, yet its links are picked from the interactive screen
+	// while its transcript is focused: answer as the interactive UI does.
+	getLinkClicksAvailable: extensionLinkClicksAvailable,
 	setStatus: () => {},
 	setWorkingMessage: () => {},
 	setWidget: () => {},
@@ -492,6 +500,7 @@ const noOpUIContext: ExtensionUIContext = {
 	editor: async () => undefined,
 	addAutocompleteProvider: () => {},
 	setEditorComponent: () => {},
+	getEditorComponent: () => undefined,
 	get theme() {
 		return theme;
 	},
@@ -531,6 +540,9 @@ export class ExtensionRunner {
 	};
 	#mode: ExtensionMode = "print";
 	#toolApprovalPreviewWaiter?: (toolCallId: string) => Promise<void>;
+	/** Grant keys (see `sessionApprovalScope`) approved "for this session", each prefixed by the session it covers. */
+	#sessionApprovals = new Set<string>();
+	#trackUserWait?: UserWaitTracker;
 	#errorListeners: Set<ExtensionErrorListener> = new Set();
 	#getModel: () => Model | undefined = () => undefined;
 	#isIdleFn: () => boolean = () => true;
@@ -542,6 +554,7 @@ export class ExtensionRunner {
 	#compactFn: (instructionsOrOptions?: string | CompactOptions) => Promise<void> = async () => {};
 	#getSystemPromptFn: () => string[] = () => [];
 	#runEphemeralTurnFn?: ExtensionContextActions["runEphemeralTurn"];
+	#startLiveFn?: ExtensionContextActions["startLive"];
 	#ephemeralTurnBlocker = new AsyncLocalStorage<string | undefined>();
 	#getAsyncJobSnapshotFn: () => AsyncJobSnapshot | null = () => null;
 	#newSessionHandler: NewSessionHandler = async () => ({ cancelled: false });
@@ -553,15 +566,30 @@ export class ExtensionRunner {
 	#resolvePlanReviewFn: NonNullable<ExtensionContextActions["resolvePlanReview"]> = () => false;
 	#getPendingPlanReviewFn: NonNullable<ExtensionContextActions["getPendingPlanReview"]> = () => undefined;
 	#openPlanReviewFn: NonNullable<ExtensionContextActions["openPlanReview"]> = async () => false;
+	#sessionModes?: ExtensionContextActions["sessionModes"];
 	#getMemoryFn?: () => MemoryRuntimeContext | undefined;
 	#createAnnotations?: ExtensionAnnotationsFactory;
 	#commandDiagnostics: Array<{ type: string; message: string; path: string }> = [];
+	/** Link schemes already reported as claimed by more than one extension. */
+	#warnedLinkSchemes = new Set<string>();
 	#toolRegistrationScope = new AsyncLocalStorage<ToolRegistrationScope>();
 	#toolRegistrationBarrier: Promise<void> | undefined;
+	/** Registration ownership and provenance follow the exact executable registry entry. */
+	readonly toolRegistrations = new WeakMap<AgentTool, RegisteredTool>();
 	#initialized = false;
-	/** Full load order, captured on the first {@link setSuspendedExtensions} call. */
+	/** Stable append-only load order, including inactive owners. */
 	#loadOrder: Extension[] | undefined;
 	#suspendedExtensions = new Set<Extension>();
+	/** Per-extension listener factories from {@link onToolRegistered}, applied to late-added extensions too. */
+	#toolRegistrationSubscribers = new Set<(extension: Extension) => ToolRegistrationListener>();
+	/** Latest `session_start` broadcast, replayed to extensions added afterwards. */
+	#sessionStartEvent: RunnerEmitEvent | undefined;
+	#fileFallbackGeneration = 0;
+	#sessionStartDelivered = new WeakMap<Extension, RunnerEmitEvent>();
+	/** Notified after {@link setSuspendedExtensions} suspends or resumes any extension. */
+	#suspensionListeners = new Set<() => void>();
+	/** Main runner whose suspensions this runner's drawing follows; see {@link followSuspension}. */
+	#suspensionParent: ExtensionRunner | undefined;
 	/**
 	 * Buffer for `credential_disabled` events received via {@link emitCredentialDisabled}
 	 * before {@link initialize} has run. Drained through {@link emit} once initialize sets
@@ -704,6 +732,11 @@ export class ExtensionRunner {
 	/** Whether a native built-in of `name` is available to delegate to. */
 	hasNativeTool(name: string): boolean {
 		return this.#nativeToolResolver?.(name) !== undefined;
+	}
+
+	/** Guidance a same-name replacement inherits from the native `name` tool it can delegate to. */
+	getNativeDelegationGuidance(name: string): string {
+		return this.#nativeToolResolver?.(name)?.tool.delegationGuidance ?? "";
 	}
 
 	/**
@@ -850,10 +883,13 @@ export class ExtensionRunner {
 		if (contextActions.resolvePlanReview) this.#resolvePlanReviewFn = contextActions.resolvePlanReview;
 		if (contextActions.getPendingPlanReview) this.#getPendingPlanReviewFn = contextActions.getPendingPlanReview;
 		if (contextActions.openPlanReview) this.#openPlanReviewFn = contextActions.openPlanReview;
+		// Assigned unconditionally: a headless rebind must not inherit a previous host's controls.
+		this.#sessionModes = contextActions.sessionModes;
 		this.#getContextUsageFn = contextActions.getContextUsage;
 		this.#compactFn = contextActions.compact;
 		this.#getSystemPromptFn = contextActions.getSystemPrompt;
 		this.#runEphemeralTurnFn = contextActions.runEphemeralTurn;
+		this.#startLiveFn = contextActions.startLive;
 
 		// Command context actions (optional, only for interactive mode)
 		if (commandContextActions) {
@@ -867,7 +903,10 @@ export class ExtensionRunner {
 			this.#compactFn = commandContextActions.compact;
 		}
 
-		this.#uiContext = uiContext ?? noOpUIContext;
+		this.#uiContext =
+			uiContext && this.#trackUserWait
+				? trackUserWaits(uiContext, this.#trackUserWait)
+				: (uiContext ?? noOpUIContext);
 		this.#mode = mode;
 		this.#initialized = true;
 
@@ -876,72 +915,7 @@ export class ExtensionRunner {
 		// installing this one's trampolines.
 		this.disposeFileFallbacks();
 		// Suspended extensions keep a (gated) trampoline so resuming them needs no rewire.
-		for (const ext of this.getLoadedExtensions()) {
-			// Nothing registered by this extension means no trampoline, so a host with
-			// no fallback-registering extension leaves the seam genuinely empty and
-			// `hasFileWriteFallback()`/`hasFileDeleteFallback()` false — the invariant
-			// the whole feature rests on. Each seam is checked separately, so an
-			// extension that only brokers writes never appears in the delete registry.
-			if (ext.fileWriteFallbackHandlers.length === 0 && ext.fileDeleteFallbackHandlers.length === 0) continue;
-			// One trampoline per extension per seam, not per handler: the list is walked
-			// at mutation time so a handler this extension adds later still takes effect,
-			// and `createContext()` takes no extension argument, so within one invocation
-			// a single context is all any of this extension's handlers would have
-			// received anyway.
-			//
-			// The context is built PER INVOCATION rather than captured here, matching
-			// every other dispatch site. `createContext()` materializes `cwd` and
-			// `hasUI` as values, so a trampoline holding one context for the life of the
-			// session would keep handing handlers the workspace this runner initialized
-			// in — wrong the moment `SessionManager.moveTo()` relocates the session
-			// (`/move`), and a handler that scopes or prompts against `ctx.cwd` would
-			// then allow the old workspace and deny the new one. A denied mutation is a
-			// rare path, so the extra object costs nothing that matters.
-			//
-			// Isolation is per HANDLER, not per extension. The registry only sees one
-			// trampoline per extension, so a throw escaping this loop would advance the
-			// registry to the NEXT extension and skip every later handler this one
-			// registered — breaking both the documented "a throwing handler is skipped"
-			// contract and registration order for a backup-handler setup.
-			if (ext.fileWriteFallbackHandlers.length > 0) {
-				this.#fileFallbackDisposers.push(
-					addFileWriteFallback(async req => {
-						if (this.#suspendedExtensions.has(ext)) return false;
-						const ctx = this.createContext();
-						for (const handler of ext.fileWriteFallbackHandlers) {
-							try {
-								if (await handler(req, ctx)) return true;
-							} catch (error) {
-								logger.warn("Extension file write fallback handler threw; trying next handler", {
-									extension: ext.path,
-									error: error instanceof Error ? error.message : String(error),
-								});
-							}
-						}
-						return false;
-					}),
-				);
-			}
-			if (ext.fileDeleteFallbackHandlers.length > 0) {
-				this.#fileFallbackDisposers.push(
-					addFileDeleteFallback(async req => {
-						if (this.#suspendedExtensions.has(ext)) return false;
-						const ctx = this.createContext();
-						for (const handler of ext.fileDeleteFallbackHandlers) {
-							try {
-								if (await handler(req, ctx)) return true;
-							} catch (error) {
-								logger.warn("Extension file delete fallback handler threw; trying next handler", {
-									extension: ext.path,
-									error: error instanceof Error ? error.message : String(error),
-								});
-							}
-						}
-						return false;
-					}),
-				);
-			}
-		}
+		for (const ext of this.getLoadedExtensions()) this.#installFileFallbacks(ext);
 
 		// Drain events buffered by emitCredentialDisabled() before initialize ran. The
 		// spread adds the `type` discriminator — `event` is the pi-ai shape (no `type`).
@@ -1041,7 +1015,8 @@ export class ExtensionRunner {
 	 */
 	async emitCacheWarmingDecision(event: CacheWarmingDecisionEvent): Promise<CacheWarmingAction> {
 		let action = event.action;
-		for (const ext of this.extensions) {
+		for (const ext of (this.#loadOrder ??= [...this.extensions])) {
+			if (ext.isActive?.() === false || this.#suspendedExtensions.has(ext)) continue;
 			const handlers = ext.handlers.get(event.type);
 			if (!handlers || handlers.length === 0) continue;
 			const ctx = this.createContext();
@@ -1066,9 +1041,26 @@ export class ExtensionRunner {
 		};
 	}
 
+	/**
+	 * Runs each dialog of the UI context the next {@link initialize} receives (tool approvals, extension prompts) as a
+	 * wait for the user.
+	 */
+	setUserWaitTracker(track: UserWaitTracker): void {
+		this.#trackUserWait = track;
+	}
+
 	/** Waits until the interactive transcript can show the tool call being approved. */
 	async waitForToolApprovalPreview(toolCallId: string): Promise<void> {
 		await this.#toolApprovalPreviewWaiter?.(toolCallId);
+	}
+
+	/** Whether the user approved `key` for the current session; a new or switched session starts with none. */
+	hasSessionApproval(key: string): boolean {
+		return this.#sessionApprovals.has(`${this.sessionId}\0${key}`);
+	}
+
+	grantSessionApproval(key: string): void {
+		this.#sessionApprovals.add(`${this.sessionId}\0${key}`);
 	}
 
 	getUIContext(): ExtensionUIContext {
@@ -1079,6 +1071,209 @@ export class ExtensionRunner {
 		return this.#uiContext !== noOpUIContext;
 	}
 
+	/**
+	 * Install this extension's file-mutation fallback trampolines.
+	 *
+	 * Nothing registered by this extension means no trampoline, so a host with
+	 * no fallback-registering extension leaves the seam genuinely empty and
+	 * `hasFileWriteFallback()`/`hasFileDeleteFallback()` false — the invariant
+	 * the whole feature rests on. Each seam is checked separately, so an
+	 * extension that only brokers writes never appears in the delete registry.
+	 *
+	 * One trampoline per extension per seam, not per handler: the list is walked
+	 * at mutation time so a handler this extension adds later still takes effect,
+	 * and `createContext()` takes no extension argument, so within one invocation
+	 * a single context is all any of this extension's handlers would have
+	 * received anyway.
+	 *
+	 * The context is built PER INVOCATION rather than captured here, matching
+	 * every other dispatch site. `createContext()` materializes `cwd` and
+	 * `hasUI` as values, so a trampoline holding one context for the life of the
+	 * session would keep handing handlers the workspace this runner initialized
+	 * in — wrong the moment `SessionManager.moveTo()` relocates the session
+	 * (`/move`), and a handler that scopes or prompts against `ctx.cwd` would
+	 * then allow the old workspace and deny the new one. A denied mutation is a
+	 * rare path, so the extra object costs nothing that matters.
+	 *
+	 * Isolation is per HANDLER, not per extension. The registry only sees one
+	 * trampoline per extension, so a throw escaping this loop would advance the
+	 * registry to the NEXT extension and skip every later handler this one
+	 * registered — breaking both the documented "a throwing handler is skipped"
+	 * contract and registration order for a backup-handler setup.
+	 */
+	#installFileFallbacks(ext: Extension): void {
+		if (ext.isActive?.() === false) return;
+		const generation = this.#fileFallbackGeneration;
+		if (ext.fileWriteFallbackHandlers.length > 0) {
+			this.#fileFallbackDisposers.push(
+				addFileWriteFallback(async req => {
+					if (
+						generation !== this.#fileFallbackGeneration ||
+						ext.isActive?.() === false ||
+						this.#suspendedExtensions.has(ext)
+					)
+						return false;
+					const ctx = this.createContext();
+					for (const handler of ext.fileWriteFallbackHandlers) {
+						if (generation !== this.#fileFallbackGeneration || ext.isActive?.() === false) return false;
+						try {
+							const handled = await handler(req, ctx);
+							if (generation !== this.#fileFallbackGeneration || ext.isActive?.() === false) return false;
+							if (handled) return true;
+						} catch (error) {
+							logger.warn("Extension file write fallback handler threw; trying next handler", {
+								extension: ext.path,
+								error: error instanceof Error ? error.message : String(error),
+							});
+						}
+					}
+					return false;
+				}),
+			);
+		}
+		if (ext.fileDeleteFallbackHandlers.length > 0) {
+			this.#fileFallbackDisposers.push(
+				addFileDeleteFallback(async req => {
+					if (
+						generation !== this.#fileFallbackGeneration ||
+						ext.isActive?.() === false ||
+						this.#suspendedExtensions.has(ext)
+					)
+						return false;
+					const ctx = this.createContext();
+					for (const handler of ext.fileDeleteFallbackHandlers) {
+						if (generation !== this.#fileFallbackGeneration || ext.isActive?.() === false) return false;
+						try {
+							const handled = await handler(req, ctx);
+							if (generation !== this.#fileFallbackGeneration || ext.isActive?.() === false) return false;
+							if (handled) return true;
+						} catch (error) {
+							logger.warn("Extension file delete fallback handler threw; trying next handler", {
+								extension: ext.path,
+								error: error instanceof Error ? error.message : String(error),
+							});
+						}
+					}
+					return false;
+				}),
+			);
+		}
+	}
+
+	/**
+	 * Append extensions bound after this runner was built (startup-deferred
+	 * extensions binding into the live session runtime). They join last, so they
+	 * win name collisions as any later-loaded extension does. Tools their
+	 * factories registered reach every {@link onToolRegistered} subscriber, file
+	 * fallbacks install when the runner is already initialized, and a
+	 * `session_start` that already went out is replayed to them alone. Resolves
+	 * once those tool activations and handlers settle.
+	 */
+	async addExtensions(
+		added: readonly Extension[],
+		options: { isActive?: () => boolean; onBound?: () => void } = {},
+	): Promise<void> {
+		if (added.length === 0) return;
+		const generation = this.#fileFallbackGeneration;
+		const sessionId = this.sessionId;
+		const cwd = this.cwd;
+		const registrationSignal = AbortSignal.timeout(extensionHandlerTimeoutMs);
+		const isActive = () =>
+			!registrationSignal.aborted &&
+			generation === this.#fileFallbackGeneration &&
+			sessionId === this.sessionId &&
+			cwd === this.cwd &&
+			options.isActive?.() !== false;
+		if (!isActive()) throw new Error("Extension owner is no longer active");
+		let activationComplete = false;
+		let activationFailed = false;
+		const rollbacks = new Set<() => Promise<void>>();
+		const scope: ToolRegistrationScope = {
+			pending: new Set(),
+			closed: false,
+			signal: registrationSignal,
+		};
+		for (const extension of added) {
+			const previousIsActive = extension.isActive;
+			extension.toolActivationRollbacks = rollbacks;
+			extension.isActive = () =>
+				!activationFailed &&
+				previousIsActive?.() !== false &&
+				options.isActive?.() !== false &&
+				(activationComplete || isActive());
+		}
+		try {
+			this.extensions.push(...added);
+			this.#loadOrder?.push(...added);
+			if (this.#initialized) {
+				for (const extension of added) this.#installFileFallbacks(extension);
+			}
+			this.#toolRegistrationScope.run(scope, () => {
+				for (const extension of added) {
+					if (!isActive()) throw new Error("Extension owner is no longer active");
+					for (const attach of this.#toolRegistrationSubscribers) {
+						const listener = attach(extension);
+						for (const toolName of extension.tools.keys()) {
+							if (!isActive()) throw new Error("Extension owner is no longer active");
+							listener(toolName);
+						}
+					}
+				}
+			});
+			try {
+				await this.#flushToolRegistrations(scope.pending);
+			} catch (error) {
+				this.emitError({
+					extensionPath: added[0]!.path,
+					event: "tool_registration",
+					error: error instanceof Error ? error.message : String(error),
+					stack: error instanceof Error ? error.stack : undefined,
+				});
+				throw error;
+			}
+			scope.closed = true;
+			scope.signal?.throwIfAborted();
+			if (!isActive()) throw new Error("Extension owner is no longer active");
+			options.onBound?.();
+			if (!isActive()) throw new Error("Extension owner is no longer active");
+			if (this.#sessionStartEvent) await this.#emitTo(added, this.#sessionStartEvent, isActive);
+			if (!isActive()) throw new Error("Extension owner is no longer active");
+			scope.signal?.throwIfAborted();
+			activationComplete = true;
+		} catch (error) {
+			activationFailed = true;
+			this.#loadOrder ??= [...this.extensions];
+			for (const extension of added) {
+				const index = this.extensions.indexOf(extension);
+				if (index !== -1) this.extensions.splice(index, 1);
+			}
+			const failures: unknown[] = [error];
+			scope.closed = true;
+			try {
+				await this.#flushToolRegistrations(scope.pending);
+			} catch (pendingError) {
+				if (pendingError !== error) failures.push(pendingError);
+			}
+			for (const rollback of [...rollbacks].reverse()) {
+				try {
+					await rollback();
+				} catch (rollbackError) {
+					failures.push(rollbackError);
+				}
+			}
+			if (failures.length > 1) throw new AggregateError(failures, "Extension activation failed");
+			throw error;
+		} finally {
+			scope.closed = true;
+			activationFailed = !activationComplete;
+			// Dependent replacements retain displaced undo until their own activation settles.
+			if (activationComplete) rollbacks.clear();
+			for (const extension of added) {
+				if (extension.toolActivationRollbacks === rollbacks) extension.toolActivationRollbacks = undefined;
+			}
+		}
+	}
+
 	setMCPContext(mcp: ExtensionMCPContext): void {
 		this.#mcp = mcp;
 	}
@@ -1087,7 +1282,7 @@ export class ExtensionRunner {
 		return this.extensions.map(e => e.path);
 	}
 
-	/** Every extension this runner loaded, in load order, including suspended ones. */
+	/** Every extension this runner loaded, including suspended and failed additions. */
 	getLoadedExtensions(): readonly Extension[] {
 		return this.#loadOrder ?? this.extensions;
 	}
@@ -1100,8 +1295,9 @@ export class ExtensionRunner {
 	/**
 	 * Suspend or resume loaded extensions in place (e.g. after a live `disabledExtensions`
 	 * edit). A suspended extension keeps its module state but stops contributing event
-	 * handlers, commands, tools, message renderers, shortcuts, flags, and file fallbacks
-	 * until resumed. Returns the extensions whose state changed.
+	 * handlers, commands, tools, message renderers, link schemes, shortcuts, flags, and file
+	 * fallbacks until resumed. Returns the extensions whose state changed, after notifying
+	 * {@link onSuspensionChange} listeners when there are any.
 	 */
 	setSuspendedExtensions(shouldSuspend: (extension: Extension) => boolean): {
 		suspended: Extension[];
@@ -1111,6 +1307,7 @@ export class ExtensionRunner {
 		const suspended: Extension[] = [];
 		const resumed: Extension[] = [];
 		for (const extension of this.#loadOrder) {
+			if (extension.isActive?.() === false) continue;
 			const suspend = shouldSuspend(extension);
 			if (suspend === this.#suspendedExtensions.has(extension)) continue;
 			if (suspend) {
@@ -1122,10 +1319,22 @@ export class ExtensionRunner {
 			}
 		}
 		if (suspended.length > 0 || resumed.length > 0) {
-			const active = this.#loadOrder.filter(extension => !this.#suspendedExtensions.has(extension));
+			const active = this.#loadOrder.filter(
+				extension => extension.isActive?.() !== false && !this.#suspendedExtensions.has(extension),
+			);
 			this.extensions.splice(0, this.extensions.length, ...active);
+			for (const listener of this.#suspensionListeners) listener();
 		}
 		return { suspended, resumed };
+	}
+
+	/**
+	 * Call `listener` whenever {@link setSuspendedExtensions} suspends or resumes an extension, so
+	 * a UI can redraw what their renderers and link schemes drew. Returns the unsubscribe.
+	 */
+	onSuspensionChange(listener: () => void): () => void {
+		this.#suspensionListeners.add(listener);
+		return () => this.#suspensionListeners.delete(listener);
 	}
 
 	/** Get all registered tools from all extensions. */
@@ -1133,6 +1342,7 @@ export class ExtensionRunner {
 		const tools: RegisteredTool[] = [];
 		for (const ext of this.extensions) {
 			for (const tool of ext.tools.values()) {
+				if (tool.owner === undefined) tool.owner = ext;
 				tools.push(tool);
 			}
 		}
@@ -1155,7 +1365,7 @@ export class ExtensionRunner {
 	 */
 	onToolRegistered(listener: (tool: RegisteredTool, signal?: AbortSignal) => void | Promise<void>): () => void {
 		const subscriptions: Array<{ extension: Extension; listener: ToolRegistrationListener }> = [];
-		for (const extension of this.extensions) {
+		const attach = (extension: Extension): ToolRegistrationListener => {
 			const trackRegistration = (pending: Promise<void>): void => {
 				const registrationBarrier = pending.then(
 					() => undefined,
@@ -1184,14 +1394,17 @@ export class ExtensionRunner {
 				});
 			};
 			const wrapped: ToolRegistrationListener = toolName => {
+				if (extension.isActive?.() === false) return;
 				const tool = extension.tools.get(toolName);
 				if (!tool) return;
+				if (tool.owner === undefined) tool.owner = extension;
 				try {
 					const scope = this.#toolRegistrationScope.getStore();
 					const registrationSignal =
 						scope && !scope.closed ? scope.signal : AbortSignal.timeout(extensionHandlerTimeoutMs);
+					registrationSignal?.throwIfAborted();
 					const pending = listener(tool, registrationSignal);
-					if (pending) trackRegistration(pending);
+					if (pending) trackRegistration(untilAborted(registrationSignal, pending));
 				} catch (error) {
 					trackRegistration(Promise.reject(error));
 				}
@@ -1199,8 +1412,12 @@ export class ExtensionRunner {
 			extension.toolRegistrationListeners ??= new Set();
 			extension.toolRegistrationListeners.add(wrapped);
 			subscriptions.push({ extension, listener: wrapped });
-		}
+			return wrapped;
+		};
+		for (const extension of this.extensions) attach(extension);
+		this.#toolRegistrationSubscribers.add(attach);
 		return () => {
+			this.#toolRegistrationSubscribers.delete(attach);
 			for (const subscription of subscriptions) {
 				subscription.extension.toolRegistrationListeners?.delete(subscription.listener);
 			}
@@ -1341,6 +1558,105 @@ export class ExtensionRunner {
 		return this.extensions.flatMap(ext => ext.assistantThinkingRenderers);
 	}
 
+	/**
+	 * Draw with what `parent` (the main session's runner) leaves active: a subagent's runner loads
+	 * its own copies of the extensions, and a live `disabledExtensions` edit suspends only the main
+	 * copies. While this runner's transcript is on screen, its renderers, link schemes and link
+	 * clicks skip every extension `parent` has suspended. `undefined` draws with all of its own.
+	 */
+	followSuspension(parent: ExtensionRunner | undefined): void {
+		this.#suspensionParent = parent === this ? undefined : parent;
+	}
+
+	/** Whether the extension loaded from `resolvedPath` is loaded here and suspended. */
+	isExtensionSuspended(resolvedPath: string): boolean {
+		for (const extension of this.#suspendedExtensions) if (extension.resolvedPath === resolvedPath) return true;
+		return false;
+	}
+
+	/** Active extensions that draw: those {@link followSuspension}'s parent has not suspended. */
+	#drawingExtensions(): Extension[] {
+		const parent = this.#suspensionParent;
+		return this.extensions.filter(
+			ext => ext.isActive?.() !== false && !parent?.isExtensionSuspended(ext.resolvedPath),
+		);
+	}
+
+	/** Registered assistant text renderers; none while `extensionRenderers.assistantText` is off. */
+	getAssistantTextRenderers(): AssistantTextRenderer[] {
+		if (!this.settings || !cfgExtensionAssistantTextRenderers.get(this.settings)) return [];
+		return this.#drawingExtensions().flatMap(ext => ext.assistantTextRenderers);
+	}
+
+	/** Link schemes claimed with `registerLinkScheme`; none while `extensionRenderers.assistantText` is off. */
+	getLinkSchemes(): string[] {
+		if (!this.settings || !cfgExtensionAssistantTextRenderers.get(this.settings)) return [];
+		const owners = new Map<string, Extension>();
+		for (const ext of this.#drawingExtensions()) {
+			for (const scheme of ext.linkSchemes) {
+				const owner = owners.get(scheme);
+				if (!owner) owners.set(scheme, ext);
+				else if (owner !== ext && !this.#warnedLinkSchemes.has(scheme)) {
+					this.#warnedLinkSchemes.add(scheme);
+					logger.warn("Link scheme claimed by several extensions; the first loaded gets its clicks", {
+						scheme,
+						owner: owner.path,
+						ignored: ext.path,
+					});
+				}
+			}
+		}
+		return [...owners.keys()];
+	}
+
+	/**
+	 * Deliver a click on `url` as `link_activate` to the extension that claimed its scheme (the first
+	 * one in load order, when several did). Returns whether an extension owns the link.
+	 *
+	 * `ui` is the UI that drew the link, for a runner that has none of its own: a subagent's runner
+	 * runs headless, but its transcript can be on screen while that subagent is focused, and the
+	 * handler's `ctx.ui.rerenderMessage` must reach that screen.
+	 *
+	 * Like a command or shortcut, a click is the user's own action, and its handler may open a
+	 * dialog: it runs without the event-handler timeout. A failure is reported, not thrown.
+	 */
+	async emitLinkActivate(url: string, ui?: ExtensionUIContext): Promise<boolean> {
+		if (!this.settings || !cfgExtensionAssistantTextRenderers.get(this.settings)) return false;
+		const colon = url.indexOf(":");
+		if (colon <= 0) return false;
+		const scheme = url.slice(0, colon).toLowerCase();
+		const owner = this.#drawingExtensions().find(ext => ext.linkSchemes.includes(scheme));
+		if (!owner) return false;
+		const handlers = owner.handlers.get("link_activate");
+		if (!handlers || handlers.length === 0) return true;
+		const event: LinkActivateEvent = { type: "link_activate", url, scheme };
+		const base = this.createContext();
+		const ctx: ExtensionContext =
+			ui && ui !== this.#uiContext ? Object.create(base, { ui: { value: ui }, hasUI: { value: true } }) : base;
+		for (const handler of handlers) {
+			if (
+				owner.isActive?.() === false ||
+				this.#suspendedExtensions.has(owner) ||
+				this.#suspensionParent?.isExtensionSuspended(owner.resolvedPath) ||
+				!cfgExtensionAssistantTextRenderers.get(this.settings)
+			)
+				break;
+			try {
+				await this.runScoped(() => handler(event, ctx));
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				logger.warn("link_activate handler failed", { extensionPath: owner.path, url, error: message });
+				this.emitError({
+					extensionPath: owner.path,
+					event: event.type,
+					error: message,
+					stack: error instanceof Error ? error.stack : undefined,
+				});
+			}
+		}
+		return true;
+	}
+
 	getRegisteredCommands(reserved?: ReadonlySet<string>): RegisteredCommand[] {
 		this.#commandDiagnostics = [];
 
@@ -1418,6 +1734,7 @@ export class ExtensionRunner {
 		const sendUserMessage = (text: string, options?: SendUserMessageOptions): void =>
 			this.runtime.sendUserMessage(text, options);
 		const delegationSignal = delegation?.signal;
+		const getSessionModes = () => (agent.kind === "main" && this.#mode === "tui" ? this.#sessionModes : undefined);
 		return {
 			ui: this.#uiContext,
 			mcp: delegationSignal
@@ -1452,6 +1769,10 @@ export class ExtensionRunner {
 			resolvePlanReview: (reviewId, choice, input) => this.#resolvePlanReviewFn(reviewId, choice, input),
 			getPendingPlanReview: () => this.#getPendingPlanReviewFn(),
 			openPlanReview: () => this.#openPlanReviewFn(),
+			// Live: a context saved before or across a host rebind sees the current controls.
+			get sessionModes() {
+				return getSessionModes();
+			},
 			getSystemPrompt: () => this.#getSystemPromptFn(),
 			runEphemeralTurn: runEphemeralTurn
 				? async options => {
@@ -1480,6 +1801,7 @@ export class ExtensionRunner {
 						return await this.#ephemeralTurnBlocker.run("ephemeral turn", () => runEphemeralTurn(request));
 					}
 				: undefined,
+			startLive: this.#startLiveFn,
 			localProtocolOptions: this.localProtocolOptions,
 			memory: this.#getMemoryFn?.(),
 			// A getter, not a value: `createHandlerContext` scopes a handler via `Object.create(ctx)`, and
@@ -1530,12 +1852,17 @@ export class ExtensionRunner {
 	 * context can never fire for another session sharing this process.
 	 */
 	disposeFileFallbacks(): void {
+		this.#fileFallbackGeneration += 1;
 		for (const dispose of this.#fileFallbackDisposers.splice(0)) dispose();
 	}
 
 	createCommandContext(): ExtensionCommandContext {
+		const context = this.createContext();
 		return {
-			...this.createContext(),
+			...context,
+			get sessionModes() {
+				return context.sessionModes;
+			},
 			getContextUsage: () => this.#getContextUsageFn(),
 			waitForIdle: () => this.#waitForIdleFn(),
 			newSession: options => this.#newSessionHandler(options),
@@ -1567,6 +1894,8 @@ export class ExtensionRunner {
 		onFailure?: (kind: "timeout" | "error", message: string) => R,
 		outerSignal?: AbortSignal,
 	): Promise<R | undefined> {
+		if (this.#suspendedExtensions.has(ext) || (event.type !== "session_shutdown" && ext.isActive?.() === false))
+			return undefined;
 		// `session_stop` carries its own signal on the event; `tool_call` receives
 		// the outer dispatch signal (loop request or wrapper execute) so an abort
 		// while a handler awaits a human dialog cancels the dialog and settles the
@@ -1617,6 +1946,8 @@ export class ExtensionRunner {
 		} finally {
 			registrationScope.closed = true;
 		}
+		if (this.#suspendedExtensions.has(ext) || (event.type !== "session_shutdown" && ext.isActive?.() === false))
+			return undefined;
 		if (handlerResult === EXTENSION_HANDLER_ABORTED) return undefined;
 		if (handlerResult === EXTENSION_HANDLER_TIMEOUT) {
 			const error = `handler timed out after ${timeoutMs}ms`;
@@ -1648,6 +1979,22 @@ export class ExtensionRunner {
 	}
 
 	async emit<TEvent extends RunnerEmitEvent>(event: TEvent): Promise<RunnerEmitResult<TEvent>> {
+		// Disposal invalidates ordinary owner lifetimes before shutdown cleanup runs.
+		const extensions = this.#isSessionShutdownEvent(event)
+			? [...this.extensions]
+			: (this.#loadOrder ??= [...this.extensions]);
+		const result = await this.#emitTo(extensions, event);
+		// Recorded once the broadcast ends: an extension added mid-broadcast is
+		// reached by the live iteration, one added later gets the replay.
+		if (event.type === "session_start") this.#sessionStartEvent = event;
+		return result;
+	}
+
+	async #emitTo<TEvent extends RunnerEmitEvent>(
+		extensions: readonly Extension[],
+		event: TEvent,
+		isActive?: () => boolean,
+	): Promise<RunnerEmitResult<TEvent>> {
 		// Defer the per-event context allocation (and the Promise.race/Bun.sleep
 		// timeout machinery) to the first matching handler. Streaming sessions emit
 		// message_update / tool_execution_* per delta with usually no extension
@@ -1658,7 +2005,8 @@ export class ExtensionRunner {
 		if (this.#isSessionShutdownEvent(event)) {
 			const timeoutMs = handlerTimeoutForEvent(event.type);
 			const promises: Promise<unknown>[] = [];
-			for (const ext of this.extensions) {
+			for (const ext of extensions) {
+				if (this.#suspendedExtensions.has(ext)) continue;
 				const handlers = ext.handlers.get(event.type);
 				if (!handlers || handlers.length === 0) continue;
 				ctx ??= this.createContext();
@@ -1670,12 +2018,20 @@ export class ExtensionRunner {
 			return result as RunnerEmitResult<TEvent>;
 		}
 
-		for (const ext of this.extensions) {
+		for (const ext of extensions) {
+			if (isActive?.() === false) throw new Error("Extension owner is no longer active");
+			if (ext.isActive?.() === false || this.#suspendedExtensions.has(ext)) continue;
 			const handlers = ext.handlers.get(event.type);
 			if (!handlers || handlers.length === 0) continue;
+			if (event.type === "session_start") {
+				if (isActive && this.#sessionStartDelivered.get(ext) === event) continue;
+				this.#sessionStartDelivered.set(ext, event);
+			}
 			ctx ??= this.createContext();
 
 			for (const handler of handlers) {
+				if (isActive?.() === false) throw new Error("Extension owner is no longer active");
+				if (ext.isActive?.() === false || this.#suspendedExtensions.has(ext)) break;
 				const handlerResult = await this.#runHandlerWithTimeout(
 					handler,
 					event,
@@ -1683,6 +2039,7 @@ export class ExtensionRunner {
 					ext,
 					handlerTimeoutForEvent(event.type),
 				);
+				if (isActive?.() === false) throw new Error("Extension owner is no longer active");
 
 				if (this.#isSessionBeforeEvent(event) && handlerResult) {
 					result = handlerResult as SessionBeforeEventResult;
@@ -1700,10 +2057,18 @@ export class ExtensionRunner {
 					if (stopResult.decision === "block") {
 						return stopResult as RunnerEmitResult<TEvent>;
 					}
-					const hasContinuationContext =
-						(typeof stopResult.additionalContext === "string" && stopResult.additionalContext.length > 0) ||
-						(typeof stopResult.reason === "string" && stopResult.reason.length > 0);
-					if (stopResult.continue === true && hasContinuationContext) result ??= stopResult;
+					const continuationContext = stopResult.additionalContext || stopResult.reason;
+					if (stopResult.continue === true && continuationContext) {
+						if (result) {
+							const prior = result as SessionStopEventResult;
+							result = {
+								continue: true,
+								additionalContext: `${prior.additionalContext || prior.reason}\n\n${continuationContext}`,
+							};
+						} else {
+							result = stopResult;
+						}
+					}
 				}
 			}
 		}
@@ -1716,7 +2081,12 @@ export class ExtensionRunner {
 		// start must not hand its values to the parent's commands. A process that
 		// hosts several top-level sessions (ACP) still has one spawn environment,
 		// which follows the latest of their events.
-		if (ctx !== undefined && this.agent.kind === "main" && SESSION_IDENTITY_EVENTS[event.type] === true) {
+		if (
+			isActive?.() !== false &&
+			ctx !== undefined &&
+			this.agent.kind === "main" &&
+			SESSION_IDENTITY_EVENTS[event.type] === true
+		) {
 			refreshShellConfigCache();
 		}
 
@@ -1757,7 +2127,8 @@ export class ExtensionRunner {
 			return metadata;
 		};
 
-		extensions: for (const ext of this.extensions) {
+		extensions: for (const ext of (this.#loadOrder ??= [...this.extensions])) {
+			if (ext.isActive?.() === false || this.#suspendedExtensions.has(ext)) continue;
 			const handlers = ext.handlers.get("assistant_message");
 			if (!handlers?.length) continue;
 			for (const handler of handlers) {
@@ -1823,7 +2194,8 @@ export class ExtensionRunner {
 		let modified = false;
 		const contexts: string[] = [];
 
-		for (const ext of this.extensions) {
+		for (const ext of (this.#loadOrder ??= [...this.extensions])) {
+			if (ext.isActive?.() === false || this.#suspendedExtensions.has(ext)) continue;
 			const handlers = ext.handlers.get("tool_result");
 			if (!handlers || handlers.length === 0) continue;
 
@@ -1896,7 +2268,8 @@ export class ExtensionRunner {
 		let result: ToolCallEventResult | undefined;
 		const aggregated = { input: undefined as ToolCallEventResult["input"], additionalContext: [] as string[] };
 
-		for (const ext of this.extensions) {
+		for (const ext of (this.#loadOrder ??= [...this.extensions])) {
+			if (ext.isActive?.() === false || this.#suspendedExtensions.has(ext)) continue;
 			const handlers = ext.handlers.get("tool_call");
 			if (!handlers || handlers.length === 0) continue;
 
@@ -1947,7 +2320,8 @@ export class ExtensionRunner {
 	): Promise<R | undefined> {
 		const ctx = this.createContext();
 
-		for (const ext of this.extensions) {
+		for (const ext of (this.#loadOrder ??= [...this.extensions])) {
+			if (ext.isActive?.() === false || this.#suspendedExtensions.has(ext)) continue;
 			const handlers = ext.handlers.get(eventName);
 			if (!handlers || handlers.length === 0) continue;
 
@@ -1981,7 +2355,8 @@ export class ExtensionRunner {
 		const promptPaths: Array<{ path: string; extensionPath: string }> = [];
 		const themePaths: Array<{ path: string; extensionPath: string }> = [];
 
-		for (const ext of this.extensions) {
+		for (const ext of (this.#loadOrder ??= [...this.extensions])) {
+			if (ext.isActive?.() === false || this.#suspendedExtensions.has(ext)) continue;
 			const handlers = ext.handlers.get("resources_discover");
 			if (!handlers || handlers.length === 0) continue;
 
@@ -2022,7 +2397,8 @@ export class ExtensionRunner {
 		let currentText = text;
 		let currentImages = images;
 
-		for (const ext of this.extensions) {
+		for (const ext of (this.#loadOrder ??= [...this.extensions])) {
+			if (ext.isActive?.() === false || this.#suspendedExtensions.has(ext)) continue;
 			for (const handler of ext.handlers.get("input") ?? []) {
 				const event: InputEvent = { type: "input", text: currentText, images: currentImages, source };
 				const result = (await this.#runHandlerWithTimeout(handler, event, ctx, ext, extensionHandlerTimeoutMs)) as
@@ -2062,7 +2438,8 @@ export class ExtensionRunner {
 			if (message) setContextHistoryIndex(message, index);
 		}
 
-		for (const ext of this.extensions) {
+		for (const ext of (this.#loadOrder ??= [...this.extensions])) {
+			if (ext.isActive?.() === false || this.#suspendedExtensions.has(ext)) continue;
 			const handlers = ext.handlers.get("context");
 			if (!handlers || handlers.length === 0) continue;
 
@@ -2121,7 +2498,8 @@ export class ExtensionRunner {
 		const ctx = this.createContext(model);
 		let currentPayload = payload;
 
-		for (const ext of this.extensions) {
+		for (const ext of (this.#loadOrder ??= [...this.extensions])) {
+			if (ext.isActive?.() === false || this.#suspendedExtensions.has(ext)) continue;
 			const handlers = ext.handlers.get("before_provider_request");
 			if (!handlers || handlers.length === 0) continue;
 
@@ -2157,7 +2535,8 @@ export class ExtensionRunner {
 		if (!this.hasHandlers("after_provider_response")) return;
 		const ctx = this.createContext(model);
 
-		for (const ext of this.extensions) {
+		for (const ext of (this.#loadOrder ??= [...this.extensions])) {
+			if (ext.isActive?.() === false || this.#suspendedExtensions.has(ext)) continue;
 			const handlers = ext.handlers.get("after_provider_response");
 			if (!handlers || handlers.length === 0) continue;
 
@@ -2178,6 +2557,7 @@ export class ExtensionRunner {
 		prompt: string,
 		images: ImageContent[] | undefined,
 		systemPrompt: string[],
+		reason: BeforeAgentStartEvent["reason"] = "prompt",
 	): Promise<BeforeAgentStartCombinedResult | undefined> {
 		if (!this.hasHandlers("before_agent_start")) return undefined;
 		const ctx = this.createContext();
@@ -2185,13 +2565,15 @@ export class ExtensionRunner {
 		let currentSystemPrompt = systemPrompt;
 		let systemPromptModified = false;
 
-		for (const ext of this.extensions) {
+		for (const ext of (this.#loadOrder ??= [...this.extensions])) {
+			if (ext.isActive?.() === false || this.#suspendedExtensions.has(ext)) continue;
 			const handlers = ext.handlers.get("before_agent_start");
 			if (!handlers || handlers.length === 0) continue;
 
 			for (const handler of handlers) {
 				const event: BeforeAgentStartEvent = {
 					type: "before_agent_start",
+					reason,
 					prompt,
 					images,
 					systemPrompt: currentSystemPrompt,
@@ -2240,7 +2622,8 @@ export class ExtensionRunner {
 		const ctx = this.createContext();
 		let chosen: Pick<BeforeSubagentSpawnEventResult, "model" | "note"> | undefined;
 
-		for (const ext of this.extensions) {
+		for (const ext of (this.#loadOrder ??= [...this.extensions])) {
+			if (ext.isActive?.() === false || this.#suspendedExtensions.has(ext)) continue;
 			const handlers = ext.handlers.get("before_subagent_spawn");
 			if (!handlers || handlers.length === 0) continue;
 

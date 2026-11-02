@@ -80,7 +80,7 @@ describe("auth-gateway explicit OpenAI prompt cache controls", () => {
 			expect(mock.calls[0]?.options?.promptCache).toEqual({ mode: "explicit", ttl: "30m", breakpoint: "none" });
 		} finally {
 			await handle.close();
-			storage.close();
+			await storage.close();
 			clearCustomApis();
 			await fs.rm(dir, { recursive: true, force: true });
 		}

@@ -14,7 +14,14 @@
 
 import { type } from "@oh-my-pi/omptype";
 import { instrumentedCompleteSimple, resolveTelemetry } from "@oh-my-pi/pi-agent-core";
-import { type Api, type AssistantMessage, Effort, type Model, type Tool } from "@oh-my-pi/pi-ai";
+import {
+	type Api,
+	type AssistantMessage,
+	Effort,
+	type Model,
+	type SimpleStreamOptions,
+	type Tool,
+} from "@oh-my-pi/pi-ai";
 import { clampThinkingLevelForModel, getSupportedEfforts } from "@oh-my-pi/pi-catalog/model-thinking";
 import { Snowflake } from "@oh-my-pi/pi-utils";
 import { extractTextContent, extractToolCall, parseJsonPayload } from "../commit/utils";
@@ -27,6 +34,7 @@ import {
 	formatModelStringWithRouting,
 	getAllowedAvailableModels,
 	getModelMatchPreferences,
+	isModelEnabledBySettings,
 	resolveModelFromString,
 	resolveModelOverride,
 } from "../config/model-resolver";
@@ -358,6 +366,9 @@ async function executeCompletion(
 	for (const [index, candidate] of candidates.entries()) {
 		if (index > 0 && retriesUsed >= maxRetries) break;
 		model = candidate.model;
+		// The session's cost cap covers completions a cell makes, attempt by attempt.
+		const refusal = session.costGate?.check();
+		if (refusal) throw new ToolError(refusal.message);
 		try {
 			// Forward the session id so session-sticky OAuth credentials
 			// resolve (see #5325); without it a usable fallback looks keyless.
@@ -368,7 +379,24 @@ async function executeCompletion(
 				);
 				continue;
 			}
+			signal.throwIfAborted();
+			const dispatchRefusal = session.costGate?.check();
+			if (dispatchRefusal) throw new ToolError(dispatchRefusal.message);
 			if (index > 0) retriesUsed += 1;
+			const streamOptions: SimpleStreamOptions = {
+				apiKey: registry.resolver(model, session.getSessionId?.() ?? undefined),
+				signal,
+				reasoning: candidate.reasoning,
+				disableReasoning: candidate.disableReasoning,
+				toolChoice: schema ? { type: "tool", name: STRUCTURED_TOOL_NAME } : undefined,
+				onPayload: () => {
+					signal.throwIfAborted();
+					session.costGate?.admit();
+					if (!isModelEnabledBySettings(candidate.model, session.settings, registry)) {
+						throw new ToolError(`completion() model disabled by settings: ${formatModelString(candidate.model)}`);
+					}
+				},
+			};
 			response = await instrumentedCompleteSimple(
 				model,
 				{
@@ -376,15 +404,10 @@ async function executeCompletion(
 					messages: [{ role: "user", content: [{ type: "text", text: prompt }], timestamp: Date.now() }],
 					tools,
 				},
-				{
-					apiKey: registry.resolver(model, session.getSessionId?.() ?? undefined),
-					signal,
-					reasoning: candidate.reasoning,
-					disableReasoning: candidate.disableReasoning,
-					toolChoice: schema ? { type: "tool", name: STRUCTURED_TOOL_NAME } : undefined,
-				},
+				session.prepareSimpleStreamOptions?.(streamOptions, model.provider) ?? streamOptions,
 				{ telemetry, oneshotKind: "eval_completion" },
 			);
+			session.costGate?.record(response.usage.cost.total);
 		} catch (error) {
 			lastError = error;
 			if (signal.aborted || index === candidates.length - 1) throw error;

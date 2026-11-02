@@ -1,14 +1,16 @@
 import { afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
 import type { TspKind } from "@oh-my-pi/pi-wire";
+import { Container, Text } from "@oh-my-pi/pi-tui";
+import { TranscriptContainer } from "@oh-my-pi/pi-tui/chrome/transcript-container";
 import { describeWorkingRow, type WorkingRowSpec } from "@oh-my-pi/pi-tui/components/loader";
 import { SelectList } from "@oh-my-pi/pi-tui/components/select-list";
 import type { DescribeContext, NativeChild, NativeNode } from "@oh-my-pi/pi-tui/native/node";
 import { setNativeRendering } from "@oh-my-pi/pi-tui/native/state";
 import { COMPOSER_DEFAULTS, Composer } from "@oh-my-pi/pi-tui/prompt/composer";
 import { type ComposerNativeState, CustomEditor } from "@oh-my-pi/pi-tui/prompt/custom-editor";
-import { QueuedMessagesBand } from "@oh-my-pi/pi-tui/prompt/queued-messages";
 import { createStartupStatusLine } from "@oh-my-pi/pi-tui/status-line/startup";
 import { getEditorTheme, getSelectListTheme, initTheme } from "@oh-my-pi/pi-tui/theme";
+import { TspHarness } from "./native/tsp-harness";
 import { VirtualTerminal } from "./virtual-terminal";
 
 const context = (kinds: readonly TspKind[] | "all"): DescribeContext => ({
@@ -197,6 +199,121 @@ describe("native composer", () => {
 		expect(submitted).toEqual(["hello"]);
 	});
 
+	it("rebuilds the microphone beside Send through every dictation state and hides it without a host", () => {
+		let dictation: ComposerNativeState["dictation"];
+		const editor = new CustomEditor(getEditorTheme());
+		editor.composerState = () => ({ running: false, dictation });
+		editor.onSubmit = vi.fn();
+		editor.onToggleDictation = vi.fn();
+		const hidden = editor.describe(cx);
+		expect(byRole(hidden, "omp.composer.dictation")).toBeUndefined();
+		editor.handleNativeEvent({ type: "action", key: "bar/dictation", act: "dictation.toggle", mods: [] });
+		expect(editor.onToggleDictation).not.toHaveBeenCalled();
+
+		for (const state of ["idle", "starting", "recording", "transcribing", "idle"] as const) {
+			dictation = state;
+			const root = editor.describe(cx);
+			const mic = byRole(root, "omp.composer.dictation")!;
+			const send = byRole(root, "omp.composer.send")!;
+			const bar = byRole(root, "omp.composer.bar")!;
+			const children = (bar.c ?? []).filter(isNode);
+			const holdsDraft = state === "recording" || state === "transcribing";
+			expect(children.indexOf(mic)).toBe(children.indexOf(send) - 1);
+			expect(nodes(root).find(n => n.k === "editor")?.p).toMatchObject({ sendable: !holdsDraft });
+			expect(send.p?.actions).toEqual(holdsDraft ? undefined : { click: "submit" });
+			expect(mic.p?.actions).toEqual(state === "transcribing" ? undefined : { click: "dictation.toggle" });
+
+			if (state === "starting" || state === "transcribing") {
+				expect(mic.p).toMatchObject({ tone: "pending" });
+				expect(nodes(mic).some(n => n.k === "spinner")).toBe(true);
+			} else {
+				expect(nodes(mic).find(n => n.k === "icon")?.p).toEqual({
+					name: state === "recording" ? "stop" : "mic",
+				});
+				if (state === "recording") {
+					expect(mic.p).toMatchObject({ tone: "error" });
+				}
+			}
+		}
+		dictation = undefined;
+		expect(byRole(editor.describe(cx), "omp.composer.dictation")).toBeUndefined();
+	});
+
+	it("routes microphone clicks without keyboard focus, cancels a slow start and keeps transcription as a draft", async () => {
+		let dictation: ComposerNativeState["dictation"] = "idle";
+		const editor = new CustomEditor(getEditorTheme());
+		const other = new CustomEditor(getEditorTheme());
+		const toggled: ComposerNativeState["dictation"][] = [];
+		const submitted: string[] = [];
+		editor.composerState = () => ({ running: false, dictation });
+		// Mirrors the host: idle starts, a pending start cancels, recording stops into transcription.
+		editor.onToggleDictation = () => {
+			toggled.push(dictation);
+			dictation = dictation === "idle" ? "starting" : dictation === "starting" ? "idle" : "transcribing";
+		};
+		editor.onSubmit = text => {
+			submitted.push(text);
+		};
+		other.onToggleDictation = () => {
+			throw new Error("dictation reached keyboard focus instead of its native owner");
+		};
+		editor.setText("existing draft");
+		const h = await TspHarness.start(tui => {
+			tui.addChild(editor);
+			tui.addChild(other);
+			tui.setFocus(other);
+		});
+		try {
+			const mic = h.find(n => n.p?.role === "omp.composer.dictation")!;
+			const send = h.find(n => n.p?.role === "omp.composer.send")!;
+			const input = h.find(n => n.k === "editor" && n.p?.text === "existing draft")!;
+			const clickMic = () => h.event({ ev: "action", sf: h.terminal.surface!, id: mic.id, act: "dictation.toggle" });
+			const assertSendBlocked = () => {
+				h.event({ ev: "action", sf: h.terminal.surface!, id: send.id, act: "submit" });
+				h.event({ ev: "send", sf: h.terminal.surface!, id: input.id, text: "must not replace draft" });
+				editor.handleInput("\r");
+				expect(submitted).toEqual([]);
+				expect(editor.getText()).toBe("existing draft");
+				expect(h.byId(input.id)?.p).toMatchObject({ sendable: false });
+			};
+
+			// A start still loading its model can be cancelled, and does not block sending.
+			clickMic();
+			await h.render();
+			expect(editor.composerState().dictation).toBe("starting");
+			expect(h.byId(input.id)?.p).toMatchObject({ sendable: true });
+			clickMic();
+			await h.render();
+			expect(toggled).toEqual(["idle", "starting"]);
+			expect(editor.composerState().dictation).toBe("idle");
+
+			clickMic();
+			dictation = "recording";
+			await h.render();
+			assertSendBlocked();
+			clickMic();
+			await h.render();
+			expect(toggled).toEqual(["idle", "starting", "idle", "recording"]);
+			expect(editor.composerState().dictation).toBe("transcribing");
+			clickMic();
+			expect(toggled).toHaveLength(4);
+			assertSendBlocked();
+
+			editor.setText("existing draft dictated words submit");
+			dictation = "idle";
+			await h.render();
+			expect(submitted).toEqual([]);
+			expect(editor.getText()).toBe("existing draft dictated words submit");
+			expect(h.byId(input.id)?.p).toMatchObject({ sendable: true });
+			h.event({ ev: "action", sf: h.terminal.surface!, id: send.id, act: "submit" });
+			expect(submitted).toEqual(["existing draft dictated words submit"]);
+			expect(editor.getText()).toBe("");
+			expect(h.errors).toEqual([]);
+		} finally {
+			h.stop();
+		}
+	});
+
 	it("keeps the effort chip at `off` with an empty glyph so a click can turn thinking back on", () => {
 		const chip = byRole(composer({ running: false, thinking: "off" }).describe(cx), "omp.composer.effort")!;
 		expect(chip.p).toMatchObject({ actions: { click: "thinking.cycle" } });
@@ -342,29 +459,6 @@ describe("native working row", () => {
 	});
 });
 
-describe("native queued messages", () => {
-	it("counts the queue in the first pill only and edits through the dequeue path", () => {
-		const onEdit = vi.fn();
-		const band = new QueuedMessagesBand(
-			[
-				{ label: "Steering", messages: ["one", "two"] },
-				{ label: "After yield", messages: ["three"] },
-			],
-			"alt+up",
-			onEdit,
-		);
-		const pills = (band.describe().c ?? []).filter(isNode);
-		expect(pills).toHaveLength(3);
-		const counts = pills.map(pill => byRole(pill, "omp.queue.count")?.p);
-		expect(counts).toEqual([{ text: "3", role: "omp.queue.count" }, undefined, undefined]);
-		band.handleNativeEvent({ type: "action", key: "x/edit", act: "queue.edit", mods: [] });
-		expect(onEdit).toHaveBeenCalledTimes(1);
-
-		const single = new QueuedMessagesBand([{ label: "Steering", messages: ["only"] }], "alt+up", onEdit);
-		expect(byRole(single.describe(), "omp.queue.count")).toBeUndefined();
-	});
-});
-
 describe("native autocomplete list", () => {
 	it("marks the typed prefix, names the icon and shows live state as the value", () => {
 		const list = new SelectList(
@@ -396,6 +490,43 @@ describe("native autocomplete list", () => {
 			value: [{ t: "demo/demo", s: "muted" }],
 		});
 		expect(move!.p).toMatchObject({ label: [{ t: "mo", s: "mark" }, { t: "ve" }] });
+	});
+});
+
+describe("native composer startup typeahead", () => {
+	const field = (composer: Composer) => nodes(composer.editor.describe(cx)).find(n => n.k === "editor");
+
+	it("asks Tern to keep typing from a deferred-input start until startup releases the held input", () => {
+		setNativeRendering(true);
+		const composer = new Composer({
+			terminal: new VirtualTerminal(80, 24),
+			preferences: { ...COMPOSER_DEFAULTS, quiet: true },
+		});
+		composer.start({ deferInput: true });
+		try {
+			expect(field(composer)?.p).toMatchObject({ typeahead: true });
+			// An editor swapped in during startup (an extension's) keeps asking.
+			composer.setEditor(new CustomEditor(getEditorTheme()));
+			expect(field(composer)?.p).toMatchObject({ typeahead: true });
+			composer.releaseHeldInput();
+			expect(field(composer)?.p).toMatchObject({ typeahead: undefined });
+		} finally {
+			composer.stop();
+		}
+	});
+
+	it("never asks after an ordinary start", () => {
+		setNativeRendering(true);
+		const composer = new Composer({
+			terminal: new VirtualTerminal(80, 24),
+			preferences: { ...COMPOSER_DEFAULTS, quiet: true },
+		});
+		composer.start();
+		try {
+			expect(field(composer)?.p).toMatchObject({ typeahead: undefined });
+		} finally {
+			composer.stop();
+		}
 	});
 });
 
@@ -475,5 +606,39 @@ describe("native composer without a status strip", () => {
 		editor.composerFacts = line;
 		editor.handleNativeEvent({ type: "action", key: "bar/model", act: "status.model", mods: [] });
 		expect(actions).toEqual(["status.model"]);
+	});
+});
+
+describe("native surface tail", () => {
+	it("flows deferred output after the transcript, not in the dock, and keeps its place moving in", () => {
+		setNativeRendering(true);
+		const composer = new Composer({
+			terminal: new VirtualTerminal(80, 24),
+			preferences: { ...COMPOSER_DEFAULTS, quiet: true },
+		});
+		composer.start();
+		try {
+			const transcript = new TranscriptContainer();
+			const answer = new Text("answer", 0, 0);
+			transcript.addChild(answer);
+			const deferred = new Container();
+			const run = new Text("$ git worktree list", 0, 0);
+			deferred.addChild(run);
+			const queued = new Container();
+			composer.setRuntimeChildren([transcript, deferred, queued], { nativeTail: [deferred] });
+
+			const live = composer.describeSurface();
+			expect(live.main.slice(-2)).toEqual([answer, run]);
+			expect(live.dock).toEqual([queued]);
+
+			// The next prompt flushes it into the transcript: same block, same place.
+			deferred.removeChild(run);
+			transcript.addChild(run);
+			const flushed = composer.describeSurface();
+			expect(flushed.main.slice(-2)).toEqual([answer, run]);
+			expect(flushed.main).toHaveLength(live.main.length);
+		} finally {
+			composer.stop();
+		}
 	});
 });

@@ -2,7 +2,8 @@ import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { AssistantMessage } from "@oh-my-pi/pi-ai";
+import { Agent } from "@oh-my-pi/pi-agent-core";
+import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { LoadExtensionsResult } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
@@ -17,45 +18,46 @@ import type { TaskParams } from "@oh-my-pi/pi-tui/tools/task";
 import type { IsolationHandle, WorktreeBaseline } from "@oh-my-pi/pi-coding-agent/task/worktree";
 import * as worktreeModule from "@oh-my-pi/pi-coding-agent/task/worktree";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { YieldTool } from "@oh-my-pi/pi-coding-agent/tools/yield";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
-import "@oh-my-pi/pi-coding-agent/tools/yield";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { createSessionDefaults } from "../helpers/session-defaults";
 
 const TEST_TASK: TaskParams = { agent: "task", name: "CheckLsp", task: "Inspect LSP tools." };
-
-function createAssistantStopMessage(text: string): AssistantMessage {
-	return {
-		role: "assistant",
-		content: text ? [{ type: "text", text }] : [],
-		api: "openai-responses",
-		provider: "openai",
-		model: "mock",
-		usage: {
-			input: 0,
-			output: 0,
-			cacheRead: 0,
-			cacheWrite: 0,
-			totalTokens: 0,
-			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-		},
-		stopReason: "stop",
-		timestamp: Date.now(),
-	};
-}
+const isolationFixtures: string[] = [];
 
 function createYieldingSession(): AgentSession {
-	const listeners: Array<(event: AgentSessionEvent) => void> = [];
-	const state = { messages: [] as AssistantMessage[] };
-
-	const emit = (event: AgentSessionEvent) => {
-		for (const listener of listeners) listener(event);
-	};
+	const transport = createMockModel({
+		responses: [
+			{ content: [{ type: "toolCall", name: "yield", arguments: { data: { ok: true } } }] },
+			{ content: ["done"] },
+		],
+	});
+	const yieldTool = new YieldTool({
+		cwd: "/tmp",
+		hasUI: false,
+		settings: Settings.isolated(),
+		getSessionFile: () => null,
+		getSessionSpawns: () => "*",
+	});
+	const agent = new Agent({
+		initialState: { model: transport.model, systemPrompt: ["test"], tools: [yieldTool] },
+		streamFn: transport.stream,
+	});
+	let disposed = false;
 
 	return {
 		...createSessionDefaults(),
-		state,
-		agent: { state: { systemPrompt: ["test"] } },
+		get isDisposed() {
+			return disposed;
+		},
+		dispose: async () => {
+			agent.abort();
+			await agent.waitForIdle();
+			disposed = true;
+		},
+		state: agent.state,
+		agent,
 		model: undefined,
 		extensionRunner: undefined,
 		sessionManager: {
@@ -63,33 +65,18 @@ function createYieldingSession(): AgentSession {
 		},
 		getActiveToolNames: () => ["yield"],
 		getEnabledToolNames: () => ["yield"],
-		subscribe: (listener: (event: AgentSessionEvent) => void) => {
-			listeners.push(listener);
-			return () => {
-				const index = listeners.indexOf(listener);
-				if (index >= 0) listeners.splice(index, 1);
-			};
-		},
-		prompt: async (_text: string, _options?: PromptOptions) => {
-			state.messages.push(createAssistantStopMessage("done"));
-			emit({
-				type: "tool_execution_end",
-				toolCallId: "yield-call",
-				toolName: "yield",
-				result: {
-					content: [{ type: "text", text: "Result submitted." }],
-					details: { status: "success", data: { ok: true } },
-				},
-				isError: false,
-			});
+		subscribe: (listener: (event: AgentSessionEvent) => void) => agent.subscribe(listener),
+		prompt: async (text: string, _options?: PromptOptions) => {
+			await agent.prompt(text);
 			return true;
 		},
-		getLastAssistantMessage: () => state.messages[state.messages.length - 1],
+		getLastAssistantMessage: () => agent.state.messages.findLast(message => message.role === "assistant"),
 	} as unknown as AgentSession;
 }
 
 function createSession(
 	options: {
+		cwd?: string;
 		isolationEnabled?: boolean;
 		parentEnableLsp?: boolean;
 		planMode?: PlanModeState;
@@ -105,7 +92,7 @@ function createSession(
 	} as unknown as ModelRegistry;
 
 	return {
-		cwd: "/tmp",
+		cwd: options.cwd ?? "/tmp",
 		hasUI: false,
 		enableLsp: options.parentEnableLsp,
 		settings: Settings.isolated({
@@ -131,8 +118,11 @@ function mockCreateAgentSession(): { getOptions: () => CreateAgentSessionOptions
 	let capturedOptions: CreateAgentSessionOptions | undefined;
 	vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async (options = {}) => {
 		capturedOptions = options;
+		const session = createYieldingSession();
 		return {
-			session: createYieldingSession(),
+			session,
+			captureOwnerCurrent: () => () => !session.isDisposed,
+			captureOwnerLifetimeCurrent: () => () => !session.isDisposed,
 			extensionsResult: {} as unknown as LoadExtensionsResult,
 			setToolUIContext: () => {},
 			eventBus: new EventBus(),
@@ -141,10 +131,28 @@ function mockCreateAgentSession(): { getOptions: () => CreateAgentSessionOptions
 	return { getOptions: () => capturedOptions };
 }
 
-function mockIsolation(): void {
+async function mockIsolation(): Promise<{ repoRoot: string; isolationDir: string }> {
+	const fixtureRoot = await fs.mkdtemp(path.join(os.tmpdir(), "omp-subagent-lsp-isolation-"));
+	isolationFixtures.push(fixtureRoot);
+	const repoRoot = path.join(fixtureRoot, "repo");
+	const isolationDir = path.join(fixtureRoot, "isolated-subagent");
+	for (const directory of [repoRoot, isolationDir]) {
+		const proc = Bun.spawn(["git", "init", "--quiet", directory], {
+			cwd: fixtureRoot,
+			stdout: "pipe",
+			stderr: "pipe",
+			windowsHide: true,
+		});
+		const [stdout, stderr, exitCode] = await Promise.all([
+			new Response(proc.stdout).text(),
+			new Response(proc.stderr).text(),
+			proc.exited,
+		]);
+		if (exitCode !== 0) throw new Error(stderr.trim() || stdout.trim() || `git init failed: ${exitCode}`);
+	}
 	const baseline: WorktreeBaseline = {
 		root: {
-			repoRoot: "/repo",
+			repoRoot,
 			headCommit: "HEAD",
 			staged: "",
 			unstaged: "",
@@ -154,22 +162,25 @@ function mockIsolation(): void {
 		nested: [],
 	};
 	const isolationHandle: IsolationHandle = {
-		mergedDir: "/tmp/isolated-subagent",
+		mergedDir: isolationDir,
 		backend: worktreeModule.parseIsolationBackend("rcopy")!,
 		fellBack: false,
 		fallbackReason: null,
 	};
 
-	vi.spyOn(worktreeModule, "getRepoRoot").mockResolvedValue("/repo");
 	vi.spyOn(worktreeModule, "captureBaseline").mockResolvedValue(baseline);
 	vi.spyOn(worktreeModule, "ensureIsolation").mockResolvedValue(isolationHandle);
 	vi.spyOn(worktreeModule, "captureDeltaPatch").mockResolvedValue({ rootPatch: "", nestedPatches: [] });
-	vi.spyOn(worktreeModule, "cleanupIsolation").mockResolvedValue();
+	vi.spyOn(worktreeModule, "cleanupIsolation").mockImplementation(async () => {
+		await removeWithRetries(isolationDir);
+	});
+	return { repoRoot, isolationDir };
 }
 
 describe("subagent LSP availability", () => {
-	afterEach(() => {
+	afterEach(async () => {
 		vi.restoreAllMocks();
+		await Promise.all(isolationFixtures.splice(0).map(directory => removeWithRetries(directory)));
 	});
 
 	it("disables LSP for subagents by default", async () => {
@@ -183,7 +194,10 @@ describe("subagent LSP availability", () => {
 		const { getOptions } = mockCreateAgentSession();
 
 		const tool = await TaskTool.create(createSession());
-		await tool.execute("tool-call", TEST_TASK);
+		const result = await tool.execute("tool-call", TEST_TASK);
+		expect(result.details?.results[0]?.error).toBeUndefined();
+		expect(result.details?.results[0]?.exitCode).toBe(0);
+		expect(JSON.parse(result.details!.results[0].output)).toEqual({ ok: true });
 
 		expect(getOptions()?.enableLsp).toBe(false);
 	});
@@ -199,7 +213,10 @@ describe("subagent LSP availability", () => {
 		const { getOptions } = mockCreateAgentSession();
 
 		const tool = await TaskTool.create(createSession({ taskEnableLsp: true }));
-		await tool.execute("tool-call", TEST_TASK);
+		const result = await tool.execute("tool-call", TEST_TASK);
+		expect(result.details?.results[0]?.error).toBeUndefined();
+		expect(result.details?.results[0]?.exitCode).toBe(0);
+		expect(JSON.parse(result.details!.results[0].output)).toEqual({ ok: true });
 
 		expect(getOptions()?.enableLsp).toBe(true);
 		expect(getOptions()?.toolNames).toContain("lsp");
@@ -216,7 +233,10 @@ describe("subagent LSP availability", () => {
 		const { getOptions } = mockCreateAgentSession();
 
 		const tool = await TaskTool.create(createSession({ parentEnableLsp: false, taskEnableLsp: true }));
-		await tool.execute("tool-call", TEST_TASK);
+		const result = await tool.execute("tool-call", TEST_TASK);
+		expect(result.details?.results[0]?.error).toBeUndefined();
+		expect(result.details?.results[0]?.exitCode).toBe(0);
+		expect(JSON.parse(result.details!.results[0].output)).toEqual({ ok: true });
 
 		expect(getOptions()?.enableLsp).toBe(false);
 	});
@@ -229,13 +249,16 @@ describe("subagent LSP availability", () => {
 			source: "bundled",
 			tools: ["lsp"],
 		});
-		mockIsolation();
+		const { repoRoot, isolationDir } = await mockIsolation();
 		const { getOptions } = mockCreateAgentSession();
 
-		const tool = await TaskTool.create(createSession({ isolationEnabled: true }));
-		await tool.execute("tool-call", { ...TEST_TASK, isolated: true });
+		const tool = await TaskTool.create(createSession({ cwd: repoRoot, isolationEnabled: true }));
+		const result = await tool.execute("tool-call", { ...TEST_TASK, isolated: true });
+		expect(result.details?.results[0]?.error).toBeUndefined();
+		expect(result.details?.results[0]?.exitCode).toBe(0);
+		expect(JSON.parse(result.details!.results[0].output)).toEqual({ ok: true });
 
-		expect(getOptions()?.cwd).toBe("/tmp/isolated-subagent");
+		expect(getOptions()?.cwd).toBe(isolationDir);
 		expect(getOptions()?.enableLsp).toBe(false);
 	});
 
@@ -247,17 +270,22 @@ describe("subagent LSP availability", () => {
 			source: "bundled",
 			tools: ["write"],
 		});
-		mockIsolation();
+		const { repoRoot, isolationDir } = await mockIsolation();
 		const { getOptions } = mockCreateAgentSession();
 		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-isolated-session-cwd-"));
 		try {
 			const parentSessionFile = path.join(tempDir, "parent.jsonl");
-			const tool = await TaskTool.create(createSession({ isolationEnabled: true, sessionFile: parentSessionFile }));
-			await tool.execute("tool-call", { ...TEST_TASK, isolated: true });
+			const tool = await TaskTool.create(
+				createSession({ cwd: repoRoot, isolationEnabled: true, sessionFile: parentSessionFile }),
+			);
+			const result = await tool.execute("tool-call", { ...TEST_TASK, isolated: true });
+			expect(result.details?.results[0]?.error).toBeUndefined();
+			expect(result.details?.results[0]?.exitCode).toBe(0);
+			expect(JSON.parse(result.details!.results[0].output)).toEqual({ ok: true });
 
 			const sessionManager = getOptions()?.sessionManager as { getCwd?: () => string } | undefined;
-			expect(getOptions()?.cwd).toBe("/tmp/isolated-subagent");
-			expect(sessionManager?.getCwd?.()).toBe("/tmp/isolated-subagent");
+			expect(getOptions()?.cwd).toBe(isolationDir);
+			expect(sessionManager?.getCwd?.()).toBe(isolationDir);
 		} finally {
 			await removeWithRetries(tempDir);
 		}
@@ -275,7 +303,10 @@ describe("subagent LSP availability", () => {
 		const planMode = { enabled: true, planFilePath: "local://PLAN.md" };
 
 		const tool = await TaskTool.create(createSession({ planMode, taskEnableLsp: true }));
-		await tool.execute("tool-call", TEST_TASK);
+		const result = await tool.execute("tool-call", TEST_TASK);
+		expect(result.details?.results[0]?.error).toBeUndefined();
+		expect(result.details?.results[0]?.exitCode).toBe(0);
+		expect(JSON.parse(result.details!.results[0].output)).toEqual({ ok: true });
 
 		const options = getOptions();
 		expect(options?.enableLsp).toBe(false);

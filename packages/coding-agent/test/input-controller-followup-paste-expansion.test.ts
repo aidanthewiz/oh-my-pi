@@ -8,6 +8,7 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import { InputController } from "@oh-my-pi/pi-coding-agent/modes/controllers/input-controller";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
+import { createSessionDefaults } from "./helpers/session-defaults";
 
 interface PromptOptionsLike {
 	streamingBehavior?: "steer" | "followUp";
@@ -28,6 +29,9 @@ describe("InputController.handleFollowUp paste-marker expansion", () => {
 					editorText = text;
 				},
 				getText: () => editorText,
+				setCollapsedText(text: string) {
+					editorText = text;
+				},
 				getExpandedText: () => editorText.replace(/\[Paste #1(?:, (?:\+\d+ lines|\d+ chars))?\]/g, expanded),
 				addToHistory: vi.fn(),
 				pendingImages: [],
@@ -40,6 +44,8 @@ describe("InputController.handleFollowUp paste-marker expansion", () => {
 			ui: { requestRender: vi.fn() },
 			skillCommands: new Map<string, string>(),
 			session: {
+				...createSessionDefaults(),
+				sessionId: "paste-streaming-main",
 				isStreaming: true,
 				isCompacting: false,
 				isBashRunning: false,
@@ -53,6 +59,7 @@ describe("InputController.handleFollowUp paste-marker expansion", () => {
 			updatePendingMessagesDisplay: vi.fn(),
 			showError: vi.fn(),
 			withLocalSubmission: async (_text: string, fn: () => unknown) => fn(),
+			sessionManager: { getSessionId: () => "session", getLeafId: () => null },
 		} as unknown as InteractiveModeContext;
 
 		await new InputController(ctx).handleFollowUp();
@@ -75,6 +82,9 @@ describe("InputController.handleFollowUp paste-marker expansion", () => {
 					editorText = text;
 				},
 				getText: () => editorText,
+				setCollapsedText(text: string) {
+					editorText = text;
+				},
 				getExpandedText: () => editorText.replace(/\[Paste #2(?:, (?:\+\d+ lines|\d+ chars))?\]/g, expanded),
 				addToHistory: vi.fn(),
 				pendingImages: [],
@@ -87,6 +97,8 @@ describe("InputController.handleFollowUp paste-marker expansion", () => {
 			ui: { requestRender: vi.fn() },
 			skillCommands: new Map<string, string>(),
 			session: {
+				...createSessionDefaults(),
+				sessionId: "paste-idle-main",
 				isStreaming: false,
 				isCompacting: false,
 				isBashRunning: false,
@@ -100,6 +112,7 @@ describe("InputController.handleFollowUp paste-marker expansion", () => {
 			updatePendingMessagesDisplay: vi.fn(),
 			showError: vi.fn(),
 			withLocalSubmission: async (_text: string, fn: () => unknown) => fn(),
+			sessionManager: { getSessionId: () => "session", getLeafId: () => null },
 		} as unknown as InteractiveModeContext;
 
 		await new InputController(ctx).handleFollowUp();

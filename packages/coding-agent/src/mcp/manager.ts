@@ -6,14 +6,13 @@
  */
 import * as path from "node:path";
 import * as url from "node:url";
-import type { AgentToolContext } from "@oh-my-pi/pi-agent-core";
 import type { TSchema } from "@oh-my-pi/pi-ai";
 import { logger, untilAborted } from "@oh-my-pi/pi-utils";
 import type { EffectiveExtensionRoots, SourceMeta } from "../capability/types";
 import { resolveConfigValue } from "../config/resolve-config-value";
 import type { CustomTool } from "../extensibility/custom-tools/types";
 import type { AuthStorage } from "../session/auth-storage";
-import { throwIfAborted } from "../tools/tool-errors";
+import { ToolAbortError, throwIfAborted } from "../tools/tool-errors";
 import {
 	MCPConnectionTimeoutError,
 	connectToServer,
@@ -56,6 +55,7 @@ import type {
 	MCPAuthChallenge,
 	MCPAuthHandlerContext,
 	MCPCallToolOptions,
+	MCPHostCallContext,
 	MCPToolCallResult,
 	MCPGetPromptResult,
 	MCPPrompt,
@@ -68,7 +68,8 @@ import type {
 	MCPToolDefinition,
 	MCPTransport,
 } from "./types";
-import { MCPNotificationMethods, MCPOAuthCancelledError } from "./types";
+import { MCPNotificationMethods } from "./types";
+import { MCPOAuthCancelledError } from "./oauth-reauth";
 export type McpCatalogChangeEvent = { serverName: string; kind: "resources" | "prompts" };
 
 export type MCPConfigLoader = (cwd: string, options?: LoadMCPConfigsOptions) => Promise<LoadMCPConfigsResult>;
@@ -701,7 +702,16 @@ export class MCPManager {
 	 * Set the auth storage for resolving OAuth credentials.
 	 */
 	setAuthStorage(authStorage: AuthStorage): void {
+		if (this.#authStorage === authStorage) return;
+		this.#epoch++;
+		this.#cancelAuthQueue();
+		this.#connectAbort.abort(new DOMException("MCP credential owner replaced", "AbortError"));
+		this.#connectAbort = new AbortController();
 		this.#authStorage = authStorage;
+	}
+
+	get lifecycleGeneration(): number {
+		return this.#epoch;
 	}
 
 	/** Set the callback used to complete OAuth after an MCP auth challenge. */
@@ -1415,33 +1425,51 @@ export class MCPManager {
 		toolName: string,
 		args: Record<string, unknown> = {},
 		options: MCPCallToolOptions = {},
-		context?: AgentToolContext,
+		context?: MCPHostCallContext,
 	): Promise<MCPToolCallResult> {
-		const ownerSignal = this.#connectionAbortControllers.get(serverName)?.signal ?? this.#connectAbort.signal;
+		const ownerSignal = context
+			? this.#connectAbort.signal
+			: (this.#connectionAbortControllers.get(serverName)?.signal ?? this.#connectAbort.signal);
 		const signal = options.signal ? AbortSignal.any([options.signal, ownerSignal]) : ownerSignal;
 		throwIfAborted(signal);
 		const config = this.#serverConfigs.get(serverName);
 		if (!config || config.enabled === false) {
 			throw new Error(`MCP server is not enabled in this session: ${serverName}`);
 		}
+		const isCurrent = () =>
+			!signal.aborted &&
+			this.#serverConfigs.get(serverName) === config &&
+			config.enabled !== false &&
+			context?.mcpOwnerCurrent?.() !== false;
+		const assertCurrent = () => {
+			throwIfAborted(signal);
+			if (!isCurrent()) throw new ToolAbortError("MCP call owner changed");
+		};
+		assertCurrent();
 		let connection = await untilAborted(signal, () => this.waitForConnection(serverName, signal));
+		assertCurrent();
 		if (!connection.transport.connected) {
 			const reconnected = await untilAborted(signal, () => this.#reconnectServerForTool(serverName));
+			assertCurrent();
 			if (!reconnected) throw new Error(`MCP server not connected: ${serverName}`);
 			connection = reconnected;
 		}
-		throwIfAborted(signal);
 		const tools = connection.tools ?? (await untilAborted(signal, () => listTools(connection, { signal })));
+		assertCurrent();
 		const tool = tools.find(candidate => candidate.name === toolName);
 		if (!tool) throw new Error(`MCP tool not found: ${serverName}/${toolName}`);
+		const requestContext: MCPHostCallContext | undefined = context
+			? { ...context, mcpOwnerCurrent: isCurrent }
+			: undefined;
 		const attempt = await dispatchMCPTool(
 			connection,
 			tool,
 			args,
 			reconnectOptions => this.#reconnectServerForTool(serverName, reconnectOptions),
 			{ retry: options.retry, signal },
-			context,
+			requestContext,
 		);
+		assertCurrent();
 		return attempt.result;
 	}
 
@@ -1546,10 +1574,16 @@ export class MCPManager {
 		options?: { authChallenge?: MCPAuthChallenge; awsProfile?: string },
 	): Promise<MCPServerConnection | null> {
 		if (this.#declinedAuthServers.has(name)) return null;
+		const definition = this.getServerConfig(name);
+		const source = this.getSource(name);
+		const epoch = this.#epoch;
+		const isCurrent = (): boolean =>
+			this.#epoch === epoch && this.getServerConfig(name) === definition && this.getSource(name) === source;
 		if (options?.awsProfile) return this.reconnectServer(name, { awsProfile: options.awsProfile });
 		let authChallenge = options?.authChallenge ?? this.#pendingAuthChallenges.get(name);
 		if (!authChallenge) {
 			const connection = await this.reconnectServer(name);
+			if (!isCurrent()) return null;
 			if (connection) return connection;
 			authChallenge = this.#pendingAuthChallenges.get(name);
 			if (!authChallenge) return null;
@@ -1557,15 +1591,40 @@ export class MCPManager {
 
 		try {
 			const authorizedConfig = await this.#runAuthHandler(name, authChallenge);
+			if (!isCurrent()) return null;
 			if (!authorizedConfig) {
 				this.#declinedAuthServers.add(name);
 				return null;
 			}
 			return this.reconnectServer(name, { authorizedConfig });
 		} catch (error) {
-			this.#declinedAuthServers.add(name);
+			if (isCurrent()) this.#declinedAuthServers.add(name);
 			throw error;
 		}
+	}
+
+	/**
+	 * Replace a stored server definition in place — used when its credentials
+	 * were refreshed outside the manager (e.g. `/mcp reauth` wrote a fresh
+	 * url-keyed credential row and the next auth resolution must pick it up).
+	 *
+	 * Updates both the stored definition and any live connection's `config`
+	 * ({@link reconnectServer} prefers the live connection's copy over the
+	 * stored map), and forgets any lost-server retry schedule so the next
+	 * reconnect uses the new definition instead of re-arming the stale one.
+	 *
+	 * Returns the in-flight reconnection for the server, if one was pending:
+	 * it captured the old definition and aborts on its next identity check.
+	 * Callers that intend to reconnect must await it first, or
+	 * {@link reconnectServer} merely joins the dying attempt instead of
+	 * starting a fresh one against the new definition.
+	 */
+	updateServerConfig(name: string, config: MCPServerConfig): Promise<MCPServerConnection | null> | undefined {
+		this.#serverConfigs.set(name, config);
+		const connection = this.#connections.get(name);
+		if (connection) connection.config = config;
+		this.#forgetLostServer(name);
+		return this.#pendingReconnections.get(name);
 	}
 
 	/**
@@ -1630,7 +1689,7 @@ export class MCPManager {
 	 */
 	async prepareConfig(
 		config: MCPServerConfig,
-		options?: { oauth?: boolean; sourceLevel?: SourceMeta["level"] },
+		options?: { oauth?: boolean; sourceLevel?: SourceMeta["level"]; signal?: AbortSignal },
 	): Promise<MCPServerConfig> {
 		return this.#resolveAuthConfig(config, options);
 	}
@@ -1790,8 +1849,11 @@ export class MCPManager {
 			authChallenge?: MCPAuthChallenge;
 			authorizedConfig?: MCPServerConfig;
 			awsProfile?: string;
+			signal?: AbortSignal;
+			isCurrent?: () => boolean;
 		},
 	): Promise<MCPServerConnection | null> {
+		if (options?.signal?.aborted || options?.isCurrent?.() === false) return null;
 		if (options?.manual) {
 			this.#reconnectHistory.delete(name);
 			this.#pendingAuthChallenges.delete(name);
@@ -1811,6 +1873,8 @@ export class MCPManager {
 				authChallenge: options?.authChallenge,
 				authorizedConfig: options?.authorizedConfig,
 				awsProfile: options?.awsProfile,
+				signal: options?.signal,
+				isCurrent: options?.isCurrent,
 			}),
 		);
 	}
@@ -1921,11 +1985,15 @@ export class MCPManager {
 			authorizedConfig?: MCPServerConfig;
 			scheduled?: boolean;
 			awsProfile?: string;
+			signal?: AbortSignal;
+			isCurrent?: () => boolean;
 		},
 	): Promise<MCPServerConnection | null> {
 		const { authChallenge, authorizedConfig, scheduled = false } = options;
+		if (options.signal?.aborted || options.isCurrent?.() === false) return null;
 		const oldConnection = this.#connections.get(name);
 		let config = oldConnection?.config ?? this.#serverConfigs.get(name);
+		const authEpoch = this.#epoch;
 		const source = this.#sources.get(name) ?? oldConnection?._source;
 		if (!config) return null;
 		const reconnectSignal = this.#connectionAbortControllers.get(name)?.signal ?? this.#connectAbort.signal;
@@ -1944,7 +2012,15 @@ export class MCPManager {
 			}
 			try {
 				const refreshedConfig = await this.#runAuthHandler(name, authChallenge);
-				if (reconnectSignal.aborted || this.#serverConfigs.get(name) !== config) return null;
+				if (
+					reconnectSignal.aborted ||
+					this.#epoch !== authEpoch ||
+					this.#serverConfigs.get(name) !== config ||
+					this.#sources.get(name) !== source ||
+					options.signal?.aborted ||
+					options.isCurrent?.() === false
+				)
+					return null;
 				if (!refreshedConfig) {
 					this.#declinedAuthServers.add(name);
 					return null;
@@ -1989,6 +2065,10 @@ export class MCPManager {
 		// attempt is a single quiet probe; its pacing is the schedule itself.
 		const delays = scheduled ? [] : this.reconnectPolicy.ladderMs;
 		for (let attempt = 0; attempt <= delays.length; attempt++) {
+			if (options.signal?.aborted || options.isCurrent?.() === false) {
+				this.#forgetLostServer(name);
+				return null;
+			}
 			if (reconnectSignal.aborted || this.#epoch !== reconnectEpoch || this.#serverConfigs.get(name) !== config) {
 				logger.debug("MCP reconnect aborted before attempt after configuration changed", {
 					path: `mcp:${name}`,
@@ -2005,6 +2085,7 @@ export class MCPManager {
 					reconnectEpoch,
 					reconnectSignal,
 					options.awsProfile ?? oldConnection?.awsPreferredProfile,
+					options,
 				);
 				if (!this.#ownsConnection(name, connection)) return null;
 				this.#pendingAuthChallenges.delete(name);
@@ -2012,6 +2093,10 @@ export class MCPManager {
 				this.#emitConnectionStatus({ type: "connected", serverName: name });
 				return connection;
 			} catch (error) {
+				if (options.signal?.aborted || options.isCurrent?.() === false) {
+					this.#forgetLostServer(name);
+					return null;
+				}
 				if (reconnectSignal.aborted || this.#epoch !== reconnectEpoch || this.#serverConfigs.get(name) !== config) {
 					logger.debug("MCP reconnect aborted after configuration changed", {
 						path: `mcp:${name}`,
@@ -2057,13 +2142,27 @@ export class MCPManager {
 		config: MCPServerConfig,
 		source: SourceMeta | undefined,
 		reconnectEpoch: number,
-		connectSignal: AbortSignal,
+		connectionSignal: AbortSignal,
 		awsPreferredProfile?: string,
+		options: { signal?: AbortSignal; isCurrent?: () => boolean } = {},
 	): Promise<MCPServerConnection> {
+		const connectSignal = options.signal ? AbortSignal.any([connectionSignal, options.signal]) : connectionSignal;
+		const assertCurrent = (): void => {
+			if (
+				connectSignal.aborted ||
+				options.isCurrent?.() === false ||
+				this.#serverConfigs.get(name) !== config ||
+				this.#epoch !== reconnectEpoch
+			) {
+				throw new MCPOAuthCancelledError();
+			}
+		};
+		assertCurrent();
 		const resolvedConfig = await this.#resolveAuthConfig(config, {
 			sourceLevel: source?.level,
 			signal: connectSignal,
 		});
+		assertCurrent();
 		const policy = resolveMCPChildCredentialPolicy(name, resolvedConfig, source);
 		const connection = await connectToServer(name, resolvedConfig, {
 			signal: connectSignal,
@@ -2083,10 +2182,12 @@ export class MCPManager {
 
 		// Bail out if the server was disconnected or the manager was reset
 		// while we were connecting (e.g. /mcp reload called disconnectAll).
-		if (connectSignal.aborted || this.#serverConfigs.get(name) !== config || this.#epoch !== reconnectEpoch) {
+		try {
+			assertCurrent();
+		} catch (error) {
 			this.#detachConnection(name, connection);
 			void disconnectServer(connection).catch(() => {});
-			throw new Error(`Server "${name}" was disconnected during reconnection`);
+			throw error;
 		}
 
 		this.#connections.set(name, connection);
@@ -2115,6 +2216,7 @@ export class MCPManager {
 		};
 		try {
 			const serverTools = await listTools(connection, { signal: connectSignal });
+			assertCurrent();
 			const reconnect = (options?: { authChallenge?: MCPAuthChallenge; awsProfile?: string }) =>
 				this.reconnectServer(name, options);
 			const customTools = MCPTool.fromTools(connection, serverTools, reconnect);
@@ -2404,16 +2506,20 @@ export class MCPManager {
 	}
 
 	/**
-	 * Get server instructions allowed by config (for prompt injection and rebuild signatures).
+	 * Get server instructions allowed by config (for prompt injection and rebuild signatures),
+	 * keyed by server name in sorted order. `#connections` follows connection order, which
+	 * shifts with late connects and reconnects; sorting keeps the rendered
+	 * "## MCP Server Instructions" section byte-stable so the provider prompt cache survives.
 	 */
 	getServerInstructions(): Map<string, string> {
-		const instructions = new Map<string, string>();
+		const instructions: [string, string][] = [];
 		for (const [name, connection] of this.#connections) {
 			if (connection.config.instructions !== false && connection.instructions) {
-				instructions.set(name, connection.instructions);
+				instructions.push([name, connection.instructions]);
 			}
 		}
-		return instructions;
+		instructions.sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0));
+		return new Map(instructions);
 	}
 
 	/**

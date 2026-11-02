@@ -44,8 +44,8 @@ describe("issue #9967 default model with ambient Bedrock credentials", () => {
 		registry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
 	});
 
-	afterEach(() => {
-		authStorage.close();
+	afterEach(async () => {
+		await authStorage.close();
 		if (savedAccessKey === undefined) delete process.env.AWS_ACCESS_KEY_ID;
 		else process.env.AWS_ACCESS_KEY_ID = savedAccessKey;
 		if (savedSecret === undefined) delete process.env.AWS_SECRET_ACCESS_KEY;

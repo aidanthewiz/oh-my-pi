@@ -29,11 +29,11 @@ describe("issue #5780 post-auth runtime provider refresh", () => {
 		registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: offlineFetch });
 	});
 
-	afterEach(() => {
+	afterEach(async () => {
 		vi.useRealTimers();
 		clearCustomApis();
 		unregisterOAuthProviders(sourceId);
-		authStorage.close();
+		await authStorage.close();
 		if (tempDir && fs.existsSync(tempDir)) removeSyncWithRetries(tempDir);
 	});
 

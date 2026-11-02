@@ -1,8 +1,15 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
+import { TempDir } from "@oh-my-pi/pi-utils";
+import { FileLock } from "@oh-my-pi/pi-natives";
+import { withArtifactPublicationLock } from "../../src/session/artifact-publication";
+import { artifactFileGeneration, serializeStructuredArtifactSidecar } from "../../src/session/artifacts";
 import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { LoadExtensionsResult } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import type { CreateAgentSessionOptions, CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession, AgentSessionEvent, PromptOptions } from "@oh-my-pi/pi-coding-agent/session/agent-session";
@@ -30,9 +37,16 @@ interface HangingSessionHandle {
 
 function createHangingSession(): HangingSessionHandle {
 	let abortCount = 0;
+	let disposed = false;
 	const { promise: hang, resolve: releaseHang } = Promise.withResolvers<void>();
 	const session: Partial<AgentSession> = {
 		...createSessionDefaults(),
+		get isDisposed() {
+			return disposed;
+		},
+		dispose: async () => {
+			disposed = true;
+		},
 		state: { messages: [] } as never,
 		agent: { state: { systemPrompt: ["test"] } } as never,
 		extensionRunner: undefined as never,
@@ -61,8 +75,16 @@ function createHangingSession(): HangingSessionHandle {
 }
 
 function mockCreateAgentSession(session: AgentSession) {
+	let disposed = false;
+	const dispose = session.dispose.bind(session);
+	vi.spyOn(session, "dispose").mockImplementation(async () => {
+		disposed = true;
+		await dispose();
+	});
 	return vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue({
 		session,
+		captureOwnerCurrent: () => () => !disposed && !session.isDisposed,
+		captureOwnerLifetimeCurrent: () => () => !disposed && !session.isDisposed,
 		extensionsResult: {} as unknown as LoadExtensionsResult,
 		setToolUIContext: () => {},
 		eventBus: new EventBus(),
@@ -113,6 +135,68 @@ describe("runSubprocess wall clock (task.maxRuntimeMs)", () => {
 		// Sanity: must finish in roughly the configured window (allow generous slack
 		// for CI; the contract is "doesn't hang for hours", not "exactly 50 ms").
 		expect(elapsedMs).toBeLessThan(10_000);
+	});
+
+	it("returns an expired run without waiting for an unrelated artifact publication", async () => {
+		using temp = TempDir.createSync("@omp-expired-publication-");
+		const artifactsDir = temp.path();
+		const id = "expired-publication";
+		const primary = path.join(artifactsDir, `${id}.md`);
+		const sidecar = path.join(artifactsDir, `${id}.json`);
+		const accepted = '{"report":"accepted result"}';
+		await fs.writeFile(primary, accepted);
+		const envelope = serializeStructuredArtifactSidecar(
+			accepted,
+			artifactFileGeneration(await fs.stat(primary, { bigint: true })),
+		);
+		await fs.writeFile(sidecar, envelope);
+		const handle = createHangingSession();
+		mockCreateAgentSession(handle.session);
+		AgentRegistry.global().register({
+			id,
+			displayName: id,
+			kind: "sub",
+			status: "running",
+			session: handle.session,
+		});
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const holder = withArtifactPublicationLock(async () => {
+			entered.resolve();
+			await release.promise;
+		});
+		await entered.promise;
+		const contended = Promise.withResolvers<undefined>();
+		const acquire = FileLock.tryAcquire.bind(FileLock);
+		vi.spyOn(FileLock, "tryAcquire").mockImplementation((...args) => {
+			const lock = acquire(...args);
+			if (!lock.acquired) contended.resolve(undefined);
+			return lock;
+		});
+		const pending = runSubprocess({
+			...baseOptions,
+			id,
+			artifactsDir,
+			keepAlive: true,
+			settings: Settings.isolated({ "task.maxRuntimeMs": 50, "task.agentIdleTtlMs": 0 }),
+		});
+		try {
+			const result = await Promise.race([pending, contended.promise]);
+			expect(result?.exitCode).toBe(1);
+			expect(result?.aborted).toBe(true);
+			expect(result?.abortReason).toContain("runtime limit exceeded");
+			expect(result?.outputPath).toBeUndefined();
+			expect(AgentRegistry.global().get(id)?.status).toBe("idle");
+			expect(handle.session.isDisposed).toBe(false);
+			expect(AgentLifecycleManager.global().has(id)).toBe(true);
+			expect(await fs.readFile(primary, "utf8")).toBe(accepted);
+			expect(await fs.readFile(sidecar, "utf8")).toBe(envelope);
+		} finally {
+			release.resolve();
+			await holder;
+			await pending;
+			AgentLifecycleManager.resetGlobalForTests();
+		}
 	});
 
 	it("does not abort early when the runtime budget is unlimited", async () => {
@@ -175,6 +259,8 @@ describe("runSubprocess wall clock (task.maxRuntimeMs)", () => {
 			await new Promise(resolve => setTimeout(resolve, 200));
 			return {
 				session: handle.session,
+				captureOwnerCurrent: () => () => !handle.session.isDisposed,
+				captureOwnerLifetimeCurrent: () => () => !handle.session.isDisposed,
 				extensionsResult: {} as unknown as LoadExtensionsResult,
 				setToolUIContext: () => {},
 				eventBus: new EventBus(),
@@ -202,9 +288,16 @@ describe("runSubprocess wall clock (task.maxRuntimeMs)", () => {
 		const creationGate = Promise.withResolvers<void>();
 		const creationStarted = Promise.withResolvers<CreateAgentSessionOptions>();
 		const lateDisposed = Promise.withResolvers<void>();
+		let disposed = false;
 		const lateSession = {
 			...createSessionDefaults(),
-			dispose: async () => lateDisposed.resolve(),
+			get isDisposed() {
+				return disposed;
+			},
+			dispose: async () => {
+				disposed = true;
+				lateDisposed.resolve();
+			},
 		} as unknown as AgentSession;
 		let lateInstall = registry.get("late-generation");
 		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async (options = {}) => {
@@ -223,6 +316,23 @@ describe("runSubprocess wall clock (task.maxRuntimeMs)", () => {
 			);
 			return {
 				session: lateSession,
+				captureOwnerCurrent: ({ allowParked = false } = {}) => {
+					const ownerRef = lateInstall;
+					return () =>
+						!disposed &&
+						ownerRef !== undefined &&
+						registry.get("late-generation") === ownerRef &&
+						ownerRef.status !== "aborted" &&
+						(allowParked || ownerRef.status !== "parked");
+				},
+				captureOwnerLifetimeCurrent: () => {
+					const ownerRef = lateInstall;
+					return () =>
+						!disposed &&
+						ownerRef !== undefined &&
+						registry.get("late-generation") === ownerRef &&
+						ownerRef.status !== "aborted";
+				},
 				extensionsResult: {} as unknown as LoadExtensionsResult,
 				setToolUIContext: () => {},
 				eventBus: new EventBus(),

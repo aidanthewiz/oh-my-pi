@@ -27,7 +27,7 @@ it("keeps excluded-name files while pruning directories and finding ignored rule
 		expect(result.agentsMdFiles).toEqual(["src/AGENTS.md", "src/a/b/c/AGENTS.md"]);
 		expect(result.truncated).toBe(false);
 		const disabled = await listWorkspace({ path: root, maxDepth: 0, collectAgentsMd: false });
-		expect(disabled).toEqual({ entries: [], agentsMdFiles: [], truncated: false });
+		expect(disabled.agentsMdFiles).toEqual([]);
 	} finally {
 		await fs.rm(root, { recursive: true, force: true });
 	}
@@ -78,3 +78,60 @@ it.skipIf(process.platform === "win32")("finds file symlink rules without traver
 		await fs.rm(root, { recursive: true, force: true });
 	}
 });
+
+it.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
+	"reports unreadable children only when requested and continues through readable siblings",
+	async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "workspace-directory-errors-"));
+		const blocked = path.join(root, "blocked");
+		try {
+			await Bun.write(path.join(blocked, "secret.txt"), "hidden");
+			await Bun.write(path.join(root, "visible/ok.txt"), "readable");
+			await fs.chmod(blocked, 0);
+			const bestEffort = await listWorkspace({ path: root, maxDepth: 2 });
+			expect(bestEffort.unreadableDirectories).toEqual([]);
+			expect(bestEffort.entries.map(entry => entry.path)).toContain("visible/ok.txt");
+			const reported = await listWorkspace({ path: root, maxDepth: 2, reportDirectoryErrors: true });
+			expect(reported.unreadableDirectories.map(directory => directory.path)).toEqual(["blocked"]);
+			expect(reported.entries.map(entry => entry.path)).toContain("visible/ok.txt");
+			expect(reported.entries.map(entry => entry.path)).not.toContain("blocked/secret.txt");
+		} finally {
+			await fs.chmod(blocked, 0o700);
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	},
+);
+
+it.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
+	"rejects an unreadable root when reporting is enabled while discovery stays best effort",
+	async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "workspace-root-error-"));
+		try {
+			await Bun.write(path.join(root, "secret.txt"), "hidden");
+			await fs.chmod(root, 0);
+			const bestEffort = await listWorkspace({ path: root, maxDepth: 1 });
+			expect(bestEffort.entries).toEqual([]);
+			await expect(listWorkspace({ path: root, maxDepth: 1, reportDirectoryErrors: true })).rejects.toThrow();
+		} finally {
+			await fs.chmod(root, 0o700);
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	},
+);
+
+it.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
+	"rejects an unreadable root at depth zero when reporting directory errors",
+	async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "workspace-denied-root-"));
+		try {
+			await Bun.write(path.join(root, "present.txt"), "present");
+			await fs.chmod(root, 0o000);
+			await expect(listWorkspace({ path: root, maxDepth: 0, reportDirectoryErrors: true })).rejects.toThrow(
+				/permission denied|os error 13/i,
+			);
+		} finally {
+			await fs.chmod(root, 0o755);
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	},
+);

@@ -3063,7 +3063,8 @@ export class ModelHubComponent implements Component {
 				this.#browser,
 			);
 		}
-		return node("col", { gap: "sm", grow: 1 }, children, "body");
+		// Zero basis: the body takes the space left of the sidebar instead of sizing to its widest line.
+		return node("col", { gap: "sm", grow: 1, basis: 0, min: { w: 0 } }, children, "body");
 	}
 
 	#describeStatus(): NativeNode {
@@ -3386,13 +3387,7 @@ export class ModelHubComponent implements Component {
 				...props,
 				tabs: this.#pickerKindTabs(),
 				tab: this.#modelKindTab,
-				columns: MODEL_PICKER_COLUMNS,
-				...catalogue,
-				order: view.order,
-				...(view.hits ? { hits: view.hits } : {}),
-				selected: this.#browser.pickerSelected,
-				...(current ? { current } : {}),
-				total: this.#browser.baseCount,
+				...this.#browser.pickerRows(catalogue, view, this.#currentSelector),
 				state,
 				...(state === "error" && this.#configError ? { message: this.#configError } : {}),
 				empty:

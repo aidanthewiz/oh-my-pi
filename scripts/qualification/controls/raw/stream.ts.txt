@@ -1,0 +1,489 @@
+import assert from "node:assert/strict";
+import { createHash, randomUUID } from "node:crypto";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
+import type { IpcConnection as NativeConnection } from "../../packages/natives/native/index";
+import type { Terminal } from "../../packages/tui/src/terminal";
+import type { PaintListener } from "../../packages/tui/src/tui";
+
+const sha256 = (bytes: Uint8Array | string) => createHash("sha256").update(bytes).digest("hex");
+function required(key: string): string {
+	const value = process.env[key];
+	assert(value, `missing ${key}`);
+	return value;
+}
+function beneath(root: string, file: string): boolean {
+	return file.startsWith(`${root}${path.sep}`);
+}
+async function bounded<T>(promise: Promise<T>, label: string): Promise<T> {
+	let timer: NodeJS.Timeout | undefined;
+	try {
+		return await Promise.race([promise, new Promise<never>((_, reject) => {
+			timer = setTimeout(() => reject(new Error(`deadline: ${label}`)), 8000);
+		})]);
+	} finally {
+		clearTimeout(timer);
+	}
+}
+interface Journal<T> {
+	values: T[];
+	push(value: T): void;
+	wait(predicate: (value: T) => boolean): Promise<T>;
+}
+function journal<T>(): Journal<T> {
+	const values: T[] = [];
+	const waiters: Array<{ predicate: (value: T) => boolean; resolve: (value: T) => void }> = [];
+	return {
+		values,
+		push(value: T) {
+			values.push(value);
+			for (let i = waiters.length - 1; i >= 0; i--) {
+				if (!waiters[i]!.predicate(value)) continue;
+				waiters.splice(i, 1)[0]!.resolve(value);
+			}
+		},
+		wait(predicate: (value: T) => boolean): Promise<T> {
+			const found = values.find(predicate);
+			if (found !== undefined) return Promise.resolve(found);
+			const pending = Promise.withResolvers<T>();
+			waiters.push({ predicate, resolve: pending.resolve });
+			return bounded(pending.promise, "observed payload");
+		},
+	};
+}
+type Frame = { t: string; [key: string]: unknown };
+const compiled = process.env.PI_COMPILED === "true";
+const manifestPath = required("V1890_SOURCE_INPUT_MANIFEST");
+assert(path.isAbsolute(manifestPath));
+const manifestBytes = await fs.readFile(manifestPath);
+assert.equal(sha256(manifestBytes), required("V1890_SOURCE_INPUT_SHA256"));
+const manifest = JSON.parse(manifestBytes.toString());
+assert.equal(manifest.schema, "CoreforgeCandidateSourceSnapshot");
+assert(Array.isArray(manifest.records));
+assert.equal(sha256(JSON.stringify(manifest.records)), manifest.sourceDigest);
+assert.match(manifest.engineHead, /^[a-f0-9]{40}$/);
+assert(manifest.mergeHead === null || /^[a-f0-9]{40}$/.test(manifest.mergeHead));
+assert.equal(manifest.native.sha256, required("V1890_NATIVE_SHA256"));
+const version = required("CF_UPSTREAM_CANDIDATE_VERSION");
+const suppliedRoot = required("CF_REVIEW_RUNTIME_ROOT");
+assert(path.isAbsolute(suppliedRoot));
+const runtimeRoot = await fs.realpath(suppliedRoot);
+assert((await fs.stat(runtimeRoot)).isDirectory());
+const portText = required("CF_REVIEW_RELAY_PORT");
+assert.match(portText, /^[1-9][0-9]*$/);
+const relayPort = Number(portText);
+assert(Number.isSafeInteger(relayPort) && relayPort <= 65535);
+const root = await fs.mkdtemp(path.join(runtimeRoot, "s-"));
+const owner = randomUUID();
+const relayToken = `review-${owner}`;
+await fs.writeFile(path.join(root, ".owner"), owner, { flag: "wx", mode: 0o600 });
+const oldEnvironment = new Map<string, { process: string | undefined; bun: string | undefined }>();
+function environment(key: string, value?: string): void {
+	if (!oldEnvironment.has(key)) oldEnvironment.set(key, { process: process.env[key], bun: Bun.env[key] });
+	if (value === undefined) { delete process.env[key]; delete Bun.env[key]; }
+	else { process.env[key] = value; Bun.env[key] = value; }
+}
+const cleanups: Array<() => void | Promise<void>> = [];
+const cases: Array<{ id: string; [key: string]: unknown }> = [];
+const endpoints: string[] = [];
+let failure: unknown;
+let cleanupVerified = false;
+let fixtureRootRemoved = false;
+let nativeIdentity: unknown;
+try {
+	const home = path.join(root, "h");
+	await fs.mkdir(home);
+	// Reject long authority roots before ipcEndpoint can select its global /tmp fallback.
+	assert(Buffer.byteLength(path.join(home, "o/run/daemons/0000000000000000/stream.sock")) < 104,
+		"CF_REVIEW_RUNTIME_ROOT must be short enough for private Unix sockets");
+	for (const [key, value] of Object.entries({ HOME: home, USERPROFILE: home, PI_CONFIG_DIR: "o",
+		PI_CODING_AGENT_DIR: path.join(home, "o/agent"), XDG_CONFIG_HOME: path.join(root, "c"),
+		XDG_DATA_HOME: path.join(root, "d"), XDG_STATE_HOME: path.join(root, "s"), XDG_CACHE_HOME: path.join(root, "k"),
+		TMPDIR: path.join(root, "t"), TMP: path.join(root, "t"), TEMP: path.join(root, "t"), TERM_PROGRAM: "review-owned",
+		PI_NO_TITLE: "1", GIT_OPTIONAL_LOCKS: "0" })) environment(key, value);
+	for (const key of ["PI_PROFILE", "OMP_PROFILE", "OMP_TUI_DEBUG"]) environment(key);
+	await fs.mkdir(path.join(root, "t"));
+	// These owners capture HOME/profile authority at import. Static imports would precede fixture isolation.
+	const { IpcConnection, IpcServer } = await import("../../packages/natives/native/index.js");
+	const { nativeAddonStatus } = await import("../../packages/natives/native/loader-state.js");
+	const native = nativeAddonStatus();
+	assert(native && !native.stale);
+	assert.equal(native.version, version);
+	assert.equal(native.packageVersion, version);
+	nativeIdentity = { version: native.version, packageVersion: native.packageVersion, stale: native.stale,
+		sha256: manifest.native.sha256, verificationOwner: "parent runtime wrapper" };
+	const { setAgentDir, getDaemonRuntimeDir } = await import("../../packages/utils/src/dirs");
+	setAgentDir(path.join(home, "o/agent"));
+	const { StreamMuxHost } = await import("../../packages/coding-agent/src/stream/streamer");
+	const { StreamPublisher } = await import("../../packages/coding-agent/src/stream/publisher");
+	const { streamSocketEndpoint } = await import("../../packages/coding-agent/src/stream/paths");
+	const { STREAM_LOCAL_PROTO } = await import("../../packages/coding-agent/src/stream/protocol");
+	const { STREAM_PROTO } = await import("../../packages/wire/src/stream");
+	const { StreamRedactor } = await import("../../packages/coding-agent/src/stream/redactor");
+	const { TUI } = await import("../../packages/tui/src/tui");
+	const redactor = new StreamRedactor([], []);
+	let nextProject = 0;
+	async function project(): Promise<string> {
+		const cwd = path.join(root, `p${nextProject++}`);
+		await fs.mkdir(cwd);
+		const expected = path.join(getDaemonRuntimeDir(await fs.realpath(cwd)), "stream.sock");
+		assert(beneath(runtimeRoot, expected), "Daemon authority must stay inside the supplied private runtime root");
+		assert(Buffer.byteLength(expected) < 104);
+		const endpoint = await streamSocketEndpoint(cwd);
+		assert.equal(endpoint, expected);
+		endpoints.push(endpoint);
+		return cwd;
+	}
+
+	// The real native start remains the transport owner. Only its JS callback is gated.
+	const descriptor = Object.getOwnPropertyDescriptor(IpcConnection.prototype, "start");
+	assert(descriptor && typeof descriptor.value === "function");
+	const originalStart = IpcConnection.prototype.start;
+	const tracked = new Map<NativeConnection, PromiseWithResolvers<void>>();
+	type Gate = { armed: boolean; connection?: NativeConnection; action?: () => void;
+		closed: PromiseWithResolvers<void>; observed?: { nativeClosedBeforeFrame: boolean; frame: string } };
+	let gate: Gate | undefined;
+	Object.defineProperty(IpcConnection.prototype, "start", { ...descriptor, value: function (
+		this: NativeConnection, onFrame: (line: string) => void, onClose: (reason: string | null) => void,
+	) {
+		const closed = Promise.withResolvers<void>();
+		tracked.set(this, closed);
+		return originalStart.call(this, line => {
+			const active = gate;
+			if (active?.armed) {
+				active.armed = false;
+				active.connection = this;
+				const deadline = performance.now() + 3000;
+				while (!this.closed) {
+					if (performance.now() >= deadline) {
+						active.closed.reject(new Error("native EOF did not precede JS delivery"));
+						return;
+					}
+				}
+				active.observed = { nativeClosedBeforeFrame: this.closed, frame: line };
+				active.action?.();
+			}
+			onFrame(line);
+		}, reason => {
+			try { onClose(reason); }
+			finally {
+				closed.resolve();
+				if (gate?.connection === this) gate.closed.resolve();
+			}
+		});
+	} });
+	cleanups.push(() => { Object.defineProperty(IpcConnection.prototype, "start", descriptor); });
+	cleanups.push(async () => {
+		for (const conn of tracked.keys()) conn.destroy();
+		await bounded(Promise.all([...tracked.values()].map(value => value.promise)), "all native close callbacks");
+	});
+	function arm(action?: () => void): Gate {
+		assert.equal(gate, undefined);
+		gate = { armed: true, action, closed: Promise.withResolvers<void>() };
+		return gate;
+	}
+	async function finishGate(active: Gate) {
+		try {
+			await bounded(active.closed.promise, "native gated close");
+			assert(active.observed?.nativeClosedBeforeFrame);
+			return active.observed;
+		} finally { gate = undefined; }
+	}
+	function send(conn: NativeConnection, frames: Array<object | string>): void {
+		for (const frame of frames) conn.send(typeof frame === "string" ? frame : JSON.stringify(frame));
+	}
+	async function destroy(conn: NativeConnection): Promise<void> {
+		conn.destroy();
+		const pending = tracked.get(conn);
+		assert(pending, "connection must have a tracked close callback");
+		await bounded(pending.promise, "native peer cleanup");
+	}
+
+	interface RelayEntry {
+		frames: Journal<Frame>;
+		closed: PromiseWithResolvers<void>;
+	}
+	const relayConnections = journal<RelayEntry>();
+	const relay = Bun.serve<{ entry: RelayEntry }>({
+		hostname: "127.0.0.1", port: relayPort,
+		fetch(request, server) {
+			if (new URL(request.url).pathname !== "/ws/host" ||
+				request.headers.get("authorization") !== `Bearer ${relayToken}`) {
+				return new Response("rejected", { status: 403 });
+			}
+			const entry = { frames: journal<Frame>(), closed: Promise.withResolvers<void>() };
+			if (server.upgrade(request, { data: { entry } })) return undefined;
+			return new Response("upgrade required", { status: 400 });
+		},
+		websocket: {
+			open(socket) { relayConnections.push(socket.data.entry); },
+			message(socket, data) {
+				const frame = JSON.parse(typeof data === "string" ? data : data.toString("utf8")) as Frame;
+				socket.data.entry.frames.push(frame);
+				if (frame.t === "hello") socket.send(JSON.stringify({ t: "welcome", proto: STREAM_PROTO,
+					channel: "synthetic-review", url: `http://127.0.0.1:${relayPort}/synthetic-review`, user: "owned-relay" }));
+			},
+			close(socket) { socket.data.entry.closed.resolve(); },
+		},
+	});
+	assert.equal(relay.port, relayPort);
+	cleanups.push(async () => {
+		await relay.stop(true);
+		await bounded(Promise.all(relayConnections.values.map(entry => entry.closed.promise)), "all relay close callbacks");
+	});
+	async function hostFixture() {
+		const cwd = await project();
+		const events = journal<Frame>();
+		const previous = relayConnections.values.length;
+		const host = new StreamMuxHost({ projectDir: cwd, title: "Synthetic stream review",
+			hostUrl: `ws://127.0.0.1:${relayPort}/ws/host`, token: async () => relayToken,
+			redactor, onEvent: event => events.push(event) });
+		cleanups.push(() => host.close("review cleanup"));
+		const endpoint = await host.start();
+		assert(beneath(runtimeRoot, endpoint) && Buffer.byteLength(endpoint) < 104);
+		await events.wait(event => event.t === "link" && event.state === "live");
+		assert.equal(relayConnections.values.length, previous + 1);
+		const remote = relayConnections.values[previous]!;
+		await remote.frames.wait(frame => frame.t === "hello");
+		return { cwd, endpoint, host, events, remote, async close() {
+			await host.close("review case complete");
+			await bounded(remote.closed.promise, "relay host close");
+		} };
+	}
+	async function session(endpoint: string) {
+		const conn = await IpcConnection.connect(endpoint, { framing: "lines", timeoutMs: 3000 });
+		const frames = journal<Frame>();
+		conn.start(line => frames.push(JSON.parse(line)), () => {});
+		return { conn, frames };
+	}
+	const hello = { t: "hello", proto: STREAM_LOCAL_PROTO, sessionId: "synthetic", title: "Final", cols: 80, rows: 2 };
+	{
+		const fixture = await hostFixture();
+		const peer = await session(fixture.endpoint);
+		send(peer.conn, [hello]);
+		await peer.frames.wait(frame => frame.t === "welcome");
+		const active = arm();
+		send(peer.conn, [{ t: "history", rows: ["committed final history"] },
+			{ t: "viewport", rows: ["final screen", "last row"] },
+			{ t: "patch", rows: 2, ops: [[1, "last update"]] }]);
+		peer.conn.end();
+		const nativeGate = await finishGate(active);
+		await fixture.remote.frames.wait(frame => frame.t === "pane-close");
+		const forwarded = fixture.remote.frames.values.filter(frame => frame.t !== "hello");
+		assert.deepEqual(forwarded, [
+			{ t: "pane-open", pane: 1, title: "Final", cols: 80, rows: 2 },
+			{ t: "history", pane: 1, rows: ["committed final history"] },
+			{ t: "viewport", pane: 1, rows: ["final screen", "last row"] },
+			{ t: "patch", pane: 1, rows: 2, ops: [[1, "last update"]] }, { t: "pane-close", pane: 1 },
+		]);
+		await destroy(peer.conn); await fixture.close();
+		cases.push({ id: "host-native-eof-final-screen", nativeGate, forwarded });
+	}
+	for (const invalid of ["invalid-json", "invalid-screen", "duplicate-hello"]) {
+		const fixture = await hostFixture();
+		const peer = await session(fixture.endpoint);
+		send(peer.conn, [hello]);
+		await peer.frames.wait(frame => frame.t === "welcome");
+		const active = arm();
+		send(peer.conn, [invalid === "invalid-json" ? "{" : invalid === "invalid-screen" ? { t: "viewport", rows: [42] } : hello,
+			{ t: "viewport", rows: ["forbidden queued payload"] }]);
+		peer.conn.end();
+		const nativeGate = await finishGate(active);
+		await fixture.remote.frames.wait(frame => frame.t === "pane-close");
+		const forwarded = fixture.remote.frames.values.filter(frame => frame.t !== "hello");
+		assert.deepEqual(forwarded, [{ t: "pane-open", pane: 1, title: "Final", cols: 80, rows: 2 }, { t: "pane-close", pane: 1 }]);
+		await destroy(peer.conn); await fixture.close();
+		cases.push({ id: `host-reject-${invalid}`, nativeGate, forwarded });
+	}
+	{
+		const fixture = await hostFixture();
+		const peer = await session(fixture.endpoint);
+		const active = arm(() => { void fixture.host.close("local cancellation"); });
+		send(peer.conn, [hello, { t: "viewport", rows: ["must not reanimate"] }]);
+		peer.conn.end();
+		const nativeGate = await finishGate(active);
+		assert.equal(await bounded(fixture.host.wait(), "canceled host"), 0);
+		assert.deepEqual(fixture.events.values.filter(event => event.t === "pane"), []);
+		assert(fixture.events.values.some(event => event.t === "link" && event.state === "stopped" && event.detail === "local cancellation"));
+		await destroy(peer.conn); await fixture.close();
+		const forwarded = fixture.remote.frames.values.filter(frame => frame.t !== "hello");
+		assert.deepEqual(forwarded, []);
+		cases.push({ id: "host-local-cancellation", nativeGate, forwarded, events: fixture.events.values });
+	}
+
+	class OwnedTerminal implements Terminal {
+		readonly columns = 80; readonly rows = 2;
+		readonly kittyProtocolActive = false; readonly kittyEnableSequence = null; readonly appearance = undefined;
+		active = false; output = "";
+		start() { this.active = true; }
+		stop() { this.active = false; }
+		async drainInput() {}
+		write(data: string) { this.output += data; }
+		moveBy(lines: number) { this.write(`\x1b[${Math.abs(lines)}${lines < 0 ? "A" : "B"}`); }
+		hideCursor() { this.write("\x1b[?25l"); }
+		showCursor() { this.write("\x1b[?25h"); }
+		clearLine() { this.write("\x1b[2K"); }
+		clearFromCursor() { this.write("\x1b[J"); }
+		clearScreen() { this.write("\x1b[2J\x1b[H"); }
+		setTitle(title: string) { this.write(`\x1b]0;${title}\x07`); }
+		setProgress(active: boolean) { this.write(`\x1b]9;4;${active ? 3 : 0}\x07`); }
+		onAppearanceChange() {}
+	}
+	function tuiFixture() {
+		const terminal = new OwnedTerminal();
+		const tui = new TUI(terminal);
+		let subscriptions = 0;
+		const descriptor = Object.getOwnPropertyDescriptor(tui, "addPaintListener");
+		const addPaintListener = tui.addPaintListener;
+		Object.defineProperty(tui, "addPaintListener", { configurable: true, writable: true,
+			value: (listener: PaintListener) => {
+				subscriptions++;
+				const unsubscribe = addPaintListener.call(tui, listener);
+				let active = true;
+				return () => { if (active) { active = false; subscriptions--; unsubscribe(); } };
+			} });
+		cleanups.push(() => {
+			tui.stop();
+			if (descriptor) Object.defineProperty(tui, "addPaintListener", descriptor);
+			else Reflect.deleteProperty(tui, "addPaintListener");
+			assert.equal(subscriptions, 0);
+			assert.equal(terminal.active, false);
+		});
+		return { tui, terminal, subscriptions: () => subscriptions };
+	}
+	const welcome = { t: "welcome", proto: STREAM_LOCAL_PROTO, channel: "synthetic", url: "synthetic" };
+	async function publisherPeer(initial: object[] = [welcome]) {
+		const cwd = await project();
+		const endpoint = await streamSocketEndpoint(cwd);
+		const accepted = Promise.withResolvers<NativeConnection>();
+		const incoming = journal<Frame>();
+		const connections: NativeConnection[] = [];
+		const server = await IpcServer.listen(endpoint, { framing: "lines" }, conn => {
+			connections.push(conn);
+			conn.start(line => {
+				const frame = JSON.parse(line) as Frame;
+				incoming.push(frame);
+				if (frame.t === "hello") { send(conn, initial); accepted.resolve(conn); }
+			}, () => {});
+		});
+		let stopped = false;
+		const close = async () => {
+			if (stopped) return;
+			stopped = true;
+			try { for (const conn of connections) await destroy(conn); }
+			finally { await server.close(); }
+		};
+		cleanups.push(close);
+		return { cwd, incoming, accepted: accepted.promise, close };
+	}
+	const first = { id: 1, name: "viewer", text: "final chat one", ts: 1700000000000 };
+	const second = { id: 2, name: "viewer", text: "final chat two", ts: 1700000000001 };
+	for (const action of ["eof", "dispose", "bye"]) {
+		const fixture = await publisherPeer();
+		const ui = tuiFixture();
+		const actions: unknown[] = [];
+		const detached = Promise.withResolvers<void>();
+		let publisher: InstanceType<typeof StreamPublisher> | null = null;
+		publisher = await StreamPublisher.connect({ cwd: fixture.cwd, sessionId: action, title: "Publisher review", tui: ui.tui, redactor,
+			onChat: msg => { actions.push({ chat: msg }); if (action === "dispose") publisher!.dispose(); },
+			onStatus: status => { actions.push({ status }); if (status === null) detached.resolve(); } });
+		assert(publisher);
+		cleanups.push(() => publisher?.dispose());
+		assert.equal(ui.subscriptions(), 1);
+		const peer = await bounded(fixture.accepted, "publisher hello");
+		const active = arm();
+		send(peer, [...(action === "bye" ? [{ t: "bye", reason: "stream ended" }] : []),
+			{ t: "chat", msg: first }, { t: "viewers", n: action === "eof" ? 9 : 99 }, { t: "chat", msg: second }]);
+		peer.end();
+		const nativeGate = await finishGate(active);
+		await bounded(detached.promise, "publisher detach");
+		assert.deepEqual(actions, action === "eof" ? [{ status: { viewers: 0 } }, { chat: first }, { status: { viewers: 9 } }, { chat: second }, { status: null }] :
+			action === "dispose" ? [{ status: { viewers: 0 } }, { chat: first }, { status: null }] : [{ status: { viewers: 0 } }, { status: null }]);
+		assert.equal(ui.subscriptions(), 0);
+		await fixture.close();
+		cases.push({ id: `publisher-${action}`, nativeGate, actions, retainedPaintSubscriptions: ui.subscriptions(), hello: fixture.incoming.values[0] });
+	}
+	{
+		const fixture = await publisherPeer([{ ...welcome, proto: -1 }, welcome, { t: "chat", msg: first }]);
+		const ui = tuiFixture();
+		const actions: unknown[] = [];
+		let secretLoads = 0;
+		const publisher = await StreamPublisher.connectLazy({ cwd: fixture.cwd, sessionId: "reject", title: "Reject", tui: ui.tui,
+			loadRedactor: async () => { secretLoads++; return redactor; },
+			onChat: msg => actions.push({ chat: msg }), onStatus: status => actions.push({ status }) });
+		assert.equal(publisher, null);
+		await fixture.close();
+		assert.equal(secretLoads, 0); assert.deepEqual(actions, []); assert.equal(ui.subscriptions(), 0);
+		cases.push({ id: "publisher-protocol-rejection", secretLoads, actions, retainedPaintSubscriptions: ui.subscriptions() });
+	}
+	{
+		const fixture = await publisherPeer();
+		const ui = tuiFixture();
+		const actions: unknown[] = [];
+		const loading = Promise.withResolvers<void>();
+		const loaded = Promise.withResolvers<InstanceType<typeof StreamRedactor>>();
+		const connecting = StreamPublisher.connectLazy({ cwd: fixture.cwd, sessionId: "lazy", title: "Lazy", tui: ui.tui,
+			loadRedactor: () => { loading.resolve(); return loaded.promise; },
+			onChat: msg => actions.push({ chat: msg }), onStatus: status => actions.push({ status }) });
+		await bounded(loading.promise, "lazy redactor entered");
+		const peer = await bounded(fixture.accepted, "lazy publisher hello");
+		const active = arm();
+		const message = { id: 7, name: "viewer", text: "last lazy chat", ts: 1700000000000 };
+		send(peer, [{ t: "chat", msg: message }]); peer.end();
+		const nativeGate = await finishGate(active);
+		loaded.resolve(redactor);
+		assert.equal(await bounded(connecting, "lazy redactor close replay"), null);
+		assert.deepEqual(actions, [{ status: { viewers: 0 } }, { chat: message }, { status: null }]);
+		assert.equal(ui.subscriptions(), 0);
+		await fixture.close();
+		cases.push({ id: "publisher-lazy-redactor-eof", nativeGate, actions, returnedNull: true, retainedPaintSubscriptions: ui.subscriptions() });
+	}
+	{
+		const fixture = await hostFixture();
+		const ui = tuiFixture();
+		const publisher = await StreamPublisher.connect({ cwd: fixture.cwd, sessionId: "owned-tui", title: "Owned TUI",
+			tui: ui.tui, redactor, onStatus: () => {} });
+		assert(publisher);
+		cleanups.push(() => publisher.dispose());
+		ui.tui.setFrameProvider({ renderFrame: () => ({ viewport: ["owned TUI first row", "owned TUI final row"] }), acknowledgeHistory() {} });
+		ui.tui.start({ deferInput: true });
+		const viewport = await fixture.remote.frames.wait(frame => frame.t === "viewport");
+		assert(Array.isArray(viewport.rows) && viewport.rows.every(row => typeof row === "string"));
+		assert.deepEqual(viewport.rows.map(row => row.replace(/\x1b\[[0-9;]*m/g, "").replace(/\x1b\]8;[^\x07]*(?:\x07)/g, "")),
+			["owned TUI first row", "owned TUI final row"]);
+		assert(ui.terminal.output.includes("owned TUI first row") && ui.terminal.output.includes("owned TUI final row"));
+		publisher.dispose(); ui.tui.stop();
+		await fixture.remote.frames.wait(frame => frame.t === "pane-close");
+		assert.equal(ui.subscriptions(), 0); assert.equal(ui.terminal.active, false);
+		await fixture.close();
+		cases.push({ id: "owned-tui-publisher-native-host-relay", viewport, terminalOutputSha256: sha256(ui.terminal.output),
+			physicalTerminal: false, forwarded: fixture.remote.frames.values.filter(frame => frame.t !== "hello") });
+	}
+} catch (error) { failure = error; }
+finally {
+	const errors: unknown[] = [];
+	for (const cleanup of cleanups.reverse()) {
+		try { await cleanup(); } catch (error) { errors.push(error); }
+	}
+	try {
+		assert.equal(await fs.readFile(path.join(root, ".owner"), "utf8"), owner);
+		assert(beneath(runtimeRoot, root));
+		if (errors.length === 0) {
+			await fs.rm(root, { recursive: true });
+			await assert.rejects(fs.stat(root), { code: "ENOENT" });
+			fixtureRootRemoved = true;
+			cleanupVerified = true;
+		}
+	} catch (error) { errors.push(error); }
+	for (const [key, values] of oldEnvironment) {
+		if (values.process === undefined) delete process.env[key]; else process.env[key] = values.process;
+		if (values.bun === undefined) delete Bun.env[key]; else Bun.env[key] = values.bun;
+	}
+	if (errors.length) failure = new AggregateError([...(failure ? [failure] : []), ...errors], "stream smoke cleanup failed");
+}
+if (failure) throw failure;
+assert(cleanupVerified && fixtureRootRemoved);
+console.log(JSON.stringify({ schema: "CoreforgeReview17StreamRuntime", passed: true, compiled, version,
+	sourceDigest: manifest.sourceDigest, sourceManifestSha256: sha256(manifestBytes), engineHead: manifest.engineHead,
+	mergeHead: manifest.mergeHead, native: nativeIdentity, relay: { hostname: "127.0.0.1", port: relayPort, path: "/ws/host" },
+	endpoints, cases, cleanupVerified, fixtureRootRemoved, paidRequests: 0 }));

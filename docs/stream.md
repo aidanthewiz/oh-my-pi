@@ -33,12 +33,12 @@ Only one `omp stream` process can listen for a given directory, and the server r
 
 On a terminal, `coreforge stream` is a full-screen chat console: header with the live badge, channel, title, your Stencil handle, viewer URL, viewer count and attached panes; a log of chat and events; and an input line at the bottom.
 
-| Input            | Effect                                                  |
-| ---------------- | ------------------------------------------------------- |
-| `<text>` + Enter | Send a chat message as the channel owner                |
-| `/title <text>`  | Change the stream title                                 |
-| `/quit`, Ctrl-C  | Stop streaming (sessions detach, channel goes offline)  |
-| Up / Down        | Recall previous messages                                |
+| Input            | Effect                                                 |
+| ---------------- | ------------------------------------------------------ |
+| `<text>` + Enter | Send a chat message as the channel owner               |
+| `/title <text>`  | Change the stream title                                |
+| `/quit`, Ctrl-C  | Stop streaming (sessions detach, channel goes offline) |
+| Up / Down        | Recall previous messages                               |
 
 `--no-tui` (or a non-TTY stdout/stdin) falls back to a line log where stdin lines are chat (`/title` is still recognized; `/quit` is TUI-only). Ctrl-C stops either console.
 

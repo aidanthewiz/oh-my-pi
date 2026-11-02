@@ -72,6 +72,7 @@ function makeGuestContext(): InteractiveModeContext {
 			},
 		},
 		statusContainer: { clear: () => {} },
+		pendingShellContainer: { clear: () => {} },
 		pendingMessagesContainer: { clear: () => {} },
 		compactionQueuedMessages: [],
 		streamingComponent: undefined,
@@ -165,9 +166,10 @@ describe("collab guest running-subagents badge", () => {
 			nextWelcomeAgents = makeAgents(["remote-one", "remote-two"]);
 			const secondSnapshot = Promise.withResolvers<void>();
 			const originalSync = ctx.syncRunningSubagentBadge.bind(ctx);
-			ctx.syncRunningSubagentBadge = () => {
-				originalSync();
+			ctx.syncRunningSubagentBadge = options => {
+				const changed = originalSync(options);
 				if (ctx.statusLine.subagentCount === 2) secondSnapshot.resolve();
+				return changed;
 			};
 			sendWelcome(nextWelcomeAgents);
 			await secondSnapshot.promise;

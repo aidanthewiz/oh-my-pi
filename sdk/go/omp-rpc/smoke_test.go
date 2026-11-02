@@ -23,8 +23,9 @@ import (
 //
 //	OMP_RPC_SMOKE=1 go test -run TestSmoke -v ./...
 //
-// PI_CODING_AGENT_DIR points at a fresh directory so no user configuration
-// applies. TestSmoke selects an auth:none loopback model and never calls it;
+// PI_CODING_AGENT_DIR isolates user configuration; --no-skills excludes project
+// discovery, which can infer compressed routing hints during startup.
+// TestSmoke selects an auth:none loopback model and never calls it.
 // TestSmokeModel prompts the scripted local model in test/rpc-wire.
 
 func repoRoot(t *testing.T) string {
@@ -70,7 +71,7 @@ func startServer(t *testing.T, root, agentDir string, args []string, options ...
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-	cmd := exec.Command("bun", append([]string{"packages/coding-agent/src/cli.ts", "--mode", "rpc", "--no-session"}, args...)...)
+	cmd := exec.Command("bun", append([]string{"packages/coding-agent/src/cli.ts", "--mode", "rpc", "--no-session", "--no-skills"}, args...)...)
 	cmd.Dir = root
 	cmd.Env = append(os.Environ(), "PI_CODING_AGENT_DIR="+agentDir)
 	var stderr bytes.Buffer

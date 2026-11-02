@@ -73,7 +73,15 @@ describe("discovery provider toggles with subagents and helper sessions", () => 
 			sessions.push(session);
 			return session;
 		};
-		return { start, close: () => authStorage.close() };
+		return {
+			start,
+			close: async () => {
+				for (const session of sessions.splice(0)) {
+					if (!session.isDisposed) await session.dispose();
+				}
+				await authStorage.close();
+			},
+		};
 	};
 
 	it("keeps following the parent's disabledProviders after a subagent session starts", async () => {
@@ -91,7 +99,7 @@ describe("discovery provider toggles with subagents and helper sessions", () => 
 		expect(isProviderEnabled("claude")).toBe(false);
 		cfgDisabledProviders.set(parentSettings, []);
 		expect(isProviderEnabled("claude")).toBe(true);
-		close();
+		await close();
 	});
 
 	it("keeps host edits reaching discovery during a helper session and after a top-level session ends", async () => {
@@ -115,7 +123,7 @@ describe("discovery provider toggles with subagents and helper sessions", () => 
 			expect(isProviderEnabled("cursor")).toBe(false);
 		} finally {
 			releaseHost();
-			close();
+			await close();
 		}
 	});
 });

@@ -8,6 +8,7 @@ import type {
 } from "@oh-my-pi/pi-ai";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import * as envApiKey from "@oh-my-pi/pi-ai/env-api-key";
+import { closeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { runUsageCommand } from "@oh-my-pi/pi-coding-agent/cli/usage-cli";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
@@ -129,8 +130,8 @@ describe("Claude saved-reset trigger integration", () => {
 		vi.restoreAllMocks();
 	});
 
-	afterAll(() => {
-		authStorage.close();
+	afterAll(async () => {
+		await authStorage.close();
 	});
 
 	function buildSession(options: {
@@ -739,7 +740,7 @@ describe("Claude saved-reset trigger integration", () => {
 			vi.spyOn(Settings, "loadReadOnly").mockResolvedValue(Settings.isolated());
 			vi.spyOn(sdkModule, "discoverAuthStorage").mockResolvedValue(authStorage);
 			// The CLI closes the store it discovered; this one outlives the test.
-			vi.spyOn(authStorage, "close").mockImplementation(() => {});
+			vi.spyOn(authStorage, "close").mockImplementation(async () => {});
 			let stdout = "";
 			vi.spyOn(process.stdout, "write").mockImplementation(chunk => {
 				stdout += String(chunk);
@@ -765,6 +766,8 @@ describe("Claude saved-reset trigger integration", () => {
 				else process.env[key] = value;
 			}
 			__resetDirsFromEnvForTests();
+			// The CLI's ModelRegistry opened `<agentDir>/models.db`; Windows cannot delete it while open.
+			closeModelCache();
 		}
 	});
 

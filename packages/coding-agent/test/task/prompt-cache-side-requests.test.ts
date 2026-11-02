@@ -131,7 +131,7 @@ it.each([
 			expect(current[1]?.sessionId).not.toBe(current[2]?.sessionId);
 		} finally {
 			await session.dispose();
-			auth.close();
+			await auth.close();
 		}
 	},
 );

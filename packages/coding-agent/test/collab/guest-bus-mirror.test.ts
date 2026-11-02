@@ -52,6 +52,7 @@ function makeGuestContext(eventBus: EventBus): InteractiveModeContext {
 			},
 		},
 		statusContainer: { clear: () => {} },
+		pendingShellContainer: { clear: () => {} },
 		pendingMessagesContainer: { clear: () => {} },
 		compactionQueuedMessages: [],
 		streamingComponent: undefined,

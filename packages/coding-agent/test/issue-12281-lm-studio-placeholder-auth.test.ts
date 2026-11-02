@@ -190,7 +190,7 @@ describe("issue #12281 — lm-studio empty-fallback placeholder vs. wire auth", 
 		}
 		expect(lmModels(registry)).toContain("qwen3-8b");
 		expect(registry.getProviderDiscoveryState("lm-studio")?.status).toBe("ok");
-		storage.close();
+		await storage.close();
 	}, 30_000);
 
 	test("an empty-paste placeholder never presents lm-studio as authenticated while discovery 401s surface as an auth error", async () => {
@@ -234,7 +234,7 @@ describe("issue #12281 — lm-studio empty-fallback placeholder vs. wire auth", 
 		if (lmModels(registry).length !== 0) {
 			violations.push(`models=${JSON.stringify(lmModels(registry))} — expected none against a 401ing server`);
 		}
-		storage.close();
+		await storage.close();
 		expect(violations).toEqual([]);
 	}, 30_000);
 
@@ -260,7 +260,7 @@ describe("issue #12281 — lm-studio empty-fallback placeholder vs. wire auth", 
 		expect(
 			freshRegistry.getAvailable().some(model => model.provider === "lm-studio" && model.id === "qwen3-8b"),
 		).toBe(true);
-		fresh.close();
+		await fresh.close();
 
 		// Placeholder-only setup: empty paste against a keyless server.
 		wire.length = 0;
@@ -278,7 +278,7 @@ describe("issue #12281 — lm-studio empty-fallback placeholder vs. wire auth", 
 		expect(
 			placeholderRegistry.getAvailable().some(model => model.provider === "lm-studio" && model.id === "qwen3-8b"),
 		).toBe(true);
-		placeholder.close();
+		await placeholder.close();
 	}, 30_000);
 
 	test("a placeholder-only vllm login keeps discovered models requestable without bearer auth", async () => {
@@ -307,6 +307,6 @@ describe("issue #12281 — lm-studio empty-fallback placeholder vs. wire auth", 
 		expect(registry.hasConcreteAuth("vllm")).toBe(true);
 		expect(registry.getAll().some(entry => entry.provider === "vllm" && entry.id === "qwen3-8b")).toBe(true);
 		expect(registry.getAvailable().some(entry => entry.provider === "vllm" && entry.id === "qwen3-8b")).toBe(true);
-		storage.close();
+		await storage.close();
 	}, 30_000);
 });

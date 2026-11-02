@@ -1,0 +1,226 @@
+import assert from "node:assert/strict";
+import { createHash, randomUUID } from "node:crypto";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
+import { Agent } from "../../packages/agent/src/agent";
+import type { AgentEvent, AgentTool, StreamFn } from "../../packages/agent/src/types";
+import type { AssistantMessage, ToolResultMessage } from "../../packages/ai/src/types";
+import { AssistantMessageEventStream } from "../../packages/ai/src/utils/event-stream";
+import { type } from "../../packages/omptype/src/index";
+import { createAgentSession, type ToolSession } from "../../packages/coding-agent/src/sdk";
+import type { AgentSession } from "../../packages/coding-agent/src/session/agent-session";
+import { AuthStorage } from "../../packages/coding-agent/src/session/auth-storage";
+import { ModelRegistry } from "../../packages/coding-agent/src/config/model-registry";
+import { Settings } from "../../packages/coding-agent/src/config/settings";
+import { AgentRegistry } from "../../packages/coding-agent/src/registry/agent-registry";
+import { resolveEffectiveSubagentPolicy } from "../../packages/coding-agent/src/task/structured-subagent";
+import { finalizeSubprocessOutput, SUBAGENT_WARNING_EMPTY_MESSAGE, SUBAGENT_WARNING_MISSING_YIELD } from "../../packages/coding-agent/src/task/executor";
+import { cfgTaskStructured } from "../../packages/coding-agent/src/task/settings";
+import { getTaskSchema } from "../../packages/coding-agent/src/task/types";
+import { parseAgentFields } from "../../packages/coding-agent/src/discovery/helpers";
+import { buildWorkPoolOutputSchema } from "../../packages/coding-agent/src/task/workpool-yield";
+import type { YieldDetails } from "../../packages/coding-agent/src/tools/yield";
+import { nativeAddonStatus } from "../../packages/natives/native/loader-state.js";
+
+const required = (name: string): string => {
+ const value = process.env[name]; assert(value, `${name} is required`); return value;
+};
+const outer = await fs.realpath(required("CF19_RUNTIME_ROOT"));
+const marker = required("CF19_MARKER"); assert.match(marker, /^[A-Za-z0-9_-]+$/);
+const version = required("CF_UPSTREAM_CANDIDATE_VERSION"); assert.match(version, /^\d+\.\d+\.\d+$/);
+const sourceDigest = required("V1890_SOURCE_INPUT_SHA256");
+const nativeSha256 = required("V1890_NATIVE_SHA256");
+for (const value of [sourceDigest, nativeSha256]) assert.match(value, /^[a-f0-9]{64}$/);
+const sha256 = (data: Uint8Array | string) => createHash("sha256").update(data).digest("hex");
+const inside = (file: string) => {
+ const relative = path.relative(outer, file); assert(relative && !relative.startsWith("..") && !path.isAbsolute(relative));
+};
+const home = await fs.realpath(required("HOME")); inside(home);
+const manifestPath = await fs.realpath(required("V1890_SOURCE_INPUT_MANIFEST")); inside(manifestPath);
+const manifestBytes = await fs.readFile(manifestPath); assert.equal(sha256(manifestBytes), sourceDigest);
+const manifest = JSON.parse(manifestBytes.toString()) as { sourceDigest: string; mergeHead?: string | null };
+assert.match(manifest.sourceDigest, /^[a-f0-9]{64}$/);
+const native = nativeAddonStatus(); assert(native);
+assert.equal(native.version, version); assert.equal(native.packageVersion, version); assert.equal(native.stale, false);
+assert.equal(sha256(await fs.readFile(native.path)), nativeSha256);
+const mode = process.env.PI_COMPILED === "true" ? "compiled" : "source";
+if (mode === "compiled") inside(await fs.realpath(native.path));
+const root = await fs.mkdtemp(path.join(outer, `task-lifecycle-${marker}-`));
+await fs.writeFile(path.join(root, ".owner"), marker, { flag: "wx", mode: 0o600 });
+const cwd = path.join(root, "work"); await fs.mkdir(cwd);
+const cases: Array<{ id: string; status: "passed"; evidence: unknown }> = [];
+const sessions: AgentSession[] = [];
+let auth: AuthStorage | undefined;
+try {
+const ownedAuth = await AuthStorage.create(":memory:"); auth = ownedAuth;
+const modelRegistry = new ModelRegistry(ownedAuth, path.join(root, "models.yml"), { ignoreLocalModelConfig: true });
+modelRegistry.registerProvider("fixture", {
+ baseUrl: "http://127.0.0.1:1/forbidden", api: "openai-completions", apiKey: "synthetic-local-only",
+ models: [{ id: "lifecycle", name: "Lifecycle fixture", reasoning: false, input: ["text"],
+  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 32768, maxTokens: 1024 }],
+});
+const model = modelRegistry.find("fixture", "lifecycle"); assert(model);
+const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+ cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+const reply = (content: AssistantMessage["content"], stopReason: "stop" | "toolUse" = "stop"): AssistantMessage => ({
+ role: "assistant", content, api: model.api, provider: model.provider, model: model.id,
+ usage: structuredClone(usage), stopReason, timestamp: Date.now(),
+});
+function stream(responses: AssistantMessage[]): StreamFn {
+ let index = 0;
+ return () => {
+  const message = responses[index++]; assert(message, "fixture exhausted: unexpected model dispatch");
+  const output = new AssistantMessageEventStream();
+  output.push({ type: "start", partial: { ...message, content: [] } });
+  output.push({ type: "done", reason: message.stopReason as "stop" | "toolUse", message }); output.end(message);
+  return output;
+ };
+}
+const call = (id: string, name: string, args: Record<string, unknown>) => reply([{ type: "toolCall", id, name, arguments: args }], "toolUse");
+const finalText = (session: AgentSession) => {
+ const last = session.messages.findLast(message => message.role === "assistant");
+ assert(last?.role === "assistant"); assert.equal(last.stopReason, "stop");
+ return last.content.filter(block => block.type === "text").map(block => block.text).join("\n");
+};
+const acceptedYields = (session: AgentSession): YieldDetails[] => session.messages
+ .filter((message): message is ToolResultMessage => message.role === "toolResult" && message.toolName === "yield" && !message.isError)
+ .map(message => message.details as YieldDetails).filter(details => details?.status !== undefined);
+function finalize(session: AgentSession, schema: unknown, structured: boolean, rawOutput = "") {
+ return finalizeSubprocessOutput({ rawOutput, exitCode: 0, stderr: "", doneAborted: false, signalAborted: false,
+  structured, outputSchema: schema, outputSchemaMode: "strict", outputSchemaSource: schema === undefined ? "none" : "caller",
+  yieldItems: structured ? acceptedYields(session) : undefined });
+}
+async function create(options: { structured?: boolean; schema?: unknown; tools?: string[]; responses: AssistantMessage[]; customTools?: Parameters<typeof createAgentSession>[0]["customTools"] }) {
+ const settings = Settings.isolated({ "async.enabled": false, "task.batch": false, "task.agentIdleTtlMs": 0,
+  "task.completionProbe": false, "compaction.enabled": false, "retry.enabled": false, "todo.enabled": false,
+  "todo.reminders": false, "advisor.enabled": false, "autolearn.enabled": false, "lsp.enabled": false,
+  modelRoles: { default: "fixture/lifecycle" } });
+ const result = await createAgentSession({ cwd, agentDir: path.join(root, "agent"), authStorage: ownedAuth, modelRegistry, model,
+  settings, agentRegistry: new AgentRegistry(), agentId: `Proof${randomUUID().replaceAll("-", "")}`,
+  disableExtensionDiscovery: true, preloadedExtensionPaths: [], preloadedCustomToolPaths: [],
+  contextFiles: [], skills: [], promptTemplates: [], slashCommands: [], rules: [],
+  enableMCP: false, enableLsp: false, enableIrc: false, cacheWarming: false, skipPythonPreflight: true,
+  toolNames: options.tools ?? [], restrictToolNames: true, allowRestrictedCustomTools: options.customTools !== undefined, requireYieldTool: options.structured === true,
+  outputSchema: options.schema, outputSchemaMode: "strict", customTools: options.customTools,
+ });
+ result.session.agent.streamFn = stream(options.responses); sessions.push(result.session); return result.session;
+}
+ const schema = { type: "object", properties: { answer: { type: "integer" } }, required: ["answer"], additionalProperties: false };
+ const plain = await create({ responses: [reply([{ type: "text", text: "  Plain final result\nwith exact whitespace.  " }])] });
+ assert.equal(cfgTaskStructured.get(plain.settings), false);
+ assert(!plain.getEnabledToolNames().includes("yield"));
+ const plainSchema = getTaskSchema({ isolationEnabled: false, batchEnabled: false, structured: cfgTaskStructured.get(plain.settings) });
+ const parsed = plainSchema({ task: "Inspect only", solutionSpace: "One local fact", outputSchema: schema, schemaMode: "strict", contextFilePolicy: "none" });
+ assert(!(parsed instanceof type.errors)); assert.equal("outputSchema" in parsed, false); assert.equal("schemaMode" in parsed, false);
+ assert.equal(parsed.contextFilePolicy, "none");
+ const fields = parseAgentFields({ name: "owned", description: "Owned policy", tools: ["read"] });
+ assert(fields); assert.deepEqual(fields.tools, ["read"]);
+ const agentDefinition = { name: "owned", description: "Owned policy", systemPrompt: "Report only", source: "project" as const, output: schema, tools: ["read"] };
+ const policySession = {
+  cwd, settings: plain.settings, taskDepth: 0, outputSchema: schema, outputSchemaMode: "strict",
+  getSessionSpawns: () => "*", getSessionAgents: () => [agentDefinition],
+  getActiveModel: () => plain.model, getActiveModelString: () => "fixture/lifecycle",
+  effectiveExtensionRoots: () => ({ explicit: [], configured: [], mode: "explicit-only" as const }),
+ } as unknown as ToolSession;
+ const prosePolicy = await resolveEffectiveSubagentPolicy({ session: policySession, invocationKind: "task", agent: "owned",
+  assignment: "Report only", structured: false, outputSchema: schema, schemaMode: "strict", contextFilePolicy: "none" });
+ assert.equal(prosePolicy.schema.source, "none"); assert.equal(prosePolicy.schema.schema, undefined);
+ await plain.prompt("Return the report"); await plain.waitForIdle();
+ const text = finalText(plain); const prose = finalize(plain, undefined, false, text);
+ assert.equal(prose.exitCode, 0); assert.equal(prose.rawOutput, "  Plain final result\nwith exact whitespace.  ");
+ assert.equal(prose.structuredOutput, undefined);
+ cases.push({ id: "default-plain-final", status: "passed", evidence: { output: prose.rawOutput, schemaSource: prosePolicy.schema.source, persistedAssistant: plain.messages.some(message => message.role === "assistant") } });
+
+ const empty = await create({ responses: [reply([])] }); await empty.prompt("Return no content"); await empty.waitForIdle();
+ const emptyAssistant = empty.messages.findLast(message => message.role === "assistant"); assert(emptyAssistant?.role === "assistant");
+ const emptyOutput = emptyAssistant.content.filter(block => block.type === "text").map(block => block.text).join("\n"); assert.equal(emptyOutput, "");
+ const emptyResult = finalize(empty, undefined, false, emptyOutput);
+ assert.equal(emptyResult.exitCode, 1); assert.equal(emptyResult.stderr, SUBAGENT_WARNING_EMPTY_MESSAGE);
+ const whitespace = finalize(empty, undefined, false, " \n\t "); assert.equal(whitespace.exitCode, 1);
+ cases.push({ id: "empty-final-fails", status: "passed", evidence: { exitCode: emptyResult.exitCode, stderr: emptyResult.stderr, whitespaceExitCode: whitespace.exitCode } });
+
+ const explicitPolicy = await resolveEffectiveSubagentPolicy({ session: policySession, invocationKind: "task", agent: "owned",
+  assignment: "Structured report", structured: true, outputSchema: schema, schemaMode: "strict" });
+ assert.equal(explicitPolicy.schema.source, "caller");
+ const structured = await create({ structured: true, schema: explicitPolicy.schema.schema, responses: [call("valid", "yield", { data: { answer: 42 } })] });
+ assert(structured.getActiveToolNames().includes("yield")); await structured.prompt("Submit answer"); await structured.waitForIdle();
+ const valid = finalize(structured, schema, true); assert.equal(valid.exitCode, 0); assert.deepEqual(JSON.parse(valid.rawOutput), { answer: 42 });
+ assert.equal(valid.structuredOutput?.status, "valid"); assert.equal(acceptedYields(structured).length, 1);
+ cases.push({ id: "explicit-structured-success", status: "passed", evidence: { output: JSON.parse(valid.rawOutput), validation: valid.structuredOutput } });
+
+ const invalid = await create({ structured: true, schema, responses: Array.from({ length: 4 }, (_, i) => call(`invalid-${i}`, "yield", { data: { answer: "wrong" } })) });
+ await invalid.prompt("Submit wrong type"); await invalid.waitForIdle();
+ const rejected = finalize(invalid, schema, true);
+ assert.equal(rejected.exitCode, 1); assert.equal(rejected.structuredOutput?.status, "invalid");
+ assert(invalid.messages.some(message => message.role === "toolResult" && message.toolName === "yield" && message.isError));
+ assert.equal(JSON.parse(rejected.rawOutput).error, "schema_violation");
+ const missing = finalizeSubprocessOutput({ rawOutput: "not the required object", exitCode: 0, stderr: "", doneAborted: false,
+  signalAborted: false, outputSchema: schema, outputSchemaMode: "strict", outputSchemaSource: "caller", structured: true });
+ assert.equal(missing.exitCode, 1); assert.equal(missing.stderr, SUBAGENT_WARNING_MISSING_YIELD);
+ cases.push({ id: "structured-invalid-and-missing-fail", status: "passed", evidence: { exitCode: rejected.exitCode, validation: rejected.structuredOutput, missingExitCode: missing.exitCode } });
+
+ const evalPolicy = await resolveEffectiveSubagentPolicy({ session: policySession, invocationKind: "eval", agent: "owned", assignment: "Structured eval", outputSchema: schema, schemaMode: "strict" });
+ assert.equal(evalPolicy.schema.source, "caller"); assert.deepEqual(evalPolicy.schema.schema, schema);
+ const evalSession = await create({ structured: true, schema: evalPolicy.schema.schema, responses: [call("eval-result", "yield", { data: { answer: 7 } })] });
+ await evalSession.prompt("Submit eval result"); await evalSession.waitForIdle();
+ const evalResult = finalize(evalSession, schema, true); assert.equal(evalResult.exitCode, 0); assert.deepEqual(JSON.parse(evalResult.rawOutput), { answer: 7 });
+ const items = [{ id: "item-one", index: 1 }, { id: "item-two", index: 2 }];
+ const poolSchema = buildWorkPoolOutputSchema(items);
+ const pool = await create({ structured: true, schema: poolSchema, responses: [call("pool-1", "yield", { key: 1, data: { n: 1 } }), call("pool-2", "yield", { key: 2, data: { n: 2 } })] });
+ await pool.setWorkPoolYieldItems(items); await pool.prompt("Complete both pooled items"); await pool.waitForIdle();
+ const poolResult = finalize(pool, poolSchema, true); assert.equal(poolResult.exitCode, 0);
+ assert.deepEqual(JSON.parse(poolResult.rawOutput), { "item-one": { n: 1 }, "item-two": { n: 2 } });
+ assert.equal(acceptedYields(pool).at(-1)?.complete, true);
+ await pool.setWorkPoolYieldItems([]); assert.deepEqual(pool.getWorkPoolYieldItems(), []);
+ cases.push({ id: "eval-and-workpool-stay-structured", status: "passed", evidence: { evalOutput: JSON.parse(evalResult.rawOutput), poolOutput: JSON.parse(poolResult.rawOutput), poolContractCleared: true } });
+
+ for (const boundary of ["live", "cancel", "begin-dispose", "disposed"] as const) {
+  let publish: ((text: string) => void) | undefined;
+  const session = await create({ tools: ["owned_job"], customTools: [{ name: "owned_job", label: "Owned job", description: "Owned in-memory background fixture", parameters: { type: "object", properties: {} },
+   async execute(_id, _params, update, _context, _signal) {
+    publish = text => update?.({ content: [{ type: "text", text }], details: { async: { jobId: "owned-job", state: "completed" } } });
+    return { content: [{ type: "text", text: "parked" }], details: { async: { jobId: "owned-job", state: "running" } } };
+   } }], responses: [call(`job-${boundary}`, "owned_job", {}), reply([{ type: "text", text: "Job is parked" }]), reply([{ type: "text", text: "A later ordinary turn" }])] });
+  const events: Array<{ type: string }> = []; const unsubscribe = session.subscribe(event => events.push(event));
+  await session.prompt("Start owned job"); await session.waitForIdle(); assert(events.some(event => event.type === "agent_end")); assert(publish);
+  if (boundary === "live") { await session.prompt("Continue normally"); await session.waitForIdle(); }
+  if (boundary === "cancel") await session.abort();
+  else if (boundary === "begin-dispose") session.beginDispose();
+  else if (boundary === "disposed") await session.dispose();
+  const updatesBefore = session.activeToolExecutionUpdates().length;
+  const eventCount = events.length; publish(`late-${boundary}`);
+  await session.settleInFlightMessagePersistence();
+  if (boundary === "live") {
+   const frame = session.activeToolExecutionUpdates().find(event => event.toolCallId === `job-${boundary}`); assert(frame);
+   assert.equal(frame.toolName, "owned_job"); assert.deepEqual(frame.args, {});
+   assert.equal(frame.partialResult.content[0]?.type, "text");
+   assert.deepEqual(frame.partialResult.content, [{ type: "text", text: "late-live" }]);
+   assert(events.slice(eventCount).some(event => event.type === "tool_execution_update"));
+  } else {
+   assert.equal(session.activeToolExecutionUpdates().length, updatesBefore, `late cache frame at ${boundary}`);
+   assert(!events.slice(eventCount).some(event => event.type === "tool_execution_update"));
+  }
+  unsubscribe(); await session.dispose();
+  cases.push({ id: `detached-${boundary}`, status: "passed", evidence: { afterAgentEnd: true, visibleLateFrame: boundary === "live", sessionCacheOwned: true } });
+ }
+
+ let late: (() => void) | undefined;
+ const parameters = type({});
+ const tool: AgentTool<typeof parameters> = { name: "job", label: "Job", description: "Owned agent fixture", parameters,
+  async execute(_id, _args, _signal, update) { late = () => update?.({ content: [{ type: "text", text: "stale-reset" }], details: {} }); return { content: [], details: {} }; } };
+ const agent = new Agent({ initialState: { model, tools: [tool] }, streamFn: stream([call("reset-job", "job", {}), reply([{ type: "text", text: "parked" }])]) });
+ const resetEvents: AgentEvent[] = []; const unsubscribe = agent.subscribe(event => resetEvents.push(event));
+ await agent.prompt("Start"); agent.reset(); late!(); assert(!resetEvents.some(event => event.type === "tool_execution_update")); unsubscribe();
+ cases.push({ id: "detached-reset", status: "passed", evidence: { oldFrameSuppressed: true, messagesAfterReset: agent.state.messages.length } });
+} finally {
+ const disposed = await Promise.allSettled(sessions.toReversed().map(session => session.dispose()));
+ try { await auth?.close(); } finally {
+  assert.equal(await fs.readFile(path.join(root, ".owner"), "utf8"), marker);
+  await fs.rm(root, { recursive: true });
+ }
+ for (const result of disposed) if (result.status === "rejected") throw result.reason;
+}
+await assert.rejects(fs.lstat(root), (error: NodeJS.ErrnoException) => error.code === "ENOENT");
+console.log(JSON.stringify({ schema: "CoreforgeFrozen19DomainProof", domain: "task-lifecycle", complete: true, passed: true,
+ mode, version, sourceDigest, inputSourceDigest: manifest.sourceDigest, nativeSha256, cases,
+ cleanupVerified: true, fixtureRootRemoved: true, paidRequests: 0 }));

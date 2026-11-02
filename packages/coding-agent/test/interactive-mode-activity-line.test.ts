@@ -77,7 +77,7 @@ describe("InteractiveMode native dock activity line", () => {
 	afterAll(async () => {
 		mode?.stop();
 		await session?.dispose();
-		authStorage?.close();
+		await authStorage?.close();
 		tempDir?.removeSync();
 		resetSettingsForTest();
 	});

@@ -6,7 +6,7 @@ Every builtin the embedded shell installs. Two layers:
    `wait`, … A locally-patched fork of
    [`brush-builtins`](https://github.com/reubeno/brush) (MIT), tracking upstream
    except where noted in `LICENSE`.
-2. **In-process command-line utilities** — `cat`, `grep`/`rg`, `sed`, `ls`,
+2. **In-process command-line utilities** — `cat`, `grep`/`rg`, `ast-grep`/`sg`, `sed`, `ls`,
    `find`, `sort`, `jq`, `fd`, `diff`, `xargs`, `ps`, `top`, `kill`, the
    moreutils set, and ~50 more. One module per command, in `src/<command>.rs`.
 
@@ -57,11 +57,11 @@ Utilities that are genuinely async — `sleep`, `timeout`, `ps`, `top`, `pgrep`,
 
 Three entry points, so the embedding shell decides what to install:
 
-| Function | Contents |
-| --- | --- |
-| `default_builtins(set)` | The POSIX/bash builtins, per `BuiltinSet`. |
-| `utility_builtins()` | The coreutils-style commands, which shadow system binaries. |
-| `process_builtins()` | `ps`, `top`, `pgrep`, `pkill`, `pidwait`, `sleep`, `timeout`, `nohup`. |
+| Function                | Contents                                                               |
+| ----------------------- | ---------------------------------------------------------------------- |
+| `default_builtins(set)` | The POSIX/bash builtins, per `BuiltinSet`.                             |
+| `utility_builtins()`    | The coreutils-style commands, which shadow system binaries.            |
+| `process_builtins()`    | `ps`, `top`, `pgrep`, `pkill`, `pidwait`, `sleep`, `timeout`, `nohup`. |
 
 Every command is behind a cargo feature (`builtin.<name>`, `util.<name>`), so a
 single one can be built and tested in isolation:
@@ -69,6 +69,23 @@ single one can be built and tested in isolation:
 ```console
 $ cargo nextest run -p pi-builtins --no-default-features --features base,util.sed
 ```
+
+## rsync output
+
+`rsync` validates displayed filename bytes against the shell's locale charset.
+`C` and `POSIX` locales escape non-ASCII bytes on Linux.
+macOS uses UTF-8, matching the reference's libcharset backend.
+`--8-bit-output` bypasses charset validation but retains control-character and literal-escape handling.
+With `--iconv`, deletion messages convert receiver filenames to UTF-8 before transmission and then to the client's charset.
+Directory markers and invalid message bytes remain intact.
+
+Conformance compares exit status, logical transfer sizes, output events and resulting filesystem state.
+It normalizes packetization-dependent wire totals and derived rates.
+Known concurrent output compares as a multiset, preserving every event and duplicate count.
+This includes implicit `--delete-during` with protocol 30 or later.
+Explicit before, after and delayed deletion modes retain ordered comparisons.
+Daemon fixtures connect to their bound IPv4 address.
+Readiness requires a fixture-specific hidden module, not merely an rsync greeting from an unrelated listener.
 
 ## Licensing
 

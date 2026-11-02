@@ -22,8 +22,8 @@
  */
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { isEnoent, logger } from "@oh-my-pi/pi-utils";
-import type { Browser } from "puppeteer-core";
+import { isEnoent, logger, withTimeout } from "@oh-my-pi/pi-utils";
+import type { Browser, CDPSession } from "puppeteer-core";
 import { daemonRuntimeDir } from "../../launch/paths";
 
 /** Identifies one shared-browser daemon's target registry. */
@@ -212,34 +212,120 @@ export async function collectOrphanTargets(
 	return { owners };
 }
 
+const CLOSE_TIMEOUT_MS = 10_000;
+
+export class CdpTargetCloseTimeoutError extends Error {
+	constructor() {
+		super("Timed out confirming CDP target closure");
+	}
+}
+
 /**
  * Close a page target by id through a fresh CDP session. Returns true only
- * when CDP confirms the close or confirms the target no longer exists; a
+ * when CDP reports the target destroyed or confirms it no longer exists; a
  * dropped connection or transient protocol failure returns false so durable
  * ownership remains available for a later retry.
+ *
+ * `Target.closeTarget` answers `success` once Chromium has started closing the
+ * page, not once it is gone: the target stays listed until its renderer has
+ * unloaded it. Its `Target.targetDestroyed` confirms the close instead, as it
+ * does for Puppeteer's own `page.close()`.
+ *
+ * `timeoutMs` bounds session creation, discovery, close and absence confirmation
+ * together. Destruction gets at most half that original budget; the remainder
+ * is reserved for the absence check.
  */
-export async function closeCdpTarget(browser: Browser, targetId: string): Promise<boolean> {
-	const session = await browser
-		.target()
-		.createCDPSession()
-		.catch(() => null);
-	if (!session) return false;
+export async function closeCdpTarget(
+	browser: Browser,
+	targetId: string,
+	timeoutMs = CLOSE_TIMEOUT_MS,
+): Promise<boolean> {
+	const startedAt = performance.now();
+	const deadline = startedAt + timeoutMs;
+	const confirmationDeadline = startedAt + timeoutMs / 2;
+	const timeoutError = new CdpTargetCloseTimeoutError();
+	const bounded = <T>(operation: () => Promise<T>, until = deadline): Promise<T> => {
+		const remaining = until - performance.now();
+		if (!(remaining > 0)) return Promise.reject(timeoutError);
+		return withTimeout(operation(), remaining, timeoutError).then(value => {
+			if (performance.now() >= until) throw timeoutError;
+			return value;
+		});
+	};
+	let session: CDPSession | undefined;
+	let finished = false;
+	const destroyed = Promise.withResolvers<boolean>();
+	const onDestroyed = (event: { targetId: string }): void => {
+		if (event.targetId === targetId) destroyed.resolve(true);
+	};
 	try {
+		const cdp = await bounded(() =>
+			browser
+				.target()
+				.createCDPSession()
+				.then(created => {
+					if (finished || performance.now() >= deadline) {
+						void created.detach().catch(() => undefined);
+						throw timeoutError;
+					}
+					session = created;
+					return created;
+				}),
+		);
+		cdp.on("Target.targetDestroyed", onDestroyed);
 		try {
-			const result = await session.send("Target.closeTarget", { targetId });
-			if (result.success) return true;
-		} catch {
-			// A concurrent reaper or the page itself may already have closed the
-			// target. Confirm absence before treating the cleanup as complete.
+			await bounded(() => cdp.send("Target.setDiscoverTargets", { discover: true }), confirmationDeadline);
+			const result = await bounded(
+				() =>
+					Promise.race([
+						cdp.send("Target.closeTarget", { targetId }).then(result => result.success),
+						destroyed.promise,
+					]),
+				confirmationDeadline,
+			);
+			if (result && (await bounded(() => destroyed.promise, confirmationDeadline))) return true;
+		} catch (error) {
+			if (error === timeoutError && performance.now() >= deadline) throw error;
+			// A concurrent reaper or the page itself may already have closed the target.
 		}
 		try {
-			const { targetInfos } = await session.send("Target.getTargets");
+			const { targetInfos } = await bounded(() => cdp.send("Target.getTargets"));
 			return !targetInfos.some(info => info.targetId === targetId);
-		} catch {
+		} catch (error) {
+			if (error === timeoutError) throw error;
 			return false;
 		}
+	} catch (error) {
+		if (error === timeoutError) throw error;
+		return false;
 	} finally {
-		await session.detach().catch(() => undefined);
+		finished = true;
+		if (session) {
+			session.off("Target.targetDestroyed", onDestroyed);
+			void session.detach().catch(() => undefined);
+		}
+	}
+}
+
+/**
+ * {@link closeCdpTarget} for the omp relay, over a channel that answers browser-level `Target.*`
+ * commands. The relay's `Target.getTargets` lists only tabs it can drive right now, not those of a
+ * disconnected browser or with a dismissed debugger, so absence is read from `Target.getTargetInfo`:
+ * it looks the id up among every tab the extensions reported, and answers an unknown id with the
+ * browser target.
+ */
+export async function closeRelayTarget(channel: Pick<CDPSession, "send">, targetId: string): Promise<boolean> {
+	try {
+		const result = await channel.send("Target.closeTarget", { targetId });
+		if (result.success) return true;
+	} catch {
+		// Closed already (the worker's own close), or the extension cannot answer.
+	}
+	try {
+		const { targetInfo } = await channel.send("Target.getTargetInfo", { targetId });
+		return targetInfo.targetId !== targetId;
+	} catch {
+		return false;
 	}
 }
 
@@ -280,7 +366,7 @@ export async function reapOrphanSharedTargets(browser: Browser, scope: SharedTar
 	for (const owner of scan.owners) {
 		const retained: string[] = [];
 		for (const targetId of owner.targetIds) {
-			if (await closeCdpTarget(browser, targetId)) {
+			if (await closeCdpTarget(browser, targetId).catch(() => false)) {
 				closed++;
 			} else {
 				retained.push(targetId);

@@ -120,7 +120,32 @@ describe("delimited path expansion", () => {
 	});
 
 	it("keeps an opaque resource URI whole when no list boundary resolves", async () => {
-		expect(await expandDelimitedPathEntries(["fixture:1;opaque"], tempDir)).toEqual(["fixture:1;opaque"]);
+		for (const input of ["fixture:1;opaque", "urn:chapter;section", "fixture:raw;opaque"]) {
+			expect(await expandDelimitedPathEntries([input], tempDir)).toEqual([input]);
+		}
+	});
+
+	it("preserves an opaque URI until an existing local target or another URL establishes a boundary", async () => {
+		expect(await expandDelimitedPathEntries(["fixture:1;opaque;apps/a.txt"], tempDir)).toEqual([
+			"fixture:1;opaque",
+			"apps/a.txt",
+		]);
+		expect(await expandDelimitedPathEntries(["fixture:1;opaque;https://example.test/b"], tempDir)).toEqual([
+			"fixture:1;opaque",
+			"https://example.test/b",
+		]);
+	});
+
+	it("splits unambiguous missing path lists and honors existing extensionless selector targets", async () => {
+		for (const entries of [
+			["missing.txt", "absent.txt"],
+			["Makefile:1", "README:2"],
+			["Makefile:1", "absent.txt:2"],
+		]) {
+			expect(await expandDelimitedPathEntries([entries.join(";")], tempDir)).toEqual(entries);
+		}
+		await Bun.write(path.join(tempDir, "Makefile"), "selected\n");
+		expect(await expandDelimitedPathEntries(["Makefile:1;absent"], tempDir)).toEqual(["Makefile:1", "absent"]);
 	});
 
 	it("does not recover local files from commas inside scalar URLs or opaque resources", async () => {

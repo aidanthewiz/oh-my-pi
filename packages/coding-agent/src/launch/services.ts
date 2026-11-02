@@ -27,9 +27,10 @@ export interface ServiceStart {
 	command: string;
 	cwd?: string;
 	pty?: boolean;
-	env?: Record<string, string>;
 	shell: { shell: string; args: string[]; prefix?: string; env: Record<string, string> };
 	ready?: ServiceReady;
+	/** Overlay on the configured shell env; wins over it. */
+	env?: Record<string, string>;
 }
 
 const serviceStateKey = Symbol("ownedServices");
@@ -240,14 +241,22 @@ export async function serviceLogs(session: ToolSession, name: string, signal?: A
 	return (await serviceLogsWithRows(session, name, signal)).text;
 }
 
+/**
+ * Start a session-owned daemon and wait for its requested readiness condition.
+ * `readyInterrupt` ends only the readiness wait, after the broker acknowledged
+ * the launch: the call then resolves `readyInterrupted` with the launched
+ * snapshot while the service keeps starting. Validation, connection, and launch
+ * failures still reject.
+ */
 export async function startService(
 	session: ToolSession,
 	params: ServiceStart,
 	signal?: AbortSignal,
+	readyInterrupt?: AbortSignal,
 ): Promise<{
 	daemon: DaemonSnapshot;
 	readyTimedOut: boolean;
-	log: string;
+	readyInterrupted: boolean;
 }> {
 	if (!cfgLaunchEnabled.get(session.settings)) throw new ToolError("Service launch is disabled in this session.");
 	if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,47}$/.test(params.name))
@@ -282,17 +291,53 @@ export async function startService(
 		persist: false,
 		detached: false,
 	};
+	const lifetime = serviceState(session).lifetime.signal;
+	const owner = serviceOwner(session);
 	const result = await request(
 		session,
-		{ op: "start", spec, owner: serviceOwner(session) ?? undefined, replace: true },
+		{
+			op: "start",
+			spec,
+			owner: owner ?? undefined,
+			replace: true,
+			awaitReady: readyInterrupt === undefined,
+		},
 		signal,
 	);
 	if (result.op !== "start") throw new Error("Unexpected daemon start response");
-	return {
-		daemon: result.daemon,
-		readyTimedOut: result.readyTimedOut,
-		log: await serviceLogs(session, params.name, signal),
-	};
+	const launched = result.daemon;
+	// A legacy broker ignores `awaitReady` and already waited: its result is
+	// ready, terminal, or timed out, so the wait phase is skipped.
+	if (
+		!readyInterrupt ||
+		!spec.ready ||
+		result.readyTimedOut ||
+		launched.readyAt !== undefined ||
+		TERMINAL_STATES[launched.state]
+	)
+		return { daemon: launched, readyTimedOut: result.readyTimedOut, readyInterrupted: false };
+	const timeoutMs = Math.max(0, spec.ready.timeoutMs - (Date.now() - launched.startedAt));
+	try {
+		const waited = await request(
+			session,
+			{ op: "wait", name: params.name, for: "ready", timeoutMs },
+			signal ? AbortSignal.any([signal, readyInterrupt]) : readyInterrupt,
+		);
+		if (waited.op !== "wait") throw new Error("Unexpected daemon wait response");
+		// A pre-ready exit is reported by its terminal state, not as a timeout.
+		return {
+			daemon: waited.daemon,
+			readyTimedOut: waited.timedOut && !TERMINAL_STATES[waited.daemon.state],
+			readyInterrupted: false,
+		};
+	} catch (error) {
+		throwIfAborted(lifetime);
+		if (session.isDisposed?.() || serviceOwner(session) !== owner)
+			throw new ToolAbortError("Service session is no longer active");
+		if (readyInterrupt.aborted && !signal?.aborted)
+			return { daemon: launched, readyTimedOut: false, readyInterrupted: true };
+		throw error;
+	}
 }
 
 export async function sendService(

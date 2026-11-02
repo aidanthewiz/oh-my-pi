@@ -125,7 +125,7 @@ export function refreshBrokerOAuthCredential(
 	}
 	// Non-MCP rows: same per-provider path AuthStorage would take by default
 	// (the serve process registers no custom OAuth providers).
-	return refreshOAuthToken(provider as OAuthProvider, credential);
+	return refreshOAuthToken(provider as OAuthProvider, credential, signal);
 }
 
 /** The `omp auth-broker serve` vault: tokens refresh in this process through {@link refreshBrokerOAuthCredential}. */
@@ -162,7 +162,7 @@ async function runServe(flags: AuthBrokerCommandArgs["flags"]): Promise<void> {
 	const shutdown = async (signal: NodeJS.Signals): Promise<void> => {
 		logger.info("auth-broker shutting down", { signal });
 		await handle.close();
-		storage.close();
+		await storage.close();
 		process.exit(0);
 	};
 	process.once("SIGINT", () => void shutdown("SIGINT"));

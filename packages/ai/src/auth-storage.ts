@@ -18,6 +18,7 @@
  * await auth.credentials.reload();
  * const apiKey = await auth.keys.get("anthropic", sessionId, { modelId });
  */
+import * as path from "node:path";
 import { logger } from "@oh-my-pi/pi-utils";
 import { SessionAffinity, type SessionRestrictions } from "./auth/affinity";
 import { BlockStoreHealth, CredentialBlocks } from "./auth/blocks";
@@ -66,6 +67,7 @@ export * from "./auth/types";
 /** Store-bound credential modules; rebuilt as a unit by {@link AuthStorage.replaceStore}. */
 interface AuthStorageModules {
 	pool: CredentialPool;
+	refresher: OAuthRefresher;
 	keys: KeyCascade;
 	oauth: OAuthAccounts;
 	sessions: SessionAffinity;
@@ -90,13 +92,26 @@ export class AuthStorage {
 	readonly #policies: AccountPolicies;
 	readonly #restrictions: SessionRestrictions = new Map();
 	#modules: AuthStorageModules;
+	#storeTransition: Promise<void> = Promise.resolve();
+	#closePromise?: Promise<void>;
+	#closed = false;
+	#sourceIdentity: string | undefined;
 
 	constructor(store: AuthCredentialStore, options: AuthStorageOptions = {}) {
 		this.#options = options;
+		this.#sourceIdentity = options.sourceIdentity;
 		this.#overrides = new KeyOverrides(options.configValueResolver);
 		this.#policies = new AccountPolicies(options.accountPolicies ?? [], options.defaultReservePct);
 		this.#modules = this.#compose(store, options.sourceLabel);
 		if (options.onCredentialDisabled) this.#modules.pool.onDisabled(options.onCredentialDisabled);
+	}
+
+	get isClosed(): boolean {
+		return this.#closed;
+	}
+
+	get sourceIdentity(): string | undefined {
+		return this.#sourceIdentity;
 	}
 
 	/** Stored credential rows, change/disable events, broker snapshot. */
@@ -152,26 +167,42 @@ export class AuthStorage {
 
 	/**
 	 * Swap the backing credential store in place (live `auth.broker.url` change).
-	 * Loads `store` into fresh store-bound state — pins, blocks, and usage caches are
-	 * keyed by the old store's row ids — then closes the previous store. Runtime key
-	 * overrides, account policies, session account restrictions, usage-provider
-	 * overrides, and credential event subscribers carry over. On a load failure
-	 * `store` is closed and the current store stays active.
+	 * Fresh store-bound state isolates row-id-keyed pins, blocks, and usage caches.
+	 * Prior refreshes drain before subscribers move and the old store closes.
+	 * Runtime key overrides, account policies, session restrictions, usage-provider
+	 * overrides, and credential event subscribers carry over. On a load failure,
+	 * `store` closes and the current store stays active.
 	 */
-	async replaceStore(store: AuthCredentialStore, options: { sourceLabel?: string } = {}): Promise<void> {
-		const next = this.#compose(store, options.sourceLabel ?? this.#options.sourceLabel);
-		try {
-			await next.pool.reload();
-		} catch (error) {
-			next.pool.close();
-			throw error;
-		}
-		const previous = this.#modules;
-		next.pool.adoptSubscribers(previous.pool);
-		next.usage.adoptRuntimeProviders(previous.usage);
-		this.#modules = next;
-		previous.pool.close();
-		next.pool.bump("store-replaced");
+	replaceStore(
+		store: AuthCredentialStore,
+		options: { sourceLabel?: string; sourceIdentity?: string } = {},
+	): Promise<void> {
+		return this.#transitionStore(async () => {
+			const next = this.#compose(store, options.sourceLabel ?? this.#options.sourceLabel);
+			const previous = this.#modules;
+			try {
+				if (this.#closed) throw new Error("Credential storage is closed");
+				await next.pool.reload();
+				await previous.refresher.close();
+				if (this.#closed) throw new Error("Credential storage is closed");
+			} catch (error) {
+				await next.refresher.close();
+				next.pool.close();
+				throw error;
+			}
+			next.pool.adoptSubscribers(previous.pool);
+			next.usage.adoptRuntimeProviders(previous.usage);
+			this.#modules = next;
+			this.#sourceIdentity = options.sourceIdentity;
+			previous.pool.close();
+			next.pool.bump("store-replaced");
+		});
+	}
+
+	#transitionStore(operation: () => Promise<void>): Promise<void> {
+		const next = this.#storeTransition.then(operation, operation);
+		this.#storeTransition = next;
+		return next;
 	}
 
 	#compose(store: AuthCredentialStore, sourceLabel: string | undefined): AuthStorageModules {
@@ -198,7 +229,13 @@ export class AuthStorage {
 		// Key reports by the effective provider (runtime extension override first), so an
 		// override's `cacheVersion` separates its rows from other processes sharing the store.
 		const usageCache = new UsageCache(store, pool, provider => usage.providerFor(provider));
-		const blocks = new CredentialBlocks({ store, pool, health: blockHealth, usageCache, strategies });
+		const blocks = new CredentialBlocks({
+			store,
+			pool,
+			health: blockHealth,
+			usageCache,
+			strategies,
+		});
 		const affinity = new SessionAffinity(store, pool, overrides, this.#restrictions);
 		const usage = new UsageService({
 			store,
@@ -229,7 +266,16 @@ export class AuthStorage {
 			refresher,
 			strategies,
 		});
-		const limits = new RateLimits({ store, pool, overrides, blocks, affinity, usage, strategies });
+		const limits = new RateLimits({
+			store,
+			pool,
+			refresher,
+			overrides,
+			blocks,
+			affinity,
+			usage,
+			strategies,
+		});
 		const keys = new KeyCascade({
 			pool,
 			overrides,
@@ -238,10 +284,18 @@ export class AuthStorage {
 			rotate: (provider, sessionId, rotateOptions) => limits.rotate(provider, sessionId, rotateOptions),
 			sourceLabel,
 		});
-		const oauth = new OAuthAccounts({ pool, overrides, policies, selector, affinity, refresher });
+		const oauth = new OAuthAccounts({
+			pool,
+			overrides,
+			policies,
+			selector,
+			affinity,
+			refresher,
+		});
 
 		return {
 			pool,
+			refresher,
 			keys,
 			oauth,
 			sessions: affinity,
@@ -259,7 +313,14 @@ export class AuthStorage {
 				strategies,
 			}),
 			limits,
-			resets: new ResetCredits({ store, pool, oauth, usage, usageCache, blocks }),
+			resets: new ResetCredits({
+				store,
+				pool,
+				oauth,
+				usage,
+				usageCache,
+				blocks,
+			}),
 			blocks,
 		};
 	}
@@ -267,12 +328,24 @@ export class AuthStorage {
 	/** Open the SQLite store at `dbPath` and wrap it (standalone use, e.g. the pi-ai CLI). */
 	static async create(dbPath: string, options: AuthStorageOptions = {}): Promise<AuthStorage> {
 		const store = await SqliteAuthCredentialStore.open(dbPath);
-		return new AuthStorage(store, options);
+		return new AuthStorage(store, {
+			...options,
+			sourceIdentity:
+				options.sourceIdentity ?? (dbPath && dbPath !== ":memory:" ? `sqlite:${path.resolve(dbPath)}` : undefined),
+		});
 	}
 
-	/** Close the underlying credential store; the instance must not be reused. */
-	close(): void {
-		this.#modules.pool.close();
+	/** Drain admitted OAuth resolution and rate-limit operations before closing their store; do not reuse this instance. */
+	close(): Promise<void> {
+		if (this.#closePromise) return this.#closePromise;
+		this.#closed = true;
+		const modules = this.#modules;
+		const drained = modules.refresher.close();
+		this.#closePromise = this.#transitionStore(async () => {
+			await drained;
+			modules.pool.close();
+		});
+		return this.#closePromise;
 	}
 
 	/**

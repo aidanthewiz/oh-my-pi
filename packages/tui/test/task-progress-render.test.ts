@@ -75,32 +75,49 @@ describe("task progress rendering", () => {
 
 	it("shortens current and recent path arguments without rewriting search patterns", async () => {
 		const theme = (await getThemeByName("dark"))!;
-		const file = `${os.homedir()}/private/file`;
-		for (const [key, recent, args, expected] of [
-			["file_path", false, file, "~/private/file"],
-			["path", true, file, "~/private/file"],
-			["command", false, `cat <${file}`, "cat <~/private/file"],
-			["task", false, `Inspect ${file}`, "Inspect ~/private/file"],
-			["prompt", false, `Explain ${file}`, "Explain ~/private/file"],
-			["pattern", false, file, file],
+		const columns = 180;
+		for (const [home, literalPrefix] of [
+			["/home/preview", "/home/preview/private/file"],
+			["/home/preview/isolated/qualification-home", "/home/preview/isolated/"],
 		] as const) {
-			const progress = runningProgress(
-				recent
-					? { recentTools: [{ tool: "read", args, argsKey: key, endMs: 1 }] }
-					: { currentTool: "read", currentToolArgs: args, currentToolArgsKey: key },
-			);
-			const text = Bun.stripANSI(
-				taskToolRenderer
-					.renderResult(
-						{ content: [], details: detailsFor(progress) },
-						{ expanded: false, isPartial: true },
-						theme,
-					)
-					.render(180)
-					.join("\n"),
-			);
-			expect(text).toContain(expected);
-			if (key !== "pattern") expect(text).not.toContain(os.homedir());
+			const homedir = vi.spyOn(os, "homedir").mockReturnValue(home);
+			try {
+				const file = `${home}/private/file`;
+				for (const [key, args, expected] of [
+					["file_path", file, "~/private/file"],
+					["path", file, "~/private/file"],
+					["command", `cat <${file}`, "cat <~/private/file"],
+					["task", `Inspect ${file}`, "Inspect ~/private/file"],
+					["prompt", `Explain ${file}`, "Explain ~/private/file"],
+					["pattern", file, literalPrefix],
+				] as const) {
+					for (const recent of [false, true]) {
+						const progress = runningProgress(
+							recent
+								? { recentTools: [{ tool: "read", args, argsKey: key, endMs: 1 }] }
+								: { currentTool: "read", currentToolArgs: args, currentToolArgsKey: key },
+						);
+						const text = Bun.stripANSI(
+							taskToolRenderer
+								.renderResult(
+									{ content: [], details: detailsFor(progress) },
+									{ expanded: false, isPartial: true },
+									theme,
+								)
+								.render(columns)
+								.join("\n"),
+						);
+						expect(text).toContain(`read: ${expected}`);
+						if (key === "pattern") expect(text).not.toContain("~/private/file");
+						else expect(text).not.toContain(home);
+						for (const line of text.split("\n")) {
+							expect(visibleWidth(line)).toBeLessThanOrEqual(columns);
+						}
+					}
+				}
+			} finally {
+				homedir.mockRestore();
+			}
 		}
 	});
 
@@ -149,6 +166,44 @@ describe("task progress rendering", () => {
 		);
 		expect(recent).toContain("~/private/file");
 		expect(recent).not.toContain("Searching the workspace");
+	});
+
+	it("shows the agent's probe stage on running rows only, sanitized to one line", async () => {
+		const theme = (await getThemeByName("dark"))!;
+		const render = (progress: AgentProgress) =>
+			Bun.stripANSI(
+				taskToolRenderer
+					.renderResult(
+						{ content: [], details: detailsFor(progress) },
+						{ expanded: false, isPartial: true },
+						theme,
+					)
+					.render(120)
+					.join("\n"),
+			);
+		const running = render(runningProgress({ stage: "benchmarking\tthe \x1b[31mdecoder" }));
+		expect(running).toContain("benchmarking");
+		expect(running).toContain("decoder");
+		expect(running).not.toContain("\t");
+		expect(running).not.toContain("[31m");
+		expect(render(runningProgress({ status: "completed", stage: "benchmarking the decoder" }))).not.toContain(
+			"benchmarking the decoder",
+		);
+		for (const status of ["running", "completed", "failed", "aborted"] as const) {
+			const progress = runningProgress({ status, stage: "CURRENT_STAGE", watch: "PRIVATE_WATCH_BRIEF" });
+			const ansi = render(progress);
+			const native = JSON.stringify(
+				taskToolRenderer.describeResult(
+					{ content: [], details: detailsFor(progress) },
+					{ expanded: false, isPartial: status === "running", renderContext: { nowMs: 1 } },
+				),
+			);
+			for (const output of [ansi, native]) {
+				expect(output).not.toContain("PRIVATE_WATCH_BRIEF");
+				if (status === "running") expect(output).toContain("CURRENT_STAGE");
+				else expect(output).not.toContain("CURRENT_STAGE");
+			}
+		}
 	});
 
 	it("shortens home paths in keyless arguments and in each call's intent on the card", async () => {

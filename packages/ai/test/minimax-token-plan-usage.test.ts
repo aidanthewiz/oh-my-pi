@@ -335,7 +335,7 @@ describe("MiniMax Token Plan usage", () => {
 			expect(storage.usage.providerFor("minimax-code")).toBe(minimaxCodeUsageProvider);
 			expect(storage.usage.providerFor("minimax-code-cn")).toBeUndefined();
 		} finally {
-			storage.close();
+			await storage.close();
 		}
 	});
 
@@ -360,7 +360,7 @@ describe("MiniMax Token Plan usage", () => {
 				"MiniMax-M2",
 			]);
 		} finally {
-			storage.close();
+			await storage.close();
 		}
 	});
 });

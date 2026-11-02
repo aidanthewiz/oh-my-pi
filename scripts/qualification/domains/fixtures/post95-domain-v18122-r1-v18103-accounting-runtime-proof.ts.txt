@@ -1,0 +1,392 @@
+import assert from "node:assert/strict";
+import { createHash, randomUUID } from "node:crypto";
+import * as fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import type { AssistantMessage, Context, Model, ProviderSessionState, SimpleStreamOptions } from "../../packages/ai/src/types";
+import type { SessionManager as Manager } from "../../packages/coding-agent/src/session/session-manager";
+
+declare const PI_COMPILED: boolean;
+const required = (name: string): string => { const value = process.env[name]; assert(value, name); return value; };
+const sha = (bytes: string | Uint8Array): string => createHash("sha256").update(bytes).digest("hex");
+const roots = [required("CF_QUAL_CHECKOUT")];
+const outsideSources = (file: string): boolean => roots.every(root => file !== root && !file.startsWith(root + path.sep));
+const compiled = typeof PI_COMPILED !== "undefined" ? PI_COMPILED : process.env.PI_COMPILED === "true";
+const candidateVersion = required("CF_UPSTREAM_CANDIDATE_VERSION");
+assert.match(candidateVersion, /^\d+\.\d+\.\d+$/);
+const engineHead = required("CF_UPSTREAM_ENGINE_HEAD"), companionHead = null;
+const mergeValue = required("CF_UPSTREAM_MERGE_HEAD");
+const mergeHead = mergeValue === "null" ? null : mergeValue;
+for (const head of [engineHead, ...(mergeHead ? [mergeHead] : [])]) assert.match(head, /^[a-f0-9]{40}$/);
+const nativeSha256 = required("V1890_NATIVE_SHA256"), sourceInputSha256 = required("V1890_SOURCE_INPUT_SHA256");
+for (const hash of [nativeSha256, sourceInputSha256]) assert.match(hash, /^[a-f0-9]{64}$/);
+const manifestPath = await fs.realpath(required("V1890_SOURCE_INPUT_MANIFEST"));
+assert(outsideSources(manifestPath), "Source snapshot must be copied outside checkouts");
+assert((await fs.lstat(manifestPath)).isFile());
+const manifestBytes = await fs.readFile(manifestPath);
+assert.equal(sha(manifestBytes), sourceInputSha256, "Copied manifest byte hash");
+const manifest: unknown = JSON.parse(manifestBytes.toString());
+assert(manifest !== null && typeof manifest === "object" && !Array.isArray(manifest));
+assert("schema" in manifest && manifest.schema === "CoreforgeCandidateSourceSnapshot");
+assert("records" in manifest && Array.isArray(manifest.records) && manifest.records.length > 0);
+assert("sourceDigest" in manifest && typeof manifest.sourceDigest === "string");
+assert.equal(sha(JSON.stringify(manifest.records)), manifest.sourceDigest, "Source records digest");
+assert.match(manifest.sourceDigest, /^[a-f0-9]{64}$/);
+assert("engineHead" in manifest && manifest.engineHead === engineHead);
+assert("mergeHead" in manifest && manifest.mergeHead === mergeHead);
+assert("companionHead" in manifest && manifest.companionHead === companionHead);
+assert("native" in manifest && manifest.native !== null && typeof manifest.native === "object" && "sha256" in manifest.native);
+assert.equal(manifest.native.sha256, nativeSha256);
+const home = await fs.realpath(required("HOME")), tmp = await fs.realpath(required("TMPDIR"));
+assert(outsideSources(home) && outsideSources(tmp));
+assert.notEqual(home, path.parse(home).root);
+assert.equal(await fs.realpath(os.homedir()), home, "Private HOME must precede Bun startup");
+assert((await fs.lstat(home)).isDirectory() && (await fs.lstat(tmp)).isDirectory());
+assert.equal((await fs.stat(home)).uid, process.getuid!());
+const startCwd = process.cwd();
+if (compiled) assert(outsideSources(await fs.realpath(startCwd)), "Compiled cwd must be outside checkouts");
+const root = await fs.mkdtemp(path.join(tmp, "v18103-accounting-"));
+assert(outsideSources(root));
+const owner = randomUUID();
+await fs.writeFile(path.join(root, ".owner"), owner, { flag: "wx", mode: 0o600 });
+// Keep the startup HOME. Provider/config imports must not see ambient credentials or routing settings.
+for (const env of [process.env, Bun.env]) {
+ const keep = { PATH: env.PATH, HOME: home, USERPROFILE: home, TMPDIR: tmp, TMP: tmp, TEMP: tmp, PI_COMPILED: String(compiled), PI_CODING_AGENT_DIR: path.join(root, "agent"), GIT_OPTIONAL_LOCKS: "0", GIT_NO_REPLACE_OBJECTS: "1", LANG: "en_US.UTF-8" };
+ for (const key of Object.keys(env)) delete env[key];
+ Object.assign(env, keep);
+}
+process.chdir(root);
+const originalFetch = globalThis.fetch;
+let networkAttempts = 0, syntheticRequests = 0;
+const denyNetwork = (): never => { networkAttempts++; throw new Error("Accounting proof forbids external network"); };
+globalThis.fetch = Object.assign(denyNetwork, { preconnect: denyNetwork }) as typeof fetch;
+const managers: Manager[] = [];
+const stateMaps: Map<string, ProviderSessionState>[] = [];
+const cases: Array<{ id: string; evidence: unknown }> = [];
+let closeIndex: (() => void) | undefined;
+let complete = false, privateRootRemoved = false;
+const deadline = setTimeout(() => { console.error("V18103_ACCOUNTING_DEADLINE"); process.exit(124); }, 60_000);
+const usage = (output: number, reasoningTokens?: number): AssistantMessage["usage"] => ({ input: 0, output, cacheRead: 0, cacheWrite: 0, totalTokens: output, ...(reasoningTokens === undefined ? {} : { reasoningTokens }), cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } });
+try {
+ // Static engine imports cannot work here: this proof exercises configuration isolation at the module-loading boundary.
+ await import("../../packages/natives/native/index.js");
+ const { nativeAddonStatus } = await import("../../packages/natives/native/loader-state.js");
+ const native = nativeAddonStatus(); assert(native);
+ assert.equal(native.version, candidateVersion); assert.equal(native.packageVersion, candidateVersion); assert.equal(native.stale, false);
+ assert.equal(sha(await fs.readFile(native.path)), nativeSha256);
+ if (compiled) assert(outsideSources(await fs.realpath(native.path)), "Compiled native must be extracted outside checkouts");
+ const { type } = await import("../../packages/omptype/src/index");
+ const { Tokenizer } = await import("../../packages/agent/src/tokenizer");
+ const { Agent } = await import("../../packages/agent/src/agent");
+ const { fitOutputTokensToContextWindow } = await import("../../packages/agent/src/output-budget");
+ const { collectShakeRegions, applyShakeRegions } = await import("../../packages/agent/src/compaction/shake");
+ const { countResponsesHistoryTokens } = await import("../../packages/agent/src/compaction/openai");
+ const { getBundledModel } = await import("../../packages/catalog/src/models");
+ const { resolveThinkingReplayTokens } = await import("../../packages/catalog/src/compat/thinking-replay");
+ const { resolveImageTokenization, imageTokens } = await import("../../packages/catalog/src/compat/image-tokenization");
+ const { Settings } = await import("../../packages/coding-agent/src/config/settings");
+ const { createSettingsAwareStreamFn } = await import("../../packages/coding-agent/src/session/settings-stream-fn");
+ const { openAIResponsesReplaysNativeHistory } = await import("../../packages/ai/src/providers/openai-responses-state");
+ const { SessionManager } = await import("../../packages/coding-agent/src/session/session-manager");
+ const { anonymizeSessionTranscripts } = await import("../../packages/coding-agent/src/session/session-anonymizer");
+ const { closeSessionIndex } = await import("../../packages/coding-agent/src/session/session-index");
+ closeIndex = closeSessionIndex;
+ const settings = Settings.isolated({ "providers.openaiWebsockets": "off", "model.loopGuard.enabled": false, "providers.maxInFlightRequests": {} });
+ const wrapped = createSettingsAwareStreamFn(settings);
+ const sol = getBundledModel<"openai-responses">("openai", "gpt-6.1-sol");
+ const opus = getBundledModel<"anthropic-messages">("anthropic", "claude-opus-5-5");
+ const gemini = getBundledModel("google", "gemini-3-pro-preview");
+ assert(sol && opus && gemini && sol.api === "openai-responses" && opus.api === "anthropic-messages");
+ const localSol: Model<"openai-responses"> = { ...sol, contextWindow: 10_000, maxTokens: 9_000 };
+ const wireBodySchema = type({
+  "max_output_tokens?": "number",
+  "input?": type({ "type?": "string", "+": "ignore" }).array(),
+  "messages?": type({ content: type("string").or(type({ type: "string", "signature?": "string", "thinking?": "string", "+": "ignore" }).array()), "+": "ignore" }).array(),
+  "+": "ignore",
+ });
+ interface Wire { url: string; body: typeof wireBodySchema.infer; serializedSha256: string; contentEncoding: string | null; wireSha256: string; }
+ const responseSse = (): Response => {
+  const text = "synthetic-accounting-ok", id = `resp_accounting_${syntheticRequests}`;
+  const item = { type: "message", id: `msg_${id}`, role: "assistant", status: "completed", content: [{ type: "output_text", text, annotations: [] }] };
+  const events = [
+   { type: "response.created", response: { id } },
+   { type: "response.output_item.added", output_index: 0, item: { ...item, status: "in_progress", content: [] } },
+   { type: "response.content_part.added", output_index: 0, content_index: 0, part: { type: "output_text", text: "", annotations: [] } },
+   { type: "response.output_text.delta", output_index: 0, content_index: 0, delta: text },
+   { type: "response.output_item.done", output_index: 0, item },
+   { type: "response.completed", response: { id, status: "completed", output: [item], usage: { input_tokens: 7, output_tokens: 3, total_tokens: 10, input_tokens_details: { cached_tokens: 0 }, output_tokens_details: { reasoning_tokens: 0 } } } },
+  ];
+  return new Response(events.map(event => `data: ${JSON.stringify(event)}\n\n`).join(""), { headers: { "content-type": "text/event-stream" } });
+ };
+ const anthropicSse = (): Response => {
+  const events = [
+   { type: "message_start", message: { id: "msg_accounting", type: "message", role: "assistant", model: opus.id, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 7, output_tokens: 0 } } },
+   { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+   { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "synthetic-accounting-ok" } },
+   { type: "content_block_stop", index: 0 },
+   { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 3 } },
+   { type: "message_stop" },
+  ];
+  return new Response(events.map(event => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join(""), { headers: { "content-type": "text/event-stream" } });
+ };
+ // The real provider builds UTF-8 JSON and the real decoder consumes SSE. No sockets or provider clients are substituted.
+ const capture = async (fn: typeof wrapped, model: Model, context: Context, options: SimpleStreamOptions = {}): Promise<Wire> => {
+  const requests: Wire[] = [], before = JSON.stringify(context), modelBefore = JSON.stringify(model);
+  const provenance = { caseNumber: cases.length + 1, completedCases: cases.map(item => item.id), provider: model.provider, api: model.api, model: model.id };
+  let requestAttempt = 0, transportFailed = false, decoderFailed = false;
+  const reportFailure = (phase: string, error: unknown, details: Record<string, unknown> = {}): void => {
+   console.error(JSON.stringify({ diagnostic: "ACCOUNTING_SYNTHETIC_FAILURE", phase, ...provenance, requestAttempt, acceptedRequests: requests.length, ...details, error: error instanceof Error ? { name: error.name, message: error.message, stack: error.stack } : error }));
+  };
+  const transport = (async (input: string | URL | Request, init?: RequestInit) => {
+   requestAttempt++;
+   let serializedSha256: string | undefined;
+   try {
+   const request = new Request(input, init), url = new URL(request.url);
+   const expected = new URL(model.baseUrl!);
+   assert.equal(url.origin, expected.origin, "Synthetic interceptor accepts only the selected model destination");
+   assert.equal(url.pathname, expected.pathname.replace(/\/$/, "") + (model.api === "anthropic-messages" ? "/v1/messages" : "/responses"));
+   assert.equal(request.method, "POST");
+   const contentEncoding = request.headers.get("content-encoding");
+   assert(contentEncoding === null || contentEncoding === "gzip", "Unsupported synthetic receiver content encoding");
+   const wireBytes = new Uint8Array(await request.arrayBuffer());
+   const serialized = new TextDecoder("utf-8", { fatal: true }).decode(contentEncoding === "gzip" ? Bun.gunzipSync(wireBytes) : wireBytes);
+   assert(serialized.length > 0 && serialized.length < 512_000);
+   serializedSha256 = sha(serialized);
+   const body = wireBodySchema.assert(JSON.parse(serialized));
+   if (model.api === "openai-responses") { assert.equal(typeof body.max_output_tokens, "number"); assert(Array.isArray(body.input)); }
+   else assert(Array.isArray(body.messages));
+   requests.push({ url: request.url, body, serializedSha256, contentEncoding, wireSha256: sha(wireBytes) });
+   syntheticRequests++;
+   return model.api === "anthropic-messages" ? anthropicSse() : responseSse();
+   } catch (error) {
+    if (!transportFailed) { transportFailed = true; reportFailure("interceptor", error, { url: input instanceof Request ? input.url : String(input), serializedSha256 }); }
+    throw error;
+   }
+  }) as typeof fetch;
+  const stream = fn(model, context, { ...options, apiKey: "synthetic-accounting-key-not-a-credential", maxTokens: options.maxTokens ?? 9_000, fetch: transport, preferWebsockets: false, signal: AbortSignal.timeout(5_000) });
+  const eventTypes: string[] = [];
+  try {
+   for await (const event of stream) {
+    eventTypes.push(event.type);
+    if (event.type === "error" && !decoderFailed) {
+     decoderFailed = true;
+     reportFailure("provider-error-event", event.error.errorMessage, { stopReason: event.error.stopReason, eventTypes, requests });
+    }
+   }
+  } catch (error) {
+   if (!decoderFailed) { decoderFailed = true; reportFailure("provider-decoder", error, { eventTypes, requests }); }
+   throw error;
+  }
+  const result = await stream.result();
+  if (result.stopReason !== "stop" && !decoderFailed) reportFailure("provider-result", result.errorMessage, { stopReason: result.stopReason, eventTypes, requests });
+  assert.equal(result.stopReason, "stop", result.errorMessage);
+  assert(result.content.some(block => block.type === "text" && block.text === "synthetic-accounting-ok"));
+  assert(eventTypes.includes("text_delta") && eventTypes.includes("done"));
+  assert.equal(result.usage.input, 7); assert.equal(result.usage.output, 3);
+  assert.equal(requests.length, 1, "Bounded single serialized synthetic request");
+  assert.equal(JSON.stringify(context), before, "Request serialization preserves the transcript");
+  assert.equal(JSON.stringify(model), modelBefore, "Request serialization preserves model metadata");
+  return requests[0]!;
+ };
+ const encrypted = { type: "reasoning", id: "rs_accounting", summary: [], encrypted_content: "ciphertext-not-billed-tokens-".repeat(600) };
+ const turn: AssistantMessage = { role: "assistant", api: localSol.api, provider: localSol.provider, model: localSol.id, content: [{ type: "text", text: "Done." }], providerPayload: { type: "openaiResponsesHistory", provider: localSol.provider, dt: true, items: [encrypted, { type: "message", role: "assistant", content: [{ type: "output_text", text: "Done.", annotations: [] }] }] }, usage: usage(6_000, 5_000), stopReason: "stop", timestamp: 1 };
+ const context: Context = { messages: [{ role: "user", content: "Rebuilt summary", historyRewriteAt: 10, timestamp: 10 } as Context["messages"][number], turn, { role: "user", content: "Continue.", timestamp: 11 }] };
+ const reasoningItems = (wire: Wire): number => { assert(wire.body.input); return wire.body.input.filter(item => item.type === "reasoning").length; };
+ const coldPolicy = getBundledModel<"openai-responses">("github-copilot", "gpt-5.4");
+ assert.equal(coldPolicy.compat.connectionBoundNativeHistory, true);
+ const connectionBound: Model<"openai-responses"> = { ...localSol, compat: { ...localSol.compat, connectionBoundNativeHistory: coldPolicy.compat.connectionBoundNativeHistory } };
+ const states = new Map<string, ProviderSessionState>(); stateMaps.push(states);
+ const agent = new Agent({ initialState: { model: connectionBound, messages: [], tools: [], systemPrompt: [] }, providerSessionState: states });
+ const transcriptBefore = JSON.stringify(context);
+ assert.equal(openAIResponsesReplaysNativeHistory(connectionBound, states), false);
+ const coldCount = agent.tokenizer.countMessage(turn), coldFloor = agent.tokenizer.countMessage(turn, { excludeEncryptedReasoning: true });
+ const cold = await capture(wrapped, connectionBound, context, { providerSessionState: states });
+ assert.equal(reasoningItems(cold), 0); assert.equal(cold.body.max_output_tokens, 9_000); assert.equal(coldCount, coldFloor);
+ assert.equal(openAIResponsesReplaysNativeHistory(connectionBound, states), true, "Successful real decoder completion warms the owned provider state");
+ const warmCount = agent.tokenizer.countMessage(turn), warmFloor = agent.tokenizer.countMessage(turn, { excludeEncryptedReasoning: true });
+ assert.equal(warmCount - coldCount, 5_000); assert.equal(warmFloor, warmCount);
+ const warm = await capture(wrapped, connectionBound, context, { providerSessionState: states });
+ assert.equal(reasoningItems(warm), 1); assert(warm.body.max_output_tokens! < cold.body.max_output_tokens!);
+ assert(warm.body.max_output_tokens! + 5_000 <= connectionBound.contextWindow);
+ for (const state of states.values()) state.close();
+ assert.equal(openAIResponsesReplaysNativeHistory(connectionBound, states), false);
+ assert.equal(agent.tokenizer.countMessage(turn), coldCount);
+ const recooled = await capture(wrapped, connectionBound, context, { providerSessionState: states });
+ assert.equal(reasoningItems(recooled), 0); assert.equal(recooled.body.max_output_tokens, cold.body.max_output_tokens);
+ assert.equal(JSON.stringify(context), transcriptBefore);
+ cases.push({ id: "identical-transcript-cold-warm-close-cold", evidence: { cold: { tokens: coldCount, floor: coldFloor, reasoningItems: reasoningItems(cold), cap: cold.body.max_output_tokens }, warm: { tokens: warmCount, floor: warmFloor, reasoningItems: reasoningItems(warm), cap: warm.body.max_output_tokens }, recooledCap: recooled.body.max_output_tokens, transcriptUnchanged: true, stateWarmedByDecodedSuccess: true } });
+
+ const filtered: Model<"openai-responses"> = { ...localSol, compat: { ...localSol.compat, filterReasoningHistory: true } };
+ const replayTokenizer = new Tokenizer(localSol), filteredTokenizer = new Tokenizer(filtered);
+ assert.equal(replayTokenizer.countsAlike(filtered), false);
+ assert.equal(replayTokenizer.countMessage(turn) - filteredTokenizer.countMessage(turn), 5_000);
+ const replay = await capture(wrapped, localSol, context);
+ const noReplay = await capture(wrapped, filtered, context);
+ const replayAgain = await capture(wrapped, localSol, context);
+ const freshFiltered = await capture(createSettingsAwareStreamFn(settings), filtered, context);
+ assert.equal(reasoningItems(replay), 1); assert.equal(reasoningItems(noReplay), 0);
+ assert.equal(noReplay.body.max_output_tokens, 9_000, "ACCOUNTING_SAME_ID_POLICY_REVALIDATION: filtering frees the serialized output budget");
+ assert.equal(noReplay.body.max_output_tokens, freshFiltered.body.max_output_tokens);
+ assert(replay.body.max_output_tokens! < noReplay.body.max_output_tokens!);
+ assert.equal(replayAgain.body.max_output_tokens, replay.body.max_output_tokens);
+ assert.equal(replay.body.max_output_tokens, fitOutputTokensToContextWindow(localSol, context, 9_000, replayTokenizer));
+ cases.push({ id: "same-id-filter-policy-cache-revalidation", evidence: { id: localSol.id, replayCap: replay.body.max_output_tokens, filteredCap: noReplay.body.max_output_tokens, restoredCap: replayAgain.body.max_output_tokens, freshFilteredCap: freshFiltered.body.max_output_tokens, replaySerializedSha256: replay.serializedSha256, filteredSerializedSha256: noReplay.serializedSha256, negativeControl: "Replace countsAlike guard with old if (!tokenizer); this same proof must fail ACCOUNTING_SAME_ID_POLICY_REVALIDATION." } });
+
+ const signed = (signature: string): AssistantMessage => ({ role: "assistant", api: opus.api, provider: opus.provider, model: opus.id, content: [{ type: "thinking", thinking: "Check the call sites.", thinkingSignature: signature }, { type: "text", text: "Done." }], usage: usage(6_000), stopReason: "stop", timestamp: 1 });
+ const shortSignature = "short-synthetic-signature", longSignature = "signature-bytes-are-not-output-tokens-".repeat(2_000);
+ const shortSigned = signed(shortSignature), longSigned = signed(longSignature);
+ const claudeTokenizer = new Tokenizer(opus);
+ assert.equal(resolveThinkingReplayTokens(opus), "output");
+ assert.equal(claudeTokenizer.countMessage(shortSigned), 6_000);
+ assert.equal(claudeTokenizer.countMessage(longSigned), 6_000);
+ const visibleSigned = claudeTokenizer.countMessage(longSigned, { excludeEncryptedReasoning: true });
+ assert(visibleSigned < 6_000);
+ const unsigned = { ...longSigned, content: longSigned.content.filter(block => block.type !== "thinking") };
+ assert(claudeTokenizer.countMessage(unsigned) < 6_000);
+ const otherDeployment = { ...longSigned, provider: "different-synthetic-deployment" };
+ assert(claudeTokenizer.countMessage(otherDeployment) < 6_000);
+ const claudeContext: Context = { messages: [{ role: "user", content: "Question", timestamp: 0 }, longSigned, { role: "user", content: "Next", timestamp: 2 }] };
+ const signedWire = await capture(wrapped, opus, claudeContext, { maxTokens: 512 });
+ assert(signedWire.body.messages);
+ const signedBlock = signedWire.body.messages.flatMap(message => Array.isArray(message.content) ? message.content : []).find(block => block.type === "thinking");
+ assert(signedBlock && typeof signedBlock.signature === "string");
+ assert.equal(signedBlock.signature, longSignature);
+ assert.equal(signedBlock.thinking, "Check the call sites.");
+ cases.push({ id: "claude-signed-output-not-signature-bytes", evidence: { shortSignatureBytes: Buffer.byteLength(shortSignature), longSignatureBytes: Buffer.byteLength(signedBlock.signature), billedSyntheticOutputTokens: 6_000, bothCounts: [claudeTokenizer.countMessage(shortSigned), claudeTokenizer.countMessage(longSigned)], visibleFloor: visibleSigned, crossDeploymentCount: claudeTokenizer.countMessage(otherDeployment), signedWireSha256: signedWire.serializedSha256, signedWireEncoding: signedWire.contentEncoding, signedWireRawSha256: signedWire.wireSha256 } });
+
+ const sonnet = getBundledModel<"anthropic-messages">("anthropic", "claude-sonnet-4-5-20250929");
+ assert(sonnet && sonnet.api === "anthropic-messages");
+ const unofficial: Model<"anthropic-messages"> = { ...sonnet, compat: { ...sonnet.compat, officialEndpoint: false }, thinking: { ...sonnet.thinking!, prefixBinding: false } };
+ const official: Model<"anthropic-messages"> = { ...unofficial, compat: { ...unofficial.compat, officialEndpoint: true } };
+ const prefixBound: Model<"anthropic-messages"> = { ...unofficial, thinking: { ...unofficial.thinking!, prefixBinding: true } };
+ const olderOpus: AssistantMessage = { ...shortSigned, model: "claude-opus-4-5-20251101" };
+ const visibleDeploymentCount = new Tokenizer(unofficial).countMessage(olderOpus, { excludeEncryptedReasoning: true });
+ assert(visibleDeploymentCount > 0 && visibleDeploymentCount < 6_000);
+ const deploymentTransitions: Array<{ policy: string; fromReplay: boolean; cached: number; fresh: number }> = [];
+ for (const [policy, replaying] of [["officialEndpoint", official], ["prefixBinding", prefixBound]] as const) {
+  const low = new Tokenizer(unofficial), high = new Tokenizer(replaying);
+  assert.equal(low.encoding, high.encoding); assert.equal(low.frameBillingKey, high.frameBillingKey);
+  assert.equal(low.reasoningReplayKey, high.reasoningReplayKey); assert.equal(low.thinkingReplayTokens, high.thinkingReplayTokens);
+  assert.equal(low.nativeHistoryReplay, high.nativeHistoryReplay);
+  assert.equal(low.countMessage(olderOpus), visibleDeploymentCount); assert.equal(high.countMessage(olderOpus), 6_000);
+  for (const [from, to, fromReplay, expected] of [[unofficial, replaying, false, 6_000], [replaying, unofficial, true, visibleDeploymentCount]] as const) {
+   const policyAgent = new Agent({ initialState: { model: from, messages: [olderOpus], tools: [], systemPrompt: [] } });
+   assert.equal(policyAgent.tokenizer.countMessage(olderOpus), fromReplay ? 6_000 : visibleDeploymentCount);
+   policyAgent.setModel(to);
+   const cached = policyAgent.tokenizer.countMessage(olderOpus), fresh = new Tokenizer(to).countMessage(olderOpus);
+   assert.equal(cached, fresh, `ACCOUNTING_DEPLOYMENT_POLICY_REVALIDATION: ${policy} ${fromReplay ? "replay-to-visible" : "visible-to-replay"}`);
+   assert.equal(cached, expected);
+   assert.equal(new Tokenizer(from).countsAlike(to), false);
+   deploymentTransitions.push({ policy, fromReplay, cached, fresh });
+  }
+ }
+ const boundOfficial: Model<"anthropic-messages"> = { ...prefixBound, compat: { ...prefixBound.compat, officialEndpoint: true } };
+ const boundAgent = new Agent({ initialState: { model: prefixBound, messages: [olderOpus], tools: [], systemPrompt: [] } });
+ assert.equal(boundAgent.tokenizer.countMessage(olderOpus), 6_000);
+ assert.equal(boundAgent.tokenizer.countsAlike(boundOfficial), true);
+ boundAgent.setModel(boundOfficial);
+ assert.equal(boundAgent.tokenizer.countMessage(olderOpus), new Tokenizer(boundOfficial).countMessage(olderOpus));
+ assert.equal(boundAgent.tokenizer.countMessage(olderOpus), 6_000);
+ cases.push({ id: "same-id-deployment-signature-policy-cache-revalidation", evidence: { marker: "ACCOUNTING_DEPLOYMENT_POLICY_REVALIDATION", reader: sonnet.id, producer: olderOpus.model, outputTokens: olderOpus.usage.output, visibleDeploymentCount, deploymentTransitions, bothPrefixBoundCount: boundAgent.tokenizer.countMessage(olderOpus), noProviderRequests: true } });
+
+ const pngWithSize = (width: number, height: number): string => {
+  const bytes = Buffer.alloc(64); Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]).copy(bytes); bytes.writeUInt32BE(13, 8); bytes.write("IHDR", 12, "ascii"); bytes.writeUInt32BE(width, 16); bytes.writeUInt32BE(height, 20); bytes[24] = 8; bytes[25] = 6; return bytes.toString("base64");
+ };
+ const image = { type: "image" as const, data: pngWithSize(1000, 1000), mimeType: "image/png" };
+ const imageMessage = { role: "user" as const, content: [image], timestamp: 0 };
+ const imagePrices: Array<Record<string, unknown>> = [];
+ for (const reader of [opus, gemini, sol]) {
+  const tokenizer = new Tokenizer(reader), rule = resolveImageTokenization(reader); assert(rule);
+  const expected = imageTokens(rule, { width: 1000, height: 1000 });
+  assert.equal(tokenizer.countMessage(imageMessage), expected);
+  assert.equal(tokenizer.countMessage({ role: "toolResult", toolName: "read", toolCallId: "image-probe", content: [image], isError: false, timestamp: 0 }), expected);
+  imagePrices.push({ provider: reader.provider, id: reader.id, rule, tokens: expected });
+ }
+ assert.equal(imagePrices[0]!.tokens, 1296); assert.equal(imagePrices[1]!.tokens, 1120);
+ const imageAgent = new Agent({ initialState: { model: opus, messages: [], tools: [], systemPrompt: [] } });
+ assert.equal(imageAgent.tokenizer.countMessage(imageMessage), 1296);
+ imageAgent.setModel(gemini); assert.equal(imageAgent.tokenizer.countMessage(imageMessage), 1120);
+ imageAgent.setModel(opus); assert.equal(imageAgent.tokenizer.countMessage(imageMessage), 1296);
+ const localReader = (identity: Model["identity"]): Model<"openai-responses"> => ({ ...localSol, id: "accounting-local-reader", name: "Synthetic canonical reader", provider: "accounting-synthetic", baseUrl: "https://accounting.example.invalid/v1", identity });
+ const claudeReader = localReader(opus.identity), geminiReader = localReader(gemini.identity);
+ const a = new Tokenizer(claudeReader), b = new Tokenizer(geminiReader);
+ assert.equal(a.countsAlike(geminiReader), false); assert.equal(a.thinkingReplayTokens, "output"); assert.equal(b.thinkingReplayTokens, "signature");
+ assert.equal(a.countMessage(imageMessage), 1296); assert.equal(b.countMessage(imageMessage), 1120);
+ const policyTurn: AssistantMessage = { ...longSigned, api: claudeReader.api, provider: claudeReader.provider, model: claudeReader.id };
+ assert.equal(a.countMessage(policyTurn), 6_000);
+ assert(b.countMessage(policyTurn) > a.countMessage(policyTurn), "Same local id reader identity changes signature pricing");
+ const imageContext: Context = { messages: [imageMessage] };
+ const imageA = await capture(wrapped, claudeReader, imageContext), imageB = await capture(wrapped, geminiReader, imageContext), imageAAgain = await capture(wrapped, claudeReader, imageContext);
+ assert(imageA.body.max_output_tokens! < imageB.body.max_output_tokens!, "Same local id must use the current canonical reader's image policy");
+ assert.equal(imageAAgain.body.max_output_tokens, imageA.body.max_output_tokens);
+ assert.equal(imageB.body.max_output_tokens, (await capture(createSettingsAwareStreamFn(settings), geminiReader, imageContext)).body.max_output_tokens);
+ assert(JSON.stringify(imageA.body.input).includes(image.data));
+ const codex = getBundledModel("openai-codex", "gpt-6.1-sol"), imageTokenizer = new Tokenizer(codex);
+ const probe = (size: number) => {
+  const data = pngWithSize(size, size), block = { type: "image" as const, data, mimeType: "image/png", detail: "original" as const };
+  return { local: imageTokenizer.countMessage({ role: "user", content: [block], timestamp: 0 }), remote: countResponsesHistoryTokens([{ role: "user", content: [{ type: "input_image", detail: "original", image_url: `data:image/png;base64,${data}` }] }], imageTokenizer) };
+ };
+ const tiny = probe(1), large = probe(4000);
+ assert.equal(large.local, 18_750); assert.equal(large.remote - tiny.remote, large.local - tiny.local);
+ cases.push({ id: "reader-specific-image-and-model-switch-cache-separation", evidence: { imagePrices, sameId: claudeReader.id, sameIdCaps: [imageA.body.max_output_tokens, imageB.body.max_output_tokens, imageAAgain.body.max_output_tokens], readerThinkingPolicies: [a.thinkingReplayTokens, b.thinkingReplayTokens], sameIdSignedThinkingCounts: [a.countMessage(policyTurn), b.countMessage(policyTurn)], nativeCompaction: { tiny, large }, sizingFixtureOnly: true } });
+
+ const manager = SessionManager.create(root, path.join(root, "sessions")); managers.push(manager);
+ manager.appendMessage({ role: "user", content: "Synthetic shake request", timestamp: 0 });
+ const fence = `\`\`\`ts\n${"const value = compute(a, b, c, d, e);\n".repeat(200)}\`\`\``;
+ const shakeTurn = signed("synthetic-shake-signature"); shakeTurn.usage = usage(30_000);
+ shakeTurn.content = [{ type: "thinking", thinking: "Keep the signed reasoning", thinkingSignature: "synthetic-shake-signature" }, { type: "text", text: `Before\n${fence}\nAfter` }];
+ manager.appendMessage(shakeTurn);
+ manager.appendMessage({ role: "user", content: "Protected recent tail", timestamp: 2 });
+ await manager.ensureOnDisk(); await manager.flush();
+ const entry = manager.getBranch().find(item => item.type === "message" && item.message.role === "assistant");
+ assert(entry && entry.type === "message" && entry.message.role === "assistant");
+ const retained = entry.message, countBefore = claudeTokenizer.countMessage(retained), floorBefore = claudeTokenizer.countMessage(retained, { excludeEncryptedReasoning: true });
+ const regions = collectShakeRegions(manager.getBranch(), claudeTokenizer, { protectTokens: 0, minSavings: 0, protectedTools: [], fenceMinTokens: 100 });
+ assert.equal(regions.length, 1); assert.equal(regions[0]!.kind, "block"); assert.equal(regions[0]!.originalText, fence);
+ const replacement = "[Synthetic fenced output shaken]", replacementTokens = claudeTokenizer.countTokens(replacement);
+ const removed = regions[0]!.tokens - replacementTokens; assert(removed > 0 && removed < 30_000);
+ applyShakeRegions(regions.map(region => ({ region, replacement, replacementTokens })));
+ assert.equal(retained.elidedOutputTokens, removed);
+ assert.equal(claudeTokenizer.countMessage(retained), countBefore - removed, "Owner mutation invalidates the already-warm per-message count");
+ assert(claudeTokenizer.countMessage(retained, { excludeEncryptedReasoning: true }) < floorBefore);
+ assert.equal(retained.usage.output, 30_000, "Historical billed output is not rewritten");
+ await manager.rewriteEntries(); await manager.flush();
+ const sessionFile = manager.getSessionFile(); assert(sessionFile && sessionFile.startsWith(root + path.sep));
+ await manager.close();
+ const reopened = await SessionManager.open(sessionFile, path.join(root, "sessions")); managers.push(reopened);
+ const reopenedEntry = reopened.getBranch().find(item => item.type === "message" && item.message.role === "assistant");
+ assert(reopenedEntry && reopenedEntry.type === "message" && reopenedEntry.message.role === "assistant");
+ assert.equal(reopenedEntry.message.elidedOutputTokens, removed);
+ assert.equal(reopenedEntry.message.usage.output, 30_000);
+ assert.equal(new Tokenizer(opus).countMessage(reopenedEntry.message), countBefore - removed);
+ assert(!JSON.stringify(reopenedEntry.message.content).includes(fence)); assert(JSON.stringify(reopenedEntry.message.content).includes(replacement));
+ const exported = await anonymizeSessionTranscripts({ header: reopened.getHeader(), entries: reopened.getEntries(), sessionFile });
+ assert.equal(exported.subagentCount, 0); assert.equal(exported.subagentError, undefined); assert.deepEqual(exported.malformed, []);
+ const mainExport = exported.files.find(([name]) => name === "session.jsonl"); assert(mainExport);
+ const exportTurnSchema = type({ type: "'message'", message: { role: "'assistant'", elidedOutputTokens: "number", usage: { output: "number", "+": "ignore" }, "+": "ignore" }, "+": "ignore" });
+ const exportedRecord = mainExport[1].trim().split("\n").map((line): unknown => JSON.parse(line)).find(record => {
+  if (record === null || typeof record !== "object" || !("type" in record) || record.type !== "message" || !("message" in record)) return false;
+  const message = record.message;
+  return message !== null && typeof message === "object" && "role" in message && message.role === "assistant";
+ });
+ const exportedTurn = exportTurnSchema.assert(exportedRecord).message;
+ assert.equal(exportedTurn.elidedOutputTokens, removed); assert.equal(exportedTurn.usage.output, 30_000);
+ assert(!mainExport[1].includes("Keep the signed reasoning") && !mainExport[1].includes("synthetic-shake-signature") && !mainExport[1].includes("compute(a, b"));
+ cases.push({ id: "shake-elided-output-persists-reopens-and-anonymizes", evidence: { countBefore, countAfter: claudeTokenizer.countMessage(retained), removed, replacementTokens, originalBilledOutput: reopenedEntry.message.usage.output, reopenedCount: new Tokenizer(opus).countMessage(reopenedEntry.message), exportedElidedOutputTokens: exportedTurn.elidedOutputTokens, anonymizedTranscriptSha256: sha(mainExport[1]), rawContentRedacted: true } });
+ complete = true;
+} finally {
+ const errors: unknown[] = [];
+ for (const states of stateMaps) for (const state of states.values()) { try { state.close(); } catch (error) { errors.push(error); } }
+ for (const manager of managers.reverse()) { try { await manager.close(); } catch (error) { errors.push(error); } }
+ try { closeIndex?.(); } catch (error) { errors.push(error); }
+ await new Promise<void>(resolve => setImmediate(resolve));
+ globalThis.fetch = originalFetch; clearTimeout(deadline); process.chdir(startCwd);
+ assert.equal(await fs.readFile(path.join(root, ".owner"), "utf8"), owner);
+ assert.equal(await fs.realpath(root), root);
+ await fs.rm(root, { recursive: true });
+ await assert.rejects(fs.lstat(root), (error: NodeJS.ErrnoException) => error.code === "ENOENT");
+ privateRootRemoved = true;
+ if (errors.length) throw new AggregateError(errors, "Accounting proof cleanup failed");
+}
+assert(complete && privateRootRemoved); assert.equal(networkAttempts, 0); assert.equal(cases.length, 6);
+console.log(JSON.stringify({ proof: "v18103-accounting-runtime", status: "passed", compiled, candidateVersion, nativeSha256, sourceInputSha256, sourceDigest: manifest.sourceDigest, engineHead, mergeHead, companionHead, cases, privateRootRemoved, networkAttempts, paidRequests: 0, syntheticRequests, ownedListeners: 0, ownedWorkers: 0, limits: { providerBillingMeasured: false, coreProviderBillingMeasured: false, priceEntitlementClaimed: false, policy: "Synthetic policy exercise from canonical catalog metadata; not a provider billing measurement or price entitlement.", transport: "Real provider serialization and SSE decoding at an owned in-memory fetch boundary; no network requests or real credentials.", images: "Header-only synthetic PNG sizing fixtures; no screenshot, decoder-pixel, or remote billing claim.", compiledFence: "Parent must enforce genuine checkout-read denial and bind canonical native/generated assets; this entrypoint does not substitute a mocked filesystem denial.", negativeControl: "Parent may compile the old settings-stream-fn if (!tokenizer) condition against this unchanged entrypoint; same-id policy output-cap assertion must fail." } }));

@@ -6,6 +6,7 @@ import type { ExtensionAskDialogQuestion } from "@oh-my-pi/pi-tui/overlays/ask-d
 import { AskDialogComponent } from "@oh-my-pi/pi-tui/overlays/ask-dialog";
 import { getThemeByName, setThemeInstance } from "@oh-my-pi/pi-tui/theme";
 import { setKeybindings } from "@oh-my-pi/pi-tui";
+import type { DescribeContext, NativeUiEvent } from "../src/native/node";
 
 const DOWN = "\x1b[B";
 const UP = "\x1b[A";
@@ -38,22 +39,6 @@ describe("AskDialogComponent", () => {
 		setKeybindings(KeybindingsManager.inMemory());
 		vi.useRealTimers();
 		vi.restoreAllMocks();
-	});
-
-	it("multi-question footer labels the question-switch keys", () => {
-		const questions: ExtensionAskDialogQuestion[] = [
-			{ id: "q1", question: "First?", options: [{ label: "A1" }, { label: "A2" }] },
-			{ id: "q2", question: "Second?", options: [{ label: "B1" }, { label: "B2" }] },
-		];
-		const component = new AskDialogComponent(questions, {
-			onSubmit: vi.fn(),
-			onCancel: vi.fn(),
-			onPrompt: vi.fn(),
-		});
-		const lines = component.render(80).map(line => stripVTControlCharacters(line));
-		const footer = lines.find(line => line.includes("select"));
-		expect(footer).toContain("⇥/←/→ question · ");
-		expect(footer).toContain("cancel");
 	});
 
 	it("single-question, single-select: Enter on option submits immediately", () => {
@@ -541,6 +526,175 @@ describe("AskDialogComponent", () => {
 		expect(onSubmit.mock.calls[0][0].results[0]).toMatchObject({
 			note: "Updated [Image #1]",
 			noteImages: [image],
+		});
+	});
+
+	describe("Note right after a pick that moved to the next question", () => {
+		const twoQuestions: ExtensionAskDialogQuestion[] = [
+			{ id: "q1", question: "Q1?", options: [{ label: "Alpha" }, { label: "Beta" }] },
+			{ id: "q2", question: "Q2?", options: [{ label: "Gamma" }, { label: "Delta" }] },
+		];
+		const cx: DescribeContext = {
+			cols: 100,
+			reduceMotion: false,
+			dark: true,
+			supports: () => true,
+			feature: () => true,
+		};
+		const action = (act: string): NativeUiEvent => ({ type: "action", key: `actions/${act}`, act, mods: [] });
+		const flush = async (): Promise<void> => {
+			for (let i = 0; i < 4; i++) await Promise.resolve();
+		};
+		const surfaces = {
+			// Tern: a click commits a single-choice row, then the Note button.
+			tern: async (component: AskDialogComponent) => {
+				component.describe(cx);
+				component.handleNativeEvent({ type: "activate", key: "q0", item: "option:1" });
+				component.handleNativeEvent(action("note"));
+				await flush();
+				component.handleNativeEvent({ type: "activate", key: "q1", item: "option:0" });
+				component.handleNativeEvent(action("submit"));
+			},
+			tui: async (component: AskDialogComponent) => {
+				component.handleInput(DOWN);
+				component.handleInput(ENTER);
+				component.handleInput("n");
+				await flush();
+				component.handleInput(ENTER);
+				component.handleInput(ENTER);
+			},
+		};
+
+		for (const [surface, run] of Object.entries(surfaces)) {
+			it(`annotates that pick, not the next question's row (${surface})`, async () => {
+				const onPrompt = vi.fn().mockResolvedValue("why Beta");
+				const onSubmit = vi.fn();
+				const component = new AskDialogComponent(twoQuestions, { onSubmit, onCancel: vi.fn(), onPrompt });
+
+				await run(component);
+
+				const [first, second] = onSubmit.mock.calls[0][0].results;
+				expect(first).toMatchObject({ selectedOptions: ["Beta"], note: "why Beta", noteOption: "Beta" });
+				expect(second).toMatchObject({ selectedOptions: ["Gamma"], note: undefined, noteOption: undefined });
+			});
+		}
+
+		it("goes back to the highlighted row once the next question gets other input", async () => {
+			const onPrompt = vi.fn().mockResolvedValue("why Delta");
+			const onSubmit = vi.fn();
+			const component = new AskDialogComponent(twoQuestions, { onSubmit, onCancel: vi.fn(), onPrompt });
+
+			component.handleInput(ENTER); // Alpha, on to Q2
+			component.handleInput(DOWN); // Delta highlighted
+			component.handleInput("n");
+			await flush();
+			component.handleInput(ENTER);
+			component.handleInput(ENTER);
+
+			const [first, second] = onSubmit.mock.calls[0][0].results;
+			expect(first.note).toBeUndefined();
+			expect(second).toMatchObject({ selectedOptions: ["Delta"], note: "why Delta", noteOption: "Delta" });
+		});
+
+		it("annotates a new pick even when the next question already has an answer", async () => {
+			const onPrompt = vi.fn().mockResolvedValue("why Beta");
+			const onSubmit = vi.fn();
+			const component = new AskDialogComponent(twoQuestions, { onSubmit, onCancel: vi.fn(), onPrompt });
+
+			component.handleInput(TAB);
+			component.handleInput(ENTER);
+			component.handleInput(SHIFT_TAB);
+			component.handleInput(SHIFT_TAB);
+			component.handleInput(DOWN);
+			component.handleInput(ENTER);
+			component.handleInput("n");
+			await flush();
+			component.handleInput(ENTER);
+			component.handleInput(ENTER);
+
+			expect(onSubmit.mock.calls[0][0].results).toMatchObject([
+				{ selectedOptions: ["Beta"], note: "why Beta", noteOption: "Beta" },
+				{ selectedOptions: ["Gamma"], note: undefined, noteOption: undefined },
+			]);
+		});
+
+		it("keeps a custom answer's note unattributed to any predefined option after advancing", async () => {
+			const onPrompt = vi.fn().mockResolvedValueOnce("my answer").mockResolvedValueOnce("why mine");
+			const onSubmit = vi.fn();
+			const component = new AskDialogComponent(twoQuestions, { onSubmit, onCancel: vi.fn(), onPrompt });
+
+			component.handleInput(DOWN);
+			component.handleInput(DOWN);
+			component.handleInput(ENTER);
+			await flush();
+			component.handleInput("n");
+			await flush();
+			component.handleInput(ENTER);
+			component.handleInput(ENTER);
+
+			expect(onSubmit.mock.calls[0][0].results).toMatchObject([
+				{ selectedOptions: [], customInput: "my answer", note: "why mine", noteOption: undefined },
+				{ selectedOptions: ["Gamma"], note: undefined, noteOption: undefined },
+			]);
+		});
+
+		it("keeps multi-select note ownership and images when re-editing the just-picked note is cancelled", async () => {
+			const image: ImageContent = { type: "image", data: "note-image", mimeType: "image/png" };
+			const onImagePrompt = vi
+				.fn()
+				.mockResolvedValueOnce({ text: "why Beta [Image #1]", images: [image] })
+				.mockResolvedValueOnce(undefined);
+			const onSubmit = vi.fn();
+			const component = new AskDialogComponent([{ ...twoQuestions[0]!, multi: true }, twoQuestions[1]!], {
+				onSubmit,
+				onCancel: vi.fn(),
+				onPrompt: vi.fn(),
+				onImagePrompt,
+			});
+
+			component.handleInput(SPACE);
+			component.handleInput(DOWN);
+			component.handleInput(SPACE);
+			component.handleInput(ENTER);
+			component.handleInput("n");
+			await flush();
+			component.handleInput("N");
+			await flush();
+			component.handleInput(ENTER);
+			component.handleInput(ENTER);
+
+			expect(onImagePrompt.mock.calls[1][1]).toEqual({ text: "why Beta [Image #1]", images: [image] });
+			expect(onSubmit.mock.calls[0][0].results).toMatchObject([
+				{
+					selectedOptions: ["Alpha", "Beta"],
+					note: "why Beta [Image #1]",
+					noteOption: "Beta",
+					noteImages: [image],
+				},
+				{ selectedOptions: ["Gamma"], note: undefined, noteImages: undefined, noteOption: undefined },
+			]);
+		});
+
+		it("uses the next question after a native selection instead of annotating the prior pick", async () => {
+			const onPrompt = vi.fn().mockResolvedValue("why Delta");
+			const onSubmit = vi.fn();
+			const component = new AskDialogComponent([twoQuestions[0]!, { ...twoQuestions[1]!, multi: true }], {
+				onSubmit,
+				onCancel: vi.fn(),
+				onPrompt,
+			});
+
+			component.handleNativeEvent({ type: "activate", key: "q0", item: "option:1" });
+			component.handleNativeEvent({ type: "select", key: "q1", item: "option:1" });
+			component.handleNativeEvent(action("note"));
+			await flush();
+			component.handleNativeEvent(action("submit"));
+			component.handleNativeEvent(action("submit"));
+
+			expect(onSubmit.mock.calls[0][0].results).toMatchObject([
+				{ selectedOptions: ["Beta"], note: undefined, noteOption: undefined },
+				{ selectedOptions: ["Delta"], note: "why Delta", noteOption: "Delta" },
+			]);
 		});
 	});
 

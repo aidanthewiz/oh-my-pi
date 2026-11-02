@@ -26,6 +26,10 @@ import {
 	type SimpleStreamOptions,
 	type Usage,
 } from "@oh-my-pi/pi-ai";
+import {
+	resolveOpenAIResponsesAccountingModel,
+	resolveOpenAIResponsesPromptCacheOptions,
+} from "@oh-my-pi/pi-ai/providers/openai-shared";
 import { calculateCost } from "@oh-my-pi/pi-catalog/models";
 import { isAnthropicOAuthToken } from "@oh-my-pi/pi-catalog/utils";
 import type { CacheWarmingDecisionEvent, CacheWarmingDecisionEventResult } from "../extensibility/shared-events";
@@ -88,6 +92,11 @@ function supportsLongCacheRetention(model: Model<Api>): boolean {
 			compat !== undefined && "supportsLongCacheRetention" in compat && compat.supportsLongCacheRetention === true
 		);
 	}
+	// Factory Droid resolves long retention per upstream at request time, so
+	// warming starts on the 5m tier and adopts 1h once a response reports it.
+	// A model declaring only a 1h lifetime (a long-only `promptCache` override)
+	// starts on 1h instead, and stops if a response reports a 5m write.
+	if (model.api === "factory-droid-agent") return model.promptCache?.short === undefined;
 	if (model.api === "bedrock-converse-stream") {
 		return (
 			compat !== undefined &&
@@ -141,6 +150,18 @@ export function observedPromptCacheTier(usage: Usage): PromptCacheTier | undefin
 	if ((usage.cttl?.ephemeral1h ?? 0) > 0) return "long";
 	if ((usage.cttl?.ephemeral5m ?? 0) > 0) return "short";
 	return undefined;
+}
+
+/**
+ * Whether `message` is the response to a request sent to `model`. A
+ * server-side fallback retags the response with the served model, so its
+ * fallback marker's `from` names the model the request went to.
+ */
+function answers(message: AssistantMessage, model: Model<Api>): boolean {
+	if (message.provider !== model.provider) return false;
+	if (message.model === model.id) return true;
+	const fallback = message.content.find(block => block.type === "fallback");
+	return fallback?.type === "fallback" && fallback.from.model === model.id;
 }
 
 /**
@@ -262,6 +283,25 @@ interface ActiveRun extends CacheWarmRequest {
 	onWarmed?: (message: AssistantMessage, extensionOverride: boolean) => void;
 	timer?: NodeJS.Timeout;
 	warmingStopReason?: string;
+	/** Cache entry this run's request writes; a refresh hit confirms and extends it. */
+	entry: TrackedCacheEntry;
+}
+
+/** Lifetime of the prompt cache entry the latest request wrote, independent of whether it is warmed. */
+export interface PromptCacheEntry {
+	/** When a request last wrote or read the entry (send time of the latest real or warm request). */
+	touchedAt: number;
+	/** Retention tier the entry was written under. */
+	tier: PromptCacheTier;
+	/** How long the provider keeps the entry after it was last touched. */
+	ttlMs: number;
+}
+
+interface TrackedCacheEntry {
+	model: Model<Api>;
+	tier: PromptCacheTier;
+	touchedAt: number;
+	isCurrent: () => boolean;
 }
 
 /** Everything the warmer needs from its host; injected so the core stays session-agnostic. */
@@ -291,6 +331,10 @@ export interface CacheWarmerDeps {
 export class CacheWarmer {
 	#run?: ActiveRun;
 	readonly #inFlight = new Set<Promise<void>>();
+	/** Entry the provider confirmed by reading or writing the prompt cache. */
+	#entry?: TrackedCacheEntry;
+	/** Entry the in-flight request will write, published only once its response confirms it. */
+	#pendingEntry?: TrackedCacheEntry;
 	#inactive: CacheWarmingStatus;
 	readonly #deps: CacheWarmerDeps;
 	/** Called with every paid warm response, including one that missed the cache or was aborted after acceptance. */
@@ -323,9 +367,34 @@ export class CacheWarmer {
 		};
 	}
 
+	/**
+	 * Cache entry the latest confirmed request wrote, while the conversation
+	 * still matches it. Tracked even when warming is off or the request cannot
+	 * be replayed; undefined until a response reports cache usage, and when the
+	 * model declares no lifetime for the tier or caching is off.
+	 */
+	get cacheEntry(): PromptCacheEntry | undefined {
+		const entry = this.#entry;
+		if (!entry?.isCurrent()) return undefined;
+		const seconds = entry.model.promptCache?.[entry.tier];
+		return seconds === undefined
+			? undefined
+			: { touchedAt: entry.touchedAt, tier: entry.tier, ttlMs: seconds * 1000 };
+	}
+
 	/** Keep the prompt cache entry written by `request` warm while `isCurrent` holds. */
 	start(request: CacheWarmRequest, isCurrent: () => boolean, onWarmed?: CacheWarmer["onWarmed"]): void {
 		this.#clearRun();
+		// A string key is classified up front. Resolver keys (rotating
+		// credentials) cannot be inspected without consuming them; they start on
+		// the short tier and `onResponse` switches to the tier the provider
+		// reports having written.
+		const apiKey = request.options.apiKey;
+		const isOAuthToken =
+			request.model.api === "anthropic-messages" && typeof apiKey === "string" && isAnthropicOAuthToken(apiKey);
+		const tier = resolvePromptCacheTier(request.model, request.options, isOAuthToken);
+		const entry = tier === undefined ? undefined : { model: request.model, tier, touchedAt: Date.now(), isCurrent };
+		this.#pendingEntry = entry;
 		const mode = this.#deps.getMode();
 		if (mode === "off") {
 			this.#stop("cache warming disabled");
@@ -335,19 +404,11 @@ export class CacheWarmer {
 			this.#stop("request cannot be replayed safely");
 			return;
 		}
-		// A string key is classified up front. Resolver keys (rotating
-		// credentials) cannot be inspected without consuming them; they start on
-		// the short tier and `onResponse` switches to the tier the provider
-		// reports having written.
-		const apiKey = request.options.apiKey;
-		const isOAuthToken =
-			request.model.api === "anthropic-messages" && typeof apiKey === "string" && isAnthropicOAuthToken(apiKey);
-		const tier = resolvePromptCacheTier(request.model, request.options, isOAuthToken);
-		if (tier === undefined) {
+		if (entry === undefined) {
 			this.#stop("request disabled prompt caching");
 			return;
 		}
-		const delayMs = this.#delayFor(request.model, tier);
+		const delayMs = this.#delayFor(request.model, entry.tier);
 		if (delayMs === undefined) {
 			this.#stop("cache lifetime unavailable");
 			return;
@@ -356,7 +417,8 @@ export class CacheWarmer {
 			...request,
 			isCurrent,
 			onWarmed,
-			tier,
+			tier: entry.tier,
+			entry,
 			delayMs,
 			startedAt: Date.now(),
 			controller: new AbortController(),
@@ -368,21 +430,33 @@ export class CacheWarmer {
 	}
 
 	/**
-	 * Adopt the retention tier the armed request's response actually wrote, so
-	 * the schedule follows the provider's decision rather than a guess about
-	 * the credential.
+	 * Confirm the in-flight request's cache entry and adopt the retention tier
+	 * its response actually wrote, so the schedule follows the provider's
+	 * decision rather than a guess about the credential. A failed response, or
+	 * one that neither read nor wrote the cache, never publishes its entry.
 	 */
 	onResponse(message: AssistantMessage): void {
+		const observed = observedPromptCacheTier(message.usage);
+		const pending = this.#pendingEntry;
+		if (pending && answers(message, pending.model)) {
+			this.#pendingEntry = undefined;
+			if (message.stopReason !== "error" && (message.usage.cacheRead > 0 || message.usage.cacheWrite > 0)) {
+				if (observed !== undefined) pending.tier = observed;
+				this.#entry = pending;
+			}
+		}
 		const run = this.#run;
 		if (!run || run.timer === undefined) return;
-		if (message.provider !== run.model.provider || message.model !== run.model.id) return;
-		const tier = observedPromptCacheTier(message.usage);
-		if (tier === undefined || tier === run.tier) return;
-		const delayMs = this.#delayFor(run.model, tier);
-		if (delayMs === undefined) return;
+		if (!answers(message, run.model)) return;
+		if (observed === undefined || observed === run.tier) return;
+		const delayMs = this.#delayFor(run.model, observed);
+		if (delayMs === undefined) {
+			this.#stop("cache lifetime unavailable");
+			return;
+		}
 		clearTimeout(run.timer);
 		run.timer = undefined;
-		run.tier = tier;
+		run.tier = observed;
 		run.delayMs = delayMs;
 		this.#schedule(run);
 	}
@@ -408,6 +482,8 @@ export class CacheWarmer {
 	}
 
 	cancel(): void {
+		this.#entry = undefined;
+		this.#pendingEntry = undefined;
 		this.#stop("inactive");
 	}
 
@@ -497,12 +573,10 @@ export class CacheWarmer {
 		}
 	}
 
-	async #refresh(run: ActiveRun): Promise<void> {
-		run.timer = undefined;
-		if (!this.#validateRun(run)) return;
-		const decision = this.#evaluate(run);
+	async #admitRefresh(run: ActiveRun, decision: CacheWarmingDecision): Promise<boolean> {
+		if (!this.#validateRun(run)) return false;
 		const action = await this.#decide(decision);
-		if (!this.#validateRun(run)) return;
+		if (!this.#validateRun(run)) return false;
 		const extensionOverride = action !== decision.action;
 		if (action === "stop") {
 			const reason = extensionOverride
@@ -511,10 +585,17 @@ export class CacheWarmer {
 					? "expected savings below threshold"
 					: "cache economics unavailable";
 			this.#stop(reason, { decision, extensionOverride });
-			return;
+			return false;
 		}
-
 		run.extensionOverride = extensionOverride;
+		return true;
+	}
+
+	async #refresh(run: ActiveRun): Promise<void> {
+		run.timer = undefined;
+		if (!this.#validateRun(run)) return;
+		const decision = this.#evaluate(run);
+		if (!(await this.#admitRefresh(run, decision)) || !this.#validateRun(run)) return;
 		const refresh: CacheWarmingRefreshStart = {
 			phase: run.phase,
 			provider: run.model.provider,
@@ -523,13 +604,14 @@ export class CacheWarmer {
 		this.onRefreshStart?.(refresh);
 		let outcome: CacheWarmingRefreshEnd["outcome"] = "error";
 		let usage: Usage | undefined;
+		const sentAt = Date.now();
 		try {
-			const message = await this.#replay(run);
+			const message = await this.#replay(run, decision);
 			// Record before the abort check: a refresh cancelled or replaced after the
 			// provider accepted it was still billed, and spend tracking must see it.
 			const onWarmed = run.onWarmed ?? this.onWarmed;
 			if (message && (reportedTokens(message.usage) > 0 || message.usage.cost.total > 0) && onWarmed) {
-				onWarmed(message, extensionOverride);
+				onWarmed(message, run.extensionOverride);
 				usage = message.usage;
 			}
 			if (this.#run !== run) {
@@ -549,6 +631,11 @@ export class CacheWarmer {
 				return;
 			}
 			outcome = "hit";
+			// A hit proves the run's entry exists even before its own response
+			// confirmed it, and restarts its lifetime.
+			run.entry.touchedAt = sentAt;
+			this.#entry = run.entry;
+			if (this.#pendingEntry === run.entry) this.#pendingEntry = undefined;
 			if (!this.#validateRun(run)) return;
 			this.#schedule(run);
 		} finally {
@@ -567,7 +654,7 @@ export class CacheWarmer {
 	 * adaptive allowance and runs to terminal metadata under a true one-token
 	 * total-generation cap.
 	 */
-	async #replay(run: ActiveRun): Promise<AssistantMessage | undefined> {
+	async #replay(run: ActiveRun, decision: CacheWarmingDecision): Promise<AssistantMessage | undefined> {
 		const cutoff = new AbortController();
 		let stream: CacheWarmStream;
 		const replayOptions: SimpleStreamOptions = {
@@ -575,6 +662,35 @@ export class CacheWarmer {
 			maxTokens: 1,
 			signal: AbortSignal.any([run.controller.signal, cutoff.signal]),
 		};
+		if (run.model.api === "openai-responses") {
+			let admittedDecision = decision;
+			replayOptions.onPayload = async (payload, model, signal) => {
+				if (!this.#validateRun(run)) throw new DOMException("Cache warming stopped", "AbortError");
+				const replacement = await run.options.onPayload?.(payload, model, signal);
+				if (!this.#validateRun(run)) throw new DOMException("Cache warming stopped", "AbortError");
+				const finalPayload = replacement === undefined ? payload : replacement;
+				const accountingModel = resolveOpenAIResponsesAccountingModel(
+					run.model,
+					finalPayload as Parameters<typeof resolveOpenAIResponsesAccountingModel>[1],
+				);
+				const finalDecision = this.#evaluate(run, accountingModel);
+				if (
+					finalDecision.phase !== admittedDecision.phase ||
+					finalDecision.warmCost !== admittedDecision.warmCost ||
+					finalDecision.missCost !== admittedDecision.missCost ||
+					finalDecision.continuationProbability !== admittedDecision.continuationProbability ||
+					finalDecision.economicsAvailable !== admittedDecision.economicsAvailable ||
+					finalDecision.action !== admittedDecision.action
+				) {
+					if (!(await this.#admitRefresh(run, finalDecision))) {
+						throw new DOMException("Cache warming stopped", "AbortError");
+					}
+					admittedDecision = finalDecision;
+				}
+				if (!this.#validateRun(run)) throw new DOMException("Cache warming stopped", "AbortError");
+				return replacement;
+			};
+		}
 		if (run.model.api === "bedrock-converse-stream" && run.model.thinking?.mode === "anthropic-adaptive") {
 			// Adaptive Converse ignores thinkingBudgets on the wire. Zero each
 			// supported effort so the generic mapper cannot inflate maxTokens,
@@ -613,9 +729,7 @@ export class CacheWarmer {
 			// The deliberate cutoff surfaces as an aborted result.
 		}
 		if (!partial) return undefined;
-		const usage: Usage = { ...partial.usage };
-		usage.cost = calculateCost(run.model, usage);
-		return { ...partial, usage, stopReason: "aborted" };
+		return { ...partial, stopReason: "aborted" };
 	}
 
 	#validateRun(run: ActiveRun): boolean {
@@ -633,8 +747,13 @@ export class CacheWarmer {
 		return undefined;
 	}
 
-	#evaluate(run: ActiveRun): CacheWarmingDecision {
-		const model = run.model;
+	#evaluate(run: ActiveRun, accountingModel?: Model<Api>): CacheWarmingDecision {
+		let model = accountingModel ?? run.model;
+		if (accountingModel === undefined && model.api === "openai-responses") {
+			model = resolveOpenAIResponsesAccountingModel(model, {
+				prompt_cache_options: resolveOpenAIResponsesPromptCacheOptions(model, run.options),
+			});
+		}
 		const promptTokens = this.#deps.getPromptTokens();
 		const cacheHitCost = price(model, { cacheRead: promptTokens });
 		const cacheMissCost = price(

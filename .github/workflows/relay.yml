@@ -54,6 +54,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
           fetch-tags: true
           persist-credentials: false
@@ -102,6 +103,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
 
       - name: Set up Bun
@@ -111,6 +113,12 @@ jobs:
 
       - name: Install dependencies
         run: bun install --frozen-lockfile
+      - name: Check relay clients
+        run: |
+          bun --cwd=packages/wire run check
+          bun --cwd=packages/collab-web run check
+          bun --cwd=packages/coding-agent run check
+
       - name: Reclaim disk for source native build
         if: needs.prepare.outputs.native_changed == 'true'
         run: |
@@ -158,12 +166,6 @@ jobs:
           BAZEL="$(command -v bazelisk || command -v bazel)"
           "$BAZEL" --bazelrc="$RUNNER_TEMP/coreforge-bazel.rc" clean --expunge
           df -h /
-
-      - name: Check relay clients
-        run: |
-          bun --cwd=packages/wire run check
-          bun --cwd=packages/collab-web run check
-          bun --cwd=packages/coding-agent run check
 
       - name: Test relay clients
         run: |

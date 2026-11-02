@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import { AgentBusyError, type AgentTelemetryConfig, type Tracer } from "@oh-my-pi/pi-agent-core";
 import { type AssistantMessage, Effort } from "@oh-my-pi/pi-ai";
+import { kCursorExecResolved } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { ExtensionActions, LoadExtensionsResult } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import type { CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
@@ -54,6 +55,7 @@ function createMockSession(
 	const listeners: Array<(event: AgentSessionEvent) => void> = [];
 	const state = { messages: [] as AssistantMessage[] };
 	let promptIndex = 0;
+	let disposed = false;
 
 	const emit = (event: AgentSessionEvent) => {
 		for (const listener of listeners) listener(event);
@@ -61,6 +63,12 @@ function createMockSession(
 
 	const session = {
 		...createSessionDefaults(),
+		get isDisposed() {
+			return disposed;
+		},
+		dispose: async () => {
+			disposed = true;
+		},
 		state,
 		agent: { state: { systemPrompt: ["test"] } },
 		model: undefined,
@@ -92,6 +100,8 @@ function createMockSession(
 function createSessionResult(session: AgentSession): CreateAgentSessionResult {
 	return {
 		session,
+		captureOwnerCurrent: () => () => !session.isDisposed,
+		captureOwnerLifetimeCurrent: () => () => !session.isDisposed,
 		extensionsResult: {} as unknown as LoadExtensionsResult,
 		setToolUIContext: () => {},
 		eventBus: new EventBus(),
@@ -414,6 +424,14 @@ describe("runSubprocess yield reminders", () => {
 				isError: false,
 			});
 		});
+		const registry = AgentRegistry.global();
+		const ref = registry.register({
+			id: "subagent-revive",
+			displayName: "subagent-revive",
+			kind: "sub",
+			status: "idle",
+			session: stale,
+		});
 		// Mock sessions lack the real yield-contract method; attach a tracker.
 		const staleMutable = stale as unknown as {
 			setWorkPoolYieldItems: (items: unknown[]) => Promise<void>;
@@ -433,13 +451,20 @@ describe("runSubprocess yield reminders", () => {
 		const ensureLive = vi
 			.spyOn(AgentLifecycleManager.global(), "ensureLive")
 			.mockResolvedValueOnce(stale)
-			.mockResolvedValue(revived);
+			.mockImplementation(async () => {
+				await stale.dispose();
+				registry.attachSession(ref.id, revived, ref.sessionFile, ref);
+				return revived;
+			});
 		try {
 			const result = await runSubagentFollowUpTurn({ ...baseOptions, id: "subagent-revive", message: "batch work" });
 			expect(ensureLive).toHaveBeenCalledTimes(3);
 			expect(calls).toEqual(["setYield:stale", "setYield:revived"]);
-			expect(result.exitCode).toBe(0);
+			expect(result.exitCode, JSON.stringify(result)).toBe(0);
 			expect(result.output).toContain('"revived": true');
+			expect(stale.isDisposed).toBe(true);
+			expect(registry.get(ref.id)).toBe(ref);
+			expect(ref.session).toBe(revived);
 		} finally {
 			AgentRegistry.global().unregister("subagent-revive");
 		}
@@ -490,6 +515,14 @@ describe("runSubprocess yield reminders", () => {
 				isError: false,
 			});
 		});
+		const registry = AgentRegistry.global();
+		const ref = registry.register({
+			id: "subagent-revive-wake",
+			displayName: "subagent-revive-wake",
+			kind: "sub",
+			status: "idle",
+			session: stale,
+		});
 		// Mock sessions lack the real session surface; attach trackers.
 		const staleMutable = stale as unknown as {
 			setWorkPoolYieldItems: (items: unknown[]) => Promise<void>;
@@ -513,7 +546,13 @@ describe("runSubprocess yield reminders", () => {
 		// Parking swaps the worker mid-install while an IRC delivery revives the
 		// replacement straight into an ordinary wake: the follow-up must wait out
 		// that wake before installing the keyed contract, not reject its yield.
-		vi.spyOn(AgentLifecycleManager.global(), "ensureLive").mockResolvedValueOnce(stale).mockResolvedValue(revived);
+		vi.spyOn(AgentLifecycleManager.global(), "ensureLive")
+			.mockResolvedValueOnce(stale)
+			.mockImplementation(async () => {
+				await stale.dispose();
+				registry.attachSession(ref.id, revived, ref.sessionFile, ref);
+				return revived;
+			});
 		try {
 			const result = await runSubagentFollowUpTurn({
 				...baseOptions,
@@ -521,8 +560,11 @@ describe("runSubprocess yield reminders", () => {
 				message: "batch work",
 			});
 			expect(calls).toEqual(["setYield:stale", "waitForIdle:revived", "setYield:revived"]);
-			expect(result.exitCode).toBe(0);
+			expect(result.exitCode, JSON.stringify(result)).toBe(0);
 			expect(result.output).toContain('"revived": true');
+			expect(stale.isDisposed).toBe(true);
+			expect(registry.get(ref.id)).toBe(ref);
+			expect(ref.session).toBe(revived);
 		} finally {
 			AgentRegistry.global().unregister("subagent-revive-wake");
 		}
@@ -593,6 +635,60 @@ describe("runSubprocess yield reminders", () => {
 		expect(prompts).toHaveLength(1);
 		expect(result.exitCode).toBe(0);
 		expect(result.output).toBe(report);
+	});
+
+	it("returns only the text after Cursor's last server-resolved tool call", async () => {
+		const report = "## Result\nThe auth lookup is complete.";
+		const session = createMockSession(({ emit, state }) => {
+			const edit = {
+				type: "toolCall" as const,
+				id: "tool-edit",
+				name: "edit",
+				arguments: { path: "src/auth.ts" },
+				[kCursorExecResolved]: true as const,
+			};
+			const read = {
+				type: "toolCall" as const,
+				id: "tool-read",
+				name: "read",
+				arguments: { path: "src/auth.ts" },
+				[kCursorExecResolved]: true as const,
+			};
+			const final: AssistantMessage = {
+				...createAssistantStopMessage(""),
+				api: "cursor-agent",
+				provider: "cursor",
+				content: [{ type: "text", text: "Checking auth." }, edit, read, { type: "text", text: report }],
+			};
+			state.messages.push(final);
+			emit({ type: "message_end", message: final });
+			emit({ type: "agent_end", messages: [final] });
+		});
+		mockCreateAgentSession(session);
+
+		const result = await runSubprocess({ ...baseOptions, id: "subagent-cursor-final", structured: false });
+
+		expect(result.exitCode).toBe(0);
+		expect(result.output).toBe(report);
+	});
+
+	it("rejects prose after a locally runnable tool call in a stop turn", async () => {
+		const session = createMockSession(({ emit, state }) => {
+			const unfinished = createAssistantStopMessage("");
+			unfinished.content = [
+				{ type: "toolCall", id: "tool-read", name: "read", arguments: { path: "src/auth.ts" } },
+				{ type: "text", text: "The auth lookup is complete." },
+			];
+			state.messages.push(unfinished);
+			emit({ type: "message_end", message: unfinished });
+			emit({ type: "agent_end", messages: [unfinished] });
+		});
+		mockCreateAgentSession(session);
+
+		const result = await runSubprocess({ ...baseOptions, id: "subagent-local-tool-prose", structured: false });
+
+		expect(result.exitCode).toBe(1);
+		expect(result.stderr).toBe(SUBAGENT_WARNING_EMPTY_MESSAGE);
 	});
 
 	it("fails an unstructured run that ends without a final message", async () => {

@@ -1,0 +1,3 @@
+# Browser Relay
+
+The browser relay is on: `browser.open` without `app` drives the user's own Chrome, signed in as them. {{#if cdp}}Pass `app: { relay: false }` to use the configured `browser.cdpUrl` browser instead; it may also contain signed-in sessions.{{else if tern}}Pass `app: { relay: false }` for Coreforge's own Tern picture-in-picture instead.{{else if cmux}}Pass `app: { relay: false }` for a cmux browser surface instead; it may retain existing account state.{{else}}Pass `app: { relay: false }` for a throwaway managed browser.{{/if}} Backend selection does not authorize borrowed-tab navigation or consequential actions; obtain authorization for the exact target and effect.

@@ -33,8 +33,8 @@ beforeAll(async () => {
 	modelRegistry = new ModelRegistry(authStorage);
 });
 
-afterAll(() => {
-	authStorage.close();
+afterAll(async () => {
+	await authStorage.close();
 });
 
 async function createHarness(responses: MockResponse[]): Promise<Harness & { sessionManager: SessionManager }> {

@@ -12,11 +12,13 @@
  *  - confirmed closures are removed, while transient failures remain durable
  *    and are retried on the next reap.
  */
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { daemonRuntimeDir } from "@oh-my-pi/pi-coding-agent/launch/paths";
 import {
+	CdpTargetCloseTimeoutError,
+	closeCdpTarget,
 	collectOrphanTargets,
 	forgetSharedTarget,
 	reapOrphanSharedTargets,
@@ -49,29 +51,233 @@ async function writeOwnershipFile(
 
 /** A pid that has been spawned and reaped, so `kill(pid, 0)` reports ESRCH. */
 async function deadPid(): Promise<number> {
-	const proc = Bun.spawn(["true"], { stdout: "ignore", stderr: "ignore" });
+	// Bun's own executable is the only binary guaranteed on every platform (`true` is absent on Windows).
+	const proc = Bun.spawn([process.execPath, "-e", ""], { stdout: "ignore", stderr: "ignore" });
 	await proc.exited;
 	return proc.pid;
 }
 
 /** Minimal puppeteer Browser stub recording closes and optionally failing selected targets. */
 function makeBrowser(closed: string[], failTargets: ReadonlySet<string> = new Set()): Browser {
+	const destroyedHandlers = new Set<(event: { targetId: string }) => void>();
 	const session = {
 		send: async (method: string, params?: { targetId: string }) => {
 			if (method === "Target.getTargets") {
 				return { targetInfos: [...failTargets].map(targetId => ({ targetId })) };
 			}
+			if (method === "Target.setDiscoverTargets") return {};
 			if (!params) throw new Error(`Missing params for ${method}`);
 			if (failTargets.has(params.targetId)) throw new Error("transient CDP failure");
 			closed.push(params.targetId);
+			const { targetId } = params;
+			queueMicrotask(() => {
+				for (const handler of destroyedHandlers) handler({ targetId });
+			});
 			return { success: true };
 		},
+		on: (_event: string, handler: (event: { targetId: string }) => void) => destroyedHandlers.add(handler),
+		off: (_event: string, handler: (event: { targetId: string }) => void) => destroyedHandlers.delete(handler),
 		detach: async () => undefined,
 	};
 	return {
 		target: () => ({ createCDPSession: async () => session }),
 	} as unknown as Browser;
 }
+
+function closeFixture(
+	send: (method: string, emit: (targetId: string) => void) => Promise<unknown>,
+	options: { create?: Promise<void>; detach?: () => Promise<void> } = {},
+): { browser: Browser; listeners: () => number; detaches: () => number } {
+	const handlers = new Set<(event: { targetId: string }) => void>();
+	let detaches = 0;
+	const session = {
+		send: (method: string) =>
+			send(method, targetId => {
+				for (const handler of handlers) handler({ targetId });
+			}),
+		on: (_event: string, handler: (event: { targetId: string }) => void) => handlers.add(handler),
+		off: (_event: string, handler: (event: { targetId: string }) => void) => handlers.delete(handler),
+		detach: async () => {
+			detaches++;
+			await options.detach?.();
+		},
+	};
+	return {
+		browser: {
+			target: () => ({
+				createCDPSession: async () => {
+					await options.create;
+					return session;
+				},
+			}),
+		} as unknown as Browser,
+		listeners: () => handlers.size,
+		detaches: () => detaches,
+	};
+}
+
+describe("CDP target close confirmation", () => {
+	let clock = 0;
+	async function flush(): Promise<void> {
+		for (let i = 0; i < 32; i++) await Promise.resolve();
+	}
+	async function advance(ms: number): Promise<void> {
+		clock += ms;
+		vi.advanceTimersByTime(ms);
+		await flush();
+	}
+	beforeEach(() => {
+		clock = 0;
+		vi.useFakeTimers();
+		spyOn(performance, "now").mockImplementation(() => clock);
+	});
+	afterEach(() => {
+		vi.restoreAllMocks();
+		vi.useRealTimers();
+	});
+
+	it("does not accept a close acknowledgment or another target's destruction as ownership release", async () => {
+		const fixture = closeFixture(async (method, emit) => {
+			if (method === "Target.closeTarget") {
+				emit("somebody-elses-page");
+				return { success: true };
+			}
+			if (method === "Target.getTargets") return { targetInfos: [{ targetId: "owned" }] };
+			return {};
+		});
+
+		const close = closeCdpTarget(fixture.browser, "owned", 80);
+		await flush();
+		await advance(40);
+		expect(await close).toBe(false);
+		expect(fixture.listeners()).toBe(0);
+		expect(fixture.detaches()).toBe(1);
+	});
+
+	it("accepts matching destruction even when the close response never arrives", async () => {
+		const fixture = closeFixture(async (method, emit) => {
+			if (method === "Target.closeTarget") {
+				emit("owned");
+				return await new Promise<never>(() => {});
+			}
+			return {};
+		});
+
+		expect(await closeCdpTarget(fixture.browser, "owned", 80)).toBe(true);
+		expect(fixture.listeners()).toBe(0);
+	});
+
+	it("confirms absence after a close protocol error", async () => {
+		const fixture = closeFixture(async method => {
+			if (method === "Target.closeTarget") throw new Error("No target with given id");
+			if (method === "Target.getTargets") return { targetInfos: [{ targetId: "unrelated" }] };
+			return {};
+		});
+
+		expect(await closeCdpTarget(fixture.browser, "owned", 80)).toBe(true);
+		expect(fixture.listeners()).toBe(0);
+	});
+
+	it("reserves absence time from the original budget, not from the end of discovery", async () => {
+		const discovery = Promise.withResolvers<void>();
+		const fixture = closeFixture(async method => {
+			if (method === "Target.setDiscoverTargets") await discovery.promise;
+			if (method === "Target.closeTarget") return { success: true };
+			if (method === "Target.getTargets") return { targetInfos: [{ targetId: "owned" }] };
+			return {};
+		});
+		let outcome: unknown;
+		const close = closeCdpTarget(fixture.browser, "owned", 200).then(
+			value => {
+				outcome = value;
+			},
+			error => {
+				outcome = error;
+			},
+		);
+		await flush();
+		await advance(150);
+		discovery.resolve();
+		await flush();
+		await advance(0);
+		expect(outcome).toBe(false);
+		await close;
+	});
+
+	it.each(["Target.setDiscoverTargets", "Target.closeTarget", "Target.getTargets"])(
+		"bounds a wedged %s and removes its destruction listener",
+		async wedged => {
+			const fixture = closeFixture(async method => {
+				if (method === wedged || method === "Target.getTargets") return await new Promise<never>(() => {});
+				if (method === "Target.closeTarget") return { success: false };
+				return {};
+			});
+			let outcome: unknown;
+			const close = closeCdpTarget(fixture.browser, "owned", 40).catch(error => {
+				outcome = error;
+			});
+			await flush();
+			await advance(20);
+			await advance(20);
+			expect(outcome).toBeInstanceOf(CdpTargetCloseTimeoutError);
+			await close;
+			expect(fixture.listeners()).toBe(0);
+			expect(fixture.detaches()).toBe(1);
+		},
+	);
+
+	it.each(["Target.setDiscoverTargets", "Target.closeTarget"])(
+		"uses the reserved absence check when %s does not answer",
+		async wedged => {
+			const fixture = closeFixture(async method => {
+				if (method === wedged) return await new Promise<never>(() => {});
+				if (method === "Target.getTargets") return { targetInfos: [] };
+				return {};
+			});
+			const close = closeCdpTarget(fixture.browser, "owned", 80);
+			await flush();
+			await advance(40);
+			expect(await close).toBe(true);
+			expect(fixture.listeners()).toBe(0);
+		},
+	);
+
+	it("detaches a session acquired after the close deadline without starting discovery", async () => {
+		const created = Promise.withResolvers<void>();
+		let sent = false;
+		const fixture = closeFixture(
+			async () => {
+				sent = true;
+				return {};
+			},
+			{ create: created.promise },
+		);
+		let outcome: unknown;
+		const close = closeCdpTarget(fixture.browser, "owned", 40).catch(error => {
+			outcome = error;
+		});
+		await flush();
+		await advance(40);
+		created.resolve();
+		await flush();
+		expect(outcome).toBeInstanceOf(CdpTargetCloseTimeoutError);
+		await close;
+		expect(fixture.detaches()).toBe(1);
+		expect(sent).toBe(false);
+		expect(fixture.listeners()).toBe(0);
+	});
+
+	it("does not let an unresponsive detach turn confirmed absence into an unbounded close", async () => {
+		const fixture = closeFixture(
+			async method => (method === "Target.getTargets" ? { targetInfos: [] } : { success: false }),
+			{ detach: () => new Promise<never>(() => {}) },
+		);
+
+		expect(await closeCdpTarget(fixture.browser, "owned", 40)).toBe(true);
+		expect(fixture.listeners()).toBe(0);
+		expect(fixture.detaches()).toBe(1);
+	});
+});
 
 const scopes: SharedTargetScope[] = [];
 function trackedScope(): SharedTargetScope {

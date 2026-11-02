@@ -723,7 +723,7 @@ describe("serviceTierFor", () => {
 				await session.dispose();
 			}
 		} finally {
-			auth.close();
+			await auth.close();
 		}
 	});
 

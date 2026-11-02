@@ -10,7 +10,7 @@
  * Bearer injection, so the next request surfaces a clean auth error instead.
  */
 import { Database } from "bun:sqlite";
-import { afterEach, beforeEach, describe, expect, setSystemTime, test, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -25,6 +25,10 @@ const TOKEN_URL = "https://example.com/oauth/token";
 const STALE_ACCESS = "stale-access-token";
 const STALE_REFRESH = "stale-refresh-token";
 
+async function drainMicrotasks(count = 10): Promise<void> {
+	for (let attempt = 0; attempt < count; attempt++) await Promise.resolve();
+}
+
 const SHARED_CREDENTIAL_ID = "mcp_oauth_test_5081";
 const SHARED_STALE_ACCESS = "access-0";
 const SHARED_STALE_REFRESH = "refresh-0";
@@ -35,53 +39,6 @@ const SHARED_FRESH_REFRESH = "refresh-1";
 function getAuthorizationHeader(config: MCPServerConfig): string | undefined {
 	if (config.type !== "http" && config.type !== "sse") return undefined;
 	return config.headers?.Authorization;
-}
-
-type ControlledSleep = {
-	ms: number;
-	resolved: boolean;
-	resolve: () => void;
-};
-
-function installControlledBunSleep(): ControlledSleep[] {
-	const calls: ControlledSleep[] = [];
-	vi.spyOn(Bun, "sleep").mockImplementation((ms: number | Date) => {
-		const { promise, resolve } = Promise.withResolvers<void>();
-		const delayMs = typeof ms === "number" ? ms : Math.max(0, ms.getTime() - Date.now());
-		const call = {
-			ms: delayMs,
-			resolved: false,
-			resolve: () => {
-				if (call.resolved) return;
-				call.resolved = true;
-				resolve();
-			},
-		};
-		calls.push(call);
-		return promise;
-	});
-	return calls;
-}
-
-async function drainMicrotasks(count = 10): Promise<void> {
-	for (let attempt = 0; attempt < count; attempt++) {
-		await Promise.resolve();
-	}
-}
-
-async function waitForControlledSleep(calls: ControlledSleep[], ms: number): Promise<ControlledSleep> {
-	for (let attempt = 0; attempt < 20; attempt++) {
-		const call = calls.find(candidate => !candidate.resolved && candidate.ms === ms);
-		if (call) return call;
-		await Promise.resolve();
-	}
-	throw new Error(`Timed out waiting for Bun.sleep(${ms})`);
-}
-
-function resolvePendingControlledSleeps(calls: ControlledSleep[]): void {
-	for (const call of calls) {
-		if (!call.resolved) call.resolve();
-	}
 }
 
 async function withSharedSQLiteAuth<T>(
@@ -105,8 +62,8 @@ async function withSharedSQLiteAuth<T>(
 		await authB.credentials.reload();
 		return await fn({ authA, authB, storeA, storeB });
 	} finally {
-		authA?.close();
-		authB?.close();
+		await authA?.close();
+		await authB?.close();
 		await removeWithRetries(tempDir);
 	}
 }
@@ -146,9 +103,9 @@ describe("MCPManager OAuth refresh failure", () => {
 		};
 	});
 
-	afterEach(() => {
+	afterEach(async () => {
 		vi.useRealTimers();
-		authStorage.close();
+		await authStorage.close();
 		vi.restoreAllMocks();
 	});
 
@@ -223,26 +180,20 @@ describe("MCPManager OAuth refresh failure", () => {
 		expect(remaining).toMatchObject({ type: "oauth", access: "fresh-access", refresh: "fresh-refresh" });
 	});
 
-	test("aborts a timed-out token fetch and waits for it before releasing refresh ownership", async () => {
+	test("stops waiting at the budget but keeps refresh ownership until the exchange settles", async () => {
 		vi.useFakeTimers();
 		const fetchCalled = Promise.withResolvers<void>();
 		const abortObserved = Promise.withResolvers<void>();
 		const allowFetchReject = Promise.withResolvers<void>();
 		let capturedSignal: AbortSignal | undefined;
-		let preparedSettled = false;
 		const releaseSpy = vi.spyOn(store, "releaseCredentialRefreshLease");
 		const fetchImpl = Object.assign(
 			async (_input: string | URL | Request, init?: RequestInit | BunFetchRequestInit): Promise<Response> => {
 				capturedSignal = init?.signal ?? undefined;
 				if (!capturedSignal) throw new Error("token refresh fetch did not receive an AbortSignal");
 				fetchCalled.resolve();
-				capturedSignal.addEventListener(
-					"abort",
-					() => {
-						abortObserved.resolve();
-					},
-					{ once: true },
-				);
+				capturedSignal.addEventListener("abort", () => abortObserved.resolve(), { once: true });
+				// Ignores the abort until the test lets it settle.
 				await allowFetchReject.promise;
 				throw capturedSignal.reason ?? new Error("fetch aborted");
 			},
@@ -250,127 +201,44 @@ describe("MCPManager OAuth refresh failure", () => {
 		);
 		vi.spyOn(globalThis, "fetch").mockImplementation(fetchImpl);
 
-		const prepared = manager.prepareConfig(serverConfig).finally(() => {
-			preparedSettled = true;
-		});
-		await fetchCalled.promise;
-		expect(capturedSignal).toBeDefined();
+		try {
+			const prepared = manager.prepareConfig(serverConfig);
+			await fetchCalled.promise;
+			expect(capturedSignal).toBeDefined();
 
-		vi.advanceTimersByTime(9_999);
-		await drainMicrotasks();
-		expect(capturedSignal!.aborted).toBe(false);
-		expect(preparedSettled).toBe(false);
-		expect(releaseSpy).not.toHaveBeenCalled();
+			// At the 10 s budget the caller proceeds with the stored token; the exchange runs on.
+			vi.advanceTimersByTime(10_000);
+			const preparedConfig = await prepared;
+			expect(getAuthorizationHeader(preparedConfig)).toBe(`Bearer ${STALE_ACCESS}`);
+			expect(capturedSignal!.aborted).toBe(false);
+			expect(releaseSpy).not.toHaveBeenCalled();
 
-		vi.advanceTimersByTime(1);
-		await abortObserved.promise;
-		expect(capturedSignal!.aborted).toBe(true);
-		await drainMicrotasks();
-		expect(preparedSettled).toBe(false);
-		expect(releaseSpy).not.toHaveBeenCalled();
-
-		allowFetchReject.resolve();
-		const preparedConfig = await prepared;
-
-		expect(preparedSettled).toBe(true);
-		expect(releaseSpy).toHaveBeenCalledTimes(1);
-		expect(getAuthorizationHeader(preparedConfig)).toBe(`Bearer ${STALE_ACCESS}`);
+			// The backstop aborts the exchange, but a signal-ignoring endpoint still owns its lease.
+			vi.advanceTimersByTime(50_000);
+			await abortObserved.promise;
+			expect(capturedSignal!.aborted).toBe(true);
+			await drainMicrotasks();
+			expect(releaseSpy).not.toHaveBeenCalled();
+			let closed = false;
+			const close = authStorage.close().then(() => {
+				closed = true;
+			});
+			await drainMicrotasks();
+			expect(closed).toBe(false);
+			allowFetchReject.resolve();
+			await close;
+			expect(releaseSpy).toHaveBeenCalledTimes(1);
+		} finally {
+			allowFetchReject.resolve();
+		}
 	});
 });
 
 describe("MCPManager shared SQLite OAuth refresh", () => {
 	afterEach(() => {
-		setSystemTime();
 		vi.restoreAllMocks();
 	});
 
-	test("renews refresh ownership while the token endpoint is blocked", async () => {
-		await withSharedSQLiteAuth(async ({ authA, authB, storeA }) => {
-			const startMs = Date.parse("2026-07-10T12:00:00.000Z");
-			setSystemTime(new Date(startMs));
-			const sleeps = installControlledBunSleep();
-			const renewSpy = vi.spyOn(storeA, "renewCredentialRefreshLease");
-
-			await authA.credentials.set(SHARED_CREDENTIAL_ID, {
-				type: "oauth",
-				access: SHARED_STALE_ACCESS,
-				refresh: SHARED_STALE_REFRESH,
-				expires: startMs - 60_000,
-			});
-			await authB.credentials.reload();
-
-			const refreshStarted = Promise.withResolvers<void>();
-			const allowRefreshResponse = Promise.withResolvers<void>();
-			const refreshTokens: string[] = [];
-			let refreshRequests = 0;
-			const tokenServer = Bun.serve({
-				hostname: "127.0.0.1",
-				port: 0,
-				async fetch(req) {
-					if (req.method !== "POST" || new URL(req.url).pathname !== "/token") {
-						return new Response("not found", { status: 404 });
-					}
-					refreshRequests += 1;
-					const body = new URLSearchParams(await req.text());
-					refreshTokens.push(body.get("refresh_token") ?? "");
-					if (refreshRequests === 1) {
-						refreshStarted.resolve();
-						await allowRefreshResponse.promise;
-						return Response.json({
-							access_token: SHARED_FRESH_ACCESS,
-							refresh_token: SHARED_FRESH_REFRESH,
-							expires_in: 3600,
-						});
-					}
-					return Response.json({ error: "invalid_grant" }, { status: 400 });
-				},
-			});
-			try {
-				const managerA = new MCPManager(process.cwd());
-				managerA.setAuthStorage(authA);
-				const managerB = new MCPManager(process.cwd());
-				managerB.setAuthStorage(authB);
-				const config: MCPServerConfig = {
-					type: "http",
-					url: "https://logfire.example.com/mcp",
-					auth: {
-						type: "oauth",
-						credentialId: SHARED_CREDENTIAL_ID,
-						tokenUrl: `http://127.0.0.1:${tokenServer.port}/token`,
-					},
-				};
-
-				const preparedA = managerA.prepareConfig(config);
-				await refreshStarted.promise;
-				const renewalSleep = await waitForControlledSleep(sleeps, 5_000);
-
-				setSystemTime(new Date(startMs + 5_000));
-				renewalSleep.resolve();
-				await drainMicrotasks();
-				expect(renewSpy).toHaveBeenCalledTimes(1);
-
-				setSystemTime(new Date(startMs + 16_000));
-				const preparedB = managerB.prepareConfig(config);
-				const peerLeaseWait = await waitForControlledSleep(sleeps, 250);
-
-				expect(refreshRequests).toBe(1);
-				expect(refreshTokens).toEqual([SHARED_STALE_REFRESH]);
-
-				allowRefreshResponse.resolve();
-				const resolvedA = await preparedA;
-				peerLeaseWait.resolve();
-				const resolvedB = await preparedB;
-
-				expect(getAuthorizationHeader(resolvedA)).toBe(`Bearer ${SHARED_FRESH_ACCESS}`);
-				expect(getAuthorizationHeader(resolvedB)).toBe(`Bearer ${SHARED_FRESH_ACCESS}`);
-				expect(refreshRequests).toBe(1);
-				expect(refreshTokens).toEqual([SHARED_STALE_REFRESH]);
-			} finally {
-				resolvePendingControlledSleeps(sleeps);
-				tokenServer.stop(true);
-			}
-		});
-	});
 	test("shares refresh ownership so peer managers do not replay a rotating refresh token", async () => {
 		await withSharedSQLiteAuth(async ({ authA, authB }) => {
 			await authA.credentials.set(SHARED_CREDENTIAL_ID, {

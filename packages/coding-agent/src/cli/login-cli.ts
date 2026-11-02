@@ -11,6 +11,7 @@ import { getOAuthProviders } from "@oh-my-pi/pi-ai";
 import { getAgentDbPath, getProjectDir } from "@oh-my-pi/pi-utils";
 import chalk from "@oh-my-pi/pi-utils/chalk";
 import { ModelRegistry } from "../config/model-registry";
+import { assertOAuthLoginProviderAllowed, filterOAuthLoginProviders } from "../config/oauth-login-gate";
 import { Settings } from "../config/settings";
 import { ensureCoreforgeIdentityAtStartup } from "../identity/startup";
 import { discoverAuthStorage, loadCliExtensionProviders } from "../sdk";
@@ -37,13 +38,18 @@ export async function runLoginCommand(provider: string | undefined): Promise<voi
 		await loadCliExtensionProviders(modelRegistry, settings, cwd);
 
 		const providers = getOAuthProviders().filter(p => p.available);
-		const providerId = provider ?? (await pickOAuthProvider(rl, providers));
+		const providerId = provider ?? (await pickOAuthProvider(rl, filterOAuthLoginProviders(providers, settings)));
 		const info = providers.find(p => p.id === providerId);
 		if (!info) {
 			throw new Error(`Unknown OAuth provider '${providerId}'. Run \`${CF_COMMAND} login\` to pick one.`);
 		}
+		assertOAuthLoginProviderAllowed(info, settings);
 
-		const identity = await runTerminalOAuthLogin(rl, authStorage, info.id, { openBrowser: true });
+		const identity = await runTerminalOAuthLogin(rl, authStorage, info.id, {
+			openBrowser: true,
+			assertLoginAllowed: () => assertOAuthLoginProviderAllowed(info, settings),
+		});
+		assertOAuthLoginProviderAllowed(info, settings);
 		if (!identity) {
 			process.stdout.write(chalk.yellow(`No credentials were stored for ${info.name}.\n`));
 			return;
@@ -66,6 +72,6 @@ export async function runLoginCommand(provider: string | undefined): Promise<voi
 		process.exitCode = 1;
 	} finally {
 		rl.close();
-		authStorage.close();
+		await authStorage.close();
 	}
 }

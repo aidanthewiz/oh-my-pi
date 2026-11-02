@@ -1,0 +1,271 @@
+import assert from "node:assert/strict";
+import { createHash, randomUUID } from "node:crypto";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
+import { registerCustomApi, unregisterCustomApis } from "../../packages/ai/src/api-registry";
+import type { AssistantMessage, Context, Model, Api } from "../../packages/ai/src/types";
+import { AssistantMessageEventStream } from "../../packages/ai/src/utils/event-stream";
+import { closeModelCache } from "../../packages/catalog/src/model-cache";
+import { createAgentSession } from "../../packages/coding-agent/src/sdk";
+import { ModelRegistry } from "../../packages/coding-agent/src/config/model-registry";
+import { Settings } from "../../packages/coding-agent/src/config/settings";
+import { AgentLifecycleManager } from "../../packages/coding-agent/src/registry/agent-lifecycle";
+import { AgentRegistry } from "../../packages/coding-agent/src/registry/agent-registry";
+import { AgentStorage } from "../../packages/coding-agent/src/session/agent-storage";
+import { AuthStorage } from "../../packages/coding-agent/src/session/auth-storage";
+import { SessionManager } from "../../packages/coding-agent/src/session/session-manager";
+import type { AgentSession } from "../../packages/coding-agent/src/session/agent-session";
+import { TaskTool } from "../../packages/coding-agent/src/task/index";
+import { SUBAGENT_WARNING_EMPTY_MESSAGE } from "../../packages/coding-agent/src/task/executor";
+import { INLINE_OUTPUT_CHARS } from "../../packages/coding-agent/src/task/result-summary";
+import { IrcBus } from "../../packages/coding-agent/src/irc/bus";
+import { type } from "../../packages/omptype/src/index";
+import { nativeAddonStatus } from "../../packages/natives/native/loader-state.js";
+
+const required = (name: string): string => {
+ const value = process.env[name]; assert(value, `${name} is required`); return value;
+};
+const sha256 = (bytes: Uint8Array | string) => createHash("sha256").update(bytes).digest("hex");
+const outer = await fs.realpath(required("CF19_RUNTIME_ROOT"));
+const marker = required("CF19_MARKER"); assert.match(marker, /^[A-Za-z0-9_-]+$/);
+const version = required("CF_UPSTREAM_CANDIDATE_VERSION"); assert.match(version, /^\d+\.\d+\.\d+$/);
+const sourceDigest = required("V1890_SOURCE_INPUT_SHA256");
+const nativeSha256 = required("V1890_NATIVE_SHA256");
+for (const digest of [sourceDigest, nativeSha256]) assert.match(digest, /^[a-f0-9]{64}$/);
+const inside = (file: string) => {
+ const relative = path.relative(outer, file);
+ assert(relative && !relative.startsWith("..") && !path.isAbsolute(relative), `Outside owned root: ${file}`);
+};
+const home = await fs.realpath(required("HOME")); inside(home);
+const manifestPath = await fs.realpath(required("V1890_SOURCE_INPUT_MANIFEST")); inside(manifestPath);
+const manifestBytes = await fs.readFile(manifestPath); assert.equal(sha256(manifestBytes), sourceDigest);
+const manifest = JSON.parse(manifestBytes.toString()) as { sourceDigest: string };
+assert.match(manifest.sourceDigest, /^[a-f0-9]{64}$/);
+const native = nativeAddonStatus(); assert(native);
+assert.equal(native.version, version); assert.equal(native.packageVersion, version); assert.equal(native.stale, false);
+assert.equal(sha256(await fs.readFile(native.path)), nativeSha256);
+const mode = process.env.PI_COMPILED === "true" ? "compiled" : "source";
+if (mode === "compiled") inside(await fs.realpath(native.path));
+const root = await fs.mkdtemp(path.join(home, `task-dispatch-${marker}-`));
+await fs.writeFile(path.join(root, ".owner"), marker, { flag: "wx", mode: 0o600 });
+const cwd = path.join(root, "work"); await fs.mkdir(cwd);
+const api = `cf19-task-dispatch-${marker}`;
+const provider = `cf19-task-${marker}`;
+const apiOwner = `task-dispatch-${marker}`;
+const modelName = `${provider}/owned`;
+const schema = { type: "object", properties: { answer: { type: "integer" } }, required: ["answer"], additionalProperties: false };
+const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+ cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+type Scenario = "plain" | "structured" | "empty" | "manual" | "chatter";
+let scenario: Scenario = "plain";
+const manualReport = `Manual report ${marker}\n${Array.from({ length: Math.ceil(INLINE_OUTPUT_CHARS / 64) }, (_, index) => `${index}: ${sha256(`${marker}:${index}`)}`).join("\n")}`;
+const wire: Array<{ scenario: Scenario; model: string; tools: unknown; messages: unknown; content: unknown; stopReason: string; streamEvents: string[] }> = [];
+function stream(model: Model<Api>, context: Context): AssistantMessageEventStream {
+ assert.equal(model.provider, provider); assert.equal(model.id, "owned"); assert.equal(model.api, api);
+ const tools = context.tools ?? [];
+ const isChild = tools.some(tool => tool.name === "read" || tool.name === "yield");
+ const structured = tools.some(tool => tool.name === "yield");
+ let content: AssistantMessage["content"];
+ let stopReason: "stop" | "toolUse" = "stop";
+ if (!isChild) content = [{ type: "text", text: "Owned local task label" }];
+ else if (scenario === "empty") content = [];
+ else if (scenario === "structured" && context.messages.at(-1)?.role !== "toolResult") {
+  assert(structured, "Structured child did not receive yield");
+  content = [{ type: "toolCall", id: `yield-${randomUUID()}`, name: "yield", arguments: { type: "result", data: { answer: 42 } } }];
+  stopReason = "toolUse";
+ } else if (scenario === "structured") content = [{ type: "text", text: "Accepted result submitted" }];
+ else if (scenario === "chatter") content = [{ type: "text", text: `Peer acknowledgment ${marker}` }];
+ else {
+  assert(!structured, "Default plain child unexpectedly received yield");
+  content = [{ type: "text", text: scenario === "manual" ? manualReport : `  Initial plain report ${marker}\nexact final whitespace.  ` }];
+ }
+ const message: AssistantMessage = { role: "assistant", api: model.api, provider: model.provider, model: model.id,
+  content, stopReason, usage: structuredClone(usage), timestamp: Date.now() };
+ const observation = { scenario, model: `${model.provider}/${model.id}`, tools: JSON.parse(JSON.stringify(tools)),
+  messages: JSON.parse(JSON.stringify(context.messages)), content, stopReason, streamEvents: ["start"] };
+ wire.push(observation);
+ const events = new AssistantMessageEventStream();
+ events.push({ type: "start", partial: { ...message, content: [] } });
+ for (const [contentIndex, block] of content.entries()) {
+  const partial = { ...message, content: content.slice(0, contentIndex + 1) };
+  if (block.type === "toolCall") {
+   events.push({ type: "toolcall_start", contentIndex, partial });
+   events.push({ type: "toolcall_delta", contentIndex, delta: JSON.stringify(block.arguments), partial });
+   events.push({ type: "toolcall_end", contentIndex, toolCall: block, partial });
+   observation.streamEvents.push("toolcall_start", "toolcall_delta", "toolcall_end");
+  } else if (block.type === "text") {
+   events.push({ type: "text_start", contentIndex, partial });
+   events.push({ type: "text_delta", contentIndex, delta: block.text, partial });
+   events.push({ type: "text_end", contentIndex, content: block.text, partial });
+   observation.streamEvents.push("text_start", "text_delta", "text_end");
+  }
+ }
+ events.push({ type: "done", reason: stopReason, message }); events.end(message);
+ observation.streamEvents.push("done");
+ return events;
+}
+const cases: Array<{ id: string; status: "passed"; evidence: unknown }> = [];
+const sessions: AgentSession[] = [];
+const cleanupSinks: Array<() => void> = [];
+let auth: AuthStorage | undefined;
+let proofArtifacts: Array<{ file: string; sha256: string; bytes: number }> = [];
+try {
+ const ownedAuth = await AuthStorage.create(":memory:"); auth = ownedAuth;
+ const modelRegistry = new ModelRegistry(ownedAuth, path.join(root, "models.yml"), { ignoreLocalModelConfig: true });
+ modelRegistry.registerProvider(provider, { api, baseUrl: "http://127.0.0.1:1/forbidden", apiKey: "synthetic-local-only",
+  models: [{ id: "owned", name: "Owned task dispatch", reasoning: false, input: ["text"], cost: usage.cost,
+   contextWindow: 32768, maxTokens: 1024 }] }, apiOwner);
+ registerCustomApi(api, stream, apiOwner);
+ const model = modelRegistry.find(provider, "owned");
+ assert(model, `Synthetic model registration failed: ${modelName}`);
+ const availableModels = modelRegistry.getAvailable().map(candidate => `${candidate.provider}/${candidate.id}`);
+ assert(availableModels.includes(modelName), `Synthetic model is not admitted: ${JSON.stringify(availableModels)}`);
+ async function parent(structured?: true) {
+  const id = `Parent${randomUUID().replaceAll("-", "").slice(0, 16)}`;
+  const settings = Settings.isolated({ "async.enabled": true, "task.batch": false, "task.isolation.enabled": false,
+   "task.enableLsp": false, "task.agentIdleTtlMs": 0, "task.completionProbe": false,
+   ...(structured ? { "task.structured": true } : {}),
+   "compaction.enabled": false, "retry.enabled": false, "todo.enabled": false, "todo.reminders": false,
+   "advisor.enabled": false, "autolearn.enabled": false, "lsp.enabled": false,
+   modelRoles: { default: modelName, tiny: modelName } });
+  const { session } = await createAgentSession({ cwd, agentDir: path.join(root, "agent"), authStorage: ownedAuth,
+   modelRegistry, model, settings, agentId: id, agentRegistry: AgentRegistry.global(),
+   sessionManager: SessionManager.create(cwd, path.join(root, "sessions", id)),
+   inheritedSessionAgents: [{ name: "proofworker", description: "Owned task dispatch worker", systemPrompt: "Return the requested report.", tools: ["read"], model: [modelName], source: "project", blocking: true }],
+   disableExtensionDiscovery: true, preloadedExtensionPaths: [], preloadedCustomToolPaths: [],
+   contextFiles: [], skills: [], promptTemplates: [], slashCommands: [], rules: [],
+   enableMCP: false, enableLsp: false, enableIrc: false,
+   cacheWarming: false, skipPythonPreflight: true, toolNames: ["task"], restrictToolNames: true, autoApprove: true });
+  sessions.push(session);
+  const task = session.getToolByName("task") as TaskTool | undefined;
+  assert(task, `Actual TaskTool is unavailable; active=${session.getActiveToolNames().join(",")}`);
+  assert.equal(task.name, "task"); assert.equal(typeof task.execute, "function");
+  const manager = session.asyncJobManager; assert(manager);
+  const admission = {
+   activeTools: session.getActiveToolNames(), enabledTools: session.getEnabledToolNames(),
+   activeModel: session.model ? `${session.model.provider}/${session.model.id}` : undefined, availableModels,
+   agents: session.getSessionAgents(),
+  };
+  assert(admission.agents.some(agent => agent.name === "proofworker" && agent.blocking === true),
+   `Blocking proofworker is not admitted: ${JSON.stringify(admission)}`);
+  const deliveries: string[] = [];
+  cleanupSinks.push(manager.registerDeliverySink(id, (_jobId, text) => { deliveries.push(text); }));
+  return { session, task, manager, id, deliveries, admission };
+ }
+ const plainParent = await parent();
+ const plainArgs = { agent: "proofworker", name: `Plain${randomUUID().replaceAll("-", "").slice(0, 12)}`, task: `Return initial plain report ${marker}`,
+  solutionSpace: "Return one deterministic local report", contextFilePolicy: "none" };
+ const observedPlainWire = plainParent.task.parameters({ ...plainArgs, outputSchema: schema, schemaMode: "strict" });
+ assert(!(observedPlainWire instanceof type.errors));
+ assert(!Object.hasOwn(observedPlainWire, "outputSchema")); assert(!Object.hasOwn(observedPlainWire, "schemaMode"));
+ const callsBeforeRejectedModel = wire.length;
+ const rejectedModel = await plainParent.task.execute(`rejected-model-${marker}`, { ...plainArgs, model: modelName }, AbortSignal.timeout(30000));
+ assert.equal(rejectedModel.isError, true);
+ assert.equal(rejectedModel.details?.results.length, 0);
+ assert.equal(wire.length, callsBeforeRejectedModel, "Rejected normal-agent model selector reached a provider");
+ const invalidModel = `${provider}/missing-${marker}`;
+ const rejectedInvalidModel = await plainParent.task.execute(`rejected-invalid-model-${marker}`, { ...plainArgs, model: invalidModel }, AbortSignal.timeout(30000));
+ assert.equal(rejectedInvalidModel.isError, true);
+ assert.equal(rejectedInvalidModel.details?.results.length, 0);
+ assert.equal(wire.length, callsBeforeRejectedModel, "Invalid caller model reached a provider");
+ const plainResponse = await plainParent.task.execute(`plain-${marker}`, plainArgs, AbortSignal.timeout(30000));
+ const plain = plainResponse.details?.results[0];
+ assert(plain, `Initial TaskTool result missing: ${JSON.stringify({ response: plainResponse, admission: plainParent.admission, wire })}`);
+ assert.equal(plain.exitCode, 0, JSON.stringify({ response: plainResponse, admission: plainParent.admission, wire }));
+ const plainExpected = `  Initial plain report ${marker}\nexact final whitespace.  `;
+ assert.equal(plain.output, plainExpected); assert.equal(plain.structuredOutput, undefined);
+ assert(plain.outputPath, `Plain artifact path missing: ${JSON.stringify(plainResponse)}`);
+ inside(await fs.realpath(plain.outputPath)); assert.equal(await fs.readFile(plain.outputPath, "utf8"), plainExpected);
+ const plainChild = AgentRegistry.global().get(plain.id)?.session;
+ assert(plainChild, `Plain child session missing: ${JSON.stringify({ result: plain, registryRef: AgentRegistry.global().get(plain.id)?.id })}`);
+ assert(!plainChild.getEnabledToolNames().includes("yield"));
+ assert(wire.some(row => row.scenario === "plain"));
+ cases.push({ id: "actual-task-default-plain-initial", status: "passed", evidence: { normalizedWire: observedPlainWire,
+  rejectedCallerModel: { selector: modelName, isError: rejectedModel.isError }, invalidModelControl: { selector: invalidModel, isError: rejectedInvalidModel.isError, providerCallsBeforeAdmission: callsBeforeRejectedModel }, output: plain.output, artifact: plainExpected, exitCode: plain.exitCode, tools: plainChild.getEnabledToolNames(), admission: plainParent.admission } });
+
+ scenario = "structured";
+ const structuredParent = await parent(true);
+ const structuredArgs = { ...plainArgs, name: `Structured${randomUUID().replaceAll("-", "").slice(0, 12)}`, task: `Return structured answer ${marker}`, outputSchema: schema, schemaMode: "strict" };
+ const observedStructuredWire = structuredParent.task.parameters(structuredArgs); assert(!(observedStructuredWire instanceof type.errors));
+ assert.deepEqual(observedStructuredWire.outputSchema, schema);
+ const structuredResponse = await structuredParent.task.execute(`structured-${marker}`, structuredArgs, AbortSignal.timeout(30000));
+ const structuredResult = structuredResponse.details?.results[0];
+ assert(structuredResult, `Structured TaskTool result missing: ${JSON.stringify({ response: structuredResponse, admission: structuredParent.admission, wire })}`);
+ assert.equal(structuredResult.exitCode, 0, JSON.stringify({ response: structuredResponse, admission: structuredParent.admission, wire }));
+ assert.equal(structuredResult.structuredOutput?.status, "valid"); assert.deepEqual(structuredResult.structuredOutput?.data, { answer: 42 });
+ assert(structuredResult.outputPath, `Structured artifact path missing: ${JSON.stringify(structuredResponse)}`);
+ const structuredArtifact = await fs.readFile(structuredResult.outputPath, "utf8");
+ assert.deepEqual(JSON.parse(structuredArtifact), { answer: 42 });
+ const structuredChild = AgentRegistry.global().get(structuredResult.id)?.session;
+ assert(structuredChild, `Structured child session missing: ${JSON.stringify(structuredResult)}`);
+ assert(structuredChild.getEnabledToolNames().includes("yield"));
+ const acceptedYields = structuredChild.messages.filter(message => message.role === "toolResult" && message.toolName === "yield" && !message.isError);
+ assert.equal(acceptedYields.length, 1);
+ cases.push({ id: "actual-task-explicit-structured-yield-schema", status: "passed", evidence: { normalizedWire: observedStructuredWire,
+  output: structuredResult.output, artifact: structuredArtifact, structuredOutput: structuredResult.structuredOutput,
+  acceptedYields, tools: structuredChild.getEnabledToolNames(), admission: structuredParent.admission } });
+
+ scenario = "empty";
+ const emptyResponse = await plainParent.task.execute(`empty-${marker}`, { ...plainArgs, name: `Empty${randomUUID().replaceAll("-", "").slice(0, 12)}`, task: `Return an empty report ${marker}` }, AbortSignal.timeout(30000));
+ const empty = emptyResponse.details?.results[0];
+ assert(empty, `Empty TaskTool result missing: ${JSON.stringify({ response: emptyResponse, admission: plainParent.admission, wire })}`);
+ assert.equal(empty.exitCode, 1, JSON.stringify({ response: emptyResponse, admission: plainParent.admission, wire }));
+ assert.equal(empty.stderr, SUBAGENT_WARNING_EMPTY_MESSAGE); assert.equal(empty.output, SUBAGENT_WARNING_EMPTY_MESSAGE);
+ assert(wire.some(row => row.scenario === "empty" && Array.isArray(row.content) && row.content.length === 0));
+ cases.push({ id: "actual-task-empty-plain-fails", status: "passed", evidence: { exitCode: empty.exitCode, output: empty.output, stderr: empty.stderr } });
+
+ scenario = "manual";
+ assert(manualReport.length > INLINE_OUTPUT_CHARS);
+ await plainChild.prompt(`Manual report requested ${marker}`);
+ await plainChild.waitForIdle(); await plainChild.waitForIrcReplies();
+ await plainParent.manager.waitForOwnerJobs(plainParent.id);
+ await plainParent.manager.drainDeliveries({ filter: { ownerId: plainParent.id } });
+ const manualArtifact = await fs.readFile(plain.outputPath, "utf8");
+ assert.equal(manualArtifact, manualReport, JSON.stringify({
+  childId: plain.id, tools: plainChild.getEnabledToolNames(), messages: plainChild.messages,
+  deliveries: plainParent.deliveries, jobs: plainChild.getAsyncJobSnapshot(), wire,
+ }));
+ assert.equal(plainParent.deliveries.filter(text => text.includes(`Manual report ${marker}`)).length, 1,
+  JSON.stringify({ deliveries: plainParent.deliveries, manualArtifact, wire }));
+ const manualDeliveries = plainParent.deliveries.filter(text => text.includes(`Manual report ${marker}`));
+ assert.match(manualDeliveries[0], new RegExp(`^<task-result id="${plain.id}" agent="proofworker" status="completed"`));
+ assert(manualDeliveries[0].includes(`agent://${plain.id}`),
+  JSON.stringify({ deliveries: plainParent.deliveries, manualArtifact, wire }));
+ const persistedManual = plainChild.messages.filter(message => message.role === "assistant").some(message => JSON.stringify(message.content).includes(`Manual report ${marker}`));
+ assert(persistedManual);
+ cases.push({ id: "actual-task-plain-focused-followup-artifact-and-parent", status: "passed", evidence: {
+  artifact: manualArtifact, deliveries: [...plainParent.deliveries], persistedManual, childId: plain.id } });
+
+ scenario = "chatter";
+ const chatterDelivered = Promise.withResolvers<void>();
+ const unsubscribe = structuredChild.subscribe(event => { if (event.type === "agent_end") chatterDelivered.resolve(); });
+ try {
+  const receipt = await IrcBus.global().send({ from: structuredParent.id, to: structuredResult.id, body: `Peer thanks ${marker}` });
+  assert.notEqual(receipt.outcome, "failed"); await chatterDelivered.promise;
+  await structuredChild.waitForIdle(); await structuredChild.waitForIrcReplies();
+  await structuredParent.manager.waitForOwnerJobs(structuredParent.id);
+  await structuredParent.manager.drainDeliveries({ filter: { ownerId: structuredParent.id } });
+  assert.equal(await fs.readFile(structuredResult.outputPath, "utf8"), structuredArtifact);
+  assert.equal(structuredChild.messages.filter(message => message.role === "toolResult" && message.toolName === "yield" && !message.isError).length, 1);
+  assert(structuredParent.deliveries.some(text => text.includes(`Peer acknowledgment ${marker}`)));
+  assert(wire.some(row => row.scenario === "chatter" && row.stopReason === "stop"));
+  cases.push({ id: "actual-task-structured-nonyield-peer-chatter-preserves-report", status: "passed", evidence: {
+   receipt, artifact: structuredArtifact, deliveries: [...structuredParent.deliveries], acceptedYieldCount: 1 } });
+ } finally { unsubscribe(); }
+ assert.equal(cases.length, 5);
+ const artifactPath = path.join(outer, `task-dispatch-${marker}-observations.json`); inside(artifactPath);
+ const bytes = Buffer.from(JSON.stringify({ marker, mode, wire, cases }, null, 2) + "\n");
+ await fs.writeFile(artifactPath, bytes, { flag: "wx", mode: 0o600 });
+ proofArtifacts = [{ file: artifactPath, bytes: bytes.length, sha256: sha256(bytes) }];
+} finally {
+ for (const close of cleanupSinks) close();
+ const lifecycle = await Promise.allSettled([AgentLifecycleManager.global().dispose()]);
+ const disposed = await Promise.allSettled(sessions.toReversed().map(session => session.dispose()));
+ unregisterCustomApis(apiOwner); await auth?.close(); AgentStorage.close(); closeModelCache();
+ assert.equal(await fs.readFile(path.join(root, ".owner"), "utf8"), marker);
+ await fs.rm(root, { recursive: true });
+ for (const outcome of [...lifecycle, ...disposed]) if (outcome.status === "rejected") throw outcome.reason;
+}
+await assert.rejects(fs.lstat(root), (error: NodeJS.ErrnoException) => error.code === "ENOENT");
+console.log(JSON.stringify({ schema: "CoreforgeFrozen19DomainProof", domain: "task-dispatch", complete: true, passed: true,
+ mode, version, sourceDigest: manifest.sourceDigest, manifestSha256: sourceDigest, nativeSha256, cases, cleanupVerified: true, fixtureRootRemoved: true, paidRequests: 0, artifacts: proofArtifacts }));

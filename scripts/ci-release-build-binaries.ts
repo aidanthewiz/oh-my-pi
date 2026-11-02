@@ -60,7 +60,7 @@ export const BINARY_TARGETS: readonly BinaryTarget[] = [
 		id: "linux-musl-x64",
 		platform: "linux",
 		arch: "x64",
-		target: "bun-linux-x64-musl-baseline",
+		target: "bun-linux-x64-baseline-musl",
 		outfile: "packages/coding-agent/binaries/omp-linux-musl-x64",
 	},
 	{
@@ -162,11 +162,11 @@ async function buildBinary(target: BinaryTarget): Promise<void> {
 async function generateBundle(): Promise<void> {
 	if (isDryRun) {
 		console.log("DRY RUN bun run gen:stats");
-		console.log("DRY RUN bun --cwd=packages/collab-web run gen:tool-views");
+		console.log("DRY RUN bun --cwd=packages/collab-web run gen:export-viewer --check");
 		return;
 	}
 	await runCommand(["bun", "run", "gen:stats"], repoRoot);
-	await runCommand(["bun", "--cwd=packages/collab-web", "run", "gen:tool-views"], repoRoot);
+	await runCommand(["bun", "--cwd=packages/collab-web", "run", "gen:export-viewer", "--check"], repoRoot);
 }
 
 async function resetArtifacts(): Promise<void> {
@@ -201,6 +201,9 @@ async function main(): Promise<void> {
 	// checked-in placeholders, even if a generate or build step throws.
 	try {
 		await generateBundle();
+		if (Bun.env.QUALIFICATION_RECEIPT_DIR) {
+			await runCommand(["bun", "scripts/ci-qualification-engine.ts", "snapshot", "binary-effective"], repoRoot);
+		}
 		for (const target of selectedTargets) {
 			await buildBinary(target);
 		}

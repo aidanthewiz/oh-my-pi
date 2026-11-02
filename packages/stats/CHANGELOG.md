@@ -6,6 +6,44 @@
 
 - Fixed dashboard controls remaining busy after a cached query's refresh is abandoned by hiding the page or switching keys.
 - Preserve the Coreforce hammer favicon in the branded stats dashboard.
+## [18.14.2] - 2026-10-31
+
+### Added
+
+- Added `setStatsCloseHandler`: while a host sets one, the dashboard shows a Close button in its top bar and closes on Esc or Ctrl+C (with no text selected), for hosts that show it in place of their terminal
+
+### Fixed
+
+- Fixed tool error rates counting skipped tool calls that were explicitly marked as not executed ([#17463](https://github.com/can1357/oh-my-pi/pull/17463) by [@Xytronix](https://github.com/Xytronix)).
+
+## [18.14.0] - 2026-10-29
+
+### Changed
+
+- Improved `omp stats` session synchronization performance by approximately 2–5× on large histories. The first sync after upgrading may take up to a minute while the stats database is optimized.
+
+### Fixed
+
+- Fixed `/stats` and `omp stats` failing when another dashboard was syncing sessions or the configured port was already in use; busy dashboards are now reused, and a free port is selected when necessary.
+
+## [18.13.3] - 2026-10-28
+
+### Changed
+
+- Updated Bun engine requirement to ≥1.4.4
+
+## [18.12.0] - 2026-10-17
+
+### Fixed
+
+- Fixed usage stats pricing Google Antigravity and MiniMax Token Plan models at $0 when their catalog rows carry no price; they now use the catalog's pricing peer, as `xai-oauth` already did ([#16092](https://github.com/can1357/oh-my-pi/pull/16092) by [@H4vC](https://github.com/H4vC))
+
+## [18.11.0] - 2026-10-14
+
+### Fixed
+
+- Providers → Subscription windows no longer mixes Codex 5-hour and 7-day quotas across plans: Team and weekly-only (ProLite) accounts now share the 7-day row, the 5-hour row counts only accounts that have one, and labels no longer flip with whichever account reported last ([#15664](https://github.com/can1357/oh-my-pi/issues/15664))
+
 ## [18.10.4] - 2026-10-13
 
 ### Fixed

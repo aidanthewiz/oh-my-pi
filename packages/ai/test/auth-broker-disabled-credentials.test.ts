@@ -44,7 +44,7 @@ describe("disabled credential tombstones", () => {
 	});
 
 	afterEach(async () => {
-		storage?.close();
+		await storage?.close();
 		await removeWithRetries(tempDir);
 	});
 
@@ -123,9 +123,9 @@ describe("broker /v1/credentials/disabled round-trip", () => {
 	});
 
 	afterEach(async () => {
-		clientStorage?.close();
+		await clientStorage?.close();
 		await handle?.close();
-		serverStorage?.close();
+		await serverStorage?.close();
 		await removeWithRetries(tempDir);
 	});
 
@@ -186,7 +186,7 @@ describe("OAuth login stamps authorizedAt", () => {
 
 	afterEach(async () => {
 		unregisterOAuthProviders("authorized-at-test");
-		storage?.close();
+		await storage?.close();
 		await removeWithRetries(tempDir);
 	});
 
@@ -220,7 +220,7 @@ describe("OAuth login stamps authorizedAt", () => {
 			expect(after.credential.refresh).toBe("refresh-rotated");
 			expect(after.credential.authorizedAt).toBe(authorizedAt);
 		} finally {
-			refreshingStorage.close();
+			await refreshingStorage.close();
 		}
 	});
 });

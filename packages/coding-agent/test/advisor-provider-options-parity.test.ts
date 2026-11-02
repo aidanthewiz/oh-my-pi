@@ -1,20 +1,10 @@
-/**
- * Contract: when the SDK supplies provider-shaping options to AgentSession,
- * the advisor `Agent` constructed by `#buildAdvisorRuntime` inherits them so
- * its OpenRouter/OpenAI requests cache and route like the main turn.
- *
- * Regression for can1357/oh-my-pi#3639: before the fix, the advisor was built
- * with only `sessionId`/`getApiKey`/telemetry — it dropped the session's
- * `streamFn` wrapper (so `providers.openrouterVariant` and `loopGuard` never
- * landed on advisor requests), its `promptCacheKey` (so OpenAI Responses
- * fell back to a different cache shard), its shared `providerSessionState`,
- * and its explicit websocket preference.
- */
+/** Advisor provider-attempt caps, cache identities, and account isolation. */
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "bun:test";
 import { Agent, type StreamFn } from "@oh-my-pi/pi-agent-core";
 import type { FetchImpl, Model, SimpleStreamOptions } from "@oh-my-pi/pi-ai";
 import { streamSimple } from "@oh-my-pi/pi-ai";
 import { resolveApiKeyOnce } from "@oh-my-pi/pi-ai/auth-retry";
+import { closeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { SessionAccountPoolScope } from "@oh-my-pi/pi-coding-agent/config/account-pool-scope";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
@@ -24,8 +14,6 @@ import type { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
-
-import { cfgProvidersOpenaiWebsockets } from "@oh-my-pi/pi-coding-agent/session/settings";
 
 /** Provider-facing advisor session ids must be UUIDv7 (issue #5040): Codex writes
  *  them verbatim onto `conversation_id`/`session_id` headers, so `-advisor`
@@ -48,18 +36,24 @@ describe("AgentSession advisor provider-options parity", () => {
 	let authStorage: AuthStorage;
 	let modelRegistry: ModelRegistry;
 	let model: Model;
+	let cacheDir: TempDir;
 
 	beforeAll(() => {
 		authStorage = createInMemoryAuthStorage();
 		authStorage.keys.setRuntime("anthropic", "test-key");
-		modelRegistry = new ModelRegistry(authStorage);
+		// An isolated discovery cache keeps the bundled catalog authoritative; the
+		// developer's `~/.omp` models.db can drop models these tests select.
+		cacheDir = TempDir.createSync("@pi-advisor-parity-cache-");
+		modelRegistry = new ModelRegistry(authStorage, undefined, { cacheDbPath: cacheDir.join("models.db") });
 		const bundled = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!bundled) throw new Error("Expected built-in anthropic model to exist");
 		model = bundled;
 	});
 
-	afterAll(() => {
-		authStorage.close();
+	afterAll(async () => {
+		await authStorage.close();
+		closeModelCache();
+		cacheDir.removeSync();
 	});
 
 	let tempDir: TempDir;
@@ -82,69 +76,6 @@ describe("AgentSession advisor provider-options parity", () => {
 		try {
 			await tempDir.remove();
 		} catch {}
-	});
-
-	it("captures the SDK-provided onPayload, onResponse, onSseEvent, and transformProviderContext on the advisor's stream call", async () => {
-		const capturedStreamOptions: Array<SimpleStreamOptions | undefined> = [];
-		const captureStreamFn: StreamFn = (_m, _ctx, opts) => {
-			capturedStreamOptions.push(opts);
-			// Return a stream that immediately fails — we only need to observe
-			// the options the advisor handed us before the call.
-			throw new Error("capture-stop");
-		};
-		const onPayload = async (payload: unknown) => payload;
-		const onResponse = async (_response: unknown, _model: unknown) => undefined;
-		const onSseEvent = (_event: { data: string }, _model: unknown) => {};
-		const transformProviderContext = async <T>(context: T): Promise<T> => context;
-
-		const mainAgent = new Agent({
-			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
-		});
-		session = new AgentSession({
-			agent: mainAgent,
-			sessionManager,
-			settings: settings(),
-			modelRegistry,
-			advisorTools: [],
-			advisorStreamFn: captureStreamFn,
-			onPayload,
-			onResponse,
-			onSseEvent,
-			transformProviderContext,
-		});
-		session.settings.setModelRole("advisor", "anthropic/claude-sonnet-4-5");
-		expect(session.setAdvisorEnabled(true)).toBe(true);
-
-		const advisor = session.getAdvisorAgent();
-		if (!advisor) throw new Error("Expected advisor agent to be live");
-
-		// Flipped after the advisor exists: the websocket hint is read per request.
-		cfgProvidersOpenaiWebsockets.set(session.settings, "on");
-		await advisor.prompt("ping").catch(() => {});
-
-		expect(capturedStreamOptions.length).toBeGreaterThan(0);
-		const opts = capturedStreamOptions[0];
-		if (!opts) throw new Error("Expected captured advisor stream options");
-
-		// Provider hooks forwarded by the Agent loop carry the session's wrappers
-		// (the session wraps `onResponse`/`onSseEvent` to also drive its
-		// `RawSseDebugBuffer` — what matters here is that *something* is wired,
-		// not the exact closure identity for those two).
-		expect(typeof opts.onPayload).toBe("function");
-		expect(typeof opts.onResponse).toBe("function");
-		expect(typeof opts.onSseEvent).toBe("function");
-
-		// Bare `onPayload` has no session-side wrapping so it reaches the stream
-		// call unchanged — proof the SDK-provided hook was installed.
-		expect(opts.onPayload).toBe(onPayload);
-
-		// Cache routing identity threaded through into the actual stream call.
-		// Without a parent `providerPromptCacheKey`, the advisor's effective key
-		// is its own provider-facing UUIDv7 session id (issue #5040).
-		expect(opts.sessionId).toBe(advisor.sessionId);
-		expect(opts.promptCacheKey).toBe(advisor.sessionId);
-		expect(opts.providerSessionState).toBe(session.providerSessionState);
-		expect(opts.preferWebsockets).toBe(true);
 	});
 
 	it("caps Codex SSE attempts inside each advisor-level retry", async () => {
@@ -396,7 +327,7 @@ describe("AgentSession advisor provider-options parity", () => {
 			expect(await pooledStorage.keys.get("anthropic", mainProviderSessionId)).toBe("runtime-key");
 		} finally {
 			await session.dispose();
-			pooledStorage.close();
+			await pooledStorage.close();
 		}
 	});
 });

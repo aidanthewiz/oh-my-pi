@@ -105,8 +105,8 @@ describe("AgentSession plan-reference delivery tracking (issue #4094)", () => {
 		vi.restoreAllMocks();
 	});
 
-	afterAll(() => {
-		authStorage.close();
+	afterAll(async () => {
+		await authStorage.close();
 		fixtureDir.removeSync();
 	});
 

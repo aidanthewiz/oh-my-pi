@@ -111,7 +111,7 @@ async function createOmpInference(
 			signal: options.signal,
 		});
 	} catch (error) {
-		authStorage.close();
+		await authStorage.close();
 		throw error;
 	}
 }
@@ -177,8 +177,12 @@ class LazyCommitInference implements CommitInference {
 
 	async dispose(): Promise<void> {
 		if (!this.#instance) return;
+		let instance: OmpCommitInference;
 		try {
-			(await this.#instance).dispose();
-		} catch {}
+			instance = await this.#instance;
+		} catch {
+			return;
+		}
+		await instance.dispose();
 	}
 }

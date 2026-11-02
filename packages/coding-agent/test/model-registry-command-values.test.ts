@@ -105,8 +105,8 @@ describe("ModelRegistry command-resolved models.yml values", () => {
 		authStorage = await AuthStorage.create(":memory:");
 	});
 
-	afterEach(() => {
-		authStorage.close();
+	afterEach(async () => {
+		await authStorage.close();
 		if (!tempDir || !fs.existsSync(tempDir)) return;
 		try {
 			removeSyncWithRetries(tempDir);

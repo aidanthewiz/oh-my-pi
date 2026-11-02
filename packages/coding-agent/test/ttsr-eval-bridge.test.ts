@@ -24,8 +24,8 @@ const authStorage: AuthStorage = createInMemoryAuthStorage();
 for (const provider of ["anthropic", "mock"]) authStorage.keys.setRuntime(provider, "test-key");
 const modelRegistry = new ModelRegistry(authStorage);
 
-afterAll(() => {
-	authStorage.close();
+afterAll(async () => {
+	await authStorage.close();
 });
 
 afterEach(async () => {

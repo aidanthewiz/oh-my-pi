@@ -14,7 +14,9 @@
  * `goto` and `evaluate` stay uncapped: navigation and user code legitimately use the full
  * cell budget.
  */
+import { untilAborted } from "@oh-my-pi/pi-utils";
 import { CELL_BUDGET_SLACK_MS } from "../run-scope";
+import { throwIfAborted } from "../tool-errors";
 
 const QUICK_OP_TIMEOUT_MS = 20_000;
 const ACTION_OP_TIMEOUT_MS = 8_000;
@@ -65,4 +67,18 @@ export function resolveWaitTimeout(cellTimeoutMs: number, explicit?: number): nu
 	// Positive finite → honored + clamped. Negative/NaN garbage → default, not the longest wait.
 	if (Number.isFinite(explicit) && explicit > 0) return Math.min(explicit, budgetBound);
 	return actionOpMs;
+}
+
+/** Wait for an allocation under `signal`, releasing a handle that arrives after cancellation. */
+export async function untilAbortedOrReleased<T>(
+	signal: AbortSignal | undefined,
+	allocate: () => Promise<T>,
+	release: (late: T) => Promise<unknown>,
+): Promise<T> {
+	throwIfAborted(signal);
+	const pending = allocate();
+	return await untilAborted(signal, () => pending).catch(error => {
+		void pending.then(release).catch(() => undefined);
+		throw error;
+	});
 }

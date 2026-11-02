@@ -1,0 +1,287 @@
+import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
+import type { AssistantMessage } from "../../packages/ai/src/types";
+import type { Terminal, TspHelloHandler } from "../../packages/tui/src/terminal";
+import type { AgentSession } from "../../packages/coding-agent/src/session/agent-session";
+
+const required = (name: string): string => {
+ const value = process.env[name]; assert(value, `${name} is required`); return value;
+};
+const sha = (bytes: string | Uint8Array) => createHash("sha256").update(bytes).digest("hex");
+const outer = await fs.realpath(required("CF19_RUNTIME_ROOT"));
+const inside = (file: string) => {
+ const relative = path.relative(outer, file);
+ assert(relative && !relative.startsWith("..") && !path.isAbsolute(relative), `outside runtime root: ${file}`);
+};
+const marker = required("CF19_MARKER"); assert.match(marker, /^[A-Za-z0-9_-]+$/);
+const version = required("CF_UPSTREAM_CANDIDATE_VERSION"); assert.match(version, /^\d+\.\d+\.\d+$/);
+const mode = process.env.PI_COMPILED === "true" ? "compiled" : "source";
+const home = await fs.realpath(required("HOME")); inside(home);
+assert.equal(await fs.realpath(os.homedir()), home, "HOME must predate Bun startup");
+const manifestPath = await fs.realpath(required("V1890_SOURCE_INPUT_MANIFEST")); inside(manifestPath);
+const manifestBytes = await fs.readFile(manifestPath);
+assert.equal(sha(manifestBytes), required("V1890_SOURCE_INPUT_SHA256"));
+const manifest = JSON.parse(manifestBytes.toString());
+assert.equal(manifest.schema, "CoreforgeCandidateSourceSnapshot");
+assert.equal(sha(JSON.stringify(manifest.records)), manifest.sourceDigest);
+const sourceDigest: string = manifest.sourceDigest;
+const nativeSha256 = required("V1890_NATIVE_SHA256"); assert.equal(manifest.native.sha256, nativeSha256);
+for (const key of ["OMP_CF_VERSION", "PI_PROFILE", "OMP_PROFILE", "PI_TUI_TSP_RECORD", "OMP_TUI_DEBUG"]) {
+ delete process.env[key]; delete Bun.env[key];
+}
+for (const [key, value] of Object.entries({ PI_CODING_AGENT_DIR: path.join(home, "agent"), TMPDIR: path.join(home, "tmp"),
+ XDG_CONFIG_HOME: path.join(home, "config"), XDG_DATA_HOME: path.join(home, "data"), XDG_CACHE_HOME: path.join(home, "cache") })) {
+ process.env[key] = Bun.env[key] = value; await fs.mkdir(value, { recursive: true });
+}
+// These modules capture environment roots; this proof intentionally exercises loading after private-root binding.
+const { nativeAddonStatus } = await import("../../packages/natives/native/loader-state.js");
+await import("../../packages/natives/native/index.js");
+const native = nativeAddonStatus(); assert(native && !native.stale);
+assert.equal(native.version, version); assert.equal(native.packageVersion, version);
+assert.equal(sha(await fs.readFile(native.path)), nativeSha256);
+if (mode === "compiled") inside(await fs.realpath(native.path));
+const { createAgentSession } = await import("../../packages/coding-agent/src/sdk");
+const { AuthStorage } = await import("../../packages/coding-agent/src/session/auth-storage");
+const { ModelRegistry } = await import("../../packages/coding-agent/src/config/model-registry");
+const { Settings } = await import("../../packages/coding-agent/src/config/settings");
+const { SessionManager } = await import("../../packages/coding-agent/src/session/session-manager");
+const { AgentRegistry } = await import("../../packages/coding-agent/src/registry/agent-registry");
+const { AssistantMessageEventStream } = await import("../../packages/ai/src/utils/event-stream");
+const { InteractiveMode } = await import("../../packages/coding-agent/src/modes/interactive-mode");
+const { Composer } = await import("../../packages/tui/src/prompt/composer");
+const { ToolExecutionComponent, asyncJobState, isSettledJobFrame } = await import("../../packages/tui/src/chat/tool-execution");
+const { isNativeRendering, setNativeRendering } = await import("../../packages/tui/src/native/state");
+const { initTheme } = await import("../../packages/tui/src/theme/theme");
+await Settings.init({ inMemory: true }); await initTheme(false);
+
+// This output-only adapter never starts host input or a terminal handshake.
+class RecordingTerminal implements Terminal {
+ readonly columns = 120; readonly rows = 40; readonly kittyProtocolActive = false;
+ readonly kittyEnableSequence = null; readonly appearance = "dark" as const;
+ bytes = "";
+ start(_input: (data: string) => void): void { assert.fail("proof must not start terminal input"); }
+ stop(): void {}
+ async drainInput(): Promise<void> {}
+ onTspHello(_callback: TspHelloHandler): void {}
+ write(bytes: string): void { this.bytes += bytes; }
+ moveBy(n: number): void { this.write(`\x1b[${Math.abs(n)}${n < 0 ? "A" : "B"}`); }
+ hideCursor(): void { this.write("\x1b[?25l"); }
+ showCursor(): void { this.write("\x1b[?25h"); }
+ clearLine(): void { this.write("\x1b[2K"); }
+ clearFromCursor(): void { this.write("\x1b[J"); }
+ clearScreen(): void { this.write("\x1b[2J\x1b[H"); }
+ setTitle(title: string): void { this.write(`\x1b]2;${title}\x07`); }
+ setProgress(active: boolean): void { this.write(`\x1b]9;4;${active ? 3 : 0}\x07`); }
+ onAppearanceChange(callback: (appearance: "dark" | "light") => void): void { callback("dark"); }
+}
+const strings = (value: unknown): string[] => typeof value === "string" ? [value]
+ : Array.isArray(value) ? value.flatMap(strings)
+ : value && typeof value === "object" ? Object.values(value).flatMap(strings) : [];
+async function eventually(predicate: () => boolean | Promise<boolean>, label: string): Promise<void> {
+ const end = Date.now() + 15000;
+ while (!(await predicate())) { assert(Date.now() < end, `deadline: ${label}`); await Bun.sleep(10); }
+}
+const root = await fs.mkdtemp(path.join(outer, `early-replay-${marker}-`));
+const artifactsRoot = await fs.mkdtemp(path.join(outer, `early-replay-artifacts-${marker}-`));
+await fs.writeFile(path.join(root, ".owner"), marker, { flag: "wx", mode: 0o600 });
+await fs.writeFile(path.join(artifactsRoot, ".owner"), marker, { flag: "wx", mode: 0o600 });
+const cases: { id: string; status: "passed"; evidence: unknown }[] = [];
+const artifacts: { file: string; sha256: string; bytes: number; kind: string }[] = [];
+async function capture(name: string, value: string, kind: string) {
+ const file = path.join(artifactsRoot, name); await fs.writeFile(file, value, { mode: 0o600 });
+ artifacts.push({ file, sha256: sha(value), bytes: Buffer.byteLength(value), kind });
+}
+const sessions: AgentSession[] = [];
+const modes: InstanceType<typeof InteractiveMode>[] = [];
+const subscriptions: (() => void)[] = [];
+const releases: (() => void)[] = [];
+const prompts: Promise<unknown>[] = [];
+const diagnosticSnapshots: (() => unknown)[] = [];
+const previousNative = isNativeRendering();
+let auth: InstanceType<typeof AuthStorage> | undefined;
+let fixtureRootRemoved = false;
+let failure: unknown;
+try {
+ auth = await AuthStorage.create(":memory:");
+ const registry = new ModelRegistry(auth, path.join(root, "models.yml"), { ignoreLocalModelConfig: true });
+ registry.registerProvider("early-replay-local", {
+  baseUrl: "http://127.0.0.1:1/forbidden", api: "openai-completions", apiKey: "synthetic-local-only",
+  models: [{ id: "owned", name: "Owned replay", reasoning: false, input: ["text"],
+   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 32768, maxTokens: 1024 }],
+ });
+ const model = registry.find("early-replay-local", "owned"); assert(model);
+ const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+ const reply = (content: AssistantMessage["content"], stopReason: "stop" | "toolUse"): AssistantMessage => ({
+  role: "assistant", content, api: model.api, provider: model.provider, model: model.id,
+  usage: structuredClone(usage), stopReason, timestamp: Date.now(),
+ });
+ for (const kind of ["bash", "eval"] as const) {
+  const cwd = path.join(root, kind); await fs.mkdir(cwd);
+  const callId = `${marker}-${kind}`;
+  const gate = path.join(cwd, "release");
+  const first = `${callId}-FIRST`, last = `${callId}-LAST`;
+  const exactOutput = `${first}\n${last}`;
+  const state = kind === "bash" ? "failed" : "completed";
+  const held = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+  releases.push(() => release.resolve());
+  let heldResult: unknown;
+  const gateEntries: unknown[] = [];
+  const settings = Settings.isolated({ "async.enabled": true, "bash.autoBackground.enabled": true,
+   "bash.autoBackground.thresholdMs": 0, "eval.autoBackground.enabled": true, "eval.autoBackground.thresholdMs": 0,
+   "bashInterceptor.enabled": false, "bash.direnv": "off", "tools.approvalMode": "yolo", "git.enabled": false,
+   "compaction.enabled": false, "compaction.idleEnabled": false, "retry.enabled": false, "todo.enabled": false,
+   "todo.reminders": false, "advisor.enabled": false, "autolearn.enabled": false, "lsp.enabled": false,
+   "recap.enabled": false, "composer.predictions": false, "tui.autoGraph": "off", "title.refreshOnReplan": false });
+  const args = kind === "bash"
+   ? { command: `printf '%s\\n' '${first}'; while [ ! -f '${gate}' ]; do :; done; printf '%s\\n' '${last}'; exit 7`, async: true, timeout: 20 }
+   : { language: "js", timeout: 20,
+    code: `var f = await import('node:fs/promises'); console.log(${JSON.stringify(first)}); while (!(await f.access(${JSON.stringify(gate)}).then(()=>true,()=>false))) { const delay = Promise.withResolvers(); setTimeout(delay.resolve,20); await delay.promise; } console.log(${JSON.stringify(last)});` };
+  const created = await createAgentSession({ cwd, agentDir: path.join(root, `agent-${kind}`), authStorage: auth,
+   modelRegistry: registry, model, getApiKey: () => "synthetic-local-only", settings, agentRegistry: new AgentRegistry(),
+   agentId: callId, sessionManager: SessionManager.inMemory(cwd),
+   disableExtensionDiscovery: true, preloadedExtensionPaths: [], preloadedCustomToolPaths: [],
+   contextFiles: [], skills: [], promptTemplates: [], slashCommands: [], rules: [],
+   enableMCP: false, enableLsp: false, enableIrc: false, cacheWarming: false, skipPythonPreflight: true,
+   autoTitle: false, toolNames: [kind], restrictToolNames: true,
+   preloadedPreparedExtensions: [{ path: "<inline-0>", resolvedPath: "<inline-0>", error: null, factory: api => {
+    api.on("tool_result", async event => {
+     if (event.toolCallId !== callId) return;
+     gateEntries.push(structuredClone(event));
+     assert.equal(asyncJobState(event.details), "running", "hold the real initial background result");
+     heldResult = structuredClone(event); held.resolve(); await release.promise;
+    });
+   } }],
+  });
+  const session = created.session; sessions.push(session);
+  const manager = session.asyncJobManager;
+  assert(manager, "the SDK root session must expose its actual owned job manager");
+  assert(session.hasExtensionHandlers("tool_result"), "restricted SDK session must bind its prepared gate hook");
+  const extensionErrors: unknown[] = [];
+  subscriptions.push(session.extensionRunner!.onError(error => extensionErrors.push(structuredClone(error))));
+  let turn = 0;
+  session.agent.streamFn = () => {
+   const message = turn++ === 0 ? reply([{ type: "toolCall", id: callId, name: kind, arguments: args }], "toolUse")
+    : reply([{ type: "text", text: "Owned local turn complete" }], "stop");
+   const stream = new AssistantMessageEventStream();
+   stream.push({ type: "start", partial: { ...message, content: [] } });
+   stream.push({ type: "done", reason: message.stopReason as "stop" | "toolUse", message }); stream.end(message);
+   return stream;
+  };
+  const terminal = new RecordingTerminal();
+  const composer = new Composer({ terminal, preferences: { quiet: true } });
+  const interactive = new InteractiveMode(session, version, undefined, undefined, undefined, undefined, undefined, composer);
+  modes.push(interactive);
+  // Skip init's host integrations; the real constructor owns both replay and event controllers.
+  interactive.isInitialized = true;
+  interactive.toolOutputExpanded = true;
+  setNativeRendering(true);
+  const events: unknown[] = [];
+  const sessionEvents: unknown[] = [];
+  let endSeen = false;
+  let routing = Promise.resolve();
+  subscriptions.push(session.subscribe(event => {
+   if (event.type === "agent_start" || event.type === "agent_end" || event.type === "message_end" || event.type.startsWith("tool_execution_")) {
+    sessionEvents.push(structuredClone(event));
+   }
+   if (!event.type.startsWith("tool_execution_")) return;
+   events.push(structuredClone(event));
+   if (event.type === "tool_execution_end") endSeen = true;
+   routing = routing.then(() => interactive.eventController.handleEvent(event));
+  }));
+  let promptSettled = false;
+  let promptError: unknown;
+  diagnosticSnapshots.push(() => ({ kind, callId, heldResult, gateEntries, extensionErrors, promptSettled,
+   promptError: promptError instanceof Error ? { message: promptError.message, stack: promptError.stack } : promptError,
+   enabledTools: session.getEnabledToolNames(), activeTools: session.getActiveToolNames(),
+   messages: session.messages, events: sessionEvents, activeUpdates: session.activeToolExecutionUpdates(),
+   jobs: manager.getAllJobs().map(job => ({ id: job.id, type: job.type, ownerId: job.ownerId, status: job.status,
+    progressText: job.progressText, resultText: job.resultText, errorText: job.errorText })),
+  }));
+  const prompt = session.prompt("Run the owned local job."); prompts.push(prompt);
+  void prompt.then(() => { promptSettled = true; }, error => { promptError = error; promptSettled = true; });
+  await eventually(() => {
+   if (promptError !== undefined) throw promptError;
+   assert.deepEqual(extensionErrors, [], "the real gate extension must not fail");
+   assert(heldResult !== undefined || !promptSettled, "prompt ended without entering the initial tool_result gate");
+   return heldResult !== undefined;
+  }, "initial tool_result extension gate"); await held.promise;
+  const jobId = (heldResult as { details?: { async?: { jobId?: string } } }).details?.async?.jobId;
+  assert(jobId, "the admitted initial result must identify its actual job");
+  const job = manager.getAllJobs().find(job => job.id === jobId); assert(job);
+  assert.equal(job.status, "running");
+  await fs.writeFile(gate, marker, { flag: "wx" });
+  await job.promise.catch(() => {});
+  assert.equal(job.status, state);
+  await eventually(() => session.activeToolExecutionUpdates().some(event => event.toolCallId === callId && isSettledJobFrame(event.partialResult.details)), "early terminal frame");
+  await routing;
+  assert.equal(endSeen, false, "terminal job frame must precede initial tool result");
+  const final = session.activeToolExecutionUpdates().find(event => event.toolCallId === callId)!;
+  assert.equal(asyncJobState(final.partialResult.details), state);
+  const finalText = final.partialResult.content.filter((block: { type: string }) => block.type === "text").map((block: { text: string }) => block.text).join("\n");
+  assert(finalText.includes(exactOutput), "actual terminal frame must retain exact stdout lines");
+  release.resolve();
+  await prompt; await session.waitForIdle(); await session.settleInFlightMessagePersistence(); await routing;
+  assert(endSeen);
+  assert.equal(session.activeToolExecutionUpdates().find(event => event.toolCallId === callId), final);
+  assert.equal(session.getAsyncJobSnapshot()?.running.length ?? 0, 0, "no running job may rescue the replay");
+  const persisted = session.messages.find(message => message.role === "toolResult" && message.toolCallId === callId);
+  assert(persisted?.role === "toolResult"); assert.equal(asyncJobState(persisted.details), "running");
+  const live = interactive.chatContainer.children.filter((child): child is InstanceType<typeof ToolExecutionComponent> => child instanceof ToolExecutionComponent);
+  assert.equal(live.length, 1); assert.equal(interactive.pendingTools.has(callId), false);
+  const liveDescription = live[0]!.describe();
+  const expectedStatus = state === "failed" ? "error" : "done";
+  assert(liveDescription.k === "card" || liveDescription.k === "tool");
+  assert.equal(liveDescription.p?.status, expectedStatus);
+  const liveOutput = strings(liveDescription).filter(value => value.includes(first) || value.includes(last));
+  assert(liveOutput.join("\n").includes(exactOutput));
+  interactive.rebuildChatFromMessages();
+  const rebuilt = interactive.chatContainer.children.filter((child): child is InstanceType<typeof ToolExecutionComponent> => child instanceof ToolExecutionComponent);
+  assert.equal(rebuilt.length, 1); assert.notEqual(rebuilt[0], live[0], "replay must create a new card, not retain the live owner");
+  rebuilt[0]!.setExpanded(true);
+  const rebuiltDescription = rebuilt[0]!.describe();
+  assert(rebuiltDescription.k === "card" || rebuiltDescription.k === "tool");
+  assert.equal(rebuiltDescription.p?.status, expectedStatus);
+  assert.deepEqual(strings(rebuiltDescription).filter(value => value.includes(first) || value.includes(last)), liveOutput);
+  assert(rebuilt[0]!.isTranscriptBlockFinalized()); assert.equal(interactive.pendingTools.has(callId), false);
+  assert(!JSON.stringify(rebuiltDescription).includes("In background"));
+  await capture(`${kind}.json`, JSON.stringify({ heldResult, events, persisted, terminalFrame: final,
+   exactOutput, live: liveDescription, rebuilt: rebuiltDescription }, null, 2), "structured-replay");
+  await capture(`${kind}.ansi`, rebuilt[0]!.render(120).join("\n"), "ansi");
+  cases.push({ id: `${kind}-early-terminal-transcript-rebuild`, status: "passed", evidence: {
+   jobId: job.id, state, terminalBeforeInitialResult: true, persistedState: "running", runningJobsAtReplay: 0,
+   exactOutput, rebuiltStatus: expectedStatus, reconstructedNewComponent: true,
+  } });
+  live[0]!.seal();
+ }
+} catch (error) {
+ failure = error;
+ const diagnostic = JSON.stringify({ schema: "CoreforgeEarlyReplayFailure", mode,
+  error: error instanceof Error ? { message: error.message, stack: error.stack } : String(error),
+  sessions: diagnosticSnapshots.map(snapshot => snapshot()) }, null, 2);
+ process.stderr.write(`${diagnostic}\n`);
+ try { await capture("failure.json", diagnostic, "failure-diagnostics"); }
+ catch (diagnosticError) { failure = new AggregateError([error, diagnosticError], "proof and diagnostic capture failed"); }
+}
+finally {
+ for (const release of releases) release();
+ for (const unsubscribe of subscriptions) unsubscribe();
+ for (const interactive of modes) { interactive.chatContainer.dispose(); interactive.stop(); }
+ const cleanup = await Promise.allSettled(sessions.map(session => session.dispose()));
+ await Promise.allSettled(prompts);
+ await auth?.close(); setNativeRendering(previousNative);
+ const rejected = cleanup.find(result => result.status === "rejected");
+ if (rejected?.status === "rejected" && failure === undefined) failure = rejected.reason;
+ assert.equal(await fs.readFile(path.join(root, ".owner"), "utf8"), marker);
+ await fs.rm(root, { recursive: true });
+ await assert.rejects(fs.lstat(root), (error: NodeJS.ErrnoException) => error.code === "ENOENT");
+ fixtureRootRemoved = true;
+}
+if (failure !== undefined) throw failure;
+assert.equal(cases.length, 2);
+console.log(JSON.stringify({ schema: "CoreforgeFrozen19DomainProof", domain: "early-replay", complete: true, passed: true,
+ mode, version, sourceDigest, nativeSha256, cases, cleanupVerified: true, fixtureRootRemoved, paidRequests: 0,
+ artifacts, artifactRoot: artifactsRoot }));

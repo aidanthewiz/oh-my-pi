@@ -8,6 +8,7 @@ import { card, span, text, withHidden } from "../native/describe";
 import { type NativeNode, type NativeUiEvent, rootToggleExpanded } from "../native/node";
 import { plainText } from "../native/spans";
 import { Memo } from "../native/memo";
+import type { FileDiagnosticsResult } from "../tools/lsp";
 
 /** Diagnostics shown by the collapsed native card, matching the ANSI tree's collapsed count. */
 const COLLAPSED_DIAGNOSTICS = 5;
@@ -20,13 +21,12 @@ export interface LateDiagnosticsFile {
 	summary?: string;
 	errored?: boolean;
 	messages?: string[];
+	unreported?: string[];
 }
 
 /** A tool frame (edit/write) that takes late diagnostics for its own paths. */
 interface LateDiagnosticsTarget {
-	attachLateDiagnostics(
-		files: readonly { path: string; summary: string; errored: boolean; messages: string[] }[],
-	): boolean;
+	attachLateDiagnostics(files: readonly (FileDiagnosticsResult & { path: string })[]): boolean;
 }
 
 /**
@@ -52,6 +52,7 @@ export function routeLateDiagnostics(
 					summary: file.summary ?? "",
 					errored: file.errored === true,
 					messages: file.messages ?? [],
+					unreported: file.unreported,
 				}
 			: undefined;
 		const routed =
@@ -112,7 +113,13 @@ export class LateDiagnosticsMessageComponent extends Container {
 			const input = this.#diagnosticInput();
 			const icon = input?.errored ? theme.status.error : theme.status.warning;
 			const head = [span(`${icon} `, input?.errored ? "error" : "warning"), span("Late diagnostics", "toolTitle")];
-			if (input?.summary) head.push(span(` (${plainText(input.summary)})`, "dim"));
+			if (input?.summary && !input.unreported?.length) head.push(span(` (${plainText(input.summary)})`, "dim"));
+			const rows = (input?.messages ?? []).map((message, index) =>
+				text([span(plainText(message), "mono")], { wrap: "word", key: `d${index}` }),
+			);
+			if (input?.unreported?.length) {
+				rows.unshift(text([span(plainText(input.summary), "warning")], { wrap: "word", key: "unreported" }));
+			}
 			const diagnostics = card(
 				{
 					role: "omp.diagnostics.late",
@@ -122,9 +129,7 @@ export class LateDiagnosticsMessageComponent extends Container {
 					collapsed: !this.#expanded,
 					preview: { lines: COLLAPSED_DIAGNOSTICS },
 				},
-				(input?.messages ?? []).map((message, index) =>
-					text([span(plainText(message), "mono")], { wrap: "word", key: `d${index}` }),
-				),
+				rows,
 			);
 			return withHidden(diagnostics, !this.#toolActivityVisible);
 		});
@@ -153,21 +158,23 @@ export class LateDiagnosticsMessageComponent extends Container {
 	}
 
 	/** Aggregate file payloads; undefined when there is nothing to render. */
-	#diagnosticInput(): { errored: boolean; summary: string; messages: string[] } | undefined {
+	#diagnosticInput(): FileDiagnosticsResult | undefined {
 		const messages: string[] = [];
 		const summaries: string[] = [];
+		let unreported: string[] | undefined;
 		let errored = false;
 		for (const file of this.#files) {
 			if (file.messages?.length) messages.push(...file.messages);
 			if (file.summary) summaries.push(file.summary);
+			if (file.unreported?.length) (unreported ??= []).push(...file.unreported);
 			if (file.errored) errored = true;
 		}
-		if (messages.length === 0) return undefined;
-		return { errored, summary: summaries.join(", "), messages };
+		if (messages.length === 0 && !unreported?.length) return undefined;
+		return { errored, summary: summaries.join(", "), messages, unreported };
 	}
 
 	/** Render one branch of the diagnostic tree, reusing the tool renderer. */
-	#format(input: { errored: boolean; summary: string; messages: string[] }, expanded: boolean): string {
+	#format(input: FileDiagnosticsResult, expanded: boolean): string {
 		return formatDiagnostics(input, expanded, theme, fp => theme.getLangIcon(getLanguageFromPath(fp)), {
 			title: "Late diagnostics",
 		}).replace(/^\n+/, "");

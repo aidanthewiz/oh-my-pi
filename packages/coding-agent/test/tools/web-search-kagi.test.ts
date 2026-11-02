@@ -12,8 +12,8 @@ const modelRegistry = new ModelRegistry(providerAuthStorage);
 const kagiModel = modelRegistry.find("web", "kagi");
 if (!kagiModel) throw new Error("Expected bundled web/kagi model");
 
-afterAll(() => {
-	providerAuthStorage.close();
+afterAll(async () => {
+	await providerAuthStorage.close();
 });
 
 const fakeAuthStorage = {

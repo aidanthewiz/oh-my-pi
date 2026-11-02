@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { OAuthManualInputManager } from "@oh-my-pi/pi-coding-agent/modes/oauth-manual-input";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import { executeBuiltinSlashCommand } from "@oh-my-pi/pi-coding-agent/slash-commands/builtin-registry";
@@ -17,6 +18,7 @@ const createRuntimeHarness = (manualInput: OAuthManualInputManager): RuntimeHarn
 	let selectorMode: "login" | "logout" | undefined;
 	let selectorProvider: string | undefined;
 	const ctx = {
+		session: { settings: Settings.isolated({}) },
 		oauthManualInput: manualInput,
 		editor: {
 			setText: () => {},

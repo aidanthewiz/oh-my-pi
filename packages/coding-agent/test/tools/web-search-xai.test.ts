@@ -87,9 +87,9 @@ describe("xAI web search provider", () => {
 		};
 	}
 
-	afterEach(() => {
+	afterEach(async () => {
 		vi.restoreAllMocks();
-		authStorage.close();
+		await authStorage.close();
 	});
 
 	it("POSTs the Responses API with the selected model and xAI web_search tool payload", async () => {
@@ -116,6 +116,7 @@ describe("xAI web search provider", () => {
 				{ role: "user", content: "latest xAI web search" },
 			],
 			tools: [{ type: "web_search" }, { type: "x_search" }],
+			tool_choice: "required",
 			reasoning: { effort: "low" },
 			max_output_tokens: 512,
 			temperature: 0.2,
@@ -282,7 +283,7 @@ describe("xAI web search provider", () => {
 		expect(capture.capturedRequest?.headers).toMatchObject({
 			Authorization: "Bearer test-xai-oauth-token",
 		});
-		oauthAuthStorage.close();
+		await oauthAuthStorage.close();
 	});
 
 	it("uses the selected model endpoint, API key, and headers together", async () => {
@@ -304,7 +305,7 @@ describe("xAI web search provider", () => {
 			Authorization: "Bearer proxy-key",
 			"X-Proxy-Tenant": "tenant-1",
 		});
-		proxyAuthStorage.close();
+		await proxyAuthStorage.close();
 	});
 
 	it("never sends official xAI OAuth credentials to a selected custom endpoint", async () => {
@@ -327,17 +328,17 @@ describe("xAI web search provider", () => {
 		}
 
 		expect(capture.capturedRequests).toHaveLength(0);
-		oauthAuthStorage.close();
+		await oauthAuthStorage.close();
 	});
 
-	it("reports availability for the selected model provider", () => {
+	it("reports availability for the selected model provider", async () => {
 		const provider = new XAIProvider();
 		const oauthAuthStorage = new AuthStorage(new SqliteAuthCredentialStore(new Database(":memory:")));
 		oauthAuthStorage.keys.setRuntime("xai-oauth", "test-xai-oauth-token");
 
 		expect(provider.isAvailable(oauthAuthStorage, xaiModel("grok-oauth", "xai-oauth"))).toBe(true);
 		expect(provider.isAvailable(oauthAuthStorage, selectedXaiModel)).toBe(false);
-		oauthAuthStorage.close();
+		await oauthAuthStorage.close();
 	});
 
 	it.each([
@@ -354,7 +355,7 @@ describe("xAI web search provider", () => {
 		expect(capture.capturedRequest).not.toBeNull();
 		const body = capture.capturedRequest?.body;
 		expect(body).not.toHaveProperty("search_parameters");
-		expect(Object.keys(body ?? {}).sort()).toEqual(["input", "model", "reasoning", "tools"]);
+		expect(Object.keys(body ?? {}).sort()).toEqual(["input", "model", "reasoning", "tool_choice", "tools"]);
 	});
 
 	it("rejects deprecated live-search 410 responses without retrying", async () => {
@@ -380,7 +381,7 @@ describe("xAI web search provider", () => {
 		expect(capture.capturedRequests).toHaveLength(1);
 		const body = capture.capturedRequests[0]?.body;
 		expect(body).not.toHaveProperty("search_parameters");
-		expect(Object.keys(body ?? {}).sort()).toEqual(["input", "model", "reasoning", "tools"]);
+		expect(Object.keys(body ?? {}).sort()).toEqual(["input", "model", "reasoning", "tool_choice", "tools"]);
 	});
 
 	it("maps output_text, URL citation annotations, top-level citations, id, model, usage, and auth mode", async () => {
@@ -508,7 +509,7 @@ describe("xAI web search provider", () => {
 		expect(capture.capturedRequest).not.toBeNull();
 		const body = capture.capturedRequest?.body;
 		expect(body).not.toHaveProperty("search_parameters");
-		expect(Object.keys(body ?? {}).sort()).toEqual(["input", "model", "reasoning", "tools"]);
+		expect(Object.keys(body ?? {}).sort()).toEqual(["input", "model", "reasoning", "tool_choice", "tools"]);
 	});
 
 	it("clamps oversized xAI local cap requests to 30 sources and citations", async () => {
@@ -533,7 +534,7 @@ describe("xAI web search provider", () => {
 		expect(capture.capturedRequest).not.toBeNull();
 		const body = capture.capturedRequest?.body;
 		expect(body).not.toHaveProperty("search_parameters");
-		expect(Object.keys(body ?? {}).sort()).toEqual(["input", "model", "reasoning", "tools"]);
+		expect(Object.keys(body ?? {}).sort()).toEqual(["input", "model", "reasoning", "tool_choice", "tools"]);
 	});
 
 	it("caps parsed sources and citations locally without changing Agent Tools request shape", async () => {
@@ -600,7 +601,7 @@ describe("xAI web search provider", () => {
 		expect(capture.capturedRequest).not.toBeNull();
 		const body = capture.capturedRequest?.body;
 		expect(body).not.toHaveProperty("search_parameters");
-		expect(Object.keys(body ?? {}).sort()).toEqual(["input", "model", "reasoning", "tools"]);
+		expect(Object.keys(body ?? {}).sort()).toEqual(["input", "model", "reasoning", "tool_choice", "tools"]);
 	});
 
 	it("uses numSearchResults before limit for the local xAI output cap", async () => {
@@ -643,7 +644,7 @@ describe("xAI web search provider", () => {
 		expect(capture.capturedRequest).not.toBeNull();
 		const body = capture.capturedRequest?.body;
 		expect(body).not.toHaveProperty("search_parameters");
-		expect(Object.keys(body ?? {}).sort()).toEqual(["input", "model", "reasoning", "tools"]);
+		expect(Object.keys(body ?? {}).sort()).toEqual(["input", "model", "reasoning", "tool_choice", "tools"]);
 	});
 
 	it("falls back to output content parts when output_text is absent", async () => {
@@ -825,6 +826,6 @@ describe("xAI web search provider", () => {
 			expect(error).toHaveProperty("message", 'xAI credentials not found for selected provider "xai".');
 		}
 		expect(fetchCalled).toBe(false);
-		emptyAuthStorage.close();
+		await emptyAuthStorage.close();
 	});
 });

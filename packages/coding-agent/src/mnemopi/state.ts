@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { dirname } from "node:path";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type * as MnemopiNs from "@oh-my-pi/pi-mnemopi";
@@ -5,6 +6,7 @@ import type { Mnemopi, RecallResult } from "@oh-my-pi/pi-mnemopi";
 import type * as MnemopiCoreNs from "@oh-my-pi/pi-mnemopi/core";
 import type { LocalModelInitializer } from "@oh-my-pi/pi-mnemopi/core";
 import { logger, prompt, toError, withLoopPhase } from "@oh-my-pi/pi-utils";
+import { all as allSettings } from "../config/registry";
 import {
 	composeRecallQuery,
 	prepareEmbeddableRetentionTranscript,
@@ -30,6 +32,63 @@ import mnemopiInstructions from "../prompts/system/mnemopi-instructions.md" with
 import { type MnemopiBackendConfig, type MnemopiScoping, truncateApproxTokens } from "./config";
 import { mnemopiEmbedClient } from "./embed-client";
 import { cfgMnemopiInjectionTokenLimit } from "./settings";
+
+export interface MnemopiRequestOwner {
+	readonly sessionId: string;
+	readonly parentId: string | null;
+	readonly file: string | undefined;
+	readonly cwd: string;
+	readonly manager: AgentSession["sessionManager"];
+	readonly isCurrent: () => boolean;
+}
+
+export const mnemopiRequestOwner = new AsyncLocalStorage<MnemopiRequestOwner>();
+
+/** Capture before the memory library schedules extraction behind other queued work. */
+export function captureMnemopiRequestOwner(session: AgentSession): MnemopiRequestOwner {
+	const manager = session.sessionManager;
+	const sessionId = manager.getSessionId();
+	const parentId = manager.getLeafId();
+	const file = manager.getSessionFile();
+	const cwd = manager.getCwd();
+	const settings = session.settings;
+	const auth = session.modelRegistry.authStorage;
+	const credentials = auth.credentials;
+	const sourceIdentity = auth.sourceIdentity;
+	const policy = allSettings().map(setting => [setting.id, setting.get(settings), settings.getProvenance(setting)]);
+	const providers = [...new Set(credentials.list().map(credential => credential.provider))]
+		.sort()
+		.filter(provider => auth.oauth.accounts(provider, sessionId).some(account => account.active));
+	const accountSnapshot = () =>
+		providers.flatMap(provider =>
+			auth.oauth
+				.accounts(provider, sessionId)
+				.filter(account => account.active)
+				.map(account => [provider, account.credentialId, account.accountId, account.orgId, account.projectId]),
+		);
+	const accounts = accountSnapshot();
+	return Object.freeze({
+		sessionId,
+		parentId,
+		file,
+		cwd,
+		manager,
+		isCurrent: () =>
+			!session.isDisposed &&
+			!session.isSessionTransitioning &&
+			manager.getSessionId() === sessionId &&
+			manager.getSessionFile() === file &&
+			manager.getCwd() === cwd &&
+			!auth.isClosed &&
+			auth.credentials === credentials &&
+			auth.sourceIdentity === sourceIdentity &&
+			Bun.deepEquals(accounts, accountSnapshot()) &&
+			Bun.deepEquals(
+				policy,
+				allSettings().map(setting => [setting.id, setting.get(settings), settings.getProvenance(setting)]),
+			),
+	});
+}
 
 /** A rendered recall block and where each tracked memory's text starts in it. */
 interface RecallBlock {
@@ -527,7 +586,10 @@ export class MnemopiSessionState {
 	): string {
 		return withLoopPhase("mnemopi.retain", () => {
 			const [scrubbed, scrubbedOptions] = redactRememberWrite(memory, options);
-			return target.memory.remember(scrubbed, scrubbedOptions);
+			if (this.config.llmMode === "none" && this.config.providerOptions.noEmbeddings)
+				return target.memory.remember(scrubbed, scrubbedOptions);
+			const owner = captureMnemopiRequestOwner(this.aliasOf?.session ?? this.session);
+			return mnemopiRequestOwner.run(owner, () => target.memory.remember(scrubbed, scrubbedOptions));
 		});
 	}
 
@@ -674,15 +736,15 @@ export class MnemopiSessionState {
 		return true;
 	}
 
-	async recallForCompaction(messages: AgentMessage[]): Promise<string | undefined> {
+	async recallForCompaction(messages: AgentMessage[], signal?: AbortSignal): Promise<string | undefined> {
 		const flat = withLoopPhase("mnemopi.recall", () => flattenAgentMessages(messages));
 		const lastUser = flat.findLast(message => message.role === "user");
 		if (!lastUser) return undefined;
-		const query = withLoopPhase("mnemopi.recall", () =>
-			composeRecallQuery(lastUser.content, flat, this.config.recallContextTurns),
-		);
-		const truncated = truncateRecallQuery(query, lastUser.content, this.config.recallMaxQueryChars);
-		return await this.recallForContext(truncated);
+		const truncated = withLoopPhase("mnemopi.recall", () => {
+			const query = composeRecallQuery(lastUser.content, flat, this.config.recallContextTurns);
+			return truncateRecallQuery(query, lastUser.content, this.config.recallMaxQueryChars);
+		});
+		return await this.recallForContext(truncated, signal);
 	}
 
 	async maybeRetainOnAgentEnd(_messages: AgentMessage[]): Promise<void> {
@@ -757,8 +819,7 @@ export class MnemopiSessionState {
 	#restoreRetainedTurnCursor(): void {
 		if (this.#retentionCursorLoaded) return;
 		this.#retentionCursorLoaded = true;
-		const rows = this.memory.beam.db
-			.prepare<MnemopiRetentionCursorRow, [string]>(`
+		using statement = this.memory.beam.db.prepare<MnemopiRetentionCursorRow, [string]>(`
 				SELECT
 					content,
 					json_extract(metadata_json, '$.source_id') AS sourceId,
@@ -768,8 +829,8 @@ export class MnemopiSessionState {
 				WHERE source = 'coding-agent-transcript'
 				  AND json_extract(metadata_json, '$.session_id') = ?
 				ORDER BY rowid
-			`)
-			.all(this.sessionId);
+		`);
+		const rows = statement.all(this.sessionId);
 		this.lastRetainedTurn = Math.max(this.lastRetainedTurn, deriveRetainedTurnCursor(rows, this.sessionId));
 	}
 
@@ -811,10 +872,10 @@ export class MnemopiSessionState {
 			const messages = withLoopPhase("mnemopi.recall", () => extractMessages(this.session.sessionManager));
 			const lastUser = messages.findLast(message => message.role === "user");
 			if (!lastUser) return;
-			const query = withLoopPhase("mnemopi.recall", () =>
-				composeRecallQuery(lastUser.content, messages, this.config.recallContextTurns),
-			);
-			const truncated = truncateRecallQuery(query, lastUser.content, this.config.recallMaxQueryChars);
+			const truncated = withLoopPhase("mnemopi.recall", () => {
+				const query = composeRecallQuery(lastUser.content, messages, this.config.recallContextTurns);
+				return truncateRecallQuery(query, lastUser.content, this.config.recallMaxQueryChars);
+			});
 			try {
 				const recall = await this.#recallBlock(truncated);
 				record = recall && this.#deliveredRecall(recall, block => this.budgetRecallBlock(block));

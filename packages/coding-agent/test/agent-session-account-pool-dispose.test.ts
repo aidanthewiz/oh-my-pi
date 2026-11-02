@@ -56,7 +56,7 @@ describe("AgentSession account pools after a dispose deadline", () => {
 		vi.useRealTimers();
 		for (const session of sessions.reverse()) await session.dispose();
 		sessions = [];
-		authStorage.close();
+		await authStorage.close();
 		AsyncJobManager.resetForTests();
 		AgentLifecycleManager.resetGlobalForTests();
 		AgentRegistry.resetGlobalForTests();
@@ -477,7 +477,7 @@ describe("SDK inherited account-pool lifetime", () => {
 		for (const session of sessions.reverse()) await session.dispose();
 		unregisterCustomApis(sourceId);
 		unregisterOAuthProvider(provider);
-		authStorage.close();
+		await authStorage.close();
 		AsyncJobManager.resetForTests();
 		AgentLifecycleManager.resetGlobalForTests();
 		AgentRegistry.resetGlobalForTests();

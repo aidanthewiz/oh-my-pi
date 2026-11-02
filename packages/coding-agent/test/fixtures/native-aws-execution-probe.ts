@@ -331,6 +331,8 @@ const wrappedWrite = new ExtensionToolWrapper(
 		consumeToolCallEmitted: () => false,
 		hasHandlers: () => false,
 		hasUI: () => false,
+		hasSessionApproval: () => false,
+		grantSessionApproval: () => assert.fail("Headless approval cannot grant session permission"),
 		runScoped: <T>(fn: () => T): T => fn(),
 	} as unknown as ExtensionRunner,
 );
@@ -462,6 +464,8 @@ for (const [profile, failure] of [
 		{
 			hasHandlers: (event: string) => failure === "resolution" && event === "tool_approval_resolved",
 			hasUI: () => true,
+			hasSessionApproval: () => false,
+			grantSessionApproval: () => assert.fail("Interrupted approval cannot grant session permission"),
 			consumeToolCallEmitted: () => false,
 			runScoped: <T>(fn: () => T): T => fn(),
 			getUIContext: () => ({
@@ -553,13 +557,14 @@ const connection = {
 		},
 	},
 } as unknown as MCPServerConnection;
-const managed = new MCPTool(connection, {
-	name: "aws___run_script",
+const managedRead = new MCPTool(connection, {
+	name: "aws___get_tasks",
+	annotations: { readOnlyHint: true },
 	inputSchema: { type: "object", properties: { aws_profile: { type: "string", enum: ["parallel-peer"] } } },
 });
 const [nativeShared, managedShared] = await Promise.all([
 	tool.execute("parallel-native", { ...read, profile: "parallel" }, undefined, undefined, context),
-	managed.execute("parallel-managed", { aws_profile: "parallel-peer" }, undefined, context),
+	managedRead.execute("parallel-managed", { aws_profile: "parallel-peer" }, undefined, context),
 ]);
 assert.notEqual(nativeShared.isError, true);
 assert.notEqual(managedShared.isError, true);
@@ -585,14 +590,15 @@ const deniedConnection = {
 		},
 	},
 } as unknown as MCPServerConnection;
-const deniedManaged = new MCPTool(deniedConnection, {
-	name: "aws___run_script",
+const deniedRead = new MCPTool(deniedConnection, {
+	name: "aws___get_tasks",
+	annotations: { readOnlyHint: true },
 	inputSchema: {
 		type: "object",
 		properties: { aws_profile: { type: "string", enum: ["automatic", "partition-conflict", "role-conflict"] } },
 	},
 });
-const deniedResult = await deniedManaged.execute(
+const deniedResult = await deniedRead.execute(
 	"valid-credentials-denied",
 	{ aws_profile: "automatic" },
 	undefined,
@@ -602,7 +608,7 @@ assert.equal(deniedResult.isError, true);
 assert.equal(confirmations, 2);
 assert.match(text(deniedResult), /expired or invalid AWS credentials/);
 for (const profile of ["partition-conflict", "role-conflict"]) {
-	const rejected = await deniedManaged.execute("partition-conflict", { aws_profile: profile }, undefined, context);
+	const rejected = await deniedRead.execute("partition-conflict", { aws_profile: profile }, undefined, context);
 	assert.equal(rejected.isError, true);
 	assert.match(text(rejected), /WRONG_PARTITION/);
 }
@@ -725,6 +731,58 @@ assert.equal(
 	2,
 );
 await fs.unlink(path.join(root, "authenticated-parallel"));
+for (const deferred of [false, true]) {
+	for (const failure of ["result", "exception"] as const) {
+		const id = `unsafe-managed-${deferred ? "deferred" : "direct"}-${failure}`;
+		const effects = path.join(root, `${id}.effects`);
+		const definition: MCPToolDefinition = {
+			name: "aws___run_script",
+			inputSchema: {
+				type: "object",
+				properties: {
+					aws_profile: { type: "string", enum: ["parallel-peer"] },
+					code: { type: "string" },
+				},
+				required: ["aws_profile", "code"],
+			},
+		};
+		const unsafeConnection = {
+			...connection,
+			serverInfo: { name: "unsafe-auth-fixture", version: "0.0.0" },
+			capabilities: { tools: {} },
+			transport: {
+				connected: true,
+				request: async (method: string) => {
+					if (method === "tools/list") return { tools: [definition] };
+					await fs.appendFile(effects, "paid action accepted\n");
+					const message = "Tool call failed due to expired or invalid AWS credentials.";
+					if (failure === "exception") throw new Error(message);
+					return { isError: true, content: [{ type: "text", text: message }] };
+				},
+			},
+		} as unknown as MCPServerConnection;
+		const unsafe = deferred
+			? new DeferredMCPTool(connection.name, definition, async () => unsafeConnection)
+			: new MCPTool(unsafeConnection, definition);
+		const beforePrompts: number = confirmations;
+		const beforeLogins = (await calls()).filter(call => call.argv.includes("login")).length;
+		const failed = await unsafe.execute(
+			id,
+			{
+				aws_profile: "parallel-peer",
+				code: "response = await call_boto3('bedrock-runtime', 'InvokeModel', {'modelId': 'fixture-paid', 'body': '{}'})\nresponse",
+			},
+			undefined,
+			context,
+		);
+		assert.equal(failed.isError, true);
+		assert.match(text(failed), /expired or invalid AWS credentials/);
+		assert.equal(await fs.readFile(effects, "utf8"), "paid action accepted\n");
+		assert.equal(confirmations, beforePrompts);
+		assert.equal((await calls()).filter(call => call.argv.includes("login")).length, beforeLogins);
+		assert.equal(await Bun.file(path.join(root, "authenticated-parallel")).exists(), false);
+	}
+}
 const beforeMixedRenewal = confirmations;
 const { promise: managedRequestReady, resolve: managedRequestStarted } = Promise.withResolvers<void>();
 const { promise: mixedRenewalComplete, resolve: finishMixedRenewal } = Promise.withResolvers<void>();
@@ -732,7 +790,12 @@ delayedManagedExpiry = {
 	ready: managedRequestStarted,
 	complete: mixedRenewalComplete,
 };
-const managedRenewal = managed.execute("managed-second-expiry", { aws_profile: "parallel-peer" }, undefined, context);
+const managedRenewal = managedRead.execute(
+	"managed-second-expiry",
+	{ aws_profile: "parallel-peer" },
+	undefined,
+	context,
+);
 await managedRequestReady;
 const nativeMixedRenewal = tool
 	.execute("native-second-expiry", { ...read, profile: "parallel" }, undefined, undefined, context)
@@ -793,7 +856,8 @@ for (const deferred of [false, true]) {
 		const token = path.join(root, `authenticated-${profile}`);
 		if (phase === "reconnect") await Bun.write(token, "yes");
 		const definition: MCPToolDefinition = {
-			name: "aws___run_script",
+			name: "aws___get_tasks",
+			annotations: { readOnlyHint: true },
 			inputSchema: { type: "object", properties: { aws_profile: { type: "string", enum: [profile] } } },
 		};
 		let requests = 0;
@@ -804,6 +868,7 @@ for (const deferred of [false, true]) {
 			capabilities: { tools: {} },
 			awsPreferredProfile: profile,
 			transport: {
+				connected: true,
 				request: async (method: string) => {
 					if (method === "tools/list") return { tools: [definition] };
 					requests++;
@@ -918,7 +983,8 @@ for (const deferred of [false, true]) {
 		const probeBarrier = path.join(root, "auth-race-expired-sts-get-caller-identity");
 		let requests = 0;
 		const definition: MCPToolDefinition = {
-			name: "aws___run_script",
+			name: "aws___get_tasks",
+			annotations: { readOnlyHint: true },
 			inputSchema: { type: "object", properties: { aws_profile: { type: "string", enum: ["expired"] } } },
 		};
 		const raceConnection = {
@@ -1003,7 +1069,8 @@ for (const approved of [false, true]) {
 		await tool.prepareRuntimeApproval(`${id}-login`, login);
 		if (approved) tool.approveRuntimeApproval(`${id}-login`, login);
 		const definition: MCPToolDefinition = {
-			name: "aws___run_script",
+			name: "aws___get_tasks",
+			annotations: { readOnlyHint: true },
 			inputSchema: { type: "object", properties: { aws_profile: { type: "string", enum: ["expired"] } } },
 		};
 		let requests = 0;
@@ -1073,6 +1140,8 @@ let selectionAbort: AbortController | undefined;
 const sessionRunner = {
 	hasHandlers: () => false,
 	hasUI: () => true,
+	hasSessionApproval: () => false,
+	grantSessionApproval: () => assert.fail("AWS approval must not grant general tool permission"),
 	consumeToolCallEmitted: () => false,
 	runScoped: <T>(fn: () => T): T => fn(),
 	getUIContext: () => ({
@@ -1343,20 +1412,20 @@ assert.notEqual(
 assert.equal(automaticSelections, 1);
 assert.equal(confirmations, beforeSessionRenewal);
 const beforeManagedGrant = selections.length;
-const managedWrapper = new ExtensionToolWrapper(managed as unknown as AgentTool, sessionRunner);
+const beforeManagedDenial = deniedRequests;
+const unsafeForApproval = new MCPTool(deniedConnection, {
+	name: "aws___run_script",
+	inputSchema: { type: "object", properties: { aws_profile: { type: "string", enum: ["automatic"] } } },
+});
+const managedWrapper = new ExtensionToolWrapper(unsafeForApproval as unknown as AgentTool, sessionRunner);
 await assert.rejects(
 	() =>
-		managedWrapper.execute(
-			"managed-not-granted",
-			{ aws_profile: "parallel-peer" },
-			undefined,
-			undefined,
-			sessionContext,
-		),
+		managedWrapper.execute("managed-not-granted", { aws_profile: "automatic" }, undefined, undefined, sessionContext),
 	/denied by user/,
 );
 assert.equal(selections.length, beforeManagedGrant + 1);
 assert.ok(!selections.at(-1)!.includes(sessionLabel));
+assert.equal(deniedRequests, beforeManagedDenial);
 
 const nestedOrdinary = { path: "xd://aws", content: JSON.stringify(ordinaryMutation) };
 for (const deniedTool of ["write", "aws"]) {

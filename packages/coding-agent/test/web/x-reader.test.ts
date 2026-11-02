@@ -42,10 +42,10 @@ describe("handleTwitter", () => {
 		return new ModelRegistry(authStorage, undefined, { settings });
 	}
 
-	afterEach(() => {
+	afterEach(async () => {
 		vi.restoreAllMocks();
 		resetSettingsForTest();
-		for (const authStorage of authStorages.splice(0)) authStorage.close();
+		for (const authStorage of authStorages.splice(0)) await authStorage.close();
 	});
 
 	it("explains how to enable X reads instead of scraping when no xAI model is available", async () => {

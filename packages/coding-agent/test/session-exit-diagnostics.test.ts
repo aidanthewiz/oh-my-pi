@@ -56,7 +56,7 @@ describe("session exit diagnostics", () => {
 	afterEach(async () => {
 		await session?.dispose();
 		session = undefined;
-		authStorage?.close();
+		await authStorage?.close();
 		authStorage = undefined;
 		tempDir?.removeSync();
 		tempDir = undefined;

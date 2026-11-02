@@ -6,7 +6,7 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { ExtensionRuntime, loadExtensionFromFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
 import type { ExtensionFactory, InputEvent } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
-import type { Skill } from "@oh-my-pi/pi-coding-agent/extensibility/skills";
+import { buildSkillPromptMessage, type Skill } from "@oh-my-pi/pi-coding-agent/extensibility/skills";
 import { CustomEditor } from "@oh-my-pi/pi-tui/prompt/custom-editor";
 import { CommandController } from "@oh-my-pi/pi-coding-agent/modes/controllers/command-controller";
 import { InputController } from "@oh-my-pi/pi-coding-agent/modes/controllers/input-controller";
@@ -53,19 +53,26 @@ async function createHarness(factory: ExtensionFactory) {
 	const prompt = vi.fn(async (_text: string, _options?: PromptOptions) => true);
 	const session = {
 		extensionRunner: runner,
+		sessionManager,
+		sessionId: sessionManager.getSessionId(),
+		isDisposed: false,
+		loadDeferredExtensions: vi.fn(async () => {}),
 		isStreaming: true,
 		isCompacting: false,
 		queuedMessageCount: 0,
 		prompt,
 		followUp: vi.fn(async (_text: string, _images?: ImageContent[]) => {}),
+		buildUserSkillPrompt: buildSkillPromptMessage,
 		promptCustomMessage: vi.fn(async () => true),
 		abort: vi.fn(async () => {}),
+		prewarmModelConnection: vi.fn(),
 	};
 	const ctx = {
 		editor,
 		session,
 		viewSession: session,
 		sessionManager,
+		eventController: { isAwaitingAsyncWork: () => false },
 		settings: Settings.isolated({}),
 		keybindings: KeybindingsManager.inMemory(),
 		dictationSpaceHold: vi.fn(),
@@ -90,6 +97,7 @@ async function createHarness(factory: ExtensionFactory) {
 		dismissCommandReport: () => false,
 		updateEditorBorderColor: vi.fn(),
 		updatePendingMessagesDisplay: vi.fn(),
+		syncIdleMaintenanceView: vi.fn(),
 		flushPendingBashComponents: vi.fn(),
 		showStatus: vi.fn(),
 		showError: vi.fn(),
@@ -130,12 +138,128 @@ async function createHarness(factory: ExtensionFactory) {
 		editor.imageLinks = editor.pendingImageLinks;
 		editor.setText(text);
 	}
-	return { ctx, editor, session, prompt, runner, blobs, generatedMessages, pressSubmit, draftWithImage };
+	return {
+		ctx,
+		editor,
+		session,
+		prompt,
+		runner,
+		runtime,
+		sessionManager,
+		blobs,
+		generatedMessages,
+		pressSubmit,
+		draftWithImage,
+	};
 }
 
 afterEach(() => vi.restoreAllMocks());
 
 describe("interactive native input ingress", () => {
+	it.each([ENTER, FOLLOW_UP])("applies a runner first installed during deferred loading (%p)", async key => {
+		const seen: string[] = [];
+		const h = await createHarness(pi => {
+			pi.on("input", event => {
+				seen.push(event.text);
+				return { handled: true };
+			});
+		});
+		let activeRunner: ExtensionRunner | undefined;
+		Object.defineProperty(h.session, "extensionRunner", { get: () => activeRunner });
+		h.session.loadDeferredExtensions.mockImplementation(async () => {
+			activeRunner = h.runner;
+		});
+		h.editor.setText("guarded first input");
+		await h.pressSubmit(key);
+		expect(seen).toEqual(["guarded first input"]);
+		expect(h.prompt).not.toHaveBeenCalled();
+		expect(h.session.followUp).not.toHaveBeenCalled();
+	});
+
+	it.each([ENTER, FOLLOW_UP])("waits for a deferred input veto before the first submission (%p)", async key => {
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const seen: string[] = [];
+		const h = await createHarness(() => {});
+		h.session.loadDeferredExtensions.mockImplementation(async () => {
+			entered.resolve();
+			await release.promise;
+			const deferred = await loadExtensionFromFactory(
+				pi => {
+					pi.on("input", event => {
+						seen.push(event.text);
+						return { handled: true };
+					});
+				},
+				process.cwd(),
+				new EventBus(),
+				h.runtime,
+				"deferred-input-guard",
+			);
+			await h.runner.addExtensions([deferred]);
+		});
+		h.editor.setText("first submission");
+		const submitting = h.pressSubmit(key);
+		await entered.promise;
+		expect(seen).toEqual([]);
+		expect(h.prompt).not.toHaveBeenCalled();
+		h.editor.setText("new draft");
+		release.resolve();
+		await submitting;
+		expect(seen).toEqual(["first submission"]);
+		expect(h.prompt).not.toHaveBeenCalled();
+		expect(h.generatedMessages).toEqual([]);
+		expect(h.editor.getText()).toBe("new draft");
+	});
+
+	it.each([ENTER, FOLLOW_UP])("refuses input and preserves its draft when deferred loading fails (%p)", async key => {
+		const seen: string[] = [];
+		const h = await createHarness(pi => {
+			pi.on("input", event => {
+				seen.push(event.text);
+			});
+		});
+		h.session.loadDeferredExtensions.mockRejectedValue(new Error("required guard failed"));
+		h.draftWithImage();
+		await h.pressSubmit(key);
+		expect(seen).toEqual([]);
+		expect(h.prompt).not.toHaveBeenCalled();
+		expect(h.session.followUp).not.toHaveBeenCalled();
+		expect(h.generatedMessages).toEqual([]);
+		expect(h.editor.getText()).toContain("original");
+		expect(h.editor.pendingImages).toEqual([originalImage]);
+		expect(h.ctx.showError).toHaveBeenCalledWith("required guard failed");
+	});
+
+	it.each([ENTER, FOLLOW_UP])("never routes a pending submission into a replacement session (%p)", async key => {
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const seen: string[] = [];
+		const h = await createHarness(pi => {
+			pi.on("input", event => {
+				seen.push(event.text);
+			});
+		});
+		h.session.loadDeferredExtensions.mockImplementation(async () => {
+			entered.resolve();
+			await release.promise;
+		});
+		h.draftWithImage();
+		const submitting = h.pressSubmit(key);
+		await entered.promise;
+		h.session.sessionId = "replacement-session";
+		h.editor.pendingImages = [newerImage];
+		h.editor.pendingImageLinks = ["local://new.jpg"];
+		h.editor.setText("replacement draft");
+		release.resolve();
+		await submitting;
+		expect(seen).toEqual([]);
+		expect(h.prompt).not.toHaveBeenCalled();
+		expect(h.generatedMessages).toEqual([]);
+		expect(h.editor.getText()).toBe("replacement draft");
+		expect(h.editor.pendingImages).toEqual([newerImage]);
+	});
+
 	it("Ctrl+Enter chains partial text/image transforms and restores materialized images after rejection", async () => {
 		const seen: InputEvent[] = [];
 		const h = await createHarness(pi => {
@@ -451,7 +575,7 @@ describe("interactive native input ingress", () => {
 			throw new Error("new session rejected");
 		};
 		const commands = new CommandController(h.ctx);
-		h.ctx.handleClearCommand = () => commands.handleClearCommand();
+		h.ctx.handleNewCommand = () => commands.handleClearCommand();
 		h.draftWithImage("/new original [Image #1]");
 		const submitting = h.pressSubmit(FOLLOW_UP);
 		await entered.promise;
@@ -498,6 +622,138 @@ describe("interactive native input ingress", () => {
 		expect(h.editor.pendingImageLinks).toEqual(["local://newer.jpg", "local://original.png"]);
 		expect(h.editor.imageLinks).toEqual(["local://newer.jpg", "local://original.png"]);
 		expect(h.prompt).not.toHaveBeenCalled();
+	});
+
+	it.each([
+		["tan", "handleTanCommand"],
+		["btw", "handleBtwCommand"],
+	] as const)(
+		"Enter /%s takes its images out of the composer, so the next draft cannot send them",
+		async (command, handler) => {
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			const h = await createHarness(() => {});
+			Object.assign(h.session, { customCommands: [], promptTemplates: [] });
+			const handle = vi.fn(async (_text: string, _images?: ImageContent[]) => {
+				entered.resolve();
+				await release.promise;
+				return true;
+			});
+			h.ctx[handler] = handle;
+			h.draftWithImage(`/${command} fix this block [Image #1]`);
+			const submitting = h.pressSubmit(ENTER);
+			await entered.promise;
+			// Pasted while the command dispatches: the composer holds only this image, so it is #1.
+			h.editor.pendingImages.push(newerImage);
+			h.editor.pendingImageLinks.push("local://newer.jpg");
+			h.editor.setText("newer [Image #1]");
+			release.resolve();
+			await submitting;
+
+			expect(handle).toHaveBeenCalledWith("fix this block [Image #1]", [originalImage]);
+			expect(h.editor.pendingImages).toEqual([newerImage]);
+			expect(h.editor.pendingImageLinks).toEqual(["local://newer.jpg"]);
+
+			await h.pressSubmit(ENTER);
+
+			expect(h.prompt).toHaveBeenCalledWith("newer [Image #1]", {
+				streamingBehavior: "steer",
+				images: [newerImage],
+			});
+		},
+	);
+
+	it.each([
+		["tan", "handleTanCommand"],
+		["btw", "handleBtwCommand"],
+	] as const)(
+		"Enter /%s that does not start gives its draft back, with or without an image",
+		async (command, handler) => {
+			const h = await createHarness(() => {});
+			Object.assign(h.session, { customCommands: [], promptTemplates: [] });
+			h.ctx[handler] = vi.fn(async () => false);
+			h.draftWithImage(`/${command} fix this block [Image #1]`);
+
+			await h.pressSubmit(ENTER);
+
+			expect(h.editor.getExpandedText()).toBe(`/${command} fix this block [Image #1]`);
+			expect(h.editor.pendingImages).toEqual([originalImage]);
+			expect(h.editor.pendingImageLinks).toEqual(["local://original.png"]);
+
+			h.editor.clearDraft();
+			h.editor.setText(`/${command} just text`);
+			await h.pressSubmit(ENTER);
+
+			expect(h.editor.getExpandedText()).toBe(`/${command} just text`);
+		},
+	);
+
+	it.each([
+		["omfg", "handleOmfgCommand"],
+		["handoff", "handleHandoffCommand"],
+		["cleanse", "handleCleanseCommand"],
+	] as const)("Enter /%s with an image keeps the draft and does not run", async (command, handler) => {
+		const h = await createHarness(() => {});
+		const showWarning = vi.fn();
+		Object.assign(h.session, { customCommands: [], promptTemplates: [] });
+		Object.assign(h.ctx, { showWarning });
+		const run = vi.fn(async () => {});
+		h.ctx[handler] = run;
+		h.draftWithImage(`/${command} look at this [Image #1]`);
+
+		await h.pressSubmit(ENTER);
+
+		expect(run).not.toHaveBeenCalled();
+		expect(showWarning).toHaveBeenCalledWith(`/${command} takes text only; remove the images to run it`);
+		expect(h.editor.getExpandedText()).toBe(`/${command} look at this [Image #1]`);
+		expect(h.editor.pendingImages).toEqual([originalImage]);
+		expect(h.editor.pendingImageLinks).toEqual(["local://original.png"]);
+	});
+
+	it("Enter /tan as a collab guest gives the draft and its image back", async () => {
+		const h = await createHarness(() => {});
+		Object.assign(h.session, { customCommands: [], promptTemplates: [] });
+		Object.assign(h.ctx, { collabGuest: {} });
+		const run = vi.fn(async () => true);
+		h.ctx.handleTanCommand = run;
+		h.draftWithImage("/tan fix this block [Image #1]");
+
+		await h.pressSubmit(ENTER);
+
+		expect(run).not.toHaveBeenCalled();
+		expect(h.ctx.showStatus).toHaveBeenCalledWith("/tan is host-only during a collab session");
+		expect(h.editor.getExpandedText()).toBe("/tan fix this block [Image #1]");
+		expect(h.editor.pendingImages).toEqual([originalImage]);
+		expect(h.editor.pendingImageLinks).toEqual(["local://original.png"]);
+	});
+
+	it("Enter /tan renumbers an image pasted while its input hook runs", async () => {
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const h = await createHarness(pi => {
+			pi.on("input", async () => {
+				entered.resolve();
+				await release.promise;
+			});
+		});
+		Object.assign(h.session, { customCommands: [], promptTemplates: [] });
+		h.ctx.handleTanCommand = vi.fn(async () => true);
+		h.draftWithImage("/tan fix this block [Image #1]");
+		const submitting = h.pressSubmit(ENTER);
+		await entered.promise;
+		// The submitted image is still pending while the hook runs, so this paste is #2.
+		h.editor.pendingImages.push(newerImage);
+		h.editor.pendingImageLinks.push("local://newer.jpg");
+		h.editor.setText("newer [Image #2]");
+		release.resolve();
+		await submitting;
+
+		expect(h.editor.getExpandedText()).toBe("newer [Image #1]");
+		expect(h.editor.pendingImages).toEqual([newerImage]);
+
+		await h.pressSubmit(ENTER);
+
+		expect(h.prompt).toHaveBeenCalledWith("newer [Image #1]", { streamingBehavior: "steer", images: [newerImage] });
 	});
 
 	it.each(["/clear", "/export"])(
@@ -620,7 +876,7 @@ describe("interactive native input ingress", () => {
 		expect(h.editor.imageLinks).toBeUndefined();
 	});
 
-	it("Enter dispatches input once, while continue shortcuts remain synthetic", async () => {
+	it("Enter dispatches input once, while continue shortcuts bypass input handlers as resumes", async () => {
 		const seen: InputEvent[] = [];
 		const h = await createHarness(pi => {
 			pi.on("input", event => {
@@ -640,7 +896,7 @@ describe("interactive native input ingress", () => {
 			await h.pressSubmit(ENTER);
 		}
 		expect(callback).toHaveBeenCalledTimes(2);
-		expect(callback.mock.calls[0][0]).toMatchObject({ synthetic: true, started: true, userInitiated: true });
+		expect(callback.mock.calls[0][0]).toMatchObject({ resume: true, started: true });
 		expect(seen).toHaveLength(1);
 		expect(h.prompt).toHaveBeenCalledTimes(1);
 	});

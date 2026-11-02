@@ -37,7 +37,7 @@ export type WritableArchiveFormat = "zip" | "tar" | "tar.gz" | "tar.zst" | "asar
  * Where to read an archive from: an extension-inferred filesystem path, a
  * format-tagged filesystem path, in-memory bytes, or any caller-provided
  * {@link ByteSource} (e.g. `httpByteSource` for ranged remote reads).
- * File- and source-backed ZIP/ASAR/RAR/7z/ISO are read lazily.
+ * File- and source-backed TAR/ZIP/ASAR/RAR/7z/ISO are read lazily.
  */
 export type ArchiveSource =
 	| string
@@ -81,6 +81,8 @@ export interface ExtractedArchiveFile extends ArchiveNode {
  * hundreds of thousands of members.
  */
 export interface MemberSource {
+	/** Shared format-owned resource, released once by the archive owner after admitted reads settle. */
+	readonly resource?: AsyncDisposable;
 	/**
 	 * Read this member's bytes. `size` is the entry's declared uncompressed
 	 * size (already bounds-checked); `memberPath` is for error messages.

@@ -139,6 +139,20 @@ export interface CredentialRefreshLeaseStore {
 	getCredentialRefreshLeaseExpiresAt(credentialId: number): number | undefined;
 	releaseCredentialRefreshLease(credentialId: number, owner: string): void;
 	renewCredentialRefreshLease(credentialId: number, owner: string, expiresAtMs: number): boolean;
+	/** The lease row as stored, expired or not; `undefined` when no lease row exists. */
+	getCredentialRefreshLeaseHolder?(credentialId: number): CredentialRefreshLeaseHolder | undefined;
+	/**
+	 * Give a lease this owner took back to the holder it replaced, with that
+	 * holder's own expiry, so the holder can still renew it and save the token
+	 * it may have exchanged. Returns false when `owner` no longer holds it.
+	 */
+	handBackCredentialRefreshLease?(credentialId: number, owner: string, holder: CredentialRefreshLeaseHolder): boolean;
+}
+
+/** Owner and expiry of a stored refresh lease row. */
+export interface CredentialRefreshLeaseHolder {
+	owner: string;
+	expiresAtMs: number;
 }
 
 /** Usage history and client-observed request accounting. */
@@ -181,6 +195,8 @@ export interface CredentialUpstream {
 	 * for `timeoutMs * (maxRetries + 1)`.
 	 * `reason` distinguishes provider-auth recovery from generic/MCP refreshes
 	 * that must always mint a new access token.
+	 * `rejectedAccess` names the rejected bearer for that row; delegates must
+	 * keep it out of URLs and logs.
 	 */
 	refreshOAuthCredential(
 		provider: Provider,
@@ -188,6 +204,7 @@ export interface CredentialUpstream {
 		credential: OAuthCredential,
 		signal?: AbortSignal,
 		reason?: OAuthRefreshReason,
+		rejectedAccess?: string,
 	): Promise<OAuthCredentials>;
 	/**
 	 * Optional async pre-read hook invoked after AuthStorage selects a stored
@@ -197,23 +214,23 @@ export interface CredentialUpstream {
 	 */
 	prepareForRequest(credentialId: number, opts?: { signal?: AbortSignal }): Promise<boolean | undefined>;
 	/**
-	 * Optional store-supplied aggregate usage fetch. When present, `AuthStorage`
-	 * routes `fetchUsageReports()` here instead of fanning out per-credential.
-	 * `RemoteAuthCredentialStore` proxies to the broker (whose datacenter IP
-	 * isn't rate-limited like a heavy residential client).
+	 * Optional store-supplied usage fetch, restricted to one provider when given.
+	 * `AuthStorage` routes reports here instead of fanning out per-credential.
+	 * `RemoteAuthCredentialStore` proxies to the broker's provider-scoped or
+	 * aggregate endpoint.
 	 *
 	 * Precedence: `AuthStorageOptions.fetchUsageReports` > this hook > local fan-out.
 	 *
 	 * `signal` propagates the agent's cancel down to the broker fetch.
 	 */
-	fetchUsageReports(signal?: AbortSignal): Promise<UsageReport[] | null>;
+	fetchUsageReports(signal?: AbortSignal, provider?: Provider): Promise<UsageReport[] | null>;
 	/**
 	 * Optional store-supplied per-credential usage report lookup. When present,
 	 * `AuthStorage` consults this before its own per-credential upstream fetch
 	 * (`UsageService.report`). `RemoteAuthCredentialStore` implements this against
-	 * the broker's aggregate `/v1/usage` (one coalesced round-trip shared across
-	 * all callers) so multi-credential ranking on the client never hits the
-	 * upstream provider's rate-limited usage endpoint from the laptop IP.
+	 * the broker's provider-scoped `/v1/usage`, coalesced for that provider,
+	 * so multi-credential ranking on the client never hits the upstream
+	 * provider's rate-limited usage endpoint from the laptop IP.
 	 *
 	 * Returning `null` is authoritative — `AuthStorage` does NOT fall back to
 	 * the local fetch path. The store hook owns the decision, since falling

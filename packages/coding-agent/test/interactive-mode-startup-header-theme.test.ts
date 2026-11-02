@@ -76,7 +76,7 @@ describe("InteractiveMode startup header after the terminal reports a light back
 		mode?.stop();
 		vi.restoreAllMocks();
 		await session?.dispose();
-		authStorage?.close();
+		await authStorage?.close();
 		tempDir?.removeSync();
 		resetSettingsForTest();
 		themeModule.stopThemeWatcher();

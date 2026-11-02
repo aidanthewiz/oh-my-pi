@@ -148,7 +148,7 @@ describe("OpenAI API-billed Responses web search", () => {
 				authMode: "api_key",
 			});
 		} finally {
-			fixture.authStorage.close();
+			await fixture.authStorage.close();
 		}
 	});
 
@@ -187,7 +187,7 @@ describe("OpenAI API-billed Responses web search", () => {
 				usage: { searchRequests: 1 },
 			});
 		} finally {
-			fixture.authStorage.close();
+			await fixture.authStorage.close();
 		}
 	});
 
@@ -212,7 +212,7 @@ describe("OpenAI API-billed Responses web search", () => {
 			await searchOpenAIResponses({ ...makeParams(fixture, fetch), sessionId: "session-1" });
 			expect(sessionHeaders).toEqual(["session-1"]);
 		} finally {
-			fixture.authStorage.close();
+			await fixture.authStorage.close();
 		}
 	});
 
@@ -260,7 +260,7 @@ describe("OpenAI API-billed Responses web search", () => {
 			});
 			expect(result.citations).toBeUndefined();
 		} finally {
-			fixture.authStorage.close();
+			await fixture.authStorage.close();
 		}
 	});
 
@@ -293,7 +293,7 @@ describe("OpenAI API-billed Responses web search", () => {
 				store: false,
 			});
 		} finally {
-			fixture.authStorage.close();
+			await fixture.authStorage.close();
 		}
 	});
 
@@ -334,7 +334,7 @@ describe("OpenAI API-billed Responses web search", () => {
 			expect(result.sources.some(source => source.url === "https://results.example.test/10")).toBe(false);
 			expect(result.citations).toEqual([{ url: citedUrl, title: "Answer citation" }]);
 		} finally {
-			fixture.authStorage.close();
+			await fixture.authStorage.close();
 		}
 	});
 
@@ -364,7 +364,7 @@ describe("OpenAI API-billed Responses web search", () => {
 				message: expect.stringContaining("no web_search_call"),
 			});
 		} finally {
-			fixture.authStorage.close();
+			await fixture.authStorage.close();
 		}
 	});
 	it("rejects a search call that returned no answer or sources", async () => {
@@ -389,7 +389,7 @@ describe("OpenAI API-billed Responses web search", () => {
 				message: expect.stringContaining("no answer or sources"),
 			});
 		} finally {
-			fixture.authStorage.close();
+			await fixture.authStorage.close();
 		}
 	});
 
@@ -418,7 +418,7 @@ describe("OpenAI API-billed Responses web search", () => {
 			).rejects.toThrow('OpenAI API credentials not found for selected provider "openai"');
 			expect(requests).toBe(0);
 		} finally {
-			fixture.authStorage.close();
+			await fixture.authStorage.close();
 			if (priorKey === undefined) delete process.env.OPENAI_API_KEY;
 			else process.env.OPENAI_API_KEY = priorKey;
 		}
@@ -443,7 +443,7 @@ describe("OpenAI API-billed Responses web search", () => {
 			).rejects.toThrow("Refusing to send the OpenAI environment API key to a custom Responses endpoint");
 			expect(requests).toBe(0);
 		} finally {
-			fixture.authStorage.close();
+			await fixture.authStorage.close();
 			if (priorKey === undefined) delete process.env.OPENAI_API_KEY;
 			else process.env.OPENAI_API_KEY = priorKey;
 		}
@@ -498,7 +498,7 @@ describe("OpenAI API-billed Responses web search", () => {
 			});
 			expect(structured instanceof Error ? structured.message : String(structured)).not.toContain(API_KEY);
 		} finally {
-			fixture.authStorage.close();
+			await fixture.authStorage.close();
 		}
 	});
 });

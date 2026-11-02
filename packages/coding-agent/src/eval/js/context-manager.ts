@@ -7,13 +7,18 @@ import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { safeSend as safeSendIpc } from "../../utils/ipc";
 import { EVAL_TIMEOUT_PAUSE_OP, EVAL_TIMEOUT_RESUME_OP } from "../bridge-timeout";
 import { getEnabledEvalPreludes } from "../preludes";
-import { attachSessionOwner, EvalKernelNotRunningError, type SessionOwners } from "../executor-base";
+import {
+	attachSessionOwner,
+	EvalKernelNotRunningError,
+	formatKernelRestartNotice,
+	type SessionOwners,
+} from "../executor-base";
 import { shouldDetachKernel } from "../py/spawn-options";
 import { updateEvalState } from "../state";
 import type { EvalShadowCellSession } from "../speculation/cell-session";
 import { getActiveEvalShadowCell } from "../speculation/runtime-context";
 import type { ShadowPlan } from "../speculation/types";
-import type { EvalToolDescriptor, EvalToolInvokeResult } from "../types";
+import type { EvalDisplayOutput, EvalToolDescriptor, EvalToolInvokeResult } from "../types";
 import { type ShadowSnapshot, shadowSnapshotDigest } from "./shared/runtime";
 import { projectJavaScriptShadowPlan } from "./speculation";
 import { callSessionTool, type JsStatusEvent } from "./tool-bridge";
@@ -21,7 +26,6 @@ import { callSessionTool, type JsStatusEvent } from "./tool-bridge";
 // hidden argv mode, so compiled/npm builds only need one JavaScript entry.
 import type {
 	EvalPreludeSource,
-	JsDisplayOutput,
 	JsToolRequest,
 	RunErrorPayload,
 	SessionSnapshot,
@@ -30,12 +34,13 @@ import type {
 } from "./worker-protocol";
 
 export { rewriteImports, wrapCode } from "./shared/rewrite-imports";
-export type { JsDisplayOutput } from "./worker-protocol";
 
 export interface VmRunState {
 	signal?: AbortSignal;
 	onText?: (chunk: string) => void;
-	onDisplay?: (output: JsDisplayOutput) => void;
+	onDisplay?: (output: EvalDisplayOutput) => void;
+	/** Shows the user `out://` replies of the run's bridged tool calls; absent, those calls are refused. */
+	onReply?: (text: string) => void;
 }
 
 /** Isolated runtime transport used by the context manager and startup regression fixtures. */
@@ -109,6 +114,8 @@ interface StartingJsSession extends SessionOwners {
 const sessions = new Map<string, JsSession>();
 const startingSessions = new Map<string, StartingJsSession>();
 const resettingSessions = new Map<string, Promise<void>>();
+// Owners of session keys whose worker died outside reset/disposal; the next cell announces the loss.
+const lostSessions = new Map<string, Set<string>>();
 // Worker startup (module-graph import + WorkerCore construction) is infrastructure
 // cost, not user compute. Floor it independently of Bun's 5s default per-test timeout
 // so a slow cold-start under load isn't aborted mid-init — terminating a still-
@@ -201,6 +208,9 @@ export async function executeInVmContext(options: {
 		options.timeoutMs,
 		options.ownerId,
 	);
+	if (!options.reset && lostSessions.delete(sessionKey)) {
+		options.runState.onText?.(`${formatKernelRestartNotice("JS worker")}\n`);
+	}
 	const result = await runOnce(session, options);
 	if (session.state === "alive" && path.isAbsolute(options.filename)) {
 		updateEvalState(options.session, {
@@ -234,12 +244,7 @@ export async function invokeJsTool(
 	let envelope: unknown;
 	const pending: PendingRun = {
 		runId,
-		runState: {
-			signal: options.signal,
-			onDisplay: output => {
-				if (output.type === "json") envelope = output.data;
-			},
-		},
+		runState: { signal: options.signal },
 		toolSession: options.session,
 		resolve,
 		reject,
@@ -263,7 +268,7 @@ export async function invokeJsTool(
 
 	try {
 		if (!pending.settled) safeSend(session, { type: "tool", runId, ...request });
-		await promise;
+		envelope = (await promise).value;
 	} catch (error) {
 		return { ok: false, error: error instanceof Error ? error.message : String(error) };
 	} finally {
@@ -390,6 +395,7 @@ export async function runIfSnapshotMatches(options: {
 }
 
 export async function resetVmContext(sessionKey: string): Promise<void> {
+	lostSessions.delete(sessionKey);
 	const session = sessions.get(sessionKey) ?? (await startingSessions.get(sessionKey)?.promise.catch(() => undefined));
 	if (!session) return;
 	sessions.delete(sessionKey);
@@ -406,6 +412,8 @@ export async function disposeAllVmContexts(): Promise<void> {
 		if (!all.includes(result.value)) all.push(result.value);
 	}
 	sessions.clear();
+	// After the await: a worker that died while startups settled marked its key lost.
+	lostSessions.clear();
 	await Promise.all(all.map(session => killSession(session, new ToolError("JS context disposed"), { force: false })));
 }
 
@@ -432,6 +440,9 @@ export async function disposeVmContextsByOwner(ownerId: string): Promise<void> {
 			continue;
 		}
 		starting.ownerIds.delete(ownerId);
+	}
+	for (const [sessionKey, ownerIds] of lostSessions) {
+		if (ownerIds.delete(ownerId) && ownerIds.size === 0) lostSessions.delete(sessionKey);
 	}
 	for (const session of toKill) {
 		if (sessions.get(session.sessionKey) === session) sessions.delete(session.sessionKey);
@@ -823,6 +834,7 @@ async function handleToolCall(session: JsSession, msg: Extract<WorkerOutbound, {
 			signal: ctrl.signal,
 			identity: msg.identity,
 			shadowCell: pending.shadowCell,
+			onReply: pending.runState.onReply,
 			emitStatus: (event: JsStatusEvent) => {
 				trackDeferPhase(pending, event);
 				pending.runState.onDisplay?.({ type: "status", event });
@@ -846,7 +858,7 @@ function finishPending(pending: PendingRun, msg: Extract<WorkerOutbound, { type:
 	pending.settled = true;
 	pending.heldResult = undefined;
 	if (msg.ok) {
-		pending.resolve({ value: undefined });
+		pending.resolve({ value: msg.value });
 		return;
 	}
 	pending.reject(errorFromPayload(msg.error));
@@ -873,6 +885,7 @@ function settlePending(session: JsSession, msg: Extract<WorkerOutbound, { type: 
 async function killSessionFor(session: JsSession, error: Error, options: { force: boolean }): Promise<void> {
 	if (sessions.get(session.sessionKey) === session) {
 		sessions.delete(session.sessionKey);
+		lostSessions.set(session.sessionKey, new Set(session.ownerIds));
 	}
 	await killSession(session, error, options);
 }

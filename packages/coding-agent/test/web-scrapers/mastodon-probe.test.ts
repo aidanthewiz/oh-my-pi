@@ -65,11 +65,29 @@ describe("mastodon instance probe", () => {
 
 	it("re-probes after an inconclusive server error instead of memoizing it", async () => {
 		const host = "probe-503.mastodon.test";
-		const { calls } = mockFetch(() => new Response("unavailable", { status: 503 }));
+		let unavailable = true;
+		mockFetch(url => {
+			if (unavailable) return new Response("unavailable", { status: 503 });
+			if (url.endsWith("/api/v1/instance")) return Response.json({ uri: host });
+			return Response.json({
+				id: "1",
+				created_at: "2026-01-01T00:00:00Z",
+				content: "<p>The recovered instance is readable.</p>",
+				url: `https://${host}/@alice/1`,
+				account: { username: "alice", acct: "alice", display_name: "Alice" },
+				reblogs_count: 0,
+				favourites_count: 0,
+				replies_count: 0,
+				media_attachments: [],
+				sensitive: false,
+				visibility: "public",
+			});
+		});
 		expect(await handleMastodon(`https://${host}/@alice/1`, 20)).toBeNull();
-		expect(calls()).toBe(1);
-		expect(await handleMastodon(`https://${host}/@alice/1`, 20)).toBeNull();
-		expect(calls()).toBe(2);
+		unavailable = false;
+		expect((await handleMastodon(`https://${host}/@alice/1`, 20))?.content).toContain(
+			"The recovered instance is readable.",
+		);
 	});
 });
 

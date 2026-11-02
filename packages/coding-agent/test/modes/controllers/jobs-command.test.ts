@@ -5,15 +5,68 @@ import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { InteractiveMode } from "@oh-my-pi/pi-coding-agent/modes/interactive-mode";
-import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { CommandController } from "@oh-my-pi/pi-coding-agent/modes/controllers/command-controller";
+import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { AgentSession, type AsyncJobSnapshotItem } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { HistoryStorage } from "@oh-my-pi/pi-coding-agent/session/history-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { executeBuiltinSlashCommand } from "@oh-my-pi/pi-coding-agent/slash-commands/builtin-registry";
+import { Container } from "@oh-my-pi/pi-tui";
 import { isNativeRendering, setNativeRendering } from "@oh-my-pi/pi-tui/native/state";
 import { JobsSheet } from "@oh-my-pi/pi-tui/overlays/jobs-panel";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { createInteractiveModeContext } from "../../helpers/interactive-mode-context";
+
+const WIDTH = 60;
+
+/** `/jobs full` in text mode, as the report box above the editor shows it: its content rows, borders stripped. */
+async function renderFullJobs(running: AsyncJobSnapshotItem[]): Promise<string[]> {
+	const reportContainer = new Container();
+	const ctx = createInteractiveModeContext({
+		ui: { terminal: { columns: WIDTH, rows: 200 } },
+		reportContainer,
+		commandReportRows: () => 200,
+		viewSession: {
+			getAsyncJobTree: () => ({ running, recent: [], agents: [] }),
+			requestJobCaptions: () => {},
+		},
+	});
+	await new CommandController(ctx).handleJobsCommand({ full: true });
+	return reportContainer
+		.render(WIDTH)
+		.map(line => Bun.stripANSI(line))
+		.filter(line => line.startsWith("│"))
+		.map(line => line.slice(2, -2).trimEnd());
+}
+
+describe("CommandController /jobs full", () => {
+	beforeAll(async () => {
+		await initTheme();
+	});
+
+	it("keeps every line of a multi-line or wrapped command indented under its job row", async () => {
+		const longLine = `python /tmp/x.py ${"--flag ".repeat(12)}END`;
+		const command = `cat <<'EOF' > /tmp/x.py\nimport sys\nEOF\n${longLine}`;
+		const startTime = Date.now();
+		const lines = await renderFullJobs([
+			{ id: "bash-1", type: "bash", status: "running", label: "cat <<'EOF'...", command, startTime },
+			{ id: "bash-2", type: "bash", status: "running", label: "sleep 5", startTime },
+		]);
+
+		const first = lines.findIndex(line => line.includes("bash-1"));
+		const second = lines.findIndex(line => line.includes("bash-2"));
+		const commandLines = lines.slice(first + 1, second);
+		// Job rows start the report body; command lines sit two columns deeper.
+		expect(lines[first]).toMatch(/^\S/);
+		expect(commandLines.length).toBeGreaterThan(4);
+		for (const line of commandLines) expect(line).toMatch(/^ {2}\S/);
+		expect(commandLines.map(line => line.trim()).join(" ")).toContain("import sys EOF python /tmp/x.py --flag");
+		expect(commandLines.at(-1)).toEndWith("END");
+		expect(lines[second + 1]).toBe("  sleep 5");
+	});
+});
 
 describe("/jobs in the native terminal", () => {
 	let tempDir: TempDir;
@@ -60,7 +113,7 @@ describe("/jobs in the native terminal", () => {
 		manager.cancelAll();
 		await manager.dispose({ timeoutMs: 1_000 });
 		await session?.dispose();
-		authStorage?.close();
+		await authStorage?.close();
 		tempDir?.removeSync();
 		resetSettingsForTest();
 	});
@@ -143,5 +196,86 @@ describe("/jobs in the native terminal", () => {
 
 		expect(manager.getJob(foreignId)?.status).toBe("running");
 		foreignGate.resolve("done");
+	});
+
+	// #14814: a subagent's jobs are owned by it, so main's owner-scoped snapshot never lists them.
+	it("a focused subagent view lists that agent's jobs, not main's, and offers no way to cancel them", async () => {
+		const worker = new AgentSession({
+			agent: new Agent({ initialState: { model: session.model, systemPrompt: ["Test"], tools: [], messages: [] } }),
+			sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
+			settings: Settings.isolated(),
+			modelRegistry: session.modelRegistry,
+			asyncJobManager: manager,
+			agentId: "Worker",
+		});
+		const gates = [Promise.withResolvers<string>(), Promise.withResolvers<string>()];
+		manager.register("bash", "main-only build", () => gates[0].promise, { ownerId: "main" });
+		const workerJob = manager.register("bash", "worker cargo test", () => gates[1].promise, { ownerId: "Worker" });
+		Object.defineProperty(mode, "viewSession", { get: () => worker, configurable: true });
+		Object.defineProperty(mode, "focusedAgentId", { get: () => "Worker", configurable: true });
+		try {
+			await mode.handleJobsCommand();
+			const sheet = mode.ui.overlayStack.at(-1)?.component;
+			expect(sheet).toBeInstanceOf(JobsSheet);
+			const listed = Bun.stripANSI(sheet?.render(100).join("\n") ?? "");
+			expect(listed).toContain("worker cargo test");
+			expect(listed).not.toContain("main-only build");
+			sheet?.handleInput?.("x");
+			sheet?.handleNativeEvent?.({ type: "action", key: "cancel", act: "cancel", mods: [] });
+			expect(manager.getJob(workerJob)?.status).toBe("running");
+			sheet?.handleInput?.("\x1b");
+
+			setNativeRendering(false);
+			await mode.handleJobsCommand({ full: true });
+			const report = Bun.stripANSI(mode.reportContainer.render(100).join("\n"));
+			expect(report).toContain("worker cargo test");
+			expect(report).not.toContain("main-only build");
+		} finally {
+			for (const gate of gates) gate.resolve("done");
+			await worker.dispose();
+		}
+	});
+
+	it("lists subagents' jobs under the task job that runs them, the deepest branch first", async () => {
+		const registry = AgentRegistry.global();
+		const refs = [
+			registry.register({ id: "Worker", displayName: "task", kind: "sub", parentId: "main", session: null }),
+			registry.register({ id: "Deep", displayName: "task", kind: "sub", parentId: "Worker", session: null }),
+		];
+		const gates = Array.from({ length: 4 }, () => Promise.withResolvers<string>());
+		manager.register("bash", "main lint", () => gates[0].promise, { ownerId: "main" });
+		manager.register("task", "audit the worker", () => gates[1].promise, { ownerId: "main", agentId: "Worker" });
+		manager.register("bash", "worker build", () => gates[2].promise, { ownerId: "Worker" });
+		const deepId = manager.register("bash", "deep probe", () => gates[3].promise, { ownerId: "Deep" });
+		try {
+			setNativeRendering(false);
+			await mode.handleJobsCommand({ full: true });
+			const report = Bun.stripANSI(mode.reportContainer.render(120).join("\n"))
+				.split("\n")
+				.map(line => line.replace(/^│ ?|\s*│$/g, "").trimEnd())
+				.filter(line => /\S/.test(line));
+			const at = (text: string) => report.findIndex(line => line.includes(text));
+			// Worker's branch (Deep's header and job, then its own job) leads; main's own leaf trails.
+			expect(report[at("audit the worker") - 1]).toMatch(/^\S+ \[task\] running \(.*\) Worker$/);
+			expect(report[at("Deep")]).toBe("├─ Deep");
+			expect(report[at("deep probe")]).toMatch(/^│ {7}deep probe$/);
+			expect(report[at("worker build")]).toMatch(/^ {5}worker build$/);
+			expect(at("audit the worker")).toBeLessThan(at("Deep"));
+			expect(at("deep probe")).toBeLessThan(at("worker build"));
+			expect(at("worker build")).toBeLessThan(at("main lint"));
+
+			// The sheet steps past Deep's header to its job, which main can inspect.
+			setNativeRendering(true);
+			await mode.handleJobsCommand();
+			const sheet = mode.ui.overlayStack.at(-1)?.component;
+			expect(sheet).toBeInstanceOf(JobsSheet);
+			sheet?.handleInput?.("\x1b[B");
+			expect(Bun.stripANSI(sheet?.render(120).join("\n") ?? "")).toMatch(/> .*running {2}bash .* deep probe/);
+			expect(session.inspectAsyncJob(deepId)).toMatchObject({ pids: [] });
+			sheet?.handleInput?.("\x1b");
+		} finally {
+			for (const gate of gates) gate.resolve("done");
+			for (const ref of refs) registry.unregister(ref.id, ref);
+		}
 	});
 });

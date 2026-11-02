@@ -123,7 +123,7 @@ describe("BTW session boundaries", () => {
 		await btw.dispose();
 		mode.stop();
 		await session.dispose();
-		auth.close();
+		await auth.close();
 		directory.removeSync();
 		resetSettingsForTest();
 	});

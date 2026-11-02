@@ -2,6 +2,7 @@ import type * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type {
+	AgentTool,
 	AgentToolResult,
 	SpeculativeAuthorization,
 	SpeculativeCommitContext,
@@ -21,7 +22,8 @@ import {
 } from "@oh-my-pi/pi-utils";
 import type { Settings } from "../config/settings";
 import type { ToolSession } from "../tools";
-import { resolveApproval } from "../tools/approval";
+import { approvalRestrictions, captureApprovalTargets, resolveApproval } from "../tools/approval";
+import { approvalTargetKey } from "../tools/approval-targets";
 import { CONVERTIBLE_EXTENSIONS } from "../utils/markit";
 import {
 	digestLocalReadBytes,
@@ -154,8 +156,6 @@ export class CodingAgentSpeculativeExecutionHost implements SpeculativeExecution
 				},
 			};
 		}
-		const gate = this.#policyGate(context.tool, context.args);
-		if (!gate.allowed) return { authorization: gate };
 		const resource = context.effect.resources[0];
 		if (!resource || context.effect.resources.length !== 1 || resource.access !== "read") {
 			return { authorization: { allowed: false, reason: "local read must have one read resource" } };
@@ -169,6 +169,17 @@ export class CodingAgentSpeculativeExecutionHost implements SpeculativeExecution
 		if (!path.isAbsolute(resource.path) || path.resolve(this.toolSession.cwd, context.args.path) !== resource.path) {
 			return { authorization: { allowed: false, reason: "local read resource changed" } };
 		}
+		const gate = await this.#policyGate(
+			{
+				...context.tool,
+				approvalCacheTargets: () => {
+					const target = approvalTargetKey(this.toolSession.cwd, resource.path);
+					return target === undefined ? undefined : [target];
+				},
+			},
+			context.args,
+		);
+		if (!gate.allowed) return { authorization: gate };
 		// Content inspection starts here — after the lifecycle, approval, and
 		// shape gates above have allowed the candidate — so a denied read
 		// never touches the filesystem. The resolver is shared with speculative
@@ -216,20 +227,27 @@ export class CodingAgentSpeculativeExecutionHost implements SpeculativeExecution
 	 * items) pass the same lifecycle and approval gate as reads: work that a
 	 * handler could block or a user must approve never starts early.
 	 */
-	authorizeLaunch(context: SpeculativeLaunchContext): SpeculativeAuthorization {
+	authorizeLaunch(context: SpeculativeLaunchContext): Promise<SpeculativeAuthorization> {
 		return this.#policyGate(context.tool, context.args);
 	}
 
 	/** Extension lifecycle handlers and non-auto-allow approval both veto early execution. */
-	#policyGate(tool: SpeculativeToolReference, args: unknown): SpeculativeAuthorization {
+	async #policyGate(
+		tool: SpeculativeToolReference & Pick<AgentTool, "approvalCacheTargets" | "approvalCacheIdentity">,
+		args: unknown,
+	): Promise<SpeculativeAuthorization> {
 		if (hasLifecycleHandlers(this.extensionRunner)) {
 			return { allowed: false, reason: "active extension lifecycle handler" };
 		}
+		const targets = await captureApprovalTargets(tool, args, this.toolSession.cwd);
 		const approval = resolveApproval(
 			tool,
 			args,
 			cfgToolsApprovalMode.get(this.settings),
 			cfgToolsApproval.get(this.settings),
+			undefined,
+			approvalRestrictions(this.settings, this.toolSession.cwd),
+			targets,
 		);
 		if (approval.policy !== "allow") return { allowed: false, reason: "tool approval is not auto-allow" };
 		return { allowed: true };

@@ -4,6 +4,7 @@
  * token file → local SQLite) in one place so build-time tooling sees the same
  * credentials as the TUI.
  */
+import { createHmac } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import {
@@ -27,7 +28,7 @@ import {
 } from "../auth-storage";
 import * as AIError from "../error";
 import { AuthBrokerClient, AuthBrokerError } from "./client";
-import { type AuthBrokerAccountPool, RemoteAuthCredentialStore } from "./remote-store";
+import { type AuthBrokerAccountPool, type AuthBrokerProviderPool, RemoteAuthCredentialStore } from "./remote-store";
 import { readAuthBrokerSnapshotCache, scheduleAuthBrokerSnapshotCacheWrite } from "./snapshot-cache";
 import { DEFAULT_SNAPSHOT_CACHE_TTL_MS, type SnapshotResponse } from "./types";
 
@@ -49,7 +50,10 @@ export interface DiscoverAuthStorageOptions {
 	/** Programmatic pool for SDK hosts. Takes precedence over the environment file. */
 	accountPool?: AuthBrokerAccountPool;
 	accountPolicies?: AuthAccountPolicies;
-	authStorageOptions?: Omit<AuthStorageOptions, "accountPolicies" | "configValueResolver" | "sourceLabel">;
+	authStorageOptions?: Omit<
+		AuthStorageOptions,
+		"accountPolicies" | "configValueResolver" | "sourceLabel" | "sourceIdentity"
+	>;
 }
 
 /** Path to the local bearer token file. Created by `omp auth-broker token`. */
@@ -122,7 +126,12 @@ function parseAuthAccountPolicies(value: unknown): AuthAccountPolicies {
 		}
 		const policy = entry as Record<string, unknown>;
 		const unknownPolicyFields = Object.keys(policy).filter(
-			key => key !== "provider" && key !== "account" && key !== "priority" && key !== "reservePct",
+			key =>
+				key !== "provider" &&
+				key !== "account" &&
+				key !== "priority" &&
+				key !== "reservePct" &&
+				key !== "reclaimAbovePct",
 		);
 		if (unknownPolicyFields.length > 0) {
 			throw new AIError.ConfigurationError(`${path} has unknown fields: ${unknownPolicyFields.join(", ")}`);
@@ -171,6 +180,12 @@ function parseAuthAccountPolicies(value: unknown): AuthAccountPolicies {
 		) {
 			throw new AIError.ConfigurationError(`${path}.reservePct must be between 0 and 100`);
 		}
+		if (
+			policy.reclaimAbovePct !== undefined &&
+			(typeof policy.reclaimAbovePct !== "number" || !Number.isFinite(policy.reclaimAbovePct))
+		) {
+			throw new AIError.ConfigurationError(`${path}.reclaimAbovePct must be a finite number`);
+		}
 
 		return {
 			provider,
@@ -182,6 +197,7 @@ function parseAuthAccountPolicies(value: unknown): AuthAccountPolicies {
 			},
 			...(typeof policy.priority === "number" ? { priority: policy.priority } : {}),
 			...(typeof policy.reservePct === "number" ? { reservePct: policy.reservePct } : {}),
+			...(typeof policy.reclaimAbovePct === "number" ? { reclaimAbovePct: policy.reclaimAbovePct } : {}),
 		};
 	});
 }
@@ -272,7 +288,7 @@ export async function loadAuthBrokerAccountPool(): Promise<AuthBrokerAccountPool
 		throw new AIError.ConfigurationError("OMP_AUTH_BROKER_ACCOUNT_POOL_FILE must contain a JSON object");
 	}
 
-	const accountPool = new Map<string, ReadonlySet<string>>();
+	const accountPool = new Map<string, ReadonlySet<string> | AuthBrokerProviderPool>();
 	for (const [provider, value] of Object.entries(parsed)) {
 		const normalizedProvider = provider.trim();
 		if (normalizedProvider.length === 0) {
@@ -283,28 +299,66 @@ export async function loadAuthBrokerAccountPool(): Promise<AuthBrokerAccountPool
 				"OMP_AUTH_BROKER_ACCOUNT_POOL_FILE contains a provider id with surrounding whitespace",
 			);
 		}
-		if (!Array.isArray(value)) {
-			throw new AIError.ConfigurationError(
-				`OMP_AUTH_BROKER_ACCOUNT_POOL_FILE entry for ${provider} must be an array of identity keys`,
-			);
-		}
-		const identities = new Set<string>();
-		for (const identity of value) {
-			if (typeof identity !== "string" || identity.length === 0) {
-				throw new AIError.ConfigurationError(
-					`OMP_AUTH_BROKER_ACCOUNT_POOL_FILE entry for ${provider} contains an invalid identity key`,
-				);
-			}
-			if (identity !== identity.trim()) {
-				throw new AIError.ConfigurationError(
-					`OMP_AUTH_BROKER_ACCOUNT_POOL_FILE entry for ${provider} contains an identity key with surrounding whitespace`,
-				);
-			}
-			identities.add(identity);
-		}
-		accountPool.set(provider, identities);
+		accountPool.set(provider, parseAccountPoolEntry(provider, value));
 	}
 	return accountPool;
+}
+
+/**
+ * One pool-file entry: an identity array (visible OAuth accounts, API keys
+ * kept), `true` (everything visible), `false` (nothing visible), or a rule
+ * object `{ "accounts"?: [...], "apiKeys"?: boolean }`.
+ */
+function parseAccountPoolEntry(provider: string, value: unknown): ReadonlySet<string> | AuthBrokerProviderPool {
+	if (Array.isArray(value)) return parseAccountPoolIdentities(provider, value);
+	if (value === true) return {};
+	if (value === false) return { accounts: new Set(), apiKeys: false };
+	if (value === null || typeof value !== "object") {
+		throw new AIError.ConfigurationError(
+			`OMP_AUTH_BROKER_ACCOUNT_POOL_FILE entry for ${provider} must be an array of identity keys, a boolean, or an object with "accounts"/"apiKeys"`,
+		);
+	}
+	const rule: { accounts?: ReadonlySet<string>; apiKeys?: boolean } = {};
+	for (const [key, field] of Object.entries(value)) {
+		if (key === "accounts") {
+			if (!Array.isArray(field)) {
+				throw new AIError.ConfigurationError(
+					`OMP_AUTH_BROKER_ACCOUNT_POOL_FILE entry for ${provider} has "accounts" that is not an array of identity keys`,
+				);
+			}
+			rule.accounts = parseAccountPoolIdentities(provider, field);
+		} else if (key === "apiKeys") {
+			if (typeof field !== "boolean") {
+				throw new AIError.ConfigurationError(
+					`OMP_AUTH_BROKER_ACCOUNT_POOL_FILE entry for ${provider} has "apiKeys" that is not a boolean`,
+				);
+			}
+			rule.apiKeys = field;
+		} else {
+			throw new AIError.ConfigurationError(
+				`OMP_AUTH_BROKER_ACCOUNT_POOL_FILE entry for ${provider} has unknown field ${JSON.stringify(key)}`,
+			);
+		}
+	}
+	return rule;
+}
+
+function parseAccountPoolIdentities(provider: string, value: unknown[]): Set<string> {
+	const identities = new Set<string>();
+	for (const identity of value) {
+		if (typeof identity !== "string" || identity.length === 0) {
+			throw new AIError.ConfigurationError(
+				`OMP_AUTH_BROKER_ACCOUNT_POOL_FILE entry for ${provider} contains an invalid identity key`,
+			);
+		}
+		if (identity !== identity.trim()) {
+			throw new AIError.ConfigurationError(
+				`OMP_AUTH_BROKER_ACCOUNT_POOL_FILE entry for ${provider} contains an identity key with surrounding whitespace`,
+			);
+		}
+		identities.add(identity);
+	}
+	return identities;
 }
 
 function resolveSnapshotTtlMs(): number {
@@ -379,6 +433,7 @@ export interface OpenAuthCredentialStoreOptions {
 export interface OpenedAuthCredentialStore {
 	store: AuthCredentialStore;
 	sourceLabel: string;
+	sourceIdentity: string;
 }
 
 /**
@@ -449,12 +504,19 @@ export async function openAuthCredentialStore(
 			onSnapshot: persist,
 			accountPool,
 		});
-		return { store, sourceLabel: options.sourceLabel ?? `broker ${brokerConfig.url}` };
+		const sourceIdentity = createHmac("sha256", brokerConfig.token)
+			.update(`coreforge-auth-source-v1\0${brokerConfig.url.replace(/\/+$/, "")}`)
+			.digest("hex");
+		return { store, sourceLabel: options.sourceLabel ?? `broker ${brokerConfig.url}`, sourceIdentity };
 	}
 
 	const dbPath = getAgentDbPath(options.agentDir ?? getAgentDir());
 	const store = await SqliteAuthCredentialStore.open(dbPath);
-	return { store, sourceLabel: options.sourceLabel ?? `local ${dbPath}` };
+	return {
+		store,
+		sourceLabel: options.sourceLabel ?? `local ${dbPath}`,
+		sourceIdentity: `sqlite:${path.resolve(dbPath)}`,
+	};
 }
 
 /**
@@ -473,7 +535,7 @@ export async function discoverAuthStorage(options: DiscoverAuthStorageOptions = 
 		accountPolicies: options.accountPolicies,
 		usageReservePct: options.authStorageOptions?.defaultReservePct,
 	});
-	const { store, sourceLabel } = await openAuthCredentialStore({
+	const { store, sourceLabel, sourceIdentity } = await openAuthCredentialStore({
 		brokerConfig,
 		agentDir,
 		cachePath: options.cachePath,
@@ -484,6 +546,7 @@ export async function discoverAuthStorage(options: DiscoverAuthStorageOptions = 
 		...options.authStorageOptions,
 		configValueResolver: options.configValueResolver,
 		sourceLabel,
+		sourceIdentity,
 		accountPolicies,
 		defaultReservePct,
 	});

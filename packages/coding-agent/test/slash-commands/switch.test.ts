@@ -48,6 +48,9 @@ describe("/switch session role transitions", () => {
 		});
 		context = {
 			session,
+			get viewSession() {
+				return context.session;
+			},
 			sessionManager: manager,
 			settings,
 			editor: { setText: () => {} },
@@ -68,7 +71,7 @@ describe("/switch session role transitions", () => {
 
 	afterEach(async () => {
 		await session.dispose();
-		auth.close();
+		await auth.close();
 		directory.removeSync();
 	});
 

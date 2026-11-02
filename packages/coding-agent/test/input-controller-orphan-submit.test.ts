@@ -11,6 +11,7 @@ import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { createSessionDefaults } from "./helpers/session-defaults";
 
 /**
  * Regression: a submission arriving while the main loop has no input waiter
@@ -32,6 +33,7 @@ type FakeEditor = {
 	pendingImageLinks: (string | undefined)[];
 	setText(text: string): void;
 	getText(): string;
+	getExpandedText(): string;
 	setCollapsedText(text: string): void;
 	composerChips(): unknown[];
 	addToHistory(text: string): void;
@@ -60,6 +62,9 @@ function createContext(sessionOverride?: InteractiveModeContext["session"]) {
 		getText() {
 			return editorText;
 		},
+		getExpandedText() {
+			return editorText;
+		},
 		setCollapsedText(text: string) {
 			editorText = text;
 		},
@@ -81,6 +86,8 @@ function createContext(sessionOverride?: InteractiveModeContext["session"]) {
 	const session =
 		sessionOverride ??
 		({
+			...createSessionDefaults(),
+			sessionId: "orphan-submit-main",
 			isStreaming: false,
 			isCompacting: false,
 			isBashRunning: false,
@@ -199,7 +206,7 @@ describe("InputController orphaned submit", () => {
 			expect(session.agent.hasQueuedMessages()).toBe(false);
 		} finally {
 			await session?.dispose();
-			authStorage?.close();
+			await authStorage?.close();
 			tempDir.removeSync();
 		}
 	});

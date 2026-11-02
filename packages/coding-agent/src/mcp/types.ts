@@ -1,4 +1,11 @@
-import type { MCPContent, MCPImageContent, MCPResourceContent, MCPTextContent } from "@oh-my-pi/pi-tui/tools/mcp";
+import type { AgentToolContext } from "@oh-my-pi/pi-agent-core";
+import type {
+	MCPContent,
+	MCPImageContent,
+	MCPProgress,
+	MCPResourceContent,
+	MCPTextContent,
+} from "@oh-my-pi/pi-tui/tools/mcp";
 /**
  * MCP (Model Context Protocol) type definitions.
  *
@@ -283,16 +290,6 @@ export interface MCPAuthHandlerContext {
 	readonly signal: AbortSignal;
 }
 
-/**
- * Thrown when an MCP OAuth flow is cancelled by the user or its owning session.
- */
-export class MCPOAuthCancelledError extends Error {
-	constructor(message = "OAuth flow cancelled") {
-		super(message);
-		this.name = "MCPOAuthCancelledError";
-	}
-}
-
 /** tools/call response */
 export interface MCPToolCallResult {
 	content: MCPContent[];
@@ -304,6 +301,11 @@ export interface MCPToolCallResult {
 	 */
 	structuredContent?: Record<string, unknown>;
 	_meta?: Record<string, unknown>;
+}
+
+/** Trusted host context; extension call options cannot supply lifecycle authority. */
+export interface MCPHostCallContext extends AgentToolContext {
+	mcpOwnerCurrent?: () => boolean;
 }
 
 /** Explicit replay contract for trusted extension callers. */
@@ -328,8 +330,15 @@ export interface ExtensionMCPContext {
 export interface MCPRequestOptions {
 	/** Abort signal (e.g. Escape-to-interrupt) */
 	signal?: AbortSignal;
+	/**
+	 * Adds `_meta.progressToken` to the request and receives only this request's
+	 * `notifications/progress` while pending. Progress never extends its deadline.
+	 */
+	onProgress?: (progress: MCPProgress) => void;
 	/** False forbids refreshing credentials to resend this request after an authentication failure. */
 	allowAuthRetry?: boolean;
+	/** Host-only lifecycle fence; never serialized into protocol parameters. */
+	mcpOwnerCurrent?: () => boolean;
 }
 
 /** Transport interface - abstracts stdio/http */
@@ -537,6 +546,7 @@ export interface MCPGetPromptResult {
 
 /** MCP server notification method names */
 export const MCPNotificationMethods = {
+	PROGRESS: "notifications/progress",
 	TOOLS_LIST_CHANGED: "notifications/tools/list_changed",
 	RESOURCES_LIST_CHANGED: "notifications/resources/list_changed",
 	RESOURCES_UPDATED: "notifications/resources/updated",

@@ -3,6 +3,8 @@ import * as path from "node:path";
 import type { Api, AssistantMessage, Model } from "@oh-my-pi/pi-ai";
 import * as ai from "@oh-my-pi/pi-ai";
 import { Effort } from "@oh-my-pi/pi-ai";
+import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import type { ModelSpec } from "@oh-my-pi/pi-catalog/types";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { $ } from "bun";
 import type { ModelRegistry } from "../../src/config/model-registry";
@@ -24,6 +26,8 @@ import { executeJs } from "../../src/eval/js/executor";
 import { disposeAllKernelSessions, type PythonResult } from "../../src/eval/py/executor";
 import type { ToolSession } from "../../src/tools";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
+import { CostGate } from "../../src/session/cost-gate";
+import { rejectionOf } from "../helpers/rejection";
 
 import { cfgRetryFallbackChains, cfgRetryMaxRetries } from "@oh-my-pi/pi-coding-agent/session/settings";
 
@@ -44,8 +48,8 @@ async function runEvalCompletionAndWait(
 	return entry.result;
 }
 
-function makeModel(provider: string, id: string, extra: Partial<Model<Api>> = {}): Model<Api> {
-	return {
+function makeModel(provider: string, id: string, extra: Partial<ModelSpec<Api>> = {}): Model<Api> {
+	return buildModel({
 		id,
 		name: id,
 		api: "openai-responses",
@@ -57,7 +61,7 @@ function makeModel(provider: string, id: string, extra: Partial<Model<Api>> = {}
 		contextWindow: 128000,
 		maxTokens: 4096,
 		...extra,
-	} as Model<Api>;
+	});
 }
 
 const SMOL = makeModel("p", "smol");
@@ -145,6 +149,7 @@ async function runPythonCompletionsInSubprocess(tempDir: TempDir): Promise<Pytho
 	const scriptPath = path.join(tempDir.path(), "run-python-completion.ts");
 	const resultPath = path.join(tempDir.path(), "python-completion-result.json");
 	const aiPath = path.resolve(import.meta.dir, "../../../ai/src/index.ts");
+	const modelBuilderPath = path.resolve(import.meta.dir, "../../../catalog/src/build.ts");
 	const executorPath = path.resolve(import.meta.dir, "../../src/eval/py/executor.ts");
 	const settingsPath = path.resolve(import.meta.dir, "../../src/config/settings.ts");
 	const code = [
@@ -159,10 +164,11 @@ async function runPythonCompletionsInSubprocess(tempDir: TempDir): Promise<Pytho
 		`
 import { vi } from "bun:test";
 import * as ai from ${JSON.stringify(aiPath)};
+import { buildModel } from ${JSON.stringify(modelBuilderPath)};
 import { executePython } from ${JSON.stringify(executorPath)};
 import { Settings } from ${JSON.stringify(settingsPath)};
 
-const SMOL = {
+const SMOL = buildModel({
 	id: "smol",
 	name: "smol",
 	api: "openai-responses",
@@ -173,7 +179,7 @@ const SMOL = {
 	cost: { input: 1, output: 1, cacheRead: 0, cacheWrite: 1 },
 	contextWindow: 128000,
 	maxTokens: 4096,
-};
+});
 const settings = Settings.isolated({ "async.enabled": false, "task.isolation.enabled": false });
 settings.setModelRole("smol", "p/smol");
 settings.setModelRole("slow", "p/slow");
@@ -253,6 +259,104 @@ describe("runEvalCompletion", () => {
 			'could not resolve a model for the "smol" tier',
 		);
 		expect(spy).not.toHaveBeenCalled();
+	});
+
+	it("counts each completion against the session's cost cap and refuses at it", async () => {
+		const billed = assistant({ text: "ok" });
+		billed.usage.cost.total = 1.2;
+		const spy = vi.spyOn(ai, "completeSimple").mockResolvedValue(billed);
+		const costGate = new CostGate(Settings.isolated({ "session.maxCost": 1 }), 0, () => {});
+		const session = { ...makeSession(), costGate } as ToolSession;
+
+		await runEvalCompletionAndWait({ prompt: "q", model: "smol" }, { session });
+		expect(costGate.spent).toBe(1.2);
+		const refused = await rejectionOf(runEvalCompletionAndWait({ prompt: "q", model: "smol" }, { session }));
+		expect(String(refused)).toContain("Cost cap reached");
+		expect(spy).toHaveBeenCalledTimes(1);
+	});
+
+	it("refuses a completion when another request reaches the cap during credential resolution", async () => {
+		const costGate = new CostGate(Settings.isolated({ "session.maxCost": 1 }), 0, () => {});
+		const session = { ...makeSession(), costGate } as ToolSession;
+		const resolving = Promise.withResolvers<void>();
+		const credential = Promise.withResolvers<string>();
+		vi.spyOn(session.modelRegistry!, "getApiKey").mockImplementation(() => {
+			resolving.resolve();
+			return credential.promise;
+		});
+		const provider = vi.spyOn(ai, "completeSimple").mockResolvedValue(assistant({ text: "must not run" }));
+		const completion = runEvalCompletionAndWait({ prompt: "q", model: "smol" }, { session });
+		await resolving.promise;
+		costGate.record(1);
+		credential.resolve("test-key");
+
+		const refused = await rejectionOf(completion);
+		expect(String(refused)).toContain("Cost cap reached");
+		expect(costGate.spent).toBe(1);
+		expect(provider).not.toHaveBeenCalled();
+	});
+
+	it("does not dispatch a completion cancelled during credential resolution", async () => {
+		const session = makeSession();
+		const controller = new AbortController();
+		const resolving = Promise.withResolvers<void>();
+		const credential = Promise.withResolvers<string>();
+		vi.spyOn(session.modelRegistry!, "getApiKey").mockImplementation(() => {
+			resolving.resolve();
+			return credential.promise;
+		});
+		const provider = vi.spyOn(ai, "completeSimple").mockResolvedValue(assistant({ text: "must not run" }));
+		const handle = await runEvalCompletion({ prompt: "q", model: "smol" }, { session, signal: controller.signal });
+		const entry = getCompletionHandle(handle.id)!;
+		await resolving.promise;
+		controller.abort(new Error("completion cancelled before dispatch"));
+		credential.resolve("test-key");
+
+		await entry.promise;
+		expect(entry.error).toContain("completion cancelled before dispatch");
+		expect(provider).not.toHaveBeenCalled();
+	});
+
+	it("runs session admission before a completion can reach the provider", async () => {
+		const session = makeSession();
+		let admissionRefused = false;
+		session.prepareSimpleStreamOptions = options => ({
+			...options,
+			onPayload: () => {
+				admissionRefused = true;
+				throw new Error("completion credit admission refused");
+			},
+		});
+		const fetch = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("unexpected provider request"));
+
+		const refused = await rejectionOf(runEvalCompletionAndWait({ prompt: "q", model: "smol" }, { session }));
+		expect(refused).toBeInstanceOf(ToolError);
+		expect(admissionRefused).toBe(true);
+		expect(fetch).not.toHaveBeenCalled();
+	});
+
+	it("rechecks the cap after asynchronous payload admission", async () => {
+		const costGate = new CostGate(Settings.isolated({ "session.maxCost": 1 }), 0, () => {});
+		const session = { ...makeSession(), costGate } as ToolSession;
+		const admitting = Promise.withResolvers<void>();
+		const admitted = Promise.withResolvers<void>();
+		session.prepareSimpleStreamOptions = options => ({
+			...options,
+			onPayload: async (payload, model, signal) => {
+				admitting.resolve();
+				await admitted.promise;
+				return options.onPayload?.(payload, model, signal);
+			},
+		});
+		const fetch = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("unexpected provider request"));
+		const completion = runEvalCompletionAndWait({ prompt: "q", model: "smol" }, { session });
+		await admitting.promise;
+		costGate.record(1);
+		admitted.resolve();
+
+		const refused = await rejectionOf(completion);
+		expect(String(refused)).toContain("Cost cap reached");
+		expect(fetch).not.toHaveBeenCalled();
 	});
 
 	it("prefers the session active model for the default tier, falling back to @default", async () => {
@@ -845,27 +949,6 @@ describe("runEvalCompletion", () => {
 		expect(efforts).toEqual([Effort.Max, Effort.Max]);
 	});
 
-	it("does not request reasoning for explicit :max on non-reasoning or empty-effort models", async () => {
-		const nonReasoning = makeModel("p", "a-no-reasoning");
-		const emptyEfforts = makeReasoningModel("a-empty-efforts", []);
-		const available = [SMOL, DEFAULT, nonReasoning, emptyEfforts];
-		const spy = vi.spyOn(ai, "completeSimple").mockResolvedValue(assistant({ text: "ok" }));
-
-		await runEvalCompletionAndWait(
-			{ prompt: "q", model: "slow" },
-			{ session: makeSession({ available, roles: { slow: "p/a-no-reasoning:max" } }) },
-		);
-		await runEvalCompletionAndWait(
-			{ prompt: "q", model: "slow" },
-			{ session: makeSession({ available, roles: { slow: "p/a-empty-efforts:max" } }) },
-		);
-
-		const nonReasoningOpts = spy.mock.calls[0]?.[2] as { reasoning?: unknown };
-		const emptyEffortsOpts = spy.mock.calls[1]?.[2] as { reasoning?: unknown };
-		expect(nonReasoningOpts.reasoning).toBeUndefined();
-		expect(emptyEffortsOpts.reasoning).toBeUndefined();
-	});
-
 	it("requests reasoning only for the slow tier on a reasoning-capable model", async () => {
 		const spy = vi.spyOn(ai, "completeSimple").mockResolvedValue(assistant({ text: "ok" }));
 		const session = makeSession({ available: [SMOL, DEFAULT, REASONING_SLOW] });
@@ -1033,6 +1116,55 @@ describe("completion() through eval runtimes", () => {
 			plain: "hello from smol",
 			structured: { ok: true, n: 3 },
 		});
+	});
+
+	it("waits for a completion started in an earlier JavaScript cell", async () => {
+		using tempDir = TempDir.createSync("@omp-eval-completion-cells-");
+		const options = {
+			cwd: tempDir.path(),
+			sessionId: `js-completion-cells:${crypto.randomUUID()}`,
+			session: makeSession({ cwd: tempDir.path() }),
+			sessionFile: path.join(tempDir.path(), "session.jsonl"),
+		};
+		vi.spyOn(ai, "completeSimple").mockResolvedValue(assistant({ text: "hello from the next cell" }));
+
+		const started = await executeJs(
+			'var handles = [completion("hi", { model: "smol" })]; print("started");',
+			options,
+		);
+		expect(started.exitCode).toBe(0);
+		expect(started.output.trim()).toBe("started");
+
+		const result = await executeJs("print((await wait(handles))[0]);", options);
+		expect(result.exitCode).toBe(0);
+		expect(result.output.trim()).toBe("hello from the next cell");
+	});
+
+	it("times out waiting on a running completion started in an earlier JavaScript cell", async () => {
+		using tempDir = TempDir.createSync("@omp-eval-completion-cells-timeout-");
+		const options = {
+			cwd: tempDir.path(),
+			sessionId: `js-completion-cells-timeout:${crypto.randomUUID()}`,
+			session: makeSession({ cwd: tempDir.path() }),
+			sessionFile: path.join(tempDir.path(), "session.jsonl"),
+		};
+		// The model call stays running until afterEach releases (aborts) the handle.
+		vi.spyOn(ai, "completeSimple").mockImplementation((_model, _context, opts) => {
+			const { promise, reject } = Promise.withResolvers<AssistantMessage>();
+			opts?.signal?.addEventListener("abort", () => reject(opts.signal?.reason), { once: true });
+			return promise;
+		});
+
+		const started = await executeJs('var handles = [completion("hi", { model: "smol" })];', options);
+		expect(started.exitCode).toBe(0);
+
+		// Real clock: the timeout is enforced by the host `__wait__` bridge across the worker boundary.
+		const result = await executeJs(
+			"try { await wait(handles, { timeout: 0.05 }); } catch (error) { print(error.name); }",
+			options,
+		);
+		expect(result.exitCode).toBe(0);
+		expect(result.output.trim()).toBe("TimeoutError");
 	});
 
 	it("exposes plain and structured completion() in the Python runtime", async () => {

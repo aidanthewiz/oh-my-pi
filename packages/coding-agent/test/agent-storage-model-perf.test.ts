@@ -165,7 +165,7 @@ describe("AgentStorage model perf aggregates", () => {
 			expect(perf.get("openai-codex/gpt-6-astra")?.samples).toBe(1);
 			expect(perf.get("openai-codex/gpt-6-astra@ultrafast")?.samples).toBe(1);
 		} finally {
-			auth.close();
+			await auth.close();
 		}
 	});
 

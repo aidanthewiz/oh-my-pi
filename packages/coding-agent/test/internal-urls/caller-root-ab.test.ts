@@ -26,6 +26,10 @@ import { InternalUrlFilesystem } from "@oh-my-pi/pi-coding-agent/internal-urls/u
 import { AgentRegistry, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { ensurePersistedRoster } from "@oh-my-pi/pi-coding-agent/registry/persisted-agents";
 import { CURRENT_SESSION_VERSION } from "@oh-my-pi/pi-coding-agent/session/session-entries";
+import {
+	artifactFileGeneration,
+	serializeStructuredArtifactSidecar,
+} from "@oh-my-pi/pi-coding-agent/session/artifacts";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { GrepTool } from "@oh-my-pi/pi-coding-agent/tools/grep";
 import { ShellFsOp } from "@oh-my-pi/pi-natives";
@@ -265,11 +269,19 @@ describe("internal URL tools resolve against the caller root (A/B same ids)", ()
 		// caller must never answer with B's sidecar.
 		await fsp.writeFile(path.join(dir, "a", "main", "Worker.md"), JSON.stringify({ count: 1 }));
 		await fsp.writeFile(path.join(dir, "b", "main", "Worker.md"), JSON.stringify({ count: 2 }));
-		await fsp.writeFile(path.join(dir, "b", "main", "Worker.json"), JSON.stringify({ count: 2 }));
+		const primaryB = path.join(dir, "b", "main", "Worker.md");
+		const generationB = artifactFileGeneration(await fsp.stat(primaryB, { bigint: true }));
+		await fsp.writeFile(
+			path.join(dir, "b", "main", "Worker.json"),
+			serializeStructuredArtifactSidecar(JSON.stringify({ count: 20 }), generationB),
+		);
 
 		const router = InternalUrlRouter.instance();
 		const resource = await router.resolve("agent://Worker/count", { sessionFile: rootA });
 		expect(JSON.parse(resource.content)).toBe(1);
 		expect(resource.sourcePath?.endsWith(path.join("a", "main", "Worker.md"))).toBe(true);
+		const ownB = await router.resolve("agent://Worker/count", { sessionFile: rootB });
+		expect(JSON.parse(ownB.content)).toBe(20);
+		expect(ownB.sourcePath).toBe(path.join(dir, "b", "main", "Worker.json"));
 	});
 });

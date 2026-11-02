@@ -37,9 +37,9 @@ describe("issue #6162 fresh launch default role from models.yml discovery provid
 		fs.mkdirSync(tempDir, { recursive: true });
 	});
 
-	afterEach(() => {
+	afterEach(async () => {
 		for (const authStorage of authStoragesToClose) {
-			authStorage.close();
+			await authStorage.close();
 		}
 		authStoragesToClose.length = 0;
 		if (tempDir && fs.existsSync(tempDir)) {

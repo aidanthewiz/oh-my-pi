@@ -80,7 +80,7 @@ describe("workspace directories in the system prompt", () => {
 				await session.dispose();
 			}
 		} finally {
-			auth.close();
+			await auth.close();
 			dir.removeSync();
 		}
 	});
@@ -143,7 +143,7 @@ describe("workspace directories in the system prompt", () => {
 				await session.dispose();
 			}
 		} finally {
-			auth.close();
+			await auth.close();
 			dir.removeSync();
 		}
 	});

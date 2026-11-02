@@ -54,7 +54,7 @@ describe("subagent session MCP tools follow the shared manager", () => {
 	afterEach(async () => {
 		for (const session of sessions.splice(0)) await session.dispose().catch(() => {});
 		await manager.disconnectAll();
-		authStorage.close();
+		await authStorage.close();
 		removeSyncWithRetries(dir);
 	});
 

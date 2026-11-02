@@ -3,7 +3,6 @@ import { streamAnthropic } from "@oh-my-pi/pi-ai/providers/anthropic";
 import { AnthropicApiRequest, AnthropicMessages } from "@oh-my-pi/pi-ai/providers/anthropic-client";
 import type { AssistantMessage, Context, Message, Model, ProviderSessionState } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
-import { logger } from "@oh-my-pi/pi-utils";
 
 const model: Model<"anthropic-messages"> = buildModel({
 	id: "claude-fable-5-1",
@@ -119,7 +118,6 @@ describe("anthropic drop_block replay after reported thinking drops", () => {
 				payloads.push(structuredClone(params));
 				return droppedResponse(reportedAt, transformations);
 			});
-			const warn = vi.spyOn(logger, "warn");
 
 			const run = async (input = context) => {
 				const stream = streamAnthropic(model, input, { apiKey: "sk-ant-test", providerSessionState });
@@ -132,14 +130,11 @@ describe("anthropic drop_block replay after reported thinking drops", () => {
 			const first = await run();
 			expect(first.stopReason).toBe("stop");
 			expect(first.inputTransformations).toEqual(droppedTransformations);
-			expect(warn).toHaveBeenCalledTimes(2);
 
 			const second = await run();
 			expect(second.stopReason).toBe("stop");
 			expect(payloads).toHaveLength(2);
 			expect(second.inputTransformations).toEqual(droppedTransformations);
-			// The API reports the same drops on every replay; they were already warned about.
-			expect(warn).toHaveBeenCalledTimes(2);
 
 			const [firstPayload, secondPayload] = payloads;
 			if (!firstPayload || !secondPayload) throw new Error("expected two captured requests");
@@ -162,7 +157,11 @@ describe("anthropic drop_block replay after reported thinking drops", () => {
 				path: item.path.replace("messages.1.", "messages.3."),
 			}));
 			expect((await run(shifted)).stopReason).toBe("stop");
-			expect(warn).toHaveBeenCalledTimes(2);
+			const shiftedPayload = payloads.at(-1);
+			if (!shiftedPayload) throw new Error("expected shifted request");
+			expect(shiftedPayload.messages.filter(message => message.role === "assistant").at(-1)?.content).toEqual(
+				firstPayload.messages.find(message => message.role === "assistant")?.content,
+			);
 
 			transformations = droppedTransformations;
 			const fresh: Context = {
@@ -180,17 +179,16 @@ describe("anthropic drop_block replay after reported thinking drops", () => {
 				),
 			};
 			expect((await run(fresh)).stopReason).toBe("stop");
-			expect(warn).toHaveBeenCalledTimes(4);
+			const freshPayload = payloads.at(-1);
+			if (!freshPayload) throw new Error("expected fresh request");
+			const freshReasoning = replayedReasoning(freshPayload);
+			expect(freshReasoning.join("")).toContain("sig_new");
+			expect(freshReasoning.join("")).toContain("redacted_new");
+			expect(freshReasoning).not.toEqual(replayedReasoning(firstPayload));
 
 			for (const state of providerSessionState.values()) state.close();
 			expect((await run()).stopReason).toBe("stop");
-			expect(warn).toHaveBeenCalledTimes(6);
 
-			for (const state of providerSessionState.values()) {
-				Reflect.deleteProperty(state, "reportedPrefixDroppedThinking");
-			}
-			expect((await run()).stopReason).toBe("stop");
-			expect(warn).toHaveBeenCalledTimes(8);
 			const hydratedPayload = payloads.at(-1);
 			if (!hydratedPayload) throw new Error("expected hydrated request");
 			expect(replayedReasoning(hydratedPayload)).toEqual(replayedReasoning(firstPayload));

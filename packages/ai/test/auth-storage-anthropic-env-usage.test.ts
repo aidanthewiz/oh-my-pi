@@ -28,7 +28,7 @@ async function probeEnvUsage(apiKey: string) {
 		try {
 			result.reports = await storage.usage.reports();
 		} finally {
-			storage.close();
+			await storage.close();
 		}
 	});
 	return result;

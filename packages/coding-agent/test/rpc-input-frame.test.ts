@@ -808,7 +808,7 @@ describe("RpcInputDispatcher", () => {
 			normalizeSpy.mockRestore();
 		} finally {
 			await session.dispose();
-			authStorage.close();
+			await authStorage.close();
 		}
 	});
 	test("an image prompt uses its selected model when a later RPC model switch arrives during preparation", async () => {
@@ -910,7 +910,7 @@ describe("RpcInputDispatcher", () => {
 			await trackedPromptTask;
 			normalizeSpy.mockRestore();
 			await session.dispose();
-			authStorage.close();
+			await authStorage.close();
 		}
 	});
 	test("abort still overtakes a model change waiting on an earlier prompt", async () => {

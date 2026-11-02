@@ -23,6 +23,8 @@ impl builtins::Command for BgCommand {
 			for job_spec in &self.job_specs {
 				if let Some(job) = context.shell.jobs_mut().resolve_job_spec(job_spec) {
 					job.move_to_background()?;
+					let pid = job.last_pid();
+					context.shell.set_last_background_pid(pid);
 				} else {
 					writeln!(context.stderr(), "{}: {}: no such job", context.command_name, job_spec)?;
 					exit_code = ExecutionResult::general_error();
@@ -31,6 +33,8 @@ impl builtins::Command for BgCommand {
 		} else {
 			if let Some(job) = context.shell.jobs_mut().current_job_mut() {
 				job.move_to_background()?;
+				let pid = job.last_pid();
+				context.shell.set_last_background_pid(pid);
 			} else {
 				writeln!(context.stderr(), "{}: no current job", context.command_name)?;
 				exit_code = ExecutionResult::general_error();

@@ -77,7 +77,7 @@ describe("InteractiveMode fork placement bridge", () => {
 	afterEach(async () => {
 		mode?.stop();
 		await session?.dispose();
-		authStorage?.close();
+		await authStorage?.close();
 		setAgentDir(originalAgentDir);
 		tempDir?.removeSync();
 		vi.restoreAllMocks();

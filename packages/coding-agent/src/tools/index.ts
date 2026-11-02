@@ -6,7 +6,16 @@ import type {
 	ThinkingLevel,
 } from "@oh-my-pi/pi-agent-core";
 import type { EditStore } from "@oh-my-pi/pi-natives";
-import type { FetchImpl, ImageContent, Model, ServiceTierByFamily, ToolChoice } from "@oh-my-pi/pi-ai";
+import type {
+	Api,
+	FetchImpl,
+	ImageContent,
+	Model,
+	ServiceTierByFamily,
+	SimpleStreamOptions,
+	TextContent,
+	ToolChoice,
+} from "@oh-my-pi/pi-ai";
 import { logger } from "@oh-my-pi/pi-utils";
 import type { AsyncJobManager } from "../async/job-manager";
 import type { Rule } from "../capability/rule";
@@ -22,7 +31,7 @@ import type {
 	BeforeSubagentSpawnEventResult,
 	PreparedExtension,
 } from "../extensibility/extensions/types";
-import type { Skill } from "../extensibility/skills";
+import type { Skill, SkillRediscoveryHost } from "../extensibility/skills";
 import type { GoalModeState, GoalRuntime } from "../goals";
 import { GoalTool } from "../goals/tools/goal-tool";
 import type { HindsightSessionState } from "../hindsight/state";
@@ -37,6 +46,7 @@ import type { AgentLifecycleManager } from "../registry/agent-lifecycle";
 import type { AgentRegistry } from "../registry/agent-registry";
 import type { ArtifactManager } from "../session/artifacts";
 import type { ClientBridge } from "../session/client-bridge";
+import type { CostGate } from "../session/cost-gate";
 import type { CustomMessage } from "../session/messages";
 import type { UsageStatistics } from "../session/session-entries";
 import type { SessionManager } from "../session/session-manager";
@@ -206,6 +216,8 @@ export interface DeferredDiagnosticsEntry {
 	summary: string;
 	/** Formatted, ready-to-display diagnostic lines. */
 	messages: string[];
+	/** Servers whose current diagnostic coverage remains unverified. */
+	unreported?: string[];
 	/** True when any message is error severity. */
 	errored: boolean;
 	/**
@@ -220,16 +232,36 @@ export interface DeferredDiagnosticsEntry {
 export interface ToolSession {
 	/** Current working directory */
 	cwd: string;
+	/** Cost gate of the session tree, forwarded to subagents. */
+	costGate?: CostGate;
 	/** Additional workspace directories beyond cwd (multi-root), forwarded to subagents. */
 	additionalDirectories?: string[];
 	/** Whether UI is available */
 	hasUI: boolean;
 	/** Whether `ask` can reach a human. Defaults to `hasUI`. */
 	canPromptUser?: boolean;
+	/** Keep `ask` in a headless fork's roster; execution still requires UI. */
+	advertiseHeadlessAsk?: boolean;
 	/** The user approves `cfg://` writes for this session (top-level TUI session only). */
 	settingsApproval?: boolean;
+	/**
+	 * Replies render in omp's own transcript (the top-level interactive session, terminal or Tern);
+	 * false for print, RPC, ACP, and subagent sessions. See `CreateAgentSessionOptions.tuiTranscript`.
+	 */
+	tuiTranscript?: boolean;
 	/** Whether this session has begun disposal. */
 	isDisposed?: () => boolean;
+	/** Capture the root/session/account/policy authority for one asynchronous launch. */
+	captureOwnerCurrent?: (options?: { allowParked?: boolean }) => () => boolean;
+	/** Bind only this request's first selected provider account to its captured authority. */
+	captureRequestOwner?: (model: Model<Api>) => {
+		isCurrent(): boolean;
+		bindCredential(credentialId: number | undefined): boolean;
+	};
+	/** Capture retained root/reference/journal/account lifetime for warm revival. */
+	captureOwnerLifetimeCurrent?: () => () => boolean;
+	/** Capture the originating root authority for one background widget source. */
+	captureWidgetOwnerCurrent?: () => () => boolean;
 	/**
 	 * Suppress the spawn specialization/coordination advisory appended to `task`
 	 * results. Set by internal/programmatic callers (e.g. the commit agent's
@@ -241,12 +273,16 @@ export interface ToolSession {
 	fetch?: FetchImpl;
 	/** Provider credential resolver forwarded unchanged to restricted child sessions. */
 	getApiKey?: AgentOptions["getApiKey"];
+	/** Prepare side requests through the owning session's actual-provider admission boundary. */
+	prepareSimpleStreamOptions?: (options: SimpleStreamOptions, provider?: string) => SimpleStreamOptions;
 	/** Current session whose stored credential affinities should seed a child session. */
 	getCredentialSourceSessionId?: () => string | undefined;
 	/** Skip subprocess-kernel availability checks and warmup */
 	skipPythonPreflight?: boolean;
 	/** Pre-loaded context files (AGENTS.md, etc) */
 	contextFiles?: ContextFileEntry[];
+	/** No context files beyond `contextFiles`, not even for additional workspace roots (forwarded to subagents) */
+	noContextFiles?: boolean;
 	/** Pre-loaded workspace tree (forwarded to subagents to skip re-scanning) */
 	workspaceTree?: WorkspaceTree;
 	/** Pre-loaded skills */
@@ -260,6 +296,8 @@ export interface ToolSession {
 	skillHintVisible?: boolean;
 	/** Rediscover live session skills after a tool mutates their backing files. */
 	refreshSkills?: () => Promise<void>;
+	/** The session as the holder `skill://` rediscovers through when a skill's files are gone. */
+	skillRediscoveryHost?: () => SkillRediscoveryHost;
 	/** Pre-loaded prompt templates */
 	promptTemplates?: PromptTemplate[];
 	/** Pre-loaded rules (forwarded to subagents to skip re-discovery). */
@@ -332,6 +370,8 @@ export interface ToolSession {
 	 * required yield tool). Suppresses automatic tool-set expansion.
 	 */
 	restrictToolNames?: boolean;
+	/** Seance forks: the consulted session's artifacts dir, read in place by history://, artifact://, agent://. */
+	readonly seanceSourceArtifactsDir?: string;
 	/** Task recursion depth (0 = top-level, 1 = first child, etc.) */
 	taskDepth?: number;
 	/** Get this agent's eval executor session ID; keys its retained JS/Python/Ruby/Julia state. */
@@ -343,7 +383,7 @@ export interface ToolSession {
 	 * cost ledger (`appendModelUsage`) without changing advisor-local IDs.
 	 */
 	sessionManager?: Pick<SessionManager, "appendCustomEntry" | "ensureOnDisk" | "flush" | "getBranch" | "getEntries"> &
-		Partial<Pick<SessionManager, "getSessionId" | "getLeafId" | "appendModelUsage">>;
+		Partial<Pick<SessionManager, "getSessionId" | "getLeafId" | "appendModelUsage" | "getResidentArtifactContent">>;
 	/** Get eval kernel owner ID for session-scoped retained-kernel cleanup. */
 	getEvalKernelOwnerId?: () => string | null;
 	/** Current enabled eval prelude definitions. */
@@ -366,7 +406,7 @@ export interface ToolSession {
 	getMnemopiSessionState?: () => MnemopiSessionState | undefined;
 	/** Agent identity used for IRC routing. Returns the registry id (e.g. "Main", "AuthLoader"). */
 	getAgentId?: () => string | null;
-	/** Parent cache identity for sibling sharing, only when the parent model opts in. */
+	/** Parent cache identity for sibling sharing; the child stores it independently of its initial model, and each request consumes it only when its own model opts in. */
 	getPromptCacheKey?: () => string | undefined;
 	/** Look up a registered tool by name (used by the eval js backend's tool bridge). */
 	getToolByName?: (name: string) => AgentTool | undefined;
@@ -378,6 +418,8 @@ export interface ToolSession {
 	getEvalBridgeToolNames?: () => readonly string[];
 	/** Return whether a built-in tool is active in this turn's tool set. */
 	isToolActive?: (name: string) => boolean;
+	/** Candidate activity for prompt metadata; never authorizes tool execution. */
+	isToolActiveForPrompt?: (name: string) => boolean;
 	/** Update the active built-in tool predicate when a session changes tools mid-run. */
 	setActiveToolNames?: (names: Iterable<string>) => void;
 	/** Canonical map containing every registered tool exactly once. */
@@ -426,6 +468,12 @@ export interface ToolSession {
 	getActiveModelString?: () => string | undefined;
 	/** Get the current session model object (provider/api capabilities), regardless of how it was chosen. */
 	getActiveModel?: () => Model | undefined;
+	/** Owned auxiliary image requests; includes admission, usage persistence and lifecycle draining. */
+	describeAttachedImages?: (
+		images: ImageContent[],
+		signal?: AbortSignal,
+		isCurrent?: () => boolean,
+	) => Promise<TextContent[]>;
 	/** Get the effective live thinking level, including disabled reasoning. */
 	getActiveThinkingLevel?: () => ThinkingLevel | undefined;
 	/** Get the session's live per-family service tiers (undefined = none). Source of truth for subagent `tier.subagent: inherit`. */
@@ -489,6 +537,8 @@ export interface ToolSession {
 	getLastAssistantText?: () => string | undefined;
 	/** Resolve a terminal yield's current or immediately preceding report, bound to its call ID. */
 	getYieldReportText?: (toolCallId: string) => string | undefined;
+	/** The `i` intent the model wrote on a tool call of the current turn, by call ID. */
+	getToolCallIntent?: (toolCallId: string) => string | undefined;
 	/** Replace the active workpool item contract and refresh its provider-facing prompt. */
 	setWorkPoolYieldItems?: (items: readonly WorkPoolYieldItem[]) => Promise<void>;
 	/** The tool-choice queue used to force forthcoming tool invocations and carry invocation handlers. */
@@ -860,6 +910,7 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 		session.setActiveToolNames(activeToolNames);
 	} else {
 		session.isToolActive = name => activeToolNames.has(name);
+		session.isToolActiveForPrompt = name => activeToolNames.has(name);
 	}
 
 	const baseResults = await Promise.all(
@@ -946,9 +997,9 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 		}
 	}
 	if (xdevEnabled) {
-		const finalActiveNames = new Set(tools.map(tool => tool.name));
-		if (session.setActiveToolNames) session.setActiveToolNames(finalActiveNames);
-		else session.isToolActive = name => finalActiveNames.has(name);
+		activeToolNames.clear();
+		for (const tool of tools) activeToolNames.add(tool.name);
+		if (session.setActiveToolNames) session.setActiveToolNames(activeToolNames);
 	}
 
 	return tools;

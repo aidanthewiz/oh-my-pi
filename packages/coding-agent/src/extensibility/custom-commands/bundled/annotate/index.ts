@@ -7,12 +7,14 @@ import type { AutocompleteItem } from "@oh-my-pi/pi-tui";
 import { CombinedAutocompleteProvider } from "@oh-my-pi/pi-tui/autocomplete";
 import type { CodeReviewOverlayResult, TextReviewSource } from "@oh-my-pi/pi-tui/overlays/annotation-types";
 import {
+	captureReviewGlabContext,
 	extractReviewPrRefFromArgs,
 	liveCommandCwd,
 	resolvePrReviewTarget,
 	ReviewCommand,
 	selectReviewChoice,
 	type ReviewPrRef,
+	type ReviewGlabContext,
 } from "../review";
 import { buildCodeReviewFeedback } from "../review/prompt";
 import {
@@ -23,8 +25,14 @@ import {
 	type ReviewTargetUI,
 } from "../review/target";
 import { acquireFileTextReviewSource, createPromptTextReviewSource } from "./direct-source";
+import { type AnnotationDraft, loadAnnotationDrafts } from "./draft-store";
 import { showCodeReviewOverlay, showTextReviewOverlay } from "./fullscreen";
-import { selectAnnotationSourceKind, selectSessionTextReviewSource, type AnnotationSourceKind } from "./text-source";
+import {
+	latestAssistantTextReviewSource,
+	selectAnnotationSourceKind,
+	selectSessionTextReviewSource,
+	type AnnotationSourceKind,
+} from "./text-source";
 import {
 	buildTextReviewPrompt,
 	normalizeTextReviewContextSummary,
@@ -33,6 +41,7 @@ import {
 import { generateTextReviewContextSummary } from "./text-summary";
 
 interface CodeReviewDependencies {
+	glabContext?: ReviewGlabContext;
 	resolveLocalReviewTarget(
 		kind: LocalReviewKind,
 		cwd: string,
@@ -42,10 +51,13 @@ interface CodeReviewDependencies {
 		cwd: string,
 		ctx: CustomCommandContext,
 		ref: ReviewPrRef,
+		glabContext?: ReviewGlabContext,
 	): Promise<ResolvedReviewTarget | undefined>;
 	showCodeReviewOverlay(
 		ctx: CustomCommandContext,
 		target: ResolvedReviewTarget,
+		focus?: string,
+		resumed?: AnnotationDraft,
 	): Promise<CodeReviewOverlayResult | undefined>;
 }
 
@@ -102,7 +114,7 @@ const ANNOTATE_MODE_COMPLETIONS: readonly AutocompleteItem[] = [
 	{
 		value: "code-review ",
 		label: "code-review",
-		description: "Annotate local changes or a GitHub pull request",
+		description: "Annotate local changes, a GitHub pull request, or a GitLab merge request",
 	},
 ];
 
@@ -182,13 +194,14 @@ async function finishCodeReview(
 	target: ResolvedReviewTarget,
 	focus: string | undefined,
 	showOverlay: CodeReviewDependencies["showCodeReviewOverlay"],
+	resumed?: AnnotationDraft,
 ): Promise<string | undefined> {
 	const issue = getReviewTargetIssue(target);
 	if (issue) {
 		ctx.ui.notify(issue, "warning");
 		return undefined;
 	}
-	const result = await showOverlay(ctx, target);
+	const result = await showOverlay(ctx, target, focus, resumed);
 	if (!result) return undefined;
 	const review = result.action === "review";
 	const feedback = buildCodeReviewFeedback(target, result.annotations, review, focus);
@@ -205,17 +218,20 @@ export async function runCodeReviewCommand(
 	dependencies: Partial<CodeReviewDependencies> = {},
 ): Promise<string | undefined> {
 	if (!ctx.hasUI) {
-		return new ReviewCommand(api).execute(splitReviewArgs(args), ctx);
+		return new ReviewCommand(api, dependencies.glabContext).execute(splitReviewArgs(args), ctx);
 	}
 	const resolved = { ...defaultCodeReviewDependencies, ...dependencies };
-	const cwd = liveCommandCwd(api, ctx);
+	const glabContext = dependencies.glabContext ?? captureReviewGlabContext(liveCommandCwd(api, ctx));
+	const cwd = glabContext.cwd;
 	const parsed = extractReviewPrRefFromArgs(splitReviewArgs(args));
 	const focus = parsed.extraInstructions || undefined;
-	const choice = parsed.prRef ? { kind: "pr" as const, ref: parsed.prRef } : await selectReviewChoice(ctx, cwd);
+	const choice = parsed.prRef
+		? { kind: "pr" as const, ref: parsed.prRef }
+		: await selectReviewChoice(ctx, cwd, { includeCustom: false, glabContext });
 	if (!choice) return undefined;
 	const target =
 		choice.kind === "pr"
-			? await resolved.resolvePrReviewTarget(cwd, ctx, choice.ref)
+			? await resolved.resolvePrReviewTarget(cwd, ctx, choice.ref, glabContext)
 			: await resolved.resolveLocalReviewTarget(choice.kind, cwd, ctx.ui);
 	return target ? finishCodeReview(ctx, target, focus, resolved.showCodeReviewOverlay) : undefined;
 }
@@ -227,6 +243,11 @@ export async function runAnnotateCommand(
 	ctx: CustomCommandContext,
 	dependencies: Partial<TextAnnotationDependencies & CodeReviewDependencies> = {},
 ): Promise<string | undefined> {
+	const cwd = liveCommandCwd(api, ctx);
+	dependencies = {
+		...dependencies,
+		glabContext: dependencies.glabContext ?? captureReviewGlabContext(cwd),
+	};
 	const codeReviewFocus = parseCodeReviewFocus(args);
 	if (codeReviewFocus !== undefined) {
 		return runCodeReviewCommand(api, codeReviewFocus, ctx, dependencies);
@@ -242,6 +263,7 @@ export async function runAnnotateCommand(
 	const trimmed = args.trim();
 	let kind: AnnotationSourceKind | undefined;
 	let source: TextReviewSource | undefined;
+	let resumed: AnnotationDraft | undefined;
 	if (trimmed.length === 0) {
 		kind = await textDependencies.selectAnnotationSourceKind(ctx.ui);
 	} else {
@@ -274,12 +296,50 @@ export async function runAnnotateCommand(
 				if (text !== undefined) source = textDependencies.createPromptTextReviewSource(ctx, text);
 				break;
 			}
+			case "draft": {
+				const drafts = await loadAnnotationDrafts(ctx.sessionManager);
+				if (drafts.length === 0) {
+					ctx.ui.notify("No saved annotation drafts in this session.", "info");
+					return undefined;
+				}
+				const labels = drafts.map(
+					({ source, state }, index) =>
+						`${index + 1}. ${source.kind === "diff" ? source.target.mode : source.source.label} — ${state.annotations.length} note(s)${state.editor?.text ? " + unfinished note" : ""}`,
+				);
+				resumed = drafts[labels.indexOf((await ctx.ui.select("Resume an annotation draft", labels)) ?? "")];
+				if (!resumed) return undefined;
+				if (resumed.source.kind === "diff") {
+					const { target, focus } = resumed.source;
+					const { showCodeReviewOverlay: show } = { ...defaultCodeReviewDependencies, ...dependencies };
+					return finishCodeReview(ctx, target, focus, show, resumed);
+				}
+				source = resumed.source.source;
+				break;
+			}
 		}
 	}
 	if (!source) return undefined;
-	const result = await textDependencies.showTextReviewOverlay(ctx, source);
+	const result = await textDependencies.showTextReviewOverlay(ctx, source, resumed);
 	if (!result || result.annotations.length === 0) return undefined;
 	if (result.editedText !== undefined) source = { ...source, text: result.editedText };
+	if (resumed && source.provenance?.kind === "latest-assistant") {
+		const current = latestAssistantTextReviewSource(
+			ctx.sessionManager.getBranch(),
+			ctx.sessionManager.getSessionId(),
+		);
+		if (
+			source.sessionId !== current?.sessionId ||
+			current?.provenance?.kind !== "latest-assistant" ||
+			source.provenance.entryId !== current.provenance.entryId ||
+			source.text !== current.text
+		) {
+			source = {
+				...source,
+				label: `Assistant reply (${source.provenance.entryId})`,
+				provenance: { kind: "session", entryId: source.provenance.entryId },
+			};
+		}
+	}
 	let contextSummary: string | undefined;
 	if (shouldSummarizeTextReviewSource(source)) {
 		ctx.ui.setStatus("annotate-summary", "Rephrasing annotation source with the session model…");

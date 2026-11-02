@@ -1,4 +1,4 @@
-import { afterAll, afterEach, expect, it } from "bun:test";
+import { afterAll, afterEach, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { TempDir } from "@oh-my-pi/pi-utils";
@@ -12,11 +12,16 @@ import { resetRegisteredArtifactDirsForTests } from "../../src/internal-urls/reg
 import { AgentRegistry } from "../../src/registry/agent-registry";
 import type { AgentSession } from "../../src/session/agent-session";
 import type { ToolSession } from "../../src/tools";
-import { ArtifactManager } from "../../src/session/artifacts";
+import {
+	artifactFileGeneration,
+	ArtifactManager,
+	serializeStructuredArtifactSidecar,
+} from "../../src/session/artifacts";
 
 import { ReadTool } from "../../src/tools/read";
 const tempDir = TempDir.createSync("@omp-nested-agent-repro-");
 afterEach(() => {
+	vi.restoreAllMocks();
 	AgentRegistry.resetGlobalForTests();
 	IrcBus.resetGlobalForTests();
 	resetRegisteredArtifactDirsForTests();
@@ -24,6 +29,14 @@ afterEach(() => {
 afterAll(() => {
 	tempDir.removeSync();
 });
+
+async function writeBoundSidecar(primary: string, data: unknown): Promise<void> {
+	const generation = artifactFileGeneration(await fs.stat(primary, { bigint: true }));
+	await fs.writeFile(
+		primary.slice(0, -3) + ".json",
+		serializeStructuredArtifactSidecar(JSON.stringify(data), generation),
+	);
+}
 
 it("agent:// resolves a depth-2 subagent's .md output while its session is live and artifact-manager-adopted", async () => {
 	const root = tempDir.path();
@@ -171,7 +184,7 @@ it("agent:// path extraction prefers the <id>.json sidecar over the markdown bod
 	const sharedArtifactManager = new ArtifactManager(rootArtifactsDir);
 	// Non-JSON body proves the fallback path could not have produced the answer.
 	await fs.writeFile(path.join(rootArtifactsDir, "Worker.md"), "schema_violation summary text");
-	await fs.writeFile(path.join(rootArtifactsDir, "Worker.json"), JSON.stringify({ summary: "ok", count: 7 }));
+	await writeBoundSidecar(path.join(rootArtifactsDir, "Worker.md"), { summary: "ok", count: 7 });
 
 	const fakeSession = {
 		sessionManager: { getArtifactsDir: () => sharedArtifactManager.dir },
@@ -198,7 +211,56 @@ it("agent:// path extraction prefers the <id>.json sidecar over the markdown bod
 
 	// A corrupt sidecar falls back to <id>.md instead of surfacing its own parse error.
 	await fs.writeFile(path.join(rootArtifactsDir, "Worker.json"), "{not json");
-	await expect(handler.resolve(new URL("agent://Worker/count") as never)).rejects.toThrow(/Worker is not valid JSON/);
+	await expect(handler.resolve(new URL("agent://Worker/count") as never)).rejects.toBeInstanceOf(Error);
+
+	await writeBoundSidecar(path.join(rootArtifactsDir, "Worker.md"), { count: 7 });
+	await fs.writeFile(path.join(rootArtifactsDir, "replacement.md"), "schema_violation summary text");
+	await fs.rename(path.join(rootArtifactsDir, "replacement.md"), path.join(rootArtifactsDir, "Worker.md"));
+	await expect(handler.resolve(new URL("agent://Worker/count") as never)).rejects.toBeInstanceOf(Error);
+	await fs.writeFile(path.join(rootArtifactsDir, "Worker.json"), JSON.stringify({ count: "unbound stale payload" }));
+	await expect(handler.resolve(new URL("agent://Worker/count") as never)).rejects.toBeInstanceOf(Error);
+	await writeBoundSidecar(path.join(rootArtifactsDir, "Worker.md"), { count: 9 });
+	expect(JSON.parse((await handler.resolve(new URL("agent://Worker/count") as never)).content)).toBe(9);
+});
+
+it.each(["primary", "sidecar"] as const)("agent:// rejects a racing %s file generation", async target => {
+	const rootSessionFile = path.join(tempDir.path(), `race-${target}.jsonl`);
+	const dir = rootSessionFile.slice(0, -6);
+	await fs.mkdir(dir, { recursive: true });
+	const primary = path.join(dir, "Worker.md");
+	const sidecar = path.join(dir, "Worker.json");
+	await fs.writeFile(primary, JSON.stringify({ count: 1 }));
+	await writeBoundSidecar(primary, { count: 7 });
+	const replacement = path.join(dir, "replacement");
+	await fs.writeFile(
+		replacement,
+		target === "primary"
+			? JSON.stringify({ count: 1 })
+			: serializeStructuredArtifactSidecar(
+					JSON.stringify({ count: 9 }),
+					artifactFileGeneration(await fs.stat(primary, { bigint: true })),
+				),
+	);
+	AgentRegistry.global().register({
+		id: "Main",
+		displayName: "Main",
+		kind: "main",
+		session: { sessionManager: { getArtifactsDir: () => dir } } as unknown as AgentSession,
+		sessionFile: rootSessionFile,
+	});
+	const originalOpen = fs.open;
+	let replaced = false;
+	vi.spyOn(fs, "open").mockImplementation(async (file, flags, mode) => {
+		const handle = await originalOpen(file, flags, mode);
+		if (String(file) === sidecar && !replaced) {
+			replaced = true;
+			await fs.rename(replacement, target === "primary" ? primary : sidecar);
+		}
+		return handle;
+	});
+	await expect(new AgentProtocolHandler().resolve(new URL("agent://Worker/count") as never)).rejects.toBeInstanceOf(
+		Error,
+	);
 });
 
 it("agent:// writes deliver peer messages but reject JSON paths and disabled IRC", async () => {

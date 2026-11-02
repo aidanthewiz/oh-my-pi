@@ -56,7 +56,7 @@ describe("Muse Code provider", () => {
 			expect(await storage.keys.get("muse-code", "muse-session")).toBe(encodedMuseCredential);
 			expect(await storage.keys.get("meta", "payg-session")).toBe("LLM|payg-key");
 		} finally {
-			storage.close();
+			await storage.close();
 		}
 	});
 
@@ -78,7 +78,7 @@ describe("Muse Code provider", () => {
 
 			expect(await storage.keys.get("muse-code", "stale-expiry-session")).toBe(encodedMuseCredential);
 		} finally {
-			storage.close();
+			await storage.close();
 		}
 	});
 

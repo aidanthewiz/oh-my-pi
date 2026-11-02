@@ -11,6 +11,7 @@ import { generateCodexAttestation } from "./attestation";
 import {
 	buildLiveSessionPayload,
 	type LiveClientMessage,
+	LIVE_MODEL,
 	type LiveServerEvent,
 	parseLiveServerEvent,
 } from "./protocol";
@@ -58,6 +59,15 @@ export interface LiveTransportOptions {
 	voice: string;
 	callbacks: LiveTransportCallbacks;
 	signal?: AbortSignal;
+	/** Rechecks the owning session, live-model policy and cost admission at each use. */
+	assertCurrent?: () => void;
+	/**
+	 * SDP offer from a caller-owned WebRTC peer (one Opus audio track plus an `oai-events`
+	 * data channel). When set, no native peer is created: the caller's peer carries the audio,
+	 * {@link CodexLiveTransport.sdpAnswer} holds the answer to apply to it, and this transport
+	 * keeps only the sideband.
+	 */
+	sdpOffer?: string;
 }
 
 /** Extracts the server-assigned `rtc_*` call ID from a signaling Location header. */
@@ -110,10 +120,11 @@ function abortReason(signal: AbortSignal | undefined): Error {
 	return new DOMException("Live connection aborted", "AbortError");
 }
 
-/** Native WebRTC transport for a Codex Frameless Bidi live session. */
+/** WebRTC transport for a Codex Frameless Bidi live session, with a native or caller-owned media peer. */
 export class CodexLiveTransport {
 	readonly #options: LiveTransportOptions;
 	#peer: LiveWebRtcPeer | undefined;
+	#sdpAnswer: string | undefined;
 	readonly #realtimeSessionId = crypto.randomUUID();
 	#sideband: Bun.WebSocket | undefined;
 	#state: Lifecycle = "idle";
@@ -123,16 +134,84 @@ export class CodexLiveTransport {
 	#muted = false;
 	#unexpectedFailureReported = false;
 	readonly #abortListener: () => void;
+	readonly #credentials: AuthStorage["credentials"];
+	readonly #sourceIdentity: string | undefined;
+	#credentialGeneration: number;
+	#acceptedAccess: OAuthAccess | undefined;
 
 	constructor(options: LiveTransportOptions) {
 		this.#options = options;
+		this.#credentials = options.authStorage.credentials;
+		this.#credentialGeneration = this.#credentials.generation;
+		this.#sourceIdentity = options.authStorage.sourceIdentity;
 		this.#abortListener = () => {
 			void this.close();
 		};
 		if (!options.signal?.aborted) options.signal?.addEventListener("abort", this.#abortListener, { once: true });
 	}
 
-	/** Establish the native peer, perform Codex signaling, and wait for the data channel. */
+	#assertOwnerCurrent(): void {
+		this.#options.signal?.throwIfAborted();
+		const auth = this.#options.authStorage;
+		if (
+			auth.isClosed ||
+			auth.credentials !== this.#credentials ||
+			auth.sourceIdentity !== this.#sourceIdentity ||
+			this.#state === "closing" ||
+			this.#state === "closed"
+		)
+			throw new Error("Live transport owner changed");
+		this.#options.assertCurrent?.();
+	}
+
+	#assertAccess(access: OAuthAccess): void {
+		const auth = this.#options.authStorage;
+		const row = this.#credentials.list(LIVE_PROVIDER).find(row => row.id === access.credentialId);
+		const account = auth.oauth.accounts(LIVE_PROVIDER, this.#options.sessionId).find(account => account.active);
+		if (
+			access.credentialId === undefined ||
+			!auth.sessions.permits(LIVE_PROVIDER, this.#options.sessionId, access.credentialId) ||
+			account?.credentialId !== access.credentialId ||
+			!row ||
+			row.credential.type !== "oauth" ||
+			row.credential.access !== access.accessToken ||
+			row.credential.accountId !== access.accountId ||
+			row.credential.orgId !== access.orgId ||
+			row.credential.projectId !== access.projectId
+		)
+			throw new Error("Live OAuth account changed");
+	}
+
+	#assertCurrent(): void {
+		this.#assertOwnerCurrent();
+		if (this.#credentials.generation !== this.#credentialGeneration)
+			throw new Error("Live credential generation changed");
+		if (this.#acceptedAccess) this.#assertAccess(this.#acceptedAccess);
+	}
+
+	#acceptAccess(access: OAuthAccess): void {
+		this.#assertOwnerCurrent();
+		this.#assertAccess(access);
+		this.#credentialGeneration = this.#credentials.generation;
+	}
+
+	#current(): boolean {
+		try {
+			this.#assertCurrent();
+			return true;
+		} catch (error) {
+			this.#reportFailure(error instanceof Error ? error.message : String(error));
+			void this.close();
+			return false;
+		}
+	}
+
+	/** SDP answer for the caller's peer once a {@link LiveTransportOptions.sdpOffer} call has been signaled. */
+	get sdpAnswer(): string | undefined {
+		return this.#sdpAnswer;
+	}
+
+	/** Establish the media peer, perform Codex signaling, and wait for the data channel or sideband. */
 	connect(): Promise<void> {
 		if (this.#state === "connected") return Promise.resolve();
 		if (this.#connectPromise) return this.#connectPromise;
@@ -149,7 +228,37 @@ export class CodexLiveTransport {
 	}
 
 	async #connect(): Promise<void> {
-		const peer = new LiveWebRtcPeer(
+		this.#assertCurrent();
+		let offer = this.#options.sdpOffer;
+		let peer: LiveWebRtcPeer | undefined;
+		if (offer === undefined) {
+			peer = this.#createPeer();
+			this.#peer = peer;
+			offer = await peer.createOffer();
+			this.#assertCurrent();
+		}
+		if (this.#state !== "connecting") throw abortReason(this.#options.signal);
+		const signaling = await this.#signal(offer);
+		this.#assertCurrent();
+		this.#acceptedAccess = signaling.access;
+		if (peer) {
+			await peer.acceptAnswer(signaling.answer);
+			this.#assertCurrent();
+			peer.setMuted(this.#muted);
+			await peer.waitForOpen();
+			this.#assertCurrent();
+		} else {
+			this.#sdpAnswer = signaling.answer;
+		}
+		if (this.#state !== "connecting") throw abortReason(this.#options.signal);
+		await this.#connectSideband(signaling.callId, signaling.access, signaling.attestation);
+		if (this.#state !== "connecting") throw abortReason(this.#options.signal);
+		this.#assertCurrent();
+		this.#state = "connected";
+	}
+
+	#createPeer(): LiveWebRtcPeer {
+		return new LiveWebRtcPeer(
 			(error, payload) => {
 				if (error) {
 					this.#reportFailure(error.message);
@@ -166,23 +275,39 @@ export class CodexLiveTransport {
 			},
 			(error, message) => this.#reportFailure(error?.message ?? message),
 		);
-		this.#peer = peer;
-		const offer = await peer.createOffer();
-		if (this.#state !== "connecting") throw abortReason(this.#options.signal);
-		const signaling = await this.#signal(offer);
-		await peer.acceptAnswer(signaling.answer);
-		peer.setMuted(this.#muted);
-		await peer.waitForOpen();
-		if (this.#state !== "connecting") throw abortReason(this.#options.signal);
-		await this.#connectSideband(signaling.callId, signaling.access, signaling.attestation);
-		if (this.#state !== "connecting") throw abortReason(this.#options.signal);
-		this.#state = "connected";
 	}
 
 	async #signal(offer: string): Promise<LiveSignalingResult> {
 		const attestation = await generateCodexAttestation();
-		return await withOAuthAccess(
-			this.#options.authStorage,
+		this.#assertCurrent();
+		const result = await withOAuthAccess(
+			{
+				oauth: {
+					access: async (...args: Parameters<AuthStorage["oauth"]["access"]>) => {
+						this.#assertCurrent();
+						const access = await this.#options.authStorage.oauth.access(args[0], args[1], {
+							...args[2],
+							baseUrl: CODEX_BASE_URL,
+							modelId: LIVE_MODEL,
+						});
+						this.#assertOwnerCurrent();
+						if (access) this.#acceptAccess(access);
+						return access;
+					},
+				},
+				limits: {
+					rotate: async (...args: Parameters<AuthStorage["limits"]["rotate"]>) => {
+						this.#assertCurrent();
+						const result = await this.#options.authStorage.limits.rotate(args[0], args[1], {
+							...args[2],
+							modelId: LIVE_MODEL,
+						});
+						this.#assertOwnerCurrent();
+						this.#credentialGeneration = this.#credentials.generation;
+						return result;
+					},
+				},
+			},
 			LIVE_PROVIDER,
 			access => this.#signalWithAccess(offer, access, attestation),
 			{
@@ -191,6 +316,8 @@ export class CodexLiveTransport {
 				missingAccessMessage: "No Codex OAuth credential is available for a live call.",
 			},
 		);
+		this.#assertCurrent();
+		return result;
 	}
 
 	async #signalWithAccess(
@@ -198,6 +325,7 @@ export class CodexLiveTransport {
 		access: OAuthAccess,
 		attestation: string | undefined,
 	): Promise<LiveSignalingResult> {
+		this.#acceptAccess(access);
 		const headers = new Headers({
 			...liveSessionHeaders(access, this.#options.sessionId, this.#realtimeSessionId, attestation),
 			Accept: "*/*",
@@ -213,7 +341,11 @@ export class CodexLiveTransport {
 			}),
 			signal: this.#options.signal,
 		});
+		this.#assertCurrent();
+		this.#assertAccess(access);
 		const responseBody = await response.text();
+		this.#assertCurrent();
+		this.#assertAccess(access);
 		if (!response.ok) {
 			const detail = boundedErrorBody(responseBody, response.statusText);
 			throw new LiveSignalingError(response.status, `Codex live signaling failed (${response.status}): ${detail}`);
@@ -231,22 +363,44 @@ export class CodexLiveTransport {
 	async #connectSideband(callId: string, access: OAuthAccess, attestation: string | undefined): Promise<void> {
 		let failure = new Error("Codex live sideband connection failed");
 		for (let attempt = 0; attempt < SIDEBAND_CONNECT_ATTEMPTS; attempt++) {
+			this.#assertCurrent();
 			try {
 				await this.#openSideband(callId, access, attestation);
+				this.#assertCurrent();
 				return;
 			} catch (cause) {
 				failure = cause instanceof Error ? cause : new Error(String(cause));
+				this.#assertCurrent();
 				if (this.#options.signal?.aborted) throw abortReason(this.#options.signal);
 				if (attempt + 1 < SIDEBAND_CONNECT_ATTEMPTS) await Bun.sleep(200 * 2 ** attempt);
+				this.#assertCurrent();
 			}
 		}
 		throw failure;
 	}
 
 	async #openSideband(callId: string, access: OAuthAccess, attestation: string | undefined): Promise<void> {
+		this.#assertCurrent();
+		if (access.credentialId === undefined) throw new Error("Live OAuth credential has no stored identity");
+		const refreshed = await this.#options.authStorage.oauth.access(LIVE_PROVIDER, this.#options.sessionId, {
+			signal: this.#options.signal,
+			baseUrl: CODEX_BASE_URL,
+			modelId: LIVE_MODEL,
+		});
+		this.#assertOwnerCurrent();
+		if (
+			!refreshed ||
+			refreshed.credentialId !== access.credentialId ||
+			refreshed.accountId !== access.accountId ||
+			refreshed.orgId !== access.orgId ||
+			refreshed.projectId !== access.projectId
+		)
+			throw new Error("Live OAuth account changed");
+		this.#acceptAccess(refreshed);
+		this.#acceptedAccess = refreshed;
 		const url = buildLiveSidebandUrl(callId);
 		const options = {
-			headers: liveSessionHeaders(access, this.#options.sessionId, this.#realtimeSessionId, attestation),
+			headers: liveSessionHeaders(refreshed, this.#options.sessionId, this.#realtimeSessionId, attestation),
 			proxy: getProxyForUrl(LIVE_PROVIDER, new URL(url)),
 		} satisfies Bun.WebSocketOptions;
 		const socket: Bun.WebSocket = Reflect.construct(WebSocket, [url, options]);
@@ -275,6 +429,11 @@ export class CodexLiveTransport {
 		socket.onopen = () => {
 			if (settled) {
 				socket.close(1000, "stale");
+				return;
+			}
+			if (!this.#current()) {
+				socket.close(1000, "stale owner");
+				rejectConnect(new Error("Live transport owner changed"));
 				return;
 			}
 			opened = true;
@@ -322,10 +481,12 @@ export class CodexLiveTransport {
 			timeout.unref?.();
 		}
 		await promise;
+		this.#assertCurrent();
 	}
 
 	#handleSidebandEvent(payload: string): void {
 		if (this.#state === "closing" || this.#state === "closed") return;
+		if (!this.#current()) return;
 		const event = parseLiveServerEvent(payload);
 		if (!event) return;
 		try {
@@ -335,6 +496,7 @@ export class CodexLiveTransport {
 
 	#handleServerEvent(payload: string): void {
 		if (this.#state === "closing" || this.#state === "closed") return;
+		if (!this.#current()) return;
 		const event = parseLiveServerEvent(payload);
 		if (!event || (this.#sideband?.readyState === WebSocket.OPEN && event.type !== "error")) return;
 		try {
@@ -344,6 +506,7 @@ export class CodexLiveTransport {
 
 	#handleOutputLevel(level: number): void {
 		if (this.#state !== "connected" || !Number.isFinite(level)) return;
+		if (!this.#current()) return;
 		try {
 			this.#options.callbacks.onOutputLevel(Math.min(1, Math.max(0, level)));
 		} catch {}
@@ -363,6 +526,7 @@ export class CodexLiveTransport {
 	send(message: LiveClientMessage): Promise<void> {
 		const operation = this.#sendTail.then(() => {
 			if (this.#state !== "connected") throw new Error("Live transport is not connected");
+			if (message.type !== "session.close") this.#assertCurrent();
 			const sideband = this.#sideband;
 			if (!sideband || sideband.readyState !== WebSocket.OPEN) {
 				throw new Error("Codex live sideband is not connected");
@@ -376,11 +540,13 @@ export class CodexLiveTransport {
 	/** Queue 16 kHz mono Float32 PCM for native Opus transmission. */
 	pushAudio(samples: Float32Array): void {
 		if (this.#state !== "connected" || this.#muted || samples.length === 0) return;
+		this.#assertCurrent();
 		this.#peer?.pushAudio(samples);
 	}
 
 	/** Enable or disable the native audio source and discard partial input when muted. */
 	async setMuted(muted: boolean): Promise<void> {
+		this.#assertCurrent();
 		this.#muted = muted;
 		if (this.#state === "connected") this.#peer?.setMuted(muted);
 	}

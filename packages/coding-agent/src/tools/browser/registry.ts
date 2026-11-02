@@ -29,7 +29,7 @@ import {
 import { reapOrphanSharedTargets } from "./orphan-registry";
 import { ensureRelayDaemon, isLoopbackRelayUrl, restartRelayDaemon } from "./relay/daemon";
 import { type RelayKind, resolveRelayWebSocketEndpoint } from "./relay/kind";
-import { waitForRelayExtension } from "./relay/probe";
+import { UPDATE_RELAY_EXTENSION, waitForRelayExtension } from "./relay/probe";
 import { ensureBrowserRelayToken, writeBrowserRelayToken } from "./relay/token";
 import { ensureSharedBrowser } from "./shared-daemon";
 import type { TernKind } from "./tern/kind";
@@ -129,6 +129,8 @@ export interface AcquireBrowserOptions {
 	cwd: string;
 	viewport?: { width: number; height: number; deviceScaleFactor?: number };
 	signal?: AbortSignal;
+	/** Runs before a fresh browser connection, never when reusing a connected handle. */
+	beforeOpen?: () => Promise<void>;
 }
 
 export async function acquireBrowser(kind: BrowserKind, opts: AcquireBrowserOptions): Promise<BrowserHandle> {
@@ -157,7 +159,12 @@ export async function acquireBrowser(kind: BrowserKind, opts: AcquireBrowserOpti
 			await untilAborted(opts.signal, () => pending.settled);
 			continue;
 		}
-		const open = openBrowserHandle(kind, opts);
+		const open = opts.beforeOpen
+			? opts.beforeOpen().then(() => {
+					if (opts.signal?.aborted) throw new ToolAbortError("Browser open aborted");
+					return openBrowserHandle(kind, opts);
+				})
+			: openBrowserHandle(kind, opts);
 		const settled = Promise.withResolvers<void>();
 		const entry = { settled: settled.promise };
 		// An open whose caller aborted is disposed below, never published, so it
@@ -361,9 +368,7 @@ async function openBrowserHandle(kind: BrowserKind, opts: AcquireBrowserOptions)
 			);
 		}
 		if (outcome === "outdated-extension") {
-			throw new ToolError(
-				`The ${CF_BRAND} Browser Relay extension is out of date. Run \`${CF_COMMAND} browser-relay install\` and reload the extension in Chrome.`,
-			);
+			throw new ToolError(`The ${CF_BRAND} Browser Relay extension is out of date. ${UPDATE_RELAY_EXTENSION}`);
 		}
 		const browserWSEndpoint = await relayBrowserWSEndpoint(cdpUrl, token, opts.signal);
 		const puppeteer = await loadPuppeteer();

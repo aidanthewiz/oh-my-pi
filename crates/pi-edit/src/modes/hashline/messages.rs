@@ -44,6 +44,41 @@ pub fn json_quote(s: &str) -> String {
 
 /// Lines of context shown either side of a hash mismatch.
 pub const MISMATCH_CONTEXT: u32 = 2;
+const MISMATCH_MAX_CONTEXT_LINES: usize = 40;
+const MISMATCH_MAX_CONTEXT_BYTES: usize = 8 * 1024;
+
+/// Complete context rows retained within the diagnostic's line and byte bounds.
+pub fn anchored_context_lines<S: AsRef<str>>(
+	anchor_lines: &[u32],
+	file_lines: &[S],
+) -> BTreeSet<u32> {
+	let line_count = file_lines.len();
+	let mut display_lines = BTreeSet::new();
+	for &line in anchor_lines {
+		if line < 1 || (line as usize) > line_count {
+			continue;
+		}
+		let lo = line.saturating_sub(MISMATCH_CONTEXT).max(1);
+		let hi = (line + MISMATCH_CONTEXT).min(line_count as u32);
+		display_lines.extend(lo..=hi);
+	}
+	let mut remaining = MISMATCH_MAX_CONTEXT_BYTES;
+	let mut count = 0;
+	display_lines.retain(|line| {
+		// Reserve line numbering, markers, separators, and elision metadata.
+		let bytes = file_lines[*line as usize - 1]
+			.as_ref()
+			.len()
+			.saturating_add(32);
+		if count == MISMATCH_MAX_CONTEXT_LINES || bytes > remaining {
+			return false;
+		}
+		remaining -= bytes;
+		count += 1;
+		true
+	});
+	display_lines
+}
 
 /// Numbered `LINE:TEXT` rows around `anchor_lines` (±[`MISMATCH_CONTEXT`]),
 /// `*`-marking anchors, `...` between non-adjacent runs. Out-of-range anchors
@@ -52,17 +87,7 @@ pub fn format_anchored_context<S: AsRef<str>>(
 	anchor_lines: &[u32],
 	file_lines: &[S],
 ) -> Vec<String> {
-	let mut display_lines = BTreeSet::new();
-	for &line in anchor_lines {
-		if line < 1 || (line as usize) > file_lines.len() {
-			continue;
-		}
-		let lo = line.saturating_sub(MISMATCH_CONTEXT).max(1);
-		let hi = (line + MISMATCH_CONTEXT).min(file_lines.len() as u32);
-		for line_num in lo..=hi {
-			display_lines.insert(line_num);
-		}
-	}
+	let display_lines = anchored_context_lines(anchor_lines, file_lines);
 	let anchor_set: HashSet<u32> = anchor_lines.iter().copied().collect();
 	let mut rows = Vec::new();
 	let mut previous: Option<u32> = None;
@@ -104,10 +129,7 @@ impl std::fmt::Display for AbsoluteRangeOp {
 }
 
 fn reg_suffix(register: Option<&str>) -> String {
-	match register {
-		Some(reg) => format!(" @{reg}"),
-		None => String::new(),
-	}
+	register.map_or_default(|reg| format!(" @{reg}"))
 }
 
 fn range_op_single(op: AbsoluteRangeOp, line: u32, register: Option<&str>) -> String {
@@ -418,12 +440,15 @@ impl std::fmt::Display for BoundarySide {
 ///
 /// After the duplicated body rows are removed, applying or dropping it would
 /// lose distinct range content, so the edit is rejected unless a
-/// parse-restoring boundary combination proves another reading.
+/// parse-restoring boundary combination proves another reading. `left_out` is
+/// the inclusive span of range rows the body does not cover when the echo is
+/// read as a range shifted by `count` lines.
 pub fn ambiguous_boundary_echo_message(
 	start_line: u32,
 	end_line: u32,
 	side: BoundarySide,
 	count: u32,
+	left_out: (u32, u32),
 ) -> String {
 	let where_clause = match side {
 		BoundarySide::Leading => {
@@ -433,11 +458,132 @@ pub fn ambiguous_boundary_echo_message(
 			format!("ends by restating the {count} line(s) just below the range")
 		},
 	};
+	let left_out = line_span(left_out);
 	format!(
 		"`PUT {start_line}{HL_RANGE_SEP}{end_line}:` rejected: the body {where_clause}, but is too \
-		 short to be the full final content of the selected range. Re-issue with the range covering \
-		 exactly the lines that change and the body as their complete final content."
+		 short to be the full final content of the selected range. If the range is off by those \
+		 line(s), the body leaves out {left_out}, which this edit would delete. Re-issue with the \
+		 range covering exactly the lines that change and the body as their complete final content."
 	)
+}
+
+/// A body restates the lines next to the range more than once.
+///
+/// One copy is read as the echo of those lines, and the body still opens (or
+/// ends) with them. `left_out` is the inclusive span of range rows the body
+/// leaves out once every row that restates a line outside the range is set
+/// aside; the chosen repair would delete them.
+pub fn repeated_boundary_echo_message(
+	start_line: u32,
+	end_line: u32,
+	side: BoundarySide,
+	count: u32,
+	left_out: (u32, u32),
+) -> String {
+	let where_clause = match side {
+		BoundarySide::Leading => {
+			format!("opens by restating the {count} line(s) just above the range more than once")
+		},
+		BoundarySide::Trailing => {
+			format!("ends by restating the {count} line(s) just below the range more than once")
+		},
+	};
+	let left_out = line_span(left_out);
+	format!(
+		"`PUT {start_line}{HL_RANGE_SEP}{end_line}:` rejected: the body {where_clause}. With the \
+		 rows that restate lines just outside the range read as those lines, the body is too short \
+		 to be the full final content of the selected range: it leaves out {left_out}, which this \
+		 edit would delete. Re-issue with the range covering exactly the lines that change and the \
+		 body as their complete final content."
+	)
+}
+
+/// A body restates both neighbouring lines but is too short for the range.
+///
+/// With both neighbours restated the range cannot be shifted, so the rows
+/// left once the restated rows are set aside are the only content the body
+/// offers, and they are fewer than the range. `repeated`: the body restates
+/// them more than once. `left_out` is the inclusive span of range rows past
+/// those rows; applying or repairing the edit would delete them.
+pub fn two_sided_boundary_echo_message(
+	start_line: u32,
+	end_line: u32,
+	above: u32,
+	below: u32,
+	repeated: bool,
+	left_out: (u32, u32),
+) -> String {
+	let left_out = line_span(left_out);
+	let repeated = if repeated { " more than once" } else { "" };
+	format!(
+		"`PUT {start_line}{HL_RANGE_SEP}{end_line}:` rejected: the body restates both the {above} \
+		 line(s) just above and the {below} line(s) just below the range{repeated}, and once the \
+		 rows that restate lines outside the range are set aside, the rows left are too few to be \
+		 the full final content of the selected range: they leave out {left_out}, which this edit \
+		 would delete. Re-issue with the range covering exactly the lines that change and the body \
+		 as their complete final content."
+	)
+}
+
+/// How a patch would repeat a neighbouring line.
+///
+/// Either the span of neighbouring lines whose copy sits at the edge of the
+/// written rows, or a count of extra copies of one neighbouring line found
+/// elsewhere in them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Restated {
+	Span(u32, u32),
+	Copies(u32, u32),
+}
+
+/// What a patch would do to a range whose body restates a neighbouring line,
+/// judged on the rows it would write there.
+///
+/// `above` / `below` say how the result would repeat the neighbouring lines;
+/// `left_out` is the span of range rows past the rows the body supplies once
+/// those copies are set aside. At least one is set.
+pub fn boundary_echo_outcome_message(
+	start_line: u32,
+	end_line: u32,
+	above: Option<Restated>,
+	below: Option<Restated>,
+	left_out: Option<(u32, u32)>,
+) -> String {
+	let restated = |restated: Restated, place: &str| match restated {
+		Restated::Span(first, last) => {
+			format!("write {} ({place} the range) a second time", line_span((first, last)))
+		},
+		Restated::Copies(line, 1) => {
+			format!("hold one more copy of line {line} ({place} the range) than the range did")
+		},
+		Restated::Copies(line, extra) => {
+			format!("hold {extra} more copies of line {line} ({place} the range) than the range did")
+		},
+	};
+	let mut effects = Vec::new();
+	if let Some(above) = above {
+		effects.push(restated(above, "just above"));
+	}
+	if let Some(below) = below {
+		effects.push(restated(below, "just below"));
+	}
+	if let Some(span) = left_out {
+		effects.push(format!("leave out {} of the range, deleting it", line_span(span)));
+	}
+	format!(
+		"`PUT {start_line}{HL_RANGE_SEP}{end_line}:` rejected: the body restates lines next to the \
+		 range, and as applied the result would {}. Re-issue with the range covering exactly the \
+		 lines that change and the body as their complete final content.",
+		effects.join(" and ")
+	)
+}
+
+fn line_span((first, last): (u32, u32)) -> String {
+	if first == last {
+		format!("line {first}")
+	} else {
+		format!("lines {first}-{last}")
+	}
 }
 
 /// A syntax-essential selected edge can be retained on either side of the
@@ -448,6 +594,17 @@ pub fn ambiguous_boundary_placement_message(start_line: u32, end_line: u32) -> S
 		 for the file to parse, but the body indentation does not establish whether it belongs \
 		 before or after that row. Re-read the region and re-issue with a range that excludes every \
 		 unchanged boundary row."
+	)
+}
+
+/// A one-row replacement fails to parse only because its body ends in a
+/// comma the surrounding syntax rejects (the last element of a JSON array).
+pub fn trailing_comma_replacement_message(start_line: u32, end_line: u32) -> String {
+	format!(
+		"`PUT {start_line}{HL_RANGE_SEP}{end_line}:` rejected: the body's last non-blank row ends \
+		 with a comma that does not parse in place (e.g. a trailing comma before a closing `]` or \
+		 `}}`); without that comma this replacement parses. Drop the comma, or include the rows \
+		 that should follow it in the same body."
 	)
 }
 
@@ -501,10 +658,7 @@ pub fn boundary_variant_repair_warning(start_line: u32, kept: u32, dropped: u32)
 /// tree-sitter and surfaced in the same response instead of waiting for a
 /// compiler pass.
 pub fn edit_broke_parse_warning(first_changed_line: Option<u32>) -> String {
-	let at = match first_changed_line {
-		Some(line) => format!(" near line {line}"),
-		None => String::new(),
-	};
+	let at = first_changed_line.map_or_default(|line| format!(" near line {line}"));
 	format!(
 		"This edit introduced a syntax error{at}: the file parsed before the patch and no longer \
 		 does. It was applied exactly as written, so a line number or range endpoint is likely \
@@ -718,16 +872,6 @@ pub fn write_drift_warning(path: &str) -> String {
 	)
 }
 
-/// Section omitted the mandatory snapshot tag. Shared by the apply
-/// (`Patcher.prepare`) and preview/diff paths so both stay in lockstep.
-pub fn missing_snapshot_tag_message(section_path: &str) -> String {
-	format!(
-		"Missing hashline snapshot tag for {section_path}; use \
-		 `{HL_FILE_PREFIX}{section_path}{HL_FILE_HASH_SEP}tag{HL_FILE_SUFFIX}` from your latest \
-		 read/search output. To create a new file, use the write tool."
-	)
-}
-
 /// Section named a nonexistent path matching an earlier snapshot's name and
 /// tag.
 ///
@@ -786,13 +930,34 @@ pub struct RevealedLine {
 	pub text: String,
 }
 
+/// A wide unseen anchor cannot be safely promoted by a column-capped reveal.
+pub fn wide_unseen_lines_message(section_path: &str, unseen_lines: &[u32]) -> String {
+	let ranges = format_line_ranges(unseen_lines);
+	let selector = ranges.replace(", ", ",");
+	format!(
+		"This edit anchors to lines {ranges} of {section_path} that were not fully displayed. Read \
+		 `{section_path}:{selector}:raw` for their full content, then re-issue the edit."
+	)
+}
+
+/// No retained read records whether these over-cap anchor lines were shown
+/// whole (process restart or store eviction), so their display may have been
+/// cut.
+pub fn unverified_wide_lines_message(section_path: &str, wide_lines: &[u32]) -> String {
+	let ranges = format_line_ranges(wide_lines);
+	let selector = ranges.replace(", ", ",");
+	format!(
+		"This edit anchors to lines {ranges} of {section_path}, which exceed the display column \
+		 cap, and no retained read shows them in full. Read `{section_path}:{selector}:raw` for \
+		 their full content, then re-issue the edit."
+	)
+}
+
 /// Content preview handed to [`unseen_lines_message`].
 ///
-/// `lines` are the unseen anchor lines whose actual file content we surface
-/// inline (from the tagged snapshot the caller matched). `truncated` = true
-/// means the anchor range exceeded the inline reveal cap; the caller only
-/// revealed a prefix and the remaining unseen lines still require a range
-/// re-read.
+/// `lines` are unseen anchor lines from the tagged snapshot. A truncated
+/// preview contains only a prefix. Diagnostics never grant displayed-line
+/// provenance.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct UnseenLinesReveal {
 	pub lines:     Vec<RevealedLine>,
@@ -800,13 +965,7 @@ pub struct UnseenLinesReveal {
 }
 
 /// Edit referenced lines never displayed by the cited tag's read.
-///
-/// Editing lines not read (partial range or collapsed summary) mangles files.
-/// When `reveal.lines` is non-empty, the caller has already inlined the actual
-/// file content at those lines and merged them into the snapshot's seen-line
-/// set, so the message points the model at a straight retry with the same
-/// `[path#tag]` header; when the reveal is empty or truncated, the message
-/// falls back to instructing a range re-read.
+/// Diagnostic previews do not replace an explicit full read.
 pub fn unseen_lines_message(
 	section_path: &str,
 	unseen_lines: &[u32],
@@ -836,16 +995,38 @@ pub fn unseen_lines_message(
 	if reveal.truncated {
 		return format!(
 			"{header} Preview of the actual file content at the first {} unseen \
-			 line(s):\n{preview}\nThe range exceeds the inline preview cap — re-read the remainder \
+			 line(s):\n{preview}\nThe range exceeds the inline preview cap. Re-read all target lines \
 			 with `{section_path}:{selector}` before re-issuing the edit.",
 			reveal.lines.len()
 		);
 	}
 	format!(
-		"{header} Actual file content at those lines:\n{preview}\nVerify the content matches what \
-		 you intend to touch, then re-issue the edit with the same \
-		 {HL_FILE_PREFIX}path{HL_FILE_HASH_SEP}tag{HL_FILE_SUFFIX} header — a straight retry now \
-		 succeeds without a re-read. If the content does NOT match, fix your line numbers."
+		"{header} Actual file content at those lines:\n{preview}\nRe-read the target lines in full \
+		 with `{section_path}:{selector}`, verify the line numbers, then re-issue the edit."
+	)
+}
+
+/// A stale tag's unseen anchors require a read at their current line numbers.
+pub fn stale_unseen_lines_message(
+	section_path: &str,
+	unseen_lines: &[u32],
+	tag: &str,
+	live_lines: &[u32],
+	live_tag: &str,
+	raw: bool,
+) -> String {
+	let ranges = format_line_ranges(unseen_lines);
+	let live_ranges = format_line_ranges(live_lines);
+	let selector = live_ranges.replace(", ", ",");
+	let raw = if raw { ":raw" } else { "" };
+	let live_header =
+		format!("{HL_FILE_PREFIX}{section_path}{HL_FILE_HASH_SEP}{live_tag}{HL_FILE_SUFFIX}");
+	format!(
+		"This edit anchors to lines {ranges} of {section_path} that \
+		 {HL_FILE_PREFIX}{section_path}{HL_FILE_HASH_SEP}{tag}{HL_FILE_SUFFIX} never displayed in \
+		 full. The file has changed since that tag: those lines are now lines {live_ranges}, under \
+		 {live_header}. Read `{section_path}:{selector}{raw}` for their full content, then re-issue \
+		 the edit under {live_header} with current line numbers."
 	)
 }
 
@@ -978,49 +1159,6 @@ mod tests {
 			msg_known,
 			"`@temp` was empty — no `CUT … @temp` precedes this op in this call and no persisted \
 			 register has that name — so nothing was pasted. Available registers: `@foo`, `@bar`."
-		);
-	}
-
-	#[test]
-	fn test_unseen_lines_message() {
-		// Empty reveal
-		let msg_empty =
-			unseen_lines_message("src/foo.ts", &[5, 6, 7, 10], "AB12", &UnseenLinesReveal::default());
-		assert_eq!(
-			msg_empty,
-			"This edit anchors to lines 5-7, 10 of src/foo.ts that [src/foo.ts#AB12] never displayed \
-			 (it showed a partial range, a search hit, or a folded summary). Re-read them in full \
-			 first with a ranged read like `src/foo.ts:5-7,10` — it skips summarization and mints a \
-			 fresh tag (a plain re-read just re-folds them) — then re-issue the edit."
-		);
-
-		// Non-empty reveal, not truncated
-		let reveal = UnseenLinesReveal {
-			lines:     vec![RevealedLine { line: 5, text: "let x = 1;".to_string() }],
-			truncated: false,
-		};
-		let msg_reveal = unseen_lines_message("src/foo.ts", &[5], "AB12", &reveal);
-		assert_eq!(
-			msg_reveal,
-			"This edit anchors to lines 5 of src/foo.ts that [src/foo.ts#AB12] never displayed (it \
-			 showed a partial range, a search hit, or a folded summary). Actual file content at \
-			 those lines:\n  5:let x = 1;\nVerify the content matches what you intend to touch, then \
-			 re-issue the edit with the same [path#tag] header — a straight retry now succeeds \
-			 without a re-read. If the content does NOT match, fix your line numbers."
-		);
-
-		// Truncated reveal
-		let reveal_trunc = UnseenLinesReveal {
-			lines:     vec![RevealedLine { line: 5, text: "let x = 1;".to_string() }],
-			truncated: true,
-		};
-		let msg_trunc = unseen_lines_message("src/foo.ts", &[5, 6], "AB12", &reveal_trunc);
-		assert_eq!(
-			msg_trunc,
-			"This edit anchors to lines 5-6 of src/foo.ts that [src/foo.ts#AB12] never displayed (it \
-			 showed a partial range, a search hit, or a folded summary). Preview of the actual file \
-			 content at the first 1 unseen line(s):\n  5:let x = 1;\nThe range exceeds the inline \
-			 preview cap — re-read the remainder with `src/foo.ts:5-6` before re-issuing the edit."
 		);
 	}
 

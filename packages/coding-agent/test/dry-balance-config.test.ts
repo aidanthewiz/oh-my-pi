@@ -30,7 +30,7 @@ test("omp dry-balance routes by account policies from a --config overlay", async
 			email: `${name}@example.com`,
 		});
 		await authStorage.credentials.set("acme", [account("a"), account("b")]);
-		authStorage.close();
+		await authStorage.close();
 		const overlayPath = path.join(agentDir.path(), "policy-overlay.yml");
 		await Bun.write(
 			overlayPath,

@@ -410,8 +410,8 @@ function emailOnlyReport(): UsageReport {
 describe("anthropic usage report dedupe partitions by org", () => {
 	let storage: AuthStorage | null = null;
 
-	afterEach(() => {
-		storage?.close();
+	afterEach(async () => {
+		await storage?.close();
 		storage = null;
 		vi.restoreAllMocks();
 	});
@@ -497,8 +497,8 @@ describe("anthropic usage report dedupe partitions by org", () => {
 describe("broker-backed refresh row addressing", () => {
 	let storage: AuthStorage | null = null;
 
-	afterEach(() => {
-		storage?.close();
+	afterEach(async () => {
+		await storage?.close();
 		storage = null;
 		vi.restoreAllMocks();
 	});

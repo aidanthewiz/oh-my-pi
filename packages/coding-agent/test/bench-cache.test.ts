@@ -85,7 +85,7 @@ describe("bench cache mode", () => {
 		const summary = await runBenchCommand(
 			{ models: ["openai/gpt-cache-test"], flags: { cache: true, json: true } },
 			{
-				createRuntime: async () => ({ modelRegistry: registry, close: () => {} }),
+				createRuntime: async () => ({ modelRegistry: registry }),
 				randomSessionId: () => `session-${++id}`,
 				writeStdout: text => {
 					stdout += text;
@@ -153,7 +153,6 @@ describe("bench cache mode", () => {
 			{
 				createRuntime: async () => ({
 					modelRegistry: { ...registry, getAll: () => [piNativeModel] },
-					close: () => {},
 				}),
 				randomSessionId: (() => {
 					let id = 0;
@@ -202,7 +201,6 @@ describe("bench cache mode", () => {
 								return "sk-test";
 							},
 						},
-						close: () => {},
 					}),
 					streamSimple: () => {
 						throw new Error("Codex cache mode must reject before issuing a request");
@@ -221,7 +219,7 @@ describe("bench cache mode", () => {
 		const summary = await runBenchCommand(
 			{ models: ["openai/gpt-cache-test"], flags: { cache: true, cachePairs: 2 } },
 			{
-				createRuntime: async () => ({ modelRegistry: registry, close: () => {} }),
+				createRuntime: async () => ({ modelRegistry: registry }),
 				randomSessionId: (() => {
 					let id = 0;
 					return () => `session-${++id}`;
@@ -275,7 +273,7 @@ describe("bench cache mode", () => {
 				flags: { cache: true, cachePairs: 2, cacheConcurrency: 2, json: true },
 			},
 			{
-				createRuntime: async () => ({ modelRegistry: registry, close: () => {} }),
+				createRuntime: async () => ({ modelRegistry: registry }),
 				randomSessionId: () => `session-${++id}`,
 				writeStdout: () => {},
 				writeStderr: () => {},
@@ -349,7 +347,7 @@ describe("bench cache mode", () => {
 		await runBenchCommand(
 			{ models: ["openai/gpt-cache-test"], flags: { cache: true } },
 			{
-				createRuntime: async () => ({ modelRegistry: registry, close: () => {} }),
+				createRuntime: async () => ({ modelRegistry: registry }),
 				randomSessionId: (() => {
 					let id = 0;
 					return () => `session-${++id}`;
@@ -388,7 +386,7 @@ describe("bench cache mode", () => {
 		const summary = await runBenchCommand(
 			{ models: ["openai/gpt-cache-test"], flags: { json: true } },
 			{
-				createRuntime: async () => ({ modelRegistry: registry, close: () => {} }),
+				createRuntime: async () => ({ modelRegistry: registry }),
 				randomSessionId: () => `session-${++id}`,
 				writeStdout: () => {},
 				writeStderr: () => {},
@@ -419,7 +417,7 @@ describe("bench cache mode", () => {
 		await expect(
 			runBenchCommand(
 				{ models: ["openai/gpt-cache-test"], flags: { cache: true, par: 2 } },
-				{ createRuntime: async () => ({ modelRegistry: registry, close: () => {} }) },
+				{ createRuntime: async () => ({ modelRegistry: registry }) },
 			),
 		).rejects.toThrow("--cache-concurrency");
 	});
@@ -431,7 +429,7 @@ describe("bench cache mode", () => {
 				flags: { cache: true, cachePrefixFile: "private-prefix.txt", cachePrefixBytes: 5, json: true },
 			},
 			{
-				createRuntime: async () => ({ modelRegistry: registry, close: () => {} }),
+				createRuntime: async () => ({ modelRegistry: registry }),
 				randomSessionId: (() => {
 					let id = 0;
 					return () => `session-${++id}`;
@@ -471,7 +469,7 @@ describe("bench cache mode", () => {
 					flags: { cache: true, cachePrefixFile: prefixPath, cachePrefixBytes: 3, json: true },
 				},
 				{
-					createRuntime: async () => ({ modelRegistry: registry, close: () => {} }),
+					createRuntime: async () => ({ modelRegistry: registry }),
 					randomSessionId: (() => {
 						let id = 0;
 						return () => `session-${++id}`;
@@ -510,7 +508,7 @@ describe("bench cache mode", () => {
 					flags: { cache: true, cachePrefixFile: prefixPath, cachePrefixBytes: 128, json: true },
 				},
 				{
-					createRuntime: async () => ({ modelRegistry: registry, close: () => {} }),
+					createRuntime: async () => ({ modelRegistry: registry }),
 					randomSessionId: (() => {
 						let id = 0;
 						return () => `session-${++id}`;
@@ -540,7 +538,7 @@ describe("bench cache mode", () => {
 		const summary = await runBenchCommand(
 			{ models: ["openai/gpt-cache-test"], flags: { cache: true, json: true } },
 			{
-				createRuntime: async () => ({ modelRegistry: registry, close: () => {} }),
+				createRuntime: async () => ({ modelRegistry: registry }),
 				randomSessionId: (() => {
 					let id = 0;
 					return () => `session-${++id}`;

@@ -9,9 +9,9 @@
  *   - **Task-isolation dirs** (`task/worktree.ts`): a wrapper dir with a
  *     compact `m` subdir mounted/cloned by `natives.isoStart`. Legacy `merged`
  *     subdirs are still recognized. `ensureIsolation` writes an ownership
- *     marker naming the live omp process; a
- *     sandbox whose owner is still running is reported `live` and never
- *     removed without `--all`, so `clear` reclaims only crashed leftovers.
+ *     marker naming the live omp process. A task-isolation sandbox whose owner
+ *     is still running remains protected even with `--all`.
+ *     `clear` removes only verified unmounted, unowned task-isolation leftovers.
  *
  * Legacy entries from before the encoding change keep working because git still
  * tracks them by branch name. This command exists to GC them on demand.
@@ -23,7 +23,12 @@ import * as vcs from "@oh-my-pi/pi-natives/vcs";
 import { getWorktreesDir, isEnoent } from "@oh-my-pi/pi-utils";
 import chalk from "@oh-my-pi/pi-utils/chalk";
 import { Settings } from "../config/settings";
-import { hasLiveIsolationOwner, ISOLATION_OWNER_FILE, readRetainedMountBackend } from "../task/isolation-ownership";
+import {
+	assertWorktreeRemovalSafe,
+	hasLiveIsolationOwner,
+	ISOLATION_OWNER_FILE,
+	readRetainedMountBackend,
+} from "../task/isolation-ownership";
 import { formatIsolationBackend, parseIsolationBackend } from "../task/worktree";
 
 import { cfgIsolationBackend, cfgWorktreeClone } from "../task/settings";
@@ -79,6 +84,7 @@ export interface ClearWorktreesOptions {
  * with the error, data intact.
  */
 export async function stopRetainedMount(dir: string): Promise<boolean> {
+	if (await hasLiveIsolationOwner(dir)) throw new Error(`Refusing to stop live isolation workspace ${dir}`);
 	const backend = await readRetainedMountBackend(dir);
 	if (backend === undefined) return false;
 	for (const name of TASK_ISOLATION_MOUNT_DIRS) {
@@ -89,6 +95,7 @@ export async function stopRetainedMount(dir: string): Promise<boolean> {
 				.then(stat => stat.isDirectory())
 				.catch(() => false)
 		) {
+			await assertWorktreeRemovalSafe(dir, { stoppingRoot: candidate });
 			await natives.isoStop(backend, candidate);
 			return true;
 		}
@@ -223,13 +230,16 @@ export async function clearWorktrees(options: ClearWorktreesOptions): Promise<{ 
 				// Live worktree: ask git to remove it cleanly. If git refuses (locked,
 				// dirty, etc.), fall back to fs.rm and rely on `worktree prune` to
 				// clean the bookkeeping on the parent side.
+				await assertWorktreeRemovalSafe(target.path);
 				const removed = await vcs.git(target.parentRepo)?.worktreeRemove(target.path, true);
 				if (!removed) {
+					await assertWorktreeRemovalSafe(target.path);
 					await fs.rm(target.path, { recursive: true, force: true });
 					parentsToPrune.add(target.parentRepo);
 				}
 			} else {
-				if (target.kind === "task-isolation") await stopRetainedMount(target.path);
+				const stopped = target.kind === "task-isolation" && (await stopRetainedMount(target.path));
+				await assertWorktreeRemovalSafe(target.path, { stoppedRoot: stopped });
 				await fs.rm(target.path, { recursive: true, force: true });
 				if (target.parentRepo) parentsToPrune.add(target.parentRepo);
 			}

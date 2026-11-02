@@ -1,246 +1,238 @@
-import { afterEach, describe, expect, it, type Mock, vi } from "bun:test";
+import { describe, expect, it, vi } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
+import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import type { Skill } from "@oh-my-pi/pi-coding-agent/extensibility/skills";
-import * as skillsModule from "@oh-my-pi/pi-coding-agent/extensibility/skills";
 import type { CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
-import type { AgentSession, AgentSessionEvent, PromptOptions } from "@oh-my-pi/pi-coding-agent/session/agent-session";
-import { SKILL_PROMPT_MESSAGE_TYPE } from "@oh-my-pi/pi-coding-agent/session/messages";
+import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import * as discoveryModule from "@oh-my-pi/pi-coding-agent/task/discovery";
 import { runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
-import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
-import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
-import { createSessionDefaults } from "../helpers/session-defaults";
+import { runStructuredSubagent } from "@oh-my-pi/pi-coding-agent/task/structured-subagent";
+import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { createInMemoryAuthStorage } from "../helpers/agent-session-setup";
 
-// ── Helpers ────────────────────────────────────────────────────────────────
+const createAgentSession = sdkModule.createAgentSession;
+const ASSIGNMENT = "Inspect the synthetic autoload target.";
 
-function createMockSession(
-	onPrompt: (params: {
-		text: string;
-		options?: PromptOptions;
-		promptIndex: number;
-		emit: (event: AgentSessionEvent) => void;
-	}) => void,
-): AgentSession {
-	const listeners: Array<(event: AgentSessionEvent) => void> = [];
-	let promptIndex = 0;
-	const state = { messages: [] as unknown[] };
+interface SkillHarness {
+	root: string;
+	parent: CreateAgentSessionResult;
+	toolSession: ToolSession;
+	requests: string[];
+	writeSkill: (name: string, body: string) => Promise<void>;
+}
 
-	const emit = (event: AgentSessionEvent) => {
-		for (const listener of listeners) listener(event);
-	};
-
-	return {
-		...createSessionDefaults(),
-		state,
-		agent: { state: { systemPrompt: ["test"] } },
-		model: undefined,
-		extensionRunner: undefined,
-		sessionManager: {
-			appendSessionInit: () => {},
-		},
-		getActiveToolNames: () => ["read", "yield"],
-		getEnabledToolNames: () => ["read", "yield"],
-		subscribe: (listener: (event: AgentSessionEvent) => void) => {
-			listeners.push(listener);
-			return () => {
-				const index = listeners.indexOf(listener);
-				if (index >= 0) listeners.splice(index, 1);
+async function withSkills(run: (harness: SkillHarness) => Promise<void>, excluded: string[] = []): Promise<void> {
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-autoload-consumer-"));
+	const authStorage = createInMemoryAuthStorage();
+	const sessions: AgentSession[] = [];
+	try {
+		const skillsDir = path.join(root, "skills");
+		await fs.mkdir(skillsDir);
+		authStorage.keys.setRuntime("anthropic", "synthetic-autoload-key");
+		const modelRegistry = new ModelRegistry(authStorage, path.join(root, "models.yml"));
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled autoload test model");
+		const settings = Settings.isolated({
+			"async.enabled": false,
+			"advisor.enabled": false,
+			"compaction.enabled": false,
+			"todo.enabled": false,
+			"task.isolation.enabled": false,
+			"task.enableLsp": false,
+			"plugins.persistentPolicy": "allowlist",
+			"plugins.persistentAllowlist": [],
+			"skills.enableCodexUser": false,
+			"skills.enableClaudeUser": false,
+			"skills.enableClaudeProject": false,
+			"skills.enablePiUser": false,
+			"skills.enablePiProject": false,
+			"skills.enableAgentsUser": false,
+			"skills.enableAgentsProject": false,
+			"skills.customDirectories": [skillsDir],
+			disabledExtensions: excluded.map(name => `skill:${name}`),
+		});
+		const parent = await createAgentSession({
+			cwd: root,
+			agentDir: root,
+			agentId: `${path.basename(root)}-parent`,
+			authStorage,
+			modelRegistry,
+			model,
+			settings,
+			sessionManager: SessionManager.inMemory(root),
+			toolNames: [],
+			contextFiles: [],
+			rules: [],
+			promptTemplates: [],
+			slashCommands: [],
+			disableExtensionDiscovery: true,
+			enableMCP: false,
+			enableLsp: false,
+			enableIrc: false,
+			skipPythonPreflight: true,
+			cacheWarming: false,
+		});
+		sessions.push(parent.session);
+		const toolSession: ToolSession = {
+			cwd: root,
+			hasUI: false,
+			settings,
+			authStorage,
+			modelRegistry,
+			enableMCP: false,
+			enableLsp: false,
+			enableIrc: false,
+			getSessionFile: () => null,
+			getSessionId: () => parent.session.sessionManager.getSessionId(),
+			getSessionSpawns: () => "*",
+			getSessionAgents: () => [],
+			getActiveModel: () => parent.session.model,
+			getAgentId: () => parent.session.getAgentId() ?? null,
+			get skills() {
+				return parent.session.skills;
+			},
+			refreshSkills: () => parent.session.refreshSkills(),
+			captureOwnerCurrent: parent.captureOwnerCurrent,
+			captureOwnerLifetimeCurrent: parent.captureOwnerLifetimeCurrent,
+			contextFiles: [],
+			rules: [],
+			promptTemplates: [],
+		};
+		const requests: string[] = [];
+		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
+			const child = await createAgentSession({
+				...options,
+				agentDir: root,
+				slashCommands: [],
+				disableExtensionDiscovery: true,
+				skipPythonPreflight: true,
+			});
+			sessions.push(child.session);
+			const transport = createMockModel({
+				responses: [
+					{ content: [{ type: "toolCall", name: "yield", arguments: { data: { ok: true } } }] },
+					{ content: ["done"] },
+				],
+			});
+			child.session.agent.streamFn = (requestModel, context, options) => {
+				requests.push(JSON.stringify(context.messages));
+				return transport.stream(requestModel, context, options);
 			};
-		},
-		prompt: async (text: string, options?: PromptOptions) => {
-			promptIndex += 1;
-			onPrompt({ text, options, promptIndex, emit });
-			return true;
-		},
-		sendCustomMessage: vi.fn(async () => {}),
-		getLastAssistantMessage: () => state.messages[state.messages.length - 1],
-	} as unknown as AgentSession;
+			return child;
+		});
+		await run({
+			root,
+			parent,
+			toolSession,
+			requests,
+			writeSkill: async (name, body) => {
+				const baseDir = path.join(skillsDir, name);
+				await fs.mkdir(baseDir);
+				await Bun.write(
+					path.join(baseDir, "SKILL.md"),
+					`---\nname: ${name}\ndescription: Synthetic autoload skill.\n---\n\n${body}\n`,
+				);
+			},
+		});
+	} finally {
+		vi.restoreAllMocks();
+		try {
+			await Promise.all(sessions.map(session => session.dispose()));
+		} finally {
+			await authStorage.close();
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	}
 }
 
-function createSessionResult(session: AgentSession): CreateAgentSessionResult {
-	return {
-		session,
-		extensionsResult:
-			{} as unknown as import("@oh-my-pi/pi-coding-agent/extensibility/extensions/types").LoadExtensionsResult,
-		setToolUIContext: () => {},
-		eventBus: new EventBus(),
-	};
+function firstRequestText(requests: string[]): string {
+	expect(requests[0]?.includes(ASSIGNMENT)).toBe(true);
+	return requests[0];
 }
-
-// ── Tests ──────────────────────────────────────────────────────────────────
 
 describe("autoloadSkills in executor", () => {
-	afterEach(() => {
-		vi.restoreAllMocks();
-	});
-
-	const baseAgent: AgentDefinition = {
-		name: "task",
-		description: "test",
-		systemPrompt: "test",
-		source: "bundled",
-	};
-
-	const baseOptions = {
-		cwd: "/tmp",
-		agent: baseAgent,
-		task: "do work",
-		index: 0,
-		id: "subagent-1",
-		settings: Settings.isolated(),
-		modelRegistry: {
-			refresh: async () => {},
-		} as unknown as import("@oh-my-pi/pi-coding-agent/config/model-registry").ModelRegistry,
-		enableLsp: false,
-	};
-
-	it("calls sendCustomMessage for each autoloaded skill before prompt", async () => {
-		const session = createMockSession(({ emit }) => {
-			emit({
-				type: "tool_execution_end",
-				toolCallId: "tool-1",
-				toolName: "yield",
-				result: {
-					content: [{ type: "text", text: "Result submitted." }],
-					details: { status: "success", data: { ok: true } },
-				},
-				isError: false,
+	it("delivers each skill body before the assignment in the first model request", async () => {
+		await withSkills(async ({ root, parent, toolSession, requests, writeSkill }) => {
+			await writeSkill("skill-a", "Synthetic skill A instructions.");
+			await writeSkill("skill-b", "Synthetic skill B instructions.");
+			await parent.session.refreshSkills();
+			const skills = parent.session.skills.filter(skill => ["skill-a", "skill-b"].includes(skill.name));
+			const result = await runSubprocess({
+				cwd: root,
+				agent: { name: "task", description: "test", systemPrompt: "Test", source: "bundled", tools: [] },
+				task: ASSIGNMENT,
+				index: 0,
+				id: `${path.basename(root)}-child`,
+				settings: toolSession.settings,
+				modelRegistry: toolSession.modelRegistry,
+				modelOverride: ["anthropic/claude-sonnet-4-5"],
+				enableLsp: false,
+				enableMCP: false,
+				enableIrc: false,
+				keepAlive: false,
+				skills,
+				autoloadSkills: skills,
 			});
+			expect(result.error).toBeUndefined();
+			expect(result.exitCode).toBe(0);
+			expect(JSON.parse(result.output)).toEqual({ ok: true });
+			const context = firstRequestText(requests);
+			for (const body of ["Synthetic skill A instructions.", "Synthetic skill B instructions."]) {
+				expect(context).toContain(body);
+				expect(context.indexOf(body)).toBeLessThan(context.indexOf(ASSIGNMENT));
+			}
 		});
-
-		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
-
-		const mockSkills: Skill[] = [
-			{
-				name: "user-created-skill-a",
-				description: "Skill A",
-				filePath: "/skills/user-created-skill-a/SKILL.md",
-				baseDir: "/skills/user-created-skill-a",
-				source: "user",
-			},
-			{
-				name: "user-created-skill-b",
-				description: "Skill B",
-				filePath: "/skills/user-created-skill-b/SKILL.md",
-				baseDir: "/skills/user-created-skill-b",
-				source: "user",
-			},
-		];
-
-		vi.spyOn(skillsModule, "buildSkillPromptMessage").mockImplementation(async skill => ({
-			message: `Content of ${skill.name}\n\n---\n\nSkill: ${skill.filePath}`,
-			details: {
-				name: skill.name,
-				path: skill.filePath,
-				args: undefined,
-				lineCount: 1,
-			},
-		}));
-
-		await runSubprocess({
-			...baseOptions,
-			skills: mockSkills,
-			autoloadSkills: mockSkills,
-		});
-
-		const sendCustomMessage = session.sendCustomMessage as Mock<any>;
-		expect(sendCustomMessage).toHaveBeenCalledTimes(2);
-
-		// Verify first skill
-		expect(sendCustomMessage).toHaveBeenNthCalledWith(
-			1,
-			{
-				customType: SKILL_PROMPT_MESSAGE_TYPE,
-				content: expect.stringContaining("Content of user-created-skill-a"),
-				display: false,
-				details: { name: "user-created-skill-a", path: "/skills/user-created-skill-a/SKILL.md" },
-			},
-			{ triggerTurn: false },
-		);
-
-		// Verify second skill
-		expect(sendCustomMessage).toHaveBeenNthCalledWith(
-			2,
-			{
-				customType: SKILL_PROMPT_MESSAGE_TYPE,
-				content: expect.stringContaining("Content of user-created-skill-b"),
-				display: false,
-				details: { name: "user-created-skill-b", path: "/skills/user-created-skill-b/SKILL.md" },
-			},
-			{ triggerTurn: false },
-		);
 	});
+});
 
-	it("does not call sendCustomMessage when autoloadSkills is empty", async () => {
-		const session = createMockSession(({ emit }) => {
-			emit({
-				type: "tool_execution_end",
-				toolCallId: "tool-1",
-				toolName: "yield",
-				result: {
-					content: [{ type: "text", text: "Result submitted." }],
-					details: { status: "success", data: { ok: true } },
+describe("autoloadSkills through task spawn", () => {
+	it.each(["late", "excluded", "unavailable", "not-requested"] as const)(
+		"handles a %s skill in the child's first model context",
+		async availability => {
+			await withSkills(
+				async ({ parent, toolSession, requests, writeSkill }) => {
+					expect(parent.session.skills.some(skill => skill.name === "late-skill")).toBe(false);
+					if (availability !== "unavailable") await writeSkill("late-skill", "Late skill body.");
+					vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({
+						agents: [
+							{
+								name: "late-agent",
+								description: "Autoloads a late skill",
+								systemPrompt: "Test",
+								source: "project",
+								tools: [],
+								autoloadSkills: availability === "not-requested" ? [] : ["late-skill"],
+							},
+						],
+						projectAgentsDir: null,
+					});
+					const { result } = await runStructuredSubagent({
+						session: toolSession,
+						invocationKind: "task",
+						assignment: ASSIGNMENT,
+						agent: "late-agent",
+						keepAlive: false,
+					});
+					expect(result.error).toBeUndefined();
+					expect(result.exitCode).toBe(0);
+					expect(JSON.parse(result.output)).toEqual({ ok: true });
+					const context = firstRequestText(requests);
+					if (availability === "late") {
+						expect(parent.session.skills.some(skill => skill.name === "late-skill")).toBe(true);
+						expect(context).toContain("Late skill body.");
+						expect(context.indexOf("Late skill body.")).toBeLessThan(context.indexOf(ASSIGNMENT));
+					} else {
+						expect(context).not.toContain("Late skill body.");
+					}
 				},
-				isError: false,
-			});
-		});
-
-		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
-
-		await runSubprocess(baseOptions);
-
-		const sendCustomMessage = session.sendCustomMessage as Mock<any>;
-		expect(sendCustomMessage).not.toHaveBeenCalled();
-	});
-
-	it("skill messages are sent before the task prompt", async () => {
-		const callOrder: string[] = [];
-		const session = createMockSession(({ emit }) => {
-			emit({
-				type: "tool_execution_end",
-				toolCallId: "tool-1",
-				toolName: "yield",
-				result: {
-					content: [{ type: "text", text: "Result submitted." }],
-					details: { status: "success", data: { ok: true } },
-				},
-				isError: false,
-			});
-		});
-
-		// Track sendCustomMessage call order
-		(session.sendCustomMessage as Mock<any>).mockImplementation(async () => {
-			callOrder.push("sendCustomMessage");
-		});
-
-		// Track the original prompt to capture order
-		const originalPrompt = session.prompt;
-		session.prompt = async (text: string, options?: PromptOptions) => {
-			callOrder.push("prompt");
-			return originalPrompt(text, options);
-		};
-
-		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
-
-		const mockSkill: Skill = {
-			name: "user-created-skill",
-			description: "A custom skill",
-			filePath: "/skills/user-created-skill/SKILL.md",
-			baseDir: "/skills/user-created-skill",
-			source: "user",
-		};
-
-		vi.spyOn(skillsModule, "buildSkillPromptMessage").mockResolvedValue({
-			message: "Skill content\n\n---\n\nSkill: /skills/user-created-skill/SKILL.md",
-			details: { name: "user-created-skill", path: "/skills/user-created-skill/SKILL.md", lineCount: 1 },
-		});
-
-		await runSubprocess({
-			...baseOptions,
-			skills: [mockSkill],
-			autoloadSkills: [mockSkill],
-		});
-
-		expect(callOrder).toEqual(["sendCustomMessage", "prompt"]);
-	});
+				availability === "excluded" ? ["late-skill"] : [],
+			);
+		},
+	);
 });

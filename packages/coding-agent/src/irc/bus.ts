@@ -3,7 +3,7 @@
  *
  * Replaces the old auto-reply model: a `send` never blocks on the recipient
  * generating anything. Delivery resolves the recipient via the global
- * AgentRegistry — parked agents are revived through the
+ * AgentRegistry — parked and killed agents are revived through the
  * AgentLifecycleManager, idle agents are woken with a real turn, and busy
  * agents receive the message as a non-interrupting aside at the next step
  * boundary (see AgentSession.deliverIrcMessage).
@@ -12,13 +12,26 @@
 import { type IrcDeliveryReceipt, type IrcMessage } from "@oh-my-pi/pi-tui/tools/irc";
 import { logger, Snowflake, untilAborted } from "@oh-my-pi/pi-utils";
 import { AgentLifecycleManager } from "../registry/agent-lifecycle";
-import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
+import { AgentRegistry, type AgentRef, MAIN_AGENT_ID } from "../registry/agent-registry";
 import type { CustomMessage } from "../session/messages";
 
 interface IrcWaiter {
 	from?: string;
 	resolve: (msg: IrcMessage) => void;
 	cancel: () => void;
+}
+
+/** When a send went out: wall-clock `ts`, and `seq` to order sends within one millisecond. */
+interface SendMark {
+	ts: number;
+	seq: number;
+	fromRef?: WeakRef<AgentRef>;
+	toRef?: WeakRef<AgentRef>;
+	fromSessionId?: string;
+	fromRunId?: string;
+	toSessionId?: string;
+	fromFile?: string | null;
+	toFile?: string | null;
 }
 
 /** Mailbox cap per agent; oldest messages are dropped beyond it. */
@@ -43,8 +56,16 @@ export class IrcBus {
 	readonly #lifecycle: () => AgentLifecycleManager;
 	readonly #mailboxes = new Map<string, IrcMessage[]>();
 	readonly #waiters = new Map<string, IrcWaiter[]>();
-	/** Timestamp of the latest successful send per `from` → `to`; see {@link sentSince}. */
-	readonly #lastSent = new Map<string, Map<string, number>>();
+	/** The latest successful non-progress send per `from` → `to`; see {@link sentSince}. */
+	readonly #lastSent = new Map<string, Map<string, SendMark>>();
+	/** The latest direct (non-broadcast, non-progress) send per `from` → `to`; see {@link unansweredSends}. */
+	readonly #lastDirect = new Map<string, Map<string, SendMark>>();
+	/** The latest progress message per `from` → `to`: a promise that a reply will follow. */
+	readonly #lastProgress = new Map<string, Map<string, SendMark>>();
+	/** The latest accepted task result per agent → owner. */
+	readonly #lastJobReply = new Map<string, Map<string, SendMark>>();
+	/** Last {@link SendMark.seq} handed out, taken when a send starts. */
+	#sendSeq = 0;
 
 	constructor(registry: AgentRegistry = AgentRegistry.global(), lifecycle?: AgentLifecycleManager) {
 		this.#registry = registry;
@@ -75,31 +96,133 @@ export class IrcBus {
 		opts?: { suppressRelay?: boolean; signal?: AbortSignal },
 	): Promise<IrcDeliveryReceipt> {
 		const message: IrcMessage = { ...msg, id: Snowflake.next(), ts: Date.now() };
-		const receipt = await this.#deliver(message, opts);
-		if (receipt.outcome !== "failed") {
-			let sent = this.#lastSent.get(message.from);
-			if (!sent) {
-				sent = new Map();
-				this.#lastSent.set(message.from, sent);
+		// Taken before delivery: a reply sent while this message is still being
+		// delivered must still order after it.
+		const fromRef = this.#registry.get(message.from);
+		const mark: SendMark = {
+			ts: message.ts,
+			seq: ++this.#sendSeq,
+			fromRef: fromRef ? new WeakRef(fromRef) : undefined,
+			fromSessionId: fromRef?.session?.sessionManager?.getSessionId(),
+			fromRunId: fromRef?.session?.lifecycleState?.runId,
+			fromFile: fromRef?.sessionFile,
+		};
+		const receipt = await this.#deliver(message, opts, ref => {
+			mark.toRef = new WeakRef(ref);
+			mark.toSessionId = ref.session?.sessionManager?.getSessionId();
+			mark.toFile = ref.sessionFile;
+		});
+		if (receipt.outcome !== "failed" && this.#markCurrent(message.from, message.to, mark)) {
+			if (message.progress) {
+				this.#record(this.#lastProgress, message.from, message.to, mark);
+			} else {
+				this.#record(this.#lastSent, message.from, message.to, mark);
+				if (!message.broadcast && !message.wakeRelay)
+					this.#record(this.#lastDirect, message.from, message.to, mark);
 			}
-			sent.set(message.to, message.ts);
 		}
 		return receipt;
 	}
 
+	#record(table: Map<string, Map<string, SendMark>>, from: string, to: string, mark: SendMark): void {
+		let sent = table.get(from);
+		if (!sent) {
+			sent = new Map();
+			table.set(from, sent);
+		}
+		// Deliveries can settle out of order; keep the latest send.
+		if ((sent.get(to)?.seq ?? 0) < mark.seq) sent.set(to, mark);
+	}
+
+	/** Captures the originating refs before work starts; commit only an accepted result. */
+	captureReply(from: AgentRef, to: AgentRef): () => void {
+		const fromSession = from.session;
+		const toSession = to.session;
+		const toRunId = toSession?.lifecycleState?.runId;
+		const mark: SendMark = {
+			ts: 0,
+			seq: 0,
+			fromRef: new WeakRef(from),
+			fromSessionId: fromSession?.sessionManager?.getSessionId(),
+			fromFile: from.sessionFile,
+			toRef: new WeakRef(to),
+			toSessionId: toSession?.sessionManager?.getSessionId(),
+			toFile: to.sessionFile,
+		};
+		let committed = false;
+		return () => {
+			if (committed || to.session !== toSession || toSession?.lifecycleState?.runId !== toRunId) return;
+			mark.fromRunId = fromSession?.lifecycleState?.runId;
+			if (!this.#markCurrent(from.id, to.id, mark)) return;
+			committed = true;
+			mark.ts = Date.now();
+			mark.seq = ++this.#sendSeq;
+			this.#record(this.#lastJobReply, from.id, to.id, mark);
+		};
+	}
+
+	#markCurrent(from: string, to: string, mark: SendMark): boolean {
+		const fromRef = this.#registry.get(from);
+		const toRef = this.#registry.get(to);
+		return (
+			(mark.fromRef === undefined || fromRef !== undefined) &&
+			toRef !== undefined &&
+			mark.fromRef?.deref() === fromRef &&
+			mark.toRef?.deref() === toRef &&
+			fromRef?.sessionFile === mark.fromFile &&
+			toRef.sessionFile === mark.toFile &&
+			(!fromRef?.session || fromRef.session.sessionManager?.getSessionId() === mark.fromSessionId) &&
+			(!fromRef?.session || fromRef.session.lifecycleState?.runId === mark.fromRunId) &&
+			(!toRef.session || toRef.session.sessionManager?.getSessionId() === mark.toSessionId) &&
+			fromRef?.status !== "aborted" &&
+			toRef?.status !== "aborted"
+		);
+	}
+
 	/**
-	 * Whether `from` successfully sent `to` anything at or after `sinceTs`.
-	 * The wake-turn relay uses it to skip agents that already answered their
-	 * waker themselves.
+	 * Whether `from` successfully sent `to` anything, progress included, at or
+	 * after `sinceTs`. The wake-turn relay uses it to skip agents that already
+	 * answered their waker themselves, or promised it a later answer.
 	 */
 	sentSince(from: string, to: string, sinceTs: number): boolean {
-		const ts = this.#lastSent.get(from)?.get(to);
-		return ts !== undefined && ts >= sinceTs;
+		return [this.#lastSent, this.#lastProgress].some(table => {
+			const sent = table.get(from)?.get(to);
+			return sent !== undefined && this.#markCurrent(from, to, sent) && sent.ts >= sinceTs;
+		});
+	}
+
+	/**
+	 * Agents `from` messaged directly at or after `sinceTs` that have not
+	 * answered since, with when the latest of those messages went out: the
+	 * replies a `wait` can block for. A message back answers, and so does a
+	 * settled job of the agent `from` owns, which delivers its result. Progress
+	 * answers nothing; it marks the request `promised`, and from then on only
+	 * an explicit message answers it (a job settling the turn that sent the
+	 * progress must not). "Since" is by send order, not timestamp, so an answer
+	 * to an earlier question never settles a later one sent within the same
+	 * millisecond.
+	 */
+	unansweredSends(from: string, sinceTs: number): Array<{ to: string; sentAt: number; promised: boolean }> {
+		const sends = this.#lastDirect.get(from);
+		if (!sends) return [];
+		const unanswered: Array<{ to: string; sentAt: number; promised: boolean }> = [];
+		for (const [to, sent] of sends) {
+			if (sent.ts < sinceTs || !this.#markCurrent(from, to, sent)) continue;
+			const after = (table: Map<string, Map<string, SendMark>>) => {
+				const reply = table.get(to)?.get(from);
+				return reply !== undefined && this.#markCurrent(to, from, reply) && reply.seq > sent.seq;
+			};
+			const promised = after(this.#lastProgress);
+			if (after(this.#lastSent) || (!promised && after(this.#lastJobReply))) continue;
+			unanswered.push({ to, sentAt: sent.ts, promised });
+		}
+		return unanswered;
 	}
 
 	async #deliver(
 		message: IrcMessage,
 		opts?: { suppressRelay?: boolean; signal?: AbortSignal },
+		onDeliver?: (ref: AgentRef) => void,
 	): Promise<IrcDeliveryReceipt> {
 		const ref = this.#registry.get(message.to);
 		if (!ref) {
@@ -107,13 +230,6 @@ export class IrcBus {
 				to: message.to,
 				outcome: "failed",
 				error: `Unknown agent "${message.to}" — check the subagent roster or read history:// for known peers.`,
-			};
-		}
-		if (ref.status === "aborted") {
-			return {
-				to: message.to,
-				outcome: "failed",
-				error: `Agent "${message.to}" was hard-aborted and cannot be messaged or revived. Its transcript remains readable at history://${message.to}.`,
 			};
 		}
 		// Advisor refs are observability-only transcripts, never messageable peers.
@@ -125,25 +241,37 @@ export class IrcBus {
 			};
 		}
 
-		// A `parked` recipient always needs the lifecycle to revive it — this is
-		// read from *this* bus's registry, so it holds for any registry. The
-		// mid-park / adopted checks below query the lifecycle's own state, which
-		// only describes the registry it manages: consult them only when the
-		// lifecycle owns this bus's registry, otherwise a custom-registry bus
-		// (fallen back to the global manager) would gate a live recipient on
-		// unrelated global park state. Main/non-adopted live peers skip the gate,
-		// and pending waiters still win without a session.
+		// A `parked` or killed (`aborted`) recipient always needs the lifecycle to
+		// revive it from its transcript — this is read from *this* bus's registry,
+		// so it holds for any registry. The mid-park / adopted checks below query
+		// the lifecycle's own state, which only describes the registry it manages:
+		// consult them only when the lifecycle owns this bus's registry, otherwise
+		// a custom-registry bus (fallen back to the global manager) would gate a
+		// live recipient on unrelated global park state. Main/non-adopted live
+		// peers skip the gate, and pending waiters still win without a session.
 		const lifecycle = this.#lifecycle();
 		const lifecycleOwnsRegistry = lifecycle.manages(this.#registry);
 		const needsLifecycleGate =
 			ref.status === "parked" ||
+			ref.status === "aborted" ||
 			(lifecycleOwnsRegistry && (lifecycle.isParking(message.to) || lifecycle.has(message.to)));
 
 		const priorSession = ref.session;
+		let deliveryRef = ref;
+		let session = priorSession;
 		let revived = false;
 		if (needsLifecycleGate) {
+			if (!lifecycleOwnsRegistry) {
+				return { to: message.to, outcome: "failed", error: "Recipient lifecycle does not own this registry." };
+			}
 			try {
 				const liveSession = await untilAborted(opts?.signal, () => lifecycle.ensureLive(message.to));
+				const liveRef = this.#registry.get(message.to);
+				if (!liveRef || liveRef.session !== liveSession || liveRef.status === "aborted") {
+					throw new Error(`Agent "${message.to}" changed before its message could be delivered.`);
+				}
+				deliveryRef = liveRef;
+				session = liveSession;
 				// Revival = we did not keep the same live instance (parked start, or
 				// park completed and a fresh session was rebuilt).
 				revived = !priorSession || liveSession !== priorSession;
@@ -162,6 +290,14 @@ export class IrcBus {
 		if (opts?.signal?.aborted) {
 			return { to: message.to, outcome: "failed", error: "Peer delivery was cancelled or timed out." };
 		}
+		if (
+			this.#registry.get(message.to) !== deliveryRef ||
+			deliveryRef.session !== session ||
+			deliveryRef.status === "aborted"
+		) {
+			return { to: message.to, outcome: "failed", error: `Agent "${message.to}" changed before delivery.` };
+		}
+		onDeliver?.(deliveryRef);
 
 		// A pending `wait` from the recipient consumes the message directly —
 		// it is returned from their irc tool call and never hits the inbox or
@@ -173,7 +309,6 @@ export class IrcBus {
 			return { to: message.to, outcome: revived ? "revived" : "injected" };
 		}
 
-		const session = this.#registry.get(message.to)?.session;
 		if (!session) {
 			return { to: message.to, outcome: "failed", error: `Agent "${message.to}" has no live session.` };
 		}
@@ -187,7 +322,7 @@ export class IrcBus {
 			// the message so a later `wait`/`inbox` from the recipient can still
 			// pick it up. The receipt stays "failed" — the recipient has not
 			// seen it.
-			this.#enqueue(message);
+			if (this.#registry.get(message.to) === deliveryRef && deliveryRef.session === session) this.#enqueue(message);
 			return {
 				to: message.to,
 				outcome: "failed",

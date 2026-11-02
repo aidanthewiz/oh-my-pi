@@ -47,7 +47,7 @@ describe("AgentSession aside delivery", () => {
 
 	afterEach(async () => {
 		await session?.dispose();
-		authStorage.close();
+		await authStorage.close();
 		tempDir.removeSync();
 		AsyncJobManager.resetForTests();
 	});
@@ -456,6 +456,67 @@ describe("AgentSession aside delivery", () => {
 		expect(startedTurn).toBe(true);
 		expect(contexts).toHaveLength(1);
 		expect(JSON.stringify(contexts[0]!.messages)).toContain("IDLE_ASIDE_BODY");
+	});
+
+	it("two asides sent back to back to an idle session both reach the model, in order", async () => {
+		const model = createMockModel({ provider: "openai", id: "gpt-test" }).model;
+		const modelRegistry = new ModelRegistry(authStorage);
+		const contexts: Context[] = [];
+
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			convertToLlm,
+			streamFn: (_model, context) => {
+				contexts.push(context);
+				const message: AssistantMessage = {
+					role: "assistant",
+					content: [{ type: "text", text: "Acknowledged." }],
+					api: model.api,
+					provider: model.provider,
+					model: model.id,
+					usage: zeroUsage,
+					stopReason: "stop",
+					timestamp: Date.now(),
+				};
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					stream.push({ type: "start", partial: message });
+					stream.push({ type: "done", reason: "stop", message });
+				});
+				return stream;
+			},
+		});
+		const settings = Settings.isolated({ "compaction.enabled": false, "todo.enabled": false });
+		settings.setModelRole("default", `${model.provider}/${model.id}`);
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(tempDir.path()),
+			settings,
+			modelRegistry,
+			toolRegistry: new Map(),
+		});
+
+		const first = session.sendCustomMessage(
+			{ customType: "ext-aside", content: "FIRST_ASIDE", display: true, attribution: "agent" },
+			{ deliverAs: "aside", triggerTurn: true },
+		);
+		const second = session.sendCustomMessage(
+			{ customType: "ext-aside", content: "SECOND_ASIDE", display: true, attribution: "agent" },
+			{ deliverAs: "aside", triggerTurn: true },
+		);
+		await Promise.all([first, second]);
+		await session.waitForIdle();
+
+		const sent = JSON.stringify(contexts.at(-1)!.messages);
+		expect(sent).toContain("FIRST_ASIDE");
+		expect(sent).toContain("SECOND_ASIDE");
+		expect(sent.indexOf("FIRST_ASIDE")).toBeLessThan(sent.indexOf("SECOND_ASIDE"));
+		const persisted = session.sessionManager
+			.getEntries()
+			.filter(entry => entry.type === "custom_message")
+			.map(entry => entry.content);
+		expect(persisted).toEqual(["FIRST_ASIDE", "SECOND_ASIDE"]);
 	});
 
 	it("a stranded aside queued during an aborted turn does not leak into a fresh session (newSession)", async () => {
@@ -1662,5 +1723,68 @@ describe("AgentSession aside delivery", () => {
 		expect(mock.calls.length).toBe(2);
 		expect(events.indexOf("observer-finish")).toBeGreaterThan(events.indexOf("continuation-ran"));
 		expect(JSON.stringify(mock.calls[1]!.context.messages)).toContain("build ok");
+	});
+
+	it("a mid-stream steer mention rides the hidden session-agent notice like an idle prompt (#14093)", async () => {
+		const modelRegistry = new ModelRegistry(authStorage);
+		const started = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const mock = createMockModel({
+			provider: "openai",
+			id: "gpt-test",
+			responses: [
+				async () => {
+					started.resolve();
+					await release.promise;
+					return { content: ["done"] };
+				},
+				{ content: ["steer handled"] },
+			],
+		});
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model: mock.model, systemPrompt: ["Test"], tools: [], messages: [] },
+			convertToLlm,
+			streamFn: mock.stream,
+		});
+		const settings = Settings.isolated({ "compaction.enabled": false, "todo.enabled": false });
+		settings.setModelRole("default", `${mock.model.provider}/${mock.model.id}`);
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(tempDir.path()),
+			settings,
+			modelRegistry,
+			toolRegistry: new Map(),
+		});
+
+		const run = session.prompt("go");
+		await started.promise;
+
+		spyOn(modelRegistry, "getAvailable").mockReturnValue([mock.model]);
+		await session.prompt("delegate to ^openai/gpt-test", { streamingBehavior: "steer" });
+
+		release.resolve();
+		await run;
+		await session.waitForIdle();
+
+		const request = mock.calls.find(call =>
+			call.context.messages.some(
+				message => message.role === "user" && JSON.stringify(message.content).includes("delegate to"),
+			),
+		);
+		if (!request) throw new Error("The queued delegation never reached the provider");
+		const messages = request.context.messages;
+		const userIndex = messages.findIndex(
+			message => message.role === "user" && JSON.stringify(message.content).includes("delegate to"),
+		);
+		const noticeIndex = messages.findIndex(
+			message =>
+				message.role !== "user" &&
+				JSON.stringify(message.content).includes("m1") &&
+				JSON.stringify(message.content).includes("openai/gpt-test"),
+		);
+		expect(noticeIndex).toBeGreaterThanOrEqual(0);
+		expect(noticeIndex).toBeLessThan(userIndex);
+		expect(mock.calls.length).toBe(2);
 	});
 });

@@ -91,7 +91,7 @@ describe("print mode + plan.defaultOnStartup (#8272)", () => {
 	afterEach(async () => {
 		await session.abort().catch(() => {});
 		await session.dispose().catch(() => {});
-		authStorage.close();
+		await authStorage.close();
 		if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true });
 		vi.restoreAllMocks();
 		holder.session = undefined;

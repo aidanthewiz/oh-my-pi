@@ -14,8 +14,8 @@ import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
 const sharedAuthStorage = createInMemoryAuthStorage();
 const sharedModelRegistry = new ModelRegistry(sharedAuthStorage);
 
-afterAll(() => {
-	sharedAuthStorage.close();
+afterAll(async () => {
+	await sharedAuthStorage.close();
 });
 
 describe("AgentSession user shortcut hooks", () => {

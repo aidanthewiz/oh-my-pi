@@ -19,7 +19,16 @@ import {
 	resolveTelemetry,
 } from "@oh-my-pi/pi-agent-core";
 import { sendsImageInputOnWire } from "@oh-my-pi/pi-ai/providers/vision-guard";
-import type { Api, completeSimple, ImageContent, Model, TextContent } from "@oh-my-pi/pi-ai";
+import type {
+	Api,
+	AssistantMessage,
+	completeSimple,
+	ImageContent,
+	Model,
+	SimpleStreamOptions,
+	TextContent,
+} from "@oh-my-pi/pi-ai";
+import { getEffectiveTokenCost, getModelPricingStatus } from "@oh-my-pi/pi-catalog/models";
 import { logger, prompt, toError } from "@oh-my-pi/pi-utils";
 import { extractTextContent } from "../commit/utils";
 import type { ModelRegistry } from "../config/model-registry";
@@ -32,6 +41,7 @@ import {
 import type { Settings } from "../config/settings";
 import { type LocalProtocolOptions, resolveLocalRoot } from "../internal-urls";
 import { cfgImagesBlockImages } from "../modes/settings";
+import type { CostGate } from "../session/cost-gate";
 import { cfgImagesDescribeForTextModels } from "../session/settings";
 import describeUserPrompt from "../prompts/tools/image-attachment-describe.md" with { type: "text" };
 import describeSystemPrompt from "../prompts/tools/image-attachment-describe-system.md" with { type: "text" };
@@ -73,8 +83,13 @@ export interface DescribeAttachedImagesDeps {
 	activeModelString?: string;
 	telemetryConfig?: AgentTelemetryConfig;
 	sessionId?: string;
+	isCurrent?: () => boolean;
+	prepareStreamOptions?: (model: Model<Api>) => SimpleStreamOptions;
+	onUsage?: (message: AssistantMessage) => void;
 	/** Test seam: overrides the underlying completeSimple call. */
 	completeImpl?: typeof completeSimple;
+	/** The session tree's cost gate: at the cap images are not described, and each description's cost is added. */
+	costGate?: CostGate;
 }
 
 /** Map an image MIME type to a file extension for the saved artifact. */
@@ -117,9 +132,8 @@ function formatImageBlock(localUrl: string, description: string): string {
 }
 
 /**
- * Resolve a vision-capable model, mirroring image-question priority
- * (`@vision` → `@default` → active → first image-capable available), but
- * never returning a text-only model.
+ * Resolve a vision-capable model, honoring explicit roles and the active model
+ * before choosing the least expensive priced vision model as a last resort.
  */
 function resolveVisionModel(deps: DescribeAttachedImagesDeps): Model<Api> | undefined {
 	const available = getAllowedAvailableModels(deps.modelRegistry, deps.settings);
@@ -131,12 +145,25 @@ function resolveVisionModel(deps: DescribeAttachedImagesDeps): Model<Api> | unde
 		const model = resolveModelFromString(expanded, available, preferences);
 		return model && sendsImageInputOnWire(model) ? model : undefined;
 	};
-	return (
-		resolvePattern("@vision") ??
-		resolvePattern("@default") ??
-		resolvePattern(deps.activeModelString) ??
-		available.find(model => sendsImageInputOnWire(model))
-	);
+	const preferred = resolvePattern("@vision") ?? resolvePattern("@default") ?? resolvePattern(deps.activeModelString);
+	if (preferred) return preferred;
+
+	let cheapest: Model<Api> | undefined;
+	let cheapestPrice = Number.POSITIVE_INFINITY;
+	let firstImageModel: Model<Api> | undefined;
+	for (const model of available) {
+		if (!sendsImageInputOnWire(model)) continue;
+		firstImageModel ??= model;
+		// Rows without a rate card rank last; a declared free row prices at 0.
+		if (getModelPricingStatus(model) === "unknown") continue;
+		const cost = getEffectiveTokenCost(model.cost);
+		const price = cost.input + cost.output;
+		if (price < cheapestPrice) {
+			cheapest = model;
+			cheapestPrice = price;
+		}
+	}
+	return cheapest ?? firstImageModel;
 }
 
 /** Run one vision-description round-trip; returns trimmed text or `null` on any failure. */
@@ -147,7 +174,12 @@ async function describeImage(
 	telemetry: AgentTelemetry | undefined,
 	signal: AbortSignal | undefined,
 ): Promise<string | null> {
+	if (deps.costGate?.check()) return null;
 	try {
+		signal?.throwIfAborted();
+		if (deps.isCurrent?.() === false) throw new Error("Image description owner is no longer current");
+		const streamOptions = deps.prepareStreamOptions?.(visionModel);
+		const resolveCredential = deps.modelRegistry.resolver(visionModel, deps.sessionId);
 		const response = await instrumentedCompleteSimple(
 			visionModel,
 			{
@@ -163,9 +195,40 @@ async function describeImage(
 					},
 				],
 			},
-			{ apiKey: deps.modelRegistry.resolver(visionModel, deps.sessionId), signal },
+			{
+				...streamOptions,
+				apiKey: async context => {
+					signal?.throwIfAborted();
+					if (deps.isCurrent?.() === false) throw new Error("Image description owner changed before credentials");
+					const resolved = await resolveCredential(context);
+					signal?.throwIfAborted();
+					if (deps.isCurrent?.() === false) throw new Error("Image description owner changed during credentials");
+					return resolved;
+				},
+				signal,
+				onPayload: async (payload, model, requestSignal) => {
+					signal?.throwIfAborted();
+					if (deps.isCurrent?.() === false) throw new Error("Image description owner changed before dispatch");
+					const replacement = await streamOptions?.onPayload?.(payload, model, requestSignal);
+					signal?.throwIfAborted();
+					if (deps.isCurrent?.() === false) throw new Error("Image description owner changed during admission");
+					deps.costGate?.admit();
+					return replacement ?? payload;
+				},
+				onResponse: async (response, model, requestSignal) => {
+					if (signal?.aborted || deps.isCurrent?.() === false) return;
+					await streamOptions?.onResponse?.(response, model, requestSignal);
+				},
+				onSseEvent: (event, model) => {
+					if (!signal?.aborted && deps.isCurrent?.() !== false) streamOptions?.onSseEvent?.(event, model);
+				},
+			},
 			{ telemetry, oneshotKind: ONESHOT_KIND, completeImpl: deps.completeImpl },
 		);
+		deps.costGate?.record(response.usage.cost.total);
+		deps.onUsage?.(response);
+		signal?.throwIfAborted();
+		if (deps.isCurrent?.() === false) return null;
 		if (response.stopReason === "error" || response.stopReason === "aborted") {
 			logger.warn("image attachment description did not complete", {
 				stopReason: response.stopReason,
@@ -195,15 +258,23 @@ export async function describeAttachedImagesForTextModel(
 	deps: DescribeAttachedImagesDeps,
 	signal?: AbortSignal,
 ): Promise<TextContent[]> {
+	signal?.throwIfAborted();
+	if (deps.isCurrent?.() === false) throw new Error("Image description owner is no longer current");
 	const localRoot = resolveLocalRoot(deps.localProtocolOptions);
 	const visionModel = resolveVisionModel(deps);
-	const apiKey = visionModel ? await deps.modelRegistry.getApiKey(visionModel, deps.sessionId) : undefined;
+	const apiKey = visionModel ? await deps.modelRegistry.getApiKey(visionModel, deps.sessionId, { signal }) : undefined;
+	signal?.throwIfAborted();
+	if (deps.isCurrent?.() === false) throw new Error("Image description owner changed during credential resolution");
 	const canDescribe = Boolean(visionModel && apiKey);
 	const telemetry = resolveTelemetry(deps.telemetryConfig, deps.sessionId);
 
-	return Promise.all(
+	const results = await Promise.allSettled(
 		images.map(async (image): Promise<TextContent> => {
+			signal?.throwIfAborted();
+			if (deps.isCurrent?.() === false) throw new Error("Image description owner changed before saving attachment");
 			const localUrl = await saveImage(image, localRoot);
+			signal?.throwIfAborted();
+			if (deps.isCurrent?.() === false) throw new Error("Image description owner changed while saving attachment");
 			let description: string;
 			if (canDescribe && visionModel) {
 				description =
@@ -214,4 +285,10 @@ export async function describeAttachedImagesForTextModel(
 			return { type: "text", text: formatImageBlock(localUrl, description) };
 		}),
 	);
+	const descriptions: TextContent[] = [];
+	for (const result of results) {
+		if (result.status === "rejected") throw result.reason;
+		descriptions.push(result.value);
+	}
+	return descriptions;
 }

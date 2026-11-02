@@ -6,8 +6,10 @@
  * it. `omp worktree clear` consults the marker so it can distinguish a live
  * subagent's sandbox from a crashed run's leftover instead of deleting both.
  */
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as natives from "@oh-my-pi/pi-natives";
+import { filterChildShellEnv, isEnoent } from "@oh-my-pi/pi-utils";
 import { $ } from "bun";
 
 const { IsoBackendKind } = natives;
@@ -75,9 +77,9 @@ export async function writeIsolationOwner(baseDir: string, id: string): Promise<
 /**
  * Whether a live omp process still owns the sandbox at `baseDir`.
  *
- * A missing or malformed marker means no verifiable owner — a crashed run or a
- * sandbox from before markers existed, both safe to reclaim. `process.kill(pid,
- * 0)` can fail with `EPERM` even when the process is alive, so only an explicit
+ * A missing or malformed marker means no verifiable owner. Removal still needs
+ * a separate mount-safety check. `process.kill(pid, 0)` can fail with `EPERM`
+ * even when the process is alive, so only an explicit
  * `ESRCH` ("no such process") counts as dead; any other error is treated as
  * alive to avoid deleting a sandbox that is actually in use. When the marker
  * carries a {@link IsolationOwner.startToken}, a live pid whose current token no
@@ -132,8 +134,7 @@ export function needsNativeTeardown(backend: unknown): backend is number {
 
 /**
  * Record which backend built a retained workspace, so cleanup can route it
- * through native teardown before removal. Best-effort: retention stays valid
- * without it (the workspace merely falls back to plain recursive removal).
+ * through native teardown before removal. A failed write never authorizes removal.
  */
 export async function writeRetainedBackend(baseDir: string, backend: number): Promise<void> {
 	await Bun.write(
@@ -151,17 +152,110 @@ export async function writeRetainedBackend(baseDir: string, backend: number): Pr
  * the mount. A well-formed record for a backend needing no teardown keeps
  * today's removal behavior.
  */
-export async function readRetainedMountBackend(dir: string): Promise<number | undefined> {
+async function readRetainedBackend(dir: string): Promise<number | undefined> {
 	const sidecar = path.join(dir, RETAINED_BACKEND_FILE);
-	if (!(await Bun.file(sidecar).exists())) return undefined;
-	const decoded: unknown = await Bun.file(sidecar).json();
+	let decoded: unknown;
+	try {
+		decoded = JSON.parse(await fs.readFile(sidecar, "utf8"));
+	} catch (err) {
+		if (isEnoent(err)) return undefined;
+		throw err;
+	}
 	if (typeof decoded !== "object" || decoded === null || !("backend" in decoded)) {
 		throw new Error(`retained-mount metadata at ${sidecar} is malformed`);
 	}
 	const backend = decoded.backend;
-	if (typeof backend !== "number" || !Number.isInteger(backend)) {
+	if (typeof backend !== "number" || !Object.values(IsoBackendKind).includes(backend)) {
 		throw new Error(`retained-mount metadata at ${sidecar} is malformed`);
 	}
-	if (!needsNativeTeardown(backend)) return undefined;
 	return backend;
+}
+
+export async function readRetainedMountBackend(dir: string): Promise<number | undefined> {
+	const backend = await readRetainedBackend(dir);
+	if (backend === IsoBackendKind.Zfs) throw new Error(`ZFS workspace at ${dir} requires manual dataset teardown`);
+	return needsNativeTeardown(backend) ? backend : undefined;
+}
+
+/** Refuse recursive removal through a mount or a live isolation owner, including nested workspaces. */
+export async function assertWorktreeRemovalSafe(
+	dir: string,
+	options: { ownedRoot?: boolean; stoppedRoot?: boolean; stoppingRoot?: string } = {},
+): Promise<void> {
+	let root: string;
+	try {
+		root = await fs.realpath(dir);
+	} catch (err) {
+		if (isEnoent(err)) return;
+		throw err;
+	}
+	const stoppingRoot = options.stoppingRoot
+		? await fs.realpath(options.stoppingRoot).catch(err => {
+				if (isEnoent(err)) return undefined;
+				throw err;
+			})
+		: undefined;
+	const withinRoot = (candidate: string): boolean => candidate === root || candidate.startsWith(`${root}${path.sep}`);
+	let mounts: string[];
+	if (process.platform === "linux") {
+		mounts = (await fs.readFile("/proc/self/mountinfo", "utf8"))
+			.trim()
+			.split("\n")
+			.map(line => {
+				const point = line.split(" ")[4];
+				if (!point?.startsWith("/")) throw new Error("Cannot read the mount table safely");
+				return point.replace(/\\([0-7]{3})/g, (_, octal: string) => String.fromCharCode(Number.parseInt(octal, 8)));
+			});
+	} else if (process.platform === "darwin") {
+		const result = await $`/sbin/mount`.env(filterChildShellEnv(Bun.env, root)).quiet().nothrow();
+		if (result.exitCode !== 0) throw new Error("Cannot read the mount table safely");
+		mounts = result
+			.text()
+			.trim()
+			.split("\n")
+			.map(line => {
+				const point = /^.+? on (.+) \([^)]*\)$/.exec(line)?.[1];
+				if (!point?.startsWith("/")) throw new Error("Cannot read the mount table safely");
+				return point;
+			});
+	} else if (process.platform === "win32") {
+		mounts = [];
+	} else {
+		throw new Error(`Cannot verify mount safety on ${process.platform}`);
+	}
+	for (const mount of mounts) {
+		if (withinRoot(mount) && mount !== stoppingRoot)
+			throw new Error(`Refusing removal through mounted workspace ${mount}`);
+	}
+	const visit = async (current: string): Promise<void> => {
+		const entries = await fs.readdir(current, { withFileTypes: true });
+		const isolation = entries.some(
+			entry =>
+				entry.name === ISOLATION_OWNER_FILE ||
+				entry.name === RETAINED_BACKEND_FILE ||
+				(entry.isDirectory() && (entry.name === "m" || entry.name === "merged")),
+		);
+		if (isolation) {
+			if (!(current === root && options.ownedRoot) && (await hasLiveIsolationOwner(current))) {
+				throw new Error(`Refusing removal of live isolation workspace ${current}`);
+			}
+			const backend = await readRetainedBackend(current);
+			if (backend === IsoBackendKind.Zfs && !(current === root && (options.stoppedRoot || options.stoppingRoot))) {
+				throw new Error(`ZFS workspace at ${current} requires manual dataset teardown`);
+			}
+			if (
+				process.platform === "win32" &&
+				entries.some(entry => entry.isDirectory() && (entry.name === "m" || entry.name === "merged")) &&
+				!(current === root && (options.stoppedRoot || options.stoppingRoot)) &&
+				backend !== IsoBackendKind.Rcopy &&
+				backend !== IsoBackendKind.WindowsBlockClone
+			) {
+				throw new Error(`Cannot verify unrecorded mount state at ${current}`);
+			}
+		}
+		for (const entry of entries) {
+			if (entry.isDirectory()) await visit(path.join(current, entry.name));
+		}
+	};
+	await visit(root);
 }

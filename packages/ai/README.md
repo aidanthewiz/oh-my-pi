@@ -84,7 +84,7 @@ Unified LLM API with automatic model discovery, provider configuration, token an
 - **vLLM** (OpenAI-compatible server; `VLLM_API_KEY` for secured deployments)
 - **GitHub Copilot** (requires OAuth, see below)
 - **Google Gemini CLI** (requires OAuth, see below)
-- **Antigravity** (requires OAuth, see below)
+- **Google Antigravity** (requires OAuth, see below)
 - **Any OpenAI-compatible API**: LM Studio, custom proxies, etc.
 
 ## Installation
@@ -396,6 +396,10 @@ All streaming events emitted during assistant message generation:
 | `done`           | Stream complete          | `reason`: Stop reason ("stop", "length", "toolUse"), `message`: Final assistant message     |
 | `error`          | Error occurred           | `reason`: Error type ("error" or "aborted"), `error`: AssistantMessage with partial content |
 
+The auth gateway's OpenAI chat SSE encoder sends `: keepalive` comments every 15 seconds while a stream remains open.
+These comments are not assistant events.
+Request abort, response cancellation, completion, and errors retire the keepalive timer.
+
 ## Image Input
 
 Models with vision capabilities can process images. You can check if a model supports images via the `input` property. If you pass images to a non-vision model, they are silently ignored.
@@ -564,6 +568,8 @@ if (message.stopReason === "error" || message.stopReason === "aborted") {
 	// message.usage contains partial token counts and costs
 }
 ```
+
+If the provider discards partial output by returning an error message with empty `content`, the final result remains empty. Leaked-thinking healing does not reconstruct discarded blocks from earlier streaming deltas.
 
 ### Aborting Requests
 
@@ -1029,7 +1035,7 @@ Several providers support OAuth authentication (some also support static API key
 - **OpenAI Codex** (ChatGPT Plus/Pro subscription, access to GPT-5.x Codex models)
 - **GitHub Copilot** (Copilot subscription)
 - **Google Gemini CLI** (Gemini 2.0/2.5 via Google Cloud Code Assist; free tier or paid subscription)
-- **Antigravity** (Free Gemini 3, Claude, GPT-OSS via Google Cloud)
+- **Google Antigravity** (Gemini, Claude, GPT-OSS via Google Cloud)
 - **Qwen Portal** (Qwen OAuth token or API key)
 - **Snowflake Cortex** (Snowflake account OAuth with PKCE and refresh, subject to the account's local-application integration)
 
@@ -1182,6 +1188,12 @@ for request authentication. Transient OAuth refresh failures reject with
 Use `keys.get` for availability probes; it returns `undefined` for these failures.
 Transient failures retain the stored credential. A restricted session cannot
 use another account or a static key to bypass its account pool.
+
+Await `authStorage.close()` before exiting or removing its database.
+It drains OAuth account recovery, credential validation, rotations, and rate-limit mutations.
+OAuth exchanges whose requesting caller was canceled can finish persisting their rotated tokens.
+`replaceStore()` drains the originating generation before exposing replacement credentials.
+Shutdown prevents new local or broker-delegated token exchanges.
 
 When an auth-broker client requests recovery after a provider rejects an OAuth
 bearer, the broker may reuse a still-fresh token that it minted in the previous

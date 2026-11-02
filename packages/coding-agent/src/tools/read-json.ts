@@ -1,12 +1,18 @@
-import * as fs from "node:fs/promises";
-import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
-import { Shell } from "@oh-my-pi/pi-natives";
+import { Shell, ShellFsOp, type ShellFilesystem } from "@oh-my-pi/pi-natives";
 import type { ReadToolDetails } from "@oh-my-pi/pi-tui/tools/read";
-import { DEFAULT_MAX_LINES, truncateHead, truncateTail } from "@oh-my-pi/pi-tui/tools/streaming-output";
+import { DEFAULT_MAX_LINES, truncateHead, truncateMiddle, truncateTail } from "@oh-my-pi/pi-tui/tools/streaming-output";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
-import { filterChildShellEnv, isEnoent, sanitizeText } from "@oh-my-pi/pi-utils";
+import {
+	filterChildShellEnv,
+	IMAGE_METADATA_HEADER_BYTES,
+	parseHeifImageMimeType,
+	parseImageMetadata,
+	sanitizeText,
+	TempDir,
+} from "@oh-my-pi/pi-utils";
+import { peekFile } from "@oh-my-pi/pi-utils/peek-file";
 import type { ToolSession } from "../sdk";
 import { quotePosixArgument } from "../utils/shell-quote";
 import { resolveReadPath } from "./path-utils";
@@ -21,7 +27,22 @@ import { parseSel } from "./read-selector";
 import { throwIfAborted } from "./tool-errors";
 import { toolResult } from "./tool-result";
 
-const JSON_FILE_PATTERN = /\.(?:jsonl?|ndjson)$/i;
+/** A JSON name, including a backup or dated copy of one (`config.json.bak`, `data.jsonl~`). */
+const JSON_FILE_PATTERN = /\.(?:jsonl?|ndjson)(?:[.~][^/\\]*)?$/i;
+const UTF8_BOM = [0xef, 0xbb, 0xbf] as const;
+
+/** Whether `header` opens a JSON object or array, after an optional UTF-8 BOM and whitespace. */
+function opensLikeJson(header: Uint8Array): boolean {
+	let index = header[0] === UTF8_BOM[0] && header[1] === UTF8_BOM[1] && header[2] === UTF8_BOM[2] ? 3 : 0;
+	while (
+		index < header.length &&
+		(header[index] === 0x20 || header[index] === 0x09 || header[index] === 0x0a || header[index] === 0x0d)
+	) {
+		index++;
+	}
+	return header[index] === 0x7b || header[index] === 0x5b;
+}
+
 const DEFAULT_JSON_QUERY_LIMIT = 100;
 const MAX_JSON_QUERY_LIMIT = 1000;
 const MAX_QUERY_CAPTURE_CHARS = 5 * 1024 * 1024;
@@ -31,10 +52,71 @@ const JSON_QUERY_TIMEOUT_MS = 30_000;
  * filled page usually means jaq is about to exit; let it finish first.
  */
 const PAGE_FULL_ABORT_DELAY_MS = 50;
+/** jaq interpolates the offending value into a diagnostic; middle-eliding each line keeps its reason and key. */
+const JSON_QUERY_ERROR_LINE_MAX_BYTES = 512;
 /** Bounds the jq stderr quoted in a result; the tail keeps the error after any `debug` lines. */
 const JSON_QUERY_ERROR_MAX_BYTES = 8 * 1024;
+const JSON_QUERY_ERROR_DECODE_BYTES = 4096;
 /** jaq's default pretty-print indent. */
 const PRETTY_INDENT = "  ";
+
+/** Bound each diagnostic line before retaining the most recent diagnostics. */
+function captureJqStderr(): { filesystem: ShellFilesystem; finish: () => string } {
+	const decoder = new TextDecoder();
+	const halfLine = JSON_QUERY_ERROR_LINE_MAX_BYTES / 2;
+	let head = "";
+	let tail = "";
+	let lineLength = 0;
+	let retained = "";
+	const endLine = () => {
+		const line = lineLength > head.length + tail.length ? `${head}[…elided…]${tail}` : head + tail;
+		const bounded = truncateMiddle(sanitizeText(line), { maxBytes: JSON_QUERY_ERROR_LINE_MAX_BYTES }).content;
+		retained = truncateTail(`${retained}${bounded}\n`, { maxBytes: JSON_QUERY_ERROR_MAX_BYTES }).content;
+		head = "";
+		tail = "";
+		lineLength = 0;
+	};
+	const append = (text: string) => {
+		let start = 0;
+		while (start < text.length) {
+			const newline = text.indexOf("\n", start);
+			const end = newline === -1 ? text.length : newline;
+			const headEnd = Math.min(end, start + halfLine - head.length);
+			head += text.slice(start, headEnd);
+			lineLength += end - start;
+			if (end - headEnd >= halfLine) tail = text.slice(end - halfLine, end);
+			else tail = (tail + text.slice(headEnd, end)).slice(-halfLine);
+			if (newline === -1) break;
+			endLine();
+			start = newline + 1;
+		}
+	};
+	return {
+		filesystem: {
+			nativeLocalPaths: true,
+			handler: async (error, request) => {
+				if (error) return { error: { code: "EIO", message: error.message } };
+				if (request.op === ShellFsOp.Open && request.path === "jq-stderr://capture") return { handle: 1 };
+				if (request.handle === 1) {
+					if (request.op === ShellFsOp.Write && request.data) {
+						for (let offset = 0; offset < request.data.length; offset += JSON_QUERY_ERROR_DECODE_BYTES) {
+							const bytes = request.data.subarray(offset, offset + JSON_QUERY_ERROR_DECODE_BYTES);
+							append(decoder.decode(bytes, { stream: true }));
+						}
+						return { written: request.data.length };
+					}
+					if (request.op === ShellFsOp.Flush || request.op === ShellFsOp.Close) return {};
+				}
+				return { error: { code: "EBADF", message: "Invalid JSON diagnostic capture operation" } };
+			},
+		},
+		finish: () => {
+			append(decoder.decode());
+			if (lineLength > 0) endLine();
+			return retained.trim();
+		},
+	};
+}
 
 /** One page of query results requested via `offset`/`limit`. */
 export interface JsonPage {
@@ -55,32 +137,34 @@ export interface JsonSelector {
 type JqStop = "capture-cap" | "page-full";
 
 /**
- * Splits `file.json?q=…` at its first `?`; null unless the text before it names
- * a `.json`, `.jsonl`, or `.ndjson` file. jq filters may contain `?`, paths rarely do.
+ * Splits a selector target at its first `?`, independently of the file extension.
+ * Admission still requires recognized parameters and an existing non-image file.
  */
 export function splitJsonQueryTarget(readPath: string): { jsonPath: string; queryString: string } | null {
 	const queryIndex = readPath.indexOf("?");
 	if (queryIndex === -1) return null;
 	const jsonPath = readPath.slice(0, queryIndex);
-	return JSON_FILE_PATTERN.test(jsonPath) ? { jsonPath, queryString: readPath.slice(queryIndex + 1) } : null;
+	return { jsonPath, queryString: readPath.slice(queryIndex + 1) };
 }
 
 /**
- * Parses `q`, `raw`, `compact`, `offset`, and `limit`; null without a filter.
+ * Parses `q`/`query`, `raw`, `compact`, `offset`, and `limit`.
+ * Modifiers or an empty filter imply `.`; unknown-only query strings return null.
  * `q` is percent-decoded but never form-decoded, so jq's `+` survives.
  */
 export function parseJsonSelector(queryString: string): JsonSelector | null {
 	const match = /(?:^|&)(?:q|query)=([^&]*)/.exec(queryString);
-	if (!match?.[1]) return null;
+	const params = new URLSearchParams(queryString);
+	if (!match && !["raw", "compact", "offset", "limit"].some(name => params.has(name))) return null;
+	const encodedQuery = match?.[1] || ".";
 	let query: string;
 	try {
-		query = decodeURIComponent(match[1]);
+		query = decodeURIComponent(encodedQuery);
 	} catch {
 		// A filter with a bare `%` (jq modulo) is not valid percent-encoding; take it verbatim.
-		query = match[1];
+		query = encodedQuery;
 	}
 
-	const params = new URLSearchParams(queryString);
 	const flag = (name: string) => {
 		const value = params.get(name)?.toLowerCase();
 		return value === "true" || value === "1";
@@ -216,28 +300,10 @@ function pageStream(values: string[], selector: JsonSelector, page: JsonPage, mo
 	return lines.join("\n");
 }
 
-async function readStderr(stderrPath: string): Promise<string> {
-	try {
-		const file = await fs.open(stderrPath, "r");
-		try {
-			const stat = await file.stat();
-			const size = Math.min(stat.size, JSON_QUERY_ERROR_MAX_BYTES);
-			const buffer = Buffer.alloc(size);
-			const { bytesRead } = await file.read(buffer, 0, size, Math.max(0, stat.size - size));
-			return buffer.toString("utf8", 0, bytesRead);
-		} finally {
-			await file.close();
-		}
-	} catch (err) {
-		if (isEnoent(err)) return "";
-		throw err;
-	}
-}
-
 /**
- * Runs the bundled jaq over `filePath` and captures stdout; stderr goes to a
- * temp file so diagnostics never mix into result values. Capture stops at
- * {@link MAX_QUERY_CAPTURE_CHARS} or after `stopAfterLines` newlines.
+ * Runs the bundled jaq over `filePath` and captures stdout. A routed stderr
+ * sink bounds diagnostics as they arrive, separately from result values.
+ * Capture stops at {@link MAX_QUERY_CAPTURE_CHARS} or after `stopAfterLines` newlines.
  *
  * Like jq, jaq reports an input that fails and goes on with the rest, exiting
  * 0 unless the last input failed; `stderr` carries those reports.
@@ -253,12 +319,11 @@ async function runJq(
 	const { signal, stopAfterLines, cwd } = options;
 	throwIfAborted(signal);
 
-	const scratchDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-jq-"));
-	const stderrPath = path.join(scratchDir, "stderr");
+	const diagnostics = captureJqStderr();
 	const env = { ...filterChildShellEnv(Bun.env, cwd), PI_DISABLE_UUTILS_BUILTINS: "0" };
 	// jaq parses any argument starting with `-` as flags even when shell-quoted;
 	// `--` keeps filters such as `-.price` positional.
-	const command = `set -o pipefail; { jq ${flags.join(" ")} -- ${quotePosixArgument(query)} ${quotePosixArgument(filePath)} 2>&1 1>&3 | tail -c ${JSON_QUERY_ERROR_MAX_BYTES} >${quotePosixArgument(stderrPath)}; } 3>&1`;
+	const command = `jq ${flags.join(" ")} -- ${quotePosixArgument(query)} ${quotePosixArgument(filePath)} 2>jq-stderr://capture`;
 
 	let output = "";
 	let lines = 0;
@@ -276,7 +341,7 @@ async function runJq(
 
 	try {
 		throwIfAborted(signal);
-		const result = await new Shell({ clearEnv: true, sessionEnv: env }).run(
+		const result = await new Shell({ clearEnv: true, sessionEnv: env, filesystem: diagnostics.filesystem }).run(
 			{ command, timeoutMs: JSON_QUERY_TIMEOUT_MS, signal: run.signal },
 			(err, chunk) => {
 				if (err) callbackError = true;
@@ -296,9 +361,7 @@ async function runJq(
 		if (result.timedOut && !stopped) {
 			throw new ToolError(`JSON query timed out after ${JSON_QUERY_TIMEOUT_MS / 1000} seconds`);
 		}
-		const stderr = truncateTail(sanitizeText(await readStderr(stderrPath)).trim(), {
-			maxBytes: JSON_QUERY_ERROR_MAX_BYTES,
-		}).content;
+		const stderr = diagnostics.finish();
 		if (!stopped && (result.exitCode !== 0 || callbackError)) {
 			throw new ToolError(`Failed to execute JSON query: ${stderr || `jq exited with code ${result.exitCode}`}`);
 		}
@@ -306,7 +369,6 @@ async function runJq(
 	} finally {
 		clearTimeout(abortTimer);
 		signal?.removeEventListener("abort", onAbort);
-		await fs.rm(scratchDir, { recursive: true, force: true });
 	}
 }
 
@@ -363,15 +425,22 @@ export async function executeJsonQuery(
 	return withStderr(text, stderr);
 }
 
-/** A JSON file path with its parsed `?q=` selector, ready for {@link readJson}. */
+/** A JSON file path with its parsed selector, ready for {@link readJson}. */
 export interface ResolvedJsonReadPath {
 	absolutePath: string;
 	selector: JsonSelector;
 	suffixResolution?: { from: string; to: string };
 }
 
+/** An already-bounded virtual text resource, queried locally without exposing scratch paths. */
+export interface ResolvedJsonReadResource {
+	url: string;
+	content: string;
+	selector: JsonSelector;
+}
+
 /**
- * Resolves `file.json?q=…` to an existing file, falling back to a unique
+ * Resolves `file?q=…` to an existing non-image file, falling back to a unique
  * workspace suffix match; null when the path is not a JSON query or no file exists.
  */
 export async function resolveJsonReadPath(
@@ -386,9 +455,20 @@ export async function resolveJsonReadPath(
 	if (!selector) return null;
 
 	const absolutePath = resolveReadPath(target.jsonPath, session.cwd);
+	// A `.json`/`.jsonl`/`.ndjson` name always admits; any other name (a backup, an
+	// extensionless file) admits only when it opens like JSON, so `?q=` on a video,
+	// SVG, PDF or raster image keeps its vision-question route.
+	const resolved = async (filePath: string): Promise<boolean> => {
+		const stat = await Bun.file(filePath).stat();
+		if (!stat.isFile()) return false;
+		const jsonName = JSON_FILE_PATTERN.test(filePath);
+		return peekFile(filePath, IMAGE_METADATA_HEADER_BYTES, header => {
+			if (parseImageMetadata(header) || parseHeifImageMimeType(header)) return false;
+			return jsonName || opensLikeJson(header);
+		});
+	};
 	try {
-		const stat = await Bun.file(absolutePath).stat();
-		return stat.isFile() ? { absolutePath, selector } : null;
+		return (await resolved(absolutePath)) ? { absolutePath, selector } : null;
 	} catch (error) {
 		if (!isNotFoundError(error) || isRemoteMountPath(absolutePath)) return null;
 	}
@@ -396,8 +476,7 @@ export async function resolveJsonReadPath(
 	const suffixMatch = await findSuffixMatchCached(session, suffixCache, target.jsonPath, signal);
 	if (!suffixMatch) return null;
 	try {
-		const stat = await Bun.file(suffixMatch.absolutePath).stat();
-		if (!stat.isFile()) return null;
+		if (!(await resolved(suffixMatch.absolutePath))) return null;
 	} catch (error) {
 		if (isNotFoundError(error)) return null;
 		throw error;
@@ -412,32 +491,43 @@ export async function resolveJsonReadPath(
 /** Runs a resolved JSON query and renders it as a read result; `lineSelector` slices the output. */
 export async function readJson(
 	session: ToolSession,
-	resolvedJsonPath: ResolvedJsonReadPath,
+	resolvedJsonPath: ResolvedJsonReadPath | ResolvedJsonReadResource,
 	lineSelector?: string,
 	signal?: AbortSignal,
 ): Promise<AgentToolResult<ReadToolDetails>> {
 	throwIfAborted(signal);
 
+	const file = "absolutePath" in resolvedJsonPath ? resolvedJsonPath : undefined;
+	const resource = "url" in resolvedJsonPath ? resolvedJsonPath : undefined;
 	const details: ReadToolDetails = {
-		resolvedPath: resolvedJsonPath.absolutePath,
-		suffixResolution: resolvedJsonPath.suffixResolution,
+		resolvedPath: file?.absolutePath,
+		suffixResolution: file?.suffixResolution,
 	};
 
-	const queryOutput = await executeJsonQuery(
-		resolvedJsonPath.absolutePath,
-		resolvedJsonPath.selector,
-		signal,
-		session.cwd,
-	);
+	let queryOutput: string;
+	if ("url" in resolvedJsonPath) {
+		await using scratch = await TempDir.create("@omp-read-json-");
+		const inputPath = scratch.join("input.json");
+		await Bun.write(inputPath, resolvedJsonPath.content);
+		queryOutput = await executeJsonQuery(inputPath, resolvedJsonPath.selector, signal, session.cwd);
+	} else {
+		queryOutput = await executeJsonQuery(
+			resolvedJsonPath.absolutePath,
+			resolvedJsonPath.selector,
+			signal,
+			session.cwd,
+		);
+	}
 
-	const output = prependSuffixResolutionNotice(queryOutput, resolvedJsonPath.suffixResolution);
+	const output = prependSuffixResolutionNotice(queryOutput, file?.suffixResolution);
 
 	if (lineSelector) {
 		const parsedSel = parseSel(lineSelector);
 		if (parsedSel.kind !== "none") {
 			return buildInMemorySelectorResult(session, output, parsedSel, {
 				details,
-				sourcePath: resolvedJsonPath.absolutePath,
+				sourcePath: file?.absolutePath,
+				sourceInternal: resource?.url,
 				entityLabel: "JSON query output",
 				immutable: true,
 			});
@@ -446,9 +536,9 @@ export async function readJson(
 
 	const truncation = truncateHead(output, { maxLines: DEFAULT_MAX_LINES });
 	details.truncation = truncation.truncated ? toReadTruncationStats(truncation) : undefined;
-	const resultBuilder = toolResult<ReadToolDetails>(details)
-		.text(truncation.content)
-		.sourcePath(resolvedJsonPath.absolutePath);
+	const resultBuilder = toolResult<ReadToolDetails>(details).text(truncation.content);
+	if (resource) resultBuilder.sourceInternal(resource.url);
+	else if (file) resultBuilder.sourcePath(file.absolutePath);
 	if (truncation.truncated) {
 		resultBuilder.truncation(truncation, { direction: "head" });
 	}

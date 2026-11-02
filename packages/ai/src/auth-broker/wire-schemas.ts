@@ -34,6 +34,7 @@ import type {
 	CredentialBlocksDeleteResponse,
 	CredentialBlocksDeleteRequest,
 	CredentialDisableResponse,
+	CredentialRefreshRequest,
 	CredentialRefreshResponse,
 	CredentialUploadRequest,
 	CredentialUploadResponse,
@@ -361,6 +362,11 @@ export const clientUsageSummaryResponseSchema: FluentType<ClientUsageSummaryResp
 });
 
 // ─── Refresh ─────────────────────────────────────────────────────────────────
+
+export const credentialRefreshRequestSchema: FluentType<CredentialRefreshRequest> = type({
+	"+": "reject",
+	"rejectedAccess?": type("string").atLeastLength(1),
+});
 
 export const credentialRefreshResponseSchema: FluentType<CredentialRefreshResponse> = type({
 	"+": "reject",

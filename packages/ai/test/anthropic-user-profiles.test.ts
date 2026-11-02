@@ -221,7 +221,7 @@ it("forwards inbound Anthropic user-profile attribution through the gateway to u
 		expect(preflight.headers.get("access-control-allow-headers")).toContain("anthropic-user-profile-id");
 	} finally {
 		await gateway.close();
-		storage.close();
+		await storage.close();
 		await fs.rm(dir, { recursive: true, force: true });
 		upstream.stop(true);
 	}

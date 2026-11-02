@@ -36,7 +36,7 @@ describe("AgentSession session_stop willContinue", () => {
 			session = undefined;
 		}
 		vi.restoreAllMocks();
-		authStorage.close();
+		await authStorage.close();
 		tempDir.removeSync();
 	});
 

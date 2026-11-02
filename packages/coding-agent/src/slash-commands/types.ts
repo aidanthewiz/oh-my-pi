@@ -1,6 +1,10 @@
 import type { Settings } from "../config/settings";
 import type { SlashCommandIconName } from "@oh-my-pi/pi-tui/theme/symbols";
 import type { InteractiveModeContext, SubmittedUserInput } from "../modes/types";
+import type { ConversationPosition } from "../modes/utils/conversation-position";
+import type { MCPManager } from "../mcp/manager";
+import type { FoundMcpServer } from "../mcp/oauth-reauth";
+import type { MCPServerConfig } from "../mcp/types";
 import type { AgentSession } from "../session/agent-session";
 import type { SessionManager } from "../session/session-manager";
 
@@ -54,7 +58,10 @@ export interface ParsedSlashCommand {
  * - `{ prompt: string }` — command handled, pass `prompt` through as the new
  *   user input (e.g. `/force <tool> <prompt>` keeps `<prompt>` as the message).
  */
-export type SlashCommandResult = undefined | { consumed: true; agentInvoked?: boolean } | { prompt: string };
+export type SlashCommandResult =
+	| undefined
+	| { consumed: true; agentInvoked?: boolean; failed?: boolean }
+	| { prompt: string };
 
 /**
  * Runtime visible to slash-command handlers that run in text/ACP mode.
@@ -70,6 +77,10 @@ export interface SlashCommandRuntime {
 	cwd: string;
 	/** Cancellation of the host prompt/request, when supported. */
 	signal?: AbortSignal;
+	/** Whether the original host/session ownership is still active after an await. */
+	isCurrent?: () => boolean;
+	/** Trusted host consent for the original explicit browser-auth command; absent means refused. */
+	allowMcpBrowserAuth?: boolean;
 	/**
 	 * Keep cancellation cleanup open until a persistent operation settles.
 	 *
@@ -110,6 +121,26 @@ export interface SlashCommandRuntime {
 	 * return immediately and leave the serialized queue free for `abort`.
 	 */
 	runCommandInBackground?: (task: () => Promise<void>) => void;
+	/**
+	 * Ask the host to reconnect one live-manager MCP server by name after its
+	 * credentials changed (e.g. `/mcp reauth`), and report the post-reconnect
+	 * state. Returns `undefined` when this host keeps no live manager for the
+	 * server; callers then fall back to restart guidance. `selected` identifies
+	 * the original definition and source; `committedConfig` is its refreshed
+	 * configuration to install only after matching the original manager entry.
+	 */
+	reconnectMcpServer?: (
+		name: string,
+		selected: FoundMcpServer,
+		committedConfig: MCPServerConfig,
+	) => Promise<"connected" | "connecting" | "disconnected" | undefined>;
+	/**
+	 * The host's live MCP manager when it keeps one. ACP sessions keep one for
+	 * client-declared servers (`session/new`/`load_session` `mcpServers`), whose
+	 * definitions live in no writable config file; `/mcp` lookups consult it so
+	 * those servers resolve like configured ones.
+	 */
+	mcpManager?: MCPManager | undefined;
 	notifyTitleChanged?: () => Promise<void> | void;
 	/**
 	 * Push the host's view of the session config (model, thinking level, mode).
@@ -137,6 +168,9 @@ export interface TuiSlashCommandRuntime {
 	input?: Pick<SubmittedUserInput, "images" | "imageLinks">;
 	/** The editor snapshot was cleared before asynchronous input hooks ran. */
 	draftDetached?: boolean;
+	/** Submitted with the follow-up key from this conversation position: queue behind the active run
+	 *  rather than interrupt it. */
+	followUp?: ConversationPosition;
 }
 
 /** Unified slash-command spec consumed by both TUI and ACP dispatchers. */
@@ -190,4 +224,7 @@ export interface SlashCommandSpec extends BuiltinSlashCommand {
 }
 
 /** Result returned by `executeAcpBuiltinSlashCommand`. */
-export type AcpBuiltinSlashCommandResult = false | { consumed: true; agentInvoked?: boolean } | { prompt: string };
+export type AcpBuiltinSlashCommandResult =
+	| false
+	| { consumed: true; agentInvoked?: boolean; failed?: boolean }
+	| { prompt: string };

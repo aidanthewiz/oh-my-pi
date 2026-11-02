@@ -114,8 +114,8 @@ describe("issue #6879 — tool output appears twice after a superseded turn", ()
 		tempDir?.removeSync();
 	});
 
-	afterAll(() => {
-		authStorage.close();
+	afterAll(async () => {
+		await authStorage.close();
 		settingsDir.removeSync();
 		resetSettingsForTest();
 	});

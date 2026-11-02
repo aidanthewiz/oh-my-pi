@@ -24,11 +24,11 @@ const sourceSpy = vi.spyOn(authStorage.keys, "source").mockImplementation(() => 
 	throw new Error("Mojeek search must not check auth");
 });
 
-afterAll(() => {
+afterAll(async () => {
 	getApiKeySpy.mockRestore();
 	resolverSpy.mockRestore();
 	sourceSpy.mockRestore();
-	authStorage.close();
+	await authStorage.close();
 });
 
 function makeParams(query: string, fetch: FetchImpl): SearchParams {

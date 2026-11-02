@@ -6,6 +6,7 @@ import {
 	disposeTerminalTitleState,
 	setTerminalTitle,
 	initTerminalTitleState,
+	popTerminalTitle,
 	setSessionTerminalTitle,
 	refreshSessionTerminalTitle,
 	setExtensionTerminalTitle,
@@ -409,6 +410,65 @@ describe("disposeTerminalTitleState", () => {
 		resetObserved(writes, windowsTitleMock);
 		vi.advanceTimersByTime(400);
 		expect(observedTitles(writes, windowsTitleMock).length).toBeGreaterThan(0);
+	});
+
+	it("clears the title before popping the saved one on shutdown", () => {
+		// CONTRACT: a terminal without a title stack ignores the pop, so the clear
+		// is all that takes omp's title off the tab. A terminal with a stack must
+		// see the pop last, or the clear would wipe the title it restored.
+		disposeTerminalTitleState();
+		popTerminalTitle();
+		expect(writes).toEqual(["\x1b]0;\x07\x1b[23;2t"]);
+	});
+
+	it.each([20, 1023, 1024, 4096, 32768])("restores all %s UTF-16 title units across repeat claims and pop", length => {
+		const originalPlatform = process.platform;
+		const native = windowsTitleMock;
+		if (!native) throw new Error("Windows console title mock not initialized");
+		disposeTerminalTitleState();
+		try {
+			Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+			const originalTitle = `shell-${"界".repeat(length - 8)}😀`;
+			native.current = originalTitle;
+			initTerminalTitleState();
+			setSessionTerminalTitle("running-session");
+			expect(native.titles).toContain("π > running-session");
+			initTerminalTitleState();
+			setSessionTerminalTitle("second-name");
+			resetObserved(writes, native);
+			disposeTerminalTitleState();
+			expect(native.current).toBe(originalTitle);
+			popTerminalTitle();
+			setSessionTerminalTitle("late-update");
+			vi.advanceTimersByTime(160);
+			expect(writes).toEqual([]);
+			expect(native.current).toBe(originalTitle);
+			expect(native.titles).toEqual([originalTitle]);
+		} finally {
+			disposeTerminalTitleState();
+			Object.defineProperty(process, "platform", { value: originalPlatform, configurable: true });
+		}
+	});
+
+	it.each([0, 65535, 65536])("uses the title-stack fallback for an incomplete %s-unit capture", length => {
+		const originalPlatform = process.platform;
+		const native = windowsTitleMock;
+		if (!native) throw new Error("Windows console title mock not initialized");
+		disposeTerminalTitleState();
+		try {
+			Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+			native.current = "界".repeat(length);
+			initTerminalTitleState();
+			setSessionTerminalTitle("running-session");
+			resetObserved(writes, native);
+			disposeTerminalTitleState();
+			popTerminalTitle();
+			expect(native.titles).toEqual([]);
+			expect(writes).toEqual(["\x1b]0;\x07\x1b[23;2t"]);
+		} finally {
+			disposeTerminalTitleState();
+			Object.defineProperty(process, "platform", { value: originalPlatform, configurable: true });
+		}
 	});
 });
 

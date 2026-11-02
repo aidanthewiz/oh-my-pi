@@ -35,7 +35,7 @@ describe("AgentSession tool-call loop guard", () => {
 
 	afterEach(async () => {
 		await session?.dispose();
-		authStorage.close();
+		await authStorage.close();
 		tempDir.removeSync();
 	});
 

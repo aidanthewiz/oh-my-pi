@@ -31,11 +31,11 @@ const missingResolverSpy = vi.spyOn(missingAuthStorage.keys, "resolver").mockImp
 	return async () => undefined;
 });
 
-afterAll(() => {
+afterAll(async () => {
 	providerResolverSpy.mockRestore();
 	missingResolverSpy.mockRestore();
-	providerAuthStorage.close();
-	missingAuthStorage.close();
+	await providerAuthStorage.close();
+	await missingAuthStorage.close();
 });
 
 function makeParams(query: string, authStorage: AuthStorage = providerAuthStorage) {

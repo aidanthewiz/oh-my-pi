@@ -70,7 +70,7 @@ test("keeps Gemini 3.6 advisor context and accepts a silent review", async () =>
 		});
 	} finally {
 		await session.dispose();
-		auth.close();
+		await auth.close();
 		await temp.remove();
 	}
 });

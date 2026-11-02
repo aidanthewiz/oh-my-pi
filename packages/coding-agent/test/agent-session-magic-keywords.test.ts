@@ -76,7 +76,7 @@ describe("AgentSession magic keyword settings", () => {
 	});
 
 	afterAll(async () => {
-		authStorage.close();
+		await authStorage.close();
 		await removeWithRetries(authRoot);
 	});
 

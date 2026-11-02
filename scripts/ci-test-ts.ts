@@ -3,6 +3,7 @@
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { Process as ProcessHandle } from "@oh-my-pi/pi-natives";
 
 type Mode =
 	| "all"
@@ -106,6 +107,13 @@ const nativeAndIntegrationPackages = [
 	"packages/typescript-edit-benchmark",
 ];
 
+const projectToolTestCommand: TestCommand = {
+	label: ".omp/tests (project-local TUI debug tool)",
+	cwd: ".",
+	command: ["bun", "test", ...onlyFailuresArgs, "./.omp/tests/tui.test.ts"],
+	parallel: 1,
+};
+
 // Packages the CI buckets deliberately skip but a local full run should still
 // cover. robomp-web lives under python/robomp and is outside every CI TS bucket.
 const localOnlyWorkspacePackages = ["python/robomp/web"];
@@ -114,11 +122,12 @@ const localOnlyWorkspacePackages = ["python/robomp/web"];
 // Coreforge release channel. Workspace test discovery does not include root scripts.
 const repoScriptTests = [
 	"scripts/cf-release-notes.test.ts",
-	"scripts/ci-release-build-binaries.test.ts",
+	"packages/coding-agent/scripts/build-binary.test.ts",
 	"scripts/ci-release-checksums.test.ts",
 	"scripts/ci-test-ts.test.ts",
 	"scripts/fix-changelogs.test.ts",
 	"scripts/inline-functions.test.ts",
+	"scripts/run-rs-task.test.ts",
 ];
 const codingAgentNativePathPatterns = [
 	/(^|\/)[^/]*(bash|native|browser|cmux|mnemopi|hindsight|memory)[^/]*\.test\.ts$/i,
@@ -223,8 +232,9 @@ function workspaceTestCommand(pkg: string, parallel: number, options: { extraArg
 
 // The Rust suite as one pooled command, so root `bun run test` reports TS and
 // Rust under the same progress stream / failure report. Delegates to
-// run-rs-task.ts, which self-skips when no Rust-affecting files changed locally
-// (printing a one-line notice) and resolves the cargo/nextest invocation.
+// run-rs-task.ts, which self-skips when the branch changed no Rust-affecting file
+// since its merge base with main, committed or not (printing a one-line notice),
+// and resolves the cargo/nextest invocation.
 function rustTestCommand(): TestCommand {
 	return {
 		label: "rust (cargo nextest; skipped if no Rust changes)",
@@ -345,7 +355,7 @@ async function commandsForMode(mode: Mode): Promise<TestCommand[]> {
 				},
 			];
 		case "native":
-			return nativeAndIntegrationPackages.map(pkg => workspaceTestCommand(pkg, 4));
+			return [...nativeAndIntegrationPackages.map(pkg => workspaceTestCommand(pkg, 4)), projectToolTestCommand];
 		case "coding-agent-singleton":
 			return await codingAgentTestCommands("singleton");
 		case "coding-agent-ui":
@@ -376,6 +386,7 @@ async function commandsForMode(mode: Mode): Promise<TestCommand[]> {
 			return [
 				...fastWorkspacePackages.map(pkg => workspaceTestCommand(pkg, 8, { extraArgs: onlyFailuresArgs })),
 				...nativeAndIntegrationPackages.map(pkg => workspaceTestCommand(pkg, 4, { extraArgs: onlyFailuresArgs })),
+				projectToolTestCommand,
 				...localOnlyWorkspacePackages.map(pkg => workspaceTestCommand(pkg, 4, { extraArgs: onlyFailuresArgs })),
 				...(await commandsForMode("coding-agent-heavy")),
 			];
@@ -387,10 +398,8 @@ async function commandsForMode(mode: Mode): Promise<TestCommand[]> {
 	}
 }
 
-// Hosted runners may inject cloud credentials, GitHub Actions injects
-// GITHUB_TOKEN, and Coreforge launches the suite with an active profile and
-// managed DCG state. Strip caller-owned state so ordinary fixtures stay
-// hermetic; focused profile and guard tests install explicit fixtures.
+// Hosted runners and Coreforge can inject credentials, managed profiles and DCG
+// state. Ordinary fixtures receive only their explicitly configured identity.
 const SCRUBBED_ENV_PREFIXES = ["ANTHROPIC_", "AWS_", "GOOGLE_CLOUD_", "OMP_DCG_", "OMP_MODEL_", "DCG_"];
 const SCRUBBED_ENV_NAMES = new Set([
 	"BUN_OPTIONS",
@@ -432,6 +441,7 @@ async function runTestCommand(testCommand: TestCommand): Promise<void> {
 	}
 
 	const env = buildChildEnv();
+	const inspector = await loadProcessInspector();
 	for (let attempt = 1; ; attempt++) {
 		const proc = Bun.spawn(testCommand.command, {
 			cwd,
@@ -439,20 +449,21 @@ async function runTestCommand(testCommand: TestCommand): Promise<void> {
 			stdout: "inherit",
 			stderr: "inherit",
 		});
+		const ownedProcess = pinTestProcess(proc, inspector);
 		// Watchdog, mirroring the parallel path: record that *we* killed the child,
 		// otherwise the resulting 137 is indistinguishable from an OOM kill.
 		let timedOut = false;
-		const killTimer = setTimeout(async () => {
+		let retirement: Promise<void> | undefined;
+		const killTimer = setTimeout(() => {
 			timedOut = true;
-			try {
-				process.stdout.write(await describeStuckProcessTree(proc.pid));
-			} finally {
-				proc.kill("SIGKILL");
-			}
+			retirement = retireStuckTestProcess(proc, ownedProcess).then(diagnostics => {
+				process.stdout.write(diagnostics);
+			});
 		}, chunkTimeoutMs());
 		const exitCode = await proc.exited;
 		clearTimeout(killTimer);
-		if (exitCode === 0) {
+		await retirement;
+		if (exitCode === 0 && !timedOut) {
 			return;
 		}
 		if (!timedOut && BUN_CRASH_EXITS[exitCode] && attempt < MAX_CHUNK_ATTEMPTS) {
@@ -467,7 +478,9 @@ async function runTestCommand(testCommand: TestCommand): Promise<void> {
 
 // Child env shared by every spawned test process: the parent env with the
 // private test-runtime marker set, all CI credential / cloud-config variables
-// scrubbed (see SCRUBBED_ENV_* above), and GITHUB_ACTIONS cleared.
+// scrubbed (see SCRUBBED_ENV_* above), and GITHUB_ACTIONS cleared. Clearing it
+// would also clear run-rs-task.ts's "always run in GitHub Actions" rule for the
+// Rust child, so under GitHub Actions OMP_FORCE_RUST_TASKS carries it instead.
 //
 // GC knobs (both needed — they gate different JSC mechanisms):
 // - `BUN_JSC_useConcurrentGC=0` stops the collector from marking concurrently
@@ -491,6 +504,7 @@ function buildChildEnv(): Record<string, string | undefined> {
 	const env: Record<string, string | undefined> = {
 		...Bun.env,
 		GITHUB_ACTIONS: "",
+		...(Bun.env.GITHUB_ACTIONS === "true" ? { OMP_FORCE_RUST_TASKS: "1" } : {}),
 		PI_TEST_RUNTIME: "1",
 		BUN_JSC_useConcurrentGC: "0",
 		BUN_JSC_numberOfGCMarkers: "1",
@@ -513,6 +527,95 @@ function chunkTimeoutMs(): number {
 	const raw = Number(Bun.env.OMP_TEST_CHUNK_TIMEOUT?.trim());
 	if (Number.isFinite(raw) && raw >= 1) return raw * 1000;
 	return 600_000;
+}
+
+type TestProcess = {
+	pid: number;
+	exitCode: number | null;
+	kill(signal: NodeJS.Signals): void;
+};
+type ProcessInspector = typeof ProcessHandle;
+
+async function loadProcessInspector(): Promise<ProcessInspector | undefined> {
+	try {
+		// Static loading would prevent even dry runs when the platform addon is absent.
+		return (await import("@oh-my-pi/pi-natives")).Process;
+	} catch {
+		// The runner must still enforce its deadline without a loadable addon.
+		return undefined;
+	}
+}
+
+function pinTestProcess(proc: TestProcess, inspector: ProcessInspector | undefined): ProcessHandle | undefined {
+	try {
+		if (proc.exitCode !== null) return undefined;
+		const owned = inspector?.fromPid(proc.pid);
+		return proc.exitCode === null && owned?.ppid === process.pid ? owned : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+async function retireStuckTestProcess(proc: TestProcess, owned: ProcessHandle | undefined): Promise<string> {
+	const descendants: ProcessHandle[] = [];
+	const cleanupFailures: string[] = [];
+	try {
+		if (!owned) throw new Error("owned process handle unavailable");
+		// Pin the whole tree before diagnostics yield. Detached workers can
+		// reparent when their coordinator exits, but the handles retain identity.
+		const seen = new Set([owned.pid]);
+		const pending = [owned];
+		for (const parent of pending) {
+			for (const child of parent.children()) {
+				if (seen.has(child.pid) || child.ppid !== parent.pid) continue;
+				seen.add(child.pid);
+				descendants.push(child);
+				pending.push(child);
+			}
+		}
+	} catch (err) {
+		cleanupFailures.push(
+			`[watchdog] descendant inspection failed: ${err instanceof Error ? err.message : String(err)}`,
+		);
+	}
+	let diagnostics = "";
+	try {
+		diagnostics = await describeStuckProcessTree(proc.pid);
+	} finally {
+		// Native handles validate identity and never signal a shared parent group.
+		// Retire children first so killing the coordinator cannot hide workers.
+		for (const child of descendants.reverse()) {
+			try {
+				if (child.status() === "running" && child.killTree(9) === 0 && child.status() === "running") {
+					cleanupFailures.push(`[watchdog] descendant ${child.pid}: no successful kill confirmed`);
+				}
+			} catch (err) {
+				cleanupFailures.push(
+					`[watchdog] descendant ${child.pid} cleanup failed: ${err instanceof Error ? err.message : String(err)}`,
+				);
+			}
+		}
+		try {
+			if (owned?.status() === "running" && owned.killTree(9) === 0 && owned.status() === "running") {
+				cleanupFailures.push(`[watchdog] coordinator ${owned.pid}: no successful native kill confirmed`);
+			}
+		} catch (err) {
+			cleanupFailures.push(
+				`[watchdog] coordinator cleanup failed: ${err instanceof Error ? err.message : String(err)}`,
+			);
+		}
+		// Inspection failure must not disable the coordinator's watchdog.
+		if (proc.exitCode === null) {
+			try {
+				proc.kill("SIGKILL");
+			} catch (err) {
+				cleanupFailures.push(
+					`[watchdog] coordinator SIGKILL failed: ${err instanceof Error ? err.message : String(err)}`,
+				);
+			}
+		}
+	}
+	return `${diagnostics}${cleanupFailures.length ? `${cleanupFailures.join("\n")}\n` : ""}`;
 }
 
 // What a watchdog-killed chunk was still doing, captured just before the
@@ -848,6 +951,7 @@ function formatChunkFailure(failure: ChunkOutcome, replayOutput: boolean): strin
 // run surfaces every broken chunk and exits non-zero without a runner stack trace.
 async function runTestCommandsInParallel(commands: TestCommand[], concurrency: number): Promise<void> {
 	const env = buildChildEnv();
+	const inspector = await loadProcessInspector();
 	const queue = [...commands];
 	const failures: ChunkOutcome[] = [];
 	let completed = 0;
@@ -909,6 +1013,7 @@ async function runTestCommandsInParallel(commands: TestCommand[], concurrency: n
 			stdout: "pipe",
 			stderr: "pipe",
 		});
+		const ownedProcess = pinTestProcess(proc, inspector);
 		const stdout = { text: "" };
 		const stderr = { text: "" };
 		const stdoutDrain = drainInto(proc.stdout as ReadableStream<Uint8Array>, stdout);
@@ -918,16 +1023,16 @@ async function runTestCommandsInParallel(commands: TestCommand[], concurrency: n
 		// after a GC crash) would otherwise hang this worker forever.
 		let timedOut = false;
 		let stuckTree = "";
-		const killTimer = setTimeout(async () => {
+		let retirement: Promise<void> | undefined;
+		const killTimer = setTimeout(() => {
 			timedOut = true;
-			try {
-				stuckTree = await describeStuckProcessTree(proc.pid);
-			} finally {
-				proc.kill("SIGKILL");
-			}
+			retirement = retireStuckTestProcess(proc, ownedProcess).then(diagnostics => {
+				stuckTree = diagnostics;
+			});
 		}, chunkTimeoutMs());
 		const exitCode = await proc.exited;
 		clearTimeout(killTimer);
+		await retirement;
 		if (!(await settleWithin(drains, 5000))) {
 			stdoutDrain.cancel();
 			stderrDrain.cancel();

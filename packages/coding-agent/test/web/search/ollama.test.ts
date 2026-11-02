@@ -19,8 +19,8 @@ function requireOllamaModel() {
 
 const ollamaModel = requireOllamaModel();
 
-afterAll(() => {
-	catalogAuthStorage.close();
+afterAll(async () => {
+	await catalogAuthStorage.close();
 });
 
 /** Build a fake AuthStorage that resolves an API key (or undefined). */

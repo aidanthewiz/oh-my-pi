@@ -70,7 +70,7 @@ describe("InteractiveMode MCP connection status", () => {
 		mode?.stop();
 		vi.restoreAllMocks();
 		await session?.dispose();
-		authStorage?.close();
+		await authStorage?.close();
 		tempDir?.removeSync();
 		resetSettingsForTest();
 	});

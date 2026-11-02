@@ -83,6 +83,7 @@ export function mcpOAuthServerUrlFromCredentialId(credentialId: string): string 
  */
 export interface MCPStoredOAuthCredential extends OAuthCredential {
 	tokenUrl?: string;
+	issuerUrl?: string;
 	clientId?: string;
 	clientSecret?: string;
 	resource?: string;

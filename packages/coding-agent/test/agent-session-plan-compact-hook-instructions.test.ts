@@ -158,7 +158,7 @@ describe("AgentSession plan-mode compaction hook contract (issue #4359)", () => 
 
 		cleanups.push(async () => {
 			await session.dispose();
-			authStorage.close();
+			await authStorage.close();
 		});
 		return { session, sessionManager, beforeCompactEvents, summarizerCalls };
 	}

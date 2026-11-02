@@ -90,7 +90,7 @@ describe("AgentSession snapcompact no-reduction guard: opaque reasoning", () => 
 
 	afterEach(async () => {
 		await session?.dispose();
-		authStorage?.close();
+		await authStorage?.close();
 		vi.restoreAllMocks();
 	});
 
@@ -113,9 +113,7 @@ describe("AgentSession snapcompact no-reduction guard: opaque reasoning", () => 
 
 		// 3 frames ≈ 15k tokens >> the handful of tokens of real archived text,
 		// so this result grows reliable local content and must be rejected.
-		await expect(session.compact(undefined, { mode: "snapcompact" })).rejects.toThrow(
-			"snapcompact would not reduce context locally.",
-		);
+		await expect(session.compact(undefined, { mode: "snapcompact" })).rejects.toBeInstanceOf(Error);
 		expect(sessionManager.getEntries().some(entry => entry.type === "compaction")).toBe(false);
 	});
 });

@@ -17,13 +17,52 @@ When an execute-time caller supplies neither settings nor `autoApprove`, approva
 
 Configure with `tools.approvalMode`:
 
-| Mode             | Auto-approves           | Prompts for     |
-| ---------------- | ----------------------- | --------------- |
-| `always-ask`     | `read`                  | `write`, `exec` |
-| `write`          | `read`, `write`         | `exec`          |
-| `yolo` (default) | `read`, `write`, `exec` | none            |
+| Mode                | Auto-approves                                          | Prompts for                 |
+| ------------------- | ------------------------------------------------------ | --------------------------- |
+| `always-ask`        | `read`                                                 | `write`, `exec`             |
+| `always-ask-cached` | `read` without file targets, granted files and folders | file reads, `write`, `exec` |
+| `write`             | `read`, `write`                                        | `exec`                      |
+| `yolo` (default)    | `read`, `write`, `exec`                                | none                        |
 
 `--approval-mode <mode>` overrides the configured mode for the session. `--auto-approve` and `--yolo` force yolo execution even when an explicit `--approval-mode` is also supplied; tool/user denies and explicit tool prompt policies still apply.
+
+### Ask and remember (`always-ask-cached`)
+
+Ask and remember prompts like `always-ask`, and also before a tool reads a file it has not been granted. Its prompts can remember what the call touched:
+
+- **Approve Directory: `<folder>`** grants the folder around the call. A folder grant covers the files directly inside it, never a subfolder or anything below one. The prompt names the folder and lists its entries (directories end in `/`): the first few in the dock, up to 24 in the expanded prompt (`Ctrl+O`). Larger folders show the rest as a count.
+- **Approve File** (or **Approve** for a directory or URL target) grants the exact targets.
+- **Approve Once** approves this call only.
+
+The **Remember across sessions** toggle selects the grant lifetime. Session grants stay in this conversation's memory. Persistent grants use `approval-cache.db` in the agent directory. Both bind the effective policy, project/cwd, account, and resolved destination. Persistent choices require a verified credential-source identity and active account; unknown sources or accounts offer session choices only. Credential-module replacement during approval invalidates the request. RPC, ACP, and collab hosts expose permitted lifetimes as separate choices.
+
+- Grants record the capability tier they authorized. A write grant also covers reads of the same target; a read grant never covers a write or exec call.
+- The tools that read files report the files and folders they touch: `read`, `grep`, `glob`, `ast_grep`, `find`, and the legacy `read`/`grep`/`find`/`ls` shims. A recursive search reaches below subfolders, so it needs a tree grant of its own; approving one also records the folder grant it includes. A root list such as `src;other` is keyed one root at a time.
+- Other read-tier tools (`lsp`, `debug`, `github`, `todo`, …) stay auto-approved as in `always-ask`. This mode decides when you are asked; it does not sandbox reads.
+- Public-only web reads need no target grant. Mixed public/local lists still require approval for every protected target. Internal URLs bind their resolved destination; an unresolved destination cannot receive a cached grant.
+- Exec or write calls without targets prompt as in `always-ask`. A mode-owned session choice also binds the captured project, policy, and account context.
+- Target derivation uses the execution parser, including literal filenames, selectors, archives, lists, and traversal depth. Exact paths and covering folders bind their resolved filesystem identity. Failed derivation is not a harmless no-target operation.
+- Grant answers appear only on prompts the mode raised. Prompts forced by a tool policy, an `override` (bash critical commands), a `tools.approval.<tool>: prompt` rule, or a pending provider safety check keep plain Approve/Deny and record nothing.
+- `/forget-approvals` clears the database and every conversation's session grants for the active agent directory. A persistent-store failure reports failure, not successful revocation.
+- Approval is captured before asynchronous prompts and checked again before execution. Changed arguments, policy, account, session, symlinks, mounts, or resolved destinations require new approval. Session replacement refuses the old call.
+
+## Restricted folders
+
+`tools.restrictedFolders` lists folders where every action needs an explicit approval, whatever the approval mode (`yolo` and `--auto-approve` included) and whatever was remembered:
+
+```yaml
+tools:
+   restrictedFolders:
+      - ~/secrets
+      - C:/work/payments
+```
+
+- A restricted folder covers itself and everything below it. A call whose targets fall inside it (`read`, `write`, `edit`, `grep`, `glob`, `ast_grep`, `find`, and any tool reporting `approvalCacheTargets`) prompts with `Reason: Restricted folder: <folder>`. A recursive search rooted above a restricted folder prompts too, because it reads into it; a one-level listing of the parent does not.
+- Paths are compared like Ask and remember keys: `~` is expanded, relative entries resolve against the session cwd, symlinks are resolved, and on Windows case is folded. `/a/foo` never covers `/a/foobar`.
+- A tool that names no path (`bash`, `eval`, `browser`, MCP tools, eval preludes) is matched by the directory it runs in: its `cwd` argument when it has one, else the session cwd. The command text is not parsed, so a `bash` call running outside the folder that names a file inside it does not match; use a `tools.approval.bash` policy for that.
+- The prompt offers plain **Approve** / **Deny**: no session answer, no grant, and no ACP "Always allow" covers it, so every call asks again. A `deny` policy (tool or `tools.approval.<tool>: deny`) still denies.
+- Without an interactive UI (print mode, headless subagents, the Cursor exec bridge) the call is refused, like any other prompt with nobody to answer it.
+- The `/settings` panel edits the list as JSON under Interaction → Approvals. It is hidden when project config supplies the list, so a project value is never promoted to global config.
 
 ## User overrides
 
@@ -31,11 +70,11 @@ Configure with `tools.approvalMode`:
 
 ```yaml
 tools:
-  approvalMode: write
-  approval:
-    bash: prompt
-    read: allow
-    mcp__filesystem_delete: deny
+   approvalMode: write
+   approval:
+      bash: prompt
+      read: allow
+      mcp__filesystem_delete: deny
 ```
 
 For MCP tools, key the policy by the exact final registered name. The ordinary form is
@@ -55,7 +94,7 @@ Resolution per tool call:
 3. In `yolo`, an explicit tool `allow`/`prompt` policy wins; otherwise the valid user policy wins, or the call is allowed. The `override` flag alone does not force a prompt in `yolo`.
 4. In non-yolo modes, an `override: true` decision allows only an accompanying tool `policy: allow`; every other non-denied case prompts.
 5. Without an override, an explicit tool `allow`/`prompt` policy wins, then a valid user policy wins.
-6. With no explicit policy, the active mode auto-approves or prompts by tier.
+6. With no explicit policy, the active mode auto-approves or prompts by tier. In `always-ask-cached`, a call whose `approvalCacheTargets` are all granted is allowed instead.
 
 Policy strings are trimmed and case-normalized. Invalid user values are ignored.
 
@@ -89,25 +128,26 @@ The disabled-by-default Eval [`computer` API](./computer-use.md) chooses its tie
 
 The approval prompt shows `read-only` when applicable, followed by the resolved JavaScript (truncated to 2,000 characters by the standard formatter). For `computer.run`, `read_only: true` also enables the worker's desktop guard: input, focus, mutation, and clipboard writes throw. It is not static analysis or a general JavaScript sandbox.
 
+`computer.control.acquire` asks the user before handing the agent foreground control, in every mode, and answers `no-ui` when nobody can be asked. Only `tools.approval["computer.control"]` answers it without asking: `allow` grants control even without an interactive UI, for unattended machines, and `deny` refuses it. The approval mode and `tools.approval.computer` never grant it, because the default `yolo` would otherwise let every headless subagent take the user's foreground.
+
 Separately, provider-originated computer-use calls may carry `pendingSafetyChecks` metadata. Any pending check forces an interactive prompt regardless of yolo or per-tool `allow`. The prompt lists each safety-check code, message, and sanitized/truncated data. Without an interactive UI, the call fails closed with `pending provider safety checks but no interactive UI is available`.
 
 Tool approval does not authorize the underlying real-world action. On-screen text is untrusted and cannot override direct user instructions. Consequential actions still require point-of-risk confirmation of the exact target, scope, and values unless the user's direct message already authorized them.
 
 ## Per-tool prompt details
 
-Tools can add approval-prompt body lines with `formatApprovalDetails(args, options?)`. The standard prompt includes:
+Tools can add approval-prompt body lines with `formatApprovalDetails(args)`. The standard prompt includes:
 
 - `Allow tool: <name>`
 - `Origin: MCP server tool` for unannotated `mcp__...` tools
 - `Reason: <reason>` when the tool decision supplies one
 - tool-specific details such as command, path, code, browser action, or subagent assignment
 
-When `options.compact` is true, return complete multiline values so the shared formatter can count every line.
-Full prompts may retain normal detail truncation.
+In the interactive UI the prompt docks above the composer until answered with a list of choices: **Approve**, **Approve `<tool>` for this session**, and **Deny**. With an empty composer the arrow keys move between them and `Enter` takes the highlighted one (Approve on mount); `Ctrl+Enter` (or `Ctrl+Q`; rebind `app.approval.approve`) approves this call outright and `Esc` denies. `Enter` and the approve key are ignored for the first half second, so a key meant for the composer (or the follow-up key, pressed mid-run) as the prompt appears cannot answer it. The session choice approves later calls of the same tool (or `xd://` device) at the same tier until the session ends or changes; it is offered only for prompts the approval mode raised, never for critical-command overrides, explicit `prompt` policies, or provider safety checks, which ask every time. The composer keeps its cursor and takes typing, to deny and steer instead: while it holds a draft, the highlight sits on Deny, relabeled **Deny and send message**, the arrows and `Enter` edit and send the draft, and `Ctrl+C` clears it rather than denying. Sending a message while calls wait (from the composer, Tern, or a collab guest) denies every pending approval, and any the same tool batch asks for before the message is delivered, then steers the turn with that message, so the agent learns why instead of guessing at a bare denial. To leave the composer its room, the prompt summarizes the tool's details to one row (each detail's first line, `…` when more is left out), always built from the input that will run; `Ctrl+O` (`app.tools.expand`, or Details in Tern) shows every detail in full, and `PgUp`/`PgDn` scroll them. In Tern, a click on a choice takes it. RPC, ACP, and other hosts without an approval dialog get a select with the same choices and the full details.
 
-In the interactive UI the prompt replaces the composer until answered: `Ctrl+Enter` (or `Ctrl+Q`; rebind `app.approval.approve`) approves, `Esc` denies, and plain `Enter` does nothing, so typing into the composer as the prompt appears cannot approve a call. The approve key is ignored for the first half second, since it is also the follow-up key. The prompt shows one row per detail, with multi-line values (file content, code) reduced to a line count, since the tool call in the transcript shows them in full; with `display.hideToolActivity` on, it shows the full details instead. RPC, ACP, and other hosts without an approval dialog get an Approve/Deny select with the full details.
+Runtime safety prompts and eligible session-access choices retain their explicit selectors and runtime-owned grants. Mode and target grants never bypass runtime safety checks. Aborted requests, failed approval hooks, and session changes retain no new grant.
 
-Runtime safety prompts and eligible session-access choices retain their explicit selectors. Docked approval does not grant broader access.
+An Ask and remember prompt lists **Remember across sessions** and its grant choices above **Approve Once**. `Ctrl+Enter` approves only this call.
 
 ## Defining approval on tools
 
@@ -127,28 +167,28 @@ export type ToolApprovalDecision =
 export type ToolApproval = ToolApprovalDecision | ((args: unknown) => ToolApprovalDecision);
 
 approval?: ToolApproval;
-export interface ApprovalDetailsOptions {
-  compact?: boolean;
-}
-formatApprovalDetails?: (args: unknown, options?: ApprovalDetailsOptions) => string | string[] | undefined;
+formatApprovalDetails?: (args: unknown) => string | string[] | undefined;
+approvalCacheTargets?: (args: unknown) => readonly string[] | undefined | Promise<readonly string[] | undefined>;
+approvalCacheIdentity?: (args: unknown) =>
+  readonly { target: string; identity: string }[] |
+  Promise<readonly { target: string; identity: string }[]>;
 ```
+
+`approvalCacheTargets` returns every executed target's key. `approvalCacheIdentity` binds exact and covering subjects to their resolved destination. Built-in filesystem targets use realpath, device, and inode identity. Both hooks may be asynchronous; derivation failures must throw. The execution wrapper captures and checks their results. Synchronous previews cannot authorize remembered access.
+
+An approval prompt sets `allowPersistentGrants: false` when persistent authority is unavailable. Hosts must hide the remember toggle and Always choices. The resolver also rejects those answers and skips global grants.
 
 Examples:
 
 ```ts
 approval: "read";
 
-approval: (args) => (LSP_READONLY_ACTIONS.has(args.action) ? "read" : "write");
+approval: args => (LSP_READONLY_ACTIONS.has(args.action) ? "read" : "write");
 
-approval: (args) =>
-  isCritical(args.command)
-    ? { tier: "exec", override: true, reason: "Critical pattern detected" }
-    : "exec";
+approval: args =>
+	isCritical(args.command) ? { tier: "exec", override: true, reason: "Critical pattern detected" } : "exec";
 
-approval: (args) =>
-  isForbidden(args)
-    ? { tier: "exec", policy: "deny", reason: "Blocked by tool policy" }
-    : "write";
+approval: args => (isForbidden(args) ? { tier: "exec", policy: "deny", reason: "Blocked by tool policy" } : "write");
 ```
 
 ## ACP sessions
@@ -159,7 +199,7 @@ To auto-approve ACP tool calls, set the mode in global or project config:
 
 ```yaml
 tools:
-  approvalMode: yolo
+   approvalMode: yolo
 ```
 
 Or launch the ACP server with a runtime override or a one-process config overlay:
@@ -173,10 +213,25 @@ omp acp --config ./acp-yolo.yml   # file contains tools.approvalMode: yolo
 
 Precedence is the normal settings precedence: runtime flags (`--approval-mode`, `--auto-approve`, `--yolo`) override `--config` overlays, which override project config, which overrides global config. ACP does not currently define a `session/new`, `session/load`, or `session/resume` approval-policy field, so ACP clients that need per-session yolo should launch a separate `omp acp` process with one of the flags above or with a session-specific `--config` overlay.
 
-`tools.approvalMode: yolo` fully applies to ACP when it is explicitly configured or supplied by a runtime flag. It skips ordinary tier-based OMP prompts and also skips the ACP client permission gate for `bash` and destructive `edit`/`delete`/`move` actions unless a per-tool policy requires that gate. Explicit tool policies and provider safety checks still apply. The schema default is `yolo`, but default-config ACP sessions still keep the client permission gate; set `tools.approvalMode: yolo` explicitly when the client wants unattended execution.
+`tools.approvalMode: yolo` fully applies to ACP when explicitly configured or supplied by a runtime flag: it skips ordinary tier-based OMP prompts and the ACP client gate unless the resolved tool or user policy requires a prompt or denies the call. The schema default is also `yolo`, but without an explicit opt-in, unmatched bash commands and destructive file operations still require an ACP client grant.
 
-When ACP approval is required, OMP routes it through the ACP client instead of the terminal TUI. Client-gated `bash`, `delete`, `move`, and `edit` patches containing deletion or rename operations use ACP `session/request_permission`; ordinary file-content edits do not use this extra destructive-action gate. Generic approval prompts use form elicitation when the client advertises `elicitation.form`. A rejected, cancelled, or unsupported prompt rejects/cancels the tool call; OMP does not silently allow it.
+For `bash`, ACP resolves `bash.patterns`, critical-command overrides, per-tool policies, and the approval mode before requesting permission: `allow` runs without a card, `deny` blocks without a card, and `prompt` uses `session/request_permission`. An “Always allow” choice covers later ordinary `bash` calls in the session; critical commands and explicit prompt patterns still require a card on every call.
+
+For `delete`, `move`, and `edit` patches containing deletion or rename operations, the additional editor-side gate remains operation-category scoped. Ordinary file-content edits do not use that extra gate. Generic approval prompts use form elicitation when the client advertises `elicitation.form`. A rejected, cancelled, or unsupported prompt rejects or cancels the tool call.
 
 ## Subagents
 
 Subagents run headless with `tools.approvalMode: yolo` so ordinary tier-based prompts do not stall them. The parent `task` approval is the authorization boundary. Per-tool policies still use the normal resolver: user `deny` remains absolute, and any call that resolves to `prompt` rejects because a headless subagent cannot satisfy it.
+
+Parked references retain their exact journal, root, credential source, and account lifetime independently of model or UI settings.
+Each warm revival captures fresh model and policy admission before startup.
+Initial queued execution retains its original strict guard until the first successful startup.
+
+## Background widget authoring
+
+`async.widgets` controls local widget display. It does not authorize inference.
+Remote authoring stays off by default. A managed setting or explicit SDK runtime override must set `async.widgetRemoteAuthoring: true`.
+Project settings and display reads cannot grant this consent.
+The root session filters model capability and provider/model policy before credential resolution.
+Requests use that session's `ModelRegistry` and `AuthStorage` account/credit routing, or its explicit credential resolver.
+Disable, account, and session transitions invalidate pending authoring. Accepted requests drain before the originating usage journal closes.

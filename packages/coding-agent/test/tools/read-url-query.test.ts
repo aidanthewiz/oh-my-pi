@@ -41,7 +41,7 @@ describe("read keeps the query of schemes that own it", () => {
 });
 
 describe("read routed documents", () => {
-	it("preserves notes while returning only the selected document lines", async () => {
+	it.each([true, false])("retains resource notes without contaminating raw=%s document text", async raw => {
 		const router = InternalUrlRouter.instance();
 		router.register({
 			scheme: "cf-noted-document",
@@ -55,14 +55,17 @@ describe("read routed documents", () => {
 		});
 		try {
 			const result = await new ReadTool(createSession()).execute("noted-document", {
-				path: "cf-noted-document://page:raw:2-2",
+				path: `cf-noted-document://page${raw ? ":raw" : ""}:2-2`,
 			});
 			const text = result.content.flatMap(part => (part.type === "text" ? [part.text] : [])).join("\n");
 			expect(result.isError).not.toBe(true);
-			expect(text).toContain("selected-document-line");
-			expect(text).toContain("synthetic resource note");
-			expect(text).not.toContain("unselected-before");
-			expect(text).not.toContain("unselected-after");
+			expect(result.details?.notes).toContain("synthetic resource note");
+			if (raw) {
+				expect(text).toBe("selected-document-line");
+			} else {
+				expect(text).toContain("selected-document-line");
+				expect(text).toContain("synthetic resource note");
+			}
 		} finally {
 			router.unregister("cf-noted-document");
 		}

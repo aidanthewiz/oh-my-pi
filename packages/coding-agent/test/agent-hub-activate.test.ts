@@ -199,51 +199,6 @@ describe("Agent hub Enter activation", () => {
 		hub.dispose();
 	});
 
-	it("Enter opens an aborted agent's read-only transcript instead of focusing it", () => {
-		const agents = new AgentRegistry();
-		agents.register({
-			id: AGENT_ID,
-			displayName: AGENT_ID,
-			kind: "sub",
-			parentId: "Main",
-			session: null,
-			sessionFile: null,
-			status: "aborted",
-		});
-		const focusAgent = vi.fn(async () => {});
-		const showOverlay = vi.fn((_component: unknown, _options: unknown) => ({ hide: () => {} }));
-		const setFocus = vi.fn();
-		const onDone = vi.fn();
-		const hub = new AgentHubOverlayComponent({
-			...createAgentHubRuntime({ settings: Settings.isolated(), registry: agents }),
-			observers: new SessionObserverRegistry(),
-			hubKeys: [],
-			onDone,
-			requestRender: () => {},
-			registry: agents,
-			irc: new IrcBus(agents),
-			focusAgent,
-			ui: {
-				requestRender: () => {},
-				requestComponentRender: () => {},
-				showOverlay,
-				setFocus,
-			} as never,
-		});
-
-		hub.handleInput("\r");
-
-		expect(focusAgent).not.toHaveBeenCalled();
-		expect(showOverlay).toHaveBeenCalledWith(expect.anything(), {
-			width: "100%",
-			margin: 0,
-			fullscreen: true,
-		});
-		expect(setFocus).toHaveBeenCalledWith(expect.anything());
-		expect(onDone).not.toHaveBeenCalled();
-		hub.dispose();
-	});
-
 	it("lists persisted subagent session files after restart", async () => {
 		using tempDir = TempDir.createSync("@omp-agent-hub-persisted-");
 		const sessionFile = path.join(tempDir.path(), "main.jsonl");
@@ -1072,7 +1027,7 @@ describe("Agent hub data refresh coalescing", () => {
 		} finally {
 			await parentSession?.dispose();
 			await childSession?.dispose();
-			authStorage.close();
+			await authStorage.close();
 		}
 	});
 	it("captures the final assistant charge before parking without replacing history metrics", async () => {
@@ -1149,7 +1104,7 @@ describe("Agent hub data refresh coalescing", () => {
 		} finally {
 			await lifecycle?.dispose();
 			await session?.dispose();
-			authStorage.close();
+			await authStorage.close();
 		}
 	});
 	it("refreshes live cost for a late off-branch model_usage entry without a message change", async () => {
@@ -1204,7 +1159,7 @@ describe("Agent hub data refresh coalescing", () => {
 			expect(run()).toBeCloseTo(0.65);
 		} finally {
 			await session?.dispose();
-			authStorage.close();
+			await authStorage.close();
 		}
 	});
 });

@@ -111,8 +111,8 @@ describe("extension autocomplete provider API (#4919)", () => {
 		session = undefined;
 	});
 
-	afterAll(() => {
-		authStorage?.close();
+	afterAll(async () => {
+		await authStorage?.close();
 		if (originalHome === undefined) delete process.env.HOME;
 		else process.env.HOME = originalHome;
 		tempDir?.removeSync();

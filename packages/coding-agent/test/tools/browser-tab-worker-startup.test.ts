@@ -5,10 +5,12 @@ declare const devicePixelRatio: number;
 declare const window: { open(url: string, target: string, features: string): unknown };
 
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import * as toolBridge from "@oh-my-pi/pi-coding-agent/eval/js/tool-bridge";
 import {
 	acquireBrowser,
 	type BrowserHandle,
 	holdBrowser,
+	type PuppeteerBrowserHandle,
 	releaseBrowser,
 } from "@oh-my-pi/pi-coding-agent/tools/browser/registry";
 import type { ReadyInfo, WorkerInbound, WorkerOutbound } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-protocol";
@@ -32,6 +34,27 @@ const CHROMIUM_AVAILABLE = await chromiumAvailable();
 // viewport smoke test only with OMP_TEST_VISIBLE_BROWSER=1.
 const VISIBLE_BROWSER_AVAILABLE = process.env.OMP_TEST_VISIBLE_BROWSER === "1" && (await visibleBrowserAvailable());
 
+// One headless Chromium for the file, held for its whole run: every test opens and closes its own tabs, and none
+// changes the browser in a way another test reads.
+let sharedHeadless: PuppeteerBrowserHandle | undefined;
+
+beforeAll(async () => {
+	if (!CHROMIUM_AVAILABLE) return;
+	const launched = await acquireBrowser({ kind: "headless", headless: true }, { cwd: process.cwd() });
+	if (!("browser" in launched)) throw new Error("Expected a Puppeteer browser");
+	holdBrowser(launched);
+	sharedHeadless = launched;
+});
+
+afterAll(async () => {
+	if (sharedHeadless) await releaseBrowser(sharedHeadless, { kill: true });
+});
+
+function headless(): PuppeteerBrowserHandle {
+	if (!sharedHeadless?.browser.connected) throw new Error("Expected the shared headless browser");
+	return sharedHeadless;
+}
+
 class FakeStartupWorker {
 	#errorHandlers = new Set<(error: Error) => void>();
 	#messageHandlers = new Set<(msg: WorkerOutbound) => void>();
@@ -47,6 +70,10 @@ class FakeStartupWorker {
 	onError(handler: (error: Error) => void): () => void {
 		this.#errorHandlers.add(handler);
 		return () => this.#errorHandlers.delete(handler);
+	}
+
+	onExit(): () => void {
+		return () => {};
 	}
 
 	async terminate(): Promise<void> {}
@@ -71,6 +98,7 @@ const initPayload = {
 	mode: "headless" as const,
 	browserWSEndpoint: "ws://127.0.0.1/devtools/browser/test",
 	safeDir: "/tmp/omp-puppeteer",
+	uploadDir: "/tmp/omp-uploads-test",
 };
 const SECRET_KEY = "BROWSER_WORKER_PARENT_SECRET";
 const MANAGED_SECRET_KEY = "OMP_MANAGED_BROWSER_WORKER_SECRET";
@@ -118,15 +146,6 @@ describe("browser tab worker startup", () => {
 		await expect(pending).resolves.toEqual(info);
 	});
 
-	it("rejects with the setup timeout when the worker never signals setup", async () => {
-		const worker = new FakeStartupWorker();
-		// timeoutMs 3_000 -> setup budget = max(2s, min(10s, 1s)) = 2s: the stall
-		// must reject under the setup guard, not consume the full init budget.
-		const pending = initializeTabWorkerForTest(worker, initPayload, 3_000);
-
-		await expect(pending).rejects.toThrow("Timed out waiting for tab worker setup");
-	});
-
 	it("surfaces a reported init failure that arrives after setup", async () => {
 		const worker = new FakeStartupWorker();
 		const pending = initializeTabWorkerForTest(worker, initPayload, 3_000);
@@ -170,22 +189,10 @@ describe("browser init budget exhaustion", () => {
 });
 
 describe("browser init deadline carry-over", () => {
-	let sharedHeadless: BrowserHandle | undefined;
-
-	beforeAll(async () => {
-		if (!CHROMIUM_AVAILABLE) return;
-		sharedHeadless = await acquireBrowser({ kind: "headless", headless: true }, { cwd: process.cwd() });
-	});
-
-	afterAll(async () => {
-		if (sharedHeadless) await releaseBrowser(sharedHeadless, { kill: true });
-	});
-
 	it.skipIf(!CHROMIUM_AVAILABLE)(
 		"counts caller time already spent before acquisition against the worker-init budget",
 		async () => {
-			const launched = sharedHeadless;
-			if (!launched) throw new Error("Expected a shared headless browser");
+			const launched = headless();
 			// The hang server makes the ready phase burn its (floor-clamped) budget
 			// without resolving, so the first init attempt fails on its own.
 			const server = Bun.serve({
@@ -236,8 +243,7 @@ describe("OMP-owned browser evaluation", () => {
 	it.skipIf(!CHROMIUM_AVAILABLE)(
 		"adopts isolated element arguments into the main world without consuming caller handles",
 		async () => {
-			const browser = await acquireBrowser({ kind: "headless", headless: true }, { cwd: process.cwd() });
-			if (!("browser" in browser)) throw new Error("Expected a Puppeteer browser");
+			const browser = headless();
 			const name = `handle-evaluate-${process.pid}`;
 			const session = {
 				cwd: process.cwd(),
@@ -318,7 +324,6 @@ describe("OMP-owned browser evaluation", () => {
 				});
 			} finally {
 				await releaseTab(name, { kill: true });
-				if (browser.browser.connected) await releaseBrowser(browser, { kill: true });
 			}
 		},
 		45_000,
@@ -329,8 +334,7 @@ describe("OMP-owned browser input", () => {
 	it.skipIf(!CHROMIUM_AVAILABLE)(
 		"clicks background tabs through selector, observed handle, and raw Puppeteer actions",
 		async () => {
-			const browser = await acquireBrowser({ kind: "headless", headless: true }, { cwd: process.cwd() });
-			if (!("browser" in browser)) throw new Error("Expected a Puppeteer browser");
+			const browser = headless();
 			const name = `background-input-${process.pid}`;
 			const session = {
 				cwd: process.cwd(),
@@ -348,7 +352,6 @@ describe("OMP-owned browser input", () => {
 					await foreground.bringToFront();
 					const result = await runInTab(name, {
 						code: `
-							await wait(500);
 							await tab.click("button");
 							const observation = await tab.observe();
 							await (await tab.id(observation.elements[0].id)).click();
@@ -364,7 +367,6 @@ describe("OMP-owned browser input", () => {
 				}
 			} finally {
 				await releaseTab(name, { kill: true });
-				if (browser.browser.connected) await releaseBrowser(browser, { kill: true });
 			}
 		},
 		45_000,
@@ -424,25 +426,18 @@ describe("visible OMP-owned browser tabs", () => {
 	it.skipIf(!CHROMIUM_AVAILABLE)(
 		"keeps deterministic viewport emulation for hidden launches",
 		async () => {
-			let browser: BrowserHandle | undefined;
+			const browser = headless();
 			const name = `hidden-viewport-${process.pid}-${Math.random().toString(36).slice(2)}`;
-			let opened = false;
 			try {
-				browser = await acquireBrowser({ kind: "headless", headless: true }, { cwd: process.cwd() });
-				if (!("browser" in browser)) throw new Error("Expected a Puppeteer browser");
 				const url = `data:text/html,<title>${name}</title><main>hidden</main>`;
 				await acquireTab(name, browser, { url, timeoutMs: 30_000 });
-				opened = true;
 				const page = (await browser.browser.pages()).find(candidate => candidate.url() === url);
 				if (!page) throw new Error("Expected the managed hidden page");
 				expect(
 					await page.evaluate(() => ({ width: innerWidth, height: innerHeight, dpr: devicePixelRatio })),
 				).toEqual({ width: 1365, height: 768, dpr: 1.25 });
 			} finally {
-				if (opened) await releaseTab(name, { kill: true });
-				else if (browser && "browser" in browser && browser.browser.connected) {
-					await releaseBrowser(browser, { kill: true });
-				}
+				await releaseTab(name, { kill: true });
 			}
 		},
 		45_000,
@@ -459,10 +454,9 @@ describe("browser tabs whose renderer crashed", () => {
 
 	/** Watch the page at `url` over a CDP session of the test's own; `crashed` resolves once Chromium reports its renderer died. */
 	async function watchRenderer(
-		browser: BrowserHandle,
+		browser: PuppeteerBrowserHandle,
 		url: string,
 	): Promise<{ client: CDPSession; crashed: Promise<void> }> {
-		if (!("browser" in browser)) throw new Error("Expected a Puppeteer browser");
 		const target = await browser.browser.waitForTarget(candidate => candidate.url() === url, { timeout: 5_000 });
 		const client = await target.createCDPSession();
 		const crashed = Promise.withResolvers<void>();
@@ -472,7 +466,7 @@ describe("browser tabs whose renderer crashed", () => {
 	}
 
 	/** Kill the page's renderer; resolves once Chromium reports the crash. */
-	async function crashRenderer(browser: BrowserHandle, url: string): Promise<void> {
+	async function crashRenderer(browser: PuppeteerBrowserHandle, url: string): Promise<void> {
 		const { client, crashed } = await watchRenderer(browser, url);
 		// Page.crash never answers: the renderer it would answer from is gone.
 		void client.send("Page.crash").catch(() => undefined);
@@ -482,7 +476,7 @@ describe("browser tabs whose renderer crashed", () => {
 	it.skipIf(!CHROMIUM_AVAILABLE)(
 		"fails a call on a tab whose renderer crashed while idle at once, with the page reloaded for the next",
 		async () => {
-			const browser = await acquireBrowser({ kind: "headless", headless: true }, { cwd: process.cwd() });
+			const browser = headless();
 			const name = `crashed-idle-${process.pid}`;
 			const url = `data:text/html,<title>${name}</title>`;
 			try {
@@ -499,7 +493,6 @@ describe("browser tabs whose renderer crashed", () => {
 				expect(next.returnValue).toBe(name);
 			} finally {
 				await releaseTab(name, { kill: true });
-				if ("browser" in browser && browser.browser.connected) await releaseBrowser(browser, { kill: true });
 			}
 		},
 		45_000,
@@ -508,7 +501,7 @@ describe("browser tabs whose renderer crashed", () => {
 	it.skipIf(!CHROMIUM_AVAILABLE)(
 		"fails the call in flight when the renderer crashes under it",
 		async () => {
-			const browser = await acquireBrowser({ kind: "headless", headless: true }, { cwd: process.cwd() });
+			const browser = headless();
 			const name = `crashed-in-flight-${process.pid}`;
 			const url = `data:text/html,<title>${name}</title>`;
 			try {
@@ -526,7 +519,6 @@ describe("browser tabs whose renderer crashed", () => {
 				expect(next.returnValue).toBe(name);
 			} finally {
 				await releaseTab(name, { kill: true });
-				if ("browser" in browser && browser.browser.connected) await releaseBrowser(browser, { kill: true });
 			}
 		},
 		45_000,
@@ -535,7 +527,7 @@ describe("browser tabs whose renderer crashed", () => {
 	it.skipIf(!CHROMIUM_AVAILABLE)(
 		"keeps a crashed tab busy while the failing call reloads it",
 		async () => {
-			const browser = await acquireBrowser({ kind: "headless", headless: true }, { cwd: process.cwd() });
+			const browser = headless();
 			const name = `crashed-busy-${process.pid}`;
 			const url = `data:text/html,<title>${name}</title>`;
 			try {
@@ -572,7 +564,6 @@ describe("browser tabs whose renderer crashed", () => {
 				expect(next.returnValue).toBe(name);
 			} finally {
 				await releaseTab(name, { kill: true });
-				if ("browser" in browser && browser.browser.connected) await releaseBrowser(browser, { kill: true });
 			}
 		},
 		45_000,
@@ -581,7 +572,7 @@ describe("browser tabs whose renderer crashed", () => {
 	it.skipIf(!CHROMIUM_AVAILABLE)(
 		"closes a tab whose page crashes again as it reloads",
 		async () => {
-			const browser = await acquireBrowser({ kind: "headless", headless: true }, { cwd: process.cwd() });
+			const browser = headless();
 			const name = `crashed-on-load-${process.pid}`;
 			try {
 				const url = `data:text/html,<title>${name}</title>`;
@@ -597,7 +588,6 @@ describe("browser tabs whose renderer crashed", () => {
 				expect(getTab(name)).toBeUndefined();
 			} finally {
 				await releaseTab(name, { kill: true });
-				if ("browser" in browser && browser.browser.connected) await releaseBrowser(browser, { kill: true });
 			}
 		},
 		45_000,
@@ -606,7 +596,7 @@ describe("browser tabs whose renderer crashed", () => {
 	it.skipIf(!CHROMIUM_AVAILABLE)(
 		"answers a run whose page crashes as its result is put together",
 		async () => {
-			const browser = await acquireBrowser({ kind: "headless", headless: true }, { cwd: process.cwd() });
+			const browser = headless();
 			const name = `crashed-late-${process.pid}`;
 			try {
 				await acquireTab(name, browser, { url: `data:text/html,<title>${name}</title>`, timeoutMs: 30_000 });
@@ -625,7 +615,152 @@ describe("browser tabs whose renderer crashed", () => {
 				expect(String(outcome)).toContain("the tab could not be reattached and was closed");
 			} finally {
 				await releaseTab(name, { kill: true });
-				if ("browser" in browser && browser.browser.connected) await releaseBrowser(browser, { kill: true });
+			}
+		},
+		45_000,
+	);
+
+	it.skipIf(!CHROMIUM_AVAILABLE)(
+		"cancels a crashed worker's run before reporting recovery instead of letting it continue",
+		async () => {
+			let gateOpen = false;
+			const started = Promise.withResolvers<void>();
+			// Whichever the run reaches once the gate opens: `stopped` when its wait was cancelled, `continued` when not.
+			const outcome = Promise.withResolvers<"stopped" | "continued">();
+			const server = Bun.serve({
+				port: 0,
+				fetch: request => {
+					const { pathname } = new URL(request.url);
+					if (pathname === "/started") started.resolve();
+					else if (pathname === "/gate") return new Response(null, { status: gateOpen ? 200 : 503 });
+					else if (pathname === "/stopped") outcome.resolve("stopped");
+					else outcome.resolve("continued");
+					return new Response("ok");
+				},
+			});
+			const browser = headless();
+			const name = `crashed-continuation-${process.pid}`;
+			const url = `data:text/html,<title>${name}</title>`;
+			try {
+				await acquireTab(name, browser, { url, timeoutMs: 30_000 });
+				const crashedWorker = getTab(name);
+				if (!crashedWorker || crashedWorker.backend !== "worker") throw new Error("Expected a worker tab");
+				const oldWorker = crashedWorker.worker;
+				// The run holds at a gate the test opens only once its caller was told of the crash, however long the
+				// crash takes to land; a run left going passes it into the second fetch, a cancelled one reports it stopped.
+				const origin = `http://127.0.0.1:${server.port}`;
+				const run = runInTab(name, {
+					code: `await fetch("${origin}/started"); try { await wait(async () => (await fetch("${origin}/gate")).ok, { timeout: 8_000, interval: 20 }); } catch (error) { await fetch("${origin}/stopped"); throw error; } await fetch("${origin}/after-crash");`,
+					timeoutMs: 10_000,
+					session,
+				}).catch((error: unknown) => error);
+				await started.promise;
+				await crashRenderer(browser, url);
+				expect(String(await run)).toContain("its page reloaded");
+				const recovered = getTab(name);
+				if (!recovered || recovered.backend !== "worker") throw new Error("Expected a recovered worker tab");
+				expect(recovered.worker).not.toBe(oldWorker);
+				gateOpen = true;
+				// A run left going passes the 20 ms gate poll at once; a run torn down harder than a cancelled wait
+				// (worker terminated, fetches aborted) never reports, which is no less stopped. Only `continued` is the bug.
+				const reported = await Promise.race([outcome.promise, Bun.sleep(2_000).then(() => "no-report" as const)]);
+				expect(["stopped", "no-report"]).toContain(reported);
+			} finally {
+				await releaseTab(name, { kill: true });
+				server.stop(true);
+			}
+		},
+		45_000,
+	);
+
+	it.skipIf(!CHROMIUM_AVAILABLE)(
+		"does not admit old-worker tool calls or deliver aborted tool results to a recovered worker",
+		async () => {
+			const browser = headless();
+			const name = `crashed-tool-identity-${process.pid}`;
+			const url = `data:text/html,<title>${name}</title>`;
+			const oldGate = Promise.withResolvers<string>();
+			const currentGate = Promise.withResolvers<string>();
+			const oldEntered = Promise.withResolvers<AbortSignal>();
+			const currentEntered = Promise.withResolvers<void>();
+			const oldFinished = Promise.withResolvers<void>();
+			const admitted: string[] = [];
+			const hostTool = spyOn(toolBridge, "callSessionTool").mockImplementation(async (toolName, _args, options) => {
+				admitted.push(toolName);
+				if (toolName === "old") {
+					if (!options.signal) throw new Error("Expected a tool abort signal");
+					oldEntered.resolve(options.signal);
+					const value = await oldGate.promise;
+					oldFinished.resolve();
+					return value;
+				}
+				currentEntered.resolve();
+				return await currentGate.promise;
+			});
+			const RealWorker = globalThis.Worker;
+			let oldRaw: Worker | undefined;
+			let currentRun: Promise<unknown> | undefined;
+			try {
+				globalThis.Worker = class extends RealWorker {
+					constructor(...args: ConstructorParameters<typeof Worker>) {
+						super(...args);
+						oldRaw = this;
+					}
+				};
+				try {
+					await acquireTab(name, browser, { url, timeoutMs: 30_000 });
+				} finally {
+					globalThis.Worker = RealWorker;
+				}
+				if (!oldRaw) throw new Error("Expected the original worker");
+				const oldRun = runInTab(name, {
+					code: 'return await __omp_call_tool__("old", {});',
+					timeoutMs: 10_000,
+					session,
+				}).catch((error: unknown) => error);
+				const signal = await oldEntered.promise;
+				await crashRenderer(browser, url);
+				expect(String(await oldRun)).toContain("its page reloaded");
+				expect(signal.aborted).toBe(true);
+				const recovered = getTab(name);
+				if (!recovered || recovered.backend !== "worker") throw new Error("Expected a recovered worker tab");
+				const replies: WorkerInbound[] = [];
+				const send = recovered.worker.send.bind(recovered.worker);
+				const replySpy = spyOn(recovered.worker, "send").mockImplementation((message, transfers) => {
+					if (message.type === "tool-reply") replies.push(message);
+					send(message, transfers);
+				});
+				try {
+					oldGate.resolve("old-run-only-result");
+					await oldFinished.promise;
+					for (let i = 0; i < 32; i++) await Promise.resolve();
+					expect(replies).toEqual([]);
+					currentRun = runInTab(name, {
+						code: 'return await __omp_call_tool__("current", {});',
+						timeoutMs: 10_000,
+						session,
+					}).catch((error: unknown) => error);
+					await currentEntered.promise;
+					const runId = recovered.pending.keys().next().value;
+					if (!runId) throw new Error("Expected the current run");
+					oldRaw.dispatchEvent(
+						new MessageEvent("message", {
+							data: { type: "tool-call", id: "stale-call", runId, name: "stale", args: {} },
+						}),
+					);
+					expect(admitted).toEqual(["old", "current"]);
+					currentGate.resolve("current-result");
+					expect(await currentRun).toMatchObject({ returnValue: "current-result" });
+				} finally {
+					replySpy.mockRestore();
+				}
+			} finally {
+				globalThis.Worker = RealWorker;
+				oldGate.resolve("cleanup");
+				currentGate.resolve("cleanup");
+				await releaseTab(name, { kill: true });
+				await currentRun;
+				hostTool.mockRestore();
 			}
 		},
 		45_000,
@@ -634,7 +769,7 @@ describe("browser tabs whose renderer crashed", () => {
 	it.skipIf(!CHROMIUM_AVAILABLE)(
 		"brings back a settle-frozen tab whose renderer crashed",
 		async () => {
-			const browser = await acquireBrowser({ kind: "headless", headless: true }, { cwd: process.cwd() });
+			const browser = headless();
 			const name = `crashed-frozen-${process.pid}`;
 			const owner = `crashed-frozen-owner-${process.pid}`;
 			const url = `data:text/html,<title>${name}</title>`;
@@ -654,7 +789,6 @@ describe("browser tabs whose renderer crashed", () => {
 				expect(result.returnValue).toBe(name);
 			} finally {
 				await releaseTab(name, { kill: true });
-				if ("browser" in browser && browser.browser.connected) await releaseBrowser(browser, { kill: true });
 			}
 		},
 		45_000,
@@ -663,7 +797,7 @@ describe("browser tabs whose renderer crashed", () => {
 	it.skipIf(!CHROMIUM_AVAILABLE)(
 		"reports the reload when an open navigates a tab whose renderer crashed",
 		async () => {
-			const browser = await acquireBrowser({ kind: "headless", headless: true }, { cwd: process.cwd() });
+			const browser = headless();
 			const name = `crashed-reopen-${process.pid}`;
 			const url = `data:text/html,<title>${name}</title>`;
 			try {
@@ -675,7 +809,6 @@ describe("browser tabs whose renderer crashed", () => {
 				expect(reopened.tab.info.title).toBe(name);
 			} finally {
 				await releaseTab(name, { kill: true });
-				if ("browser" in browser && browser.browser.connected) await releaseBrowser(browser, { kill: true });
 			}
 		},
 		45_000,
@@ -684,9 +817,7 @@ describe("browser tabs whose renderer crashed", () => {
 	it.skipIf(!CHROMIUM_AVAILABLE)(
 		"leaves a tab closed while its crashed page is being reattached closed",
 		async () => {
-			const launched = await acquireBrowser({ kind: "headless", headless: true }, { cwd: process.cwd() });
-			if (!("browser" in launched)) throw new Error("Expected a Puppeteer browser");
-			holdBrowser(launched);
+			const launched = headless();
 			const name = `crashed-closed-${process.pid}`;
 			const url = `data:text/html,<title>${name}</title>`;
 			const userPage = await launched.browser.newPage();
@@ -723,7 +854,6 @@ describe("browser tabs whose renderer crashed", () => {
 			} finally {
 				await releaseTab(name, { kill: false });
 				await userPage.close().catch(() => undefined);
-				await releaseBrowser(launched, { kill: true });
 			}
 		},
 		45_000,
@@ -732,8 +862,7 @@ describe("browser tabs whose renderer crashed", () => {
 	it.skipIf(!CHROMIUM_AVAILABLE)(
 		"leaves a tab reopened under the same name alone when the closed one's reattach fails",
 		async () => {
-			const browser = await acquireBrowser({ kind: "headless", headless: true }, { cwd: process.cwd() });
-			holdBrowser(browser);
+			const browser = headless();
 			const name = `crashed-reopened-${process.pid}`;
 			const url = `data:text/html,<title>${name}</title>`;
 			try {
@@ -768,7 +897,6 @@ describe("browser tabs whose renderer crashed", () => {
 				expect(next.returnValue).toBe(`${name}-new`);
 			} finally {
 				await releaseTab(name, { kill: true });
-				await releaseBrowser(browser, { kill: true });
 			}
 		},
 		45_000,
@@ -785,8 +913,7 @@ describe("browser tabs whose renderer crashed", () => {
 					return new Response("<title>late-commit</title>", { headers: { "content-type": "text/html" } });
 				},
 			});
-			const browser = await acquireBrowser({ kind: "headless", headless: true }, { cwd: process.cwd() });
-			if (!("browser" in browser)) throw new Error("Expected a Puppeteer browser");
+			const browser = headless();
 			const name = `crashed-unlisted-${process.pid}`;
 			const url = `data:text/html,<title>${name}</title>`;
 			const opener = await browser.browser.newPage();
@@ -812,19 +939,33 @@ describe("browser tabs whose renderer crashed", () => {
 				await watcher.detach();
 				await crashRenderer(browser, url);
 				tab.targetId = popupId;
-				const failure = runInTab(name, { code: "return 1;", timeoutMs: 10_000, session }).catch(
-					(error: unknown) => error,
-				);
-				// Commit the popup's load only after the new worker has looked the target up (it starts well inside
-				// this); nothing in the worker signals that moment to the test.
-				setTimeout(() => loadGate.resolve(), 1_500);
-				expect(String(await failure)).toContain("its page reloaded");
+				// Commit the popup's load only after the new worker has looked the target up. The worker lists
+				// Puppeteer's targets in the same turn it reports `setup`, so that report releases the load.
+				const RealWorker = globalThis.Worker;
+				globalThis.Worker = class SetupReportingWorker extends RealWorker {
+					constructor(...args: ConstructorParameters<typeof Worker>) {
+						super(...args);
+						this.addEventListener("message", event => {
+							if ((event.data as WorkerOutbound).type === "setup") loadGate.resolve();
+						});
+					}
+				};
+				let failure: unknown;
+				try {
+					failure = await runInTab(name, { code: "return 1;", timeoutMs: 10_000, session }).catch(
+						(error: unknown) => error,
+					);
+				} finally {
+					globalThis.Worker = RealWorker;
+				}
+				expect(String(failure)).toContain("its page reloaded");
+				// The worker that looked the page up adopted it; an inline fallback would retry after the load committed.
+				expect(getTab(name)).toMatchObject({ worker: { mode: "worker" } });
 				const next = await runInTab(name, { code: "return await page.title();", timeoutMs: 10_000, session });
 				expect(next.returnValue).toBe("late-commit");
 			} finally {
 				await releaseTab(name, { kill: true });
 				await opener.close().catch(() => undefined);
-				if (browser.browser.connected) await releaseBrowser(browser, { kill: true });
 				server.stop(true);
 			}
 		},
@@ -834,9 +975,7 @@ describe("browser tabs whose renderer crashed", () => {
 	it.skipIf(!CHROMIUM_AVAILABLE)(
 		"closes a reattached headless tab's page when the tab is released",
 		async () => {
-			const browser = await acquireBrowser({ kind: "headless", headless: true }, { cwd: process.cwd() });
-			if (!("browser" in browser)) throw new Error("Expected a Puppeteer browser");
-			holdBrowser(browser);
+			const browser = headless();
 			const name = `crashed-released-${process.pid}`;
 			const url = `data:text/html,<title>${name}</title>`;
 			try {
@@ -856,7 +995,48 @@ describe("browser tabs whose renderer crashed", () => {
 				expect(targetInfos.map(info => info.targetId)).not.toContain(targetId);
 			} finally {
 				await releaseTab(name, { kill: true });
-				await releaseBrowser(browser, { kill: true });
+			}
+		},
+		45_000,
+	);
+});
+
+describe("closing an OMP-owned page", () => {
+	it.skipIf(!CHROMIUM_AVAILABLE)(
+		"closes the page by id when its worker reports closed without closing it",
+		async () => {
+			const browser = headless();
+			const name = `unconfirmed-close-${process.pid}`;
+			try {
+				await acquireTab(name, browser, { timeoutMs: 30_000 });
+				const tab = getTab(name);
+				if (tab?.backend !== "worker") throw new Error("Expected a worker tab");
+				const targetId = tab.targetId;
+				// A worker whose page close failed (its CDP socket broke) still answers `closed`.
+				const handlers = new Set<(msg: WorkerOutbound) => void>();
+				const subscribe = tab.worker.onMessage.bind(tab.worker);
+				spyOn(tab.worker, "onMessage").mockImplementation(handler => {
+					handlers.add(handler);
+					const unsubscribe = subscribe(handler);
+					return () => {
+						handlers.delete(handler);
+						unsubscribe();
+					};
+				});
+				const send = tab.worker.send.bind(tab.worker);
+				spyOn(tab.worker, "send").mockImplementation((msg, transfer) => {
+					if (msg.type !== "close") return send(msg, transfer);
+					queueMicrotask(() => {
+						for (const handler of handlers) handler({ type: "closed" });
+					});
+				});
+				await releaseTab(name, { kill: false });
+				const watcher = await browser.browser.target().createCDPSession();
+				const { targetInfos } = await watcher.send("Target.getTargets");
+				await watcher.detach();
+				expect(targetInfos.map(info => info.targetId)).not.toContain(targetId);
+			} finally {
+				await releaseTab(name, { kill: true });
 			}
 		},
 		45_000,

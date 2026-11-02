@@ -78,7 +78,7 @@ export interface DryBalanceModelRegistry {
 export interface DryBalanceRuntime {
 	modelRegistry: DryBalanceModelRegistry;
 	settings?: Settings;
-	close?: () => void;
+	close?: () => Promise<void>;
 }
 
 export interface DryBalanceAccountStat {
@@ -541,7 +541,7 @@ async function createDefaultRuntime(configFiles: string[] | undefined): Promise<
 			close: () => authStorage.close(),
 		};
 	} catch (error) {
-		authStorage.close();
+		await authStorage.close();
 		throw error;
 	}
 }
@@ -856,6 +856,6 @@ export async function runDryBalanceCommand(
 		return summary;
 	} finally {
 		closeProgress();
-		runtime.close?.();
+		await runtime.close?.();
 	}
 }

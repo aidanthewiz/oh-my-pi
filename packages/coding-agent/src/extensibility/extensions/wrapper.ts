@@ -11,17 +11,25 @@ import {
 } from "@oh-my-pi/pi-agent-core";
 import type { ComputerSafetyCheck, ImageContent, Static, TextContent, TSchema } from "@oh-my-pi/pi-ai";
 import { TERMINAL } from "@oh-my-pi/pi-tui";
-import { sanitizeText, untilAborted } from "@oh-my-pi/pi-utils";
+import { prompt, sanitizeText, untilAborted } from "@oh-my-pi/pi-utils";
 import type { Theme } from "@oh-my-pi/pi-tui/theme";
+import nativeDelegationTemplate from "../../prompts/tools/native-delegation.md" with { type: "text" };
 import { cfgApprovalNotify } from "../../tools/settings";
 import {
+	approvalRestrictions,
 	denyError,
+	captureApprovalTargets,
+	captureApprovalAuthority,
+	sameApprovalAuthority,
 	formatApprovalPrompt,
 	type RuntimeApprovalCapableTool,
+	recordApprovalGrant,
 	requestApproval,
 	resolveApproval,
 	resolveApprovalFromContext,
+	sessionApprovalScope,
 } from "../../tools/approval";
+import { getApprovalGrants } from "../../tools/approval-cache";
 import { defaultLoadModeForToolName } from "../../tools/essential-tools";
 import { withFileMutationSession } from "../../tools/file-write-fallback";
 import { mcpToolEventIdentity, normalizeToolEventInput, resolveToolEventInput } from "../tool-event-input";
@@ -64,7 +72,13 @@ function renderOptionsWithTheme<T extends object>(options: T, theme: Theme): T &
  */
 export class RegisteredToolAdapter implements AgentTool<any, any, any> {
 	declare name: string;
-	declare description: string;
+	get description(): string {
+		const description = this.registeredTool.definition.description;
+		const guidance = this.runner.getNativeDelegationGuidance(this.name);
+		return guidance
+			? prompt.render(nativeDelegationTemplate, { description, name: this.name, guidance })
+			: description;
+	}
 	declare parameters: any;
 	declare label: string;
 	declare strict: boolean;
@@ -72,11 +86,19 @@ export class RegisteredToolAdapter implements AgentTool<any, any, any> {
 	renderCall?: (args: any, options: any, theme: any) => any;
 	renderResult?: (result: any, options: any, theme: any, args?: any) => any;
 	readonly loadMode: ToolLoadMode;
+	readonly #isActive: () => boolean;
 
 	constructor(
 		private registeredTool: RegisteredTool,
 		private runner: ExtensionRunner,
 	) {
+		const owner = registeredTool.owner;
+		const activationCurrent = owner?.isActive;
+		this.#isActive = () =>
+			owner === null ||
+			(owner !== undefined &&
+				owner.tools.get(registeredTool.definition.name) === registeredTool &&
+				activationCurrent?.() !== false);
 		applyToolProxy(registeredTool.definition, this);
 		this.loadMode = defaultLoadModeForToolName(registeredTool.definition.name, registeredTool.definition.loadMode);
 
@@ -114,6 +136,7 @@ export class RegisteredToolAdapter implements AgentTool<any, any, any> {
 		onUpdate?: AgentToolUpdateCallback<any>,
 		context?: AgentToolContext,
 	) {
+		if (!this.#isActive()) throw new Error("Extension owner is no longer active");
 		// Bind the extension context to this tool's own name so `ctx.invokeTool` delegates to the
 		// native built-in of the same name (present only when this tool re-registers a built-in). The
 		// wrapper's own context, abort signal, and progress callback are inherited by the delegated
@@ -240,6 +263,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		// preflight again. Direct and nested xd:// calls have no loop marker:
 		// their final-input preflight still runs below.
 		const dispatchKey = `${toolCallId}:${this.tool.name}`;
+		const approvalSessionId = this.runner.sessionId;
 		const inheritedLoopDispatch =
 			(context as LoopAwareToolContext | undefined)?.[LOOP_DISPATCH_CONTEXT] === dispatchKey;
 		const loopDispatchedToolCall =
@@ -254,8 +278,17 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		// newly prompt-gated command and have it run unapproved.
 		const approvalContext =
 			context ?? (this.runner.sessionSettings ? { settings: this.runner.sessionSettings } : undefined);
-		const { approvalMode, userPolicies } = resolveApprovalFromContext(approvalContext);
-		const preResolved = resolveApproval(this.tool, approvalArgs(params, context), approvalMode, userPolicies);
+		const initialApproval = resolveApprovalFromContext(approvalContext);
+		const preResolved = resolveApproval(
+			this.tool,
+			approvalArgs(params, context),
+			initialApproval.approvalMode,
+			initialApproval.userPolicies,
+			undefined,
+			undefined,
+			undefined,
+			context,
+		);
 		if (preResolved.policy === "deny") {
 			throw denyError(preResolved, this.tool.name);
 		}
@@ -311,192 +344,310 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				throw new Error(`Extension failed, blocking execution: ${String(err)}`);
 			}
 		}
-		if (!loopDispatchedToolCall) {
-			const preflight = await this.runner.runToolCallPreflightBefore?.(
-				toolCallId,
-				this.tool,
-				effectiveParams,
-				context,
-			);
-			if (preflight?.block) {
-				throw new Error(preflight.reason || "Tool execution was blocked by a preflight rule");
-			}
-		}
-
 		const runtimeApprovalTool = this.tool as AgentTool<TParameters, TDetails> & RuntimeApprovalCapableTool;
-		const runtimeApproval = await runtimeApprovalTool.prepareRuntimeApproval?.(
-			toolCallId,
-			effectiveParams,
-			signal,
-			context,
-		);
-		if (runtimeApproval && !runtimeApprovalTool.approveRuntimeApproval) {
-			throw new Error(`Tool "${this.tool.name}" requested runtime approval without a grant handler.`);
-		}
-
-		// 2. Full approval gate against the (possibly revised) input that will actually run — resolves
-		// policy and prompts on `effectiveParams`, so the user approves exactly what executes. A revised
-		// input that newly resolves to `deny` is caught here even though the original passed the
-		// short-circuit above.
-		const resolvedArgs = approvalArgs(effectiveParams, context);
-		const resolved = resolveApproval(this.tool, resolvedArgs, approvalMode, userPolicies);
-		context?.xdevTierResolved?.(resolved.tier);
-		if (resolved.policy === "deny") {
-			cancelPreflight();
-			throw denyError(resolved, this.tool.name);
-		}
-		const pendingSafetyChecks = computerSafetyChecks(context);
-		// Outer approvals only cover the original input. `xd://` approval skips
-		// tier-only prompts while the same object flows through; ACP approval also
-		// satisfies explicit prompts, but compares against a deep snapshot because
-		// handlers can mutate the original argument object in place. Denies were
-		// enforced above, and provider safety checks remain independently required.
-		const explicitPrompt = resolved.override || Object.hasOwn(userPolicies, resolved.policyKey ?? this.tool.name);
-		const xdevBypass = context?.xdevApproved === true && effectiveParams === params;
-		const acpBypass =
-			context !== undefined &&
-			Object.hasOwn(context, "acpApprovedArgs") &&
-			Bun.deepEquals(effectiveParams, context.acpApprovedArgs);
-		const approvalCheck = {
-			required:
-				runtimeApproval !== undefined ||
-				pendingSafetyChecks.length > 0 ||
-				(resolved.policy === "prompt" && !acpBypass && (explicitPrompt || !xdevBypass)),
-			reason: runtimeApproval?.reason ?? resolved.reason,
-		};
-
-		if (approvalCheck.required) {
+		const captureAuthority = () => {
 			try {
-				const scheduledCall = context?.toolCall?.toolCalls[context.toolCall.index];
-				if (
-					scheduledCall?.id === toolCallId &&
-					(scheduledCall.name === this.tool.name || scheduledCall.name === this.tool.customWireName)
-				) {
-					await untilAborted(signal, () => this.runner.waitForToolApprovalPreview(toolCallId));
-				}
-
-				const hasApprovalHandlers =
-					this.runner.hasHandlers("tool_approval_requested") || this.runner.hasHandlers("tool_approval_resolved");
-				const sessionId = context?.sessionManager?.getSessionId() ?? "";
-				if (hasApprovalHandlers) {
-					await this.runner.emit({
-						type: "tool_approval_requested",
-						sessionId,
-						toolName: this.tool.name,
+				return captureApprovalAuthority(
+					this.runner.cwd,
+					approvalSessionId,
+					approvalContext?.settings,
+					this.runner.createContext(),
+				);
+			} catch {
+				return undefined;
+			}
+		};
+		let recheckPreflight = false;
+		for (;;) {
+			try {
+				signal?.throwIfAborted();
+				if (this.runner.sessionId !== approvalSessionId) throw new Error("Approval session changed");
+				const gateInput = structuredClone(effectiveParams);
+				const gateAuthority = captureAuthority();
+				if (!loopDispatchedToolCall || recheckPreflight) {
+					const preflight = await this.runner.runToolCallPreflightBefore?.(
 						toolCallId,
-						...(approvalCheck.reason ? { reason: approvalCheck.reason } : {}),
-						approvalMode,
-					});
-				}
-
-				const emitApprovalResolved = async (approved: boolean, reason?: string) => {
-					if (!hasApprovalHandlers) return;
-					await this.runner.emit({
-						type: "tool_approval_resolved",
-						sessionId,
-						toolName: this.tool.name,
-						toolCallId,
-						approved,
-						...(reason ? { reason } : {}),
-					});
-				};
-
-				// Runtime and provider safety approvals fail closed without an interactive
-				// prompt. Unlike ordinary tier approval, no setting or yolo mode may bypass
-				// either gate.
-				if (!this.runner.hasUI()) {
-					const reason = "no interactive UI available";
-					await emitApprovalResolved(false, reason);
-					if (runtimeApproval) {
-						throw new Error(
-							`Tool "${this.tool.name}" requires runtime approval but no interactive UI is available.`,
-						);
-					}
-					if (pendingSafetyChecks.length > 0) {
-						throw new Error(
-							`Tool "${this.tool.name}" has pending provider safety checks but no interactive UI is available.`,
-						);
-					}
-					throw new Error(
-						`Tool "${this.tool.name}" requires approval but no interactive UI available.\n` +
-							`Options:\n` +
-							`  1. Set tools.approvalMode: yolo in /settings\n` +
-							`  2. Add tools.approval.${this.tool.name}: allow to config\n` +
-							`  3. Use an interactive UI to approve the tool call`,
+						this.tool,
+						effectiveParams,
+						context,
 					);
+					if (preflight?.block)
+						throw new Error(preflight.reason || "Tool execution was blocked by a preflight rule");
 				}
-
-				const uiContext = this.runner.getUIContext();
-				if (approvalContext?.settings && cfgApprovalNotify.get(approvalContext.settings) === "on") {
-					const sessionName = context?.sessionManager?.getSessionName();
-					TERMINAL.sendNotification({
-						title: sessionName || "Coreforge",
-						body: "Tool approval required",
-						type: "approval",
-						urgency: "normal",
-						actions: "focus",
-					});
+				const runtimeApproval = await runtimeApprovalTool.prepareRuntimeApproval?.(
+					toolCallId,
+					effectiveParams,
+					signal,
+					context,
+				);
+				if (
+					!Bun.deepEquals(gateInput, effectiveParams) ||
+					!sameApprovalAuthority(gateAuthority, captureAuthority())
+				) {
+					runtimeApprovalTool.denyRuntimeApproval?.(toolCallId, effectiveParams);
+					recheckPreflight = true;
+					continue;
 				}
+				if (runtimeApproval && !runtimeApprovalTool.approveRuntimeApproval) {
+					throw new Error(`Tool "${this.tool.name}" requested runtime approval without a grant handler.`);
+				}
+				const { approvalMode, userPolicies } = resolveApprovalFromContext(approvalContext);
+				const authority = captureAuthority();
+				const scope = authority?.scope;
+				const credentials = authority?.credentials;
+				const approvalOwner = scope === undefined ? undefined : this.runner.createContext();
+				const allowPersistentGrants =
+					approvalOwner?.model !== undefined &&
+					approvalOwner.modelRegistry.authStorage.sourceIdentity !== undefined &&
+					approvalOwner.modelRegistry.authStorage.oauth
+						.accounts(approvalOwner.model.provider, approvalSessionId)
+						.some(account => account.active);
+				const inputSnapshot = structuredClone(effectiveParams);
+				const resolvedArgs = structuredClone(approvalArgs(inputSnapshot, context));
+				const safetySnapshot = structuredClone(computerSafetyChecks(context));
+				const targets = await captureApprovalTargets(this.tool, resolvedArgs, this.runner.cwd);
+				const restrictions = approvalRestrictions(approvalContext?.settings, this.runner.cwd);
+				const approvalGrants =
+					approvalMode === "always-ask-cached" && scope !== undefined
+						? getApprovalGrants(approvalContext?.settings?.getAgentDir(), approvalSessionId, scope, {
+								allowPersistent: allowPersistentGrants,
+								sessionAuthority: credentials,
+							})
+						: undefined;
+				const resolved = resolveApproval(
+					this.tool,
+					resolvedArgs,
+					approvalMode,
+					userPolicies,
+					approvalGrants,
+					restrictions,
+					targets,
+					context,
+				);
+				context?.xdevTierResolved?.(resolved.tier);
+				if (resolved.policy === "deny") throw denyError(resolved, this.tool.name);
+				const policyKey = resolved.policyKey ?? this.tool.name;
+				const explicitPrompt =
+					resolved.override || (resolved.source !== "mode" && policyKey !== context?.xdevPolicyKey);
+				const xdevBypass = context?.xdevPolicyKey !== undefined && effectiveParams === params;
+				const acp = context?.acpApproval;
+				const acpBypass =
+					acp !== undefined &&
+					acp.toolCallId === toolCallId &&
+					acp.toolName === this.tool.name &&
+					(resolved.source !== "restriction" || acp.perCall) &&
+					!targets.failed &&
+					!acp.targets.failed &&
+					sameApprovalAuthority(acp.authority, authority) &&
+					Bun.deepEquals(inputSnapshot, acp.args) &&
+					Bun.deepEquals(targets, acp.targets) &&
+					Bun.deepEquals({ approvalMode, userPolicies }, acp.policy) &&
+					Bun.deepEquals(restrictions, acp.restrictions);
+				const cacheTargets =
+					approvalGrants !== undefined &&
+					!targets.failed &&
+					targets.targets.length > 0 &&
+					resolved.policy === "prompt" &&
+					resolved.source === "mode" &&
+					safetySnapshot.length === 0 &&
+					!runtimeApproval &&
+					!runtimeApprovalTool.sessionApproval;
+				const unboundSessionScope =
+					scope !== undefined &&
+					!targets.failed &&
+					targets.targets.length === 0 &&
+					safetySnapshot.length === 0 &&
+					!runtimeApproval &&
+					!runtimeApprovalTool.sessionApproval
+						? sessionApprovalScope(resolved, this.tool.name)
+						: undefined;
+				const sessionScope = unboundSessionScope && {
+					subject: unboundSessionScope.subject,
+					key: JSON.stringify([scope, unboundSessionScope.key]),
+				};
+				const sessionApproved = sessionScope !== undefined && this.runner.hasSessionApproval(sessionScope.key);
+				const required =
+					runtimeApproval !== undefined ||
+					safetySnapshot.length > 0 ||
+					(resolved.policy === "prompt" && !acpBypass && !sessionApproved && (explicitPrompt || !xdevBypass));
+				const reason = runtimeApproval?.reason ?? resolved.reason;
 				const capability = runtimeApprovalTool.sessionApproval;
 				const sessionApproval =
-					pendingSafetyChecks.length === 0 &&
+					resolved.source !== "restriction" &&
+					safetySnapshot.length === 0 &&
 					(!runtimeApproval || runtimeApproval.allowSessionApproval === true) &&
 					capability?.label &&
-					capability.label !== "Deny" &&
-					capability.label !== "Approve" &&
-					capability.label !== "Approve once"
+					!["Deny", "Approve", "Approve once"].includes(capability.label)
 						? capability
 						: undefined;
 				let approveSession = false;
-				let approved: boolean;
-				const denialReason = "denied by user";
-				try {
-					if (runtimeApproval) {
-						const safetySuffix =
-							pendingSafetyChecks.length > 0
-								? `\n\nProvider safety checks:\n${safetyCheckLines(pendingSafetyChecks).join("\n")}`
-								: "";
-						const choice = await uiContext.select(
-							`Approve ${this.tool.name}?\nReason: ${runtimeApproval.reason}\n${runtimeApproval.prompt}${safetySuffix}`,
-							sessionApproval ? ["Deny", "Approve once", sessionApproval.label] : ["Deny", "Approve once"],
-							{ tuiStyle: runtimeApproval.tuiStyle },
-						);
-						approveSession = sessionApproval !== undefined && choice === sessionApproval.label;
-						approved = choice === "Approve once" || approveSession;
-					} else if (sessionApproval || pendingSafetyChecks.length > 0) {
-						// Provider safety details have no transcript preview and must remain fully readable.
-						const basePrompt = formatApprovalPrompt(this.tool, resolvedArgs, approvalCheck.reason);
-						const safetyPrompt =
-							pendingSafetyChecks.length > 0
-								? `${basePrompt}\nProvider safety checks:\n${safetyCheckLines(pendingSafetyChecks).join("\n")}`
-								: basePrompt;
-						const choice = await uiContext.select(
-							safetyPrompt,
-							sessionApproval ? ["Approve", "Deny", sessionApproval.label] : ["Deny", "Approve"],
-						);
-						approveSession = sessionApproval !== undefined && choice === sessionApproval.label;
-						approved = choice === "Approve" || approveSession;
-					} else {
-						approved = await requestApproval(uiContext, this.tool, resolvedArgs, approvalCheck.reason);
+				let approveModeSession = false;
+				let targetGrant: { grant: "folder" | "target"; always: boolean } | undefined;
+				if (required) {
+					const scheduledCall = context?.toolCall?.toolCalls[context.toolCall.index];
+					if (
+						scheduledCall?.id === toolCallId &&
+						(scheduledCall.name === this.tool.name || scheduledCall.name === this.tool.customWireName)
+					) {
+						await untilAborted(signal, () => this.runner.waitForToolApprovalPreview(toolCallId));
 					}
-					signal?.throwIfAborted();
-				} catch (err) {
-					await emitApprovalResolved(false, err instanceof Error ? err.message : "approval aborted");
-					throw err;
+					const hasApprovalHandlers =
+						this.runner.hasHandlers("tool_approval_requested") ||
+						this.runner.hasHandlers("tool_approval_resolved");
+					if (hasApprovalHandlers) {
+						await this.runner.emit({
+							type: "tool_approval_requested",
+							sessionId: approvalSessionId,
+							toolName: this.tool.name,
+							toolCallId,
+							...(reason ? { reason } : {}),
+							approvalMode,
+						});
+					}
+					const emitResolved = async (approved: boolean, reason?: string): Promise<void> => {
+						if (hasApprovalHandlers) {
+							await this.runner.emit({
+								type: "tool_approval_resolved",
+								sessionId: approvalSessionId,
+								toolName: this.tool.name,
+								toolCallId,
+								approved,
+								...(reason ? { reason } : {}),
+							});
+						}
+					};
+					if (!this.runner.hasUI()) {
+						await emitResolved(false, "no interactive UI available");
+						if (runtimeApproval) {
+							throw new Error(
+								`Tool "${this.tool.name}" requires runtime approval but no interactive UI is available.`,
+							);
+						}
+						if (safetySnapshot.length > 0) {
+							throw new Error(
+								`Tool "${this.tool.name}" has pending provider safety checks but no interactive UI is available.`,
+							);
+						}
+						if (resolved.source === "restriction") {
+							throw new Error(
+								`Tool "${this.tool.name}" requires approval but no interactive UI available.\n` +
+									`Reason: ${resolved.reason}\n` +
+									`A restricted folder (tools.restrictedFolders) asks in every approval mode.`,
+							);
+						}
+						throw new Error(
+							`Tool "${this.tool.name}" requires approval but no interactive UI available.\n` +
+								`Options:\n` +
+								`  1. Set tools.approvalMode: yolo in /settings\n` +
+								`  2. Add tools.approval.${this.tool.name}: allow to config\n` +
+								`  3. Use an interactive UI to approve the tool call`,
+						);
+					}
+					const ui = this.runner.getUIContext();
+					if (approvalContext?.settings && cfgApprovalNotify.get(approvalContext.settings) === "on") {
+						TERMINAL.sendNotification({
+							title: context?.sessionManager?.getSessionName() || "Coreforge",
+							body: "Tool approval required",
+							type: "approval",
+							urgency: "normal",
+							actions: "focus",
+						});
+					}
+					let approved = false;
+					try {
+						if (runtimeApproval) {
+							const safetySuffix = safetySnapshot.length
+								? `\n\nProvider safety checks:\n${safetyCheckLines(safetySnapshot).join("\n")}`
+								: "";
+							const choice = await ui.select(
+								`Approve ${this.tool.name}?\nReason: ${runtimeApproval.reason}\n${runtimeApproval.prompt}${safetySuffix}`,
+								sessionApproval ? ["Deny", "Approve once", sessionApproval.label] : ["Deny", "Approve once"],
+								{ tuiStyle: runtimeApproval.tuiStyle },
+							);
+							approveSession = sessionApproval !== undefined && choice === sessionApproval.label;
+							approved = choice === "Approve once" || approveSession;
+						} else if (sessionApproval || safetySnapshot.length) {
+							const base = formatApprovalPrompt(this.tool, resolvedArgs, reason);
+							const choice = await ui.select(
+								safetySnapshot.length
+									? `${base}\nProvider safety checks:\n${safetyCheckLines(safetySnapshot).join("\n")}`
+									: base,
+								sessionApproval ? ["Approve", "Deny", sessionApproval.label] : ["Deny", "Approve"],
+							);
+							approveSession = sessionApproval !== undefined && choice === sessionApproval.label;
+							approved = choice === "Approve" || approveSession;
+						} else {
+							const answer = await requestApproval(ui, this.tool, resolvedArgs, {
+								reason,
+								sessionSubject: sessionScope?.subject,
+								grants: cacheTargets,
+								targets,
+								allowPersistentGrants,
+							});
+							approveModeSession = answer === "session" && sessionScope !== undefined;
+							targetGrant = typeof answer === "object" ? answer : undefined;
+							approved = answer === "once" || approveModeSession || targetGrant !== undefined;
+						}
+						signal?.throwIfAborted();
+						if (this.runner.sessionId !== approvalSessionId) throw new Error("Approval session changed");
+					} catch (error) {
+						await emitResolved(false, error instanceof Error ? error.message : "approval aborted");
+						throw error;
+					}
+					await emitResolved(approved, approved ? undefined : "denied by user");
+					if (!approved) throw new Error(`Tool call denied by user: ${this.tool.name}`);
 				}
-				await emitApprovalResolved(approved, approved ? undefined : denialReason);
+				const finalTargets = await captureApprovalTargets(
+					this.tool,
+					approvalArgs(effectiveParams, context),
+					this.runner.cwd,
+				);
 				signal?.throwIfAborted();
-				if (!approved) {
-					throw new Error(`Tool call denied by user: ${this.tool.name}`);
+				if (
+					(approvalMode === "always-ask-cached" || resolved.source === "restriction") &&
+					targets.failed &&
+					finalTargets.failed
+				) {
+					throw new Error(`Tool "${this.tool.name}" approval target identity is unavailable; execution refused.`);
 				}
-				if (runtimeApproval) {
-					runtimeApprovalTool.approveRuntimeApproval!(toolCallId, effectiveParams);
+				if (this.runner.sessionId !== approvalSessionId) throw new Error("Approval session changed");
+				const finalPolicy = resolveApprovalFromContext(approvalContext);
+				if (
+					!Bun.deepEquals(inputSnapshot, effectiveParams) ||
+					!Bun.deepEquals(resolvedArgs, approvalArgs(effectiveParams, context)) ||
+					!Bun.deepEquals(targets, finalTargets) ||
+					!sameApprovalAuthority(authority, captureAuthority()) ||
+					!Bun.deepEquals(safetySnapshot, computerSafetyChecks(context)) ||
+					!Bun.deepEquals({ approvalMode, userPolicies }, finalPolicy) ||
+					!Bun.deepEquals(
+						resolved,
+						resolveApproval(
+							this.tool,
+							approvalArgs(effectiveParams, context),
+							finalPolicy.approvalMode,
+							finalPolicy.userPolicies,
+							approvalGrants,
+							approvalRestrictions(approvalContext?.settings, this.runner.cwd),
+							finalTargets,
+							context,
+						),
+					)
+				) {
+					runtimeApprovalTool.denyRuntimeApproval?.(toolCallId, effectiveParams);
+					recheckPreflight = true;
+					continue;
 				}
-				if (pendingSafetyChecks.length > 0) {
+				if (runtimeApproval && required) runtimeApprovalTool.approveRuntimeApproval!(toolCallId, effectiveParams);
+				if (safetySnapshot.length) {
 					if (!context) throw new Error("Provider safety approval context is unavailable");
 					context.providerSafetyApproved = true;
 				}
 				if (approveSession) sessionApproval!.approve();
+				if (approveModeSession) this.runner.grantSessionApproval(sessionScope!.key);
+				if (targetGrant && approvalGrants) {
+					recordApprovalGrant(this.tool, resolvedArgs, approvalGrants, resolved.tier, targetGrant, targets);
+				}
+				break;
 			} catch (error) {
 				cancelPreflight();
 				runtimeApprovalTool.denyRuntimeApproval?.(toolCallId, effectiveParams);

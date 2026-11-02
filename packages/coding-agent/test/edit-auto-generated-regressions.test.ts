@@ -220,7 +220,7 @@ it("auto-generated edit rejection stays scoped to the tool call", async () => {
 		try {
 			await session.dispose();
 		} finally {
-			authStorage.close();
+			await authStorage.close();
 		}
 	}
 });
@@ -339,7 +339,7 @@ it("agent-loop propagates explicit isError from a tool result to the wire", asyn
 		try {
 			await session.dispose();
 		} finally {
-			authStorage.close();
+			await authStorage.close();
 		}
 	}
 });

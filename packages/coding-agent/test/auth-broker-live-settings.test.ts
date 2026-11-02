@@ -29,7 +29,7 @@ async function startBroker(dir: string, apiKey: string): Promise<Broker> {
 describe("auth broker settings take effect live", () => {
 	let tempDir: TempDir;
 	const brokers: Broker[] = [];
-	const cleanups: Array<() => void> = [];
+	const cleanups: Array<() => void | Promise<void>> = [];
 	const savedEnv: Partial<Record<(typeof BROKER_ENV)[number], string>> = {};
 
 	beforeEach(() => {
@@ -44,10 +44,10 @@ describe("auth broker settings take effect live", () => {
 	});
 
 	afterEach(async () => {
-		for (const cleanup of cleanups.splice(0)) cleanup();
+		for (const cleanup of cleanups.splice(0)) await cleanup();
 		for (const broker of brokers.splice(0)) {
 			await broker.handle.close();
-			broker.storage.close();
+			await broker.storage.close();
 		}
 		for (const key of BROKER_ENV) {
 			delete process.env[key];

@@ -8,8 +8,10 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { EffectiveExtensionRoots } from "@oh-my-pi/pi-coding-agent/capability/types";
+import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
+import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { executeBuiltinSlashCommand } from "@oh-my-pi/pi-coding-agent/slash-commands/builtin-registry";
 import type { TuiSlashCommandRuntime } from "@oh-my-pi/pi-coding-agent/slash-commands/types";
 import { TaskTool } from "@oh-my-pi/pi-coding-agent/task";
@@ -39,14 +41,20 @@ function createTaskSession(cwd: string): ToolSession {
 	} as unknown as ToolSession;
 }
 
-function createFakeCtx(cwd: string, settingsValues: Record<string, unknown> = {}) {
+function createFakeCtx(cwd: string, modelRegistry: ModelRegistry, settingsValues: Record<string, unknown> = {}) {
 	const mcpTools = [{ name: "mcp__srv_do" }];
 	const mcpManager = {
 		disconnectAll: vi.fn(async () => {}),
 		discoverAndConnect: vi.fn(async (_options?: unknown) => ({ errors: new Map<string, string>() })),
 		getTools: vi.fn(() => mcpTools),
 	};
+	const settings = Settings.isolated(settingsValues);
 	const session = {
+		sessionId: "reload-plugins-session",
+		isDisposed: false,
+		settings,
+		model: modelRegistry.find("anthropic", "claude-sonnet-4-5"),
+		modelRegistry,
 		effectiveExtensionRoots: TEST_EXTENSION_ROOTS,
 		getEvalPreludes: () => [],
 		refreshMCPTools: vi.fn(async (_tools: unknown) => {}),
@@ -56,7 +64,7 @@ function createFakeCtx(cwd: string, settingsValues: Record<string, unknown> = {}
 		mcpManager,
 		session,
 		sessionManager: { getCwd: () => cwd },
-		settings: Settings.isolated(settingsValues),
+		settings,
 		refreshSkillState: vi.fn(async () => {}),
 		refreshSlashCommandState: vi.fn(async () => {}),
 		showStatus: vi.fn(() => {}),
@@ -67,20 +75,25 @@ function createFakeCtx(cwd: string, settingsValues: Record<string, unknown> = {}
 
 describe("/reload-plugins runtime refresh", () => {
 	let projectDir = "";
+	let authStorage: AuthStorage;
+	let modelRegistry: ModelRegistry;
 
 	beforeEach(async () => {
 		projectDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-reload-plugins-mcp-"));
 		setProjectDir(projectDir);
+		authStorage = await AuthStorage.create(":memory:");
+		modelRegistry = new ModelRegistry(authStorage, path.join(projectDir, "models.yml"));
 	});
 
 	afterEach(async () => {
 		vi.restoreAllMocks();
+		await authStorage.close();
 		setProjectDir(originalProjectDir);
 		await removeWithRetries(projectDir);
 	});
 
 	test("reconnects MCP servers, rebinds tools, and clears stale prompt commands", async () => {
-		const { ctx, mcpManager, session, mcpTools } = createFakeCtx(projectDir);
+		const { ctx, mcpManager, session, mcpTools } = createFakeCtx(projectDir, modelRegistry);
 		const runtime: TuiSlashCommandRuntime = { ctx };
 
 		const result = await executeBuiltinSlashCommand("/reload-plugins", runtime);
@@ -94,7 +107,7 @@ describe("/reload-plugins runtime refresh", () => {
 	});
 
 	test("honors mcp.enableProjectConfig=false so opted-out project servers are not started on reload", async () => {
-		const { ctx, mcpManager } = createFakeCtx(projectDir, { "mcp.enableProjectConfig": false });
+		const { ctx, mcpManager } = createFakeCtx(projectDir, modelRegistry, { "mcp.enableProjectConfig": false });
 		const runtime: TuiSlashCommandRuntime = { ctx };
 
 		await executeBuiltinSlashCommand("/reload-plugins", runtime);
@@ -114,7 +127,7 @@ describe("/reload-plugins runtime refresh", () => {
 		expect(taskTool.description).toContain("VERSION_ONE");
 
 		await Bun.write(agentFile, agentDefinition("VERSION_TWO"));
-		const { ctx } = createFakeCtx(projectDir);
+		const { ctx } = createFakeCtx(projectDir, modelRegistry);
 		const runtime: TuiSlashCommandRuntime = { ctx };
 		await executeBuiltinSlashCommand("/reload-plugins", runtime);
 

@@ -11,11 +11,13 @@
  *      the failure backoff window — a repeat poll within the window is served
  *      from cache (no refetch); the entry expires and the next poll retries.
  */
+import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import {
 	type AuthCredential,
 	type AuthCredentialStore,
 	AuthStorage,
+	SqliteAuthCredentialStore,
 	type StoredAuthCredential,
 } from "@oh-my-pi/pi-ai/auth-storage";
 import { usageCacheIdentity } from "@oh-my-pi/pi-ai/auth/usage-cache";
@@ -211,8 +213,8 @@ describe("AuthStorage usage cache: last-good failure fallback", () => {
 		await storage.credentials.reload();
 	});
 
-	afterEach(() => {
-		storage.close();
+	afterEach(async () => {
+		await storage.close();
 		vi.restoreAllMocks();
 	});
 
@@ -266,7 +268,7 @@ describe("AuthStorage usage cache: last-good failure fallback", () => {
 				return { ...base, metadata: { ...base.metadata, source: "custom-provider" } };
 			},
 		};
-		storage.close();
+		await storage.close();
 		storage = new AuthStorage(store, {
 			usageProviderResolver: provider => (provider === "anthropic" ? customProvider : undefined),
 		});
@@ -312,7 +314,7 @@ describe("AuthStorage usage cache: last-good failure fallback", () => {
 			await extensionless.usage.reports();
 			expect(anthropicReports(await storage.usage.reports())[0]?.metadata?.source).toBe("built-in");
 		} finally {
-			extensionless.close();
+			await extensionless.close();
 		}
 	});
 
@@ -460,7 +462,7 @@ describe("AuthStorage usage cache: Claude saved resets", () => {
 			expect(second.fetchedAt).toBeGreaterThanOrEqual(first.fetchedAt);
 			expect(second.resetCredits).toMatchObject({ availableCount: 1, nextCreditId: "grant_1" });
 		} finally {
-			storage.close();
+			await storage.close();
 		}
 	});
 });
@@ -507,7 +509,7 @@ describe("AuthStorage usage cache: Claude rate limits", () => {
 			expect(requireLimit(recovered, "anthropic:5h").amount.used).toBe(25);
 			expect(usageRequests).toBe(2);
 		} finally {
-			storage.close();
+			await storage.close();
 		}
 	});
 });
@@ -535,7 +537,7 @@ describe("AuthStorage usage cache: explicit invalidation", () => {
 			expect(await storage.usage.reports()).toEqual([]);
 			await storage.usage.invalidate("anthropic");
 			expect(await storage.usage.reports()).toEqual([]);
-			storage.close();
+			await storage.close();
 			storage = new AuthStorage(store, options);
 			await storage.credentials.reload();
 			await storage.usage.invalidate("anthropic");
@@ -546,7 +548,7 @@ describe("AuthStorage usage cache: explicit invalidation", () => {
 			expect(await storage.usage.reports()).toEqual([recovered]);
 			expect(calls).toBe(2);
 		} finally {
-			storage.close();
+			await storage.close();
 		}
 	});
 
@@ -584,7 +586,7 @@ describe("AuthStorage usage cache: explicit invalidation", () => {
 			expect(calls).toBe(1);
 		} finally {
 			release.resolve(null);
-			storage.close();
+			await storage.close();
 		}
 	});
 
@@ -636,7 +638,7 @@ describe("AuthStorage usage cache: explicit invalidation", () => {
 			expect(calls).toBe(2);
 		} finally {
 			release.resolve(null);
-			storage.close();
+			await storage.close();
 		}
 	});
 
@@ -678,7 +680,7 @@ describe("AuthStorage usage cache: explicit invalidation", () => {
 			expect(calls).toBe(1);
 		} finally {
 			release.resolve(null);
-			storage.close();
+			await storage.close();
 		}
 	});
 
@@ -726,7 +728,7 @@ describe("AuthStorage usage cache: explicit invalidation", () => {
 			expect(refreshed?.[0]?.limits[0]?.amount.used).toBe(20);
 			expect(calls).toBe(2);
 		} finally {
-			storage.close();
+			await storage.close();
 		}
 	});
 
@@ -797,7 +799,7 @@ describe("AuthStorage usage cache: explicit invalidation", () => {
 			expect((await storage.usage.reports())?.[0]?.limits[0]?.amount.used).toBe(0);
 			expect(usageCalls).toBe(2);
 		} finally {
-			storage.close();
+			await storage.close();
 		}
 	});
 
@@ -893,7 +895,7 @@ describe("AuthStorage usage cache: explicit invalidation", () => {
 			expect(await initialStorage.usage.reports()).toHaveLength(3);
 			await initialStorage.usage.invalidate();
 		} finally {
-			initialStorage.close();
+			await initialStorage.close();
 		}
 
 		upgraded = true;
@@ -929,7 +931,7 @@ describe("AuthStorage usage cache: explicit invalidation", () => {
 				"pro",
 			);
 		} finally {
-			refreshedStorage.close();
+			await refreshedStorage.close();
 		}
 	});
 });
@@ -994,7 +996,7 @@ describe("AuthStorage usage cache: provider failure policy", () => {
 			expect(second.filter(report => report.provider === "alibaba-token-plan")).toHaveLength(0);
 			expect(usageCalls).toBe(2);
 		} finally {
-			storage.close();
+			await storage.close();
 		}
 	});
 });
@@ -1032,7 +1034,7 @@ describe("AuthStorage usage cache: jitter", () => {
 				expect(delta).toBeLessThan(6.5 * 60_000);
 			}
 		} finally {
-			storage.close();
+			await storage.close();
 			vi.restoreAllMocks();
 		}
 	});
@@ -1050,8 +1052,8 @@ describe("AuthStorage usage cache: header ingestion", () => {
 		await storage.credentials.reload();
 	});
 
-	afterEach(() => {
-		storage.close();
+	afterEach(async () => {
+		await storage.close();
 		vi.restoreAllMocks();
 	});
 
@@ -1398,6 +1400,49 @@ describe("AuthStorage usage cache: terminal refresh failure", () => {
 			expect(fetchSpy).toHaveBeenCalledTimes(1);
 			expect(fetchSpy.mock.calls[0]?.[0].credential.accessToken).toBe("oat-1");
 		} finally {
+			await storage.close();
+			vi.restoreAllMocks();
+		}
+	});
+
+	it("keeps a leased SQLite credential when the usage probe's refresh gets invalid_grant", async () => {
+		// The SQLite store serializes refreshes through durable leases; that path
+		// must apply the same advisory policy as lease-less stores.
+		const store = new SqliteAuthCredentialStore(new Database(":memory:"));
+		await store.saveOAuth("anthropic", {
+			access: "oat-leased",
+			refresh: "refresh-leased",
+			expires: Date.now() + 30_000,
+			accountId: "account-leased",
+			email: "leased@example.com",
+		});
+		let refreshCalls = 0;
+		const storage = new AuthStorage(store, {
+			usageProviderResolver: provider => (provider === "anthropic" ? claudeUsage.claudeUsageProvider : undefined),
+			refreshOAuthCredential: async () => {
+				refreshCalls += 1;
+				throw new Error(
+					'anthropic token refresh failed: 400 {"error":"invalid_grant","error_description":"Refresh token not found or invalid"}',
+				);
+			},
+		});
+		await storage.credentials.reload();
+		const disabled: string[] = [];
+		storage.credentials.onDisabled(event => {
+			disabled.push(event.disabledCause);
+		});
+		const fetchSpy = vi
+			.spyOn(claudeUsage.claudeUsageProvider, "fetchUsage")
+			.mockResolvedValue(makeReport("leased@example.com"));
+		try {
+			expect(anthropicReports(await storage.usage.reports())).toHaveLength(1);
+			expect(refreshCalls).toBe(1);
+			expect(fetchSpy.mock.calls[0]?.[0].credential.accessToken).toBe("oat-leased");
+			expect(disabled).toEqual([]);
+			expect(store.listAuthCredentials("anthropic").map(row => row.credential)).toMatchObject([
+				{ type: "oauth", refresh: "refresh-leased" },
+			]);
+		} finally {
 			storage.close();
 			vi.restoreAllMocks();
 		}
@@ -1428,7 +1473,7 @@ describe("AuthStorage usage cache: terminal refresh failure", () => {
 			const cached = JSON.parse(store.cache.get(cacheKey)!.value);
 			expect(cached.value).toBeNull();
 		} finally {
-			storage.close();
+			await storage.close();
 			vi.restoreAllMocks();
 		}
 	});
@@ -1493,7 +1538,7 @@ describe("AuthStorage usage cache: terminal refresh failure", () => {
 			expect(reports[0]?.metadata?.email).toBe("b@example.com");
 			expect(rows[0].disabledCause).toBeNull();
 		} finally {
-			storage.close();
+			await storage.close();
 			vi.restoreAllMocks();
 		}
 	});
@@ -1546,7 +1591,7 @@ describe("AuthStorage usage cache: org-only identity stability", () => {
 				expect(key).not.toContain("secret:");
 			}
 		} finally {
-			storage.close();
+			await storage.close();
 			vi.restoreAllMocks();
 		}
 	});

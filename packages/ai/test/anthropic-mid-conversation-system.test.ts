@@ -153,6 +153,49 @@ describe("Anthropic mid-conversation system messages", () => {
 		expect(params.at(-1)?.content).toBe("Switch to German.");
 	});
 
+	it("keeps user-attributed developer turns on the user role (#15881)", () => {
+		const model = makeModel();
+		const fileMention: DeveloperMessage = {
+			...developer('<file path="report.md">\n1:# Report\n</file>'),
+			attribution: "user",
+		};
+		const extensionStatus: DeveloperMessage = {
+			...developer("[extension] status=disconnected"),
+			attribution: "user",
+		};
+		// User-supplied context must not gain system authority or end the request
+		// in place of the user's turn.
+		expect(
+			convertAnthropicMessages([user("@report.md polish this"), fileMention], model, false).map(p => p.role),
+		).toEqual(["user", "user"]);
+		expect(
+			convertAnthropicMessages([user("@report.md polish this"), fileMention, extensionStatus], model, false).map(
+				p => p.role,
+			),
+		).toEqual(["user", "user", "user"]);
+		// An agent-owned reminder after the user-supplied context is still upgraded.
+		const reminder: DeveloperMessage = { ...developer("Track multi-step work."), attribution: "agent" };
+		expect(
+			convertAnthropicMessages([user("@report.md polish this"), fileMention, reminder], model, false).map(
+				p => p.role,
+			),
+		).toEqual(["user", "user", "system"]);
+	});
+
+	it.each([
+		["https://api.anthropic.com", "agent", "system"],
+		["https://api.anthropic.com", "user", "user"],
+		["https://gateway.example/v1", "agent", "user"],
+		["https://gateway.example/v1", "user", "user"],
+	] as const)("respects effective endpoint %s and %s attribution", (effectiveBaseUrl, attribution, expectedRole) => {
+		const message: DeveloperMessage = { ...developer("Keep this context."), attribution };
+		const params = convertAnthropicMessages([user("Review this."), message], makeModel(), false, {
+			effectiveBaseUrl,
+		});
+		expect(params.map(param => param.role)).toEqual(["user", expectedRole]);
+		expect(params[1]?.content).toBe("Keep this context.");
+	});
+
 	it("never emits a developer message in the first position as system", () => {
 		const model = makeModel();
 		const params = convertAnthropicMessages([developer("Global rule."), user("hi")], model, false);

@@ -1,22 +1,23 @@
 import { scheduler } from "node:timers/promises";
 import * as AIError from "../error";
 import { isUsageLimitOutcome } from "../error/rate-limit";
-import { extractProviderRetryHint } from "../utils/retry-after";
 import type { CredentialRankingContext, CredentialRankingStrategy } from "../usage";
 import type { RankingStrategyResolver } from "../usage/registry";
+import { extractProviderRetryHint } from "../utils/retry-after";
 import { raceSignal } from "./abort";
+import type { SessionAffinity } from "./affinity";
+import type { CredentialBlocks } from "./blocks";
 import {
 	ACCOUNT_POLICY_BLOCK_SCOPE,
 	AUTH_BLOCK_SCOPE,
-	DEFAULT_BLOCK_MS,
 	credentialBlockScopesForRequest,
+	DEFAULT_BLOCK_MS,
 	modelAccountPolicyBlockScope,
 	providerTypeKey,
 } from "./blocks";
-import type { CredentialBlocks } from "./blocks";
 import type { KeyOverrides } from "./cascade";
-import type { SessionAffinity } from "./affinity";
 import type { CredentialPool } from "./pool";
+import type { OAuthRefresher } from "./refresh";
 import type { AuthCredentialStore } from "./store";
 import type {
 	AuthCredential,
@@ -59,6 +60,7 @@ export type CredentialBlockRouting = {
 export interface RateLimitsDeps {
 	store: AuthCredentialStore;
 	pool: CredentialPool;
+	refresher: OAuthRefresher;
 	overrides: KeyOverrides;
 	blocks: CredentialBlocks;
 	affinity: SessionAffinity;
@@ -77,7 +79,11 @@ export class RateLimits implements LimitsApi {
 	async #resolveCredentialTarget(
 		provider: string,
 		sessionId: string | undefined,
-		options?: { credentialId?: number; apiKey?: string; allowStaleOAuthBearer?: boolean },
+		options?: {
+			credentialId?: number;
+			apiKey?: string;
+			allowStaleOAuthBearer?: boolean;
+		},
 	): Promise<{ type: AuthCredential["type"]; index: number; explicit: boolean } | undefined> {
 		const explicit = options?.credentialId !== undefined || options?.apiKey !== undefined;
 		if (explicit) {
@@ -237,7 +243,15 @@ export class RateLimits implements LimitsApi {
 	 * reports the earliest time a blocked sibling becomes available again so
 	 * callers can wait for the sibling instead of the provider's full window.
 	 */
-	async markReached(
+	markReached(
+		provider: string,
+		sessionId: string | undefined,
+		options?: MarkUsageLimitOptions,
+	): Promise<UsageLimitMarkResult> {
+		return this.#deps.refresher.runWithLifetime(() => this.#markReached(provider, sessionId, options));
+	}
+
+	async #markReached(
 		provider: string,
 		sessionId: string | undefined,
 		options?: MarkUsageLimitOptions,
@@ -333,7 +347,15 @@ export class RateLimits implements LimitsApi {
 		if (credential.access === apiKey) return true;
 		return this.#extractStructuredApiKeyToken(apiKey) === credential.access;
 	}
-	async invalidateMatching(
+	invalidateMatching(
+		provider: string,
+		apiKey: string,
+		options?: InvalidateCredentialMatchingOptions,
+	): Promise<boolean> {
+		return this.#deps.refresher.runWithLifetime(() => this.#invalidateMatching(provider, apiKey, options));
+	}
+
+	async #invalidateMatching(
 		provider: string,
 		apiKey: string,
 		options?: InvalidateCredentialMatchingOptions,
@@ -370,6 +392,7 @@ export class RateLimits implements LimitsApi {
 
 		const markSuspect = this.#deps.store.markCredentialSuspect?.bind(this.#deps.store);
 		if (markSuspect) {
+			this.#deps.refresher.assertRefreshAllowed();
 			await markSuspect(matched.id, { signal });
 		} else {
 			await this.#deps.pool.reload();
@@ -407,9 +430,18 @@ export class RateLimits implements LimitsApi {
 	 * For usage-limit and account-policy failures with no free sibling, sleeps
 	 * until the earliest sibling unblocks when that is at most
 	 * {@link SIBLING_UNBLOCK_WAIT_MAX_MS} away, then reports `afterSiblingWait`.
-	 * Aborting `options.signal` during that wait rejects.
+	 * Setting `options.waitForSibling` to false skips that wait without skipping
+	 * the failed credential's block. Aborting `options.signal` during the wait rejects.
 	 */
-	async rotate(
+	rotate(
+		provider: string,
+		sessionId: string | undefined,
+		options?: RotateCredentialOptions,
+	): Promise<CredentialRotation> {
+		return this.#deps.refresher.runWithLifetime(() => this.#rotate(provider, sessionId, options));
+	}
+
+	async #rotate(
 		provider: string,
 		sessionId: string | undefined,
 		options?: RotateCredentialOptions,
@@ -433,7 +465,7 @@ export class RateLimits implements LimitsApi {
 				credentialId: options?.credentialId,
 				signal: options?.signal,
 			});
-			return awaitSiblingUnblock(mark, options?.signal);
+			return awaitSiblingUnblock(mark, options?.signal, options?.waitForSibling);
 		}
 
 		const deniedModel = AIError.codexChatGPTAccountPolicyModel(error);
@@ -479,7 +511,7 @@ export class RateLimits implements LimitsApi {
 				routing,
 				false,
 			);
-			return awaitSiblingUnblock(mark, options?.signal);
+			return awaitSiblingUnblock(mark, options?.signal, options?.waitForSibling);
 		}
 
 		const providerKey = providerTypeKey(provider, sessionCredential.type);
@@ -526,6 +558,7 @@ export class RateLimits implements LimitsApi {
 		if (target) {
 			const markSuspect = this.#deps.store.markCredentialSuspect?.bind(this.#deps.store);
 			if (markSuspect) {
+				this.#deps.refresher.assertRefreshAllowed();
 				await markSuspect(target.id, { signal: options?.signal });
 			} else {
 				await this.#deps.pool.reload();
@@ -545,9 +578,13 @@ export class RateLimits implements LimitsApi {
  * Turn a no-sibling mark into a rotation by sleeping out the soonest sibling
  * block when it expires within {@link SIBLING_UNBLOCK_WAIT_MAX_MS}.
  */
-async function awaitSiblingUnblock(mark: UsageLimitMarkResult, signal?: AbortSignal): Promise<CredentialRotation> {
+async function awaitSiblingUnblock(
+	mark: UsageLimitMarkResult,
+	signal?: AbortSignal,
+	waitForSibling = true,
+): Promise<CredentialRotation> {
 	if (mark.switched) return { switched: true };
-	if (mark.retryAtMs === undefined) return { switched: false };
+	if (!waitForSibling || mark.retryAtMs === undefined) return { switched: false };
 	const waitMs = mark.retryAtMs - Date.now() + SIBLING_UNBLOCK_SLACK_MS;
 	if (waitMs > SIBLING_UNBLOCK_WAIT_MAX_MS) return { switched: false };
 	if (waitMs > 0) await scheduler.wait(waitMs, { signal });

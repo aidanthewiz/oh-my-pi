@@ -1,8 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
+import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { FileLock } from "@oh-my-pi/pi-natives";
+import { withArtifactPublicationLock } from "../src/session/artifact-publication";
 import { ArtifactManager, writeArtifact } from "@oh-my-pi/pi-coding-agent/session/artifacts";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { removeSyncWithRetries } from "@oh-my-pi/pi-utils";
 
 describe("ArtifactManager write integrity", () => {
@@ -19,6 +23,151 @@ describe("ArtifactManager write integrity", () => {
 		for (const dir of dirs.splice(0)) removeSyncWithRetries(dir);
 	});
 
+	it("keeps large resident artifacts scoped to the restored live owner without removing bounded reads", async () => {
+		const manager = SessionManager.inMemory();
+		const content = `${"x".repeat(8 * 1024 * 1024)}\ncomplete resident tail`;
+		const id = await manager.saveArtifact(content, "read");
+		if (!id) throw new Error("Expected resident artifact id");
+		expect(await manager.getArtifactContent(id, 8 * 1024 * 1024)).toBeNull();
+		expect(manager.getResidentArtifactContent(id)).toBe(content);
+		expect(manager.getResidentArtifactContent(`0${id}`)).toBeNull();
+		const snapshot = manager.captureState();
+
+		await manager.newSession();
+		expect(manager.getResidentArtifactContent(id)).toBeNull();
+		expect(await manager.saveArtifact("replacement owner", "read")).toBe(id);
+		expect(manager.getResidentArtifactContent(id)).toBe("replacement owner");
+		manager.restoreState(snapshot);
+		expect(manager.getResidentArtifactContent(id)).toBe(content);
+
+		manager.seal();
+		expect(manager.getResidentArtifactContent(id)).toBeNull();
+		expect(await manager.getArtifactContent(id, content.length)).toBeNull();
+		manager.releaseRetainedEntries();
+	});
+
+	it("never exposes a file-backed artifact through the resident capability", async () => {
+		const dir = freshDir();
+		const manager = SessionManager.create(dir, dir);
+		try {
+			const id = await manager.saveArtifact("disk-owned report", "read");
+			if (!id) throw new Error("Expected disk artifact id");
+			expect(manager.getResidentArtifactContent(id)).toBeNull();
+			expect(await manager.getArtifactContent(id, 16)).toBeNull();
+			expect(await manager.getArtifactContent(id, 17)).toBe("disk-owned report");
+		} finally {
+			await manager.close();
+			manager.releaseRetainedEntries();
+		}
+	});
+
+	it("waits for a live publication before replacing its complete artifact", async () => {
+		const dir = freshDir();
+		await fs.promises.mkdir(dir, { recursive: true });
+		const destination = path.join(dir, "Worker.md");
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const contended = Promise.withResolvers<void>();
+		const acquire = FileLock.tryAcquire.bind(FileLock);
+		vi.spyOn(FileLock, "tryAcquire").mockImplementation((...args) => {
+			const lock = acquire(...args);
+			if (!lock.acquired) contended.resolve();
+			return lock;
+		});
+		const holder = withArtifactPublicationLock(async () => {
+			await writeArtifact(destination, "first accepted report");
+			entered.resolve();
+			await release.promise;
+		});
+		await entered.promise;
+		const replacement = writeArtifact(destination, "second accepted report");
+		try {
+			await contended.promise;
+			expect(await Bun.file(destination).text()).toBe("first accepted report");
+		} finally {
+			release.resolve();
+			await holder;
+			await replacement;
+		}
+		expect(await Bun.file(destination).text()).toBe("second accepted report");
+	});
+
+	it("cancels a waiting publisher without changing the accepted artifact", async () => {
+		const dir = freshDir();
+		await fs.promises.mkdir(dir, { recursive: true });
+		const destination = path.join(dir, "Worker.md");
+		await writeArtifact(destination, "accepted report");
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const contended = Promise.withResolvers<void>();
+		const acquire = FileLock.tryAcquire.bind(FileLock);
+		vi.spyOn(FileLock, "tryAcquire").mockImplementation((...args) => {
+			const lock = acquire(...args);
+			if (!lock.acquired) contended.resolve();
+			return lock;
+		});
+		const holder = withArtifactPublicationLock(async () => {
+			entered.resolve();
+			await release.promise;
+		});
+		await entered.promise;
+		const controller = new AbortController();
+		const waiting = withArtifactPublicationLock(
+			() => writeArtifact(destination, "cancelled report"),
+			controller.signal,
+		).then(
+			() => undefined,
+			error => error,
+		);
+		try {
+			await contended.promise;
+			controller.abort();
+			expect(await waiting).toMatchObject({ name: "AbortError" });
+			expect(await Bun.file(destination).text()).toBe("accepted report");
+		} finally {
+			controller.abort();
+			release.resolve();
+			await holder;
+			await waiting;
+		}
+	});
+
+	it("makes a detached continuation reacquire after its publication scope ends", async () => {
+		const dir = freshDir();
+		await fs.promises.mkdir(dir, { recursive: true });
+		const destination = path.join(dir, "Worker.md");
+		await writeArtifact(destination, "accepted report");
+		const wake = Promise.withResolvers<void>();
+		let detached!: Promise<number>;
+		await withArtifactPublicationLock(() => {
+			detached = wake.promise.then(() => writeArtifact(destination, "detached report"));
+		});
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const contended = Promise.withResolvers<void>();
+		const acquire = FileLock.tryAcquire.bind(FileLock);
+		vi.spyOn(FileLock, "tryAcquire").mockImplementation((...args) => {
+			const lock = acquire(...args);
+			if (!lock.acquired) contended.resolve();
+			return lock;
+		});
+		const holder = withArtifactPublicationLock(async () => {
+			entered.resolve();
+			await release.promise;
+		});
+		await entered.promise;
+		wake.resolve();
+		try {
+			await contended.promise;
+			expect(await Bun.file(destination).text()).toBe("accepted report");
+		} finally {
+			release.resolve();
+			await holder;
+			await detached;
+		}
+		expect(await Bun.file(destination).text()).toBe("detached report");
+	});
+
 	it("rejects a short write instead of publishing an unreadable artifact id", async () => {
 		const manager = new ArtifactManager(freshDir());
 		vi.spyOn(Bun, "write").mockResolvedValue(1);
@@ -26,6 +175,23 @@ describe("ArtifactManager write integrity", () => {
 		await expect(manager.save("complete report", "task")).rejects.toThrow(
 			"Artifact write incomplete: wrote 1 of 15 bytes",
 		);
+	});
+
+	it("preserves the write failure when staging cleanup also fails", async () => {
+		const dir = freshDir();
+		await fs.promises.mkdir(dir, { recursive: true });
+		const destination = path.join(dir, "Worker.md");
+		await writeArtifact(destination, "original valid report");
+
+		const realWrite = Bun.write.bind(Bun);
+		vi.spyOn(Bun, "write").mockImplementation(async (target, content) => {
+			await realWrite(target as string, String(content).slice(0, 3));
+			return 3;
+		});
+		vi.spyOn(fsPromises, "rm").mockRejectedValue(Object.assign(new Error("cleanup denied"), { code: "EPERM" }));
+
+		await expect(writeArtifact(destination, "replacement report")).rejects.toThrow("Artifact write incomplete");
+		expect(await Bun.file(destination).text()).toBe("original valid report");
 	});
 
 	it("leaves no discoverable file when the staged write falls short", async () => {

@@ -1,0 +1,72 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps")
+load("@rules_rust//cargo:defs.bzl", "cargo_build_script")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files(["Cargo.toml"])
+
+_FEATURES = [
+    "gimli",
+    "host-arch",
+    "std",
+    "timing",
+    "unwind",
+]
+
+cargo_build_script(
+    name = "build_script",
+    srcs = ["build.rs"],
+    aliases = aliases(build = True),
+    build_script_env = {
+        "GIT_DIR": ".",
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_OPTIONAL_LOCKS": "0",
+    },
+    crate_features = _FEATURES,
+    crate_root = "build.rs",
+    data = glob(["src/**"]),
+    edition = "2021",
+    pkg_name = "cranelift-codegen",
+    rustc_flags = ["--cap-lints=allow"],
+    tags = [
+        "noclippy",
+        "norustfmt",
+    ],
+    version = "0.116.1",
+    deps = all_crate_deps(build = True),
+)
+
+rust_library(
+    name = "cranelift-codegen",
+    srcs = glob(["src/**/*.rs"]),
+    aliases = aliases(),
+    compile_data = glob(["src/**"]),
+    crate_features = _FEATURES,
+    crate_name = "cranelift_codegen",
+    crate_root = "src/lib.rs",
+    edition = "2021",
+    rustc_flags = ["--cap-lints=allow"],
+    tags = [
+        "noclippy",
+        "norustfmt",
+    ],
+    version = "0.116.1",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = all_crate_deps(normal = True) + [":build_script"],
+)
+
+rust_test(
+    name = "cranelift-codegen_test",
+    crate = ":cranelift-codegen",
+    aliases = aliases(normal = True, normal_dev = True, proc_macro = True, proc_macro_dev = True),
+    crate_features = _FEATURES,
+    edition = "2021",
+    rustc_flags = ["--cap-lints=allow"],
+    tags = [
+        "noclippy",
+        "norustfmt",
+    ],
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    deps = all_crate_deps(normal_dev = True),
+)

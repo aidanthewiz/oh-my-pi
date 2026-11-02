@@ -63,7 +63,7 @@ describe("AgentSession resolve reminder", () => {
 
 	afterEach(async () => {
 		await session.dispose();
-		authStorage?.close();
+		await authStorage?.close();
 		authStorage = undefined;
 		if (fs.existsSync(tempDir)) {
 			removeSyncWithRetries(tempDir);

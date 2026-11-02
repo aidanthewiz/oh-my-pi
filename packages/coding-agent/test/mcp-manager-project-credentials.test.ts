@@ -28,8 +28,8 @@ describe("MCP project credential boundary", () => {
 		Bun.env[secretName] = "managed-parent-secret";
 	});
 
-	afterEach(() => {
-		authStorage.close();
+	afterEach(async () => {
+		await authStorage.close();
 		clearConfigValueCache();
 		vi.restoreAllMocks();
 		if (previousSecret === undefined) delete Bun.env[secretName];

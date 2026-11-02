@@ -86,6 +86,6 @@ async function updateChangelog(cwd: string, args: CommitCommandArgs): Promise<vo
 			onProgress: message => process.stdout.write(`${message}\n`),
 		});
 	} finally {
-		authStorage.close();
+		await authStorage.close();
 	}
 }

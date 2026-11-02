@@ -1,6 +1,7 @@
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import type { Settings } from "../config/settings";
 import { type GhCommandOptions, github } from "../utils/github";
+import { captureForgeCliEnvironment, ForgeCredentialsChangedError } from "../utils/forge-cli";
 import type { ToolSession } from ".";
 import type { GhToolDetails } from "@oh-my-pi/pi-tui/tools/github";
 import {
@@ -103,13 +104,14 @@ export async function githubIssueJsonWithStateReasonFallback<T>(
 	signal: AbortSignal | undefined,
 	options?: GhCommandOptions,
 ): Promise<T> {
+	const captured = { ...options, env: options?.env ?? captureForgeCliEnvironment(cwd, "gh") };
 	try {
-		return await github.json<T>(cwd, [...args], signal, options);
+		return await github.json<T>(cwd, [...args], signal, captured);
 	} catch (err) {
 		if (!ghJsonErrorNamesField(err, GH_ISSUE_STATE_REASON_FIELD)) throw err;
 		const retryArgs = dropJsonField(args, GH_ISSUE_STATE_REASON_FIELD);
 		if (!retryArgs) throw err;
-		return await github.json<T>(cwd, retryArgs, signal, options);
+		return await github.json<T>(cwd, retryArgs, signal, captured);
 	}
 }
 
@@ -178,6 +180,7 @@ export async function fetchPrReviewComments(
 	repo: string,
 	prNumber: number,
 	signal?: AbortSignal,
+	env: Readonly<Record<string, string | undefined>> = captureForgeCliEnvironment(cwd, "gh"),
 ): Promise<GhPrReviewComment[]> {
 	const ref = parseRepoRef(repo);
 	const reviewComments: GhPrReviewComment[] = [];
@@ -198,7 +201,7 @@ export async function fetchPrReviewComments(
 				`page=${page}`,
 			],
 			signal,
-			{ repoProvided: true },
+			{ repoProvided: true, env },
 		);
 
 		const pageComments = response
@@ -478,6 +481,7 @@ export interface IssueViewLookupOptions {
 	signal?: AbortSignal;
 	settings?: Settings;
 	cacheAuthKey?: string | null;
+	env?: Readonly<Record<string, string | undefined>>;
 }
 
 export interface PrViewLookupOptions {
@@ -488,6 +492,7 @@ export interface PrViewLookupOptions {
 	signal?: AbortSignal;
 	settings?: Settings;
 	cacheAuthKey?: string | null;
+	env?: Readonly<Record<string, string | undefined>>;
 }
 
 export interface ViewLookupResult<T> {
@@ -504,12 +509,14 @@ export async function fetchIssueViewFresh(
 	identifier: string,
 	includeComments: boolean,
 	signal: AbortSignal | undefined,
+	env: Readonly<Record<string, string | undefined>> = captureForgeCliEnvironment(cwd, "gh"),
 ): Promise<{ rendered: string; sourceUrl: string | undefined; payload: GhIssueViewData }> {
 	const args = ["issue", "view", identifier];
 	appendRepoFlag(args, repo, identifier);
 	args.push("--json", (includeComments ? GH_ISSUE_FIELDS : GH_ISSUE_FIELDS_NO_COMMENTS).join(","));
 	const data = await githubIssueJsonWithStateReasonFallback<GhIssueViewData>(cwd, args, signal, {
 		repoProvided: Boolean(repo),
+		env,
 	});
 	const rendered = formatIssueView(data, { issue: identifier, repo, comments: includeComments });
 	return { rendered, sourceUrl: data.url, payload: data };
@@ -521,13 +528,14 @@ export async function fetchPrViewFresh(
 	number: number,
 	includeComments: boolean,
 	signal: AbortSignal | undefined,
+	env: Readonly<Record<string, string | undefined>> = captureForgeCliEnvironment(cwd, "gh"),
 ): Promise<{ rendered: string; sourceUrl: string | undefined; payload: GhPrViewData }> {
 	const args = ["pr", "view", String(number)];
 	appendRepoFlag(args, repo, String(number));
 	args.push("--json", (includeComments ? GH_PR_FIELDS : GH_PR_FIELDS_NO_COMMENTS).join(","));
-	const data = await github.json<GhPrViewData>(cwd, args, signal, { repoProvided: true });
+	const data = await github.json<GhPrViewData>(cwd, args, signal, { repoProvided: true, env });
 	if (includeComments && typeof data.number === "number") {
-		data.reviewComments = await fetchPrReviewComments(cwd, repo, data.number, signal);
+		data.reviewComments = await fetchPrReviewComments(cwd, repo, data.number, signal, env);
 	}
 	const rendered = formatPrView(data, { pr: String(number), repo, comments: includeComments });
 	return { rendered, sourceUrl: data.url, payload: data };
@@ -538,12 +546,13 @@ export async function fetchPrViewFresh(
  * `issue://` protocol handler so a single shared row services both surfaces.
  */
 export async function getOrFetchIssue(options: IssueViewLookupOptions): Promise<ViewLookupResult<GhIssueViewData>> {
+	const env = options.env ?? captureForgeCliEnvironment(options.cwd, "gh");
+	const credentialIdentity = resolveGithubCacheAuthKey(undefined, env);
 	const identifier = requireNonEmpty(options.issue, "issue");
 	if (identifier.startsWith("-")) {
 		throw new ToolError(`invalid issue identifier: ${identifier}. Pass an issue number or URL.`);
 	}
 	const includeComments = options.includeComments ?? true;
-	const authKey = options.cacheAuthKey === undefined ? (resolveGithubCacheAuthKey() ?? null) : options.cacheAuthKey;
 	const urlParse = parseIssueUrl(identifier);
 	// Prefer the URL's repo when the identifier is a full URL; fall back to the
 	// explicit `repo` option, then to the cwd's default repo.
@@ -554,7 +563,7 @@ export async function getOrFetchIssue(options: IssueViewLookupOptions): Promise<
 	}
 	if (cacheNumber !== undefined && !repo) {
 		try {
-			repo = await resolveDefaultRepoMemoized(options.cwd, options.signal);
+			repo = await resolveDefaultRepoMemoized(options.cwd, options.signal, env);
 		} catch {
 			// Resolution failure leaves `repo` undefined: we'll fall through to a
 			// direct fetch below so gh produces its own error message instead of
@@ -563,7 +572,25 @@ export async function getOrFetchIssue(options: IssueViewLookupOptions): Promise<
 		}
 	}
 
-	const doFetch = () => fetchIssueViewFresh(options.cwd, repo, identifier, includeComments, options.signal);
+	if (resolveGithubCacheAuthKey(undefined, env) !== credentialIdentity) {
+		throw new ForgeCredentialsChangedError("GitHub credentials changed during request preparation.");
+	}
+	const authKey =
+		options.cacheAuthKey === undefined
+			? (resolveGithubCacheAuthKey(repo ? parseRepoRef(repo).host : undefined, env) ?? null)
+			: options.cacheAuthKey;
+	const doFetch = async () => {
+		if (resolveGithubCacheAuthKey(undefined, env) !== credentialIdentity) {
+			throw new ForgeCredentialsChangedError("GitHub credentials changed before the request.");
+		}
+		const fresh = await fetchIssueViewFresh(options.cwd, repo, identifier, includeComments, options.signal, env);
+		if (resolveGithubCacheAuthKey(undefined, env) !== credentialIdentity) {
+			throw new ForgeCredentialsChangedError(
+				"GitHub credentials changed during the request; no cache entry was written.",
+			);
+		}
+		return fresh;
+	};
 
 	if (!repo || cacheNumber === undefined) {
 		const fresh = await doFetch();
@@ -594,9 +621,32 @@ export async function getOrFetchIssue(options: IssueViewLookupOptions): Promise<
  * (see `executePrView`).
  */
 export async function getOrFetchPr(options: PrViewLookupOptions): Promise<ViewLookupResult<GhPrViewData>> {
+	const env = options.env ?? captureForgeCliEnvironment(options.cwd, "gh");
 	const includeComments = options.includeComments ?? true;
-	const authKey = options.cacheAuthKey === undefined ? (resolveGithubCacheAuthKey() ?? null) : options.cacheAuthKey;
-	const doFetch = () => fetchPrViewFresh(options.cwd, options.repo, options.number, includeComments, options.signal);
+	const credentialIdentity = resolveGithubCacheAuthKey(undefined, env);
+	const authKey =
+		options.cacheAuthKey === undefined
+			? (resolveGithubCacheAuthKey(parseRepoRef(options.repo).host, env) ?? null)
+			: options.cacheAuthKey;
+	const doFetch = async () => {
+		if (resolveGithubCacheAuthKey(undefined, env) !== credentialIdentity) {
+			throw new ForgeCredentialsChangedError("GitHub credentials changed before the request.");
+		}
+		const fresh = await fetchPrViewFresh(
+			options.cwd,
+			options.repo,
+			options.number,
+			includeComments,
+			options.signal,
+			env,
+		);
+		if (resolveGithubCacheAuthKey(undefined, env) !== credentialIdentity) {
+			throw new ForgeCredentialsChangedError(
+				"GitHub credentials changed during the request; no cache entry was written.",
+			);
+		}
+		return fresh;
+	};
 	const lookup = await getOrFetchView<GhPrViewData>({
 		repo: options.repo,
 		kind: "pr",

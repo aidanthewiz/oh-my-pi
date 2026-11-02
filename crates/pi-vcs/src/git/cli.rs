@@ -1,6 +1,6 @@
 //! The deliberately small git-CLI escape hatch.
 //!
-//! Three categories are allowed to spawn `git`, per the hybrid policy:
+//! Four categories are allowed to spawn `git`, per the hybrid policy:
 //! - **Credential-bound network transfers** — clone/fetch/push must reuse the
 //!   user's ssh config and credential helpers.
 //! - **Commits** — Git owns configured signing and repository hook behavior.
@@ -223,15 +223,17 @@ pub(crate) async fn run(cwd: &Path, args: &[String], options: &RunOptions) -> Re
 	apply_env(&mut cmd, options.env.as_ref());
 	let mut child = cmd.spawn().map_err(|err| spawn_error(cwd, err))?;
 
-	if let Some(stdin) = &options.stdin
-		&& let Some(mut pipe) = child.stdin.take()
-	{
-		use tokio::io::AsyncWriteExt;
-		// A child that exits early (e.g. usage error) closes the pipe;
-		// that is its answer, not ours to fail on.
-		let _ = pipe.write_all(stdin).await;
-		let _ = pipe.shutdown().await;
-	}
+	let stdin_pipe = child.stdin.take();
+	let write_stdin = async {
+		if let Some(stdin) = &options.stdin
+			&& let Some(mut pipe) = stdin_pipe
+		{
+			use tokio::io::AsyncWriteExt;
+			// Early exit closes stdin; the exit status remains authoritative.
+			let _ = pipe.write_all(stdin).await;
+			let _ = pipe.shutdown().await;
+		}
+	};
 
 	let stdout = child.stdout.take().expect("stdout piped");
 	let stderr = child.stderr.take().expect("stderr piped");
@@ -241,7 +243,9 @@ pub(crate) async fn run(cwd: &Path, args: &[String], options: &RunOptions) -> Re
 	let timeout = options.timeout.unwrap_or(COMMAND_TIMEOUT);
 	let cancel = options.cancel.clone().unwrap_or_default();
 	let exit = tokio::select! {
-		status = tokio::time::timeout(timeout, child.wait()) => match status {
+		status = tokio::time::timeout(timeout, async {
+			tokio::join!(write_stdin, child.wait()).1
+		}) => match status {
 			Ok(status) => status.map_err(Error::Io)?,
 			Err(_elapsed) => {
 				terminate(&mut child).await;
@@ -347,7 +351,6 @@ pub(crate) fn run_sync_capped(
 	let mut child = cmd.spawn().map_err(|err| spawn_error(cwd, err))?;
 	let stdout = spawn_sync_reader("git-cli-stdout", child.stdout.take(), limit);
 	let stderr = spawn_sync_reader("git-cli-stderr", child.stderr.take(), limit);
-
 	let deadline = std::time::Instant::now() + timeout;
 	let status = loop {
 		match child.try_wait()? {
@@ -362,8 +365,8 @@ pub(crate) fn run_sync_capped(
 	};
 	// The child has exited (or been killed), so the pipes reach EOF and the
 	// readers terminate; join can only block briefly on the final drain.
-	let stdout = stdout.map_or_else(String::new, |h| h.join().unwrap_or_default());
-	let stderr = stderr.map_or_else(String::new, |h| h.join().unwrap_or_default());
+	let stdout = stdout.map_or_default(|h| h.join().unwrap_or_default());
+	let stderr = stderr.map_or_default(|h| h.join().unwrap_or_default());
 	let Some(status) = status else {
 		return Err(Error::CliTimeout { command: format!("git {}", argv.join(" ")) });
 	};
@@ -410,7 +413,7 @@ fn read_capped_sync(mut stream: impl std::io::Read, limit: usize) -> String {
 			truncated = true;
 		}
 	}
-	let mut text = String::from_utf8_lossy(&retained).into_owned();
+	let mut text = String::from_utf8_lossy_owned(retained);
 	if truncated {
 		text.push_str(TRUNCATION_MARKER);
 	}
@@ -453,7 +456,7 @@ async fn read_capped(mut stream: impl tokio::io::AsyncRead + Unpin) -> Result<St
 			truncated = true;
 		}
 	}
-	let mut text = String::from_utf8_lossy(&retained).into_owned();
+	let mut text = String::from_utf8_lossy_owned(retained);
 	if truncated {
 		text.push_str(TRUNCATION_MARKER);
 	}
@@ -603,6 +606,39 @@ pub async fn clone(
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn async_runner_drains_output_while_delivering_stdin() {
+		let dir = tempfile::tempdir().unwrap();
+		let init = std::process::Command::new("git")
+			.args(["init", "-q"])
+			.current_dir(dir.path())
+			.status()
+			.unwrap();
+		assert!(init.success());
+		let prefix = "output\n".repeat(32 * 1024);
+		let input = "input\n".repeat(32 * 1024);
+		std::fs::write(dir.path().join("output-prefix"), &prefix).unwrap();
+		let output = tokio::time::timeout(
+			Duration::from_secs(10),
+			run(
+				dir.path(),
+				&["-c".into(), "alias.pipeprobe=!cat output-prefix; cat".into(), "pipeprobe".into()],
+				&RunOptions {
+					stdin: Some(input.as_bytes().to_vec()),
+					timeout: Some(Duration::from_secs(5)),
+					..RunOptions::default()
+				},
+			),
+		)
+		.await
+		.expect("stdin delivery must not block the runner deadline")
+		.unwrap();
+		assert_eq!(output.exit_code, 0);
+		assert_eq!(output.stdout, prefix + &input);
+		assert_eq!(output.stderr, "");
+	}
 
 	/// Set on the re-executed child; carries the fixture repository it should
 	/// probe. Its presence is what tells the test body which side it is on.

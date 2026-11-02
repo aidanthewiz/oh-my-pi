@@ -5,6 +5,7 @@ import { fetchCursorAccountEmail } from "@oh-my-pi/pi-ai/registry/oauth/cursor";
 
 const EMAIL = "dev@example.com";
 const POLICIES = [{ provider: "cursor", account: { email: EMAIL }, priority: -1 }] satisfies AuthAccountPolicies;
+const GET_ME_URL = "https://api2.cursor.sh/aiserver.v1.DashboardService/GetMe";
 
 function cursorAccessToken(label: string): string {
 	const claims = { sub: "github|user_1", exp: Math.floor(Date.now() / 1000) + 86_400, label };
@@ -29,7 +30,7 @@ function renewCursorSession(init: RequestInit | undefined, session: string | und
 function stubCursor(access: string, session?: string): void {
 	vi.spyOn(globalThis, "fetch").mockImplementation((async (input: string | URL | Request, init?: RequestInit) => {
 		const url = input instanceof Request ? input.url : String(input);
-		if (url === "https://cursor.com/api/auth/me") return Response.json({ sub: "user_1", email: EMAIL });
+		if (url === GET_ME_URL) return Response.json({ authId: "github|user_1", email: EMAIL });
 		if (url.startsWith("https://api2.cursor.sh/auth/poll?")) {
 			return Response.json({ accessToken: access, refreshToken: access });
 		}
@@ -54,11 +55,15 @@ afterEach(() => {
 describe("Cursor account email", () => {
 	test("rejects a profile email belonging to another token subject", async () => {
 		const token = cursorAccessToken("profile");
+		for (const authId of ["github|other_user", "auth0|user_1", "user_1"]) {
+			expect(
+				await fetchCursorAccountEmail(token, async () => Response.json({ authId, email: EMAIL })),
+			).toBeUndefined();
+		}
 		expect(
-			await fetchCursorAccountEmail(token, async () => Response.json({ sub: "other_user", email: EMAIL })),
-		).toBeUndefined();
-		expect(
-			await fetchCursorAccountEmail(token, async () => Response.json({ sub: "user_1", email: ` ${EMAIL} ` })),
+			await fetchCursorAccountEmail(token, async () =>
+				Response.json({ authId: "github|user_1", email: ` ${EMAIL} ` }),
+			),
 		).toBe(EMAIL);
 	});
 
@@ -73,7 +78,7 @@ describe("Cursor account email", () => {
 
 			expect(auth.oauth.accounts("cursor").map(account => account.email)).toEqual([EMAIL]);
 		} finally {
-			auth.close();
+			await auth.close();
 			store.close();
 		}
 	});
@@ -99,8 +104,8 @@ describe("Cursor account email", () => {
 			await restarted.credentials.reload();
 			expect(restarted.oauth.accounts("cursor").map(account => account.email)).toEqual([EMAIL]);
 		} finally {
-			auth.close();
-			restarted.close();
+			await auth.close();
+			await restarted.close();
 			store.close();
 		}
 	});
@@ -126,7 +131,7 @@ describe("Cursor account email", () => {
 			) => {
 				const url = input instanceof Request ? input.url : String(input);
 				if (url === "https://api2.cursor.sh/oauth/token") return renewCursorSession(init, stale, fresh);
-				if (url !== "https://cursor.com/api/auth/me") throw new Error(`unexpected request: ${url}`);
+				if (url !== GET_ME_URL) throw new Error(`unexpected request: ${url}`);
 				// The profile never answers; only the lookup's own deadline ends it.
 				const { promise, reject } = Promise.withResolvers<Response>();
 				init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true });
@@ -136,7 +141,7 @@ describe("Cursor account email", () => {
 
 			expect(await auth.keys.get("cursor", "session")).toBe(fresh);
 		} finally {
-			auth.close();
+			await auth.close();
 			store.close();
 		}
 	});
@@ -181,7 +186,7 @@ describe("Cursor session refresh", () => {
 				expires: payload.exp * 1000 - 5 * 60 * 1000,
 			});
 		} finally {
-			auth.close();
+			await auth.close();
 			store.close();
 		}
 	});
@@ -203,7 +208,7 @@ describe("Cursor session refresh", () => {
 				{ type: "oauth", access: fresh, refresh: rotated },
 			]);
 		} finally {
-			auth.close();
+			await auth.close();
 			store.close();
 		}
 	});
@@ -221,7 +226,7 @@ describe("Cursor session refresh", () => {
 			expect(store.listAuthCredentials("cursor")).toEqual([]);
 			expect(await store.listDisabledCredentials("cursor")).toHaveLength(1);
 		} finally {
-			auth.close();
+			await auth.close();
 			store.close();
 		}
 	});
@@ -249,7 +254,7 @@ describe("Cursor session refresh", () => {
 				expect(store.listAuthCredentials("cursor").map(row => row.credential)).toEqual(original);
 				expect(await store.listDisabledCredentials("cursor")).toEqual([]);
 			} finally {
-				auth.close();
+				await auth.close();
 				store.close();
 			}
 		},

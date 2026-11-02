@@ -168,7 +168,7 @@ describe("AuthStorage credential block persistence", () => {
 				blockedUntilMs: FUTURE_BLOCK_MS,
 			});
 		} finally {
-			firstStorage.close();
+			await firstStorage.close();
 		}
 
 		const reopenedStore = await SqliteAuthCredentialStore.open(dbPath);
@@ -178,7 +178,7 @@ describe("AuthStorage credential block persistence", () => {
 			const fableKey = await reopenedStorage.keys.get(PROVIDER, "session-3", { modelId: "claude-fable-5" });
 			expect(fableKey).toBe("access-3");
 		} finally {
-			reopenedStorage.close();
+			await reopenedStorage.close();
 		}
 	});
 
@@ -218,7 +218,7 @@ describe("AuthStorage credential block persistence", () => {
 			expect(recovered.accounts[0]?.resetsAt).toBeUndefined();
 		} finally {
 			spy.mockRestore();
-			storage.close();
+			await storage.close();
 		}
 	});
 
@@ -257,7 +257,7 @@ describe("AuthStorage credential block persistence", () => {
 				},
 			]);
 		} finally {
-			storage.close();
+			await storage.close();
 		}
 	});
 
@@ -368,7 +368,7 @@ describe("AuthStorage credential block persistence", () => {
 				"access-healthy",
 			);
 		} finally {
-			storage.close();
+			await storage.close();
 		}
 	});
 
@@ -404,8 +404,8 @@ describe("AuthStorage credential block persistence", () => {
 			expect(result.blockedUntilMs).toBeLessThan(shortDeadline);
 			expect(storeA.getCredentialBlock(row.id, PROVIDER_KEY, "")).toBeLessThan(shortDeadline);
 		} finally {
-			a.close();
-			b.close();
+			await a.close();
+			await b.close();
 		}
 	});
 
@@ -435,7 +435,7 @@ describe("AuthStorage credential block persistence", () => {
 			});
 			expect(result.blockedUntilMs).toBeLessThan(Date.now() + 120_000);
 		} finally {
-			a.close();
+			await a.close();
 			storeB.close();
 		}
 	});
@@ -456,7 +456,7 @@ describe("AuthStorage credential block persistence", () => {
 			}
 			expect(await storage.keys.get(PROVIDER, "pinned-session")).toBe("access-2");
 		} finally {
-			storage.close();
+			await storage.close();
 		}
 	});
 
@@ -507,7 +507,7 @@ describe("AuthStorage credential block persistence", () => {
 			expect(storage.blocks.list([row.id])).toEqual([]);
 			expect(storage.credentials.generation).toBe(generationBeforeDelete + 1);
 		} finally {
-			storage.close();
+			await storage.close();
 		}
 	});
 
@@ -527,7 +527,7 @@ describe("AuthStorage credential block persistence", () => {
 				blockedUntilMs: FUTURE_BLOCK_MS,
 			});
 		} finally {
-			storage.close();
+			await storage.close();
 		}
 
 		const disablingStore = await SqliteAuthCredentialStore.open(dbPath);
@@ -541,7 +541,7 @@ describe("AuthStorage credential block persistence", () => {
 			const key = await reopenedStorage.keys.get(PROVIDER, "a");
 			expect(key).toBe("access-3");
 		} finally {
-			reopenedStorage.close();
+			await reopenedStorage.close();
 		}
 	});
 

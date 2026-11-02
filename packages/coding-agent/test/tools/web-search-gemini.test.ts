@@ -96,11 +96,11 @@ describe("searchGemini tools serialization", () => {
 		};
 	}
 
-	afterEach(() => {
+	afterEach(async () => {
 		capturedRequest = null;
 		vi.restoreAllMocks();
-		oauthAuthStorage.close();
-		apiKeyAuthStorage.close();
+		await oauthAuthStorage.close();
+		await apiKeyAuthStorage.close();
 	});
 
 	function makeParams(query: string, model: Model = oauthModel, modelRegistry = oauthRegistry) {
@@ -198,7 +198,7 @@ describe("searchGemini tools serialization", () => {
 			...makeParams("gateway", gatewayModel, gatewayRegistry),
 			fetch: fetchMock,
 		});
-		gatewayAuthStorage.close();
+		await gatewayAuthStorage.close();
 
 		expect(capturedRequest?.url).toBe(
 			"https://gateway.ai.cloudflare.com/v1/account/gateway/google-ai-studio/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse",
@@ -412,5 +412,16 @@ describe("searchGemini tools serialization", () => {
 				fetch: mockGeminiFetch("data: {}\n\n"),
 			}),
 		).rejects.toThrow("Gemini API returned an empty grounded response");
+	});
+
+	it("does not tag Antigravity search requests with the requestType that draws false 429 quota errors", async () => {
+		const fetchMock = mockGeminiFetch();
+		await searchGemini({
+			...makeParams("antigravity search", getBundledModel("google-antigravity", "gemini-3.8-flash")),
+			fetch: fetchMock,
+		});
+
+		expect(capturedRequest?.body?.userAgent).toBe("antigravity");
+		expect(capturedRequest?.body?.requestType).toBeUndefined();
 	});
 });

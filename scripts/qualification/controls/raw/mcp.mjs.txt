@@ -1,0 +1,55 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import { createHash, randomUUID } from 'node:crypto';
+import { Database } from 'bun:sqlite';
+const [manifestFile] = process.argv.slice(2);
+const home = await fs.realpath(process.env.HOME), engine = path.resolve(import.meta.dirname, '../..');
+assert.equal(path.dirname(home), '/private/tmp'); assert.match(path.basename(home), /^cf-[A-Za-z0-9]+$/);
+const manifest = JSON.parse(await fs.readFile(manifestFile, 'utf8'));
+const sha = bytes => createHash('sha256').update(bytes).digest('hex');
+assert.equal(sha(JSON.stringify(manifest.records)), manifest.sourceDigest);
+const files = ['packages/coding-agent/src/mcp/tool-bridge.ts', 'packages/coding-agent/src/mcp/client.ts', 'packages/coding-agent/src/mcp/errors.ts', 'packages/coding-agent/src/mcp/transports/http.ts'];
+async function unchanged() { for (const relative of files) { const row = manifest.records.find(x => x.root === engine && x.path === relative); assert(row); assert.equal(sha(await fs.readFile(path.join(engine, relative))), row.state.sha256, relative); } }
+await unchanged();
+const root = await fs.mkdtemp(path.join(home, 'mcp-ambiguous-delivery-')), owner = randomUUID();
+await fs.writeFile(path.join(root, '.owner'), owner, { flag: 'wx', mode: 0o600 });
+const db = new Database(path.join(root, 'synthetic-effects.db'));
+db.run('CREATE TABLE synthetic_effects (id INTEGER PRIMARY KEY, units INTEGER NOT NULL)');
+const originalFetch = globalThis.fetch, transports = [], requests = [];
+let reconnects = 0, result, unexpectedNetwork = 0;
+globalThis.fetch = async (input, init) => {
+  const request = new Request(input, init);
+  if (request.url !== 'https://owned-mcp-replay.invalid/mcp') { unexpectedNetwork++; throw new Error('Unexpected destination in isolated synthetic MCP receiver'); }
+  assert.equal(request.method, 'POST');
+  const body = await request.json(); assert.equal(body.method, 'tools/call'); assert.equal(body.params.name, 'append_effect');
+  assert.deepEqual(body.params.arguments, { units: 7 });
+  db.run('INSERT INTO synthetic_effects(units) VALUES (?)', [body.params.arguments.units]);
+  requests.push({ id: body.id, method: body.method, syntheticEffectPersisted: true });
+  if (requests.length === 1) throw Object.assign(new Error('socket reset after the synthetic receiver committed the request'), { code: 'ECONNRESET' });
+  return Response.json({ jsonrpc: '2.0', id: body.id, result: { content: [{ type: 'text', text: 'synthetic effect committed' }] } });
+};
+try {
+  const { HttpTransport } = await import('../../packages/coding-agent/src/mcp/transports/http.ts');
+  const { MCPTool } = await import('../../packages/coding-agent/src/mcp/tool-bridge.ts');
+  const config = { type: 'http', url: 'https://owned-mcp-replay.invalid/mcp', timeout: 3000 };
+  const connect = async () => {
+    const transport = new HttpTransport(config); transports.push(transport); await transport.connect();
+    return { name: 'owned-synthetic-effects', config, transport, capabilities: { tools: {} }, serverInfo: { name: 'owned-synthetic-effects', version: '1' } };
+  };
+  const definition = { name: 'append_effect', inputSchema: { type: 'object', properties: { units: { type: 'number' } }, required: ['units'] }, annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false } };
+  const tool = new MCPTool(await connect(), definition, async () => { reconnects++; return connect(); });
+  result = await tool.execute('one-authorized-synthetic-call', { units: 7 }, undefined, {});
+} finally {
+  for (const transport of transports.reverse()) await transport.close();
+  globalThis.fetch = originalFetch;
+}
+const effects = db.query('SELECT id, units FROM synthetic_effects ORDER BY id').all();
+db.close();
+await unchanged();
+assert.equal(await fs.readFile(path.join(root, '.owner'), 'utf8'), owner);
+await fs.rm(root, { recursive: true });
+assert.equal(unexpectedNetwork, 0);
+const checks = { exactlyOneDurableSyntheticEffect: effects.length === 1, ambiguousFailureNotReportedAsSuccess: result?.isError === true, noAutomaticReconnectAndReplay: reconnects === 0 };
+console.log(JSON.stringify({ schema: 'CoreforgeActualMcpAmbiguousDeliveryProof', complete: true, sourceDigest: manifest.sourceDigest, sourceManifest: manifestFile, checks, effects, requests, reconnects, resultIsError: result?.isError === true, resultContent: result?.content, fixtureRemoved: true, externalNetworkDeniedByParent: true, receiverBoundary: 'Owned in-memory FetchImpl receiver, real HttpTransport/client/MCPTool serialization and retry code, real private SQLite commits; no network fault injection or external endpoint', unexpectedNetwork, paidRequests: 0 }, null, 2));
+if (Object.values(checks).some(value => !value)) process.exitCode = 1;

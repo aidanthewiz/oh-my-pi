@@ -4,11 +4,11 @@
  * semantic nodes/spans only, with ANSI-free, sanitized text.
  */
 import * as path from "node:path";
-import { pathToFileURL } from "node:url";
 import type { TspSpan, TspText, TspTone } from "@oh-my-pi/pi-wire";
 import { ansi, code, compact, keyed, node, row, span, text } from "../native/describe";
 import type { NativeChild, NativeNode } from "../native/node";
-import { type ParsedDiagnostic, parseDiagnosticMessage, shortenPath } from "../render/render-utils";
+import { tryFileUri } from "../render/hyperlink";
+import { type ParsedDiagnostic, parseDiagnosticMessage, pathNameStart, shortenPath } from "../render/render-utils";
 import { plainText } from "../native/spans";
 import type { FileDiagnosticsResult } from "./lsp";
 import { formatArtifactErrorNotice, formatTruncationMetaNotice, type OutputMeta } from "./output-meta";
@@ -23,9 +23,16 @@ export function displayPath(filePath: string): string {
 	return shortenPath(filePath);
 }
 
-/** `file://` link for a head's path target, when the path is absolute. */
+/** Configured file link for a head's path target, when the path is absolute. */
 export function fileHref(filePath: string | undefined): string | undefined {
-	return filePath && path.isAbsolute(filePath) ? pathToFileURL(filePath).href : undefined;
+	return filePath && path.isAbsolute(filePath) ? tryFileUri(filePath) : undefined;
+}
+
+/** Link for a head target that is a web URL (`www.` gains `https://`), else undefined. */
+export function urlHref(target: string | undefined): string | undefined {
+	if (!target) return undefined;
+	const candidate = /^www\./i.test(target) ? `https://${target}` : target;
+	return /^https?:\/\/\S+$/i.test(candidate) ? candidate : undefined;
 }
 
 /** Diff stats as one head `meta` string, `+8 −1` (U+2212 minus), or undefined when nothing changed. */
@@ -74,11 +81,10 @@ export function fileRow(
 	} = {},
 ): NativeNode {
 	const isDir = filePath.endsWith("/");
-	const bare = isDir ? filePath.slice(0, -1) : filePath;
-	const cut = bare.lastIndexOf("/") + 1;
+	const cut = pathNameStart(filePath);
 	const spans: TspSpan[] = [];
-	if (cut > 0) spans.push(span(bare.slice(0, cut), "dim"));
-	spans.push(span(`${bare.slice(cut) || "…"}${isDir ? "/" : ""}`, "strong", p.href ? { href: p.href } : undefined));
+	if (cut > 0) spans.push(span(filePath.slice(0, cut), "dim"));
+	spans.push(span(filePath.slice(cut) || "…", "strong", p.href ? { href: p.href } : undefined));
 	if (p.range) spans.push(span(p.range, "muted"));
 	const children: NativeChild[] = [
 		p.lead ?? node("icon", { name: p.icon ?? (isDir ? "folder" : "file"), tone: p.tone }),
@@ -342,7 +348,7 @@ export function diagnosticsSection(
 	diagnostics: FileDiagnosticsResult | undefined,
 	opts?: { withPath?: boolean },
 ): NativeNode | undefined {
-	if (!diagnostics || diagnostics.messages.length === 0) return undefined;
+	if (!diagnostics || (diagnostics.messages.length === 0 && !diagnostics.unreported?.length)) return undefined;
 	const parsed: ParsedDiagnostic[] = [];
 	const unparsed: string[] = [];
 	for (const message of diagnostics.messages) {
@@ -365,6 +371,15 @@ export function diagnosticsSection(
 	if (hidden > 0) {
 		shown.push(text([span(`+${hidden} more`, "muted")], { role: "omp.tool.stats", key: "more" }));
 	}
+	if (diagnostics.unreported?.length) {
+		shown.unshift(
+			text([span(plainText(diagnostics.summary), "warning")], {
+				wrap: "word",
+				role: "omp.tool.diagnostics.unreported",
+				key: "unreported",
+			}),
+		);
+	}
 	return node(
 		"section",
 		{
@@ -377,17 +392,20 @@ export function diagnosticsSection(
 	);
 }
 
-/** Head chip counting LSP diagnostics across files (`2 diagnostics`), or undefined when there are none. */
+/** Head chip counting reported diagnostics and marking missing reports independently. */
 export function diagnosticsBadge(
 	files: readonly (FileDiagnosticsResult | undefined)[],
 ): { text: string; tone: TspTone } | undefined {
 	let count = 0;
 	let errored = false;
+	let unreported = false;
 	for (const file of files) {
 		if (!file) continue;
 		count += file.messages.length;
 		errored ||= file.errored;
+		unreported ||= !!file.unreported?.length;
 	}
-	if (count === 0) return undefined;
-	return { text: count === 1 ? "1 diagnostic" : `${count} diagnostics`, tone: errored ? "error" : "warning" };
+	if (count === 0) return unreported ? { text: "Diagnostics unverified", tone: "warning" } : undefined;
+	const label = count === 1 ? "1 diagnostic" : `${count} diagnostics`;
+	return { text: unreported ? `${label}; unverified` : label, tone: errored ? "error" : "warning" };
 }

@@ -41,12 +41,78 @@ const files = await find({
 
 // SIXEL encode for a terminal cell box (px), off the JS thread
 // (`encodeSixel` is the synchronous form)
-const sequence = await encodeSixelAsync(pngBytes, widthPx, heightPx);
+const backgroundRgb = 0x202040; // Actual terminal background, packed 0xRRGGBB
+const sequence = await encodeSixelAsync(pngBytes, widthPx, heightPx, backgroundRgb);
 
 // Extract PDF text and identify pages that still need OCR
 const pdf = await pdfToMarkdown(pdfBytes);
 console.log(pdf.markdown, pdf.pagesNeedingOcr);
 ```
+
+Both SIXEL encoder forms require the terminal background as a fourth argument:
+a finite integer from `0` through `0xffffff`, packed as `0xRRGGBB`.
+Invalid colors throw synchronously or reject the asynchronous promise.
+When resizing images with alpha, RGB is
+premultiplied before Lanczos filtering so transparent pixels cannot darken or
+discolor visible edges. After resizing, the terminal background is composited
+without applying alpha twice. Fully transparent pixels remain transparent;
+unscaled images retain their existing blending path. Re-encode when the terminal
+background RGB changes.
+
+### Line matching
+
+`new LineMatcher(patterns)` compiles Rust regular expressions.
+`groupNames()` returns each pattern's named groups in capture order.
+`matchLines(text)` returns typed arrays named `lines`, `rules`, and `spans`.
+Matches use zero-based line and pattern indices, ordered by line then pattern.
+Each pattern reports its first match per line.
+Each named group contributes UTF-16 start/end offsets within that line.
+An unmatched optional group contributes `-1, -1`.
+
+### Pipeline streams
+
+Create one `PipeStreams` per `Shell.run` and pass it as `streams`.
+It mirrors pipeline bytes without changing the shell's output or cancellation owner.
+`list()` reports retained streams in opening order, including producer, consumer,
+total byte count, and whether more bytes can arrive.
+`read(id, from?)` returns `{ start, end, data, open }`, or `null` for an unknown
+or evicted stream. Resume from `end`; `start > from` identifies discarded bytes.
+Offsets count bytes, not characters. Decode the returned `Buffer` incrementally.
+When `open` is false, read any remaining bytes before treating the stream as finished.
+
+Each stream retains its newest 1 MiB. At most 16 streams remain retained.
+New pipes evict the oldest finished streams, keeping room for four recent finished
+streams. If all 16 streams remain open, additional pipes run without capture.
+Dropping the JavaScript handle does not cancel the shell run.
+
+On Unix and Windows, a consumer that closes its pipe releases the relay even
+when the producer remains idle. Windows checks native pipe state before reading;
+it preserves buffered bytes after producer closure and keeps ordinary write backpressure.
+Unsupported Windows pipe queries fail before pipeline stages start.
+
+### HTML conversion
+
+`htmlToMarkdown(html, { hiddenContent })` accepts `"drop"` (the default),
+`"reachable"`, or `"all"`.
+`"reachable"` includes content that a page can reveal, such as collapsed sections.
+`"all"` also includes `<template>` and `<noscript>` content.
+Invalid values throw before conversion starts.
+
+### Hashline display limits
+
+`EditPolicy.maxColumns` is the narrowest display limit measured in UTF-8 bytes.
+Use zero only when no display tool truncates lines.
+Without retained read provenance, hashline rejects guarded lines exceeding this
+limit until a full read records them. Block replacements and cuts guard every
+affected line, not only the opening anchor.
+
+### PTY dimensions
+
+`normalizePtyDimensions(cols, rows)` returns `{ cols, rows }` with fractional
+values truncated toward zero and dimensions clamped to 20–400 columns and
+5–200 rows. It shares the native bounds used by `PtySession.start`,
+`startArgv`, and `resize`. Use the returned dimensions when sizing a screen
+emulator so its viewport matches the native PTY.
 
 ### Lazy Windows path helpers
 

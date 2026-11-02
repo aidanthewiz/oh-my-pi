@@ -15,6 +15,7 @@ import {
 	getProjectDir,
 	hasFsCode,
 	isEnoent,
+	isInteractiveHost,
 	logger,
 	prompt,
 } from "@oh-my-pi/pi-utils";
@@ -44,7 +45,8 @@ import { XD_URL_PREFIX } from "@oh-my-pi/pi-tui/tools/xd-url";
 import { resolveActiveRepoContext } from "./utils/active-repo-context";
 import { normalizePromptPath } from "./utils/prompt-path";
 import { AGENTS_MD_LIMIT, buildWorkspaceTree, type WorkspaceTree } from "./workspace-tree";
-import { combine } from "./config/registry";
+import { combine, Derived } from "./config/registry";
+import type { Settings } from "./config/settings";
 import { cfgBashAutoBackgroundEnabled } from "./exec/settings";
 import { cfgEvalAutoBackgroundEnabled } from "./eval/settings";
 import { cfgTtsrBuiltinRules, cfgTtsrDisabledRules, cfgTtsrEnabled } from "./export/ttsr-settings";
@@ -60,11 +62,25 @@ import {
 import { cfgTaskBatch, cfgTaskEager } from "./task/settings";
 import {
 	cfgAsyncEnabled,
+	cfgOutEnabled,
 	cfgToolsIntentTracing,
 	cfgToolsXdevDocs,
 	cfgToolsXdevInlineDevices,
 	cfgVaultEnabled,
 } from "./tools/settings";
+const cfgOutPromptEnabled = new (class extends Derived<boolean | undefined> {
+	get sources() {
+		return cfgOutEnabled.sources;
+	}
+
+	inputs(settings: Settings): readonly unknown[] {
+		return [cfgOutEnabled.isConfigured(settings) ? cfgOutEnabled.get(settings) : undefined];
+	}
+
+	compute(inputs: readonly unknown[]): boolean | undefined {
+		return inputs[0] as boolean | undefined;
+	}
+})();
 
 /**
  * Settings the system prompt renders from (`secrets.enabled` via the obfuscator state it
@@ -82,6 +98,7 @@ export const cfgSystemPromptInputs = combine({
 	xdevDocs: cfgToolsXdevDocs,
 	xdevInlineDevices: cfgToolsXdevInlineDevices,
 	vaultEnabled: cfgVaultEnabled,
+	outEnabled: cfgOutPromptEnabled,
 	renderMermaid: cfgTuiRenderMermaid,
 	renderSvg: cfgTuiRenderSvg,
 	autoGraph: cfgTuiAutoGraph,
@@ -706,6 +723,8 @@ export interface BuildSystemPromptOptions {
 	additionalWorkspaceRoots?: string[];
 	/** Pre-loaded context files (skips discovery if provided). */
 	contextFiles?: Array<{ path: string; content: string; depth?: number }>;
+	/** Load no context files beyond `contextFiles`: none for additional workspace roots, no nested AGENTS.md list. */
+	noContextFiles?: boolean;
 	/** Skills provided directly to system prompt construction. */
 	skills?: readonly Skill[];
 	/** Session-scoped description snapshot; background cache writes apply only to the next session. */
@@ -741,6 +760,8 @@ export interface BuildSystemPromptOptions {
 	securityEnabled?: boolean;
 	/** Whether the user approves `cfg://` writes for this session; gates advertising `cfg://`. */
 	settingsApproval?: boolean;
+	/** Whether `out://` writes reach the user as transcript replies; gates advertising `out://`. */
+	outReplies?: boolean;
 	/**
 	 * Eval preludes advertised by this prompt. Each prelude's `guidance` is
 	 * appended as its own block after the rendered template, so custom templates
@@ -829,6 +850,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		cwd,
 		additionalWorkspaceRoots = [],
 		contextFiles: providedContextFiles,
+		noContextFiles = false,
 		skills: providedSkills,
 		rules,
 		alwaysApplyRules,
@@ -845,6 +867,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		memoryBackend,
 		securityEnabled = false,
 		settingsApproval = false,
+		outReplies = false,
 		evalPreludes = [],
 		model,
 		includeModelInPrompt = true,
@@ -950,7 +973,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 			: await logger.time("loadProjectContextFiles", loadProjectContextFiles, { cwd: resolvedCwd });
 		// Also discover context files (AGENTS.md, rules, etc.) for each additional workspace root.
 		const additionalRoots = additionalWorkspaceRoots.filter(d => path.resolve(d) !== path.resolve(resolvedCwd));
-		if (additionalRoots.length === 0) return primary;
+		if (additionalRoots.length === 0 || noContextFiles) return primary;
 		const extra = await Promise.all(
 			additionalRoots.map(root => loadProjectContextFiles({ cwd: root }).catch(() => [])),
 		);
@@ -1039,7 +1062,9 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		withDeadline("loadPersonalityOverride", personalityPromise, bundledPersonality),
 	]);
 	clearTimeout(deadlineTimer);
-	const agentsMdFiles = Array.from(new Set(workspaceTree.agentsMdFiles)).sort().slice(0, AGENTS_MD_LIMIT);
+	const agentsMdFiles = noContextFiles
+		? []
+		: Array.from(new Set(workspaceTree.agentsMdFiles)).sort().slice(0, AGENTS_MD_LIMIT);
 
 	if (timedOut.length > 0) {
 		logger.warn("System prompt preparation steps timed out; using minimal fallback for those steps", {
@@ -1047,9 +1072,13 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 			timeoutMs: SYSTEM_PROMPT_PREP_TIMEOUT_MS,
 			steps: timedOut,
 		});
-		process.stderr.write(
-			`Warning: system prompt preparation steps timed out after ${SYSTEM_PROMPT_PREP_TIMEOUT_MS}ms (${timedOut.join(", ")}); using minimal fallback for those steps.\n`,
-		);
+		// An interactive host writes nothing ahead of its UI (a Tern surface
+		// would open over the line); the log above has it.
+		if (!isInteractiveHost()) {
+			process.stderr.write(
+				`Warning: system prompt preparation steps timed out after ${SYSTEM_PROMPT_PREP_TIMEOUT_MS}ms (${timedOut.join(", ")}); using minimal fallback for those steps.\n`,
+			);
+		}
 	}
 	if (failed.length > 0) {
 		for (const { name, error } of failed) {
@@ -1125,6 +1154,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		memoryBackend,
 		securityEnabled,
 		settingsApproval,
+		outReplies,
 	};
 	const filteredSkills = (options.skillDescriptions ?? new SkillDescriptionCatalog()).render(
 		hasSkillReader ? skills.filter(skill => skill.hide !== true) : [],
@@ -1170,6 +1200,8 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		personality: personalityBlock,
 		intentTracing: !!intentField,
 		intentField: intentField ?? "",
+		// `PI_INTENT_PROMPT` replaces the default intent-field guidance line.
+		intentGuidance: $env.PI_INTENT_PROMPT ?? "",
 		eagerTasks,
 		eagerTasksAlways,
 		// Restrained bias yields to an explicit eager-tasks mode.

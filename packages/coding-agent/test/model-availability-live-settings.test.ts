@@ -33,7 +33,7 @@ describe("disabledProviders takes effect live", () => {
 	afterEach(async () => {
 		await session?.dispose();
 		session = undefined;
-		authStorage.close();
+		await authStorage.close();
 		tempDir.removeSync();
 		vi.restoreAllMocks();
 	});

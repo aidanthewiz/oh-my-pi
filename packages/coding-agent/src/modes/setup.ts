@@ -1,3 +1,4 @@
+import { getOAuthCredentialProvider } from "@oh-my-pi/pi-ai/oauth";
 import { runProviderSetupWizard as runProviderWizard } from "@oh-my-pi/pi-tui/setup/lazy";
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import type { SetupHost, SetupScene } from "@oh-my-pi/pi-tui/setup/scenes/types";
@@ -52,7 +53,7 @@ export function createSetupHost(ctx: InteractiveModeContext): SetupHost {
 			return cfgDisabledProviders.get(ctx.settings);
 		},
 		get oauthProviders() {
-			return filterOAuthLoginProviders(getOAuthProviders());
+			return filterOAuthLoginProviders(getOAuthProviders(), ctx.settings);
 		},
 		get authStorage() {
 			return ctx.session.modelRegistry.authStorage;
@@ -70,7 +71,15 @@ export function createSetupHost(ctx: InteractiveModeContext): SetupHost {
 			if (projectScope) ctx.settings.setProjectModelRole("default", selector);
 			await ctx.settings.flush();
 		},
-		refreshProvider: provider => ctx.session.modelRegistry.refreshProvider(provider, "online"),
+		refreshProvider: async provider => {
+			const session = ctx.session;
+			const sessionId = session.sessionId;
+			if (session.isDisposed) return;
+			// OAuth aliases store credentials under their canonical provider.
+			await session.modelRegistry.refreshProvider(getOAuthCredentialProvider(provider), "online");
+			if (ctx.session !== session || session.sessionId !== sessionId || session.isDisposed) return;
+			await ctx.refreshScopedModelsAfterLogin?.();
+		},
 		saveComposerShape: async shape => {
 			cfgComposerShape.set(ctx.settings, shape);
 			await ctx.settings.flush();

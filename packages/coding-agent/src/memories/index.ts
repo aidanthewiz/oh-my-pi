@@ -192,21 +192,16 @@ const memoryToolDeveloperInstructionsBySession = new WeakMap<
 >();
 const memoryToolDeveloperInstructionsByRoot = new Map<string, MemoryToolDeveloperInstructionsSnapshot | undefined>();
 
-function getMemoryInstructionRoot(agentDir: string, settings: Settings): string {
-	return getMemoryRoot(agentDir, settings.getCwd());
-}
-
 function getMemoryInstructionSessionFile(session: MemoryInstructionSession): string | undefined {
 	return session.sessionManager.getSessionFile() ?? undefined;
 }
 
 async function readMemoryToolDeveloperInstructionsSnapshot(
-	agentDir: string,
+	memoryRoot: string,
 	settings: Settings,
 ): Promise<MemoryToolDeveloperInstructionsSnapshot | undefined> {
 	const cfg = loadMemoryConfig(settings);
 	if (!cfg.enabled) return undefined;
-	const memoryRoot = getMemoryInstructionRoot(agentDir, settings);
 
 	let summary = "";
 	try {
@@ -281,14 +276,15 @@ export function clearMemoryToolDeveloperInstructionsCache(session: MemoryInstruc
 export async function refreshMemoryToolDeveloperInstructionsCacheAfterStartup(
 	session: MemoryInstructionSession,
 	agentDir: string,
+	cwd: string,
 	settings: Settings,
 ): Promise<void> {
 	if (memoryConversationStarted(session)) return;
 	const sessionFile = getMemoryInstructionSessionFile(session);
 	const cached = memoryToolDeveloperInstructionsBySession.get(session);
-	const current = await readMemoryToolDeveloperInstructionsSnapshot(agentDir, settings);
+	const root = getMemoryRoot(agentDir, cwd);
+	const current = await readMemoryToolDeveloperInstructionsSnapshot(root, settings);
 	if (memoryConversationStarted(session)) return;
-	const root = getMemoryInstructionRoot(agentDir, settings);
 	const baseline = memoryToolDeveloperInstructionsByRoot.get(root);
 	const cachedLearned = cached && cached.sessionFile === sessionFile ? cached.snapshot?.learned : undefined;
 	const learned = cachedLearned ?? baseline?.learned ?? "";
@@ -298,15 +294,21 @@ export async function refreshMemoryToolDeveloperInstructionsCacheAfterStartup(
 
 /**
  * Build memory usage instructions for prompt injection.
+ *
+ * `cwd` is the session's project directory, the same scope consolidation and
+ * `learn` write to; never `settings.getCwd()`, which an embedding host may pin
+ * to one directory for sessions spanning several projects.
  */
 export async function buildMemoryToolDeveloperInstructions(
 	agentDir: string,
+	cwd: string,
 	settings: Settings,
 	session?: MemoryInstructionSession,
 ): Promise<string | undefined> {
+	const root = getMemoryRoot(agentDir, cwd);
 	if (!session) {
-		const snapshot = await readMemoryToolDeveloperInstructionsSnapshot(agentDir, settings);
-		memoryToolDeveloperInstructionsByRoot.set(getMemoryInstructionRoot(agentDir, settings), snapshot);
+		const snapshot = await readMemoryToolDeveloperInstructionsSnapshot(root, settings);
+		memoryToolDeveloperInstructionsByRoot.set(root, snapshot);
 		return renderMemoryToolDeveloperInstructionsSnapshot(snapshot, settings);
 	}
 
@@ -314,19 +316,19 @@ export async function buildMemoryToolDeveloperInstructions(
 	const cached = memoryToolDeveloperInstructionsBySession.get(session);
 	if (cached && cached.sessionFile === sessionFile) return cached.value;
 
-	const snapshot = await readMemoryToolDeveloperInstructionsSnapshot(agentDir, settings);
+	const snapshot = await readMemoryToolDeveloperInstructionsSnapshot(root, settings);
 	return cacheMemoryToolDeveloperInstructions(session, sessionFile, snapshot, settings);
 }
 
 /**
- * Clear all persisted memory state and generated artifacts.
+ * Clear the persisted memory state and generated artifacts of one project.
  */
 export async function clearMemoryData(agentDir: string, cwd: string, signal?: AbortSignal): Promise<void> {
 	signal?.throwIfAborted();
 	const db = openMemoryDb(getAgentDbPath(agentDir));
 	try {
 		signal?.throwIfAborted();
-		clearMemoryDataInDb(db);
+		clearMemoryDataInDb(db, cwd);
 	} finally {
 		closeMemoryDb(db);
 	}
@@ -365,7 +367,12 @@ async function runMemoryStartup(options: MemoryStartupOptions): Promise<void> {
 	if (!isMemoryStartupActive(options)) return;
 	await runPhase2(options);
 	if (!isMemoryStartupActive(options)) return;
-	await refreshMemoryToolDeveloperInstructionsCacheAfterStartup(options.session, options.agentDir, options.settings);
+	await refreshMemoryToolDeveloperInstructionsCacheAfterStartup(
+		options.session,
+		options.agentDir,
+		options.session.sessionManager.getCwd(),
+		options.settings,
+	);
 	if (!isMemoryStartupActive(options)) return;
 	if (memoryConversationStarted(options.session)) return;
 	await options.session.refreshBaseSystemPrompt?.();
@@ -760,9 +767,19 @@ function extractPersistableMessages(payload: string): AgentMessage[] {
 		const maybeMessage = entry.message;
 		if (!maybeMessage || typeof maybeMessage !== "object") continue;
 		const message = maybeMessage as AgentMessage;
-		if (shouldPersistResponseItemForMemories(message)) {
+		if (!shouldPersistResponseItemForMemories(message)) continue;
+		if (message.role !== "assistant") {
 			messages.push(message);
+			continue;
 		}
+		const content = message.content.some(block => block.type === "thinking" || block.type === "redactedThinking")
+			? message.content.filter(block => block.type !== "thinking" && block.type !== "redactedThinking")
+			: message.content;
+		messages.push(
+			content === message.content && !message.providerPayload
+				? message
+				: { ...message, content, providerPayload: undefined },
+		);
 	}
 	return messages;
 }
@@ -896,9 +913,12 @@ async function runStage1Job(options: {
 						metadata: options.metadata,
 						maxTokens: Math.max(1024, Math.min(4096, Math.floor(modelMaxTokens * 0.2))),
 						reasoning: clampThinkingLevelForModel(model, Effort.Low),
+						// OpenAI chat-completions owns its transient retries in the HTTP
+						// transport; never restart that budget at the provider/oneshot layers.
+						maxHttpAttempts: model.api === "openai-completions" ? 3 : undefined,
 					},
 				),
-			{ provider: model.provider },
+			{ provider: model.provider, maxAttempts: model.api === "openai-completions" ? 1 : undefined },
 		);
 
 		if (response.stopReason === "error") {
@@ -1039,9 +1059,10 @@ async function runConsolidationModel(options: {
 					metadata: options.metadata,
 					maxTokens: 8192,
 					reasoning: clampThinkingLevelForModel(model, Effort.Medium),
+					maxHttpAttempts: model.api === "openai-completions" ? 3 : undefined,
 				},
 			),
-		{ provider: model.provider },
+		{ provider: model.provider, maxAttempts: model.api === "openai-completions" ? 1 : undefined },
 	);
 	if (response.stopReason === "error") {
 		throw new Error(response.errorMessage || "phase2 model error");

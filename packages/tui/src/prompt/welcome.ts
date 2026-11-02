@@ -228,33 +228,7 @@ export class WelcomeComponent implements Component {
 	describe(cx: DescribeContext): NativeNode {
 		const tip = this.tip;
 		if (this.#native && this.#native.tip === tip && this.#native.cols === cx.cols) return this.#native.node;
-		const art = (spans: readonly TspSpan[], role: string): NativeNode =>
-			keyed(text(spans, { wrap: "none", role }), role);
-		const lockupRow = keyed(
-			row(
-				[
-					...(cx.cols >= LOGO_WIDTH + LOCKUP_GAP + visibleWidth(this.productName)
-						? [keyed(logoNode(COREFORGE_LOGO, true, "omp.welcome.logo"), "logo")]
-						: []),
-					keyed(
-						col(
-							[
-								art([span(plainLine(this.productName), "strong")], "omp.welcome.wordmark"),
-								art([span(`v${this.version}`, "dim mono")], "omp.welcome.version"),
-								...(this.greetingName
-									? [text(plainLine(this.#welcomeText()), { wrap: "word", role: "omp.welcome.greeting" })]
-									: []),
-							],
-							{ role: "omp.welcome.mark" },
-						),
-						"mark",
-					),
-				],
-				{ align: "center", gap: "md", role: "omp.welcome.lockup" },
-			),
-			"lockup",
-		);
-		const body: NativeChild[] = [lockupRow];
+		const body: NativeChild[] = [lockupNode(this.version, this.productName, this.greetingName, cx.cols)];
 		if (tip) {
 			const isNew = NEW_TIP_MARKER.test(tip);
 			const tipText = compactText(tipSpans(expandTipKeys(isNew ? tip.replace(NEW_TIP_MARKER, "") : tip)));
@@ -422,6 +396,56 @@ export const COREFORGE_LOGO = [
 	" ⣤⣤⣤⣤⡄",
 ].map(line => line.padEnd(24));
 
+/** Shared native brand lockup for the welcome card and setup splash. */
+export function lockupNode(
+	version: string,
+	productName = "Coreforge",
+	greetingName?: string,
+	cols = Infinity,
+): NativeNode {
+	const art = (spans: readonly TspSpan[], role: string): NativeNode =>
+		keyed(text(spans, { wrap: "none", role }), role);
+	return keyed(
+		row(
+			[
+				...(cols >= LOGO_WIDTH + LOCKUP_GAP + visibleWidth(productName)
+					? [
+							keyed(
+								col(
+									COREFORGE_LOGO.map(line =>
+										text([span(line, "accent", { fx: "shimmer" })], { wrap: "none" }),
+									),
+									{ align: "center", role: "omp.welcome.logo" },
+								),
+								"logo",
+							),
+						]
+					: []),
+				keyed(
+					col(
+						[
+							art([span(plainLine(productName), "strong")], "omp.welcome.wordmark"),
+							art([span(`v${version}`, "dim mono")], "omp.welcome.version"),
+							...(greetingName
+								? [
+										text(plainLine(`Welcome back, ${greetingName}!`), {
+											wrap: "word",
+											role: "omp.welcome.greeting",
+										}),
+									]
+								: []),
+						],
+						{ role: "omp.welcome.mark" },
+					),
+					"mark",
+				),
+			],
+			{ align: "center", gap: "md", role: "omp.welcome.lockup" },
+		),
+		"lockup",
+	);
+}
+
 const LOGO_WIDTH = Math.max(...COREFORGE_LOGO.map(line => visibleWidth(line)));
 const LOCKUP_GAP = 4;
 const TIP_MEASURE = 72;
@@ -435,18 +459,6 @@ function centerBlock(lines: readonly string[], width: number): string[] {
 	const widest = lines.reduce((max, line) => Math.max(max, visibleWidth(line)), 0);
 	const indent = padding(Math.max(0, Math.floor((width - widest) / 2)));
 	return lines.map(line => indent + line);
-}
-
-/** The brand mark as accent lines; `shimmer` declares the terminal-clocked shine sweep. */
-export function logoNode(lines: readonly string[], shimmer: boolean, role = "omp.setup.logo"): NativeNode {
-	return col(
-		lines.map(line =>
-			text([span(line, "accent", shimmer ? { fx: "shimmer" } : undefined)], {
-				wrap: "none",
-			}),
-		),
-		{ align: "center", role },
-	);
 }
 
 /** Multi-stop palette for the diagonal gradient. */

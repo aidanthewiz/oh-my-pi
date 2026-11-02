@@ -60,7 +60,7 @@ describe("issue #4806 command output during streaming", () => {
 		HistoryStorage.close();
 		vi.restoreAllMocks();
 		await session?.dispose();
-		authStorage?.close();
+		await authStorage?.close();
 		tempDir?.removeSync();
 		resetSettingsForTest();
 	});
@@ -94,7 +94,7 @@ describe("issue #4806 command output during streaming", () => {
 			type Described = { scroll?: { by: string; n: number }; c?: Described[] };
 			const sheet = () => mode.ui.overlayStack.at(-1)?.component;
 
-			mode.handleContextCommand();
+			mode.handleToolsCommand();
 			expect(sheet()?.nativeOverlay).toMatchObject({ role: "omp.overlay.report", size: "lg" });
 			expect(mode.ui.getFocused()).toBe(sheet() ?? null);
 			expect(mode.chatContainer.children).toHaveLength(0);

@@ -78,7 +78,7 @@ describe("session_stop block continuation — idle recap resilience (#4323)", ()
 
 	afterEach(async () => {
 		if (session) await session.dispose();
-		for (const authStorage of authStorages.splice(0)) authStorage.close();
+		for (const authStorage of authStorages.splice(0)) await authStorage.close();
 		vi.restoreAllMocks();
 		await fs.promises.rm(tempDir, { recursive: true, force: true }).catch(() => undefined);
 	});

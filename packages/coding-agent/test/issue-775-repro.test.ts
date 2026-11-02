@@ -24,7 +24,7 @@ describe("issue #775: per-model defaultLevel", () => {
 			await session.dispose();
 		}
 		for (const authStorage of authStorages.splice(0)) {
-			authStorage.close();
+			await authStorage.close();
 		}
 		tempDir.removeSync();
 	});

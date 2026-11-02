@@ -96,6 +96,7 @@ fn smoke_real_server() {
 			"--mode",
 			"rpc",
 			"--no-session",
+			"--no-skills",
 			"--provider",
 			"metadata-fixture",
 			"--model",
@@ -298,6 +299,7 @@ fn smoke_scripted_model() {
 			"--mode",
 			"rpc",
 			"--no-session",
+			"--no-skills",
 			"--model",
 			"fake/fake-model",
 		])

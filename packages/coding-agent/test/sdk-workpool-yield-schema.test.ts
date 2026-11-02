@@ -69,7 +69,7 @@ describe("SDK workpool yield schema", () => {
 
 	afterAll(async () => {
 		for (const session of sessions) await session.dispose().catch(() => {});
-		authStorage.close();
+		await authStorage.close();
 		if (fs.existsSync(registryDir)) removeSyncWithRetries(registryDir);
 	});
 

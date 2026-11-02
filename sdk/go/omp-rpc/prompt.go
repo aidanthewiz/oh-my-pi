@@ -159,8 +159,13 @@ func buildPromptTurn(events []RpcAgentEvent, result *PromptResultEvent) (PromptT
 	if turn.AssistantMessage != nil {
 		var text strings.Builder
 		for _, block := range turn.AssistantMessage.Content {
-			if content, ok := block.Value.(TextContent); ok {
+			switch content := block.Value.(type) {
+			case TextContent:
 				text.WriteString(content.Text)
+			case ThinkingContent:
+				if content.Narration != nil && *content.Narration {
+					text.WriteString(content.Thinking)
+				}
 			}
 		}
 		if text.Len() > 0 {

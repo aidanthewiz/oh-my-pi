@@ -8,7 +8,7 @@ import { Text } from "../components/text";
 import { getImageDimensions, ImageProtocol, imageFallback, TERMINAL } from "../terminal-capabilities";
 import { type Component, Container, type TUI } from "../tui";
 import { truncateToWidth } from "../utils";
-import { getProjectDir, isRecord, logger, sanitizeText } from "@oh-my-pi/pi-utils";
+import { getProjectDir, isRecord, logger, sanitizeText, sanitizeTextDeep } from "@oh-my-pi/pi-utils";
 import type { Theme } from "../theme/theme";
 import { ensureThemeSync, getThemeEpoch, theme } from "../theme/theme";
 import {
@@ -30,9 +30,10 @@ import {
 	rootToggleExpanded,
 } from "../native/node";
 import { plainText } from "../native/spans";
-import { diagnosticsSection, displayPath, toolHead } from "../tools/native-view";
+import { diagnosticsBadge, diagnosticsSection, displayPath, toolHead } from "../tools/native-view";
 import type { FileDiagnosticsResult } from "../tools/lsp";
 import { NativeImageCache, shownImageBlobs } from "../native/blobs";
+import { imageLinksEnabled, linkedImageText } from "../prompt/image-references";
 import { Memo } from "../native/memo";
 import { type EditMode, type PerFileDiffPreview, renderStreamingFallback } from "../tools/edit";
 import { taskCardAgentIds } from "../tools/task";
@@ -124,6 +125,9 @@ function cardPreview(preview: NativeToolView["preview"]): TspPreview | undefined
 
 /** The describe hooks of a registry renderer or of a custom tool object. */
 type ToolDescriber = Pick<ToolRenderer, "describeCall" | "describeResult" | "mergeCallAndResult">;
+
+/** Optional kinds of the host's vocabulary the describe hooks branch on. */
+type NativeHostKinds = Required<Pick<RenderResultContextOptions, "json">>;
 
 class SafeToolRendererComponent implements Component {
 	#toolName: string;
@@ -234,7 +238,6 @@ export interface ToolExecutionHandle extends Component {
 	setArgsComplete(toolCallId?: string): void;
 	setExecutionStarted(toolCallId?: string): void;
 	setExpanded(expanded: boolean): void;
-	setToolActivityVisible(visible: boolean): void;
 	/** Mark the call parked: it returned, but stays tracked for async job frames. */
 	parkAsBackground(): void;
 	/** Seal the block as final history and stop its animations. */
@@ -421,6 +424,8 @@ export class ToolExecutionComponent extends Container {
 		isError?: boolean;
 		details?: unknown;
 	};
+	// Machine paths remain verbatim; only #result.details is handed to display renderers.
+	#rawDetails: unknown;
 	// Edit preview state
 	#editMode?: EditMode;
 	#editDiffPreview?: PerFileDiffPreview[];
@@ -437,6 +442,8 @@ export class ToolExecutionComponent extends Container {
 	#spinnerActive = false;
 	// Todo write completion strikethrough reveal animation
 	#todoStrikeInterval?: NodeJS.Timeout;
+	// Once-a-second repaint for renderers that show live elapsed time (`tickElapsed`)
+	#elapsedTicker?: NodeJS.Timeout;
 	// Track if args are still being streamed (for edit/write spinner)
 	#argsComplete = false;
 	#executionStarted = false;
@@ -460,6 +467,7 @@ export class ToolExecutionComponent extends Container {
 	readonly #nativeImages = new NativeImageCache();
 	// Wall clock captured whenever a task card is rebuilt.
 	#taskRenderNowMs = Date.now();
+	#taskTimerOwner: object | undefined;
 	// Set on each `render()` when the last painted pending shape must be
 	// replayed wholesale when the first result arrives. Reset gates key off
 	// these so a topology-changing update that lands before the shape reaches
@@ -474,6 +482,8 @@ export class ToolExecutionComponent extends Container {
 		argsComplete?: boolean;
 		executionStarted?: boolean;
 		renderContext?: Record<string, unknown>;
+		/** Live: read at render time, so a ticking spinner advances it. */
+		readonly elapsedMs?: number;
 	} = {
 		expanded: false,
 		isPartial: true,
@@ -491,6 +501,10 @@ export class ToolExecutionComponent extends Container {
 		toolCallId?: string,
 	) {
 		super();
+		Object.defineProperty(this.#renderState, "elapsedMs", {
+			get: () => this.#elapsedMs(this.#nativeStatus()),
+			enumerable: true,
+		});
 		ensureThemeSync();
 		this.#toolCallId = toolCallId;
 		this.#toolName = toolName;
@@ -635,7 +649,11 @@ export class ToolExecutionComponent extends Container {
 		const partialResultPainted = this.#partialResultShapePainted;
 		this.#firstResultViewportRepaintShapePainted = false;
 		this.#partialResultShapePainted = false;
-		this.#result = result;
+		this.#rawDetails = result.details;
+		// Renderers receive sanitized details for display; raw paths are available
+		// separately for links and media through the built-in render context.
+		const details = sanitizeTextDeep(result.details);
+		this.#result = details === result.details ? result : { ...result, details };
 		this.#resultVersion++;
 		this.#blockVersion++;
 		this.#isPartial = isPartial;
@@ -700,14 +718,15 @@ export class ToolExecutionComponent extends Container {
 			// Convert async - catch errors from processing
 			convertImageToPngShared(image)
 				.then(converted => {
+					this.#kittyConversionsAwaited.delete(key);
 					this.#kittyConverted.set(key, converted);
 					this.#displayInputVersion++;
 					this.#updateDisplay();
 					this.#ui.requestRender();
 				})
 				.catch(() => {
-					// Ignore conversion failures - display will use original image format
 					this.#kittyConversionsAwaited.delete(key);
+					this.#ui.requestRender();
 				});
 		}
 	}
@@ -769,6 +788,32 @@ export class ToolExecutionComponent extends Container {
 				this.#renderState.spinnerFrame = undefined;
 			}
 		}
+		this.#updateElapsedTicker(isBackgroundAsyncRunning);
+	}
+
+	/**
+	 * Repaint once a second while a `tickElapsed` renderer's call executes, so a
+	 * quiet command's elapsed time advances without the 30fps spinner ticker.
+	 */
+	#updateElapsedTicker(isBackgroundAsyncRunning: boolean): void {
+		const needsTicker =
+			this.#renderer?.tickElapsed === true &&
+			this.#executionStarted &&
+			this.#isPartial &&
+			!this.#sealed &&
+			!isBackgroundAsyncRunning &&
+			!isNativeRendering();
+		if (needsTicker && !this.#elapsedTicker) {
+			this.#elapsedTicker = setInterval(() => this.#ui.requestComponentRender(this), 1000);
+		} else if (!needsTicker) {
+			this.#stopElapsedTicker();
+		}
+	}
+
+	#stopElapsedTicker(): void {
+		if (!this.#elapsedTicker) return;
+		clearInterval(this.#elapsedTicker);
+		this.#elapsedTicker = undefined;
 	}
 
 	/**
@@ -822,9 +867,12 @@ export class ToolExecutionComponent extends Container {
 		}
 	}
 
-	/** Whether the result's figure still waits for its raster; the transcript holds retirement meanwhile. */
+	/** Hold visible results until their figures and Kitty images are ready for immutable scrollback. */
 	isTranscriptBlockPending(): boolean {
-		return this.#toolActivityVisible && this.#figure?.pending === true;
+		return (
+			this.#toolActivityVisible &&
+			((this.#showImages && this.#kittyConversionsAwaited.size > 0) || this.#figure?.pending === true)
+		);
 	}
 
 	/**
@@ -914,6 +962,7 @@ export class ToolExecutionComponent extends Container {
 			this.#renderState.spinnerFrame = undefined;
 		}
 		this.#stopTodoStrikeAnimation();
+		this.#stopElapsedTicker();
 		this.#previewReady?.resolve();
 	}
 
@@ -980,6 +1029,7 @@ export class ToolExecutionComponent extends Container {
 	override describe(cx?: DescribeContext): NativeNode {
 		if (this.#toolName === "wait" && this.#isBenignSkip()) return EMPTY_NODE;
 		const dataFirst = cx?.supports("tool") === true;
+		const host: NativeHostKinds = { json: cx?.supports("json") === true };
 		const key = [
 			dataFirst,
 			this.#resultVersion,
@@ -990,12 +1040,14 @@ export class ToolExecutionComponent extends Container {
 			this.#sealed,
 			this.#parkedBackground,
 			this.#showImages,
+			imageLinksEnabled(),
 			this.#displayInputVersion,
 			this.#toolActivityVisible,
+			host.json,
 			getThemeEpoch(),
 		];
 		return this.#native.get(key, () =>
-			withHidden(dataFirst ? this.#describeTool() : this.#describeCard(), !this.#toolActivityVisible),
+			withHidden(dataFirst ? this.#describeTool(host) : this.#describeCard(host), !this.#toolActivityVisible),
 		);
 	}
 
@@ -1025,15 +1077,15 @@ export class ToolExecutionComponent extends Container {
 		const files = this.#lateDiagnostics;
 		if (!files || files.length === 0) return {};
 		const sections = files.map(file => diagnosticsSection(file)).filter((n): n is NativeNode => n !== undefined);
-		const count = files.reduce((sum, file) => sum + file.messages.length, 0);
-		const errored = files.some(file => file.errored);
+		if (sections.length === 0) return {};
+		const chip = diagnosticsBadge(files);
 		const section =
 			sections.length === 1
 				? sections[0]
 				: node("col", { gap: "sm", role: "omp.tool.diagnostics" }, sections, "late");
 		return {
 			section,
-			chip: { text: count === 1 ? "1 diagnostic" : `${count} diagnostics`, tone: errored ? "error" : "warning" },
+			chip,
 		};
 	}
 
@@ -1041,8 +1093,8 @@ export class ToolExecutionComponent extends Container {
 	 * The data-first `tool` node (§7.2): the renderer's head data, status,
 	 * timer, exit and intent as props; its body as borderless children.
 	 */
-	#describeTool(): NativeNode {
-		const view = this.#nativeView();
+	#describeTool(host: NativeHostKinds): NativeNode {
+		const view = this.#nativeView(host);
 		const status = this.#nativeStatus();
 		const head = view.tool;
 		const late = this.#lateDiagnosticsParts();
@@ -1111,8 +1163,8 @@ export class ToolExecutionComponent extends Container {
 		return spans;
 	}
 
-	#describeCard(): NativeNode {
-		const view = this.#nativeView();
+	#describeCard(host: NativeHostKinds): NativeNode {
+		const view = this.#nativeView(host);
 		const status = this.#nativeStatus();
 		const late = this.#lateDiagnosticsParts();
 		const fallbackHead = this.#fallbackHead(view);
@@ -1166,9 +1218,10 @@ export class ToolExecutionComponent extends Container {
 	 * the result view (merged renderers) or the call head over both bodies.
 	 * A renderer that throws falls back to the generic card.
 	 */
-	#nativeView(): NativeToolView {
+	#nativeView(host: NativeHostKinds): NativeToolView {
 		const status = this.#nativeStatus();
 		const options: RenderResultContextOptions = {
+			...host,
 			showImages: this.#showImages,
 			expanded: this.#expanded,
 			isPartial: this.#isPartial,
@@ -1290,7 +1343,7 @@ export class ToolExecutionComponent extends Container {
 		// TUI startup, so a result rendered before it lands must re-shape once it
 		// does (it gates Image children vs text fallback in #rebuildDisplay); keyed
 		// here for the same reason markdown.ts keys its render cache on it.
-		const key = `${this.#resultVersion}|${this.#expanded}|${this.#isPartial}|${this.#argsComplete ? "1" : "0"}|${this.#executionStarted ? "1" : "0"}|${this.#spinnerFrame ?? "-"}|${this.#showImages}|${getThemeEpoch()}|${this.#displayInputVersion}|${TERMINAL.imageProtocol ?? "-"}|${this.#imageSizeKey()}`;
+		const key = `${this.#resultVersion}|${this.#expanded}|${this.#isPartial}|${this.#argsComplete ? "1" : "0"}|${this.#executionStarted ? "1" : "0"}|${this.#spinnerFrame ?? "-"}|${this.#showImages}|${getThemeEpoch()}|${this.#displayInputVersion}|${TERMINAL.imageProtocol ?? "-"}|${this.#imageSizeKey()}|${imageLinksEnabled()}`;
 		if (key === this.#lastDisplayKey && this.#displayBuilt) return;
 		this.#lastDisplayKey = key;
 
@@ -1560,6 +1613,10 @@ export class ToolExecutionComponent extends Container {
 				this.#contentBox.clear();
 
 				const renderContext = this.#buildRenderContext();
+				const rawPerFileResults =
+					isRecord(this.#rawDetails) && Array.isArray(this.#rawDetails.perFileResults)
+						? this.#rawDetails.perFileResults
+						: undefined;
 				this.#renderState.renderContext = renderContext;
 
 				for (let i = 0; i < perFileResults.length; i++) {
@@ -1571,9 +1628,13 @@ export class ToolExecutionComponent extends Container {
 					}
 					const fileBox = new Box(0, 0);
 					try {
+						const fileOptions = {
+							...this.#renderState,
+							renderContext: { ...renderContext, rawDetails: rawPerFileResults?.[i] },
+						};
 						const resultComponent = renderer.renderResult(
 							{ content: [], details: fileResult, isError: fileResult.isError },
-							this.#renderState,
+							fileOptions,
 							theme,
 						);
 						if (resultComponent) {
@@ -1802,6 +1863,9 @@ export class ToolExecutionComponent extends Container {
 			return Math.max(1, Math.min(maxSeconds, value));
 		};
 
+		if (this.#renderer && !this.#tool?.renderResult && this.#rawDetails !== undefined) {
+			context.rawDetails = this.#rawDetails;
+		}
 		if (this.#toolName === "bash") {
 			// Bash needs render context even before a result exists. The renderer uses the pending-call args
 			// plus this context to keep the inline command preview visible while tool-call JSON is still streaming.
@@ -1825,6 +1889,7 @@ export class ToolExecutionComponent extends Container {
 			context.hasResult = Boolean(this.#result);
 			this.#taskRenderNowMs = Date.now();
 			context.nowMs = this.#taskRenderNowMs;
+			context.taskTimerOwner = this.#taskTimerOwner ??= {};
 		} else if (isEditLikeToolName(this.#toolName)) {
 			context.editMode = this.#editMode;
 			const previews = this.#editDiffPreview;
@@ -1862,7 +1927,8 @@ export class ToolExecutionComponent extends Container {
 
 	#getTextOutput(): string {
 		if (!this.#result) return "";
-		const key = `${this.#resultVersion}|${this.#showImages}|${TERMINAL.imageProtocol ?? "-"}`;
+		// Image placeholders embed a link only under an enabled hyperlink policy.
+		const key = `${this.#resultVersion}|${this.#showImages}|${TERMINAL.imageProtocol ?? "-"}|${imageLinksEnabled()}`;
 		if (key === this.#textOutputKey) return this.#textOutput;
 
 		const textBlocks = this.#result.content.filter(c => c.type === "text");
@@ -1879,7 +1945,8 @@ export class ToolExecutionComponent extends Container {
 				.map(img => {
 					const mimeType = String(img.mimeType);
 					const dims = img.data ? (getImageDimensions(img.data, mimeType) ?? undefined) : undefined;
-					return imageFallback(mimeType, dims);
+					const placeholder = imageFallback(mimeType, dims);
+					return img.data ? linkedImageText(placeholder, { data: img.data, mimeType }) : placeholder;
 				})
 				.join("\n");
 			output = output ? `${output}\n${imageIndicators}` : imageIndicators;

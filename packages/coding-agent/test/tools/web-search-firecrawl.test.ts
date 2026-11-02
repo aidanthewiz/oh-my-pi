@@ -31,11 +31,11 @@ const keylessSourceSpy = vi.spyOn(keylessAuthStorage.keys, "source").mockImpleme
 	return undefined;
 });
 
-afterAll(() => {
+afterAll(async () => {
 	keylessResolverSpy.mockRestore();
 	keylessSourceSpy.mockRestore();
-	providerAuthStorage.close();
-	keylessAuthStorage.close();
+	await providerAuthStorage.close();
+	await keylessAuthStorage.close();
 });
 
 function makeParams(query: string, authStorage: AuthStorage = providerAuthStorage) {
@@ -209,7 +209,7 @@ describe("Firecrawl web search provider", () => {
 			expect(resolutionCount).toBe(1);
 		} finally {
 			resolverSpy.mockRestore();
-			authStorage.close();
+			await authStorage.close();
 		}
 	});
 
@@ -251,7 +251,7 @@ describe("Firecrawl web search provider", () => {
 			});
 		} finally {
 			resolverSpy.mockRestore();
-			authStorage.close();
+			await authStorage.close();
 		}
 	});
 

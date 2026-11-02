@@ -2144,6 +2144,6 @@ export async function runBenchmark(
 
 		return buildBenchmarkResult({ tasks, config, resultsByTask, startTime });
 	} finally {
-		shared?.authStorage.close();
+		await shared?.authStorage.close();
 	}
 }

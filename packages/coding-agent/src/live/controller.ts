@@ -3,6 +3,7 @@ import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import { AudioCapture } from "@oh-my-pi/pi-natives";
 import { prompt } from "@oh-my-pi/pi-utils";
+import { isModelEnabledBySettings } from "../config/model-resolver";
 import type { AgentSession } from "../session/agent-session";
 import type { AgentSessionEvent } from "../session/agent-session-events";
 import { LIVE_DELEGATION_MESSAGE_TYPE } from "../session/messages";
@@ -13,13 +14,14 @@ import {
 	buildSessionClose,
 	chunkLiveContext,
 	type LiveClientMessage,
+	LIVE_MODEL,
 	type LiveServerEvent,
 } from "./protocol";
+import { OUTPUT_ACTIVE_LEVEL, OutputActivity } from "./output-activity";
 import { CodexLiveTransport } from "./transport";
 import type { LivePhase } from "@oh-my-pi/pi-tui/apps/live-visualizer";
 import { DEFAULT_LIVE_VOICE } from "./voices";
 
-const OUTPUT_ACTIVE_LEVEL = 0.015;
 const MIN_BARGE_IN_LEVEL = 0.04;
 const OUTPUT_ECHO_RATIO = 0.65;
 
@@ -59,6 +61,17 @@ export interface LiveSessionControllerOptions {
 	 * `{ username, firstName }` like the bundled prompt.
 	 */
 	instructions?: string;
+	/**
+	 * SDP offer from a caller-owned WebRTC peer that carries the microphone and speaker audio
+	 * (see `LiveTransportOptions.sdpOffer`). When set, no host microphone or speaker is opened;
+	 * the caller applies {@link LiveSessionController.sdpAnswer} to its peer after `start()`
+	 * and handles echo cancellation itself. There is no host track to mute: `toggleMute` only
+	 * moves the phase to `muted`, and the caller must silence its own microphone track while the
+	 * phase is `muted`. Levels are not reported in this mode.
+	 */
+	sdpOffer?: string;
+	/** Host ownership beyond the AgentSession, such as foreground view and collaboration authority. */
+	isCurrent?: () => boolean;
 }
 
 function errorFrom(cause: unknown): Error {
@@ -99,6 +112,9 @@ export class LiveSessionController {
 	readonly #extractAssistantText: (message: AssistantMessage) => string;
 	readonly #voice: string;
 	readonly #instructionsTemplate: string;
+	readonly #sdpOffer: string | undefined;
+	readonly #assertOwnerCurrent: () => void;
+	readonly #lifetime = new AbortController();
 
 	#transport: CodexLiveTransport | undefined;
 	#recorder: AudioCapture | undefined;
@@ -124,6 +140,11 @@ export class LiveSessionController {
 	#userTranscriptTurn = 0;
 	#assistantTranscriptTurn = 0;
 	#lastTranscript: LiveTranscript | undefined;
+	readonly #outputActivity = new OutputActivity(() =>
+		this.#guardEvent(() => {
+			if (!this.#activeDelegationId) this.#refreshAudioPhase();
+		}),
+	);
 
 	constructor(options: LiveSessionControllerOptions) {
 		this.#session = options.session;
@@ -131,6 +152,40 @@ export class LiveSessionController {
 		this.#extractAssistantText = options.extractAssistantText;
 		this.#voice = options.voice?.trim() || DEFAULT_LIVE_VOICE;
 		this.#instructionsTemplate = options.instructions ?? liveInstructionsTemplate;
+		this.#sdpOffer = options.sdpOffer;
+		const session = options.session;
+		const sessionId = session.sessionId;
+		const model = session.model;
+		const liveModel = model ? { ...model, provider: "openai-codex", id: LIVE_MODEL } : undefined;
+		const settings = session.settings;
+		const settingsRevision = settings.revision;
+		const registry = session.modelRegistry;
+		const auth = registry.authStorage;
+		const credentials = auth.credentials;
+		const sourceIdentity = auth.sourceIdentity;
+		const gate = session.costGate;
+		this.#assertOwnerCurrent = () => {
+			this.#lifetime.signal.throwIfAborted();
+			if (
+				session.isDisposed ||
+				session.isSessionTransitioning ||
+				session.sessionId !== sessionId ||
+				session.model !== model ||
+				session.modelRegistry !== registry ||
+				registry.authStorage !== auth ||
+				auth.isClosed ||
+				auth.credentials !== credentials ||
+				auth.sourceIdentity !== sourceIdentity ||
+				session.costGate !== gate ||
+				session.settings !== settings ||
+				settings.revision !== settingsRevision ||
+				options.isCurrent?.() === false
+			)
+				throw new Error("Live session owner changed");
+			if (!liveModel || !isModelEnabledBySettings(liveModel, settings, registry))
+				throw new Error(`Model "openai-codex/${LIVE_MODEL}" is excluded by model policy.`);
+			gate.admit();
+		};
 	}
 
 	/** Current realtime call phase. */
@@ -143,7 +198,15 @@ export class LiveSessionController {
 		return this.#muted;
 	}
 
-	/** Connects the realtime surface and starts microphone streaming. */
+	/**
+	 * SDP answer for the caller's peer in an `sdpOffer` session. It exists as soon as the offer is
+	 * signaled, before the control socket connects, so apply it only after `start()` resolves.
+	 */
+	get sdpAnswer(): string | undefined {
+		return this.#transport?.sdpAnswer;
+	}
+
+	/** Connects the realtime surface and starts microphone streaming (or, with `sdpOffer`, only signaling). */
 	async start(): Promise<void> {
 		if (this.#stopped) {
 			throw (
@@ -151,6 +214,7 @@ export class LiveSessionController {
 			);
 		}
 		if (this.#started) return;
+		this.#assertOwnerCurrent();
 		this.#started = true;
 		this.#emitPhase("connecting", true);
 		this.#emitTranscript(undefined);
@@ -159,6 +223,7 @@ export class LiveSessionController {
 		}
 
 		try {
+			this.#assertOwnerCurrent();
 			const user = currentUser();
 			const instructions = prompt.render(this.#instructionsTemplate, user);
 			const transport = new CodexLiveTransport({
@@ -166,6 +231,9 @@ export class LiveSessionController {
 				sessionId: this.#session.sessionId,
 				instructions,
 				voice: this.#voice,
+				sdpOffer: this.#sdpOffer,
+				signal: this.#lifetime.signal,
+				assertCurrent: this.#assertOwnerCurrent,
 				callbacks: {
 					onEvent: event => this.#guardEvent(() => this.#handleLiveEvent(event)),
 					onOutputLevel: level => this.#guardEvent(() => this.#handleOutputLevel(level)),
@@ -173,6 +241,7 @@ export class LiveSessionController {
 			});
 			this.#transport = transport;
 			await transport.connect();
+			this.#assertOwnerCurrent();
 			if (this.#stopped) {
 				throw this.#failure ?? new Error("The live session stopped while connecting.");
 			}
@@ -180,8 +249,13 @@ export class LiveSessionController {
 				this.#guardEvent(() => this.#handleSessionEvent(event)),
 			);
 			if (this.#muted) await transport.setMuted(true);
+			this.#assertOwnerCurrent();
 			if (this.#stopped) {
 				throw this.#failure ?? new Error("The live session stopped before recording began.");
+			}
+			if (this.#sdpOffer !== undefined) {
+				this.#refreshAudioPhase();
+				return;
 			}
 			const recorder = new AudioCapture(16_000, (error, samples) => {
 				if (error) {
@@ -211,8 +285,15 @@ export class LiveSessionController {
 	/** Toggles microphone capture while leaving output and the session connected. */
 	toggleMute(): void {
 		if (this.#stopped) return;
+		try {
+			this.#assertCurrent();
+		} catch (cause) {
+			this.#reportFailure(errorFrom(cause));
+			return;
+		}
 		this.#muted = !this.#muted;
-		if (this.#muted) {
+		// Remote audio reports no levels, so a mute must not emit a `(0, 0)` pair either.
+		if (this.#muted && this.#sdpOffer === undefined) {
 			this.#inputLevel = 0;
 			this.#emitLevels();
 		}
@@ -231,6 +312,7 @@ export class LiveSessionController {
 
 	async #stop(): Promise<void> {
 		this.#stopped = true;
+		this.#outputActivity.dispose();
 		this.#unsubscribeSession?.();
 		this.#unsubscribeSession = undefined;
 		let cleanupError: Error | undefined;
@@ -255,19 +337,27 @@ export class LiveSessionController {
 				cleanupError ??= errorFrom(cause);
 			}
 			try {
+				this.#lifetime.abort();
 				await transport.close();
 			} catch (cause) {
 				cleanupError ??= errorFrom(cause);
 			}
 		}
+		this.#lifetime.abort();
 
 		if (cleanupError) this.#emitPhaseSafely("error");
 		this.#emitTerminal(cleanupError);
 	}
 
+	#assertCurrent(): void {
+		if (this.#stopped) throw this.#failure ?? new Error("Live session stopped");
+		this.#assertOwnerCurrent();
+	}
+
 	#guardEvent(handler: () => void): void {
 		if (this.#stopped) return;
 		try {
+			this.#assertCurrent();
 			handler();
 		} catch (cause) {
 			this.#reportFailure(errorFrom(cause));
@@ -277,7 +367,8 @@ export class LiveSessionController {
 	#handleLiveEvent(event: LiveServerEvent): void {
 		switch (event.type) {
 			case "session.started":
-				this.#emitPhase("listening");
+				// Mute wins over server-driven phases: a remote peer treats any other phase as unmuted.
+				this.#refreshAudioPhase();
 				break;
 			case "session.updated":
 			case "output_audio.delta":
@@ -310,7 +401,7 @@ export class LiveSessionController {
 		request = request.trim();
 		if (!request) return;
 		this.#activeDelegationId = event.item.id;
-		this.#emitPhase("working");
+		this.#refreshAudioPhase();
 		void this.#session
 			.sendCustomMessage(
 				{
@@ -363,6 +454,7 @@ export class LiveSessionController {
 
 	#handleOutputLevel(level: number): void {
 		this.#outputLevel = clampLevel(level);
+		this.#outputActivity.observe(this.#outputLevel);
 		this.#emitLevels();
 		if (!this.#activeDelegationId) this.#refreshAudioPhase();
 	}
@@ -370,12 +462,14 @@ export class LiveSessionController {
 	#handleMicrophoneAudio(samples: Float32Array): void {
 		if (this.#stopped || !this.#transport) return;
 		if (this.#muted) return;
-		this.#inputLevel = microphoneLevel(samples);
-		this.#emitLevels();
-		const outputActive = this.#outputLevel > OUTPUT_ACTIVE_LEVEL;
-		const echoThreshold = Math.max(MIN_BARGE_IN_LEVEL, this.#outputLevel * OUTPUT_ECHO_RATIO);
-		if (outputActive && this.#inputLevel < echoThreshold) return;
 		try {
+			this.#assertCurrent();
+			this.#inputLevel = microphoneLevel(samples);
+			this.#emitLevels();
+			const outputActive = this.#outputLevel > OUTPUT_ACTIVE_LEVEL;
+			const echoThreshold = Math.max(MIN_BARGE_IN_LEVEL, this.#outputLevel * OUTPUT_ECHO_RATIO);
+			if (outputActive && this.#inputLevel < echoThreshold) return;
+			this.#assertCurrent();
 			this.#transport.pushAudio(samples);
 		} catch (cause) {
 			this.#reportFailure(errorFrom(cause));
@@ -453,9 +547,15 @@ export class LiveSessionController {
 		if (!transport || this.#stopped) return;
 		this.#sendChain = this.#sendChain
 			.then(async () => {
-				if (!this.#stopped) await transport.send(message);
+				if (!this.#stopped) {
+					this.#assertCurrent();
+					await transport.send(message);
+					this.#assertCurrent();
+				}
 			})
-			.catch(cause => this.#reportFailure(errorFrom(cause)));
+			.catch(cause => {
+				if (!this.#stopped) this.#reportFailure(errorFrom(cause));
+			});
 	}
 
 	#refreshAudioPhase(): void {
@@ -464,7 +564,7 @@ export class LiveSessionController {
 			this.#emitPhase("muted");
 		} else if (this.#activeDelegationId) {
 			this.#emitPhase("working");
-		} else if (this.#outputLevel > OUTPUT_ACTIVE_LEVEL) {
+		} else if (this.#outputActivity.active) {
 			this.#emitPhase("speaking");
 		} else {
 			this.#emitPhase("listening");

@@ -1,0 +1,313 @@
+import assert from "node:assert/strict";
+import fs from "node:fs/promises";
+import path from "node:path";
+import os from "node:os";
+import { createHash } from "node:crypto";
+import type { AnthropicOptions } from "../../packages/ai/src/providers/anthropic";
+import type { Context, Model, AnthropicFallbackCreditHandle } from "../../packages/ai/src/types";
+import type { AnthropicCompat } from "../../packages/catalog/src/types";
+
+declare const PI_COMPILED: boolean;
+const required = (key: string): string => { const value = process.env[key]; assert(value, key); return value; };
+const sha = (bytes: Uint8Array | string): string => createHash("sha256").update(bytes).digest("hex");
+const runtime = await fs.realpath(required("CF19_RUNTIME_ROOT"));
+const marker = required("CF19_MARKER");
+assert(/^[A-Za-z0-9_-]+$/.test(marker), "safe marker");
+const home = await fs.realpath(required("HOME"));
+assert(home.startsWith(runtime + path.sep));
+assert.equal(await fs.realpath(os.homedir()), home, "HOME must be private before Bun starts");
+const version = required("CF_UPSTREAM_CANDIDATE_VERSION");
+const manifestPath = await fs.realpath(required("V1890_SOURCE_INPUT_MANIFEST"));
+assert(manifestPath.startsWith(runtime + path.sep), "copied manifest must be runtime-owned");
+const manifestBytes = await fs.readFile(manifestPath);
+assert.equal(sha(manifestBytes), required("V1890_SOURCE_INPUT_SHA256"));
+const manifest = JSON.parse(manifestBytes.toString());
+assert(Array.isArray(manifest.records));
+assert.equal(sha(JSON.stringify(manifest.records)), manifest.sourceDigest);
+const nativeSha256 = required("V1890_NATIVE_SHA256");
+const compiled = typeof PI_COMPILED !== "undefined" ? PI_COMPILED : process.env.PI_COMPILED === "true";
+const fixture = await fs.mkdtemp(path.join(runtime, `${marker}-provider-beta-`));
+await fs.writeFile(path.join(fixture, ".owner"), marker, { flag: "wx", mode: 0o600 });
+const cases: { id: string; status: "passed"; evidence: unknown }[] = [];
+const originalFetch = globalThis.fetch;
+const envKeys = new Set([...Object.keys(process.env), ...Object.keys(Bun.env)].filter(key => /^(ANTHROPIC_|CLAUDE_CODE_|FOUNDRY_)/.test(key)));
+for (const key of ["CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", "CLAUDE_CODE_USE_FOUNDRY", "ANTHROPIC_BASE_URL"]) envKeys.add(key);
+const savedEnv = new Map([...envKeys].map(key => [key, { process: process.env[key], bun: Bun.env[key] }]));
+const setEnv = (key: string, value: string | undefined): void => {
+	if (value === undefined) { delete process.env[key]; delete Bun.env[key]; }
+	else { process.env[key] = value; Bun.env[key] = value; }
+};
+for (const key of envKeys) setEnv(key, undefined);
+let deniedExternalRequests = 0;
+globalThis.fetch = (async () => { deniedExternalRequests++; throw new Error("provider-beta external network disabled"); }) as typeof fetch;
+let failure: unknown;
+let passed = false;
+let cleanupVerified = false;
+let fixtureRootRemoved = false;
+let syntheticRequests = 0;
+try {
+	await assert.rejects(globalThis.fetch("https://must-not-connect.invalid"), /external network disabled/);
+	// Load-boundary probe: isolate import-time environment and deny fetch before provider/native initialization.
+	await import("../../packages/natives/native/index.js");
+	const { nativeAddonStatus } = await import("../../packages/natives/native/loader-state.js");
+	const native = nativeAddonStatus();
+	assert(native && !native.stale);
+	assert.equal(native.version, version);
+	assert.equal(sha(await fs.readFile(native.path)), nativeSha256);
+	if (manifest.native?.sha256 !== undefined) assert.equal(manifest.native.sha256, nativeSha256);
+	const { buildModel } = await import("../../packages/catalog/src/build");
+	const { streamAnthropic } = await import("../../packages/ai/src/providers/anthropic");
+	const { AnthropicMessagesClient } = await import("../../packages/ai/src/providers/anthropic-client");
+	const binding = "thinking-binding-controls-2026-08-01";
+	const contextBeta = "context-management-2025-06-27";
+	const withheld = [binding, contextBeta, "compact-2026-09-04", "compact-2026-01-12", "structured-outputs-2025-12-15", "task-budgets-2026-03-13", "mid-conversation-tool-changes-2026-07-01"];
+	const customBeta = "synthetic-beta-2026-01-01";
+	const official = "https://api.anthropic.com";
+	const gateway = "https://provider-beta-gateway.example.invalid";
+	const apiKey = "synthetic-provider-beta-key";
+	const oauthKey = `sk-ant-${"oat01"}-synthetic-provider-beta`;
+	const makeModel = (provider = "anthropic", compat?: AnthropicCompat, baseUrl = official, id = "claude-sonnet-5-5"): Model<"anthropic-messages"> => buildModel({
+		id, name: id, api: "anthropic-messages", provider, baseUrl, reasoning: true, input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 1_000_000, maxTokens: 128_000, compat,
+	});
+	const messages: Context["messages"] = [{ role: "user", content: `local ${marker}`, timestamp: 1 }];
+	const tools: Context["tools"] = [
+		{ name: "edit", description: "Edit synthetic data", parameters: { type: "object", properties: {} } },
+		{ name: "find", description: "Find synthetic data", parameters: { type: "object", properties: {} }, deferLoading: true },
+	];
+	const events = [
+		{ type: "message_start", message: { id: "msg_synthetic", type: "message", role: "assistant", model: "claude-sonnet-5-5", content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 7, output_tokens: 0, cache_read_input_tokens: 5, cache_creation_input_tokens: 2 } } },
+		{ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+		{ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: `serialized:${marker}` } },
+		{ type: "content_block_stop", index: 0 },
+		{ type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 3 } },
+		{ type: "message_stop" },
+	];
+	const sse = events.map(event => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join("");
+	interface Wire { url: string; headers: Headers; body: Record<string, any>; }
+	const capture = async (model: Model<"anthropic-messages">, options: AnthropicOptions = {}, history = messages, withTools = false, injected = false) => {
+		const requests: Wire[] = [];
+		const modelBefore = structuredClone(model);
+		const historyBefore = structuredClone(history);
+		const syntheticFetch: typeof fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+			const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
+			assert([official, gateway, "https://api.z.ai"].includes(url.origin), "reject unexpected provider destination");
+			assert.equal(url.pathname, model.provider === "zai" ? "/api/anthropic/v1/messages" : "/v1/messages");
+			assert.equal(init?.method, "POST");
+			const rawBody = init?.body;
+			assert(typeof rawBody === "string" || rawBody instanceof Uint8Array, "actual serialized JSON or OAuth-attested UTF-8 bytes");
+			const serializedBody = typeof rawBody === "string" ? rawBody : new TextDecoder("utf-8", { fatal: true }).decode(rawBody);
+			requests.push({ url: url.href, headers: new Headers(init?.headers), body: JSON.parse(serializedBody) });
+			syntheticRequests++;
+			return new Response(sse, { status: 200, headers: { "content-type": "text/event-stream", "request-id": "req_synthetic" } });
+		}) as typeof fetch;
+		const injectedClient = injected ? new AnthropicMessagesClient({ apiKey, baseURL: official, fetch: syntheticFetch }) : undefined;
+		const stream = streamAnthropic(model, { messages: history, ...(withTools ? { tools } : {}) }, {
+			apiKey, thinkingEnabled: true, effort: "high", maxTokens: 512, ...options,
+			fetch: syntheticFetch, ...(injectedClient ? { client: injectedClient } : {}),
+		});
+		const observed: string[] = [];
+		for await (const event of stream) observed.push(event.type);
+		const result = await stream.result();
+		assert.equal(result.stopReason, "stop", result.errorMessage);
+		assert.deepEqual(JSON.parse(JSON.stringify(result.content)), [{ type: "text", text: `serialized:${marker}` }]);
+		assert.equal(result.usage.input, 7); assert.equal(result.usage.output, 3);
+		assert.equal(result.usage.cacheRead, 5); assert.equal(result.usage.cacheWrite, 2); assert.equal(result.usage.totalTokens, 17);
+		assert(observed.includes("text_delta") && observed.includes("done"));
+		assert.equal(requests.length, 1, "one deterministic synthetic request; no retries");
+		assert.deepEqual(model, modelBefore, "compat gating must not mutate shared model");
+		assert.deepEqual(history, historyBefore, "per-call sanitizer must not mutate persisted history");
+		return requests[0]!;
+	};
+	const noWithheldHeader = (request: Wire): void => {
+		const betas = (request.headers.get("anthropic-beta") ?? "").split(",");
+		for (const beta of withheld) assert(!betas.includes(beta), `withheld header ${beta}`);
+	};
+	const record = (id: string, request: Wire, extra: unknown = {}): void => {
+		cases.push({ id, status: "passed", evidence: { url: request.url, body: request.body, beta: request.headers.get("anthropic-beta"), authenticated: Boolean(request.headers.get("authorization") || request.headers.get("x-api-key")), sseText: `serialized:${marker}`, usage: { input: 7, output: 3, cacheRead: 5, cacheWrite: 2, totalTokens: 17 }, extra } });
+	};
+	setEnv("ANTHROPIC_BASE_URL", gateway);
+	const enabled = await capture(makeModel());
+	assert.equal(new URL(enabled.url).origin, gateway);
+	assert.deepEqual(enabled.body.thinking.block_binding, { prefix_mismatch_behavior: "drop_block" });
+	assert(enabled.body.context_management);
+	assert(enabled.headers.get("anthropic-beta")?.includes(binding));
+	assert(enabled.headers.get("anthropic-beta")?.includes(contextBeta));
+	record("enabled-gateway-binding-and-context", enabled);
+	setEnv("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", "1");
+	const disabled = await capture(makeModel(), { betas: [...withheld, customBeta, "interleaved-thinking-2025-05-14", "context-1m-2025-08-07"], taskBudget: { type: "tokens", total: 50000 } }, messages, true);
+	assert.equal(disabled.body.thinking.type, "adaptive");
+	assert.equal(disabled.body.thinking.block_binding, undefined);
+	assert.equal(disabled.body.context_management, undefined);
+	assert.deepEqual(disabled.body.output_config, { effort: "high" });
+	assert(disabled.headers.get("anthropic-beta")?.includes("effort-2025-11-24"));
+	assert(disabled.headers.get("anthropic-beta")?.includes(customBeta));
+	assert(disabled.headers.get("anthropic-beta")?.includes("interleaved-thinking-2025-05-14"));
+	assert(disabled.headers.get("anthropic-beta")?.includes("context-1m-2025-08-07"));
+	for (const tool of disabled.body.tools) { assert.equal(tool.strict, undefined); assert.equal(tool.defer_loading, undefined); assert.equal(tool.eager_input_streaming, undefined); }
+	assert(disabled.body.tools.some((tool: Record<string, unknown>) => tool.name === "edit"));
+	noWithheldHeader(disabled);
+	record("disabled-gateway-tools-budgets-and-unaffected-effort", disabled);
+
+	const overrideModel = makeModel("anthropic", { allowAnthropicHeaderOverrides: true });
+	overrideModel.headers = { "AnThRoPiC-BeTa": `${binding},${customBeta}` };
+	const override = await capture(overrideModel, { apiKey: oauthKey, headers: { "ANTHROPIC-BETA": `${contextBeta},${customBeta}` } });
+	assert.equal(override.headers.get("anthropic-beta"), customBeta);
+	assert.equal(override.headers.get("authorization"), `Bearer ${oauthKey}`);
+	assert.equal(override.headers.get("x-api-key"), null);
+	noWithheldHeader(override);
+	record("mixed-case-oauth-header-override-auth-preserved", override);
+
+	setEnv("ANTHROPIC_BASE_URL", undefined);
+	for (const [provider, admitted] of [["anthropic", false], ["private-provider", true], ["private-provider", false]] as const) {
+		const request = await capture(makeModel(provider, { honorsClaudeCodeBetaKillSwitch: admitted }, gateway));
+		assert.equal(request.body.context_management !== undefined, !admitted);
+		assert.equal(request.headers.get("anthropic-beta")?.includes(contextBeta), !admitted);
+		if (admitted) noWithheldHeader(request);
+		record(`compat-${provider}-${admitted ? "admitted" : "not-admitted"}`, request);
+	}
+	const zai = await capture(makeModel("zai", undefined, "https://api.z.ai/api/anthropic", "glm-4.6"));
+	assert.deepEqual(zai.body.context_management, { edits: [{ type: "clear_thinking_20251015", keep: "all" }] });
+	assert(zai.headers.get("anthropic-beta")?.includes(contextBeta));
+	record("unrelated-provider-keeps-context", zai);
+
+	const injected = await capture(makeModel(), { headers: { "AnThRoPiC-BeTa": `${binding},${contextBeta},${customBeta}` } }, messages, false, true);
+	noWithheldHeader(injected);
+	assert(injected.headers.get("anthropic-beta")?.includes(customBeta));
+	assert(injected.headers.get("anthropic-beta")?.includes("effort-2025-11-24"));
+	record("actual-injected-client-per-request-header-merge", injected);
+
+	const copilot = await capture(makeModel("github-copilot", { honorsClaudeCodeBetaKillSwitch: true }, gateway), {
+		headers: { "AnThRoPiC-BeTa": `${binding},${contextBeta},${customBeta}` },
+	});
+	noWithheldHeader(copilot);
+	assert.equal(copilot.headers.get("anthropic-beta"), customBeta);
+	assert.equal(copilot.headers.get("authorization"), `Bearer ${apiKey}`);
+	record("explicitly-admitted-copilot-caller-header-boundary", copilot);
+
+	let mutationCalls = 0;
+	const mutated = await capture(makeModel(), { onPayload: payload => {
+		mutationCalls++;
+		return {
+			...(payload as object), context_management: { edits: [] }, compaction: { type: "summarize" },
+			thinking: { type: "adaptive", block_binding: { prefix_mismatch_behavior: "error" } },
+			output_config: { effort: "high", task_budget: { type: "tokens", total: 50000 }, format: { type: "json_schema", schema: { type: "object" } } },
+			tools: [{ name: "edit", input_schema: { type: "object" }, strict: true, defer_loading: true, eager_input_streaming: true }],
+			fallbacks: [{ model: "claude-opus-5", thinking: { type: "adaptive", block_binding: {} }, output_config: { effort: "low", task_budget: {}, format: {} } }],
+			messages: [{ role: "user", content: [{ type: "compaction", content: "retained summary", signature: "synthetic" }], output_config: { effort: "low", task_budget: {}, format: {} } }],
+			anthropic_beta: [...withheld, customBeta],
+		};
+	} });
+	assert.equal(mutationCalls, 1);
+	assert.equal(mutated.body.context_management, undefined); assert.equal(mutated.body.compaction, undefined);
+	assert.deepEqual(mutated.body.thinking, { type: "adaptive" });
+	assert.deepEqual(mutated.body.output_config, { effort: "high" });
+	assert.deepEqual(mutated.body.tools, [{ name: "edit", input_schema: { type: "object" } }]);
+	assert.deepEqual(mutated.body.fallbacks, [{ model: "claude-opus-5", thinking: { type: "adaptive" }, output_config: { effort: "low" } }]);
+	assert.deepEqual(mutated.body.messages, [{ role: "user", content: [{ type: "text", text: "retained summary" }], output_config: { effort: "low" } }]);
+	assert.deepEqual(mutated.body.anthropic_beta, [customBeta]);
+	noWithheldHeader(mutated);
+	record("post-payload-top-level-fallback-message-and-body-beta-enforcement", mutated, { mutationCalls });
+
+	const fallbackEntry = { model: "claude-opus-5", thinking: { type: "adaptive" as const, block_binding: { prefix_mismatch_behavior: "drop_block" as const } }, output_config: { effort: "high" as const, task_budget: { type: "tokens" as const, total: 50000 } } };
+	const entryBefore = structuredClone(fallbackEntry);
+	const fallback = await capture(makeModel(), { fallbacks: [fallbackEntry] });
+	assert.deepEqual(fallback.body.fallbacks, [{ model: "claude-opus-5", thinking: { type: "adaptive" }, output_config: { effort: "high" } }]);
+	assert.deepEqual(fallbackEntry, entryBefore, "caller-owned fallback controls remain unchanged");
+	noWithheldHeader(fallback);
+	record("official-fallback-controls-sanitized", fallback);
+
+	const frozen = (betaFields: boolean): AnthropicFallbackCreditHandle => ({
+		token: "fct_synthetic", prefillClaim: false, expiresAt: Date.now() + 60_000,
+		params: { model: "claude-fable-5", stream: true, max_tokens: 512, messages: [{ role: "user", content: "frozen refused request" }], thinking: { type: "adaptive", ...(betaFields ? { block_binding: { prefix_mismatch_behavior: "drop_block" } } : {}) }, output_config: { effort: "high" }, fallbacks: [fallbackEntry] },
+		betas: [binding, contextBeta], betaHeader: `${binding},${contextBeta},${customBeta},server-side-fallback-2026-06-01`,
+	});
+	const forfeiture = frozen(true), forfeitureBefore = structuredClone(forfeiture);
+	const fresh = await capture(makeModel(), { fallbackCreditRedemption: forfeiture });
+	assert.equal(fresh.body.fallback_credit_token, undefined);
+	assert(JSON.stringify(fresh.body.messages).includes(marker));
+	assert(fresh.headers.get("anthropic-beta")?.includes("effort-2025-11-24"));
+	assert.deepEqual(forfeiture, forfeitureBefore);
+	noWithheldHeader(fresh);
+	record("frozen-beta-redemption-forfeited-fresh-betas-retained", fresh);
+
+	const safeFrozen = frozen(false), safeBefore = structuredClone(safeFrozen);
+	const redeemed = await capture(makeModel(), { fallbackCreditRedemption: safeFrozen, onPayload: payload => {
+		const admitted = payload as Record<string, any>;
+		assert.equal(admitted.fallback_credit_token, "fct_synthetic");
+		assert.equal(admitted.messages[0].content, "frozen refused request");
+	} });
+	assert.equal(redeemed.body.fallback_credit_token, "fct_synthetic");
+	assert.equal(redeemed.body.fallbacks, undefined);
+	assert.equal(redeemed.body.messages[0].content, "frozen refused request");
+	assert(redeemed.headers.get("anthropic-beta")?.includes("fallback-credit-2026-06-01"));
+	assert(redeemed.headers.get("anthropic-beta")?.includes(customBeta));
+	assert(!redeemed.headers.get("anthropic-beta")?.includes("server-side-fallback-"));
+	assert.deepEqual(safeFrozen, safeBefore);
+	noWithheldHeader(redeemed);
+	const beforeMutation = syntheticRequests;
+	const mutationDenied = await streamAnthropic(makeModel(), { messages }, {
+		apiKey, fallbackCreditRedemption: safeFrozen,
+		onPayload: payload => {
+			(payload as { messages: { content: unknown }[] }).messages[0].content = "rewritten frozen request";
+		},
+		fetch: (async () => { syntheticRequests++; throw new Error("mutated frozen replay reached transport"); }) as typeof fetch,
+	}).result();
+	assert.equal(mutationDenied.stopReason, "error");
+	assert.equal(syntheticRequests, beforeMutation);
+	assert.deepEqual(safeFrozen, safeBefore, "rejected admission must not mutate the saved credit");
+	record("safe-redemption-replays-frozen-body-drops-fallbacks-and-withheld-header", redeemed, { replayMutationRejected: true });
+
+	const beforeBlocked = syntheticRequests;
+	const blockedHandle = frozen(true);
+	blockedHandle.refusedContent = [{ type: "anthropicServerTool", block: { type: "server_tool_use", id: "srv_synthetic", name: "web_search", input: {} } }];
+	const blocked = await streamAnthropic(makeModel(), { messages }, { apiKey, fallbackCreditRedemption: blockedHandle, fetch: (async () => { throw new Error("server-tool forfeiture must not reach fetch"); }) as typeof fetch }).result();
+	assert.equal(blocked.stopReason, "error"); assert.match(blocked.errorMessage ?? "", /ran server tools/);
+	assert.equal(syntheticRequests, beforeBlocked);
+	cases.push({ id: "server-tool-redemption-refuses-before-request", status: "passed", evidence: { error: blocked.errorMessage, syntheticRequestsAdded: syntheticRequests - beforeBlocked } });
+
+	setEnv("ANTHROPIC_BASE_URL", gateway);
+	const unsupported = await capture(makeModel(), { fallbacks: [fallbackEntry], fallbackCreditRedemption: blockedHandle });
+	assert.equal(unsupported.body.fallbacks, undefined);
+	assert.equal(unsupported.body.fallback_credit_token, undefined);
+	assert(!unsupported.headers.get("anthropic-beta")?.includes("server-side-fallback-"));
+	record("gateway-ignores-unsupported-fallbacks-and-credit", unsupported);
+
+	setEnv("ANTHROPIC_BASE_URL", undefined);
+	setEnv("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", undefined);
+	const compactEnabled = await capture(makeModel("anthropic", undefined, official, "claude-fable-5"), { anthropicCompaction: { instructions: "Summarize synthetic data" } });
+	assert.deepEqual(compactEnabled.body.compaction, { type: "summarize", instructions: "Summarize synthetic data" });
+	assert(compactEnabled.headers.get("anthropic-beta")?.includes("compact-2026-09-04"));
+	record("server-compaction-enabled", compactEnabled);
+	setEnv("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", "1");
+	const compactDisabled = await capture(makeModel("anthropic", undefined, official, "claude-fable-5"), { anthropicCompaction: { instructions: "Summarize synthetic data" } });
+	assert.equal(compactDisabled.body.compaction, undefined);
+	noWithheldHeader(compactDisabled);
+	record("server-compaction-disabled", compactDisabled);
+	const legacyMessages: Context["messages"] = [{ role: "user", content: "<summary>synthetic retained summary</summary>", timestamp: 1, providerPayload: { type: "anthropicCompaction", provider: "anthropic", content: "synthetic retained summary", exactTail: true, encryptedContent: "synthetic_encrypted_summary" } }, ...messages];
+	const legacy = await capture(makeModel("anthropic", undefined, official, "claude-fable-5"), {}, legacyMessages);
+	assert(JSON.stringify(legacy.body.messages).includes("<summary>"));
+	assert(!JSON.stringify(legacy.body.messages).includes("synthetic_encrypted_summary"));
+	assert.equal(legacy.body.context_management, undefined);
+	noWithheldHeader(legacy);
+	record("legacy-compaction-readable-summary-no-encrypted-beta", legacy);
+	assert.equal(deniedExternalRequests, 1, "only the deliberate boundary check used global fetch");
+	passed = true;
+} catch (error) { failure = error; }
+finally {
+	globalThis.fetch = originalFetch;
+	for (const [key, value] of savedEnv) {
+		if (value.process === undefined) delete process.env[key]; else process.env[key] = value.process;
+		if (value.bun === undefined) delete Bun.env[key]; else Bun.env[key] = value.bun;
+	}
+	try {
+		assert.equal(await fs.readFile(path.join(fixture, ".owner"), "utf8"), marker);
+		await fs.rm(fixture, { recursive: true });
+		fixtureRootRemoved = !(await fs.stat(fixture).then(() => true, error => { if (error.code === "ENOENT") return false; throw error; }));
+		assert(fixtureRootRemoved);
+		assert.equal(globalThis.fetch, originalFetch);
+		cleanupVerified = true;
+	} catch (error) { failure ??= error; passed = false; }
+}
+console.log(JSON.stringify({ schema: "CoreforgeFrozen19DomainProof", domain: "provider-beta", sourceVariant: "proposed-inherited-corrections", complete: passed && cleanupVerified && cases.length === 18, passed: passed && cleanupVerified, mode: compiled ? "compiled" : "source", version, sourceDigest: manifest.sourceDigest, nativeSha256, cases, cleanupVerified, fixtureRootRemoved, syntheticRequests, deniedExternalRequests, paidRequests: 0, ...(failure ? { failure: failure instanceof Error ? failure.stack : String(failure) } : {}) }));
+if (failure) throw failure;
