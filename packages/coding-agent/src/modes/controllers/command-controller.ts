@@ -1462,11 +1462,10 @@ export class CommandController {
 		}
 		this.ctx.statusContainer.disposeChildren();
 
-		// After a `/fork`, the current session ID is changed to the forked one,
-		// so the session ID before the fork is the one we want to show in the hint.
 		const outgoingSessionId = this.ctx.sessionManager.getSessionId();
-		const previousSessionId = this.ctx.sessionManager.isSessionOnDisk() ? outgoingSessionId : undefined;
-		const previousSessionDir = this.ctx.sessionManager.getSessionDir();
+		const previousSessionFile = this.ctx.sessionManager.isSessionOnDisk()
+			? this.ctx.sessionManager.getSessionFile()
+			: undefined;
 
 		const success = await this.ctx.session.fork();
 		if (!success) {
@@ -1483,8 +1482,8 @@ export class CommandController {
 			new Text(
 				theme.fg(
 					"accent",
-					previousSessionId
-						? `${theme.status.success} Session forked · return to original: ${resumeCommand(previousSessionId, previousSessionDir)} or /resume ${previousSessionId}`
+					previousSessionFile
+						? `${theme.status.success} Session forked · return to original: ${resumeCommand(previousSessionFile)}`
 						: `${theme.status.success} Session forked`,
 				),
 				1,

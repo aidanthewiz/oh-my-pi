@@ -22,6 +22,7 @@ function fixture() {
 	roots.push(root);
 	const custom = join(root, "sessions ' $HOME $(touch injected) & spaces");
 	const fallback = join(root, "default-sessions");
+	const sessionFile = join(custom, `2026-01-01T00-00-00-000Z_${sessionId}.jsonl`);
 	mkdirSync(custom);
 	mkdirSync(fallback);
 	for (const [directory, checkpoint] of [
@@ -44,14 +45,14 @@ import { join } from "node:path";
 const args = process.argv.slice(2);
 const value = name => { const index = args.indexOf(name); return index < 0 ? undefined : args[index + 1]; };
 const directory = value("--session-dir") ?? process.env.DEFAULT_SESSION_DIR;
-const id = value("--resume");
-const filename = fs.readdirSync(directory).find(name => name.endsWith("_" + id + ".jsonl"));
-if (!filename) process.exit(7);
-const rows = fs.readFileSync(join(directory, filename), "utf8").split("\\n").map(JSON.parse);
+const selector = value("--resume");
+const filename = selector?.endsWith(".jsonl") ? selector
+	: join(directory, fs.readdirSync(directory).find(name => name.endsWith("_" + selector + ".jsonl")) ?? "");
+const rows = fs.readFileSync(filename, "utf8").split("\\n").map(JSON.parse);
 console.log(JSON.stringify({ id: rows[0].id, checkpoint: rows[1].data.checkpoint, profile: value("--profile") ?? null }));
 `,
 	);
-	return { root, custom, fallback, driver };
+	return { root, sessionFile, fallback, driver };
 }
 
 describe("runnable resume commands", () => {
@@ -60,10 +61,10 @@ describe("runnable resume commands", () => {
 			`opens the retained custom-directory checkpoint${profile ? " with its profile" : ""}`,
 			async () => {
 				setProfile(profile);
-				const { root, custom, fallback, driver } = fixture();
+				const { root, sessionFile, fallback, driver } = fixture();
 				const executable = join(root, CF_COMMAND);
 				writeFileSync(executable, `#!/usr/bin/env bun\nimport ${JSON.stringify(driver)};\n`, { mode: 0o700 });
-				const child = Bun.spawn([posixShell!, "-c", resumeCommand(sessionId, custom, "linux")], {
+				const child = Bun.spawn([posixShell!, "-c", resumeCommand(sessionFile, "linux")], {
 					cwd: root,
 					env: {
 						PATH: [root, dirname(process.execPath), "/usr/bin", "/bin"].join(delimiter),
@@ -88,10 +89,10 @@ describe("runnable resume commands", () => {
 		"preserves literal custom directories through PowerShell without executing their contents",
 		async () => {
 			setProfile("personal");
-			const { root, custom, fallback, driver } = fixture();
+			const { root, sessionFile, fallback, driver } = fixture();
 			const runtime = `'${process.execPath.replace(/'/g, "''")}'`;
 			const script = `'${driver.replace(/'/g, "''")}'`;
-			const command = `function ${CF_COMMAND} { & ${runtime} ${script} @args }; ${resumeCommand(sessionId, custom, "win32")}`;
+			const command = `function ${CF_COMMAND} { & ${runtime} ${script} @args }; ${resumeCommand(sessionFile, "win32")}`;
 			const child = Bun.spawn([powerShell!, "-NoProfile", "-NonInteractive", "-Command", command], {
 				cwd: root,
 				env: { ...process.env, DEFAULT_SESSION_DIR: fallback },

@@ -502,22 +502,39 @@ describe("createSessionManager — cross-project --resume relocation (moved work
 });
 
 describe("generated resume hints — explicit custom session directory", () => {
-	it.skipIf(process.platform === "win32")(
-		"opens the original retained conversation from another launch directory",
-		async () => {
+	for (const scenario of ["custom directory", "different future directory", "unavailable recorded project"]) {
+		it.skipIf(process.platform === "win32")(`opens the retained journal with ${scenario}`, async () => {
 			if (!agentDirRoot) throw new Error("Expected isolated agent directory");
 			const project = path.join(agentDirRoot, "project");
 			const launch = path.join(agentDirRoot, "another-launch-directory");
 			const sessionDir = path.join(agentDirRoot, "custom ' $HOME $(touch injected) sessions");
 			await fsp.mkdir(project);
 			await fsp.mkdir(launch);
+			setProjectDir(launch);
 			const original = SessionManager.create(project, sessionDir);
 			original.appendMessage({ role: "user", content: "retained checkpoint", timestamp: 1 });
+			await original.ensureOnDisk();
 			await original.flush();
 			const sessionId = original.getSessionId();
 			const sessionFile = original.getSessionFile();
-			const hint = resumeCommand(sessionId, original.getSessionDir());
 			await original.close();
+			if (!sessionFile) throw new Error("Expected persisted journal");
+			if (scenario === "unavailable recorded project") await fsp.rmdir(project);
+			const opened = await SessionManager.open(
+				sessionFile,
+				scenario === "different future directory" ? path.join(agentDirRoot, "future-sessions") : undefined,
+				undefined,
+				{ initialCwd: launch },
+			);
+			let hint: string;
+			try {
+				if (scenario !== "custom directory") expect(opened.getSessionDir()).not.toBe(sessionDir);
+				const currentFile = opened.getSessionFile();
+				if (!currentFile) throw new Error("Expected original journal");
+				hint = resumeCommand(currentFile);
+			} finally {
+				await opened.close();
+			}
 			const shell = Bun.spawn(["/bin/sh", "-c", `set -- ${hint}; printf '%s\\000' "$@"`], {
 				cwd: launch,
 				env: { PATH: "/usr/bin:/bin" },
@@ -537,7 +554,9 @@ describe("generated resume hints — explicit custom session directory", () => {
 				expect(resumed.getSessionId()).toBe(sessionId);
 				expect(resumed.getSessionFile()).toBe(sessionFile);
 				expect(resumed.getSessionDir()).toBe(sessionDir);
-				expect(resumed.getCwd()).toBe(project);
+				expect(await fsp.realpath(resumed.getCwd())).toBe(
+					await fsp.realpath(scenario === "unavailable recorded project" ? launch : project),
+				);
 				expect(
 					resumed
 						.getEntries()
@@ -552,6 +571,6 @@ describe("generated resume hints — explicit custom session directory", () => {
 			} finally {
 				await resumed.close();
 			}
-		},
-	);
+		});
+	}
 });

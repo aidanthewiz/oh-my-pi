@@ -8110,15 +8110,12 @@ export class InteractiveMode implements InteractiveModeContext {
 			process.stderr.write(`${chalk.yellow(message)}\n`);
 		}
 
-		// Print resumption hint only if the session was actually materialized to
-		// durable storage — `--resume <id>` fails on a never-written file (see
-		// #resumableSessionId).
-		const sessionId = this.#resumableSessionId();
-		if (sessionId) {
+		// Persistence is lazy; an allocated journal path may not exist on disk.
+		const sessionId = this.sessionManager.getSessionId();
+		const sessionFile = this.sessionManager.getSessionFile();
+		if (sessionId && sessionFile && this.sessionManager.isSessionOnDisk()) {
 			// Command on its own line so triple-click selects just the command (#11001).
-			process.stderr.write(
-				`\n${chalk.dim("Resume this session with")}\n${chalk.dim(resumeCommand(sessionId, this.sessionManager.getSessionDir()))}\n`,
-			);
+			process.stderr.write(`\n${chalk.dim("Resume this session with")}\n${chalk.dim(resumeCommand(sessionFile))}\n`);
 		}
 
 		await this.#quitHostOwned(0);
@@ -8250,19 +8247,6 @@ export class InteractiveMode implements InteractiveModeContext {
 			process.stderr.write(`${chalk.red(`Restart spawn failed: ${err instanceof Error ? err.message : err}`)}\n`);
 			await postmortem.quit(1);
 		}
-	}
-
-	/**
-	 * Session id when the session was actually materialized to durable storage —
-	 * the only case `--resume <id>` can load. Persistence is lazy: a session that
-	 * exits before its first assistant message (or dies early to an auth error, a
-	 * mid-flight Ctrl+C, or a launch-then-quit) never wrote its JSONL, so the path
-	 * is allocated but the file does not exist (issue #8860).
-	 */
-	#resumableSessionId(): string | undefined {
-		const sessionId = this.sessionManager.getSessionId();
-		const sessionFile = this.sessionManager.getSessionFile();
-		return sessionId && sessionFile && this.sessionManager.isSessionOnDisk() ? sessionId : undefined;
 	}
 
 	/**
