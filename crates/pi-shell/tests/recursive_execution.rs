@@ -73,7 +73,7 @@ async fn dropping_suspended_recursion_releases_owned_pipe_descriptors() {
 	use std::io::{BufRead, Read};
 
 	use brush_core::{ProfileLoadBehavior, RcLoadBehavior, Shell, SourceInfo, openfiles::OpenFiles};
-	use pi_builtins::{BuiltinSet, default_builtins, utility_builtins};
+	use pi_builtins::{BuiltinSet, default_builtins, process_builtins, utility_builtins};
 
 	let mut shell = Shell::builder()
 		.do_not_inherit_env(true)
@@ -83,7 +83,7 @@ async fn dropping_suspended_recursion_releases_owned_pipe_descriptors() {
 		.build()
 		.await
 		.expect("shell");
-	for (name, builtin) in utility_builtins() {
+	for (name, builtin) in process_builtins().into_iter().chain(utility_builtins()) {
 		shell.register_builtin(name, builtin);
 	}
 	let (reader, writer) = std::io::pipe().expect("output pipe");
