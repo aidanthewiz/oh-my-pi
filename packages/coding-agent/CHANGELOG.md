@@ -11,6 +11,7 @@
 - Native AWS approvals offer **Allow for the rest of this session** for later commands, profiles, and SSO renewal without saving a configuration grant.
 - Keep job widgets local by default. Remote spec authoring requires managed or runtime consent, current model and account admission, bounded redacted context, and originating-journal accounting.
 - Expose session-bound native MCP calls to extensions. Honor `exposeTools: false` without disabling server startup or discovery.
+- Select the JavaScript debug adapter's executable with `JS_DEBUG_NODE` independently of the target runtime, and reject invalid paths without fallback.
 
 ### Fixed
 
