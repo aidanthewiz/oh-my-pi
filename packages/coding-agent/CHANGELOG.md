@@ -15,6 +15,7 @@
 ### Fixed
 
 - Preserve the exact durable journal and its parent directory in shutdown, fork-return and fatal-recovery commands. Quote paths for POSIX shells and PowerShell, including sessions opened with a different future-session directory.
+- Separate MCP fixture startup from request deadlines. Make connected-browser viewport qualification deterministic and preserve navigation failures during cleanup.
 - Serialize and atomically publish shared ACP handle mappings. Fork unloaded handles from their continued conversation instead of the original transcript.
 - Keep language-server configuration non-executing. Start package-less native TypeScript only through the managed client lifecycle.
 - Preserve live or mounted task-isolation data when teardown fails, isolation is replaced, or `worktree clear --all` runs. Retain workspaces when mount safety cannot be verified.

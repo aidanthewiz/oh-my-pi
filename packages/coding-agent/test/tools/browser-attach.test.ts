@@ -619,7 +619,7 @@ describe("pickElectronTarget", () => {
 	);
 
 	test.skipIf(!CHROMIUM_AVAILABLE)(
-		"reports a connected browser's own viewport on open and observe",
+		"reports the connected browser's current viewport on open and after an external resize",
 		async () => {
 			const exe = await ensureChromiumExecutable();
 			if (!exe) throw new Error("Expected a Chromium executable");
@@ -632,8 +632,6 @@ describe("pickElectronTarget", () => {
 					"--no-sandbox",
 					"--no-first-run",
 					"--use-mock-keychain",
-					"--window-size=900,700",
-					"--force-device-scale-factor=2",
 					`--user-data-dir=${root}`,
 					`--remote-debugging-port=${port}`,
 				],
@@ -644,14 +642,29 @@ describe("pickElectronTarget", () => {
 			const invoke = (parameters: unknown) =>
 				prelude.invoke(parameters, { session, toolCallId: "connected-viewport" });
 			const name = `connected-viewport-${crypto.randomUUID()}`;
+			let browser: Browser | undefined;
+			let opened = false;
 			try {
-				await waitForCdp(`http://127.0.0.1:${port}`, 15_000);
-				const opened = await invoke({
+				const cdpUrl = `http://127.0.0.1:${port}`;
+				await waitForCdp(cdpUrl, 15_000);
+				const puppeteer = await loadPuppeteer();
+				browser = await puppeteer.connect({ browserURL: cdpUrl, defaultViewport: null });
+				const target = await browser.waitForTarget(target => target.type() === "page");
+				const page = await target.page();
+				if (!page) throw new Error("Expected the connected browser's page");
+				await page.goto("data:text/html,<title>Viewport</title>");
+				const initialViewport = { width: 900, height: 700, deviceScaleFactor: 2 };
+				await page.setViewport(initialViewport);
+				const opening = await invoke({
 					action: "open",
 					name,
-					url: "data:text/html,<title>Viewport</title>",
-					app: { cdp_url: `http://127.0.0.1:${port}` },
+					app: { cdp_url: cdpUrl, target: "Viewport" },
 				});
+				opened = true;
+				expect(opening.details).toMatchObject({ viewport: initialViewport });
+
+				const resizedViewport = { width: 1100, height: 800, deviceScaleFactor: 2 };
+				await page.setViewport(resizedViewport);
 				const result = await invoke({
 					action: "run",
 					name,
@@ -665,16 +678,21 @@ describe("pickElectronTarget", () => {
 					throw new Error("run returned no value");
 				// `run` details carry the cell's return value untyped.
 				const { observed, window } = details.value as { observed: unknown; window: unknown };
-				// The window's chrome eats into --window-size differently per OS, so pin only the forced
-				// pixel ratio; it differs from DEFAULT_VIEWPORT's 1.25, which main reported here.
-				expect(window).toMatchObject({ deviceScaleFactor: 2 });
-				expect(observed).toEqual(window);
-				expect(opened.details).toMatchObject({ viewport: window });
+				expect(window).toEqual(resizedViewport);
+				expect(observed).toEqual(resizedViewport);
+				expect(opening.details).toMatchObject({ viewport: initialViewport });
 			} finally {
-				await invoke({ action: "close", name }).catch(() => {});
-				child.kill();
-				await child.exited;
-				await fs.rm(root, { recursive: true, force: true });
+				try {
+					if (opened) await invoke({ action: "close", name });
+				} finally {
+					try {
+						await browser?.disconnect();
+					} finally {
+						child.kill();
+						await child.exited;
+						await fs.rm(root, { recursive: true, force: true });
+					}
+				}
 			}
 		},
 		30_000,
