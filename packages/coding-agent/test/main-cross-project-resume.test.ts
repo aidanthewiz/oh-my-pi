@@ -22,6 +22,7 @@ import type { SessionInfo } from "@oh-my-pi/pi-coding-agent/session/session-list
 import * as sessionListingModule from "@oh-my-pi/pi-coding-agent/session/session-listing";
 import { loadEntriesFromFile } from "@oh-my-pi/pi-coding-agent/session/session-loader";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { resumeCommand } from "@oh-my-pi/pi-coding-agent/utils/resume-command";
 import {
 	__resetDirsFromEnvForTests,
 	getProjectDir,
@@ -33,6 +34,7 @@ import {
 const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
 const originalPiProfile = process.env.PI_PROFILE;
 const originalOmpProfile = process.env.OMP_PROFILE;
+const originalProjectDir = getProjectDir();
 let agentDirRoot: string | undefined;
 
 function restoreEnv(key: string, value: string | undefined): void {
@@ -49,6 +51,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+	setProjectDir(originalProjectDir);
 	// `runRootCommand` registers the CLI's extension roots (`--no-extensions` → explicit-only) process-wide.
 	clearOmpExtensionCliRoots();
 	restoreEnv("PI_CODING_AGENT_DIR", originalAgentDir);
@@ -251,11 +254,6 @@ describe("runRootCommand — cross-project --resume", () => {
 		const match = buildGlobalMatch(resumedProject);
 		vi.spyOn(sessionListingModule, "resolveResumableSession").mockResolvedValue(match);
 		const settings = Settings.isolated({ "marketplace.autoUpdate": "off" });
-		const reloadForCwd = vi.spyOn(settings, "reloadForCwd");
-		const preloadedCwds: (string | undefined)[] = [];
-		vi.spyOn(pluginHelpers, "preloadPluginRoots").mockImplementation(async (_home, cwd) => {
-			preloadedCwds.push(cwd);
-		});
 		const realAccess = fs.promises.access.bind(fs.promises);
 		let deniedProbes = 2;
 		const access = vi.spyOn(fs.promises, "access").mockImplementation(async (target, mode) => {
@@ -275,8 +273,7 @@ describe("runRootCommand — cross-project --resume", () => {
 		parsed.noLsp = true;
 		let resumedManager: SessionManager | undefined;
 
-		let preloadedDestinationAtCreation = false;
-		let sessionOptionsCwd: string | undefined;
+		let settingsCwdAtCreation: string | undefined;
 
 		try {
 			await runRootCommand(parsed, rawArgs, {
@@ -285,10 +282,7 @@ describe("runRootCommand — cross-project --resume", () => {
 				createAgentSession: async options => {
 					if (!options) throw new Error("Expected session options");
 					resumedManager = options.sessionManager;
-					sessionOptionsCwd = options.cwd;
-					// Awaited during the switch, so by session creation the destination
-					// preload has already been requested for the resumed project.
-					preloadedDestinationAtCreation = preloadedCwds.includes(resumedProject);
+					settingsCwdAtCreation = settings.getCwd();
 					throw new Error("stop after session options");
 				},
 			});
@@ -300,16 +294,13 @@ describe("runRootCommand — cross-project --resume", () => {
 			await resumedManager?.close();
 		}
 		expect(deniedProbes).toBe(0);
+		if (!resumedManager) throw new Error("Expected resumed session manager");
 
-		expect(getProjectDir()).toBe(resumedProject);
-		// process.cwd() reports the physical path (/private/var/... on macOS) while
-		// the fixture path keeps the /var symlink form — compare canonicalized.
-		expect(normalizePathForComparison(process.cwd())).toBe(normalizePathForComparison(resumedProject));
-		expect(reloadForCwd).toHaveBeenCalledWith(resumedProject);
-		expect(resumedManager?.getCwd()).toBe(resumedProject);
-		expect(parsed.cwd).toBe(resumedProject);
-		expect(sessionOptionsCwd).toBe(resumedProject);
-		expect(preloadedDestinationAtCreation).toBe(true);
+		expect(await fsp.realpath(getProjectDir())).toBe(await fsp.realpath(resumedProject));
+		expect(await fsp.realpath(process.cwd())).toBe(await fsp.realpath(resumedProject));
+		expect(await fsp.realpath(resumedManager.getCwd())).toBe(await fsp.realpath(resumedProject));
+		if (!settingsCwdAtCreation) throw new Error("Expected session settings directory");
+		expect(await fsp.realpath(settingsCwdAtCreation)).toBe(await fsp.realpath(resumedProject));
 	}, 15_000);
 
 	it("re-scopes Settings back to the launch project when destination rescope fails", async () => {
@@ -352,9 +343,10 @@ describe("runRootCommand — cross-project --resume", () => {
 		// The destination read rejected, so the fallback must re-scope Settings
 		// back to the launch project; otherwise path-derived values and saves
 		// would still target the failed resume target.
-		expect(getProjectDir()).toBe(launchProject);
-		expect(resumedManager?.getCwd()).toBe(launchProject);
-		expect(settings.getCwd()).toBe(launchProject);
+		if (!resumedManager) throw new Error("Expected resumed session manager");
+		expect(await fsp.realpath(getProjectDir())).toBe(await fsp.realpath(launchProject));
+		expect(await fsp.realpath(resumedManager.getCwd())).toBe(await fsp.realpath(launchProject));
+		expect(await fsp.realpath(settings.getCwd())).toBe(await fsp.realpath(launchProject));
 	});
 
 	it("rolls back the session manager when the resumed cwd is denied", async () => {
@@ -395,8 +387,9 @@ describe("runRootCommand — cross-project --resume", () => {
 			await resumedManager?.close();
 		}
 
-		expect(getProjectDir()).toBe(launchProject);
-		expect(resumedManager?.getCwd()).toBe(launchProject);
+		if (!resumedManager) throw new Error("Expected resumed session manager");
+		expect(await fsp.realpath(getProjectDir())).toBe(await fsp.realpath(launchProject));
+		expect(await fsp.realpath(resumedManager.getCwd())).toBe(await fsp.realpath(launchProject));
 	});
 });
 
@@ -498,4 +491,78 @@ describe("createSessionManager — cross-project --resume relocation (moved work
 		}
 		expect(movePrompt).toHaveBeenCalledTimes(1);
 	});
+});
+
+describe("generated resume hints — explicit custom session directory", () => {
+	for (const scenario of ["custom directory", "different future directory", "unavailable recorded project"]) {
+		it.skipIf(process.platform === "win32")(`opens the retained journal with ${scenario}`, async () => {
+			if (!agentDirRoot) throw new Error("Expected isolated agent directory");
+			const project = path.join(agentDirRoot, "project");
+			const launch = path.join(agentDirRoot, "another-launch-directory");
+			const sessionDir = path.join(agentDirRoot, "custom ' $HOME $(touch injected) sessions");
+			await fsp.mkdir(project);
+			await fsp.mkdir(launch);
+			setProjectDir(launch);
+			const original = SessionManager.create(project, sessionDir);
+			original.appendMessage({ role: "user", content: "retained checkpoint", timestamp: 1 });
+			await original.ensureOnDisk();
+			await original.flush();
+			const sessionId = original.getSessionId();
+			const sessionFile = original.getSessionFile();
+			await original.close();
+			if (!sessionFile) throw new Error("Expected persisted journal");
+			if (scenario === "unavailable recorded project") await fsp.rmdir(project);
+			const opened = await SessionManager.open(
+				sessionFile,
+				scenario === "different future directory" ? path.join(agentDirRoot, "future-sessions") : undefined,
+				undefined,
+				{ initialCwd: launch },
+			);
+			let hint: string;
+			try {
+				if (scenario !== "custom directory") expect(opened.getSessionDir()).not.toBe(sessionDir);
+				const currentFile = opened.getSessionFile();
+				if (!currentFile) throw new Error("Expected original journal");
+				hint = resumeCommand(currentFile);
+			} finally {
+				await opened.close();
+			}
+			const shell = Bun.spawn(["/bin/sh", "-c", `set -- ${hint}; printf '%s\\000' "$@"`], {
+				cwd: launch,
+				env: { PATH: "/usr/bin:/bin" },
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			const output = await new Response(shell.stdout).text();
+			expect(await shell.exited).toBe(0);
+			const args = parseArgs(output.split("\0").slice(1, -1));
+			const resumed = await createSessionManager(
+				args,
+				launch,
+				Settings.isolated({ "marketplace.autoUpdate": "off" }),
+			);
+			if (!resumed) throw new Error("Expected the original session manager");
+			try {
+				expect(resumed.getSessionId()).toBe(sessionId);
+				expect(resumed.getSessionFile()).toBe(sessionFile);
+				expect(resumed.getSessionDir()).toBe(sessionDir);
+				expect(await fsp.realpath(resumed.getCwd())).toBe(
+					await fsp.realpath(scenario === "unavailable recorded project" ? launch : project),
+				);
+				expect(
+					resumed
+						.getEntries()
+						.some(
+							entry =>
+								entry.type === "message" &&
+								entry.message.role === "user" &&
+								entry.message.content === "retained checkpoint",
+						),
+				).toBe(true);
+				expect(fs.existsSync(path.join(launch, "injected"))).toBe(false);
+			} finally {
+				await resumed.close();
+			}
+		});
+	}
 });

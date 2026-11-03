@@ -2652,12 +2652,13 @@ export class AgentSession implements SettingsScope {
 		});
 		this.#cancelFatalRecoveryHint = postmortem.registerFatalRecoveryHint(() => {
 			const sessionId = this.sessionManager.getSessionId();
+			const sessionFile = this.sessionManager.getSessionFile();
 			// `--resume <id>` fails on a session that never reached disk (issue #8860), or whose
 			// first remote write the exit aborts before the store confirms it.
-			if (!sessionId || !this.sessionManager.isSessionConfirmedOnDisk()) return undefined;
+			if (!sessionId || !sessionFile || !this.sessionManager.isSessionConfirmedOnDisk()) return undefined;
 			return {
 				label: this.#agentId ?? (this.#agentKind === "main" ? "Main" : "Agent"),
-				command: resumeCommand(sessionId),
+				command: resumeCommand(sessionFile),
 			};
 		});
 
