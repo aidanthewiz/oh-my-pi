@@ -143,12 +143,13 @@ jobs:
   cache_restore:
     needs: prepare
     if: vars.CI_CACHE_ENABLED == 'true' && needs.prepare.outputs.should_release == 'true'
-    uses: Coreforce-CAD/oh-my-pi/.github/workflows/cf-cache-read.yml@9dc313bdc0cbcd04aeacb6ede57738668b8ed325
+    uses: Coreforce-CAD/oh-my-pi/.github/workflows/cf-cache-read.yml@d4088c9fcf2f06974b1d6023e2676b45a677164b
     with:
       enabled: true
       slots: '["darwin-arm64-xcode-27","darwin-x64-macos-15-intel","linux-x64-ubuntu-22.04","linux-arm64-ubuntu-24.04-arm","linux-musl-x64-ubuntu-22.04","linux-musl-arm64-ubuntu-24.04-arm","win32-x64-ubuntu-24.04"]'
     permissions:
       contents: read
+      actions: read
       id-token: write
 
   build:
@@ -489,8 +490,8 @@ jobs:
 
   cache_publish:
     needs: [prepare, build, release, verify_release]
-    if: vars.CI_CACHE_ENABLED == 'true' && needs.build.result == 'success' && needs.release.result == 'success' && needs.verify_release.result == 'success'
-    uses: Coreforce-CAD/oh-my-pi/.github/workflows/cf-cache-write.yml@9dc313bdc0cbcd04aeacb6ede57738668b8ed325
+    if: ${{ !cancelled() && vars.CI_CACHE_ENABLED == 'true' && needs.prepare.result == 'success' && needs.build.result == 'success' && needs.release.result == 'success' && needs.verify_release.result == 'success' }}
+    uses: Coreforce-CAD/oh-my-pi/.github/workflows/cf-cache-write.yml@d4088c9fcf2f06974b1d6023e2676b45a677164b
     with:
       enabled: true
       source-sha: ${{ needs.prepare.outputs.release_sha }}
@@ -505,7 +506,7 @@ jobs:
     permissions:
       contents: write
     needs: [prepare, build]
-    if: needs.prepare.outputs.should_release == 'true'
+    if: ${{ !cancelled() && needs.prepare.result == 'success' && needs.prepare.outputs.should_release == 'true' && needs.build.result == 'success' }}
     concurrency:
       group: cf-release-publish
       cancel-in-progress: false
@@ -585,7 +586,7 @@ jobs:
 
   verify_release:
     needs: [prepare, release]
-    if: needs.prepare.outputs.should_release == 'true'
+    if: ${{ !cancelled() && needs.prepare.result == 'success' && needs.prepare.outputs.should_release == 'true' && needs.release.result == 'success' }}
     env:
       RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
       MACOS_SIGNING: ${{ secrets.APPLE_CERTIFICATE_P12 != '' && secrets.APPLE_CERTIFICATE_PASSWORD != '' && secrets.APPLE_API_KEY_ID != '' && secrets.APPLE_API_ISSUER_ID != '' && secrets.APPLE_API_KEY != '' }}

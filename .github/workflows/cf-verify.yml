@@ -51,7 +51,7 @@ jobs:
       - name: Verify selective LLVM extraction
         run: python3 -m unittest discover -s bazel/toolchains -p test_extract_llvm.py
       - name: Verify durable cache boundaries
-        run: python3 -m unittest discover -s scripts -p test_ci_cache.py
+        run: python3 -m unittest discover -s scripts -p 'test_ci_cache*.py'
       - name: Select native verification source
         id: native
         env:
@@ -76,12 +76,13 @@ jobs:
   cache_restore:
     needs: prepare
     if: vars.CI_CACHE_ENABLED == 'true' && needs.prepare.outputs.native_changed == 'true'
-    uses: Coreforce-CAD/oh-my-pi/.github/workflows/cf-cache-read.yml@9dc313bdc0cbcd04aeacb6ede57738668b8ed325
+    uses: Coreforce-CAD/oh-my-pi/.github/workflows/cf-cache-read.yml@d4088c9fcf2f06974b1d6023e2676b45a677164b
     with:
       enabled: true
       slots: '["darwin-arm64-xcode-27","darwin-x64-macos-15-intel","linux-x64-ubuntu-22.04","linux-arm64-ubuntu-24.04-arm","linux-musl-x64-ubuntu-22.04","linux-musl-arm64-ubuntu-24.04-arm","win32-x64-ubuntu-24.04"]'
     permissions:
       contents: read
+      actions: read
       id-token: write
 
   build:
@@ -494,6 +495,7 @@ jobs:
   qualification_engine:
     name: full engine / ${{ matrix.target }} / ${{ matrix.scope }}
     needs: build
+    if: ${{ !cancelled() && needs.build.result == 'success' }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 360
     strategy:
@@ -634,6 +636,7 @@ jobs:
 
   qualification_consumers:
     needs: [build]
+    if: ${{ !cancelled() && needs.build.result == 'success' }}
     uses: ./.github/workflows/cf-qualification-consumers.yml
     with:
       source-sha: ${{ github.event.pull_request.head.sha }}

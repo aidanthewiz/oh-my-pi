@@ -83,12 +83,13 @@ jobs:
   cache_restore:
     needs: prepare
     if: vars.CI_CACHE_ENABLED == 'true' && needs.prepare.outputs.native_changed == 'true'
-    uses: Coreforce-CAD/oh-my-pi/.github/workflows/cf-cache-read.yml@9dc313bdc0cbcd04aeacb6ede57738668b8ed325
+    uses: Coreforce-CAD/oh-my-pi/.github/workflows/cf-cache-read.yml@d4088c9fcf2f06974b1d6023e2676b45a677164b
     with:
       enabled: true
       slots: '["linux-x64-ubuntu-24.04"]'
     permissions:
       contents: read
+      actions: read
       id-token: write
 
   validate:
@@ -273,8 +274,8 @@ jobs:
 
   cache_publish:
     needs: [prepare, validate, publish]
-    if: vars.CI_CACHE_ENABLED == 'true' && startsWith(github.ref, 'refs/tags/relay/v') && needs.prepare.outputs.native_changed == 'true' && needs.validate.result == 'success' && needs.publish.result == 'success'
-    uses: Coreforce-CAD/oh-my-pi/.github/workflows/cf-cache-write.yml@9dc313bdc0cbcd04aeacb6ede57738668b8ed325
+    if: ${{ !cancelled() && vars.CI_CACHE_ENABLED == 'true' && startsWith(github.ref, 'refs/tags/relay/v') && needs.prepare.result == 'success' && needs.prepare.outputs.native_changed == 'true' && needs.validate.result == 'success' && needs.publish.result == 'success' }}
+    uses: Coreforce-CAD/oh-my-pi/.github/workflows/cf-cache-write.yml@d4088c9fcf2f06974b1d6023e2676b45a677164b
     with:
       enabled: true
       source-sha: ${{ github.sha }}
@@ -287,7 +288,7 @@ jobs:
 
   publish:
     name: publish
-    if: startsWith(github.ref, 'refs/tags/relay/v')
+    if: ${{ !cancelled() && startsWith(github.ref, 'refs/tags/relay/v') && needs.validate.result == 'success' }}
     needs: validate
     runs-on: ubuntu-24.04
     timeout-minutes: 20
