@@ -1,4 +1,5 @@
 import importlib.util
+import copy
 import json
 import os
 from pathlib import Path
@@ -20,7 +21,7 @@ class PathPolicyTests(unittest.TestCase):
     def test_only_direct_cache_names_and_explicit_documentation_are_exempt(self):
         allowed = [
             b'CONTRIBUTING.md', b'docs/ci-cache-iam.md',
-            b'.github/workflows/cf-verify.yml', b'.github/workflows/cf-release.yml',
+            b'.github/workflows/cf-verify.yml',
             b'.github/workflows/relay.yml', b'.github/workflows/cf-cache-read.yml',
             b'.github/workflows/cf-cache-A0_b-c.yml', b'scripts/ci_cache.py',
             b'scripts/test_ci_cache.py', b'scripts/ci_cache_release.py',
@@ -33,6 +34,7 @@ class PathPolicyTests(unittest.TestCase):
             b'packages/coding-agent/package.json', b'crates/runtime.rs',
             b'scripts/ci-release-build-binaries.ts', b'Cargo.lock',
             b'README.md', b'docs/ci-cache-iam.md.bak',
+            b'.github/workflows/cf-release.yml',
             b'.github/workflows/cf-cache-.yml', b'.github/workflows/cf-cache-read.yaml',
             b'.github/workflows/cf-cache-nested/read.yml',
             b'.github/workflows/cf-cache-read.extra.yml',
@@ -45,6 +47,25 @@ class PathPolicyTests(unittest.TestCase):
         for path in denied:
             with self.subTest(path=path):
                 self.assertFalse(release.is_cache_path(path))
+
+def artifact_workflow():
+    gate = "needs.prepare.outputs.should_release == 'true'"
+    return {'on': {'push': {'branches': ['coreforge']}}, 'permissions': {'contents': 'read'},
+            'jobs': {
+                'prepare': {'steps': [{'id': 'release', 'run': 'admit\n\nallocate\n'}]},
+                'build': {'needs': 'prepare', 'if': gate,
+                          'strategy': {'matrix': {'target': ['linux-x64', 'darwin-arm64']}},
+                          'steps': [
+                              {'id': 'bazel-cache', 'name': 'Restore Bazel native build cache',
+                               'uses': 'actions/cache/restore@fixture'},
+                              {'name': 'Build native addon', 'run': 'bun scripts/bazel-natives.ts host'},
+                              {'name': 'Sign binary', 'run': 'codesign --sign fixture binary'},
+                              {'name': 'Save Bazel native build cache', 'uses': 'actions/cache/save@fixture'},
+                          ]},
+                'release': {'if': gate, 'steps': [{'run': 'publish artifact'}]},
+                'verify_release': {'if': gate, 'steps': [{'run': 'verify artifact'}]},
+            }}
+
 
 
 class GitFixture:
@@ -76,14 +97,17 @@ class GitFixture:
         self.files = {
             'packages/coding-agent/package.json': b'{"version":"1.2.3"}\n',
             'crates/runtime.rs': b'fn artifact_input() {}\n',
+            '.github/workflows/cf-release.yml': json.dumps(artifact_workflow()).encode(),
         }
         self.base = self.commit(self.files)
+        self.tag('v1.2.3.1', self.base)
         package = self.repo / 'packages/coding-agent/package.json'
         package.parent.mkdir(parents=True)
         package.write_bytes(self.files['packages/coding-agent/package.json'])
         scripts = self.repo / 'scripts'
         scripts.mkdir()
         (scripts / SCRIPT.name).symlink_to(SCRIPT)
+        (scripts / 'ci-released-native.ts').symlink_to(SCRIPT.with_name('ci-released-native.ts'))
 
     def run(self, args, *, data=None, cwd=None, env=None):
         return subprocess.run(args, input=data, cwd=cwd or self.repo,
@@ -134,8 +158,11 @@ class GitFixture:
                 files[path] = contents
         return self.commit(files, [self.base])
 
-    def classify(self, source, *, cwd=None, env=None):
-        return self.run([sys.executable, str(SCRIPT), source], cwd=cwd, env=env)
+    def classify(self, source, *, cwd=None, env=None, published_ref='base'):
+        args = [sys.executable, str(SCRIPT), source]
+        if published_ref is not None:
+            args += ['--published-ref', self.base if published_ref == 'base' else published_ref]
+        return self.run(args, cwd=cwd, env=env)
 
     def publish_tip(self, source):
         self.git('push', '--quiet', 'origin', f'{source}:refs/fixtures/{source}')
@@ -146,7 +173,7 @@ class GitFixture:
         self.git('push', '--quiet', 'origin', f'refs/tags/{name}')
 
     def prepare(self, shell, source, *, ref_type='branch', ref_name='coreforge', merged=1,
-                published=(), tip=None):
+                published=('v1.2.3.1',), tip=None, records=None, metadata_failure=False):
         self.publish_tip(tip or source)
         gh = self.bin / 'gh'
         gh.write_text('''#!/usr/bin/env python3
@@ -162,6 +189,12 @@ expected = ['api', 'repos/fixture/repo/commits/' + os.environ['EVENT_SHA'] + '/p
 if args == expected:
     print(os.environ['MERGED_COUNT'])
     sys.exit(0)
+if args == ['release', 'list', '--repo', 'fixture/repo', '--exclude-drafts', '--limit', '1000',
+            '--json', 'tagName,isDraft']:
+    if os.environ['METADATA_FAILURE'] == 'true':
+        sys.exit(98)
+    print(os.environ['RELEASE_RECORDS'])
+    sys.exit(0)
 if len(args) == 5 and args[:2] == ['release', 'view'] and args[3:] == ['--repo', 'fixture/repo']:
     sys.exit(0 if args[2] in json.loads(os.environ['PUBLISHED_TAGS']) else 1)
 sys.exit(97)
@@ -175,7 +208,10 @@ sys.exit(97)
                'EVENT_REF_NAME': ref_name, 'GITHUB_REPOSITORY': 'fixture/repo',
                'GITHUB_OUTPUT': str(output), 'GH_TOKEN': 'synthetic-not-a-token',
                'GH_CALLS': str(calls), 'MERGED_COUNT': str(merged),
-               'PUBLISHED_TAGS': json.dumps(published)}
+               'PUBLISHED_TAGS': json.dumps(published),
+               'RELEASE_RECORDS': json.dumps(records if records is not None else
+                                             [{'tagName': tag, 'isDraft': False} for tag in published]),
+               'METADATA_FAILURE': 'true' if metadata_failure else 'false'}
         result = self.run(['bash', '--noprofile', '--norc', '-e', '-o', 'pipefail', '-c', shell], env=env)
         outputs = dict(line.split('=', 1) for line in output.read_text().splitlines())
         requests = [json.loads(line) for line in calls.read_text().splitlines()]
@@ -185,8 +221,9 @@ sys.exit(97)
 @unittest.skipUnless(os.name == 'posix', 'release prepare uses a POSIX Bash runner')
 class GitDecisionTests(unittest.TestCase):
     def setUp(self):
-        if shutil.which('git') is None:
-            self.fail('Git is required for release decision qualification')
+        for tool in ('git', 'bun'):
+            if shutil.which(tool) is None:
+                self.fail(f'{tool} is required for release decision qualification')
         self.temp = tempfile.TemporaryDirectory(prefix='ci-cache-release-')
         self.addCleanup(self.temp.cleanup)
         self.fixture = GitFixture(Path(self.temp.name))
@@ -196,7 +233,7 @@ class GitDecisionTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, expected.encode() + b'\n')
 
-    def test_cache_only_merge_compares_first_parent_not_second_parent(self):
+    def test_cache_only_merge_compares_published_ancestor_not_second_parent(self):
         files = {**self.fixture.files, 'scripts/ci_cache_probe.py': b'cache tooling'}
         other = self.fixture.commit({**self.fixture.files, 'crates/runtime.rs': b'other runtime'})
         source = self.fixture.commit(files, [self.fixture.base, other])
@@ -224,6 +261,34 @@ class GitDecisionTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(result.stdout, b'')
 
+    def test_absent_anchor_cannot_suppress_even_cache_only_release(self):
+        source = self.fixture.changed({'scripts/ci_cache_probe.py': b'cache'})
+        result = self.fixture.classify(source, published_ref=None)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, b'true\n')
+
+    def test_invalid_missing_and_nonancestor_published_refs_abort_without_decision(self):
+        source = self.fixture.changed({'scripts/ci_cache_probe.py': b'cache'})
+        unrelated = self.fixture.commit({'unrelated': b'not source ancestry'})
+        for ref in ['HEAD', '--all', 'v1.2.3.0', 'v1.2.3.9', 'f' * 40, unrelated]:
+            with self.subTest(ref=ref):
+                result = self.fixture.classify(source, published_ref=ref)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, b'')
+
+
+    def test_malformed_workflow_or_cache_region_cannot_skip_release(self):
+        invalid = artifact_workflow()
+        invalid['jobs']['prepare']['steps'][0]['run'] = (
+            'admit\n# coreforge-cache-publication:start\nallocate\n'
+        )
+        for contents in [b'jobs: [', json.dumps(invalid).encode()]:
+            with self.subTest(contents=contents):
+                source = self.fixture.changed({'.github/workflows/cf-release.yml': contents})
+                result = self.fixture.classify(source)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, b'')
+
 
 @unittest.skipUnless(os.name == 'posix', 'release prepare uses a POSIX Bash runner')
 class PrepareWorkflowTests(unittest.TestCase):
@@ -249,7 +314,7 @@ class PrepareWorkflowTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.fixture = GitFixture(Path(self.temp.name))
 
-    def assert_release(self, source, *, tag='v1.2.3.1', **kwargs):
+    def assert_release(self, source, *, tag='v1.2.3.2', **kwargs):
         result, outputs, _ = self.fixture.prepare(self.shell, source, **kwargs)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(outputs, {'release_tag': tag, 'should_release': 'true', 'release_sha': source})
@@ -258,7 +323,6 @@ class PrepareWorkflowTests(unittest.TestCase):
         source = self.fixture.changed({
             'CONTRIBUTING.md': b'cache adoption', 'docs/ci-cache-iam.md': b'cache policy',
             '.github/workflows/cf-verify.yml': b'cache reader',
-            '.github/workflows/cf-release.yml': b'cache release gate',
             '.github/workflows/relay.yml': b'cache consumer',
             '.github/workflows/cf-cache-read.yml': b'broker',
             'scripts/ci_cache.py': b'cache', 'scripts/test_ci_cache.py': b'qualification',
@@ -268,7 +332,7 @@ class PrepareWorkflowTests(unittest.TestCase):
         result, outputs, calls = self.fixture.prepare(self.shell, source)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(outputs, {'should_release': 'false'})
-        self.assertEqual([call[0] for call in calls], ['api'])
+        self.assertEqual([call[:2] for call in calls], [['api', calls[0][1]], ['release', 'list']])
 
     def test_artifact_changes_empty_diff_and_renames_keep_release_decision(self):
         changes = [
@@ -319,6 +383,76 @@ class PrepareWorkflowTests(unittest.TestCase):
         result, outputs, _ = self.fixture.prepare(self.shell, source, published=['v1.2.3.3'])
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(outputs, {})
+
+    def test_pending_runtime_before_cache_tip_is_not_stranded_by_unpublished_tag(self):
+        runtime_files = {**self.fixture.files, 'crates/runtime.rs': b'pending runtime'}
+        runtime = self.fixture.commit(runtime_files, [self.fixture.base])
+        source = self.fixture.commit({**runtime_files, 'scripts/ci_cache_probe.py': b'cache'}, [runtime])
+        self.fixture.tag('v1.2.3.7', runtime)
+        self.assert_release(source, tag='v1.2.3.8')
+        result, outputs, _ = self.fixture.prepare(
+            self.shell, source, published=['v1.2.3.1', 'v1.2.3.7'],
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(outputs, {'should_release': 'false'})
+
+    def test_missing_published_anchor_and_draft_or_other_family_do_not_skip(self):
+        source = self.fixture.changed({'scripts/ci_cache_probe.py': b'cache'})
+        self.fixture.tag('v1.2.3.7', self.fixture.base)
+        for records in [[], [{'tagName': 'v1.2.3.7', 'isDraft': True}],
+                        [{'tagName': 'v9.8.7.3', 'isDraft': False}]]:
+            with self.subTest(records=records):
+                self.assert_release(source, tag='v1.2.3.8', published=(), records=records)
+
+    def test_published_release_metadata_or_tag_resolution_failure_aborts_prepare(self):
+        source = self.fixture.changed({'scripts/ci_cache_probe.py': b'cache'})
+        for kwargs in [{'metadata_failure': True}, {'published': ['v1.2.3.99']}]:
+            with self.subTest(kwargs=kwargs):
+                result, outputs, _ = self.fixture.prepare(self.shell, source, **kwargs)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(outputs, {})
+
+    def test_cache_workflow_adoption_preserves_all_artifact_semantics(self):
+        old = artifact_workflow()
+        new = copy.deepcopy(old)
+        jobs = new['jobs']
+        jobs['cache_restore'] = {'uses': 'owner/repo/.github/workflows/cf-cache-read.yml@fixture'}
+        jobs['cache_publish'] = {'uses': 'owner/repo/.github/workflows/cf-cache-write.yml@fixture'}
+        build = jobs['build']
+        build['name'] = 'build (${{ matrix.target }})'
+        build['needs'] = ['prepare', 'cache_restore']
+        build['steps'] = [
+            {'id': 'cache-identity', 'name': 'Identify compatible Bazel caches',
+             'run': 'python3 scripts/ci_cache.py identity'},
+            *build['steps'][1:3],
+            {'name': 'Save successful GitHub hot cache', 'uses': 'actions/cache/save@fixture'},
+        ]
+        for name, suffix in [('build', ''), ('release', " && needs.build.result == 'success'"),
+                             ('verify_release', " && needs.release.result == 'success'")]:
+            jobs[name]['if'] = ("${{ !cancelled() && needs.prepare.result == 'success' && "
+                                "needs.prepare.outputs.should_release == 'true'" + suffix + " }}")
+        jobs['prepare']['steps'][0]['run'] = (
+            'admit\n\n# coreforge-cache-publication:start\ncache decision\n'
+            '# coreforge-cache-publication:end\n\nallocate\n'
+        )
+        source = self.fixture.changed({'.github/workflows/cf-release.yml': json.dumps(new).encode()})
+        result, outputs, _ = self.fixture.prepare(self.shell, source)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(outputs, {'should_release': 'false'})
+        mutations = [
+            lambda doc: doc['jobs']['build']['steps'][1].update(run='bun scripts/bazel-natives.ts changed'),
+            lambda doc: doc['jobs']['build']['steps'][2].update(run='codesign --sign other binary'),
+            lambda doc: doc['jobs']['build']['strategy']['matrix'].update(target=['linux-x64']),
+            lambda doc: doc['jobs']['prepare']['steps'][0].update(run='different admission\n'),
+            lambda doc: doc['jobs']['release'].update(**{'if': 'always()'}),
+            lambda doc: doc.update(permissions={'contents': 'write'}),
+            lambda doc: doc['jobs']['build']['steps'].append({'name': 'Other cache step', 'run': 'artifact change'}),
+        ]
+        for mutate in mutations:
+            changed = copy.deepcopy(new)
+            mutate(changed)
+            source = self.fixture.changed({'.github/workflows/cf-release.yml': json.dumps(changed).encode()})
+            self.assert_release(source)
 
     def test_manual_tag_must_still_match_tip_and_package_roll(self):
         source = self.fixture.changed({'scripts/ci_cache_probe.py': b'cache'})

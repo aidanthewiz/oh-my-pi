@@ -92,12 +92,19 @@ jobs:
               exit 0
             fi
 
-            SHOULD_RELEASE="$(python3 scripts/ci_cache_release.py "$EVENT_SHA")"
+            # coreforge-cache-publication:start
+            RELEASE_LIST="$(mktemp)"
+            trap 'rm -f "$RELEASE_LIST"' EXIT
+            gh release list --repo "$GITHUB_REPOSITORY" --exclude-drafts --limit 1000 \
+              --json tagName,isDraft > "$RELEASE_LIST"
+            PUBLISHED_TAG="$(bun scripts/ci-released-native.ts resolve-optional "$PKG" "$RELEASE_LIST")"
+            SHOULD_RELEASE="$(python3 scripts/ci_cache_release.py "$EVENT_SHA" --published-ref "$PUBLISHED_TAG")"
             if [ "$SHOULD_RELEASE" = "false" ]; then
-              echo "$EVENT_SHA changes only CI cache infrastructure - no engine release"
+              echo "$EVENT_SHA has only cache changes since $PUBLISHED_TAG - no engine release"
               echo "should_release=false" >> "$GITHUB_OUTPUT"
               exit 0
             fi
+            # coreforge-cache-publication:end
 
             LAST=0
             RESUME_TAG=""

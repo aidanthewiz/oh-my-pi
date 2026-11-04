@@ -61,7 +61,7 @@ Staging these values does not enable the backend. Never store static AWS keys, t
 `cf-cache-canary.yml` accepts only deliberate dispatch from protected `coreforge`. It publishes no release, tag, package, image, or application deployment. The workflow must first exist on the protected default branch; a feature-only source proposal is not an operational cache.
 
 1. Apply the approved infrastructure change through its existing protected plan/apply path.
-2. Merge the approved cache-only engine source through required independent/latest-push review and authorized merge gates. The cache-only release classifier must report `should_release=false`; no engine tag or release is allocated. Runtime/mixed changes and manual recovery tags retain their original release safeguards.
+2. Merge the approved cache-only engine source through required independent/latest-push review and authorized merge gates. Before merge, compare the candidate with the latest published engine ancestor: the classifier must report `false`. If runtime changes remain unpublished, wait for their separately authorized release; do not use the cache merge to publish them. The resulting preparation must report `should_release=false` without allocating an engine tag.
 3. Verify bucket controls, exact IAM workflow pins, default OIDC metadata, and cache variables while `CI_CACHE_ENABLED=false`.
 4. Dispatch the bounded verification:
 
@@ -71,7 +71,11 @@ Staging these values does not enable the backend. Never store static AWS keys, t
 
 5. Require the entire run to succeed before enablement.
 
-The non-releasing exemption admits only the explicit cache documentation/workflows and direct cache-helper/test namespaces. Any runtime, mixed, unknown, renamed/deleted artifact input, or empty diff retains the normal release decision. First-parent Git errors abort preparation. The classifier runs after merged-PR/current-tip checks and before branch release-tag allocation; it never handles the manual tag path.
+The non-releasing exemption admits only explicit cache documentation/workflows and direct cache-helper/test namespaces. The release workflow additionally requires identical non-cache semantics after removing owned cache jobs/steps, exact cache status conditions, and the marked cache-publication region. Native commands, signing, matrices, permissions, admission, and tag allocation remain significant.
+
+The baseline is the latest published roll in the current package family, not an unpublished tag or the merge's first parent. Pending runtime, mixed, unknown, renamed/deleted artifact input, and empty diffs retain the normal release decision. A missing published baseline cannot suppress publication. Git, metadata, and parse errors abort preparation.
+
+The classifier runs after merged-PR/current-tip checks and before branch release-tag allocation. It never handles the manual tag path.
 
 Each fresh dispatch creates `omp-bazel-v1/canary/probe-<run-id>-<attempt>/`. Use a fresh dispatch rather than reusing stale snapshot artifacts from a failed attempt.
 
