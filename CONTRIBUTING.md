@@ -69,8 +69,9 @@ These checks do not qualify live S3/OIDC, the native-addon matrix, or deployed p
 
 ## Dependency releases
 
-A verified pull request merged into `coreforge` triggers `.github/workflows/cf-release.yml`.
-The workflow publishes a `v<upstream>.<roll>` engine dependency release.
+A verified artifact-changing pull request merged into `coreforge` triggers an engine dependency release through `.github/workflows/cf-release.yml`.
+Nonempty cache-only CI changes run preparation without allocating or publishing an engine tag. Runtime, mixed, unknown, and empty changes retain the release path.
+Manual four-part recovery tags retain their existing tip, package-version, and roll safeguards.
 Coreforge installers use the exact release and checksums recorded in `engine.lock`.
 Do not use upstream's `bun run release` for this fork's dependency channel.
 

@@ -92,6 +92,13 @@ jobs:
               exit 0
             fi
 
+            SHOULD_RELEASE="$(python3 scripts/ci_cache_release.py "$EVENT_SHA")"
+            if [ "$SHOULD_RELEASE" = "false" ]; then
+              echo "$EVENT_SHA changes only CI cache infrastructure - no engine release"
+              echo "should_release=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
             LAST=0
             RESUME_TAG=""
             while IFS= read -r candidate; do

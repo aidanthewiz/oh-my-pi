@@ -61,7 +61,7 @@ Staging these values does not enable the backend. Never store static AWS keys, t
 `cf-cache-canary.yml` accepts only deliberate dispatch from protected `coreforge`. It publishes no release, tag, package, image, or application deployment. The workflow must first exist on the protected default branch; a feature-only source proposal is not an operational cache.
 
 1. Apply the approved infrastructure change through its existing protected plan/apply path.
-2. Merge the approved engine source through required independent/latest-push review and authorized merge gates. Existing automatic engine-release side effects still require the owner's authorization; the canary itself never invokes release jobs.
+2. Merge the approved cache-only engine source through required independent/latest-push review and authorized merge gates. The cache-only release classifier must report `should_release=false`; no engine tag or release is allocated. Runtime/mixed changes and manual recovery tags retain their original release safeguards.
 3. Verify bucket controls, exact IAM workflow pins, default OIDC metadata, and cache variables while `CI_CACHE_ENABLED=false`.
 4. Dispatch the bounded verification:
 
@@ -70,6 +70,8 @@ Staging these values does not enable the backend. Never store static AWS keys, t
    ```
 
 5. Require the entire run to succeed before enablement.
+
+The non-releasing exemption admits only the explicit cache documentation/workflows and direct cache-helper/test namespaces. Any runtime, mixed, unknown, renamed/deleted artifact input, or empty diff retains the normal release decision. First-parent Git errors abort preparation. The classifier runs after merged-PR/current-tip checks and before branch release-tag allocation; it never handles the manual tag path.
 
 Each fresh dispatch creates `omp-bazel-v1/canary/probe-<run-id>-<attempt>/`. Use a fresh dispatch rather than reusing stale snapshot artifacts from a failed attempt.
 
