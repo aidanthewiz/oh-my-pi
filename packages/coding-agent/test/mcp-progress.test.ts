@@ -6,13 +6,29 @@ import type { MCPProgress } from "@oh-my-pi/pi-tui/tools/mcp";
 import { withTimeout } from "@oh-my-pi/pi-utils";
 import { rejectionOf } from "./helpers/rejection";
 
-const STARTUP_TIMEOUT_MS = 300;
+const REQUEST_TIMEOUT_MS = 300;
 const transports: StdioTransport[] = [];
 afterEach(async () => {
 	await Promise.all(transports.splice(0).map(transport => transport.close()));
 });
 
-async function connect(timeout = STARTUP_TIMEOUT_MS, requestIdFormat?: "string"): Promise<StdioTransport> {
+async function connectReady(transport: StdioTransport): Promise<void> {
+	const ready = Promise.withResolvers<void>();
+	transport.onNotification = method => {
+		if (method === "notifications/progress-fixture-ready") ready.resolve();
+	};
+	transport.onClose = () => ready.reject(new Error("Progress fixture closed before readiness"));
+	transport.onError = error => ready.reject(error);
+	try {
+		await Promise.all([transport.connect(), ready.promise]);
+	} finally {
+		transport.onNotification = undefined;
+		transport.onClose = undefined;
+		transport.onError = undefined;
+	}
+}
+
+async function connect(timeout = REQUEST_TIMEOUT_MS, requestIdFormat?: "string"): Promise<StdioTransport> {
 	const transport = new StdioTransport({
 		type: "stdio",
 		command: process.execPath,
@@ -21,13 +37,7 @@ async function connect(timeout = STARTUP_TIMEOUT_MS, requestIdFormat?: "string")
 		requestIdFormat,
 	});
 	transports.push(transport);
-	const ready = Promise.withResolvers<void>();
-	transport.onNotification = method => {
-		if (method === "notifications/progress-fixture-ready") ready.resolve();
-	};
-	await transport.connect();
-	await withTimeout(ready.promise, STARTUP_TIMEOUT_MS, "progress fixture did not become ready");
-	transport.onNotification = undefined;
+	await connectReady(transport);
 	return transport;
 }
 
@@ -84,7 +94,7 @@ describe("MCP stdio request progress", () => {
 			onProgress: () => {},
 		});
 		await transport.close();
-		await transport.connect();
+		await connectReady(transport);
 		const second = await transport.request<MCPToolCallResult>("tools/call", params({ steps: 0 }), {
 			onProgress: () => {},
 		});

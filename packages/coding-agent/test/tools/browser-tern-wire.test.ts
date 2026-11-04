@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from "bun:test";
+import { dirname, join } from "node:path";
 import { CommandController } from "@oh-my-pi/pi-coding-agent/modes/controllers/command-controller";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import {
@@ -36,7 +37,11 @@ async function runForkCommand(socketPath: string): Promise<{ localForks: number;
 					return false;
 				},
 			},
-			sessionManager: { isSessionOnDisk: () => true, getSessionId: () => "test-session" },
+			sessionManager: {
+				isSessionOnDisk: () => true,
+				getSessionId: () => "test-session",
+				getSessionFile: () => join(dirname(socketPath), "test-session.jsonl"),
+			},
 			statusContainer: { disposeChildren: () => {} },
 			showError: () => {
 				outcome.errors++;
