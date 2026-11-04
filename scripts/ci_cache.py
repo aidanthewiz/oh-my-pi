@@ -214,6 +214,25 @@ def validate_pointer(value, slot):
     return manifest
 
 
+def retirement_key(manifest):
+    return f"retired/{manifest['slot']}/{manifest['dimension']}/{manifest['run_id']}-{manifest['run_attempt']}.json"
+
+
+def retirement_for(manifest, retired_at):
+    return {"schema": SCHEMA, "pointer": pointer_for(manifest), "retired_at": retired_at}
+
+
+def validate_retirement(value, key):
+    match = re.fullmatch(r"retired/(" + SLOT + ")/" + HEX + r"/[1-9][0-9]{0,19}-[1-9][0-9]{0,19}\.json", key)
+    require(match is not None, "unknown/incomplete retirement listing")
+    require(isinstance(value, dict) and set(value) == {"schema", "pointer", "retired_at"}, "invalid retirement fields")
+    require(type(value["schema"]) is int and value["schema"] == SCHEMA, "invalid retirement schema")
+    manifest = validate_pointer(value["pointer"], match[1])
+    require(retirement_key(manifest) == key, "retirement key mismatch")
+    retired_at = None if value["retired_at"] is None else parse_time(value["retired_at"])
+    return manifest, retired_at
+
+
 def valid_member(name, size):
     if type(size) is not int or size < 0:
         return False
@@ -478,22 +497,32 @@ class S3Store:
             self.environment["AWS_IGNORE_CONFIGURED_ENDPOINT_URLS"] = "true"
         self.environment["AWS_PAGER"] = ""
 
-    def command(self, arguments, missing=False):
+    def command(self, arguments):
         result = subprocess.run(["aws", *arguments, "--region", self.region], capture_output=True, text=True, env=self.environment)
         if result.returncode:
-            if missing and re.search(r"An error occurred \((?:404|NoSuchKey|NotFound)\)", result.stderr):
-                return None
             raise CacheError(f"AWS cache operation failed: {result.stderr.strip()}")
         return result.stdout
 
     def key(self, key):
         return self.prefix + "/" + key
 
+    def exists(self, key):
+        full_key = self.key(key)
+        value = json.loads(self.command(["s3api", "list-objects-v2", "--bucket", self.bucket, "--prefix", full_key, "--max-keys", "1", "--no-paginate", "--output", "json"]))
+        require(isinstance(value, dict) and value.get("Prefix") == full_key and type(value.get("MaxKeys")) is int and value["MaxKeys"] == 1, "invalid exact-key S3 listing scope")
+        entries = value.get("Contents", [])
+        require(type(value.get("IsTruncated")) is bool and type(value.get("KeyCount")) is int and isinstance(entries, list) and value["KeyCount"] == len(entries) and len(entries) <= 1, "invalid exact-key S3 listing count")
+        require(not value["IsTruncated"] or len(entries) == 1, "incomplete exact-key S3 listing")
+        for item in entries:
+            require(isinstance(item, dict) and isinstance(item.get("Key"), str) and item["Key"].startswith(full_key) and type(item.get("Size")) is int and item["Size"] >= 0, "invalid exact-key S3 listing entry")
+            parse_time(item.get("LastModified"))
+        # General-purpose S3 listings sort exact keys before longer prefix matches.
+        return bool(entries) and entries[0]["Key"] == full_key
+
     def get(self, key, destination):
-        result = self.command(["s3api", "get-object", "--bucket", self.bucket, "--key", self.key(key), str(destination), "--output", "json"], missing=True)
-        if result is None:
-            Path(destination).unlink(missing_ok=True)
+        if key.startswith("refs/") and not self.exists(key):
             return False
+        self.command(["s3api", "get-object", "--bucket", self.bucket, "--key", self.key(key), str(destination), "--output", "json"])
         return True
 
     def head(self, key):
@@ -501,13 +530,11 @@ class S3Store:
         return {"key": key, "size": value["ContentLength"], "modified": parse_time(value["LastModified"])}
 
     def put(self, key, source, immutable=False):
-        if immutable:
-            existing = self.command(["s3api", "head-object", "--bucket", self.bucket, "--key", self.key(key), "--output", "json"], missing=True)
-            if existing is not None:
-                value = json.loads(existing)
-                require(value.get("ContentLength") == Path(source).stat().st_size, "immutable object size collision")
-                require(value.get("Metadata", {}).get("sha256") == digest_file(source), "immutable object digest collision")
-                return
+        if immutable and self.exists(key):
+            value = json.loads(self.command(["s3api", "head-object", "--bucket", self.bucket, "--key", self.key(key), "--output", "json"]))
+            require(value.get("ContentLength") == Path(source).stat().st_size, "immutable object size collision")
+            require(value.get("Metadata", {}).get("sha256") == digest_file(source), "immutable object digest collision")
+            return
         self.command(["s3", "cp", str(source), f"s3://{self.bucket}/{self.key(key)}", "--sse", "AES256", "--metadata", "sha256=" + digest_file(source), "--only-show-errors"])
 
     def listing(self):
@@ -561,12 +588,19 @@ def fetch(slot, output, store):
 def trusted_publication(manifest):
     environment = os.environ
     require(environment.get("GITHUB_REPOSITORY") == REPOSITORY, "publication requires protected repository")
-    require(environment.get("GITHUB_EVENT_NAME") == "push", "publication requires push event")
     require(environment.get("CACHE_BUILD_RESULT") == "success", "publication requires successful build")
     require(environment.get("GITHUB_SHA") == manifest["source_sha"], "publication source SHA mismatch")
     require(environment.get("GITHUB_RUN_ID") == manifest["run_id"] and environment.get("GITHUB_RUN_ATTEMPT", "1") == manifest["run_attempt"], "publication run mismatch")
     ref = environment.get("GITHUB_REF", "")
     workflow = environment.get("GITHUB_WORKFLOW_REF", "")
+    canary_id = environment.get("CI_CACHE_CANARY_ID", "")
+    if canary_id:
+        require(re.fullmatch(r"[a-z0-9][a-z0-9-]{0,47}", canary_id), "invalid canary ID")
+        canary_workflow = f"{REPOSITORY}/.github/workflows/cf-cache-canary.yml@refs/heads/coreforge"
+        require(environment.get("GITHUB_EVENT_NAME") == "workflow_dispatch" and ref == "refs/heads/coreforge" and workflow == canary_workflow, "untrusted canary publication source")
+        require(environment.get("CI_CACHE_PREFIX", "").endswith("/canary/" + canary_id), "canary prefix mismatch")
+        return
+    require(environment.get("GITHUB_EVENT_NAME") == "push", "publication requires push event")
     release = f"{REPOSITORY}/.github/workflows/cf-release.yml@{ref}"
     relay = f"{REPOSITORY}/.github/workflows/relay.yml@{ref}"
     trusted_release = workflow == release and (ref == "refs/heads/coreforge" or re.fullmatch(r"refs/tags/v[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+", ref))
@@ -585,9 +619,24 @@ def publish(snapshot, store):
     require(store.head(object_key(manifest))["size"] == manifest["size"], "uploaded archive size mismatch")
     store.put(manifest_key(manifest), snapshot / "manifest.json", immutable=True)
     with tempfile.TemporaryDirectory(prefix="ci-cache-ref-") as temporary:
-        pointer_path = Path(temporary) / "current.json"
+        directory = Path(temporary)
+        pointer_path = directory / "current.json"
+        current_key = f"refs/{manifest['slot']}/current.json"
+        previous = None
+        if store.get(current_key, pointer_path):
+            previous = validate_pointer(read_json(pointer_path), manifest["slot"])
+            require(get_json(store, manifest_key(previous), directory) == previous, "current manifest mismatch")
+            require(store.head(object_key(previous))["size"] == previous["size"], "current object size mismatch")
+        replacing = previous is not None and previous != manifest
+        retirement_path = directory / "retired.json"
+        if replacing:
+            atomic_json(retirement_path, retirement_for(previous, None))
+            store.put(retirement_key(previous), retirement_path)
         atomic_json(pointer_path, pointer_for(manifest))
-        store.put(f"refs/{manifest['slot']}/current.json", pointer_path)
+        store.put(current_key, pointer_path)
+        if replacing:
+            atomic_json(retirement_path, retirement_for(previous, timestamp()))
+            store.put(retirement_key(previous), retirement_path)
     print(f"Published snapshot: {manifest['sha256']}")
     return manifest
 
@@ -614,6 +663,7 @@ def prune(store, keep=2, retire=(), apply=False, now=None):
         rows[row["key"]] = row
     protected = set()
     manifests = {}
+    retirements = {}
     with tempfile.TemporaryDirectory(prefix="ci-cache-prune-") as temporary:
         directory = Path(temporary)
         for key in sorted(rows):
@@ -647,14 +697,24 @@ def prune(store, keep=2, retire=(), apply=False, now=None):
             if group not in retired:
                 historical = [key for key in keys if key not in protected]
                 protected.update(historical[:keep])
+        for key in sorted(rows):
+            if not key.startswith("retired/"):
+                continue
+            manifest, retired_at = validate_retirement(get_json(store, key, directory), key)
+            require(manifests.get(manifest_key(manifest)) == manifest, "retirement manifest missing/mismatch")
+            require(object_key(manifest) in rows and rows[object_key(manifest)]["size"] == manifest["size"], "retirement object missing/corrupt")
+            retirements[key] = manifest
+            if retired_at is None or now - max(retired_at, rows[key]["modified"]) < GRACE:
+                protected.update((key, manifest_key(manifest), object_key(manifest)))
         # Grace-protected manifests also retain their objects, including shared objects.
         for key, manifest in manifests.items():
             if key in protected or now - rows[key]["modified"] < GRACE:
                 protected.add(key)
                 protected.add(object_key(manifest))
         deletions = []
-        for key, row in sorted(rows.items()):
-            known = key in manifests or re.fullmatch(r"objects/" + HEX + r"\.tar\.gz", key) is not None
+        # Expired markers must disappear before their targets if deletion is interrupted.
+        for key, row in sorted(rows.items(), key=lambda item: (not item[0].startswith("retired/"), item[0])):
+            known = key in manifests or key in retirements or re.fullmatch(r"objects/" + HEX + r"\.tar\.gz", key) is not None
             if known and key not in protected and now - row["modified"] >= GRACE:
                 deletions.append(key)
         plan = {"apply": apply, "delete": deletions, "keep_generations": keep, "retire": sorted(retired)}

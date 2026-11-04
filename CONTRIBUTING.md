@@ -56,13 +56,13 @@ PR, `pull_request_target`, and `workflow_run` execution cannot publish shared sn
 `scripts/ci_cache.py` publishes immutable archives and manifests before updating each current reference.
 Restore verifies the archive digest, complete identity, and every member before replacing either cache root.
 Successful publication explicitly prunes obsolete generations, retaining every current snapshot plus two historical generations per dimension.
-A 24-hour grace protects in-flight transfers. Owners explicitly retire noncurrent dimensions with `prune --retire`; inactivity never expires current snapshots.
+A full 24-hour grace after supersession protects in-flight readers, including long-idle snapshots. Owners explicitly retire noncurrent dimensions with `prune --retire`; inactivity never expires current snapshots.
 
-This feature is disabled until the CI/cloud owners complete [the bucket, IAM, OIDC, and variable setup](docs/ci-cache-iam.md).
-Requiring `job_workflow_ref` affects the repository's existing relay/cosign OIDC consumers.
-Complete their reviewed compatibility migration before enabling this cache; do not weaken broker trust or change live configuration implicitly.
+The existing governed infrastructure workspace owns [the bucket, IAM roles, and setup procedure](docs/ci-cache-iam.md).
+AWS trust uses exact immutable `job_workflow_ref` conditions directly; the repository's default OIDC subject and existing relay/cosign authentication remain unchanged.
+Keep `CI_CACHE_ENABLED=false` until governed apply, protected source adoption, and the non-releasing `cf-cache-canary` cold/save/warm proof succeed.
 
-Run `python3 -m unittest discover -s scripts -p test_ci_cache.py` for cache boundaries.
+Run `python3 -m unittest discover -s scripts -p 'test_ci_cache*.py'` for cache and real broker-guard boundaries.
 Local qualification exercised a real Bazel 9.2.0 C build with isolated output bases and a loopback repository download.
 Warm restore produced a disk-cache hit with repository downloads disabled; changed inputs rebuilt correctly, and a miss ran a real cold build.
 These checks do not qualify live S3/OIDC, the native-addon matrix, or deployed performance.

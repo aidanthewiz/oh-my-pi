@@ -1,263 +1,128 @@
-# Durable CI cache: owner setup and IAM
+# Durable CI cache: governed setup and verification
 
-This cache is **unconfigured and disabled** until owners complete every gate below. This document does not authorize infrastructure changes.
+The cache uses ephemeral build runners and private S3 snapshots. It does not replace build, test, qualification, signing, or release gates.
 
-The cache stores only Bazel disk and repository snapshots. It does not replace build, release, relay, signing, or verification gates. Build jobs receive inert GitHub artifacts, never AWS credentials. The reusable brokers execute `scripts/ci_cache.py` from protected `coreforge`, not PR code.
+## Infrastructure authority
 
-## Required owner parameters
+[`Coreforce-CAD/github-org-management/iam/omp_cache.tf`](https://github.com/Coreforce-CAD/github-org-management/blob/main/iam/omp_cache.tf) owns the cache bucket, runtime roles, and narrowly scoped Terraform administration grants. The existing protected `iam/` plan/apply workflow owns deployment and state. Do not create competing manual resources or use the application Terraform stacks.
 
-Choose these values explicitly. There are no production defaults.
-
-| Parameter | Meaning |
+| Input | Governed value |
 | --- | --- |
-| `<PARTITION>` | Verified AWS partition, such as `aws` or `aws-us-gov` |
-| `<ACCOUNT_ID>` | Verified cache account ID |
-| `<REGION>` | Bucket and STS region in that partition |
-| `<BUCKET>` | Dedicated private cache bucket name |
-| `<PREFIX>` | Dedicated cache prefix without leading or trailing `/`, such as `omp-bazel-v1` |
-| `<READ_ROLE>` | Role name for immutable read broker only |
-| `<WRITE_ROLE>` | Role name for immutable write broker and controlled pruning only |
-| `<BROKER_SHA>` | Full 40-character commit SHA containing the reviewed reusable brokers |
+| Account | `800128555654` |
+| Partition | `aws-us-gov` |
+| Region | `us-gov-west-1` |
+| Bucket | `coreforge-ci-cache-800128555654-us-gov-west-1` |
+| Prefix | `omp-bazel-v1` |
+| Read role | `arn:aws-us-gov:iam::800128555654:role/CoreforgeOmpCacheRead` |
+| Write role | `arn:aws-us-gov:iam::800128555654:role/CoreforgeOmpCacheWrite` |
 
-After setup, configure repository variables:
+These are intended resource identities, not evidence that an unapplied infrastructure PR has created them. Require successful governed apply and authoritative readback before a canary.
+
+The bucket blocks all public access, requires BucketOwnerEnforced ownership and TLS, and uses SSE-S3 `AES256`. It has `prevent_destroy`, no force deletion, and only incomplete-multipart cleanup after one day. No lifecycle rule expires usable snapshots. Existing release/artifact buckets and the shared OIDC provider are unchanged.
+
+## Compatible GitHub OIDC
+
+AWS IAM supports GitHub's `job_workflow_ref` directly in role trust. Cache roles require all of these conditions:
+
+- Audience `sts.amazonaws.com`.
+- Immutable repository ID `1291753113` and owner ID `259898564`.
+- Exact `Coreforce-CAD/oh-my-pi/.github/workflows/cf-cache-read.yml@<BROKER_SHA>` or corresponding write workflow.
+- The existing default subject and allowed ref context. Only readers admit PR refs; writers admit protected `coreforge` or validated engine/relay release tags.
+
+`<BROKER_SHA>` is the reviewed immutable 40-character source revision sealed in governed IAM and every caller. Updates require matching reviewed source and IAM changes; never wildcard the workflow ref.
+
+**Do not customize the repository subject template.** Keep `use_default=true` and the existing provider audience/thumbprints. The default relay AWS subject and cosign issuer/certificate identity remain unchanged. A new audience alone is not a workflow identity boundary: arbitrary code can request that audience. A direct non-broker token must fail both cache-role assumptions.
+
+Broker jobs check out only protected `coreforge` helper code. They validate actual source/event/run/attempt, repository IDs, caller workflow, completed predecessors, and artifact provenance before requesting AWS credentials. Builders never receive AWS credentials or OIDC request authority.
+
+## Runtime permissions
+
+The read role can read only cache references, manifests, and immutable archives. It can list only the exact-pointer lookup prefixes under `omp-bazel-v1/refs/*` and `omp-bazel-v1/canary/*/refs/*`. This bounded lookup distinguishes a confirmed missing object from ambiguous S3 `AccessDenied`; access failures are never called misses.
+
+The writer can get/put cache data and abort its multipart uploads. It can delete only obsolete manifests, archives, and retirement markers under the cache prefix. It cannot delete current references, administer the bucket, read secrets, mutate IAM, or access another bucket. Prefix-scoped listing supports immutable-object existence checks and pruning. Runtime roles have no ACL permissions. Terraform administration has separate exact-bucket configuration/refresh grants, not object-data access.
+
+## Repository configuration
+
+After governed resources exist, set these non-secret variables:
 
 ```text
-CI_CACHE_BUCKET=<BUCKET>
-CI_CACHE_REGION=<REGION>
-CI_CACHE_PREFIX=<PREFIX>
-CI_CACHE_READ_ROLE=arn:<PARTITION>:iam::<ACCOUNT_ID>:role/<READ_ROLE>
-CI_CACHE_WRITE_ROLE=arn:<PARTITION>:iam::<ACCOUNT_ID>:role/<WRITE_ROLE>
+CI_CACHE_BUCKET=coreforge-ci-cache-800128555654-us-gov-west-1
+CI_CACHE_REGION=us-gov-west-1
+CI_CACHE_PREFIX=omp-bazel-v1
+CI_CACHE_READ_ROLE=arn:aws-us-gov:iam::800128555654:role/CoreforgeOmpCacheRead
+CI_CACHE_WRITE_ROLE=arn:aws-us-gov:iam::800128555654:role/CoreforgeOmpCacheWrite
 CI_CACHE_ENABLED=false
 ```
 
-Do not store static AWS credentials. Do not add AWS permissions to builders. The broker overrides configured AWS endpoints and does not load local credential/configuration files.
+Staging these values does not enable the backend. Never store static AWS keys, tokens, or profile files in variables, source, logs, or artifacts. Set `CI_CACHE_ENABLED=true` only after the protected-source cloud canary succeeds and the resource/trust readback matches governed source.
 
-## Enablement gates
+## Non-releasing real-cloud canary
 
-1. Merge the helper and brokers into protected `coreforge` through the required review process.
-2. Push the signed broker commit before creating callers that reference its immutable SHA.
-3. Pin every caller `uses:` to `Coreforce-CAD/oh-my-pi/.github/workflows/cf-cache-read.yml@<BROKER_SHA>` or `cf-cache-write.yml@<BROKER_SHA>`.
-4. Verify that `<BROKER_SHA>` contains the reviewed broker code. Never replace this pin with a branch or tag.
-5. Require protected `coreforge` reviews for helper changes. The helper deliberately follows this protected branch, not `<BROKER_SHA>`.
-6. Complete the relay/cosign OIDC compatibility migration below before changing the repository OIDC subject template.
-7. Provision the private bucket, OIDC provider, and the two scoped roles after verifying the account and partition.
-8. Validate the resulting OIDC claims and role restrictions in the owner's controlled qualification procedure.
-9. Validate cold builds, cache hits, corruption fallback, publication refusal, and retention without weakening existing gates.
-10. Set `CI_CACHE_ENABLED=true` only after every prerequisite succeeds.
+`cf-cache-canary.yml` accepts only deliberate dispatch from protected `coreforge`. It publishes no release, tag, package, image, or application deployment. The workflow must first exist on the protected default branch; a feature-only source proposal is not an operational cache.
 
-An immutable broker upgrade requires a reviewed SHA, matching IAM trust updates, and caller pin updates. Keep old trust only while approved callers still need it. Never add a wildcard workflow SHA.
+1. Apply the approved infrastructure change through its existing protected plan/apply path.
+2. Merge the approved engine source through required independent/latest-push review and authorized merge gates. Existing automatic engine-release side effects still require the owner's authorization; the canary itself never invokes release jobs.
+3. Verify bucket controls, exact IAM workflow pins, default OIDC metadata, and cache variables while `CI_CACHE_ENABLED=false`.
+4. Dispatch the bounded verification:
 
-### Repository OIDC compatibility blocker
+   ```sh
+   gh workflow run cf-cache-canary.yml --repo Coreforce-CAD/oh-my-pi --ref coreforge
+   ```
 
-GitHub's default subject does **not** bind AWS trust to a reusable workflow. A repository owner must opt this repository into a custom subject:
+5. Require the entire run to succeed before enablement.
 
-```json
-{
-  "use_default": false,
-  "include_claim_keys": ["repo", "context", "job_workflow_ref"]
-}
-```
+Each fresh dispatch creates `omp-bazel-v1/canary/probe-<run-id>-<attempt>/`. Use a fresh dispatch rather than reusing stale snapshot artifacts from a failed attempt.
 
-`context` expands to `pull_request`, `ref:refs/heads/coreforge`, or `ref:refs/tags/<tag>` when no environment is declared. `job_workflow_ref` identifies the **called reusable workflow**, including the immutable SHA. `workflow_ref` identifies the caller; it is not a substitute for `job_workflow_ref`.
+The canary proves:
 
-The resulting read PR subject is:
+- A real GitHub OIDC token from a non-broker job receives IAM `AccessDenied` for both roles. Network, invalid-token, and configuration failures do not count as successful denials.
+- The read broker's actual OIDC claims and STS role match the intended identities. Tokens are never persisted or logged; receipts include only allowlisted claims.
+- A confirmed S3 miss runs the canonical `linux-x64-baseline` native build and addon load probe in a credential-free builder.
+- The same production writer broker validates the successful cold job and same-run/attempt snapshot, then publishes to the derived canary prefix and prunes safely.
+- A separate runner restores the real S3 archive, rejects an incompatible identity, and rebuilds/loads the same native addon with `--repository_disable_download` and observed disk-cache hits.
+- Cold and warm addon hashes agree. Build receipts verify AWS keys, profiles, and OIDC request authority are absent before and after compilation.
 
-```text
-repo:Coreforce-CAD/oh-my-pi:pull_request:job_workflow_ref:Coreforce-CAD/oh-my-pi/.github/workflows/cf-cache-read.yml@<BROKER_SHA>
-```
+Receipts are `cache-canary-trust-denial`, `cache-canary-cold-consumer`, `cache-canary-warm-consumer`, reader transfer `receipts/`, and `cache-write-receipts-canary-<id>`. The source SHA, run ID/attempt, snapshot digest/size, exact role, and actual cache hits are evidence. A version string or a local administrator upload is not this proof.
 
-The resulting branch writer subject is:
+No Linux proof qualifies Darwin, musl, Windows, or deployed performance/cost. Existing platform qualification remains authoritative. Optional cache jobs must not transitively skip full qualification or release work; downstream jobs explicitly require successful original predecessors while tolerating a skipped optional cache job.
 
-```text
-repo:Coreforce-CAD/oh-my-pi:ref:refs/heads/coreforge:job_workflow_ref:Coreforce-CAD/oh-my-pi/.github/workflows/cf-cache-write.yml@<BROKER_SHA>
-```
+## Cache contents and restore order
 
-Subject values containing `:` use GitHub's `%3A` encoding inside claim values. The values shown here need no such encoding. Do not add job environments without reviewing their changed `context` subjects and trust.
+Only the existing Bazel `--disk_cache` and `--repository_cache` roots are snapshotted: `~/.cache/omp-bazel-disk` and `~/.cache/omp-bazel-repo`. Allowlisted contents are regular action/CAS files, repository downloads, and zero-byte canonical-ID markers. Output bases, extracted repository trees, logs, credentials/profiles, signing material, and unrelated workspaces are excluded. Windows ARM64 and full Rust qualification retain Cargo ownership.
 
-**Do not apply this template now.** It changes OIDC issuance for the entire repository. Existing `relay.yml` publishes to ECR through `SomaPlatformProdRelayPublish` and performs keyless cosign signing in a non-reusable job. Such jobs lack `job_workflow_ref`; a template requiring it can prevent token issuance, not merely change the AWS subject. Updating the relay role's old subject alone is insufficient.
+Compatibility separates target/runner, actual OS/architecture, Bazel 9.2.0, compiler/SDK/tool identities, pinned toolchains, native configuration, and snapshot format. Native source and commit SHAs do not partition the durable cache; Bazel action hashes invalidate changed inputs.
 
-The owner must first design, review, and qualify compatible reusable relay publication/signing or another GitHub-supported subject migration. Preserve the existing relay role's release restrictions, ECR scope, cosign certificate identity, issuer verification, and required release gates. Confirm both AWS STS and the Sigstore/Fulcio token path remain compatible. Inventory other OIDC consumers before applying a repository-wide change. This PR changes neither relay publication code nor live OIDC configuration. Until that migration is complete, leave this cache disabled; never weaken its trust to the default repository-only subject.
+S3 restores first. A confirmed miss or incompatible snapshot falls back to the identity-scoped GitHub hot cache, then the real cold build. Corrupt, partial, denied, or unreachable snapshots produce scoped warnings. They never skip required work or convert failed builds into success.
 
-## OIDC role trust
+Archives/manifests are immutable; current references update last. Restore checks identity, size/SHA256, and every member before atomically replacing either root with rollback. GNU tar long names support valid SHA-512 repository paths; traversal, duplicate paths, links, devices, sparse entries, and unapproved layouts are rejected.
 
-Create or reuse the account's provider for `https://token.actions.githubusercontent.com`, with audience `sts.amazonaws.com`. Use the following read-role trust policy after replacing every placeholder:
+## Retention and cleanup
 
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [{
-    "Effect": "Allow",
-    "Principal": {"Federated": "arn:<PARTITION>:iam::<ACCOUNT_ID>:oidc-provider/token.actions.githubusercontent.com"},
-    "Action": "sts:AssumeRoleWithWebIdentity",
-    "Condition": {
-      "StringEquals": {"token.actions.githubusercontent.com:aud": "sts.amazonaws.com"},
-      "StringLike": {
-        "token.actions.githubusercontent.com:sub": [
-          "repo:Coreforce-CAD/oh-my-pi:pull_request:job_workflow_ref:Coreforce-CAD/oh-my-pi/.github/workflows/cf-cache-read.yml@<BROKER_SHA>",
-          "repo:Coreforce-CAD/oh-my-pi:ref:refs/heads/coreforge:job_workflow_ref:Coreforce-CAD/oh-my-pi/.github/workflows/cf-cache-read.yml@<BROKER_SHA>",
-          "repo:Coreforce-CAD/oh-my-pi:ref:refs/tags/v*.*.*.*:job_workflow_ref:Coreforce-CAD/oh-my-pi/.github/workflows/cf-cache-read.yml@<BROKER_SHA>",
-          "repo:Coreforce-CAD/oh-my-pi:ref:refs/tags/relay/v*:job_workflow_ref:Coreforce-CAD/oh-my-pi/.github/workflows/cf-cache-read.yml@<BROKER_SHA>"
-        ]
-      }
-    }
-  }]
-}
-```
+Every successful publication runs `python3 scripts/ci_cache.py prune --keep 2 --apply`. Pruning retains current references plus two historical generations per compatibility dimension. A retirement marker is written before a current reference changes and completed afterward. Previously current data receives a full 24-hour reader grace after supersession, even after long idle periods. Interrupted pending markers retain their targets safely; malformed or incomplete metadata stops deletion.
 
-The writer uses the same provider and audience, but only these subjects:
-
-```json
-[
-  "repo:Coreforce-CAD/oh-my-pi:ref:refs/heads/coreforge:job_workflow_ref:Coreforce-CAD/oh-my-pi/.github/workflows/cf-cache-write.yml@<BROKER_SHA>",
-  "repo:Coreforce-CAD/oh-my-pi:ref:refs/tags/v*.*.*.*:job_workflow_ref:Coreforce-CAD/oh-my-pi/.github/workflows/cf-cache-write.yml@<BROKER_SHA>",
-  "repo:Coreforce-CAD/oh-my-pi:ref:refs/tags/relay/v*:job_workflow_ref:Coreforce-CAD/oh-my-pi/.github/workflows/cf-cache-write.yml@<BROKER_SHA>"
-]
-```
-
-AWS wildcard matching is not a SemVer validator. The pinned broker independently verifies the event, exact caller workflow path and SHA, ref syntax, tag commit, and current protected branch tip before assuming the role. Do not add PR writer trust or trust another repository. Restrict role sessions to the short duration needed for these broker jobs.
-
-## Bucket and role permissions
-
-Enable all four S3 Block Public Access controls. Use Object Ownership `BucketOwnerEnforced`; do not grant ACL permissions. Enable default SSE-S3 encryption with `AES256`. Keep this cache separate from release assets, credentials, and production data.
-
-Read-role identity policy:
-
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [{
-    "Effect": "Allow",
-    "Action": "s3:GetObject",
-    "Resource": [
-      "arn:<PARTITION>:s3:::<BUCKET>/<PREFIX>/refs/*",
-      "arn:<PARTITION>:s3:::<BUCKET>/<PREFIX>/manifests/*",
-      "arn:<PARTITION>:s3:::<BUCKET>/<PREFIX>/objects/*"
-    ]
-  }]
-}
-```
-
-The reader needs no `ListBucket`, write, delete, KMS, or access outside this prefix. With this permission, S3 can report an absent key as HTTP 403 rather than 404. The helper must treat that ambiguous response as a visible cache error, not a confirmed miss. A new empty bucket may therefore produce a warning and a cold build until the first trusted publication. Do not grant bucket listing merely to hide that distinction.
-
-Writer identity policy, including explicit cache-only pruning:
-
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Action": ["s3:GetObject", "s3:PutObject", "s3:AbortMultipartUpload"],
-      "Resource": [
-        "arn:<PARTITION>:s3:::<BUCKET>/<PREFIX>/refs/*",
-        "arn:<PARTITION>:s3:::<BUCKET>/<PREFIX>/manifests/*",
-        "arn:<PARTITION>:s3:::<BUCKET>/<PREFIX>/objects/*"
-      ]
-    },
-    {
-      "Effect": "Allow",
-      "Action": "s3:DeleteObject",
-      "Resource": [
-        "arn:<PARTITION>:s3:::<BUCKET>/<PREFIX>/manifests/*",
-        "arn:<PARTITION>:s3:::<BUCKET>/<PREFIX>/objects/*"
-      ]
-    },
-    {
-      "Effect": "Allow",
-      "Action": "s3:ListBucket",
-      "Resource": "arn:<PARTITION>:s3:::<BUCKET>",
-      "Condition": {"StringLike": {"s3:prefix": ["<PREFIX>/", "<PREFIX>/*"]}}
-    }
-  ]
-}
-```
-
-`DeleteObject` is limited to immutable cache data because the writer runs the validated `prune` command. It cannot delete references, the bucket, other prefixes, or object versions. `AbortMultipartUpload` permits cleanup of interrupted archive uploads. Do not grant `s3:*`, bucket administration, `DeleteObjectVersion`, or unrelated service permissions.
-
-Use this dedicated bucket policy in addition to the role policies:
-
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Sid": "DenyInsecureTransport",
-      "Effect": "Deny",
-      "Principal": "*",
-      "Action": "s3:*",
-      "Resource": ["arn:<PARTITION>:s3:::<BUCKET>", "arn:<PARTITION>:s3:::<BUCKET>/*"],
-      "Condition": {"Bool": {"aws:SecureTransport": "false"}}
-    },
-    {
-      "Sid": "RequireExplicitSSES3ForCacheWrites",
-      "Effect": "Deny",
-      "Principal": "*",
-      "Action": "s3:PutObject",
-      "Resource": "arn:<PARTITION>:s3:::<BUCKET>/<PREFIX>/*",
-      "Condition": {"StringNotEquals": {"s3:x-amz-server-side-encryption": "AES256"}}
-    }
-  ]
-}
-```
-
-Do not add public or cross-account allow statements. If the owner requires additional organization or endpoint restrictions, qualify those restrictions without widening these grants.
-
-## Retention and controlled maintenance
-
-Objects are content-addressed. Manifests identify successful generations. The publisher updates `refs/<slot>/current.json` only after immutable archive upload and validation.
-
-Every successful broker publication runs:
-
-```sh
-python3 scripts/ci_cache.py prune --keep 2 --apply
-```
-
-Pruning preserves every current reference and the newest two historical manifests per compatibility dimension. A 24-hour grace protects in-flight transfers. Invalid references or incomplete listings stop deletion. Retention does not depend on cache activity or object age alone.
-
-Review a dry-run plan before explicitly retiring an obsolete, noncurrent dimension:
+Review an explicit plan before retiring an obsolete noncurrent dimension:
 
 ```sh
 python3 scripts/ci_cache.py prune --keep 2 --retire '<SLOT>/<DIMENSION>'
 python3 scripts/ci_cache.py prune --keep 2 --retire '<SLOT>/<DIMENSION>' --apply
 ```
 
-Run owner maintenance only with the same prefix-scoped permissions and serialization as publication. The broker uses concurrency group `cf-durable-cache-publish` with cancellation disabled. An external maintenance session must exclude concurrent broker publishers; GitHub's concurrency group cannot serialize an external process automatically.
+Use the writer's prefix-scoped authority and serialize maintenance with publisher concurrency group `cf-durable-cache-publish`. An external maintenance session must exclude concurrent publishers; GitHub cannot serialize an unrelated external process.
 
-Do not configure lifecycle expiration for snapshots, manifests, or references. Optional lifecycle cleanup may abort incomplete multipart uploads after one day. For a new dedicated bucket, leave versioning disabled unless the owner also supplies a separate noncurrent-version retention policy. The writer deliberately lacks permanent version deletion.
+After retaining canary receipts, remove only its exact owned S3 namespace through the approved native operational route. Runtime writers intentionally cannot delete references. Preserve production snapshots and unrelated data. Do not enable versioning or add lifecycle expiration without a governed retention design.
 
-## Broker interfaces and failure behavior
+## Focused source verification
 
-`cf-cache-read.yml` accepts `slots` (required JSON array of valid slot strings) and `enabled` (boolean, default `false`). It has no scalar workflow outputs. For each enabled slot it uploads `cache-restore-<slot>` with one-day retention. A valid snapshot contains `manifest.json` and `snapshot.tar.gz`. `status.json` records the transfer outcome, including misses/errors; it is not evidence of an identity-compatible hit. Consumers perform the helper's full restore validation. Missing manifests mean a cold build.
+```sh
+python3 -m unittest discover -s scripts -p 'test_ci_cache*.py'
+```
 
-The reader checks the actual repository, event, and protected base before checkout or OIDC. It never checks out the PR source. Disabled operation needs no credentials. Incomplete enabled configuration, STS failures, fetch failures, and artifact-transfer failures produce cache-only warnings, never invented hits.
-
-`cf-cache-write.yml` accepts `enabled` (boolean, default `false`), `source-sha` (required full commit SHA), `expected-workflow` (required `cf-release` or `relay`), and `build-result` (required string). It has no workflow outputs. `build-result=success` is necessary but insufficient.
-
-Before OIDC, the writer queries GitHub for the actual run attempt, event, repository, head SHA, workflow ID/path, and current `coreforge` tip. Tags must resolve to that same commit. The writer requires these completed-success predecessor jobs:
-
-- `cf-release`: `prepare`, all eight `build (<target>)` jobs, `release`, and `verify_release`.
-- `relay`: `validate` and `publish`.
-
-The writer accepts only the expected `snapshot-*` artifacts from the same run and validates manifest source SHA, run ID, attempt, and slot. It downloads no caller-selected run, executes no artifact, and checks out only protected `coreforge`. Reruns must regenerate every required snapshot for the current attempt; older artifacts cannot authorize publication.
-
-Release snapshot slots are `darwin-arm64-xcode-27`, `darwin-x64-macos-15-intel`, `linux-x64-ubuntu-22.04`, `linux-arm64-ubuntu-24.04-arm`, `linux-musl-x64-ubuntu-22.04`, `linux-musl-arm64-ubuntu-24.04-arm`, and `win32-x64-ubuntu-24.04`. Relay uses `linux-x64-ubuntu-24.04`. Windows ARM64 remains a required release gate but uses Cargo, not this cache.
-
-Only the dedicated broker jobs request `id-token: write`. The writer additionally needs `actions: read` for authoritative provenance checks. Neither broker has `contents: write`. Cache publication failure remains visible in annotations and the step summary, but cannot convert a failed original gate into success. Callers must retain their original `needs` and failure conditions independently of these cache jobs.
-
-## Observed local qualification
-
-- Python 3.15.2: all 28 cache regression tests passed, including long SHA-512 repository paths, integrity failures, atomic rollback, trust refusal, and retention.
-- Ten subprocess scenarios executed the actual writer's pre-OIDC guard against exact synthetic GitHub API responses. Unknown network destinations were forbidden.
-- A real Bazel 9.2.0 C compilation used a loopback HTTP header dependency and separate cold/warm output bases. Restored disk and repository caches produced `1 disk cache hit` with `--repository_disable_download` and the HTTP fixture stopped.
-- The warm executable returned `42`; changed source returned `43`; a cache miss fetched the dependency and compiled a working executable.
-- Snapshot archives use GNU tar long-name support for valid SHA-512 paths. Extraction still rejects traversal, duplicate paths, links, special files, sparse entries, and unapproved payload layouts.
-- Storage publication used the isolated filesystem object-store interface, not AWS. No OIDC token, STS role, real S3 transfer, hosted native matrix, or deployed speed/cost claim was qualified locally.
+The permanent suite covers actual authorization predicates, source/run/attempt boundaries, denied or malformed S3 existence lookups, safe archive/restore/publication, reader grace after supersession, and explicit pruning. Source tests do not establish live S3/OIDC deployment; retain real cloud canary receipts separately.
 
 ## Primary references
 
-- [GitHub OIDC reusable-workflow claims](https://docs.github.com/en/actions/how-tos/secure-your-work/security-harden-deployments/oidc-with-reusable-workflows)
-- [GitHub subject customization](https://docs.github.com/en/actions/reference/security/oidc#customizing-the-subject-claims-for-an-organization-or-repository)
+- [AWS IAM GitHub-specific OIDC condition keys](https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_iam-condition-keys.html#condition-keys-wif)
+- [AWS required shared-provider controls](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_providers_oidc_secure-by-default.html)
+- [GitHub reusable-workflow OIDC claims](https://docs.github.com/en/actions/how-tos/secure-your-work/security-harden-deployments/oidc-with-reusable-workflows)
 - [GitHub cache inactivity eviction](https://docs.github.com/en/actions/reference/workflows-and-actions/dependency-caching#usage-limits-and-eviction-policy)
-- [Bazel 9.2 disk cache layout](https://github.com/bazelbuild/bazel/blob/9.2.0/src/main/java/com/google/devtools/build/lib/remote/disk/DiskCacheClient.java)
-- [Bazel 9.2 repository download cache](https://github.com/bazelbuild/bazel/blob/9.2.0/src/main/java/com/google/devtools/build/lib/bazel/repository/cache/DownloadCache.java)
-- [S3 SSE-S3 and multipart encryption](https://docs.aws.amazon.com/AmazonS3/latest/userguide/specifying-s3-encryption.html)
+- [Bazel 9.2 repository cache](https://github.com/bazelbuild/bazel/blob/9.2.0/src/main/java/com/google/devtools/build/lib/bazel/repository/cache/DownloadCache.java)

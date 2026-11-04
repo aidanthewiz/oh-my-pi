@@ -1,3 +1,4 @@
+import contextlib
 import datetime as dt
 import importlib.util
 import io
@@ -18,6 +19,13 @@ SPEC.loader.exec_module(cache)
 DISK_NAME = "cas/aa/" + "a" * 64
 REPO_NAME = "content_addressable/sha256/" + "b" * 64 + "/file"
 ID_NAME = "content_addressable/sha256/" + "b" * 64 + "/id-" + "c" * 64
+CANARY_ENV = {
+    "GITHUB_EVENT_NAME": "workflow_dispatch",
+    "GITHUB_REF": "refs/heads/coreforge",
+    "GITHUB_WORKFLOW_REF": cache.REPOSITORY + "/.github/workflows/cf-cache-canary.yml@refs/heads/coreforge",
+    "CI_CACHE_CANARY_ID": "proof-123",
+    "CI_CACHE_PREFIX": "omp-bazel-v1/canary/proof-123",
+}
 NOW = dt.datetime(2030, 1, 10, tzinfo=dt.timezone.utc)
 
 
@@ -77,6 +85,17 @@ class CacheTests(unittest.TestCase):
         snapshot, manifest = self.snapshot(name, generation, identity)
         cache.publish(snapshot, self.store)
         return snapshot, manifest
+
+    @contextlib.contextmanager
+    def publication_time(self, when):
+        original_put = self.store.put
+        def put(key, source, immutable=False):
+            exists = self.store.path(key).exists()
+            original_put(key, source, immutable)
+            if not immutable or not exists:
+                os.utime(self.store.path(key), (when.timestamp(),) * 2)
+        with patch.object(cache, "timestamp", return_value=when.isoformat().replace("+00:00", "Z")), patch.object(self.store, "put", side_effect=put):
+            yield
 
     def roots(self):
         disk, repo = self.root / "restored-disk", self.root / "restored-repo"
@@ -197,6 +216,75 @@ class CacheTests(unittest.TestCase):
         self.write(path, ("#!/bin/sh\n" + body).encode())
         path.chmod(0o755)
 
+    def s3_fixture(self):
+        remote = self.root / "synthetic-s3"
+        data = remote / "data"
+        data.mkdir(parents=True)
+        control = remote / "control.json"
+        cache.atomic_json(control, {})
+        binary = self.root / "synthetic-bin" / "aws"
+        self.write(binary, (f"#!{sys.executable}\n" + """import hashlib
+import json
+import os
+from pathlib import Path
+import sys
+
+root = Path(os.environ["SYNTHETIC_S3_ROOT"])
+data = root / "data"
+control = json.loads((root / "control.json").read_text())
+args = sys.argv[1:]
+operation = args[1]
+
+def argument(name):
+    return args[args.index(name) + 1]
+
+def deny(operation, code="AccessDenied"):
+    print(f"An error occurred ({code}) when calling the {operation} operation: synthetic denial", file=sys.stderr)
+    sys.exit(255)
+
+if operation == "list-objects-v2":
+    if control.get("deny_list"):
+        deny("ListObjectsV2")
+    if "list_raw" in control:
+        print(control["list_raw"])
+        sys.exit()
+    if "list_response" in control:
+        print(json.dumps(control["list_response"]))
+        sys.exit()
+    prefix = argument("--prefix")
+    maximum = int(argument("--max-keys")) if "--max-keys" in args else 1000
+    keys = sorted(path.relative_to(data).as_posix() for path in data.rglob("*") if path.is_file() and path.relative_to(data).as_posix().startswith(prefix))
+    selected = keys[:maximum]
+    print(json.dumps({"Prefix": prefix, "MaxKeys": maximum, "KeyCount": len(selected), "IsTruncated": len(keys) > maximum, "Contents": [{"Key": key, "Size": (data / key).stat().st_size, "LastModified": "2030-01-01T00:00:00Z"} for key in selected]}))
+elif operation in {"get-object", "head-object"}:
+    path = data / argument("--key")
+    if control.get("deny_get" if operation == "get-object" else "deny_head") or not path.exists():
+        deny("GetObject" if operation == "get-object" else "HeadObject", control.get("error_code", "AccessDenied"))
+    body = path.read_bytes()
+    if operation == "get-object":
+        Path(args[args.index("--key") + 2]).write_bytes(body)
+    print(json.dumps({"ContentLength": len(body), "Metadata": {"sha256": hashlib.sha256(body).hexdigest()}, "LastModified": "2030-01-01T00:00:00Z"}))
+elif operation == "cp":
+    if control.get("deny_copy"):
+        deny("PutObject")
+    destination = data / args[3].split("/", 3)[3]
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_bytes(Path(args[2]).read_bytes())
+else:
+    raise RuntimeError("unexpected synthetic AWS operation: " + operation)
+""").encode())
+        binary.chmod(0o755)
+        environment = patch.dict(os.environ, {
+            "PATH": str(binary.parent) + os.pathsep + os.environ["PATH"],
+            "SYNTHETIC_S3_ROOT": str(remote),
+            "CI_CACHE_BUCKET": "synthetic-cache",
+            "CI_CACHE_REGION": "us-east-1",
+            "CI_CACHE_PREFIX": "synthetic/cache",
+        })
+        environment.start()
+        self.addCleanup(environment.stop)
+        return cache.S3Store(), data, control
+
     def test_identity_accepts_bazelisk_without_bazel_and_never_invokes_rustup(self):
         root, binary = self.identity_fixture()
         self.executable(binary / "bazelisk", "printf 'bazel 9.2.0\\n'\n")
@@ -295,6 +383,70 @@ class CacheTests(unittest.TestCase):
                 cache.publish(snapshot, self.store)
             pointer = cache.read_json(self.store.path(f"refs/{self.identity['slot']}/current.json"))
             self.assertEqual(pointer["manifest"]["source_sha"], manifest["source_sha"])
+
+    def test_protected_canary_can_publish_fetch_and_apply_prune(self):
+        snapshot, manifest = self.snapshot()
+        with patch.dict(os.environ, CANARY_ENV):
+            cache.publish(snapshot, self.store)
+            orphan_key = "objects/" + "e" * 64 + ".tar.gz"
+            self.write(self.store.path(orphan_key), b"expired canary orphan")
+            self.age_store()
+            with patch.dict(os.environ, {"GITHUB_ACTIONS": "true"}):
+                plan = cache.prune(self.store, apply=True, now=NOW)
+            self.assertIn(orphan_key, plan["delete"])
+            self.assertFalse(self.store.path(orphan_key).exists())
+            fetched = self.root / "protected-canary-fetch"
+            cache.fetch(self.identity["slot"], fetched, self.store)
+            self.assertEqual(cache.read_json(fetched / "manifest.json"), manifest)
+            disk, repo = self.roots()
+            cache.restore(self.identity_path, fetched, disk, repo)
+            self.assertEqual((disk / DISK_NAME).read_bytes(), b"compiled action output")
+
+    def assert_canary_operations_denied(self, cases):
+        snapshot, _ = self.snapshot()
+        self.write(self.store.path("objects/" + "e" * 64 + ".tar.gz"), b"eligible orphan")
+        self.age_store()
+        before = {row["key"] for row in self.store.listing()}
+        for changes in cases:
+            with self.subTest(environment=changes), patch.dict(os.environ, {**CANARY_ENV, **changes}):
+                with self.assertRaises(cache.CacheError):
+                    cache.publish(snapshot, self.store)
+                self.assertEqual({row["key"] for row in self.store.listing()}, before)
+                with patch.dict(os.environ, {"GITHUB_ACTIONS": "true"}), self.assertRaises(cache.CacheError):
+                    cache.prune(self.store, apply=True, now=NOW)
+                self.assertEqual({row["key"] for row in self.store.listing()}, before)
+
+    def test_canary_rejects_other_events_and_missing_or_unsafe_mode(self):
+        cases = [{"GITHUB_EVENT_NAME": event} for event in ("push", "pull_request", "pull_request_target", "workflow_run")]
+        cases.extend({"CI_CACHE_CANARY_ID": value} for value in ("", "-proof", "Proof", "proof_123", "proof/123", "a" * 49))
+        cases.append({"GITHUB_EVENT_NAME": "push", "GITHUB_WORKFLOW_REF": cache.REPOSITORY + "/.github/workflows/cf-release.yml@refs/heads/coreforge"})
+        self.assert_canary_operations_denied(cases)
+
+    def test_canary_rejects_other_refs_workflows_and_repositories(self):
+        self.assert_canary_operations_denied([
+            {"GITHUB_REF": "refs/heads/feature/proof"},
+            {"GITHUB_REF": "refs/tags/v1.2.3.4"},
+            {"GITHUB_WORKFLOW_REF": cache.REPOSITORY + "/.github/workflows/cf-cache-canary.yml@refs/heads/feature/proof"},
+            {"GITHUB_WORKFLOW_REF": cache.REPOSITORY + "/.github/workflows/cf-release.yml@refs/heads/coreforge"},
+            {"GITHUB_WORKFLOW_REF": "fork/oh-my-pi/.github/workflows/cf-cache-canary.yml@refs/heads/coreforge"},
+            {"GITHUB_REPOSITORY": "fork/oh-my-pi"},
+        ])
+
+    def test_canary_rejects_missing_production_and_mismatched_prefixes(self):
+        self.assert_canary_operations_denied([
+            {"CI_CACHE_PREFIX": prefix}
+            for prefix in ("", "omp-bazel-v1", "omp-bazel-v1/canary/other", "omp-bazel-v1/canary/proof-123/", "omp-bazel-v1/canary/proof-123/nested")
+        ])
+
+    def test_canary_preserves_success_source_and_run_provenance_guards(self):
+        self.assert_canary_operations_denied([{"CACHE_BUILD_RESULT": "failure"}])
+        snapshot, _ = self.snapshot("canary-provenance")
+        before = {row["key"] for row in self.store.listing()}
+        for changes in ({"GITHUB_SHA": "2" * 40}, {"GITHUB_RUN_ID": "999"}, {"GITHUB_RUN_ATTEMPT": "2"}):
+            with self.subTest(environment=changes), patch.dict(os.environ, {**CANARY_ENV, **changes}):
+                with self.assertRaises(cache.CacheError):
+                    cache.publish(snapshot, self.store)
+                self.assertEqual({row["key"] for row in self.store.listing()}, before)
 
     def test_archive_rejects_traversal_links_duplicate_special_and_unknown_members(self):
         snapshot, _ = self.snapshot()
@@ -405,6 +557,117 @@ class CacheTests(unittest.TestCase):
                 with self.assertRaises(cache.CacheError):
                     cache.S3Store()
 
+    def test_s3_pointer_lookup_confirms_absence_and_reads_exact_match_among_neighbors(self):
+        store, remote, _ = self.s3_fixture()
+        key = f"refs/{self.identity['slot']}/current.json"
+        destination = self.root / "s3-pointer"
+        self.assertFalse(store.get(key, destination))
+        self.assertFalse(destination.exists())
+        self.write(remote / store.key(key + ".backup"), b"not the current pointer")
+        self.assertFalse(store.get(key, destination))
+        self.assertFalse(destination.exists())
+        self.write(remote / store.key(key), b"the exact current pointer")
+        self.assertTrue(store.get(key, destination))
+        self.assertEqual(destination.read_bytes(), b"the exact current pointer")
+
+    def test_s3_immutable_first_upload_reuse_and_collision_preserve_bytes(self):
+        store, remote, control = self.s3_fixture()
+        key = "objects/" + "a" * 64 + ".tar.gz"
+        source = self.root / "s3-source"
+        source.write_bytes(b"original")
+        self.write(remote / store.key(key + ".backup"), b"neighbor")
+        store.put(key, source, immutable=True)
+        self.assertEqual((remote / store.key(key)).read_bytes(), b"original")
+        cache.atomic_json(control, {"deny_copy": True})
+        store.put(key, source, immutable=True)
+        self.assertEqual((remote / store.key(key)).read_bytes(), b"original")
+        source.write_bytes(b"modified")
+        with self.assertRaisesRegex(cache.CacheError, "digest collision"):
+            store.put(key, source, immutable=True)
+        self.assertEqual((remote / store.key(key)).read_bytes(), b"original")
+        source.write_bytes(b"different size")
+        with self.assertRaisesRegex(cache.CacheError, "size collision"):
+            store.put(key, source, immutable=True)
+        self.assertEqual((remote / store.key(key)).read_bytes(), b"original")
+
+    def test_s3_lookup_denial_blocks_pointer_read_and_first_immutable_upload(self):
+        store, remote, control = self.s3_fixture()
+        pointer_key = f"refs/{self.identity['slot']}/current.json"
+        self.write(remote / store.key(pointer_key), b"private pointer")
+        cache.atomic_json(control, {"deny_list": True})
+        destination = self.root / "denied-s3-pointer"
+        with self.assertRaisesRegex(cache.CacheError, "AccessDenied"):
+            store.get(pointer_key, destination)
+        self.assertFalse(destination.exists())
+        source = self.root / "denied-s3-upload"
+        source.write_bytes(b"must not upload")
+        object_key = "objects/" + "a" * 64 + ".tar.gz"
+        with self.assertRaisesRegex(cache.CacheError, "AccessDenied"):
+            store.put(object_key, source, immutable=True)
+        self.assertFalse((remote / store.key(object_key)).exists())
+
+    def test_s3_invalid_exact_lookup_blocks_pointer_read_and_immutable_upload(self):
+        store, remote, control = self.s3_fixture()
+        source = self.root / "invalid-list-source"
+        source.write_bytes(b"must not upload")
+        destination = self.root / "invalid-list-pointer"
+        for operation, key in (("get", f"refs/{self.identity['slot']}/current.json"), ("put", "objects/" + "a" * 64 + ".tar.gz")):
+            full_key = store.key(key)
+            empty = {"Prefix": full_key, "MaxKeys": 1, "KeyCount": 0, "IsTruncated": False, "Contents": []}
+            entry = {"Key": full_key, "Size": 10, "LastModified": "2030-01-01T00:00:00Z"}
+            single = {**empty, "KeyCount": 1, "Contents": [entry]}
+            responses = [
+                [],
+                {**empty, "Prefix": "another/prefix"},
+                {**empty, "MaxKeys": 2},
+                {**empty, "KeyCount": True},
+                {**empty, "KeyCount": 1},
+                {**empty, "IsTruncated": True},
+                {**empty, "IsTruncated": None},
+                {**empty, "Contents": {}},
+                {**single, "KeyCount": 2, "Contents": [entry, entry]},
+                {**single, "Contents": [None]},
+                {**single, "Contents": [{**entry, "Key": "another/key"}]},
+                {**single, "Contents": [{**entry, "Size": -1}]},
+                {**single, "Contents": [{**entry, "Size": True}]},
+                {**single, "Contents": [{**entry, "LastModified": "2030-01-01T00:00:00"}]},
+            ]
+            configurations = [{"list_response": response} for response in responses] + [{"list_raw": "{"}]
+            for configuration in configurations:
+                with self.subTest(operation=operation, configuration=configuration):
+                    cache.atomic_json(control, configuration)
+                    with self.assertRaises((cache.CacheError, ValueError)):
+                        if operation == "get":
+                            store.get(key, destination)
+                        else:
+                            store.put(key, source, immutable=True)
+                    self.assertFalse(destination.exists())
+                    self.assertFalse((remote / store.key(key)).exists())
+
+    def test_s3_referenced_get_and_existing_pointer_or_head_errors_are_not_misses(self):
+        store, remote, control = self.s3_fixture()
+        destination = self.root / "unreadable-s3-object"
+        object_key = "objects/" + "a" * 64 + ".tar.gz"
+        for code in ("AccessDenied", "NoSuchKey"):
+            with self.subTest(code=code):
+                cache.atomic_json(control, {"error_code": code})
+                with self.assertRaisesRegex(cache.CacheError, code):
+                    store.get(object_key, destination)
+                self.assertFalse(destination.exists())
+        pointer_key = f"refs/{self.identity['slot']}/current.json"
+        self.write(remote / store.key(pointer_key), b"unreadable pointer")
+        cache.atomic_json(control, {"deny_get": True})
+        with self.assertRaisesRegex(cache.CacheError, "AccessDenied"):
+            store.get(pointer_key, destination)
+        self.assertFalse(destination.exists())
+        source = self.root / "unreadable-head-source"
+        source.write_bytes(b"original")
+        self.write(remote / store.key(object_key), b"original")
+        cache.atomic_json(control, {"deny_head": True})
+        with self.assertRaisesRegex(cache.CacheError, "AccessDenied"):
+            store.put(object_key, source, immutable=True)
+        self.assertEqual((remote / store.key(object_key)).read_bytes(), b"original")
+
     def test_prune_preserves_current_latest_historical_shared_and_grace_objects(self):
         generations = []
         for generation in range(100, 105):
@@ -417,7 +680,9 @@ class CacheTests(unittest.TestCase):
         self.write(orphan, b"in flight")
         os.utime(orphan, ((NOW - dt.timedelta(hours=1)).timestamp(),) * 2)
         dry = cache.prune(self.store, keep=2, now=NOW)
-        self.assertEqual(set(dry["delete"]), {key for manifest in generations[:2] for key in (cache.manifest_key(manifest), cache.object_key(manifest))})
+        expected = {key for manifest in generations[:2] for key in (cache.manifest_key(manifest), cache.object_key(manifest))}
+        expected.update(cache.retirement_key(manifest) for manifest in generations[:-1])
+        self.assertEqual(set(dry["delete"]), expected)
         self.assertTrue(self.store.path(cache.manifest_key(generations[0])).exists())
         applied = cache.prune(self.store, keep=2, apply=True, now=NOW)
         self.assertEqual(applied["delete"], dry["delete"])
@@ -439,7 +704,7 @@ class CacheTests(unittest.TestCase):
         cache.publish(second_snapshot, self.store)
         self.age_store()
         plan = cache.prune(self.store, keep=1, apply=True, now=NOW + dt.timedelta(days=3650))
-        self.assertEqual(plan["delete"], [])
+        self.assertEqual(plan["delete"], [cache.retirement_key(first)])
         self.assertTrue(self.store.path(cache.object_key(first)).exists())
 
     def test_prune_requires_explicit_retirement_and_refuses_current_dimension(self):
@@ -457,6 +722,217 @@ class CacheTests(unittest.TestCase):
         with self.assertRaises(cache.CacheError):
             cache.prune(self.store, retire=[current["slot"] + "/" + current["dimension"]], apply=True, now=NOW)
         self.assertEqual({row["key"] for row in self.store.listing()}, before)
+
+    def test_long_idle_current_survives_quick_supersessions_for_full_reader_grace(self):
+        with self.publication_time(NOW - dt.timedelta(days=30)):
+            _, original = self.publish()
+        generations = []
+        class InFlightReader(cache.LocalStore):
+            def get(inner, key, destination):
+                result = super().get(key, destination)
+                if key == f"refs/{self.identity['slot']}/current.json":
+                    for index in range(4):
+                        self.write(self.disk / DISK_NAME, f"generation {index}".encode())
+                        with self.publication_time(NOW + dt.timedelta(minutes=index)):
+                            generations.append(self.publish(f"quick-{index}", str(101 + index))[1])
+                    plan = cache.prune(self.store, apply=True, now=NOW + cache.GRACE - dt.timedelta(seconds=1))
+                    self.assertNotIn(cache.manifest_key(original), plan["delete"])
+                    self.assertNotIn(cache.object_key(original), plan["delete"])
+                return result
+        fetched = self.root / "in-flight-reader"
+        self.assertTrue(cache.fetch(self.identity["slot"], fetched, InFlightReader(self.store.root)))
+        disk, repo = self.roots()
+        cache.restore(self.identity_path, fetched, disk, repo)
+        self.assertEqual((disk / DISK_NAME).read_bytes(), b"compiled action output")
+        plan = cache.prune(self.store, apply=True, now=NOW + cache.GRACE)
+        self.assertIn(cache.manifest_key(original), plan["delete"])
+        self.assertIn(cache.object_key(original), plan["delete"])
+        self.assertIn(cache.retirement_key(original), plan["delete"])
+        self.assertFalse(self.store.path(cache.object_key(original)).exists())
+        for manifest in generations[1:]:
+            self.assertTrue(self.store.path(cache.manifest_key(manifest)).exists())
+            self.assertTrue(self.store.path(cache.object_key(manifest)).exists())
+        latest = self.root / "latest-after-grace"
+        cache.fetch(self.identity["slot"], latest, self.store)
+        cache.restore(self.identity_path, latest, disk, repo)
+        self.assertEqual((disk / DISK_NAME).read_bytes(), b"generation 3")
+
+    def test_retired_manifest_expiry_does_not_delete_archive_shared_with_current(self):
+        with self.publication_time(NOW - dt.timedelta(days=30)):
+            original_snapshot, original = self.publish()
+        for index in range(3):
+            self.write(self.disk / DISK_NAME, f"different {index}".encode())
+            with self.publication_time(NOW + dt.timedelta(minutes=index)):
+                self.publish(f"different-{index}", str(101 + index))
+        with self.publication_time(NOW + dt.timedelta(minutes=3)):
+            snapshot, current = self.snapshot("shared-current", "104")
+            current["sha256"], current["size"] = original["sha256"], original["size"]
+            (snapshot / "snapshot.tar.gz").write_bytes((original_snapshot / "snapshot.tar.gz").read_bytes())
+            cache.atomic_json(snapshot / "manifest.json", current)
+            cache.publish(snapshot, self.store)
+        plan = cache.prune(self.store, apply=True, now=NOW + cache.GRACE + dt.timedelta(hours=1))
+        self.assertIn(cache.manifest_key(original), plan["delete"])
+        self.assertNotIn(cache.object_key(original), plan["delete"])
+        fetched = self.root / "shared-fetch"
+        cache.fetch(self.identity["slot"], fetched, self.store)
+        disk, repo = self.roots()
+        cache.restore(self.identity_path, fetched, disk, repo)
+        self.assertEqual((disk / DISK_NAME).read_bytes(), b"compiled action output")
+
+    def test_retirement_grace_starts_after_slow_pointer_replacement(self):
+        with self.publication_time(NOW - dt.timedelta(days=30)):
+            _, original = self.publish("slow-original")
+        retired = original["slot"] + "/" + original["dimension"]
+        self.write(self.disk / DISK_NAME, b"new dimension")
+        changed = {**self.identity, "tools": {"cc": "new compiler"}}
+        clock = [NOW]
+        original_put = self.store.put
+        def slow_pointer(key, source, immutable=False):
+            original_put(key, source, immutable)
+            if key.startswith("refs/"):
+                clock[0] += dt.timedelta(days=2)
+            os.utime(self.store.path(key), (clock[0].timestamp(),) * 2)
+            if key.startswith("refs/"):
+                plan = cache.prune(self.store, retire=[retired], apply=True, now=clock[0])
+                self.assertNotIn(cache.manifest_key(original), plan["delete"])
+                self.assertNotIn(cache.object_key(original), plan["delete"])
+        with patch.object(cache, "timestamp", side_effect=lambda: clock[0].isoformat().replace("+00:00", "Z")):
+            snapshot, _ = self.snapshot("slow-replacement", "101", changed)
+            with patch.object(self.store, "put", side_effect=slow_pointer):
+                cache.publish(snapshot, self.store)
+        plan = cache.prune(self.store, retire=[retired], apply=True, now=clock[0] + cache.GRACE - dt.timedelta(seconds=1))
+        self.assertNotIn(cache.manifest_key(original), plan["delete"])
+        self.assertNotIn(cache.object_key(original), plan["delete"])
+        plan = cache.prune(self.store, retire=[retired], apply=True, now=clock[0] + cache.GRACE)
+        self.assertIn(cache.manifest_key(original), plan["delete"])
+        self.assertIn(cache.object_key(original), plan["delete"])
+
+    def test_interrupted_retirement_and_pointer_writes_preserve_readers(self):
+        for failure in ("pending", "pointer", "completion"):
+            with self.subTest(failure=failure):
+                self.store = cache.LocalStore(self.root / ("interrupted-" + failure))
+                self.write(self.disk / DISK_NAME, b"original")
+                with self.publication_time(NOW - dt.timedelta(days=30)):
+                    _, original = self.publish("original-" + failure)
+                self.write(self.disk / DISK_NAME, b"replacement")
+                with self.publication_time(NOW):
+                    snapshot, replacement = self.snapshot("replacement-" + failure, "101")
+                    original_put = self.store.put
+                    def interrupt(key, source, immutable=False):
+                        if key.startswith("retired/"):
+                            pending = cache.read_json(source)["retired_at"] is None
+                            if (failure == "pending" and pending) or (failure == "completion" and not pending):
+                                raise OSError("synthetic retirement interruption")
+                        if failure == "pointer" and key.startswith("refs/"):
+                            raise OSError("synthetic pointer interruption")
+                        return original_put(key, source, immutable)
+                    with patch.object(self.store, "put", side_effect=interrupt), self.assertRaises(OSError):
+                        cache.publish(snapshot, self.store)
+                pointer = cache.read_json(self.store.path(f"refs/{self.identity['slot']}/current.json"))
+                self.assertEqual(pointer["manifest"], replacement if failure == "completion" else original)
+                if failure == "completion":
+                    for index in range(3):
+                        self.write(self.disk / DISK_NAME, f"later {index}".encode())
+                        with self.publication_time(NOW + dt.timedelta(minutes=index + 1)):
+                            self.publish(f"later-{index}", str(102 + index))
+                plan = cache.prune(self.store, apply=True, now=NOW + dt.timedelta(days=2))
+                self.assertNotIn(cache.manifest_key(original), plan["delete"])
+                self.assertNotIn(cache.object_key(original), plan["delete"])
+                self.assertTrue(self.store.path(cache.manifest_key(original)).exists())
+                self.assertTrue(self.store.path(cache.object_key(original)).exists())
+                if failure == "completion":
+                    marker = cache.read_json(self.store.path(cache.retirement_key(original)))
+                    self.assertIsNone(marker["retired_at"])
+                fetched = self.root / ("interrupted-fetch-" + failure)
+                cache.fetch(self.identity["slot"], fetched, self.store)
+                disk, repo = self.roots()
+                cache.restore(self.identity_path, fetched, disk, repo)
+                self.assertEqual((disk / DISK_NAME).read_bytes(), b"later 2" if failure == "completion" else b"original")
+
+    def test_retry_after_failed_pointer_write_starts_new_full_retirement_grace(self):
+        with self.publication_time(NOW - dt.timedelta(days=30)):
+            _, original = self.publish()
+        self.write(self.disk / DISK_NAME, b"retry output")
+        with self.publication_time(NOW):
+            snapshot, _ = self.snapshot("failed-pointer", "101")
+            original_put = self.store.put
+            def interrupt(key, source, immutable=False):
+                if key.startswith("refs/"):
+                    raise OSError("synthetic pointer interruption")
+                return original_put(key, source, immutable)
+            with patch.object(self.store, "put", side_effect=interrupt), self.assertRaises(OSError):
+                cache.publish(snapshot, self.store)
+        resumed_at = NOW + dt.timedelta(days=2)
+        with self.publication_time(resumed_at):
+            cache.publish(snapshot, self.store)
+        for index in range(3):
+            self.write(self.disk / DISK_NAME, f"after retry {index}".encode())
+            with self.publication_time(resumed_at + dt.timedelta(minutes=index + 1)):
+                self.publish(f"after-retry-{index}", str(102 + index))
+        plan = cache.prune(self.store, apply=True, now=resumed_at + cache.GRACE - dt.timedelta(seconds=1))
+        self.assertNotIn(cache.manifest_key(original), plan["delete"])
+        self.assertNotIn(cache.object_key(original), plan["delete"])
+        plan = cache.prune(self.store, apply=True, now=resumed_at + cache.GRACE)
+        self.assertIn(cache.manifest_key(original), plan["delete"])
+        self.assertIn(cache.object_key(original), plan["delete"])
+
+    def test_malformed_or_incomplete_retirement_prevents_all_deletions(self):
+        generations = []
+        for index in range(5):
+            self.write(self.disk / DISK_NAME, f"generation {index}".encode())
+            with self.publication_time(NOW - dt.timedelta(days=2) + dt.timedelta(minutes=index)):
+                generations.append(self.publish(f"metadata-{index}", str(100 + index))[1])
+        key = cache.retirement_key(generations[0])
+        path = self.store.path(key)
+        marker = cache.read_json(path)
+        cases = [
+            {**marker, "schema": 2},
+            {**marker, "unexpected": True},
+            {**marker, "retired_at": "2030-01-01T00:00:00"},
+            {**marker, "retired_at": 123},
+            {**marker, "pointer": cache.pointer_for(generations[1])},
+            {name: value for name, value in marker.items() if name != "retired_at"},
+        ]
+        for invalid in cases:
+            with self.subTest(marker=invalid):
+                cache.atomic_json(path, invalid)
+                before = {row["key"] for row in self.store.listing()}
+                with self.assertRaises(cache.CacheError):
+                    cache.prune(self.store, apply=True, now=NOW)
+                self.assertEqual({row["key"] for row in self.store.listing()}, before)
+        cache.atomic_json(path, marker)
+        unknown = self.store.path("retired/unknown.json")
+        cache.atomic_json(unknown, marker)
+        before = {row["key"] for row in self.store.listing()}
+        with self.assertRaises(cache.CacheError):
+            cache.prune(self.store, apply=True, now=NOW)
+        self.assertEqual({row["key"] for row in self.store.listing()}, before)
+        unknown.unlink()
+        self.store.delete(cache.manifest_key(generations[0]))
+        before = {row["key"] for row in self.store.listing()}
+        with self.assertRaisesRegex(cache.CacheError, "retirement manifest missing"):
+            cache.prune(self.store, apply=True, now=NOW)
+        self.assertEqual({row["key"] for row in self.store.listing()}, before)
+
+    def test_interrupted_prune_removes_expired_markers_before_targets(self):
+        generations = []
+        for index in range(5):
+            self.write(self.disk / DISK_NAME, f"generation {index}".encode())
+            with self.publication_time(NOW - dt.timedelta(days=2) + dt.timedelta(minutes=index)):
+                generations.append(self.publish(f"prune-interruption-{index}", str(100 + index))[1])
+        original_delete = self.store.delete
+        def interrupt(key):
+            if key == cache.manifest_key(generations[0]):
+                raise OSError("synthetic prune interruption")
+            return original_delete(key)
+        with patch.object(self.store, "delete", side_effect=interrupt), self.assertRaises(OSError):
+            cache.prune(self.store, apply=True, now=NOW)
+        self.assertFalse(self.store.path(cache.retirement_key(generations[0])).exists())
+        self.assertTrue(self.store.path(cache.manifest_key(generations[0])).exists())
+        plan = cache.prune(self.store, apply=True, now=NOW)
+        self.assertIn(cache.manifest_key(generations[0]), plan["delete"])
+        self.assertIn(cache.object_key(generations[0]), plan["delete"])
+        self.assertTrue(self.store.path(cache.manifest_key(generations[-1])).exists())
 
     def test_invalid_or_incomplete_listing_prevents_all_deletions(self):
         self.publish()
