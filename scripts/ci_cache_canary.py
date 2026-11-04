@@ -122,6 +122,12 @@ def main(argv=None):
         if arguments.phase == "warm":
             cache.require(hits > 0, "warm native build did not consume restored disk actions")
         addon = Path("packages/natives/native/pi_natives.linux-x64-baseline.node")
+        probe = (
+            'import { verifyHostAddonLoads } from "./scripts/bazel-natives.ts";'
+            'import { nativesPackageVersion } from "./scripts/stamp-native-version.ts";'
+            'await verifyHostAddonLoads(process.argv[1], undefined, await nativesPackageVersion());'
+        )
+        subprocess.run(["bun", "-e", probe, str(addon.resolve())], cwd=Path(__file__).resolve().parent.parent, check=True, timeout=90)
         addon_sha = cache.digest_file(addon)
         if arguments.phase == "warm":
             cold = cache.read_json(arguments.cold_receipt)
@@ -137,7 +143,7 @@ def main(argv=None):
             "dimension": cache.dimension(identity), "restored": restored,
             "confirmed_s3_miss": arguments.phase == "cold", "disk_cache_hits": hits,
             "repository_downloads_disabled": arguments.phase == "warm",
-            "addon_sha256": addon_sha, "addon_load_probe": "passed by canonical native driver",
+            "addon_sha256": addon_sha, "addon_load_probe": "passed explicit baseline load and version check",
             "incompatible_snapshot_missed": incompatible_missed,
             **authority,
         }
