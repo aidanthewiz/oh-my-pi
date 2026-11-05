@@ -1,6 +1,7 @@
 import type {
 	AgentTool,
 	AgentToolContext,
+	AgentToolDocTopic,
 	AgentToolResult,
 	AgentToolUpdateCallback,
 	ToolApprovalDecision,
@@ -94,6 +95,12 @@ export class AwsDbTool implements AgentTool<typeof awsDbSchema, AwsDbToolDetails
 		} catch {
 			this.#lifecycleBound = false;
 		}
+	}
+
+	docTopics(): Readonly<Record<string, AgentToolDocTopic>> {
+		return {
+			schema: { format: "json", value: { name: this.name, inputSchema: this.parameters.toJsonSchema() } },
+		};
 	}
 
 	#sessionId(): string | null {

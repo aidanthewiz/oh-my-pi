@@ -1142,6 +1142,9 @@ export interface AgentToolArgStreamInit {
 	emit(update: unknown): void;
 }
 
+/** On-demand tool documentation: markdown text or an opt-in, unpaged JSON value. */
+export type AgentToolDocTopic = string | { readonly format: "json"; readonly value: unknown };
+
 // AgentTool extends Tool but adds the execute function
 export interface AgentTool<
 	TParameters extends TSchema = TSchema,
@@ -1169,11 +1172,11 @@ export interface AgentTool<
 	 */
 	readonly delegationGuidance?: string;
 	/**
-	 * On-demand documentation topics (`topic → markdown`), readable as
-	 * `xd://<tool>/<topic>`. Lets a tool keep large sub-surfaces out of its
-	 * description and advertise only a one-line pointer per topic.
+	 * On-demand documentation topics, readable as `xd://<tool>/<topic>`.
+	 * Strings are markdown documents; JSON topics return their complete value.
+	 * Advertise large sub-surfaces with a one-line pointer in the description.
 	 */
-	docTopics?(): Readonly<Record<string, string>>;
+	docTopics?(): Readonly<Record<string, AgentToolDocTopic>>;
 	/**
 	 * Concurrency mode for tool scheduling when multiple calls are in one turn.
 	 * - "shared": can run alongside other shared tools (default)

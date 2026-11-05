@@ -16,6 +16,7 @@
 
 ### Fixed
 
+- Repair executable `aws_db` discovery through `xd://aws_db/schema`, returning the full registered JSON input schema. Require full schema comparison before capability discovery and full manifest/digest verification before authentication or approval. The root TypeScript display remains human documentation; source delivery does not publish a runtime, update installed skills, or collect SRI-704 evidence.
 - Preserve constructor-registered tool session callbacks so active native scopes stop when the SDK adopts or forks a session.
 - Preserve the exact durable journal and its parent directory in shutdown, fork-return and fatal-recovery commands. Quote paths for POSIX shells and PowerShell, including sessions opened with a different future-session directory.
 - Separate MCP fixture startup from request deadlines. Make connected-browser viewport qualification deterministic and preserve navigation failures during cleanup.

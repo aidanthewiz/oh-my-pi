@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { classifyAwsDbSmokeStartup, describeAwsDbSmokeFailure } from "../fixtures/aws-db-native-diagnostics";
 
 const CASES = [
+	"registered-schema-read-no-access",
 	"registered-capability-no-access",
 	"missing-device-no-access",
 	"missing-execution-host-no-access",

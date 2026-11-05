@@ -787,6 +787,7 @@ async function runSmoke(root: string, mode: "full" | "capabilities" | "missing")
 		getSessionFile: () => null,
 		getSessionSpawns: () => null,
 		getSessionId: () => sessionId,
+		getToolByName: name => session.toolRegistry?.get(name),
 		isDisposed: () => disposed,
 		getToolContext: () => activeContext,
 		registerDisposeCallback: (callback, options) => {
@@ -905,7 +906,8 @@ async function runSmoke(root: string, mode: "full" | "capabilities" | "missing")
 	requireProof(session.xdev && session.toolRegistry && session.xdev.mountedNames.has("aws_db"));
 	const registered = session.toolRegistry.get("aws_db");
 	const canonicalWrite = tools.find(tool => tool.name === "write");
-	requireProof(registered && canonicalWrite);
+	const read = tools.find(tool => tool.name === "read");
+	requireProof(registered instanceof AwsDbTool && canonicalWrite && read);
 	const probeClient = createAwsDbWorkerClient({ beforeDirectoryRemoval });
 	const canonical = new AwsDbTool(session, { probeWorker: probeClient.probeAwsDbWorker });
 	session.toolRegistry.set("aws_db", canonical);
@@ -1011,7 +1013,59 @@ async function runSmoke(root: string, mode: "full" | "capabilities" | "missing")
 		session.toolRegistry!.set("aws_db", native);
 		return native;
 	};
+	let discovery: Record<string, unknown> | undefined;
 	try {
+		await record("registered-schema-read-no-access", async () => {
+			session.settings = Settings.isolated({ "tools.approvalMode": "always-ask" });
+			const beforeCounts = { ...counts };
+			requireProof(
+				counts.approvals === 0 && counts.providerScopes === 0 && counts.guardSteps === 0 && counts.workers === 0,
+			);
+			let networkCalls = 0;
+			const originalFetch = globalThis.fetch;
+			const originalConnect = Bun.connect;
+			const originalSocketConnect = net.Socket.prototype.connect;
+			const denyNetwork = () => {
+				networkCalls++;
+				throw new Error(FAILURE);
+			};
+			globalThis.fetch = new Proxy(originalFetch, { apply: denyNetwork });
+			Bun.connect = new Proxy(originalConnect, { apply: denyNetwork });
+			net.Socket.prototype.connect = new Proxy(originalSocketConnect, { apply: denyNetwork });
+			try {
+				const result = await read.execute(
+					"read-aws-db-schema",
+					{ path: "xd://aws_db/schema" },
+					undefined,
+					update => observation.inspect(update),
+					activeContext,
+				);
+				observation.inspect(result);
+				requireProof(!result.isError && isRecord(result.details));
+				requireProof(result.details.shape === "value" && result.details.contentType === "application/json");
+				const text = result.content
+					.filter(entry => entry.type === "text")
+					.map(entry => entry.text)
+					.join("\n");
+				const parsed: unknown = JSON.parse(text);
+				const schemaTool = session.toolRegistry!.get("aws_db");
+				requireProof(schemaTool instanceof AwsDbTool && isRecord(parsed));
+				requireProof(
+					Bun.deepEquals(parsed, { name: schemaTool.name, inputSchema: schemaTool.parameters.toJsonSchema() }) &&
+						Bun.deepEquals(parsed, {
+							name: registered.name,
+							inputSchema: registered.parameters.toJsonSchema(),
+						}) &&
+						Bun.deepEquals(parsed, { name: "aws_db", inputSchema: AWS_DB_INPUT_SCHEMA }),
+				);
+				discovery = parsed;
+			} finally {
+				globalThis.fetch = originalFetch;
+				Bun.connect = originalConnect;
+				net.Socket.prototype.connect = originalSocketConnect;
+			}
+			requireProof(Bun.deepEquals(counts, beforeCounts) && counts.workers === 0 && networkCalls === 0);
+		});
 		await record("registered-capability-no-access", async () => {
 			session.settings = Settings.isolated({ "tools.approvalMode": "always-ask" });
 			const beforeApprovals = counts.approvals;
@@ -1035,11 +1089,11 @@ async function runSmoke(root: string, mode: "full" | "capabilities" | "missing")
 			failureStage = "CAPABILITY_VALUE";
 			assertAwsDbCapability(capability);
 			failureStage = "CAPABILITY_SCHEMA";
-			requireProof(Bun.deepEquals(canonical.parameters.toJsonSchema(), AWS_DB_INPUT_SCHEMA));
+			requireProof(discovery);
 			if (mode === "capabilities")
 				stdout(
 					`${JSON.stringify({
-						discovery: { name: "aws_db", inputSchema: canonical.parameters.toJsonSchema() },
+						discovery,
 						capability,
 						nativeCalls: {
 							authentication: 0,

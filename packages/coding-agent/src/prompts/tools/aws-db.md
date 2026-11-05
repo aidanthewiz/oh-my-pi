@@ -1,6 +1,12 @@
 Inspect one approved automation template through an isolated memory-only native AWS database scope.
 
-Call `{"action":"capabilities"}` first. It performs no profile lookup, credential resolution, authentication, access approval, or service request. Require an exact compatible manifest and capability digest before authentication or inspection approval.
+Read `xd://aws_db/schema` first. It returns the full immutable JSON envelope `{"name":"aws_db","inputSchema":<actual registered schema>}`. Parse the actual model-visible Read result and compare the entire registered input schema before writing `{"action":"capabilities"}` to `xd://aws_db`. Do not substitute a manifest-derived descriptor or fallback schema.
+
+Outer host output limits still apply. If the model-visible schema is incomplete, truncated, or spilled, stop preflight before any capability call or write. Do not use a fallback.
+
+The root `xd://aws_db` TypeScript display is human documentation, not the full JSON Schema. Use the exact `xd://aws_db/schema` topic for executable discovery.
+
+The capability call performs no profile lookup, credential resolution, authentication, access approval, or service request. Verify the entire compatible capability manifest and digest before authentication or inspection approval.
 
 The loaded host must prove its actual dispatcher cleanup support, non-null session identity, early disposal, and session-change invalidation. A matching worker module alone is insufficient. Older embedding hosts fail before approval or provider work.
 

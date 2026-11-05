@@ -1,5 +1,5 @@
-import type { ToolApprovalDecision } from "@oh-my-pi/pi-agent-core";
-import { isRecord } from "@oh-my-pi/pi-utils";
+import type { AgentToolDocTopic, ToolApprovalDecision } from "@oh-my-pi/pi-agent-core";
+import { isRecord, stableStringifyJson } from "@oh-my-pi/pi-utils";
 import { REPORT_ISSUE_DEVICE_NAME } from "@oh-my-pi/pi-tui/tools/report-tool-issue";
 import { isResolutionDeviceName } from "@oh-my-pi/pi-tui/tools/resolve";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
@@ -91,8 +91,25 @@ export class XdProtocolHandler implements ProtocolHandler {
 		const topic = parseXdTopicUrl(url.href);
 		const device = topic ? null : parseXdUrl(url.href);
 		let content: string;
-		if (topic) content = this.#topic(session, topic.name, topic.topic);
-		else if (device) content = this.#usage(session, device.name);
+		if (topic) {
+			const doc = this.#topic(session, topic.name, topic.topic);
+			if (typeof doc !== "string") {
+				try {
+					if (doc.format !== "json") throw new TypeError();
+					content = stableStringifyJson(doc.value);
+				} catch {
+					throw new ToolError("Cannot serialize xd:// JSON topic.");
+				}
+				return {
+					url: url.href,
+					content,
+					contentType: "application/json",
+					shape: "value",
+					size: Buffer.byteLength(content),
+				};
+			}
+			content = doc;
+		} else if (device) content = this.#usage(session, device.name);
 		else throw new ToolError(`Invalid xd:// URL: ${url.href}. Use xd://, xd://<tool>, or xd://<tool>/<topic>.`);
 		return { url: url.href, content, contentType: "text/plain", size: Buffer.byteLength(content) };
 	}
@@ -146,7 +163,7 @@ export class XdProtocolHandler implements ProtocolHandler {
 	}
 
 	/** `read xd://<tool>/<topic>`: one named doc topic of a tool. */
-	#topic(session: ToolSession, name: string, topic: string): string {
+	#topic(session: ToolSession, name: string, topic: string): AgentToolDocTopic {
 		const topics = session.getToolByName?.(name)?.docTopics?.();
 		if (!topics) throw new ToolError(`Tool '${name}' has no doc topics.`);
 		const doc = topics[topic];

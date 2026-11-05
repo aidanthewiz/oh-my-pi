@@ -4,7 +4,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { setImmediate as waitForImmediate } from "node:timers/promises";
 import { type } from "@oh-my-pi/omptype";
-import type { AgentTool } from "@oh-my-pi/pi-agent-core";
+import type { AgentTool, AgentToolContext, AgentToolDocTopic, AgentToolResult } from "@oh-my-pi/pi-agent-core";
+import { toolWireSchema } from "@oh-my-pi/pi-ai";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { HookRunner } from "@oh-my-pi/pi-coding-agent/extensibility/hooks/runner";
 import { HookToolWrapper } from "@oh-my-pi/pi-coding-agent/extensibility/hooks/tool-wrapper";
@@ -14,9 +15,15 @@ import { LocalProtocolHandler } from "@oh-my-pi/pi-coding-agent/internal-urls/lo
 import { ConflictProtocolHandler } from "@oh-my-pi/pi-coding-agent/internal-urls/conflict-protocol";
 import { createTools, type Tool, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { requiresApproval, resolveApproval } from "@oh-my-pi/pi-coding-agent/tools/approval";
+import { AwsDbTool } from "@oh-my-pi/pi-coding-agent/tools/aws-db";
+import { AWS_DB_INPUT_SCHEMA } from "@oh-my-pi/pi-coding-agent/tools/aws-db-contract";
+import * as awsDbWorkerClient from "@oh-my-pi/pi-coding-agent/tools/aws-db-worker-client";
+import { EvalTool } from "@oh-my-pi/pi-coding-agent/tools/eval";
+import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
 import { Text } from "@oh-my-pi/pi-tui";
 import { githubToolRenderer } from "@oh-my-pi/pi-tui/tools/github";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
+import { DEFAULT_MAX_LINES } from "@oh-my-pi/pi-tui/tools/streaming-output";
 import { wrapToolWithMetaNotice } from "@oh-my-pi/pi-coding-agent/tools/output-meta";
 import { WriteTool } from "@oh-my-pi/pi-coding-agent/tools/write";
 import { type WriteRenderContext, type WriteToolDetails, writeToolRenderer } from "@oh-my-pi/pi-tui/tools/write";
@@ -77,6 +84,206 @@ function createTestXdevState(
 	};
 	return state;
 }
+
+describe("read xd:// documentation topics", () => {
+	function text(result: AgentToolResult<unknown>): string {
+		return result.content
+			.filter(block => block.type === "text")
+			.map(block => block.text)
+			.join("\n");
+	}
+
+	function topicFixture(topics: Record<string, AgentToolDocTopic>) {
+		let approvals = 0;
+		let executions = 0;
+		const tool: AgentTool = {
+			name: "topic_fixture",
+			label: "Topic Fixture",
+			description: "Documentation topic fixture",
+			parameters: type({}),
+			docTopics: () => topics,
+			approval: () => {
+				approvals++;
+				return "exec";
+			},
+			async execute() {
+				executions++;
+				throw new Error("Documentation must not execute its tool");
+			},
+		};
+		const session = xdevSession(import.meta.dir, {
+			getToolByName: name => (name === tool.name ? tool : undefined),
+		});
+		return {
+			read: new ReadTool(session),
+			calls: () => ({ approvals, executions }),
+		};
+	}
+
+	it("returns complete stable JSON values without document formatting or paging", async () => {
+		const value = {
+			z: { text: "complete JSON value\n".repeat(20_000) },
+			a: [{ pattern: "^[0-9]+$", minimum: 1, maximum: 9, additionalProperties: false }],
+		};
+		const topics: Record<string, AgentToolDocTopic> = { data: { format: "json", value } };
+		const fixture = topicFixture(topics);
+		const first = await fixture.read.execute("json-topic", { path: "xd://topic_fixture/data" });
+		expect(first.details).toMatchObject({ shape: "value", contentType: "application/json" });
+		expect(JSON.parse(text(first))).toEqual(value);
+		expect(first.details?.meta?.truncation).toBeUndefined();
+		topics.data = {
+			format: "json",
+			value: { a: [{ additionalProperties: false, maximum: 9, minimum: 1, pattern: "^[0-9]+$" }], z: value.z },
+		};
+		const reordered = await fixture.read.execute("reordered-json-topic", { path: "xd://topic_fixture/data" });
+		expect(text(reordered)).toBe(text(first));
+		expect(fixture.calls()).toEqual({ approvals: 0, executions: 0 });
+	});
+
+	it("retains string topics as bounded documents instead of JSON values", async () => {
+		const markdown = [
+			"# MARKDOWN_BEGIN",
+			...Array.from({ length: DEFAULT_MAX_LINES + 20 }, () => "x"),
+			"MARKDOWN_END",
+		].join("\n");
+		const fixture = topicFixture({ guide: markdown });
+		const result = await fixture.read.execute("markdown-topic", { path: "xd://topic_fixture/guide" });
+		expect(result.details?.shape).not.toBe("value");
+		expect(result.details?.contentType).toBe("text/plain");
+		expect(text(result)).toContain("MARKDOWN_BEGIN");
+		expect(text(result)).not.toContain("MARKDOWN_END");
+		expect(result.details?.meta?.truncation?.truncatedBy).toBe("lines");
+		expect(fixture.calls()).toEqual({ approvals: 0, executions: 0 });
+	});
+
+	it("withholds serialization failures and their causes without executing the tool", async () => {
+		const cyclic: Record<string, unknown> = {};
+		cyclic.self = cyclic;
+		const throwing = Object.defineProperty({}, "private", {
+			enumerable: true,
+			get() {
+				throw new Error("private schema serialization cause");
+			},
+		});
+		for (const value of [undefined, 1n, cyclic, throwing]) {
+			const fixture = topicFixture({ data: { format: "json", value } });
+			let failure: unknown;
+			try {
+				await fixture.read.execute("invalid-json-topic", { path: "xd://topic_fixture/data" });
+			} catch (error) {
+				failure = error;
+			}
+			expect(failure).toBeInstanceOf(ToolError);
+			expect((failure as Error).message).toBe("Cannot serialize xd:// JSON topic.");
+			expect(Object.hasOwn(failure as Error, "cause")).toBe(false);
+			expect(fixture.calls()).toEqual({ approvals: 0, executions: 0 });
+		}
+	});
+
+	it("keeps existing eval markdown topics readable without executing eval", async () => {
+		const session: ToolSession = xdevSession(import.meta.dir, {
+			getToolByName: name => session.toolRegistry?.get(name),
+		});
+		const tools = await createTools(session, ["read", "write", "eval"]);
+		const registered = session.toolRegistry?.get("eval");
+		const read = tools.find(tool => tool.name === "read");
+		if (!(registered instanceof EvalTool) || !read) throw new Error("Eval topic fixture is not registered");
+		const execute = spyOn(registered, "execute").mockRejectedValue(new Error("Documentation must not execute eval"));
+		try {
+			const result = await read.execute("eval-markdown-topic", { path: "xd://eval/helpers" });
+			expect(result.details?.shape).not.toBe("value");
+			expect(result.details?.contentType).toBe("text/plain");
+			expect(() => JSON.parse(text(result))).toThrow();
+			expect(execute).not.toHaveBeenCalled();
+		} finally {
+			execute.mockRestore();
+		}
+	});
+
+	it("discovers the full registered AWS DB admission schema before any capability or provider work", async () => {
+		const session: ToolSession = xdevSession(import.meta.dir, {
+			settings: Settings.isolated({ "tools.approvalMode": "always-ask" }),
+			getToolByName: name => session.toolRegistry?.get(name),
+		});
+		const tools = await createTools(session, ["read", "write", "aws_db"]);
+		const native = session.toolRegistry?.get("aws_db");
+		const read = tools.find(tool => tool.name === "read");
+		if (!(native instanceof AwsDbTool) || !read) throw new Error("AWS DB discovery fixture is not registered");
+		let artifactWrites = 0;
+		const context = {
+			settings: session.settings,
+			sessionManager: {
+				saveArtifact: async () => {
+					artifactWrites++;
+					throw new Error("Schema discovery must fit the default outer output limits");
+				},
+			},
+		} as unknown as AgentToolContext;
+		const entrypoints = [
+			spyOn(native, "approval"),
+			spyOn(native, "prepareApprovalTier"),
+			spyOn(native, "prepareRuntimeApproval"),
+			spyOn(native, "execute"),
+			spyOn(awsDbWorkerClient, "probeAwsDbWorker").mockRejectedValue(new Error("Unexpected capability probe")),
+			spyOn(awsDbWorkerClient, "runAwsDbWorker").mockRejectedValue(new Error("Unexpected provider scope")),
+		];
+		try {
+			const result = await read.execute(
+				"aws-db-schema",
+				{ path: "xd://aws_db/schema" },
+				undefined,
+				undefined,
+				context,
+			);
+			const discovery = JSON.parse(text(result));
+			expect(result.details).toMatchObject({ shape: "value", contentType: "application/json" });
+			expect(discovery).toEqual({ name: native.name, inputSchema: native.parameters.toJsonSchema() });
+			expect(discovery.inputSchema).toEqual(toolWireSchema(native));
+			expect(discovery.inputSchema).toEqual(AWS_DB_INPUT_SCHEMA);
+			expect(artifactWrites).toBe(0);
+			console.info(JSON.stringify({ schema: "aws-db-schema-discovery/v1", bytes: Buffer.byteLength(text(result)) }));
+
+			const serialization = spyOn(native, "docTopics").mockReturnValue({
+				schema: {
+					format: "json",
+					value: Object.defineProperty({}, "private", {
+						enumerable: true,
+						get() {
+							throw new Error("private schema serialization cause");
+						},
+					}),
+				},
+			});
+			try {
+				await expect(read.execute("aws-db-serialization-failure", { path: "xd://aws_db/schema" })).rejects.toThrow(
+					"Cannot serialize xd:// JSON topic.",
+				);
+			} finally {
+				serialization.mockRestore();
+			}
+
+			const rootDocs = await read.execute("aws-db-human-docs", { path: "xd://aws_db" });
+			expect(rootDocs.details?.shape).not.toBe("value");
+			expect(() => JSON.parse(text(rootDocs))).toThrow();
+			await expect(read.execute("aws-db-unknown-topic", { path: "xd://aws_db/unknown" })).rejects.toThrow(
+				"Unknown topic",
+			);
+			await expect(read.execute("aws-db-missing-tool", { path: "xd://not_registered/schema" })).rejects.toThrow(
+				"has no doc topics",
+			);
+			await expect(read.execute("unadvertised-schema-topic", { path: "xd://write/schema" })).rejects.toThrow(
+				"has no doc topics",
+			);
+			session.toolRegistry!.delete("aws_db");
+			await expect(read.execute("aws-db-removed-tool", { path: "xd://aws_db/schema" })).rejects.toThrow(
+				"has no doc topics",
+			);
+			for (const entrypoint of entrypoints) expect(entrypoint).not.toHaveBeenCalled();
+		} finally {
+			for (const entrypoint of entrypoints) entrypoint.mockRestore();
+		}
+	});
+});
 
 describe("read and write route xd:// device URLs", () => {
 	it("lists, documents, and dispatches an ast_edit device", async () => {

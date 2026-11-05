@@ -5,6 +5,7 @@
 ### Added
 
 - Added intrinsic `AgentTool.cancellationBehavior`, `resolveToolCancellationBehavior`, and `TOOL_CANCELLATION_CLEANUP_VERSION` for bounded cancellation cleanup.
+- Add opt-in JSON values to `AgentTool.docTopics` without changing markdown document topics.
 
 ### Fixed
 

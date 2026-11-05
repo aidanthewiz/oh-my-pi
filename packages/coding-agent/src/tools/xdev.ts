@@ -6,7 +6,7 @@
  * tools the model already has:
  *
  *   read  xd://          → mounted tool listing (discovery)
- *   read  xd://<tool>    → tool docs + JSON parameter schema
+ *   read  xd://<tool>    → tool docs + TypeScript parameter summary
  *   write xd://<tool>    → execute: `content` is the JSON args object
  *
  * Direct and device dispatch share one canonical tool map. The mounted-name
@@ -122,7 +122,7 @@ function renderDocs(inst: Tool, heading = "#", descriptionCap?: number): string 
 		"",
 		description,
 		"",
-		`${heading}# Schema`,
+		`${heading}# Schema summary (TypeScript, not full JSON Schema)`,
 		"```ts",
 		`type Args = ${schema};`,
 		"```",
@@ -329,11 +329,11 @@ export function xdevListing(state: XdevState): string {
 		`${XD_URL_PREFIX} ${state.mountedNames.size} mounted tool devices.`,
 		...rows,
 		"",
-		`Read ${XD_URL_PREFIX}<tool> for docs + JSON schema; write the JSON args object to ${XD_URL_PREFIX}<tool> to execute. Active top-level tools accept the same dispatch.`,
+		`Read ${XD_URL_PREFIX}<tool> for docs + a TypeScript parameter summary; write the JSON args object to ${XD_URL_PREFIX}<tool> to execute. Active top-level tools accept the same dispatch.`,
 	].join("\n");
 }
 
-/** Docs + schema for any enabled tool. */
+/** Docs + TypeScript parameter summary for any enabled tool. */
 export function xdevDocs(state: XdevState, name: string): string {
 	return renderDocs(resolveRequiredXdevTool(state, name));
 }

@@ -22,6 +22,11 @@ import { APP_NAME, getActiveProfile, MIN_BUN_VERSION, resolveProfileEnv, setProf
 import { declareWorkerHostEntry, installWorkerInbox, isWorkerHostSelector } from "@oh-my-pi/pi-utils/worker-host";
 import { CF_COMMAND, CF_DISPLAY_VERSION, CF_VERSION } from "./cli/cf-version";
 import { extractProfileFlags } from "./cli/profile-bootstrap";
+import type * as SettingsConfig from "./config/settings";
+import type * as Tools from "./tools";
+import type { ToolSession } from "./tools";
+import type * as AwsDb from "./tools/aws-db";
+import type * as AwsDbContract from "./tools/aws-db-contract";
 import type * as AwsDbWorker from "./tools/aws-db-worker";
 import type * as AwsDbWorkerClient from "./tools/aws-db-worker-client";
 import {
@@ -521,8 +526,44 @@ export async function runCli(argv: string[]): Promise<void> {
 	}
 
 	if (resolvedArgv[0] === "--smoke-test-aws-db") {
-		const { probeAwsDbWorker }: typeof AwsDbWorkerClient = require("./tools/aws-db-worker-client");
-		await probeAwsDbWorker();
+		try {
+			const { createTools }: typeof Tools = require("./tools");
+			const { Settings }: typeof SettingsConfig = require("./config/settings");
+			const { AwsDbTool }: typeof AwsDb = require("./tools/aws-db");
+			const contract: typeof AwsDbContract = require("./tools/aws-db-contract");
+			const { probeAwsDbWorker }: typeof AwsDbWorkerClient = require("./tools/aws-db-worker-client");
+			const session: ToolSession = {
+				cwd: process.cwd(),
+				hasUI: false,
+				restrictToolNames: true,
+				skipPythonPreflight: true,
+				settings: Settings.isolated(),
+				getSessionFile: () => null,
+				getSessionSpawns: () => null,
+				getToolByName: name => session.toolRegistry?.get(name),
+			};
+			const tools = await createTools(session, ["read", "write", "aws_db"]);
+			const read = tools.find(tool => tool.name === "read");
+			const registered = session.toolRegistry?.get("aws_db");
+			if (!read || !(registered instanceof AwsDbTool)) throw new Error("AWS_DB_SMOKE_TEST_FAILED");
+			const result = await read.execute("aws-db-smoke-schema", { path: "xd://aws_db/schema" });
+			if (result.isError || result.details?.shape !== "value" || result.details?.contentType !== "application/json")
+				throw new Error("AWS_DB_SMOKE_TEST_FAILED");
+			const discovery: unknown = JSON.parse(
+				result.content
+					.filter(entry => entry.type === "text")
+					.map(entry => entry.text)
+					.join("\n"),
+			);
+			if (
+				!Bun.deepEquals(discovery, { name: registered.name, inputSchema: registered.parameters.toJsonSchema() }) ||
+				!Bun.deepEquals(discovery, { name: "aws_db", inputSchema: contract.AWS_DB_INPUT_SCHEMA })
+			)
+				throw new Error("AWS_DB_SMOKE_TEST_FAILED");
+			contract.assertAwsDbCapability(await probeAwsDbWorker());
+		} catch {
+			throw new Error("AWS_DB_SMOKE_TEST_FAILED");
+		}
 		process.stdout.write("aws-db-smoke-test: ok\n");
 		return;
 	}
