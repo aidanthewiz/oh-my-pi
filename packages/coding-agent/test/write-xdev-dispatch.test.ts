@@ -2,9 +2,12 @@ import { describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { setImmediate as waitForImmediate } from "node:timers/promises";
 import { type } from "@oh-my-pi/omptype";
 import type { AgentTool } from "@oh-my-pi/pi-agent-core";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import type { HookRunner } from "@oh-my-pi/pi-coding-agent/extensibility/hooks/runner";
+import { HookToolWrapper } from "@oh-my-pi/pi-coding-agent/extensibility/hooks/tool-wrapper";
 import * as themeModule from "@oh-my-pi/pi-tui/theme";
 import { ToolChoiceQueue } from "@oh-my-pi/pi-coding-agent/session/tool-choice-queue";
 import { LocalProtocolHandler } from "@oh-my-pi/pi-coding-agent/internal-urls/local-protocol";
@@ -14,8 +17,9 @@ import { requiresApproval, resolveApproval } from "@oh-my-pi/pi-coding-agent/too
 import { Text } from "@oh-my-pi/pi-tui";
 import { githubToolRenderer } from "@oh-my-pi/pi-tui/tools/github";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
+import { wrapToolWithMetaNotice } from "@oh-my-pi/pi-coding-agent/tools/output-meta";
 import { WriteTool } from "@oh-my-pi/pi-coding-agent/tools/write";
-import { type WriteRenderContext, writeToolRenderer } from "@oh-my-pi/pi-tui/tools/write";
+import { type WriteRenderContext, type WriteToolDetails, writeToolRenderer } from "@oh-my-pi/pi-tui/tools/write";
 import {
 	dispatchXdevTool,
 	listXdevTools,
@@ -1018,5 +1022,179 @@ describe("device writes honor lenientArgValidation", () => {
 			"Invalid args for xd://strict_dev",
 		);
 		expect(seen).toHaveLength(1);
+	});
+});
+
+describe("device cancellation lifecycle", () => {
+	function fixture(cancellationBehavior?: AgentTool["cancellationBehavior"]) {
+		const started = Promise.withResolvers<void>();
+		const aborted = Promise.withResolvers<void>();
+		const releaseCleanup = Promise.withResolvers<void>();
+		const closed = Promise.withResolvers<void>();
+		const schema = type({ mode: "'cleanup' | 'ordinary'", "cancellationBehavior?": "string" });
+		let openResources = 0;
+		let executions = 0;
+		const device: AgentTool<typeof schema, { openResources: number }> = {
+			name: "lifecycle",
+			label: "Lifecycle",
+			description: "Owns a resource until cancellation cleanup completes.",
+			parameters: schema,
+			approval: "read",
+			cancellationBehavior,
+			async execute(_id, _args, signal) {
+				executions++;
+				openResources++;
+				const onAbort = () => aborted.resolve();
+				signal?.addEventListener("abort", onAbort, { once: true });
+				if (signal?.aborted) onAbort();
+				started.resolve();
+				try {
+					await aborted.promise;
+					await releaseCleanup.promise;
+				} finally {
+					openResources--;
+					signal?.removeEventListener("abort", onAbort);
+					closed.resolve();
+				}
+				return {
+					content: [{ type: "text", text: "Cancelled after resource cleanup." }],
+					details: { openResources },
+					isError: true,
+				};
+			},
+		};
+		const hookRunner = {
+			hasHandlers: (event: string) => event === "tool_result",
+			emit: async () => ({
+				content: [{ type: "text", text: "PRIVATE-CANCELLATION-CAUSE" }],
+			}),
+		} as unknown as HookRunner;
+		const canonical = wrapToolWithMetaNotice(new HookToolWrapper(device, hookRunner));
+		const xdev = createTestXdevState([canonical]);
+		const write = wrapToolWithMetaNotice(
+			new HookToolWrapper<WriteTool["parameters"], WriteToolDetails>(
+				new WriteTool(xdevSession(process.cwd(), { xdev })),
+				hookRunner,
+			),
+		);
+		return {
+			write,
+			xdev,
+			started,
+			aborted,
+			releaseCleanup,
+			closed,
+			get openResources() {
+				return openResources;
+			},
+			get executions() {
+				return executions;
+			},
+		};
+	}
+
+	const perCall: AgentTool["cancellationBehavior"] = args =>
+		args !== null && typeof args === "object" && "mode" in args && args.mode === "cleanup"
+			? "await-cleanup"
+			: undefined;
+
+	for (const [name, behavior] of [
+		["intrinsic", "await-cleanup"],
+		["per-call", perCall],
+	] as const) {
+		it(`awaits ${name} cleanup through write, protocol, hook, and output wrappers`, async () => {
+			const test = fixture(behavior);
+			const controller = new AbortController();
+			let settled = false;
+			const execution = test.write.execute(
+				"cleanup",
+				{ path: "[xd://lifecycle#ABCD]", content: JSON.stringify({ mode: "cleanup" }) },
+				controller.signal,
+			);
+			void execution.then(
+				() => {
+					settled = true;
+				},
+				() => {
+					settled = true;
+				},
+			);
+			try {
+				await Promise.race([
+					test.started.promise,
+					execution.then(() => {
+						throw new Error("Device execution finished before starting.");
+					}),
+				]);
+				controller.abort(new Error("PRIVATE-CANCELLATION-CAUSE"));
+				await test.aborted.promise;
+				await waitForImmediate();
+				expect(test.openResources).toBe(1);
+				expect(settled).toBe(false);
+				test.releaseCleanup.resolve();
+				const result = await execution;
+				expect(test.openResources).toBe(0);
+				expect(result).toMatchObject({
+					content: [{ type: "text", text: "Cancelled after resource cleanup." }],
+					details: { xdev: { tool: "lifecycle", inner: { openResources: 0 } } },
+					isError: true,
+				});
+				expect(JSON.stringify(result)).not.toContain("PRIVATE-CANCELLATION-CAUSE");
+			} finally {
+				controller.abort();
+				test.releaseCleanup.resolve();
+				await execution.catch(() => {});
+				if (test.executions > 0) await test.closed.promise;
+			}
+		});
+	}
+
+	for (const [name, behavior] of [
+		["ordinary", undefined],
+		["per-call opt-out", perCall],
+	] as const) {
+		it(`keeps early cancellation for ${name} work despite a caller-supplied marker`, async () => {
+			const test = fixture(behavior);
+			const controller = new AbortController();
+			const execution = test.write.execute(
+				"ordinary",
+				{
+					path: "xd://lifecycle",
+					content: JSON.stringify({ mode: "ordinary", cancellationBehavior: "await-cleanup" }),
+				},
+				controller.signal,
+			);
+			try {
+				await Promise.race([
+					test.started.promise,
+					execution.then(() => {
+						throw new Error("Device execution finished before starting.");
+					}),
+				]);
+				controller.abort();
+				await expect(execution).rejects.toBeInstanceOf(Error);
+				expect(test.openResources).toBe(1);
+			} finally {
+				controller.abort();
+				test.releaseCleanup.resolve();
+				await execution.catch(() => {});
+				if (test.executions > 0) await test.closed.promise;
+			}
+			expect(test.openResources).toBe(0);
+		});
+	}
+
+	it("does not start opted-in write or direct device work after pre-cancellation", async () => {
+		const test = fixture("await-cleanup");
+		const signal = AbortSignal.abort(new Error("PRIVATE-CANCELLATION-CAUSE"));
+		const input = JSON.stringify({ mode: "cleanup" });
+		await expect(
+			test.write.execute("pre-cancelled", { path: "xd://lifecycle", content: input }, signal),
+		).rejects.toThrow("Tool execution was aborted");
+		await expect(dispatchXdevTool(test.xdev, "lifecycle", input, "pre-cancelled-direct", signal)).rejects.toThrow(
+			"Tool execution was aborted",
+		);
+		expect(test.executions).toBe(0);
+		expect(test.openResources).toBe(0);
 	});
 });

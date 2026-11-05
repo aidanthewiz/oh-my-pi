@@ -34,6 +34,7 @@ import {
 	type AgentToolResult,
 	type AgentToolUpdateCallback,
 	type ToolLoadMode,
+	resolveToolCancellationBehavior,
 	validateAgentToolArguments,
 } from "@oh-my-pi/pi-agent-core";
 import { type Tool as AiTool, jsonSchemaToTypeScript, toolWireSchema } from "@oh-my-pi/pi-ai";
@@ -256,6 +257,22 @@ export const XDEV_EXTERNAL_DESCRIPTION_CAP = 200;
 export function resolveXdevTool(state: XdevState, name: string): Tool | undefined {
 	if (!state.mountedNames.has(name) && !state.isActive(name)) return undefined;
 	return state.tools.get(name);
+}
+
+/** Resolve cancellation from the enabled canonical tool and its validated execution input. */
+export function resolveXdevCancellationBehavior(
+	state: XdevState,
+	name: string,
+	content: string,
+): "await-cleanup" | undefined {
+	const tool = resolveXdevTool(state, name);
+	if (!tool || tool.cancellationBehavior === undefined || HELP_CONTENT_RE.test(content)) return undefined;
+	try {
+		const args = parseDeviceArgs(tool, content, "cancellation-policy", () => "");
+		return resolveToolCancellationBehavior(tool, args);
+	} catch {
+		return undefined;
+	}
 }
 
 /**
@@ -485,6 +502,7 @@ export async function dispatchXdevTool(
 					},
 				}
 			: undefined;
+		if (signal?.aborted) throw new ToolAbortError("Tool execution was aborted");
 		const result = await executable.execute(toolCallId, validated as never, signal, innerOnUpdate, executionContext);
 		return { result, xdev: { ...xdev, inner: result.details } };
 	} catch (error) {

@@ -1209,6 +1209,14 @@ export interface AgentTool<
 	 */
 	handlesToolInterrupt?: boolean;
 	/**
+	 * Intrinsic execution policy, never model arguments or remote tool annotations.
+	 * `await-cleanup` keeps an executing call pending through bounded cancellation
+	 * teardown and preserves its safe result. Omission retains ordinary abort races.
+	 * A function resolves the policy for the arguments this call executes.
+	 * Pre-start cancellation and permission denial still prevent execution.
+	 */
+	readonly cancellationBehavior?: "await-cleanup" | ((args: unknown) => "await-cleanup" | undefined);
+	/**
 	 * Controls how the INTENT_FIELD (`i`) is handled for this tool.
 	 * - `"require"` (default): `i` is injected and required in the parameter schema.
 	 * - `"optional"`: `i` is injected as an optional/nullable field.

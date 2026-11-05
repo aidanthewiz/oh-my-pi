@@ -4,8 +4,10 @@
 import {
 	type AgentTool,
 	type AgentToolContext,
+	type AgentToolResult,
 	type AgentToolUpdateCallback,
 	isNonBlankContext,
+	resolveToolCancellationBehavior,
 } from "@oh-my-pi/pi-agent-core";
 import type { Static, TSchema } from "@oh-my-pi/pi-ai";
 import { normalizeToolEventInput, resolveToolEventInput } from "../tool-event-input";
@@ -30,6 +32,7 @@ export class HookToolWrapper<TParameters extends TSchema = TSchema, TDetails = u
 	declare parameters: TParameters;
 	declare label: string;
 	declare strict: boolean;
+	declare readonly cancellationBehavior?: AgentTool["cancellationBehavior"];
 
 	constructor(
 		private tool: AgentTool<TParameters, TDetails>,
@@ -86,8 +89,12 @@ export class HookToolWrapper<TParameters extends TSchema = TSchema, TDetails = u
 		}
 
 		// Execute the actual tool, forwarding onUpdate for progress streaming
+		const awaitCleanup = resolveToolCancellationBehavior(this.tool, effectiveParams) === "await-cleanup";
+		let completedResult: AgentToolResult<TDetails, TParameters> | undefined;
 		try {
 			const result = await this.tool.execute(toolCallId, effectiveParams, signal, onUpdate, context);
+			completedResult = result;
+			if (awaitCleanup && signal?.aborted) return result;
 
 			// Emit tool_result event - hooks can modify the result
 			let resultResult: ToolResultEventResult | undefined;
@@ -104,6 +111,7 @@ export class HookToolWrapper<TParameters extends TSchema = TSchema, TDetails = u
 					details: result.details,
 					isError: result.isError === true,
 				})) as ToolResultEventResult | undefined;
+				if (awaitCleanup && signal?.aborted) return result;
 				// tool_result context precedes the call's tool_call context, as in the agent loop.
 				if (isNonBlankContext(resultResult?.additionalContext)) {
 					context?.addAdditionalContext?.(resultResult.additionalContext);
@@ -125,6 +133,7 @@ export class HookToolWrapper<TParameters extends TSchema = TSchema, TDetails = u
 
 			return result;
 		} catch (err) {
+			if (completedResult && awaitCleanup && signal?.aborted) return completedResult;
 			// Emit tool_result event for errors so hooks can observe failures and
 			// attach failure-specific context; the result itself stays the error.
 			if (this.hookRunner.hasHandlers("tool_result")) {

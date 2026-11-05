@@ -283,6 +283,10 @@ function legacyBuiltinTool(cwd: string, name: LegacyCodingToolName): ToolDefinit
 		parameters: tool.parameters,
 		hidden: tool.hidden,
 		deferrable: tool.deferrable,
+		cancellationBehavior:
+			typeof tool.cancellationBehavior === "function"
+				? tool.cancellationBehavior.bind(tool)
+				: tool.cancellationBehavior,
 		approval: tool.approval,
 		approvalCacheTargets: tool.approvalCacheTargets?.bind(tool),
 		approvalCacheIdentity: tool.approvalCacheIdentity?.bind(tool),

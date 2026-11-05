@@ -84,6 +84,7 @@ import {
 	updateRowByRowId,
 } from "./sqlite-reader";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
+import { ToolAbortError } from "./tool-errors";
 import { toolResult } from "./tool-result";
 import { maybeWriteSnapshotHeader, stripWriteContent } from "./write-content";
 import { resolveXdevTool } from "./xdev";
@@ -585,6 +586,26 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 			this.session,
 		);
 	};
+	readonly cancellationBehavior = (args: unknown): "await-cleanup" | undefined => {
+		if (!isRecord(args) || typeof args.path !== "string") return undefined;
+		try {
+			const router = InternalUrlRouter.instance();
+			const { path } = recoverConflictUriPrefix(
+				router.peelWriteSelector(unwrapHashlineHeaderPath(args.path), "write"),
+			);
+			const target = router.writeTarget(path);
+			const policy = target?.spec.write;
+			if (!target || !policy?.cancellationBehavior) return undefined;
+			const content = typeof args.content === "string" ? args.content : undefined;
+			const cleanContent =
+				content === undefined || policy.payload === "verbatim"
+					? content
+					: stripWriteContent(this.session, content).text;
+			return policy.cancellationBehavior(target.url, cleanContent, this.session);
+		} catch {
+			return undefined;
+		}
+	};
 	async prepareRuntimeApproval(_toolCallId: string, args: unknown, signal?: AbortSignal): Promise<undefined> {
 		const input = args as Partial<WriteParams>;
 		if (typeof input.path !== "string" || typeof input.content !== "string") return undefined;
@@ -1051,14 +1072,12 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 				}),
 			);
 		}
-		return untilAborted(signal, async () => {
-			// Text payloads get hashline display prefixes ([PATH#HASH] + LINE:) stripped if the model
-			// copied them from read output. Verbatim payloads (messages, process stdin, setting
-			// values, conflict directives) reach their handler exactly as the model wrote them.
-			const verbatim = policy?.payload === "verbatim";
-			const { text: cleanContent, stripped } = verbatim
-				? { text: content, stripped: false }
-				: stripWriteContent(this.session, content);
+		// Text payloads strip copied display prefixes; device policy sees the execution payload.
+		const verbatim = policy?.payload === "verbatim";
+		const { text: cleanContent, stripped } = verbatim
+			? { text: content, stripped: false }
+			: stripWriteContent(this.session, content);
+		const writeOperation = async (): Promise<AgentToolResult<WriteToolDetails>> => {
 			// One UTF-8 scan per call, shared by the progress and result lines.
 			const cleanBytes = Buffer.byteLength(cleanContent, "utf8");
 			assertWriteTargetAddressable(path, router);
@@ -1281,6 +1300,11 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 						.get(),
 				},
 			};
-		});
+		};
+		if (target && policy?.cancellationBehavior?.(target.url, cleanContent, this.session) === "await-cleanup") {
+			if (signal?.aborted) throw new ToolAbortError("Tool execution was aborted");
+			return writeOperation();
+		}
+		return untilAborted(signal, writeOperation);
 	}
 }

@@ -30,5 +30,7 @@ export * from "./tool-context";
 export * from "./tokenizer";
 // Lenient-aware tool argument validation
 export * from "./tool-arguments";
+// Intrinsic tool cancellation policy
+export * from "./tool-cancellation";
 // Types
 export * from "./types";

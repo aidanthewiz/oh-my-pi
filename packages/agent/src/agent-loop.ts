@@ -76,6 +76,7 @@ import {
 	startInvokeAgentSpan,
 } from "./telemetry";
 import { validateAgentToolArguments } from "./tool-arguments";
+import { resolveToolCancellationBehavior } from "./tool-cancellation";
 import {
 	createAdditionalContextMessage,
 	isNonBlankContext,
@@ -3579,6 +3580,7 @@ async function executeToolCalls(
 		let caughtError: unknown;
 		let deliveredReplies: string[] | undefined;
 		let completedToolExecution = false;
+		let awaitCancellationCleanup = false;
 		let executionStarted = false;
 		const abortBeforeToolExecution = (): boolean => {
 			if (!isToolAborted(record)) return false;
@@ -3603,6 +3605,7 @@ async function executeToolCalls(
 					record.executionArgs ??
 					(transformToolCallArguments ? transformToolCallArguments(effectiveArgs, toolCall.name) : effectiveArgs);
 				record.args = executionArgs;
+				awaitCancellationCleanup = resolveToolCancellationBehavior(tool, executionArgs) === "await-cleanup";
 				// A transform or awaited claim can cancel the external run after
 				// a queued wake already fixed the combined signal's reason.
 				if (abortBeforeToolExecution()) return;
@@ -3702,7 +3705,12 @@ async function executeToolCalls(
 				isError = true;
 			}
 
-			if (afterToolCall && (!record.signal.aborted || completedToolExecution)) {
+			const retainsCleanupResult = completedToolExecution && awaitCancellationCleanup;
+			if (
+				afterToolCall &&
+				(!record.signal.aborted || completedToolExecution) &&
+				!(retainsCleanupResult && record.signal.aborted)
+			) {
 				try {
 					const after = await afterToolCall(
 						{
@@ -3715,6 +3723,7 @@ async function executeToolCalls(
 						},
 						record.signal,
 					);
+					if (retainsCleanupResult && record.signal.aborted) return;
 					if (after) {
 						// Re-normalize the post-hook result: `afterToolCall` is untyped user/extension
 						// code and may return malformed `content` (non-array / invalid blocks), which
@@ -3734,6 +3743,7 @@ async function executeToolCalls(
 						}
 					}
 				} catch (e) {
+					if (retainsCleanupResult && record.signal.aborted) return;
 					caughtError = e;
 					result = {
 						content: [{ type: "text", text: e instanceof Error ? e.message : String(e) }],

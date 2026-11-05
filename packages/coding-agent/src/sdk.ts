@@ -12,6 +12,7 @@ import {
 	type StreamFn,
 	type ThinkingLevel,
 } from "@oh-my-pi/pi-agent-core";
+import { resolveToolCancellationBehavior } from "@oh-my-pi/pi-agent-core/tool-cancellation";
 import type {
 	Api,
 	Context,
@@ -309,6 +310,7 @@ import {
 	warmupLspServers,
 	xdevEntries,
 } from "./tools";
+import { TOOL_EXECUTION_HOST_CAPABILITIES } from "./tools/tool-execution-host";
 import { resolveYieldReportText } from "./tools/yield";
 import { forgetSessionApprovals } from "./tools/approval-cache";
 import {
@@ -1530,6 +1532,10 @@ export function customToolToDefinition(tool: CustomTool, sourcePath?: string): T
 		loadMode: defaultLoadModeForToolName(tool.name, tool.loadMode),
 		deferrable: tool.deferrable,
 		readsSkillUris: tool.readsSkillUris,
+		cancellationBehavior:
+			typeof tool.cancellationBehavior === "function"
+				? tool.cancellationBehavior.bind(tool)
+				: tool.cancellationBehavior,
 		approval: typeof tool.approval === "function" ? tool.approval.bind(tool) : tool.approval,
 		// Extension tools take part in Ask-and-remember grants through the same bridge.
 		approvalCacheTargets:
@@ -1740,6 +1746,7 @@ const CAPTURE_DROPPED_KEYS = [
 	"speculation",
 	"interruptible",
 	"handlesToolInterrupt",
+	"cancellationBehavior",
 	"matcherDigest",
 	"matcherPaths",
 	"matcherEntries",
@@ -2693,6 +2700,8 @@ async function createAgentSessionScoped(
 		// mutation (any tool) bumped it in the meantime.
 		const fileMutationVersions = new Map<string, number>();
 		const disposeCallbacks = new Set<() => void>();
+		const beginDisposeCallbacks = new Set<() => void>();
+		const deferredToolSessionChangeCallbacks = new Map<() => void, (() => void) | undefined>();
 		const activeToolNames = new Set<string>();
 		const toolRegistry = new Map<string, Tool & Pick<ToolDefinition, "defaultInactive">>();
 		const setActiveToolNames = (names: Iterable<string>): void => {
@@ -2922,6 +2931,30 @@ async function createAgentSessionScoped(
 				session ? session.trackEvalExecution(execution, abortController) : execution,
 			getSessionId: () => sessionManager.getSessionId?.() ?? null,
 			isDisposed: () => session?.isDisposed ?? false,
+			getToolExecutionCapabilities: (tool, args) => {
+				if (
+					!hasSession ||
+					session.isDisposed ||
+					!sessionManager.getSessionId() ||
+					resolveToolCancellationBehavior(tool, args) !== "await-cleanup"
+				)
+					return undefined;
+				const direct = agent.state.tools.find(candidate => candidate.name === tool.name);
+				if (direct)
+					return resolveToolCancellationBehavior(direct, args) === "await-cleanup"
+						? TOOL_EXECUTION_HOST_CAPABILITIES
+						: undefined;
+				const mounted = toolSession.xdev && resolveMountedXdevExecutable(toolSession.xdev, tool.name);
+				const writer = agent.state.tools.find(candidate => candidate.name === "write");
+				if (!mounted || !writer || resolveToolCancellationBehavior(mounted, args) !== "await-cleanup")
+					return undefined;
+				return resolveToolCancellationBehavior(writer, {
+					path: `xd://${tool.name}`,
+					content: JSON.stringify(args),
+				}) === "await-cleanup"
+					? TOOL_EXECUTION_HOST_CAPABILITIES
+					: undefined;
+			},
 			captureOwnerCurrent: ({ allowParked = false } = {}) => {
 				const owner = captureOwnerScope();
 				const model = owner.modelSnapshot();
@@ -2988,11 +3021,24 @@ async function createAgentSessionScoped(
 			queueLaunchCompletion: notification =>
 				session?.queueLaunchCompletion(notification) ??
 				Promise.reject(new Error("Session unavailable for launch completion delivery")),
-			registerDisposeCallback: callback => {
-				disposeCallbacks.add(callback);
-				return () => disposeCallbacks.delete(callback);
+			registerDisposeCallback: (callback, options) => {
+				if (options?.phase === "begin" && hasSession && session.isDisposed) {
+					callback();
+					return () => {};
+				}
+				const callbacks = options?.phase === "begin" ? beginDisposeCallbacks : disposeCallbacks;
+				callbacks.add(callback);
+				return () => callbacks.delete(callback);
 			},
-			registerSessionChangeCallback: callback => session?.registerSessionChangeCallback(callback),
+			registerSessionChangeCallback: callback => {
+				if (hasSession) return session.registerSessionChangeCallback(callback);
+				deferredToolSessionChangeCallbacks.set(callback, undefined);
+				return () => {
+					const unsubscribe = deferredToolSessionChangeCallbacks.get(callback);
+					deferredToolSessionChangeCallbacks.delete(callback);
+					unsubscribe?.();
+				};
+			},
 			bumpFileMutationVersion: path => {
 				const next = (fileMutationVersions.get(path) ?? 0) + 1;
 				fileMutationVersions.set(path, next);
@@ -5616,6 +5662,19 @@ async function createAgentSessionScoped(
 			titleSystemPrompt: options.titleSystemPrompt,
 			autoTitle: options.autoTitle === true && !isSubagentSession,
 		});
+		for (const callback of deferredToolSessionChangeCallbacks.keys()) {
+			deferredToolSessionChangeCallbacks.set(callback, session.registerSessionChangeCallback(callback));
+		}
+		session.addDisposer(() => {
+			for (const callback of beginDisposeCallbacks) {
+				try {
+					callback();
+				} catch {
+					logger.warn("Session begin-dispose callback failed");
+				}
+			}
+			beginDisposeCallbacks.clear();
+		});
 		hasSession = true;
 		session.setSideRequestOwnerCapture(toolSession.captureOwnerCurrent!);
 		accountPoolOwnedBySession = true;
@@ -6051,6 +6110,8 @@ async function createAgentSessionScoped(
 					restoreProviderToggles?.();
 					unsubscribeMcpNotifications?.();
 					unregisterMcpPostmortem?.();
+					for (const unsubscribe of deferredToolSessionChangeCallbacks.values()) unsubscribe?.();
+					deferredToolSessionChangeCallbacks.clear();
 					for (const callback of disposeCallbacks) callback();
 					disposeCallbacks.clear();
 					// Drop refs so the process-global postmortem list doesn't retain

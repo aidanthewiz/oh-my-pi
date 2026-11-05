@@ -8,6 +8,7 @@
 
 ### Added
 
+- Add discoverable `aws_db` capability checks and exact-approved, memory-only automation-template inspection. Bind loaded partition-specific TLS trust and qualified regions before authentication. Retain native AWS guards, verify the physical Aurora reader, return only validated structure, and dispose the owned process without credential files.
 - Native AWS approvals offer **Allow for the rest of this session** for later commands, profiles, and SSO renewal without saving a configuration grant.
 - Keep job widgets local by default. Remote spec authoring requires managed or runtime consent, current model and account admission, bounded redacted context, and originating-journal accounting.
 - Expose session-bound native MCP calls to extensions. Honor `exposeTools: false` without disabling server startup or discovery.
@@ -15,6 +16,7 @@
 
 ### Fixed
 
+- Preserve constructor-registered tool session callbacks so active native scopes stop when the SDK adopts or forks a session.
 - Preserve the exact durable journal and its parent directory in shutdown, fork-return and fatal-recovery commands. Quote paths for POSIX shells and PowerShell, including sessions opened with a different future-session directory.
 - Separate MCP fixture startup from request deadlines. Make connected-browser viewport qualification deterministic and preserve navigation failures during cleanup.
 - Serialize and atomically publish shared ACP handle mappings. Fork unloaded handles from their continued conversation instead of the original transcript.

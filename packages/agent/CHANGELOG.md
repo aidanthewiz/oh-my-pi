@@ -2,8 +2,13 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added intrinsic `AgentTool.cancellationBehavior`, `resolveToolCancellationBehavior`, and `TOOL_CANCELLATION_CLEANUP_VERSION` for bounded cancellation cleanup.
+
 ### Fixed
 
+- Preserve cleanup-owned tool results when cancellation interrupts outer execution or postflight hooks.
 - Validate tool arguments without imposing unrelated renderer theme types on the tool metadata.
 - Preserve visible signed narration in compaction summaries without retaining private reasoning.
 - Fixed queued follow-ups being delayed by non-triggering custom messages appended at the end of a turn.

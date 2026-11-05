@@ -1065,8 +1065,13 @@ export class SessionTools {
 		// Match the capability+method gating pattern used by read/write/bash.
 		if (!bridge?.capabilities.requestPermission || !bridge.requestPermission) return tool;
 		if (PERMISSION_REQUIRED_TOOLS[tool.name] !== true) return tool;
+		const cancellationBehavior =
+			typeof tool.cancellationBehavior === "function"
+				? tool.cancellationBehavior.bind(tool)
+				: tool.cancellationBehavior;
 		return new Proxy(tool, {
 			get: (target, prop) => {
+				if (prop === "cancellationBehavior") return cancellationBehavior;
 				if (prop !== "execute") return target[prop as keyof T];
 				return async (
 					toolCallId: string,

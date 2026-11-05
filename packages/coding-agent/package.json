@@ -536,6 +536,10 @@
 	},
 	"dependencies": {
 		"@agentclientprotocol/sdk": "catalog:",
+		"@aws-sdk/client-rds": "3.1150.0",
+		"@aws-sdk/client-secrets-manager": "3.1150.0",
+		"@aws-sdk/client-sso": "3.1150.0",
+		"@aws-sdk/client-sts": "3.1150.0",
 		"@azure/msal-node": "catalog:",
 		"@babel/parser": "catalog:",
 		"@oh-my-pi/omp-stats": "catalog:",
@@ -562,6 +566,7 @@
 		"@opentelemetry/sdk-trace-base": "catalog:",
 		"@opentelemetry/sdk-trace-node": "catalog:",
 		"axe-core": "4.13.0",
+		"mysql2": "3.24.6",
 		"puppeteer-core": "catalog:"
 	},
 	"devDependencies": {

@@ -8,7 +8,13 @@ import type { ToolSession } from "../tools";
 import { resolveToolDecision } from "../tools/approval";
 import { dispatchReportIssueDevice, reportIssueDeviceUsage } from "../tools/report-tool-issue";
 import { dispatchResolutionDevice, resolutionDeviceUsage } from "../tools/resolve";
-import { dispatchXdevTool, resolveXdevTool, xdevDocs, xdevListing } from "../tools/xdev";
+import {
+	dispatchXdevTool,
+	resolveXdevCancellationBehavior,
+	resolveXdevTool,
+	xdevDocs,
+	xdevListing,
+} from "../tools/xdev";
 import type {
 	InternalResource,
 	InternalUrl,
@@ -52,6 +58,16 @@ function deviceWriteTier(
 	}
 }
 
+function deviceWriteCancellationBehavior(
+	url: InternalUrl,
+	content: string | undefined,
+	session: ToolSession | undefined,
+): "await-cleanup" | undefined {
+	const name = parseXdUrl(url.rawHref ?? url.href)?.name;
+	if (!name || !session?.xdev || typeof content !== "string") return undefined;
+	return resolveXdevCancellationBehavior(session.xdev, name, content);
+}
+
 /** Routes session-bound virtual tool devices through `xd://` URLs. */
 export class XdProtocolHandler implements ProtocolHandler {
 	readonly scheme = "xd";
@@ -60,7 +76,13 @@ export class XdProtocolHandler implements ProtocolHandler {
 		selectors: "none",
 		immutable: true,
 		compactTranscript: true,
-		write: { via: "handler", payload: "text", scope: "device", tier: deviceWriteTier },
+		write: {
+			via: "handler",
+			payload: "text",
+			scope: "device",
+			tier: deviceWriteTier,
+			cancellationBehavior: deviceWriteCancellationBehavior,
+		},
 	};
 
 	async resolve(url: InternalUrl, context?: ResolveContext): Promise<InternalResource> {

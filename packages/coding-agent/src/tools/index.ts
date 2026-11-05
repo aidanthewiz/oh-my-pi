@@ -63,6 +63,8 @@ import { AskTool } from "./ask";
 import { AstEditTool } from "./ast-edit";
 import { AstGrepTool } from "./ast-grep";
 import { AwsTool } from "./aws";
+import { AwsDbTool } from "./aws-db";
+import type { ToolExecutionHostCapabilities } from "./tool-execution-host";
 import { BashTool } from "./bash";
 import { type BuiltinToolName, type HiddenToolName, normalizeToolNames } from "./builtin-names";
 import { type CheckpointState, CheckpointTool, type CompletedRewindState, RewindTool } from "./checkpoint";
@@ -586,10 +588,15 @@ export interface ToolSession {
 	queueDeferredMessage?(message: CustomMessage): void;
 	/** Queue a broker supervised-process completion for the owning session. */
 	queueLaunchCompletion?(notification: DaemonCompletionNotification): Promise<void>;
-	/** Register cleanup that runs when this session is disposed; returns a handle that removes the cleanup. */
-	registerDisposeCallback?(callback: () => void): (() => void) | void;
+	/** Begin callbacks run synchronously at shutdown; complete callbacks retain terminal cleanup timing. */
+	registerDisposeCallback?(callback: () => void, options?: { phase?: "begin" | "complete" }): (() => void) | void;
 	/** Register cleanup that runs when this ToolSession adopts a different session ID. */
 	registerSessionChangeCallback?(callback: () => void): (() => void) | void;
+	/** Prove the current dispatcher and session lifecycle support this intrinsic tool contract. */
+	getToolExecutionCapabilities?(
+		tool: Pick<Tool, "name" | "cancellationBehavior">,
+		args: unknown,
+	): ToolExecutionHostCapabilities | undefined;
 	/** Queue late LSP diagnostics (arrived after an edit/write returned) to be shown
 	 *  in the transcript and delivered to the model at the next yield, like background
 	 *  job results. */
@@ -645,6 +652,7 @@ export const BUILTIN_TOOLS: Record<BuiltinToolName, ToolFactory> = {
 	learn: LearnTool.createIf,
 	manage_skill: ManageSkillTool.createIf,
 	aws: s => new AwsTool(s),
+	aws_db: s => new AwsDbTool(s),
 };
 
 export const HIDDEN_TOOLS: Record<HiddenToolName, ToolFactory> = {
