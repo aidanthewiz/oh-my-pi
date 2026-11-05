@@ -637,6 +637,8 @@ These are read as runtime signals; they are usually set by the terminal/OS rathe
 
 `COPILOT_HOME` overrides the GitHub Copilot config home (default `~/.copilot`), and `COPILOT_CUSTOM_INSTRUCTIONS_DIRS` supplies additional comma-separated instruction directories. `JS_DEBUG_DAP_SERVER` selects an existing JavaScript debug-adapter server; `XDG_DATA_HOME` also participates in bundled debugger discovery.
 
+`JS_DEBUG_NODE` selects the default JavaScript adapter's executable independently of the debuggee runtime. Use an absolute path or a path relative to the debug cwd. An empty or unresolvable value makes the adapter unavailable without fallback. If unset, project-local Node, `PATH` Node, and the omp host remain the fallback order. Custom adapter commands are unaffected. See [debug setup](tools/debug.md#notes).
+
 ---
 
 ## 9) TUI runtime flags (shared package, affects coding-agent UX)
