@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import type { AgentToolContext, AgentToolResult } from "@oh-my-pi/pi-agent-core";
+import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
+import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { isRecord } from "@oh-my-pi/pi-utils";
 import { ModelRegistry } from "../../src/config/model-registry";
@@ -141,20 +142,22 @@ export async function runSdkAwsSecretInputLifecycleProbe(
 			await assertAwsSecretInputNativeFiles(directory);
 		},
 	});
-	const constructed: { tool?: AwsTool; signal?: AbortSignal; context?: () => AgentToolContext | undefined } = {};
+	const constructed: { tool?: AwsTool; signal?: AbortSignal } = {};
 	const lifecycle = { completeCallbacks: 0, workerReapedBeforeResult: false, synchronousCleanupComplete: false };
 	let session: AgentSession | undefined;
+	let probeWorkers = 0;
 	let runWorkers = 0;
-	let modelDispatches = 0;
+	let providerDispatches = 0;
 	let approvals = 0;
 	let active: Promise<AgentToolResult<unknown>> | undefined;
 	let disposing: Promise<void> | undefined;
 	let restoreTeardown: (() => void) | undefined;
 	let restoreUI: (() => void) | undefined;
+	let restoreWriter: (() => void) | undefined;
+	let unsubscribeAgent: (() => void) | undefined;
 	let consumerPid: number | undefined;
 	let descendantPid: number | undefined;
 	let guardianPid: number | undefined;
-	const external = new AbortController();
 	const teardownEntered = Promise.withResolvers<void>();
 	const releaseTeardown = Promise.withResolvers<void>();
 	const originalFactory = BUILTIN_TOOLS.aws;
@@ -166,7 +169,10 @@ export async function runSdkAwsSecretInputLifecycleProbe(
 			toolSession.registerDisposeCallback?.(completed);
 			const native = new AwsTool(toolSession, undefined, {
 				launch: () => launch,
-				probeWorker: client.probeAwsSecretInputWorker,
+				probeWorker: async signal => {
+					probeWorkers++;
+					return client.probeAwsSecretInputWorker(signal);
+				},
 				runWorker: async (approvedRequest, files, authorize, signal, admitConsumer) => {
 					runWorkers++;
 					constructed.signal = signal;
@@ -179,7 +185,6 @@ export async function runSdkAwsSecretInputLifecycleProbe(
 				},
 			});
 			constructed.tool = native;
-			constructed.context = () => toolSession.getToolContext?.();
 			return native;
 		};
 		try {
@@ -212,7 +217,7 @@ export async function runSdkAwsSecretInputLifecycleProbe(
 				rules: [],
 				workspaceTree: { rootPath: root, rendered: "", truncated: false, totalLines: 0, agentsMdFiles: [] },
 				onFirstChatDispatch: () => {
-					modelDispatches++;
+					providerDispatches++;
 				},
 			});
 			session = created.session;
@@ -246,23 +251,49 @@ export async function runSdkAwsSecretInputLifecycleProbe(
 		const originalSessionFile = session.sessionFile;
 		requireNativeProof(originalSessionFile);
 		stage = "fresh-approval";
-		const approval = await native.prepareRuntimeApproval("unused", request);
-		requireNativeProof(approval?.allowSessionApproval === false);
-		native.approveRuntimeApproval("unused", request);
-		stage = "consumer-readiness";
-		active = session
-			.getToolByName("write")!
-			.execute(
-				"active",
-				{ path: "xd://aws", content: JSON.stringify(request) },
-				external.signal,
-				update => observation.inspect(update),
-				constructed.context?.(),
-			)
-			.then(result => {
-				observation.inspect(result);
-				return result;
-			});
+		const invocation = { path: "xd://aws", content: JSON.stringify(request) };
+		const synthetic = createMockModel({
+			responses: [
+				{ content: [{ type: "toolCall", id: "active", name: "write", arguments: invocation }] },
+				{ content: ["Private execution settled."] },
+			],
+		});
+		let activeResult: AgentToolResult<unknown> | undefined;
+		let staleGrantRejected = false;
+		const writer = session.agent.state.tools.find(tool => tool.name === "write");
+		requireNativeProof(writer);
+		const execute = writer.execute;
+		writer.execute = async (toolCallId, args, signal, onUpdate, context) => {
+			if (toolCallId === "active") {
+				const approval = await native.prepareRuntimeApproval("unused", request, signal, context);
+				requireNativeProof(approval?.allowSessionApproval === false);
+				native.approveRuntimeApproval("unused", request);
+				stage = "consumer-readiness";
+			} else if (toolCallId === "replay") {
+				native.approveRuntimeApproval("unused", request);
+				const replay = await native.execute("unused", request, signal, undefined, context);
+				observation.inspect(replay);
+				requireNativeFailure(replay, "APPROVAL_REQUIRED");
+				staleGrantRejected = true;
+				return replay;
+			}
+			return execute.call(writer, toolCallId, args, signal, onUpdate, context);
+		};
+		restoreWriter = () => {
+			writer.execute = execute;
+		};
+		session.agent.streamFn = synthetic.stream;
+		unsubscribeAgent = session.agent.subscribe(event => {
+			observation.inspect(event);
+			if (event.type === "tool_execution_end" && event.toolCallId === "active") {
+				activeResult = { ...event.result, isError: event.isError === true };
+			}
+		});
+		active = session.agent.prompt("Run the synthetic private AWS lifecycle request.").then(() => {
+			requireNativeProof(activeResult);
+			return activeResult;
+		});
+		void active.catch(() => {});
 		const readiness = waitForAwsSecretInputLifecycleConsumerReady(control, workerChildren);
 		void readiness.catch(() => {});
 		const ready = await Promise.race([readiness, active.then(() => undefined)]);
@@ -312,9 +343,28 @@ export async function runSdkAwsSecretInputLifecycleProbe(
 			stage = "returned-session-replay";
 			requireNativeProof(await session.switchSession(originalSessionFile));
 			requireNativeProof(sessionManager.getSessionId() === originalSessionId);
-			const beforeReplayWorkers = workers.length;
-			requireNativeFailure(await native.execute("unused", request), "APPROVAL_REQUIRED");
-			requireNativeProof(runWorkers === 1 && workers.length === beforeReplayWorkers);
+			const beforeReplay = { workers: workers.length, probes: probeWorkers, approvals };
+			let rejectedPreparation = false;
+			try {
+				await native.prepareRuntimeApproval("after-fork", request);
+			} catch (error) {
+				observation.inspect(error);
+				rejectedPreparation = error instanceof Error && error.message === "CAPABILITY_INCOMPATIBLE";
+			}
+			requireNativeProof(rejectedPreparation);
+			requireNativeFailure(await native.execute("after-fork", request), "CAPABILITY_INCOMPATIBLE");
+			synthetic.push({
+				content: [{ type: "toolCall", id: "replay", name: "write", arguments: invocation }],
+			});
+			synthetic.push({ content: ["Stale approval replay settled."] });
+			await session.agent.prompt("Replay the previous private AWS approval without a fresh approval.");
+			requireNativeProof(
+				staleGrantRejected &&
+					runWorkers === 1 &&
+					workers.length === beforeReplay.workers &&
+					probeWorkers === beforeReplay.probes &&
+					approvals === beforeReplay.approvals,
+			);
 			transition = {
 				kind: "fork",
 				identityChanged: true,
@@ -357,7 +407,7 @@ export async function runSdkAwsSecretInputLifecycleProbe(
 					lifecycle.completeCallbacks === 0,
 			);
 			stage = "closed-disposal-admission";
-			const beforeAdmissionWorkers = workers.length;
+			const beforeAdmission = { workers: workers.length, probes: probeWorkers, approvals };
 			let rejectedPreparation = false;
 			try {
 				await native.prepareRuntimeApproval("after-dispose", request);
@@ -367,8 +417,14 @@ export async function runSdkAwsSecretInputLifecycleProbe(
 			}
 			requireNativeProof(rejectedPreparation);
 			requireNativeFailure(await native.execute("after-dispose", request), "CANCELLED");
+			native.approveRuntimeApproval("unused", request);
+			requireNativeFailure(await native.execute("unused", request), "CANCELLED");
 			requireNativeProof(
-				runWorkers === 1 && workers.length === beforeAdmissionWorkers && lifecycle.completeCallbacks === 0,
+				runWorkers === 1 &&
+					workers.length === beforeAdmission.workers &&
+					probeWorkers === beforeAdmission.probes &&
+					approvals === beforeAdmission.approvals &&
+					lifecycle.completeCallbacks === 0,
 			);
 			stage = "complete-root-teardown";
 			releaseTeardown.resolve();
@@ -391,7 +447,7 @@ export async function runSdkAwsSecretInputLifecycleProbe(
 		observation.inspect(sessionManager.getEntries());
 		requireNativeProof(observation.clean);
 		stage = "no-model-dispatch";
-		requireNativeProof(modelDispatches === 0);
+		requireNativeProof(providerDispatches === 0);
 		stage = "worker-owned-directories";
 		requireNativeProof(removedDirectories.size > 0 && workers.length > 0);
 		for (const directory of removedDirectories) {
@@ -476,7 +532,7 @@ export async function runSdkAwsSecretInputLifecycleProbe(
 			releaseTeardown.resolve();
 			restoreTeardown?.();
 			restoreUI?.();
-			external.abort();
+			session?.agent.abort();
 			control.send("release-consumer");
 			await cleanup("private-processes", () => cleanupAwsSecretInputLifecycleProcesses(workerChildren));
 			await cleanup("active-execution", () => active);
@@ -487,6 +543,8 @@ export async function runSdkAwsSecretInputLifecycleProbe(
 			await cleanup("owned-files", () => assertAwsSecretInputNativeFiles(root));
 			requireNativeProof(!cleanupFailed && observation.clean);
 		} finally {
+			restoreWriter?.();
+			unsubscribeAgent?.();
 			observation.restore();
 		}
 	}

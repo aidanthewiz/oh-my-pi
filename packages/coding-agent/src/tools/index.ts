@@ -594,7 +594,7 @@ export interface ToolSession {
 	): (() => void) | void;
 	/** Start cleanup synchronously at session/context boundaries; async transitions await completion. */
 	registerSessionChangeCallback?(callback: () => void | Promise<void>): (() => void) | void;
-	/** Prove the current dispatcher and session lifecycle support this intrinsic tool contract. */
+	/** Prove the actual live invocation owns cancellation cleanup and the current session lifecycle. */
 	getToolExecutionCapabilities?(
 		tool: Pick<Tool, "name" | "cancellationBehavior">,
 		args: unknown,

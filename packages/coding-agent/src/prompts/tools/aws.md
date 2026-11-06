@@ -24,6 +24,14 @@ The receiving CLI owns application reads and writes; no query parser, client ada
 5. Bind the verified `capability` fingerprint in the exact request's `secretInput`.
 
 Capability discovery needs no profile, credentials, authentication, or network access.
+Discovery does not authorize unsupported execution paths.
+Require actual invocation ownership under `native-tool-host/v2`, not merely a canonical registered tool wrapper.
+Use the actual native Agent dispatcher or native Write → `xd://aws`, with intrinsic `await-cleanup` and session lifecycle ownership.
+JavaScript/Python Eval and naked SDK/direct `.execute(...)` calls reject with `CAPABILITY_INCOMPATIBLE` before approval UI, provider work, or receiver execution.
+Canonical registered wrappers and nested Write → `xd://aws` calls do not make those unsupported invocations admissible.
+Discover the current fingerprint at runtime; do not reuse one from another host contract.
+Require manifest `hostPolicy:"native-tool-host/v2"`; retain `executionPolicy:"tool-cancellation-cleanup/v1"` and `outputPolicy:"raw-bounded-consumer-output/v1"`.
+Scope, lifecycle, and delivery remain `aws-secret-input-sdk-scope/v2`, `tool-session-lifecycle/v2`, and `finite-stdin-owned-process-group/v2`.
 Native schema and description discovery no longer enumerate AWS profiles; schema and capability discovery read no profile or credential files.
 Use an operator-approved, caller-known operational profile; never infer ambient, default, or model/relay profiles.
 Ordinary explicit-profile execution and the existing commercial MCP profile metadata route remain unchanged.
@@ -64,6 +72,7 @@ The guardian uses a fresh neutral owned startup directory and minimal Bun startu
 Only the receiver uses its approved cwd, environment, and argv.
 Cancellation, timeout, and session disposal reap the owned consumer group and worker without retry or replacement.
 An independent owned finite-input guardian also covers worker SIGKILL/disconnect and receiver leader exit with foreground descendants or pipes remaining.
+The intrinsic `await-cleanup` policy keeps admitted native invocations pending until owned teardown completes.
 Interrupted writes can have committed: report uncertain completion, not rollback or retry safety.
 After worker execution starts, failures report `{ok:false,code,completion:"uncertain"}`; pre-run failures report `{ok:false,code}`.
 Successful `completion:"exited"` means process exit only, not transaction atomicity or rollback.

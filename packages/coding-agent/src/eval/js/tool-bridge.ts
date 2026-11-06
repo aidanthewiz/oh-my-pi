@@ -4,6 +4,7 @@ import {
 	type AgentToolUpdateCallback,
 	validateAgentToolArguments,
 } from "@oh-my-pi/pi-agent-core";
+import { withoutCleanupOwnedToolCall } from "@oh-my-pi/pi-agent-core/agent-loop";
 import { type ImageContent, toolWireSchema } from "@oh-my-pi/pi-ai";
 import type { ReadToolDetails } from "@oh-my-pi/pi-tui/tools/read";
 import { isRecord } from "@oh-my-pi/pi-utils";
@@ -348,12 +349,8 @@ export async function callSessionTool(name: string, args: unknown, options: Tool
 			Object.hasOwn(DELEGATED_WORK_TOOLS, name) ? options.emitStatus : undefined,
 			async () => {
 				try {
-					return await tool.execute(
-						toolCallId,
-						validatedArgs,
-						options.signal,
-						onUpdate,
-						options.session.getToolContext?.(),
+					return await withoutCleanupOwnedToolCall(() =>
+						tool.execute(toolCallId, validatedArgs, options.signal, onUpdate, options.session.getToolContext?.()),
 					);
 				} finally {
 					settled = true;

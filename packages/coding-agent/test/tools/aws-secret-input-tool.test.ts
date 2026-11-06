@@ -121,12 +121,12 @@ const unsupportedHosts: Array<[string, (session: ToolSession) => void]> = [
 		},
 	],
 	[
-		"an older dispatcher protocol",
+		"the registry-only dispatcher protocol",
 		session => {
 			session.getToolExecutionCapabilities = () =>
 				({
 					...TOOL_EXECUTION_HOST_CAPABILITIES,
-					protocol: "native-tool-host/v0",
+					protocol: "native-tool-host/v1",
 				}) as unknown as ToolExecutionHostCapabilities;
 		},
 	],
@@ -192,6 +192,14 @@ describe.skipIf(process.platform === "win32")("AWS secret input local host admis
 
 	for (const [name, workerCapability] of [
 		["protocol", { ...AWS_SECRET_INPUT_CAPABILITY, protocol: "aws-secret-input/v0" }],
+		[
+			"registry-only host",
+			{
+				...AWS_SECRET_INPUT_CAPABILITY,
+				capability: "sha256:d22786d4a043200a285344d1ce7316ed342e7a7de68e33af4de6e07a1b7f6469",
+				manifest: { ...AWS_SECRET_INPUT_CAPABILITY.manifest, hostPolicy: "native-tool-host/v1" },
+			},
+		],
 		[
 			"manifest",
 			{

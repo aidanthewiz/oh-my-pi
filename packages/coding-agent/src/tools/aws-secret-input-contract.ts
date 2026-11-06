@@ -170,7 +170,7 @@ export const AWS_SECRET_INPUT_MANIFEST = freeze({
 	scope: "aws-secret-input-sdk-scope/v2",
 	worker: "aws-secret-input-isolated-process/v1",
 	executionPolicy: "tool-cancellation-cleanup/v1",
-	hostPolicy: "native-tool-host/v1",
+	hostPolicy: "native-tool-host/v2",
 	lifecyclePolicy: "tool-session-lifecycle/v2",
 	deliveryPolicy: "finite-stdin-owned-process-group/v2",
 	outputPolicy: "raw-bounded-consumer-output/v1",

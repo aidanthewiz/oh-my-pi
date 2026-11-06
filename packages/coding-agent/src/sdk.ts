@@ -13,6 +13,7 @@ import {
 	type StreamFn,
 	type ThinkingLevel,
 } from "@oh-my-pi/pi-agent-core";
+import { getCleanupOwnedToolCallArgs } from "@oh-my-pi/pi-agent-core/agent-loop";
 import { resolveToolCancellationBehavior } from "@oh-my-pi/pi-agent-core/tool-cancellation";
 import type {
 	Api,
@@ -3035,20 +3036,34 @@ async function createAgentSessionScoped(
 				)
 					return undefined;
 				const direct = agent.state.tools.find(candidate => candidate.name === tool.name);
-				if (direct)
-					return resolveToolCancellationBehavior(direct, args) === "await-cleanup"
-						? TOOL_EXECUTION_HOST_CAPABILITIES
-						: undefined;
+				if (
+					direct &&
+					resolveToolCancellationBehavior(direct, args) === "await-cleanup" &&
+					Bun.deepEquals(getCleanupOwnedToolCallArgs(direct), args)
+				)
+					return TOOL_EXECUTION_HOST_CAPABILITIES;
 				const mounted = toolSession.xdev && resolveMountedXdevExecutable(toolSession.xdev, tool.name);
 				const writer = agent.state.tools.find(candidate => candidate.name === "write");
 				if (!mounted || !writer || resolveToolCancellationBehavior(mounted, args) !== "await-cleanup")
 					return undefined;
-				return resolveToolCancellationBehavior(writer, {
-					path: `xd://${tool.name}`,
-					content: JSON.stringify(args),
-				}) === "await-cleanup"
-					? TOOL_EXECUTION_HOST_CAPABILITIES
-					: undefined;
+				const invocation = getCleanupOwnedToolCallArgs(writer);
+				if (
+					!invocation ||
+					typeof invocation !== "object" ||
+					!("path" in invocation) ||
+					invocation.path !== `xd://${tool.name}` ||
+					!("content" in invocation) ||
+					typeof invocation.content !== "string" ||
+					resolveToolCancellationBehavior(writer, invocation) !== "await-cleanup"
+				)
+					return undefined;
+				try {
+					return Bun.deepEquals(JSON.parse(invocation.content), args)
+						? TOOL_EXECUTION_HOST_CAPABILITIES
+						: undefined;
+				} catch {
+					return undefined;
+				}
 			},
 			captureOwnerCurrent: ({ allowParked = false } = {}) => {
 				const owner = captureOwnerScope();

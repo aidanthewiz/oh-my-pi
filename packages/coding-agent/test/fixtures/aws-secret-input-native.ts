@@ -3,8 +3,10 @@ import * as fs from "node:fs/promises";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import * as net from "node:net";
 import * as path from "node:path";
-import type { AgentTool, AgentToolContext, AgentToolResult } from "@oh-my-pi/pi-agent-core";
+import { Agent, type AgentTool, type AgentToolContext, type AgentToolResult } from "@oh-my-pi/pi-agent-core";
+import { getCleanupOwnedToolCallArgs } from "@oh-my-pi/pi-agent-core/agent-loop";
 import { resolveToolCancellationBehavior } from "@oh-my-pi/pi-agent-core/tool-cancellation";
+import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { validateJsonSchemaValue } from "@oh-my-pi/pi-ai/utils/schema";
 import { isRecord } from "@oh-my-pi/pi-utils";
 import { Settings } from "../../src/config/settings";
@@ -483,15 +485,26 @@ export async function runAwsSecretInputNativeProbe(
 			};
 		},
 		getToolExecutionCapabilities: (tool, args) => {
-			if (disposed || !sessionId || resolveToolCancellationBehavior(tool, args) !== "await-cleanup")
+			if (
+				disposed ||
+				!sessionId ||
+				!executionWrite ||
+				session.toolRegistry?.get(tool.name) !== tool ||
+				resolveToolCancellationBehavior(tool, args) !== "await-cleanup"
+			)
 				return undefined;
+			const input = getCleanupOwnedToolCallArgs(executionWrite);
+			if (!isRecord(input) || input.path !== "xd://aws" || typeof input.content !== "string") return undefined;
+			try {
+				if (!Bun.deepEquals(JSON.parse(input.content), args)) return undefined;
+			} catch {
+				return undefined;
+			}
 			const mounted = session.xdev && resolveMountedXdevExecutable(session.xdev, tool.name);
 			const canonicalWrite = session.toolRegistry?.get("write");
-			const input = { path: "xd://aws", content: JSON.stringify(args) };
 			if (
 				!mounted ||
 				!canonicalWrite ||
-				!executionWrite ||
 				resolveToolCancellationBehavior(mounted, args) !== "await-cleanup" ||
 				resolveToolCancellationBehavior(canonicalWrite, input) !== "await-cleanup" ||
 				resolveToolCancellationBehavior(executionWrite, input) !== "await-cleanup"
@@ -603,18 +616,62 @@ export async function runAwsSecretInputNativeProbe(
 	const cases: { name: string; passed: true }[] = [];
 	const verifiedWorkers = new Set<(typeof workers)[number]>();
 	let sequence = 0;
-	const invoke = async (request: unknown, id = `native-${++sequence}`) => {
+	const dispatchWrite = async (request: unknown, id: string) => {
+		requireNativeProof(executionWrite);
 		activeContext = context();
 		const input = { path: "xd://aws", content: JSON.stringify(request) };
 		observation.inspect(input);
+		const mock = createMockModel({
+			responses: [
+				{ content: [{ type: "toolCall", id, name: executionWrite.name, arguments: input }] },
+				{ content: ["Native fixture turn complete"] },
+			],
+		});
+		const agent = new Agent({
+			initialState: { model: mock.model, tools: [executionWrite] },
+			streamFn: mock.stream,
+			getToolContext: () => activeContext,
+		});
+		const outcome: { result?: AgentToolResult<unknown> } = {};
+		const unsubscribe = agent.subscribe(event => {
+			observation.inspect(event);
+			if (event.type === "tool_execution_end" && event.toolCallId === id)
+				outcome.result = { ...event.result, isError: event.isError === true };
+		});
 		try {
-			const result = await executionWrite!.execute(
-				id,
-				input,
-				undefined,
-				update => observation.inspect(update),
-				activeContext,
-			);
+			await agent.prompt("Run the native fixture Write call");
+			requireNativeProof(outcome.result);
+			return outcome.result;
+		} finally {
+			unsubscribe();
+		}
+	};
+	const atWriteExecution = async <T>(request: unknown, id: string, run: () => T | Promise<T>): Promise<T> => {
+		requireNativeProof(executionWrite);
+		const rootTool = executionWrite;
+		const originalExecute = Object.getOwnPropertyDescriptor(rootTool, "execute");
+		const checkpoint: { outcome?: { ok: true; value: T } | { ok: false; error: unknown } } = {};
+		rootTool.execute = async () => {
+			try {
+				checkpoint.outcome = { ok: true, value: await run() };
+			} catch (error) {
+				checkpoint.outcome = { ok: false, error };
+			}
+			return { content: [{ type: "text", text: "Native fixture checkpoint complete" }], details: {} };
+		};
+		try {
+			await dispatchWrite(request, id);
+		} finally {
+			if (originalExecute) Object.defineProperty(rootTool, "execute", originalExecute);
+			else Reflect.deleteProperty(rootTool, "execute");
+		}
+		requireNativeProof(checkpoint.outcome);
+		if (!checkpoint.outcome.ok) throw checkpoint.outcome.error;
+		return checkpoint.outcome.value;
+	};
+	const invoke = async (request: unknown, id = `native-${++sequence}`) => {
+		try {
+			const result = await dispatchWrite(request, id);
 			observation.inspect(result);
 			const response = awsSecretInputNativeResponse(result);
 			const code =
@@ -839,12 +896,12 @@ export async function runAwsSecretInputNativeProbe(
 			native = install();
 			choice = "deny";
 			const approvals = choices.length;
-			const invocation = await invoke(awsSecretInputLifecycleRequest(root), "denied");
+			const request = awsSecretInputLifecycleRequest(root);
+			const invocation = await invoke(request, "denied");
 			requireNativeProof(invocation.failed && choices.length === approvals + 1 && runWorkers === 0);
-			requireNativeFailure(
-				await native.execute("denied", awsSecretInputLifecycleRequest(root)),
-				"APPROVAL_REQUIRED",
-			);
+			await atWriteExecution(request, "denied", async () => {
+				requireNativeFailure(await native.execute("denied", request), "APPROVAL_REQUIRED");
+			});
 		});
 		for (const [name, policy] of [
 			["aws-policy-denial", { "aws.secretsmanager.get-secret-value": "deny" }],
@@ -917,7 +974,9 @@ export async function runAwsSecretInputNativeProbe(
 				requireNativeProof(title.includes(guard.command) && title.includes(guard.cwd));
 				if (guard.decision === "ask") requireNativeProof(title.includes(guard.reason));
 			}
-			requireNativeFailure(await native.execute("consume-once", request), "APPROVAL_REQUIRED");
+			await atWriteExecution(request, "consume-once", async () => {
+				requireNativeFailure(await native.execute("consume-once", request), "APPROVAL_REQUIRED");
+			});
 			requireNativeProof(runWorkers === 1);
 		});
 		await record("immutable-approved-request", async () => {
@@ -961,58 +1020,68 @@ export async function runAwsSecretInputNativeProbe(
 			for (const [index, change] of changes.entries()) {
 				const request = structuredClone(awsSecretInputLifecycleRequest(root));
 				const id = `immutable-${index}`;
-				const approval = await native.prepareRuntimeApproval(id, request, undefined, context());
-				requireNativeProof(approval?.allowSessionApproval === false);
-				native.approveRuntimeApproval(id, request);
+				await atWriteExecution(request, id, async () => {
+					const approval = await native.prepareRuntimeApproval(id, request, undefined, context());
+					requireNativeProof(approval?.allowSessionApproval === false);
+					native.approveRuntimeApproval(id, request);
+				});
 				change(request);
-				requireNativeFailure(
-					await native.execute(id, request, undefined, observation.inspect, context()),
-					"APPROVAL_REQUIRED",
-				);
+				await atWriteExecution(request, id, async () => {
+					requireNativeFailure(
+						await native.execute(id, request, undefined, observation.inspect, context()),
+						"APPROVAL_REQUIRED",
+					);
+				});
 			}
 			requireNativeProof(runWorkers === 1);
 		});
 		await record("changed-settings-reject-grant", async () => {
 			const request = awsSecretInputLifecycleRequest(root);
-			requireNativeProof(await native.prepareRuntimeApproval("settings", request, undefined, context()));
-			native.approveRuntimeApproval("settings", request);
-			cfgToolsApprovalMode.set(session.settings, "always-ask");
-			requireNativeFailure(
-				await native.execute("settings", request, undefined, observation.inspect, context()),
-				"APPROVAL_REQUIRED",
-			);
+			await atWriteExecution(request, "settings", async () => {
+				requireNativeProof(await native.prepareRuntimeApproval("settings", request, undefined, context()));
+				native.approveRuntimeApproval("settings", request);
+				cfgToolsApprovalMode.set(session.settings, "always-ask");
+				requireNativeFailure(
+					await native.execute("settings", request, undefined, observation.inspect, context()),
+					"APPROVAL_REQUIRED",
+				);
+			});
 			requireNativeProof(runWorkers === 1);
 		});
 		await record("changed-session-reject-grant", async () => {
 			const request = awsSecretInputLifecycleRequest(root);
-			requireNativeProof(await native.prepareRuntimeApproval("session", request, undefined, context()));
-			native.approveRuntimeApproval("session", request);
-			sessionId = "aws-secret-input-native-next";
-			for (const callback of Array.from(sessionChanges)) callback();
-			sessionId = "aws-secret-input-native";
-			for (const callback of Array.from(sessionChanges)) callback();
-			requireNativeFailure(
-				await native.execute("session", request, undefined, observation.inspect, context()),
-				"APPROVAL_REQUIRED",
-			);
+			await atWriteExecution(request, "session", async () => {
+				requireNativeProof(await native.prepareRuntimeApproval("session", request, undefined, context()));
+				native.approveRuntimeApproval("session", request);
+				sessionId = "aws-secret-input-native-next";
+				for (const callback of Array.from(sessionChanges)) callback();
+				sessionId = "aws-secret-input-native";
+				for (const callback of Array.from(sessionChanges)) callback();
+				requireNativeFailure(
+					await native.execute("session", request, undefined, observation.inspect, context()),
+					"APPROVAL_REQUIRED",
+				);
+			});
 			requireNativeProof(runWorkers === 1);
 		});
 		await record("changed-host-cwd-reject-grant", async () => {
 			const request = awsSecretInputLifecycleRequest(root);
-			requireNativeProof(await native.prepareRuntimeApproval("host-cwd", request, undefined, context()));
-			native.approveRuntimeApproval("host-cwd", request);
-			const originalCwd = session.cwd;
-			const beforeWorkers = workers.length;
-			session.cwd = path.join(root, "alternate-cwd");
-			try {
-				requireNativeFailure(
-					await native.execute("host-cwd", request, undefined, observation.inspect, context()),
-					"APPROVAL_REQUIRED",
-				);
-				requireNativeProof(runWorkers === 1 && workers.length === beforeWorkers);
-			} finally {
-				session.cwd = originalCwd;
-			}
+			await atWriteExecution(request, "host-cwd", async () => {
+				requireNativeProof(await native.prepareRuntimeApproval("host-cwd", request, undefined, context()));
+				native.approveRuntimeApproval("host-cwd", request);
+				const originalCwd = session.cwd;
+				const beforeWorkers = workers.length;
+				session.cwd = path.join(root, "alternate-cwd");
+				try {
+					requireNativeFailure(
+						await native.execute("host-cwd", request, undefined, observation.inspect, context()),
+						"APPROVAL_REQUIRED",
+					);
+					requireNativeProof(runWorkers === 1 && workers.length === beforeWorkers);
+				} finally {
+					session.cwd = originalCwd;
+				}
+			});
 		});
 		await record("raw-consumer-output", async () => {
 			native = install();
@@ -1064,34 +1133,32 @@ export async function runAwsSecretInputNativeProbe(
 			native.sessionApproval.approve();
 			const request = awsSecretInputLifecycleRequest(root, "success", control.port);
 			const before = runWorkers;
-			requireNativeFailure(await native.execute("ordinary-session-grant", request), "APPROVAL_REQUIRED");
-			const approval = await native.prepareRuntimeApproval("no-session-once", request, undefined, context());
-			requireNativeProof(approval?.allowSessionApproval === false);
-			native.approveRuntimeApproval("no-session-once", request);
-			const result = await native.execute("no-session-once", request, undefined, observation.inspect, context());
-			observation.inspect(result);
-			requireNativeProof(
-				!result.isError && awsSecretInputNativeResponse(result)?.ok === true && runWorkers === before + 1,
-			);
-			requireNativeFailure(await native.execute("no-session-once", request), "APPROVAL_REQUIRED");
-			requireNativeFailure(await native.execute("no-session-fresh", request), "APPROVAL_REQUIRED");
-			requireNativeProof(runWorkers === before + 1);
+			await atWriteExecution(request, "no-session-once", async () => {
+				requireNativeFailure(await native.execute("ordinary-session-grant", request), "APPROVAL_REQUIRED");
+				const approval = await native.prepareRuntimeApproval("no-session-once", request, undefined, context());
+				requireNativeProof(approval?.allowSessionApproval === false);
+				native.approveRuntimeApproval("no-session-once", request);
+				const result = await native.execute("no-session-once", request, undefined, observation.inspect, context());
+				observation.inspect(result);
+				requireNativeProof(
+					!result.isError && awsSecretInputNativeResponse(result)?.ok === true && runWorkers === before + 1,
+				);
+				requireNativeFailure(await native.execute("no-session-once", request), "APPROVAL_REQUIRED");
+				requireNativeFailure(await native.execute("no-session-fresh", request), "APPROVAL_REQUIRED");
+				requireNativeProof(runWorkers === before + 1);
+			});
 		});
 		await record("completed-secret-input-cannot-downgrade", async () => {
 			native = install();
 			native.sessionApproval.approve();
 			const request = awsSecretInputLifecycleRequest(root, "success", control.port);
-			requireNativeProof(
-				await native.prepareRuntimeApproval("completed-protected-once", request, undefined, context()),
-			);
-			native.approveRuntimeApproval("completed-protected-once", request);
-			const completed = await native.execute(
-				"completed-protected-once",
-				request,
-				undefined,
-				observation.inspect,
-				context(),
-			);
+			const completed = await atWriteExecution(request, "completed-protected-once", async () => {
+				requireNativeProof(
+					await native.prepareRuntimeApproval("completed-protected-once", request, undefined, context()),
+				);
+				native.approveRuntimeApproval("completed-protected-once", request);
+				return native.execute("completed-protected-once", request, undefined, observation.inspect, context());
+			});
 			observation.inspect(completed);
 			requireNativeProof(!completed.isError && awsSecretInputNativeResponse(completed)?.ok === true);
 			const ordinary = ordinarySecretValueRequest(request);
@@ -1119,9 +1186,11 @@ export async function runAwsSecretInputNativeProbe(
 			for (const phase of ["execute", "prepare", "approve", "deny"] as const) {
 				const id = `strip-secret-input-${phase}`;
 				const request = awsSecretInputLifecycleRequest(root);
-				requireNativeProof(await native.prepareRuntimeApproval(id, request, undefined, context()));
-				native.approveRuntimeApproval(id, request);
-				if (phase === "deny") native.denyRuntimeApproval(id, request);
+				await atWriteExecution(request, id, async () => {
+					requireNativeProof(await native.prepareRuntimeApproval(id, request, undefined, context()));
+					native.approveRuntimeApproval(id, request);
+					if (phase === "deny") native.denyRuntimeApproval(id, request);
+				});
 				const ordinary = ordinarySecretValueRequest(request);
 				const beforeWorkers = workers.length;
 				const beforeRuns = runWorkers;
@@ -1167,17 +1236,19 @@ export async function runAwsSecretInputNativeProbe(
 			for (const [target, request] of targets) {
 				for (const phase of ["prepared", "completed", "denied"] as const) {
 					const id = `replace-capability-${target}-${phase}`;
-					if (phase === "completed") {
-						const result = await native.execute(id, capability, undefined, observation.inspect, context());
-						observation.inspect(result);
-						requireNativeProof(!result.isError);
-						assertAwsSecretInputCapability(awsSecretInputNativeResponse(result));
-					} else {
-						requireNativeProof(
-							(await native.prepareRuntimeApproval(id, capability, undefined, context())) === undefined,
-						);
-						if (phase === "denied") native.denyRuntimeApproval(id, capability);
-					}
+					await atWriteExecution(capability, id, async () => {
+						if (phase === "completed") {
+							const result = await native.execute(id, capability, undefined, observation.inspect, context());
+							observation.inspect(result);
+							requireNativeProof(!result.isError);
+							assertAwsSecretInputCapability(awsSecretInputNativeResponse(result));
+						} else {
+							requireNativeProof(
+								(await native.prepareRuntimeApproval(id, capability, undefined, context())) === undefined,
+							);
+							if (phase === "denied") native.denyRuntimeApproval(id, capability);
+						}
+					});
 					const ordinary = { ...capability, ...request };
 					Reflect.deleteProperty(ordinary, "action");
 					Reflect.deleteProperty(ordinary, "protocol");
@@ -1390,18 +1461,22 @@ export async function runAwsSecretInputNativeProbe(
 			for (const guard of secretGuards)
 				requireNativeProof(title.includes(guard.command) && title.includes(guard.cwd));
 			const id = `cross-account-approved-${++sequence}`;
-			const approval = await native.prepareRuntimeApproval(id, request, undefined, context());
-			requireNativeProof(approval?.allowSessionApproval === false);
-			native.approveRuntimeApproval(id, request);
+			await atWriteExecution(request, id, async () => {
+				const approval = await native.prepareRuntimeApproval(id, request, undefined, context());
+				requireNativeProof(approval?.allowSessionApproval === false);
+				native.approveRuntimeApproval(id, request);
+			});
 			const unapproved = structuredClone(request);
 			unapproved.parameters.SecretId = approvedArn.replace(":210987654321:", ":345678901234:");
 			const beforeWorkers = workers.length;
 			const promptsAfterApproval = choices.length;
-			await withoutOrdinaryAwsIo(async () => {
-				const result = await native.execute(id, unapproved, undefined, observation.inspect, context());
-				observation.inspect(result);
-				requireNativeFailure(result, "APPROVAL_REQUIRED");
-			});
+			await atWriteExecution(unapproved, id, () =>
+				withoutOrdinaryAwsIo(async () => {
+					const result = await native.execute(id, unapproved, undefined, observation.inspect, context());
+					observation.inspect(result);
+					requireNativeFailure(result, "APPROVAL_REQUIRED");
+				}),
+			);
 			requireNativeProof(
 				runWorkers === beforeRuns + 1 &&
 					workers.length === beforeWorkers &&

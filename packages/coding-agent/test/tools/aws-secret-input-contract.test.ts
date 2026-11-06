@@ -96,9 +96,14 @@ describe("AWS secret input admission data", () => {
 	it("requires the agreed protocol and exact manifest fingerprint", () => {
 		rejects({ action: "secret-input-capabilities", protocol: "aws-secret-input/v0" });
 		rejects({ action: "secret-input-capabilities", protocol: AWS_SECRET_INPUT_PROTOCOL, profile: "synthetic-input" });
-		const value = request();
-		value.secretInput.capability = `sha256:${"0".repeat(64)}`;
-		rejects(value, "CAPABILITY_INCOMPATIBLE");
+		for (const capability of [
+			`sha256:${"0".repeat(64)}`,
+			"sha256:d22786d4a043200a285344d1ce7316ed342e7a7de68e33af4de6e07a1b7f6469",
+		]) {
+			const value = request();
+			value.secretInput.capability = capability;
+			rejects(value, "CAPABILITY_INCOMPATIBLE");
+		}
 	});
 
 	const invalidReference: Array<[string, (value: AwsSecretInputRequest) => unknown]> = [

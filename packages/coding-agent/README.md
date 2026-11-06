@@ -53,8 +53,15 @@ The receiving CLI controls its own reads and writes.
 6. Approve that exact immutable request once. Session grants do not replace this approval.
 
 Capability discovery performs no authentication, credential access, or AWS request.
-It verifies actual host cancellation, session disposal, and private worker support, not only a version flag.
-Unsupported hosts fail before provider work or approval.
+Discovery checks loaded host and private worker capabilities; it does not authorize an unsupported execution path.
+Execution requires actual invocation ownership under `native-tool-host/v2`, not merely a canonical registered tool wrapper.
+The actual native Agent dispatcher and native Write → `xd://aws` route support secret input with intrinsic `await-cleanup` and session lifecycle ownership.
+JavaScript/Python Eval and naked SDK/direct `.execute(...)` invocations are unsupported, even through a canonical registered wrapper or nested Write → `xd://aws`.
+They fail with `CAPABILITY_INCOMPATIBLE` before approval UI, provider work, or receiver execution.
+Discover and verify the current fingerprint at runtime; do not reuse a fingerprint from another host contract.
+The manifest requires `hostPolicy:"native-tool-host/v2"` and retains `executionPolicy:"tool-cancellation-cleanup/v1"`.
+Scope, lifecycle, and delivery remain `aws-secret-input-sdk-scope/v2`, `tool-session-lifecycle/v2`, and `finite-stdin-owned-process-group/v2`.
+Output remains `raw-bounded-consumer-output/v1`.
 Native schema and description discovery no longer enumerate AWS profiles; schema and capability discovery read no profile or credential files.
 Use an operator-approved, caller-known operational profile, never an inferred ambient, default, or model/relay profile.
 Ordinary explicit-profile execution and the existing commercial MCP profile metadata route remain unchanged.
@@ -116,7 +123,7 @@ Only the receiver uses the approved working directory, environment, and argv.
 Stdin closes after the bounded input.
 Cancellation, timeout, and session disposal terminate and reap the owned consumer group and worker, close streams, and release owned references.
 An independent owned finite-input guardian handles worker SIGKILL or disconnect and receiver leader exit while foreground descendants or pipes remain.
-The `await-cleanup` execution policy keeps wrappers pending until owned teardown completes.
+The intrinsic `await-cleanup` execution policy keeps admitted native invocations pending until owned teardown completes.
 There is no automatic retry or replacement.
 Interrupted writes may already have committed; uncertain completion does not imply rollback or retry safety.
 After worker execution starts, failures report `{ok:false,code,completion:"uncertain"}`; pre-run failures report only `{ok:false,code}`.

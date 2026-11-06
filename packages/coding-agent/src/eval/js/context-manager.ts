@@ -1,4 +1,5 @@
 import * as path from "node:path";
+import { withoutCleanupOwnedToolCall } from "@oh-my-pi/pi-agent-core/agent-loop";
 import { filterChildShellEnv, logger, Snowflake, workerHostEntry } from "@oh-my-pi/pi-utils";
 import { createWorkerHandle, createWorkerSubprocess, resolveWorkerSpawnCmd } from "../../subprocess/worker-client";
 import type { ToolSession } from "../../tools";
@@ -829,17 +830,19 @@ async function handleToolCall(session: JsSession, msg: Extract<WorkerOutbound, {
 	const ctrl = new AbortController();
 	pending.toolCalls.set(msg.id, ctrl);
 	try {
-		const value = await callSessionTool(msg.name, msg.args, {
-			session: pending.toolSession,
-			signal: ctrl.signal,
-			identity: msg.identity,
-			shadowCell: pending.shadowCell,
-			onReply: pending.runState.onReply,
-			emitStatus: (event: JsStatusEvent) => {
-				trackDeferPhase(pending, event);
-				pending.runState.onDisplay?.({ type: "status", event });
-			},
-		});
+		const value = await withoutCleanupOwnedToolCall(() =>
+			callSessionTool(msg.name, msg.args, {
+				session: pending.toolSession,
+				signal: ctrl.signal,
+				identity: msg.identity,
+				shadowCell: pending.shadowCell,
+				onReply: pending.runState.onReply,
+				emitStatus: (event: JsStatusEvent) => {
+					trackDeferPhase(pending, event);
+					pending.runState.onDisplay?.({ type: "status", event });
+				},
+			}),
+		);
 		safeSend(session, { type: "tool-reply", id: msg.id, reply: { ok: true, value } });
 	} catch (error) {
 		safeSend(session, { type: "tool-reply", id: msg.id, reply: { ok: false, error: toErrorPayload(error) } });

@@ -155,7 +155,7 @@ export class AwsSecretInput {
 		}
 	}
 	approval(args: unknown): ToolApprovalDecision {
-		const request = this.#normalize(args);
+		const request = normalizeAwsSecretInputRequest(args);
 		return "action" in request ? { tier: "read", policy: "allow" } : "exec";
 	}
 	formatApprovalDetails(args: unknown): string[] {
