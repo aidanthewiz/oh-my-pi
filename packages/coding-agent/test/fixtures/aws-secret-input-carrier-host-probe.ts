@@ -19,6 +19,7 @@ import {
 	AWS_SECRET_INPUT_CAPABILITY,
 	AWS_SECRET_INPUT_PROTOCOL,
 	type AwsSecretInputRequest,
+	assertAwsSecretInputCapability,
 	normalizeAwsSecretInputRequest,
 } from "../../src/tools/aws-secret-input-contract";
 import { runAwsSecretInputScope } from "../../src/tools/aws-secret-input-scope";
@@ -27,6 +28,7 @@ import { createInMemoryAuthStorage } from "../helpers/agent-session-setup";
 const emit = process.stdout.write.bind(process.stdout);
 const APPROVED_OUTPUT = "carrier-input-approved\n";
 const SYNTHETIC_INPUT = "carrier-fixture-private-input";
+const COPIED_AWS_PATH = "[xd://aws#ABCD]";
 let stage = "setup";
 
 function proof(value: unknown): asserts value {
@@ -54,18 +56,22 @@ function incompatible(value: unknown): boolean {
 	);
 }
 
-function evalCode(language: "js" | "py", carrier: "aws" | "write", args: unknown): string {
-	const input = carrier === "aws" ? args : { path: "xd://aws", content: JSON.stringify(args) };
+function evalCode(language: "js" | "py", carrier: "aws" | "write" | "copied-write", args: unknown): string {
+	const tool = carrier === "aws" ? "aws" : "write";
+	const input =
+		carrier === "aws"
+			? args
+			: { path: carrier === "copied-write" ? COPIED_AWS_PATH : "xd://aws", content: JSON.stringify(args) };
 	if (language === "js") {
 		return [
-			`const result = await tool.${carrier}(${JSON.stringify(input)});`,
+			`const result = await tool.${tool}(${JSON.stringify(input)});`,
 			"if (result?.hasError) throw new Error(result.text);",
 			"return result;",
 		].join("\n");
 	}
 	return [
 		"import json",
-		`result = await tool.${carrier}(json.loads(${JSON.stringify(JSON.stringify(input))}))`,
+		`result = await tool.${tool}(json.loads(${JSON.stringify(JSON.stringify(input))}))`,
 		"if isinstance(result, dict) and result.get('hasError'):",
 		"    raise RuntimeError(result['text'])",
 		"result",
@@ -378,7 +384,10 @@ async function run(root: string, language: "js" | "py") {
 			if (event.type === "tool_execution_end")
 				results.set(event.toolCallId, { ...event.result, isError: event.isError === true });
 		});
-		const writeArgs = (args: unknown) => ({ path: "xd://aws", content: JSON.stringify(args) });
+		const writeArgs = (args: unknown, destination = "xd://aws") => ({
+			path: destination,
+			content: JSON.stringify(args),
+		});
 		const execute = (tool: AgentTool, args: unknown) =>
 			tool.execute(
 				`outside-${++sequence}`,
@@ -416,12 +425,13 @@ async function run(root: string, language: "js" | "py") {
 				await reject(`sdk-raw-aws-${kind}`, () => raw.execute(`raw-${++sequence}`, args));
 				await reject(`sdk-canonical-aws-${kind}`, () => execute(canonicalAws, args));
 				await reject(`sdk-canonical-write-${kind}`, () => execute(canonicalWrite, writeArgs(args)));
+				await reject(`sdk-copied-write-${kind}`, () => execute(canonicalWrite, writeArgs(args, COPIED_AWS_PATH)));
 				await reject(`sdk-bridge-aws-${kind}`, () => callSessionTool("aws", args, { session: owner }));
 				await reject(`sdk-bridge-write-${kind}`, () =>
 					callSessionTool("write", writeArgs(args), { session: owner }),
 				);
 			}
-			for (const carrier of ["aws", "write"] as const) {
+			for (const carrier of ["aws", "write", "copied-write"] as const) {
 				await reject(`${language}-eval-${carrier}-${kind}`, async () => {
 					const turn = dispatch("eval", { language, code: evalCode(language, carrier, args), timeout: 30 });
 					await turn.pending;
@@ -440,7 +450,7 @@ async function run(root: string, language: "js" | "py") {
 			};
 
 		const rejectPreflight = async (carrier: "aws" | "write") => {
-			const args = carrier === "aws" ? request : writeArgs(request);
+			const args = carrier === "aws" ? request : writeArgs(request, COPIED_AWS_PATH);
 			const beforeToolCall = live.agent.beforeToolCall;
 			let entered = 0;
 			live.agent.beforeToolCall = async context => {
@@ -491,6 +501,16 @@ async function run(root: string, language: "js" | "py") {
 		};
 		await rejectPreflight("write");
 
+		stage = "native-copied-write-capability";
+		const beforeCapability = { ...counts };
+		const capability = dispatch("write", writeArgs(capabilityRequest, COPIED_AWS_PATH));
+		await capability.pending;
+		const capabilityResult = results.get(capability.id);
+		proof(capabilityResult && capabilityResult.isError !== true);
+		const discoveredCapability = response(capabilityResult);
+		assertAwsSecretInputCapability(discoveredCapability);
+		proof(Bun.deepEquals(counts, { ...beforeCapability, probeWorker: counts.probeWorker }));
+
 		stage = "native-approved-result";
 		captureStale = async () => {
 			await reject("stale-canonical-aws", () => execute(canonicalAws, request));
@@ -498,7 +518,7 @@ async function run(root: string, language: "js" | "py") {
 		};
 		const writeResultHook: CarrierResultHook = {
 			root: "write",
-			args: writeArgs(request),
+			args: writeArgs(request, COPIED_AWS_PATH),
 			entered: 0,
 			completed: 0,
 			failed: false,
@@ -510,7 +530,7 @@ async function run(root: string, language: "js" | "py") {
 		};
 		resultHook = writeResultHook;
 		const successStart = events.length;
-		const successful = dispatch("write", writeArgs(request));
+		const successful = dispatch("write", writeArgs(request, COPIED_AWS_PATH));
 		await successful.pending;
 		proof(writeResultHook.entered === 1 && writeResultHook.completed === 1 && !writeResultHook.failed);
 		const approved = results.get(successful.id);
@@ -541,7 +561,7 @@ async function run(root: string, language: "js" | "py") {
 		};
 		const held = hold;
 		const heldStart = events.length;
-		const cancelled = dispatch("write", writeArgs(request));
+		const cancelled = dispatch("write", writeArgs(request, COPIED_AWS_PATH));
 		let promptSettled = false;
 		void cancelled.pending.then(
 			() => {
@@ -645,6 +665,7 @@ async function run(root: string, language: "js" | "py") {
 			denied,
 			counts,
 			native: {
+				capability: discoveredCapability,
 				stdout: approvedResponse.result.stdout,
 				directStdout: directResponse.result.stdout,
 				resultHandlers: { write: writeResultHook.completed, aws: directResultHook.completed },

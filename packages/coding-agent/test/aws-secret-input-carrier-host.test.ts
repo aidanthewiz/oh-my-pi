@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { isRecord } from "@oh-my-pi/pi-utils";
+import { AWS_SECRET_INPUT_CAPABILITY } from "../src/tools/aws-secret-input-contract";
 import { createAwsSecretInputNativeGuardLauncher } from "./fixtures/aws-secret-input-native-dcg";
 
 async function capture(stream: ReadableStream<Uint8Array>, maxBytes: number) {
@@ -110,12 +111,14 @@ for (const language of ["js", "py"] as const) {
 								"raw-aws",
 								"canonical-aws",
 								"canonical-write",
+								"copied-write",
 								"bridge-aws",
 								"bridge-write",
 							])
 								expectedDenials.push(`sdk-${carrier}-${kind}`);
 						}
-						for (const carrier of ["aws", "write"]) expectedDenials.push(`${language}-eval-${carrier}-${kind}`);
+						for (const carrier of ["aws", "write", "copied-write"])
+							expectedDenials.push(`${language}-eval-${carrier}-${kind}`);
 					}
 					if (language === "js")
 						expectedDenials.push(
@@ -158,6 +161,7 @@ for (const language of ["js", "py"] as const) {
 						expect(counts?.receiver).toBe(3);
 						expect(counts?.cleanupComplete).toBe(3);
 						const native = isRecord(summary?.native) ? summary.native : undefined;
+						expect(native?.capability).toEqual(AWS_SECRET_INPUT_CAPABILITY);
 						expect(native?.stdout).toBe("carrier-input-approved\n");
 						expect(native?.directStdout).toBe("carrier-input-approved\n");
 						expect(native?.resultHandlers).toEqual({ write: 1, aws: 1 });

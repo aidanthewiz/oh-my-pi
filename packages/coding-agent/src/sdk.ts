@@ -334,6 +334,7 @@ import { isIrcEnabled } from "./irc/messaging";
 import { imageGenTool } from "./tools/image-gen";
 import { wrapToolWithMetaNotice } from "./tools/output-meta";
 import { isFilesystemSourcePath } from "./tools/path-utils";
+import { unwrapHashlineHeaderPath } from "./tools/plan-mode-guard";
 import { queueResolveHandler } from "./tools/resolve";
 import { USER_TODO_EDIT_CUSTOM_TYPE } from "./tools/todo";
 import { ttsTool } from "./tools/tts";
@@ -3051,7 +3052,8 @@ async function createAgentSessionScoped(
 					!invocation ||
 					typeof invocation !== "object" ||
 					!("path" in invocation) ||
-					invocation.path !== `xd://${tool.name}` ||
+					typeof invocation.path !== "string" ||
+					unwrapHashlineHeaderPath(invocation.path) !== `xd://${tool.name}` ||
 					!("content" in invocation) ||
 					typeof invocation.content !== "string" ||
 					resolveToolCancellationBehavior(writer, invocation) !== "await-cleanup"
