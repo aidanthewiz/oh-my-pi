@@ -1546,12 +1546,10 @@ sessionId = "native-approval-owner";
 
 const beforeReservation = (await listTrustedAwsProfiles()).map(profile => profile.name);
 assert.ok(beforeReservation.includes("adopted-model") && beforeReservation.includes("adopted-alias"));
-void tool.parameters;
 reserveManagedAwsProfile("adopted-model");
 const afterReservation = (await listTrustedAwsProfiles()).map(profile => profile.name);
 assert.ok(!afterReservation.includes("adopted-model") && !afterReservation.includes("adopted-alias"));
 assert.ok(afterReservation.includes("coreforge-admin"));
-assert.throws(() => tool.parameters.assert({ ...read, profile: "adopted-model" }));
 const beforeRejectedHelpers = (await calls()).length;
 const repositoryHelper = path.join(repository, process.platform === "win32" ? "native-helper.exe" : "native-helper");
 await fs.copyFile(process.execPath, repositoryHelper);
@@ -1560,7 +1558,9 @@ await fs.writeFile(scriptHelper, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
 for (const profile of ["repository-helper", "script-helper"]) {
 	await assert.rejects(() => tool.execute(profile, { ...read, profile }), /AUTH_REQUIRED/);
 }
-await assert.rejects(() => tool.execute("reserved-alias", { ...read, profile: "adopted-alias" }), /PROFILE_NOT_FOUND/);
+for (const profile of ["adopted-model", "adopted-alias"]) {
+	await assert.rejects(() => tool.execute(`reserved-${profile}`, { ...read, profile }), /PROFILE_NOT_FOUND/);
+}
 assert.equal((await calls()).length, beforeRejectedHelpers);
 for (const prefix of ["malformed-json", "prefixed-json", "truncated-json"]) {
 	const result = await tool.execute(prefix, { ...read, parameters: { Prefix: prefix } });
