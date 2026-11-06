@@ -1655,8 +1655,9 @@ for (const [service, operation] of [
 	tool.approveRuntimeApproval(failedId, failedArgs);
 	const failed = await tool.execute(failedId, failedArgs);
 	assert.equal(failed.isError, true);
-	assert.equal(failed.details?.code, "AWS_ERROR");
-	assert.equal(failed.details?.exitCode, 23);
+	assert.ok(failed.details && "code" in failed.details && "exitCode" in failed.details);
+	assert.equal(failed.details.code, "AWS_ERROR");
+	assert.equal(failed.details.exitCode, 23);
 	assert.match(text(failed), /fixture helper failure/);
 	assert.ok(!text(failed).includes("REMOTE_COMMAND_OK"));
 
@@ -1666,7 +1667,8 @@ for (const [service, operation] of [
 	tool.approveRuntimeApproval(logId, logArgs);
 	const logResult = await tool.execute(logId, logArgs);
 	assert.notEqual(logResult.isError, true, text(logResult));
-	assert.equal(logResult.details?.exitCode, 0);
+	assert.ok(logResult.details && "exitCode" in logResult.details);
+	assert.equal(logResult.details.exitCode, 0);
 	assert.match(text(logResult), /Cannot perform start session: historical application log entry/);
 	assert.match(text(logResult), /REMOTE_COMMAND_OK/);
 
@@ -1676,7 +1678,8 @@ for (const [service, operation] of [
 	tool.approveRuntimeApproval(zeroId, zeroArgs);
 	const zeroResult = await tool.execute(zeroId, zeroArgs);
 	assert.notEqual(zeroResult.isError, true, text(zeroResult));
-	assert.equal(zeroResult.details?.exitCode, 0);
+	assert.ok(zeroResult.details && "exitCode" in zeroResult.details);
+	assert.equal(zeroResult.details.exitCode, 0);
 	assert.match(text(zeroResult), /Cannot perform start session: fixture helper failure/);
 	assert.ok(!text(zeroResult).includes("REMOTE_COMMAND_OK"));
 	const hangingArgs = { ...args, parameters: { ...parameters, [modeParameter]: "fixture-hang" } };

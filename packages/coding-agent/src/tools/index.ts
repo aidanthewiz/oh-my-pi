@@ -63,7 +63,6 @@ import { AskTool } from "./ask";
 import { AstEditTool } from "./ast-edit";
 import { AstGrepTool } from "./ast-grep";
 import { AwsTool } from "./aws";
-import { AwsDbTool } from "./aws-db";
 import type { ToolExecutionHostCapabilities } from "./tool-execution-host";
 import { BashTool } from "./bash";
 import { type BuiltinToolName, type HiddenToolName, normalizeToolNames } from "./builtin-names";
@@ -588,10 +587,13 @@ export interface ToolSession {
 	queueDeferredMessage?(message: CustomMessage): void;
 	/** Queue a broker supervised-process completion for the owning session. */
 	queueLaunchCompletion?(notification: DaemonCompletionNotification): Promise<void>;
-	/** Begin callbacks run synchronously at shutdown; complete callbacks retain terminal cleanup timing. */
-	registerDisposeCallback?(callback: () => void, options?: { phase?: "begin" | "complete" }): (() => void) | void;
-	/** Register cleanup that runs when this ToolSession adopts a different session ID. */
-	registerSessionChangeCallback?(callback: () => void): (() => void) | void;
+	/** Begin callbacks start synchronously; disposal awaits cleanup from both phases before returning. */
+	registerDisposeCallback?(
+		callback: () => void | Promise<void>,
+		options?: { phase?: "begin" | "complete" },
+	): (() => void) | void;
+	/** Start cleanup synchronously at session/context boundaries; async transitions await completion. */
+	registerSessionChangeCallback?(callback: () => void | Promise<void>): (() => void) | void;
 	/** Prove the current dispatcher and session lifecycle support this intrinsic tool contract. */
 	getToolExecutionCapabilities?(
 		tool: Pick<Tool, "name" | "cancellationBehavior">,
@@ -652,7 +654,6 @@ export const BUILTIN_TOOLS: Record<BuiltinToolName, ToolFactory> = {
 	learn: LearnTool.createIf,
 	manage_skill: ManageSkillTool.createIf,
 	aws: s => new AwsTool(s),
-	aws_db: s => new AwsDbTool(s),
 };
 
 export const HIDDEN_TOOLS: Record<HiddenToolName, ToolFactory> = {

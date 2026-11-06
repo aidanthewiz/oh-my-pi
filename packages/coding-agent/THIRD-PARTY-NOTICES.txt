@@ -126,9 +126,8 @@ Bundled into dist/cli.js and the omp executable:
 - @opentelemetry/semantic-conventions 1.43.0 — Apache-2.0
 - axe-core 4.13.0 — MPL-2.0
 
-Native AWS database runtime dependencies, including their resolved transitive graph:
+Native AWS secret-input runtime dependencies, including their resolved transitive graph:
 
-- @aws-sdk/client-rds 3.1150.0 — Apache-2.0
 - @aws-sdk/client-secrets-manager 3.1150.0 — Apache-2.0
 - @aws-sdk/client-sso 3.1150.0 — Apache-2.0
 - @aws-sdk/client-sts 3.1150.0 — Apache-2.0
@@ -141,7 +140,6 @@ Native AWS database runtime dependencies, including their resolved transitive gr
 - @aws-sdk/credential-provider-process 3.972.80 — Apache-2.0
 - @aws-sdk/credential-provider-sso 3.973.24 — Apache-2.0
 - @aws-sdk/credential-provider-web-identity 3.972.86 — Apache-2.0
-- @aws-sdk/middleware-sdk-rds 3.972.68 — Apache-2.0
 - @aws-sdk/nested-clients 3.997.54 — Apache-2.0
 - @aws-sdk/signature-v4-multi-region 3.996.51 — Apache-2.0
 - @aws-sdk/token-providers 3.1161.0 — Apache-2.0
@@ -154,21 +152,11 @@ Native AWS database runtime dependencies, including their resolved transitive gr
 - @smithy/node-http-handler 4.14.1 — Apache-2.0
 - @smithy/signature-v4 5.7.5 — Apache-2.0
 - @smithy/types 4.19.0 — Apache-2.0
-- aws-ssl-profiles 1.1.2 — MIT
 - bowser 2.15.0 — MIT
-- generate-function 2.3.1 — MIT
-- iconv-lite 0.7.3 — MIT
-- is-property 1.0.2 — MIT
-- long 5.3.2 — Apache-2.0
-- lru.min 1.1.5 — MIT
-- mysql2 3.24.6 — MIT
-- named-placeholders 1.1.6 — MIT
-- safer-buffer 2.1.2 — MIT
-- sql-escaper 1.5.2 — MIT
 - tslib 2.8.1 — 0BSD
 
-mysql2 also carries ISC-licensed typings. bowser's MIT-labeled license includes
-an additional modification notice clause. Both license texts appear below.
+bowser's MIT-labeled license includes an additional modification notice clause.
+Its license text appears below.
 
 Bundled into the omp executable only:
 
@@ -1486,21 +1474,19 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
 -------------------------------------------------------------------------------
-Native AWS database runtime: Apache-2.0 packages
+Native AWS secret-input runtime: Apache-2.0 packages
 
 The full Apache-2.0 license below applies to each package in this section.
 Package-specific copyright notices from the distributed licenses follow.
 
 Copyright 2018-2020 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 Used by:
-- @aws-sdk/client-rds@3.1150.0: LICENSE
 - @aws-sdk/client-secrets-manager@3.1150.0: LICENSE
 - @aws-sdk/client-sso@3.1150.0: LICENSE
 - @aws-sdk/client-sts@3.1150.0: LICENSE
 - @aws-sdk/credential-provider-env@3.972.80: LICENSE
 - @aws-sdk/credential-provider-ini@3.973.25: LICENSE
 - @aws-sdk/credential-provider-node@3.972.92: LICENSE
-- @aws-sdk/middleware-sdk-rds@3.972.68: LICENSE
 - @aws-sdk/token-providers@3.1161.0: LICENSE
 - @aws-sdk/types@3.975.0: LICENSE
 - @aws-sdk/xml-builder@3.972.42: LICENSE
@@ -1530,11 +1516,6 @@ https://github.com/aws/aws-sdk-js-v3/blob/main/LICENSE
 
 Used by:
 - @aws/lambda-invoke-store@0.3.0: LICENSE
-
-Copyright 2009 The Closure Library Authors
-Copyright 2020 Daniel Wirtz / The long.js Authors.
-Used by:
-- long@5.3.2: LICENSE; copyright notices from index.js
 
                                 Apache License
                            Version 2.0, January 2004
@@ -1740,74 +1721,6 @@ Used by:
 
 -------------------------------------------------------------------------------
 Used by:
-- mysql2@3.24.6: License
-
-Copyright (c) 2016 Andrey Sidorov (sidorares@yandex.ru) and contributors
-
- Permission is hereby granted, free of charge, to any person obtaining a copy
- of this software and associated documentation files (the "Software"), to deal
- in the Software without restriction, including without limitation the rights
- to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- copies of the Software, and to permit persons to whom the Software is
- furnished to do so, subject to the following conditions:
-
- The above copyright notice and this permission notice shall be included in
- all copies or substantial portions of the Software.
-
- THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
- THE SOFTWARE.
-
--------------------------------------------------------------------------------
-Used by:
-- mysql2@3.24.6: typings/mysql/LICENSE.txt
-
-ISC License
-
-Copyright (c) 2016, Felix Frederick Becker
-
-Permission to use, copy, modify, and/or distribute this software for any
-purpose with or without fee is hereby granted, provided that the above
-copyright notice and this permission notice appear in all copies.
-
-THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
-WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
-MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
-ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
-WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
-ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
-OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
-
--------------------------------------------------------------------------------
-Used by:
-- aws-ssl-profiles@1.1.2: LICENSE
-
-Copyright (c) 2024 Andrey Sidorov, Douglas Wilson, Weslley Araújo and contributors.
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in
-all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-THE SOFTWARE.
-
--------------------------------------------------------------------------------
-Used by:
 - bowser@2.15.0: LICENSE
 
 Copyright 2015, Dustin Diaz (the "Original Author")
@@ -1849,187 +1762,6 @@ OTHER DEALINGS IN THE SOFTWARE.
 Except where noted, this license applies to any and all software
 programs and associated documentation files created by the
 Original Author, when distributed with the Software.
-
--------------------------------------------------------------------------------
-Used by:
-- generate-function@2.3.1: LICENSE
-
-The MIT License (MIT)
-
-Copyright (c) 2014 Mathias Buus
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in
-all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-THE SOFTWARE.
-
--------------------------------------------------------------------------------
-Used by:
-- iconv-lite@0.7.3: LICENSE
-
-Copyright (c) 2011 Alexander Shtuchkin
-
-Permission is hereby granted, free of charge, to any person obtaining
-a copy of this software and associated documentation files (the
-"Software"), to deal in the Software without restriction, including
-without limitation the rights to use, copy, modify, merge, publish,
-distribute, sublicense, and/or sell copies of the Software, and to
-permit persons to whom the Software is furnished to do so, subject to
-the following conditions:
-
-The above copyright notice and this permission notice shall be
-included in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
-EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
-NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
-LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
-OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
-WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
--------------------------------------------------------------------------------
-Used by:
-- is-property@1.0.2: LICENSE
-
-The MIT License (MIT)
-
-Copyright (c) 2013 Mikola Lysenko
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in
-all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-THE SOFTWARE.
-
--------------------------------------------------------------------------------
-Used by:
-- lru.min@1.1.5: LICENSE
-
-MIT License
-
-Copyright (c) 2024-current Weslley Araújo (@wellwelwel)
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-
--------------------------------------------------------------------------------
-Used by:
-- named-placeholders@1.1.6: LICENSE
-
-The MIT License (MIT)
-
-Copyright (c) 2014 Andrey Sidorov
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-
--------------------------------------------------------------------------------
-Used by:
-- safer-buffer@2.1.2: LICENSE
-
-MIT License
-
-Copyright (c) 2018 Nikita Skovoroda <chalkerx@gmail.com>
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-
--------------------------------------------------------------------------------
-Used by:
-- sql-escaper@1.5.2: LICENSE
-
-MIT License
-
-Copyright (c) 2026 Weslley Araújo, Andrey Sidorov, Douglas Wilson, and contributors.
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
 
 -------------------------------------------------------------------------------
 Used by:

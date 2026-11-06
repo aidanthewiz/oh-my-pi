@@ -36,68 +36,98 @@ The agent supports three mutually-exclusive memory backends, selected via the `m
 
 Switching backends mid-session immediately replaces the live backend, memory tools, listeners, and system-prompt context. Existing users with `memories.enabled = true|false` are migrated to `memory.backend = "local"|"off"` exactly once on first launch; afterward, `memory.backend` is the sole runtime selector.
 
-## Memory-only AWS database inspection
+## AWS secret delivery to a process
 
-`xd://aws_db` is a separate native device. It does not capture generic `aws` output.
+`xd://aws` supports ordinary AWS operations and an optional `secretInput` handoff.
+It delivers a pinned Secrets Manager value directly to one local process through finite stdin.
+The native API does not provide a database interface, query layer, client adapter, or receiver allowlist.
+The receiving CLI controls its own reads and writes.
 
-1. Call `{"action":"capabilities"}` before authentication or access approval.
-2. Require the exact host, lifecycle, execution, schema, worker, scope, read/sanitizer, TLS trust, SDK, and driver manifest.
-3. Submit `inspect-automation-template` with that capability and an explicit launcher-selected profile.
-4. Bind the expected account, partition, principal ARN, region, tenant, cluster, node, endpoint, database, and secret version.
-5. Bind the distinct agency ID, automation ID, step ID, and limits.
-6. Approve the exact immutable request once. Session grants do not replace this approval.
+### Preflight and approval
 
-The active host must prove a non-null session identity, early disposal, session-change invalidation, and actual dispatcher cleanup support.
-A matching worker module alone is insufficient. Unsupported or older embedding hosts fail before approval or provider work.
-The manifest pins the loaded partition-specific Amazon RDS root material and qualified region table.
-Unknown or uncovered regions fail before approval or provider work.
+1. Read `xd://aws/schema` and compare the complete registered JSON input schema with the expected contract.
+2. Call `{"action":"secret-input-capabilities","protocol":"aws-secret-input/v1"}` before authentication or access approval.
+3. Verify the complete capability, manifest, limits, supported providers, and `sha256:` fingerprint against the expected implementation.
+4. Stop on missing, old, incompatible, or unsupported schema, host, lifecycle, or private worker support.
+5. Submit the pinned request with the verified fingerprint in `secretInput.capability`.
+6. Approve that exact immutable request once. Session grants do not replace this approval.
 
-The device schema defines the complete strict request. Unknown fields fail closed.
-Maximum limits are one definition, 65,536 bytes, and 10,000 milliseconds.
-The fixed read joins `automations` and `automation_steps`, scoped by agency and both record IDs.
-It inspects stored `query_text`; it never reads configuration or executes the saved template.
-Known SQL and record-filter forms produce generic structure. Unsupported forms are withheld.
+Capability discovery performs no authentication, credential access, or AWS request.
+It verifies actual host cancellation, session disposal, and private worker support, not only a version flag.
+Unsupported hosts fail before provider work or approval.
+Native schema and description discovery no longer enumerate AWS profiles; schema and capability discovery read no profile or credential files.
+Use an operator-approved, caller-known operational profile, never an inferred ambient, default, or model/relay profile.
+Ordinary explicit-profile execution and the existing commercial MCP profile metadata route remain unchanged.
+No new native profile metadata API is provided.
 
-The scope uses official AWS SDK clients with one attempt and no automatic authentication.
-It supports existing explicit static credentials and an unexpired, read-only SSO token.
-It rejects role chains, `credential_process`, web identity, custom endpoints, and ambient credential providers.
-Every internal AWS operation retains the `aws_db`, `aws`, and operation-specific native policy.
-Command-guard asks require a separate approval for that step.
+The request requires explicit `profile`, `region`, `service:"secretsmanager"`, and `operation:"get-secret-value"`.
+Its `parameters` bind the full `SecretId` ARN, exact `VersionId`, and optional exact `VersionStage`.
+`secretInput` requires `protocol:"aws-secret-input/v1"`, the capability fingerprint, and `expectedIdentity` with exact `account`, principal `arn`, and `partition`.
+The partition must be `aws`, `aws-us-gov`, or `aws-cn`.
+The principal account may differ from the secret account; the full secret ARN and version remain independently pinned.
+Identity, region, partition, resource, and version mismatches fail closed.
 
-### Required verification metadata
+`secretInput.consumer.argv` supplies an absolute executable followed by literal public arguments.
+`secretInput.consumer.cwd` supplies the absolute local working directory.
+No shell expands these arguments.
+Approval binds the full AWS reference, expected identity, exact argv/cwd, input transformations, timeout, and fixed input/output limits.
+Any request, session, or settings change invalidates earlier approval.
+Native AWS policy and command guards apply to internal AWS operations.
+The receiver also requires bash/exec policy and command-guard approval for its properly quoted exact command.
+Denials are not bypassed.
+Each actual SDK dispatch rechecks current authority, settings, and guards.
+A distinct consumer admission repeats these checks after secret retrieval without prompting.
+Receiver denial, authority revision, or replacement while retrieval is pending prevents receiver execution.
 
-Cluster, instance, and secret tags must contain `coreforge:tenant-id` with the expected tenant value.
-The dedicated secret must also contain `coreforge:database-reader=true`.
-These are fixed native policy keys, not caller-selected tag names.
-Missing tags fail closed; source delivery does not establish that deployed resources have them.
-The caller must bind the exact secret version that is currently `AWSCURRENT`.
-The secret must bind the verified endpoint, port, database, and dedicated reader account.
-The account must have only the definition-read grants accepted by the fixed database policy.
-Unsupported engines, writable nodes, forwarding, executable views, and ambiguous resource bindings are denied.
-TLS uses source-shipped production G1 roots from the official commercial, GovCloud, and China bundles, with exact hostname verification.
-No AWS or database permission changes are part of this feature.
+### Input and authentication
 
-### Isolation, evidence, and limits
+Without `jsonPointer`, stdin contains exact SecretString UTF-8 bytes or SecretBinary bytes.
+With `secretInput.jsonPointer`, an RFC 6901 pointer selects only a string leaf from parsed SecretString JSON.
+`secretInput.appendNewline` defaults to `false`; `true` appends one newline.
+The native route does not infer fields or combine credentials with application commands.
+The receiver must already support this finite stdin channel and normal non-echoing configuration.
+A receiver that requires another credential channel is unsupported.
+Do not substitute secret argv, environment variables, files, FIFOs, RAM disks, PTY injection, or a shell AWS fallback.
 
-One short-lived process owns provider credentials, secret responses, database authentication, and raw definitions.
-Its arguments and environment contain no credentials. Standard output and error are discarded.
-A private empty startup directory isolates runtime configuration and is removed after process exit.
-Bun crash uploads and the shared transpiler cache are disabled in that process.
-Only validated capability data, bounded guard descriptors, and safe results cross its private IPC boundary.
-The scope closes its physical connection and releases owned references before returning a result.
-Cancellation and timeout stop the owned process without retry or replacement.
-The intrinsic `await-cleanup` execution policy keeps outer device wrappers pending until owned teardown completes.
-Results contain only capability/policy identifiers, approved limits, structural disposition, reader proof, and teardown evidence.
-The approved request supplies the non-secret identity and resource audit binding.
-There are no credential files, `capturePath`, raw-result artifacts, or shell AWS fallback.
+Input is limited to 65,536 bytes.
+`maxStdoutBytes` and `maxStderrBytes` each bound retained output to 1,048,576 bytes: at most 2 MiB combined.
+The default timeout is 30 seconds; `timeout` uses seconds and cannot exceed 120 seconds.
+Per-stream truncation, exit, cancellation, timeout, and uncertain completion remain explicit.
 
-Reader checks use the same physical connection before, during, and after the fixed read.
-A read-only transaction and same-statement role predicate add protection.
-The fixed session also sets and verifies the approved server execution deadline.
-Local socket closure does not prove instantaneous remote statement cancellation.
-Separated probes cannot exclude an unobserved transient role change atomically.
-GC, immutable strings, SDK/driver buffers, allocator copies, privileged OS access, swap, and crash memory prevent secure-erasure guarantees.
+One short-lived private worker owns provider credentials, the secret response, and input buffers until the consumer completes.
+It uses official AWS SDK clients with one attempt and no automatic sign-in or retry.
+Only explicit existing static profile credentials or an existing unexpired SSO token are supported.
+Role chains, `credential_process`, web identity, custom endpoints, and ambient credential providers are unsupported.
+Missing or expired authentication requires a separate explicit user-authorized operation, followed by fresh preflight and approval.
+Ordinary AWS operations retain their existing authentication behavior.
 
-This source change does not publish an engine release or update an installed Coreforge runtime.
-Publication, immutable `engine.lock` adoption, matching managed skill/helper installation, and independent operational authorization remain separate gates.
-No real credentials, production records, or SRI-704 evidence were collected for this implementation.
+### Output, cleanup, and disclosure limits
+
+Consumer stdout and stderr are raw, agent-visible normal output and may persist in transcripts or artifacts.
+They are not sanitized, masked, or interpreted as queries.
+The receiver sees stdin and can intentionally print, store, or transmit it.
+This feature protects delivery, not confidentiality against arbitrary receiving programs.
+Do not enable receiver credential echo, history, or caches.
+
+The consumer runs in a detached owned process group without a controlling terminal.
+It receives no inherited AWS credential environment or private worker control descriptors.
+The guardian starts in a fresh neutral owned directory with a minimal Bun startup environment that blocks project and global preloads.
+Only the receiver uses the approved working directory, environment, and argv.
+Stdin closes after the bounded input.
+Cancellation, timeout, and session disposal terminate and reap the owned consumer group and worker, close streams, and release owned references.
+An independent owned finite-input guardian handles worker SIGKILL or disconnect and receiver leader exit while foreground descendants or pipes remain.
+The `await-cleanup` execution policy keeps wrappers pending until owned teardown completes.
+There is no automatic retry or replacement.
+Interrupted writes may already have committed; uncertain completion does not imply rollback or retry safety.
+After worker execution starts, failures report `{ok:false,code,completion:"uncertain"}`; pre-run failures report only `{ok:false,code}`.
+Successful `completion:"exited"` means process exit, not transaction atomicity or rollback.
+Consumers that deliberately daemonize or escape the owned process group are outside the cleanup guarantee.
+External forced termination of all independent owners and OS crashes also exceed that guarantee.
+Lost ownership does not establish successful teardown.
+
+Audit evidence contains only non-secret request bindings and lifecycle metadata, never a secret payload hash.
+Provider and IPC errors expose fixed non-secret codes, not SDK diagnostic objects.
+GC, immutable strings, SDK buffers, allocator copies, swap, core dumps, and privileged OS inspection prevent secure-erasure guarantees.
+
+Source delivery does not publish an engine release or adopt an installed runtime.
+Publication, immutable `engine.lock` adoption, matching package preflight, and operational authorization remain separate gates.

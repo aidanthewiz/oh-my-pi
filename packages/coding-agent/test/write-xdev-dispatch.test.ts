@@ -4,8 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { setImmediate as waitForImmediate } from "node:timers/promises";
 import { type } from "@oh-my-pi/omptype";
-import type { AgentTool, AgentToolContext, AgentToolDocTopic, AgentToolResult } from "@oh-my-pi/pi-agent-core";
-import { toolWireSchema } from "@oh-my-pi/pi-ai";
+import type { AgentTool, AgentToolDocTopic, AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { HookRunner } from "@oh-my-pi/pi-coding-agent/extensibility/hooks/runner";
 import { HookToolWrapper } from "@oh-my-pi/pi-coding-agent/extensibility/hooks/tool-wrapper";
@@ -15,9 +14,6 @@ import { LocalProtocolHandler } from "@oh-my-pi/pi-coding-agent/internal-urls/lo
 import { ConflictProtocolHandler } from "@oh-my-pi/pi-coding-agent/internal-urls/conflict-protocol";
 import { createTools, type Tool, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { requiresApproval, resolveApproval } from "@oh-my-pi/pi-coding-agent/tools/approval";
-import { AwsDbTool } from "@oh-my-pi/pi-coding-agent/tools/aws-db";
-import { AWS_DB_INPUT_SCHEMA } from "@oh-my-pi/pi-coding-agent/tools/aws-db-contract";
-import * as awsDbWorkerClient from "@oh-my-pi/pi-coding-agent/tools/aws-db-worker-client";
 import { EvalTool } from "@oh-my-pi/pi-coding-agent/tools/eval";
 import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
 import { Text } from "@oh-my-pi/pi-tui";
@@ -197,90 +193,6 @@ describe("read xd:// documentation topics", () => {
 			expect(execute).not.toHaveBeenCalled();
 		} finally {
 			execute.mockRestore();
-		}
-	});
-
-	it("discovers the full registered AWS DB admission schema before any capability or provider work", async () => {
-		const session: ToolSession = xdevSession(import.meta.dir, {
-			settings: Settings.isolated({ "tools.approvalMode": "always-ask" }),
-			getToolByName: name => session.toolRegistry?.get(name),
-		});
-		const tools = await createTools(session, ["read", "write", "aws_db"]);
-		const native = session.toolRegistry?.get("aws_db");
-		const read = tools.find(tool => tool.name === "read");
-		if (!(native instanceof AwsDbTool) || !read) throw new Error("AWS DB discovery fixture is not registered");
-		let artifactWrites = 0;
-		const context = {
-			settings: session.settings,
-			sessionManager: {
-				saveArtifact: async () => {
-					artifactWrites++;
-					throw new Error("Schema discovery must fit the default outer output limits");
-				},
-			},
-		} as unknown as AgentToolContext;
-		const entrypoints = [
-			spyOn(native, "approval"),
-			spyOn(native, "prepareApprovalTier"),
-			spyOn(native, "prepareRuntimeApproval"),
-			spyOn(native, "execute"),
-			spyOn(awsDbWorkerClient, "probeAwsDbWorker").mockRejectedValue(new Error("Unexpected capability probe")),
-			spyOn(awsDbWorkerClient, "runAwsDbWorker").mockRejectedValue(new Error("Unexpected provider scope")),
-		];
-		try {
-			const result = await read.execute(
-				"aws-db-schema",
-				{ path: "xd://aws_db/schema" },
-				undefined,
-				undefined,
-				context,
-			);
-			const discovery = JSON.parse(text(result));
-			expect(result.details).toMatchObject({ shape: "value", contentType: "application/json" });
-			expect(discovery).toEqual({ name: native.name, inputSchema: native.parameters.toJsonSchema() });
-			expect(discovery.inputSchema).toEqual(toolWireSchema(native));
-			expect(discovery.inputSchema).toEqual(AWS_DB_INPUT_SCHEMA);
-			expect(artifactWrites).toBe(0);
-			console.info(JSON.stringify({ schema: "aws-db-schema-discovery/v1", bytes: Buffer.byteLength(text(result)) }));
-
-			const serialization = spyOn(native, "docTopics").mockReturnValue({
-				schema: {
-					format: "json",
-					value: Object.defineProperty({}, "private", {
-						enumerable: true,
-						get() {
-							throw new Error("private schema serialization cause");
-						},
-					}),
-				},
-			});
-			try {
-				await expect(read.execute("aws-db-serialization-failure", { path: "xd://aws_db/schema" })).rejects.toThrow(
-					"Cannot serialize xd:// JSON topic.",
-				);
-			} finally {
-				serialization.mockRestore();
-			}
-
-			const rootDocs = await read.execute("aws-db-human-docs", { path: "xd://aws_db" });
-			expect(rootDocs.details?.shape).not.toBe("value");
-			expect(() => JSON.parse(text(rootDocs))).toThrow();
-			await expect(read.execute("aws-db-unknown-topic", { path: "xd://aws_db/unknown" })).rejects.toThrow(
-				"Unknown topic",
-			);
-			await expect(read.execute("aws-db-missing-tool", { path: "xd://not_registered/schema" })).rejects.toThrow(
-				"has no doc topics",
-			);
-			await expect(read.execute("unadvertised-schema-topic", { path: "xd://write/schema" })).rejects.toThrow(
-				"has no doc topics",
-			);
-			session.toolRegistry!.delete("aws_db");
-			await expect(read.execute("aws-db-removed-tool", { path: "xd://aws_db/schema" })).rejects.toThrow(
-				"has no doc topics",
-			);
-			for (const entrypoint of entrypoints) expect(entrypoint).not.toHaveBeenCalled();
-		} finally {
-			for (const entrypoint of entrypoints) entrypoint.mockRestore();
 		}
 	});
 });

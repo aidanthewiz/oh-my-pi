@@ -8,7 +8,7 @@
 
 ### Added
 
-- Add discoverable `aws_db` capability checks and exact-approved, memory-only automation-template inspection. Bind loaded partition-specific TLS trust and qualified regions before authentication. Retain native AWS guards, verify the physical Aurora reader, return only validated structure, and dispose the owned process without credential files.
+- Add generic `xd://aws` secret delivery through finite stdin to an exact-approved local process on Darwin and Linux. Pin the AWS identity and secret version, verify live host/worker capabilities, preserve AWS and receiver guards, and return bounded raw consumer output. The native route supports existing static profiles and unexpired SSO without automatic sign-in or retry; cancellation reports uncertain writes and reaps owned processes.
 - Native AWS approvals offer **Allow for the rest of this session** for later commands, profiles, and SSO renewal without saving a configuration grant.
 - Keep job widgets local by default. Remote spec authoring requires managed or runtime consent, current model and account admission, bounded redacted context, and originating-journal accounting.
 - Expose session-bound native MCP calls to extensions. Honor `exposeTools: false` without disabling server startup or discovery.
@@ -16,8 +16,11 @@
 
 ### Fixed
 
-- Repair executable `aws_db` discovery through `xd://aws_db/schema`, returning the full registered JSON input schema. Require full schema comparison before capability discovery and full manifest/digest verification before authentication or approval. The root TypeScript display remains human documentation; source delivery does not publish a runtime, update installed skills, or collect SRI-704 evidence.
+- Expose the full registered AWS JSON input schema through `xd://aws/schema`. Require complete schema and `aws-secret-input/v1` capability comparison before authentication or approval. Preserve native session-disposal and cancellation cleanup. Source delivery does not publish an engine or adopt an installed runtime.
 - Preserve constructor-registered tool session callbacks so active native scopes stop when the SDK adopts or forks a session.
+- Acquire session cleanup ownership before forwarding constructor callbacks. Failed startup keeps pooled credential restrictions until cleanup settles and preserves unrelated live roots.
+- Settle restored session generations before rollback reconciliation without declaring transition readiness or skipping native cleanup.
+- Handle ordinary synchronous disposer returns without losing subsequent session cleanup. Continue to await native cancellation and asynchronous disposers.
 - Preserve the exact durable journal and its parent directory in shutdown, fork-return and fatal-recovery commands. Quote paths for POSIX shells and PowerShell, including sessions opened with a different future-session directory.
 - Separate MCP fixture startup from request deadlines. Make connected-browser viewport qualification deterministic and preserve navigation failures during cleanup.
 - Serialize and atomically publish shared ACP handle mappings. Fork unloaded handles from their continued conversation instead of the original transcript.
@@ -236,6 +239,7 @@
 - Resume interrupted daemon upgrades without replacing adopted history. Refuse migration while an older broker or client owns the scope.
 - Keep terminal status consistent with retained host outcomes when collaboration recovery prunes or replaces transcript messages.
 - Verify cached grammar size and SHA-256 before reuse; corrupt files require a verified atomic replacement.
+
 ## [18.15.0] - 2026-11-01
 
 ### Added

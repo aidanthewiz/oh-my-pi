@@ -31,7 +31,6 @@ export const BUILTIN_TOOL_NAMES = [
 	"learn",
 	"manage_skill",
 	"aws",
-	"aws_db",
 ] as const;
 
 export type BuiltinToolName = (typeof BUILTIN_TOOL_NAMES)[number];
