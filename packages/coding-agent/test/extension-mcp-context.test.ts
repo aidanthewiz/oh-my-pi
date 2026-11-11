@@ -7,7 +7,7 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { ExtensionFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { connectToServer, disconnectServer, listTools } from "@oh-my-pi/pi-coding-agent/mcp/client";
 import { MCPManager } from "@oh-my-pi/pi-coding-agent/mcp/manager";
-import { dispatchMCPTool } from "@oh-my-pi/pi-coding-agent/mcp/tool-bridge";
+import { createMCPToolName, dispatchMCPTool } from "@oh-my-pi/pi-coding-agent/mcp/tool-bridge";
 import { AgentRegistry, createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
@@ -168,6 +168,41 @@ async function pinSyntheticAccount(s: AgentSession): Promise<void> {
 }
 
 describe("session-owned extension MCP", () => {
+	for (const policy of ["allow", "deny"] as const) {
+		it(`keeps Drata host calls behind native consent with an exact ${policy} policy under default yolo`, async () => {
+			const manager = new MCPManager(process.cwd());
+			const dispatch = spyOn(manager, "callTool").mockResolvedValue({
+				content: [{ type: "text", text: "mutated" }],
+			});
+			const serverName = "coreforge-drata-mcp";
+			const toolName = "create_task";
+			let hooks = 0;
+			const s = await session(
+				manager,
+				pi => {
+					pi.on("tool_call", () => {
+						hooks++;
+					});
+				},
+				Settings.isolated({ "tools.approval": { [createMCPToolName(serverName, toolName)]: policy } }),
+			);
+			await expect(
+				s
+					.extensionRunner!.createContext()
+					.mcp!.callTool(serverName, toolName, { controlId: 17 }, { retry: "never" }),
+			).rejects.toThrow(policy === "deny" ? "blocked by user policy" : "requires approval");
+			expect(dispatch).not.toHaveBeenCalled();
+			expect(hooks).toBe(policy === "deny" ? 0 : 1);
+		});
+	}
+
+	it("retains default-yolo dispatch for another host server with the same raw tool name", async () => {
+		const f = await fixture();
+		const s = await session(f.manager);
+		await s.extensionRunner!.createContext().mcp!.callTool("minions", "create_task", { title: "synthetic task" });
+		expect(f.calls).toEqual([{ name: "create_task", arguments: { title: "synthetic task" } }]);
+	});
+
 	it("keeps host-only catalogs hidden after refresh and reconnect while permitting calls", async () => {
 		const { manager, calls } = await fixture();
 		expect(manager.getConnectedServers()).toEqual(["minions"]);

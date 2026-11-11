@@ -117,6 +117,22 @@ export function extractOAuthChallengeScopes(error: Error): string | undefined {
 	return undefined;
 }
 
+function isOAuthEndpointUrl(value: unknown): value is string {
+	if (typeof value !== "string") return false;
+	try {
+		const url = new URL(value);
+		return (url.protocol === "https:" || url.protocol === "http:") && !url.username && !url.password;
+	} catch {
+		return false;
+	}
+}
+
+/** Validate the explicit metadata trust location without changing inferred discovery. */
+export function validateOAuthResourceMetadataUrl(value: unknown): string | undefined {
+	if (value === undefined || isOAuthEndpointUrl(value)) return undefined;
+	return "oauth.resourceMetadataUrl must be an absolute HTTP(S) URL without user information";
+}
+
 /**
  * Extract OAuth endpoints from error response.
  * Looks for WWW-Authenticate header format or JSON error bodies.
@@ -125,16 +141,6 @@ export function extractOAuthEndpoints(error: Error): OAuthEndpoints | null {
 	const preserved = oauthDiscoveryHints.get(error)?.oauth;
 	if (preserved) return { ...preserved };
 	const errorMsg = error.message;
-
-	const endpointUrl = (value: unknown): value is string => {
-		if (typeof value !== "string") return false;
-		try {
-			const url = new URL(value);
-			return (url.protocol === "https:" || url.protocol === "http:") && !url.username && !url.password;
-		} catch {
-			return false;
-		}
-	};
 
 	const readEndpointsFromObject = (obj: Record<string, unknown>): OAuthEndpoints | null => {
 		const authorizationUrl =
@@ -152,7 +158,7 @@ export function extractOAuthEndpoints(error: Error): OAuthEndpoints | null {
 			(obj.token_uri as string | undefined) ||
 			(obj.tokenUri as string | undefined);
 
-		if (!endpointUrl(authorizationUrl) || !endpointUrl(tokenUrl)) return null;
+		if (!isOAuthEndpointUrl(authorizationUrl) || !isOAuthEndpointUrl(tokenUrl)) return null;
 
 		const scopeFromArray = Array.isArray(obj.scopes_supported)
 			? (obj.scopes_supported as unknown[]).filter(v => typeof v === "string").join(" ")
@@ -246,7 +252,7 @@ export function extractOAuthEndpoints(error: Error): OAuthEndpoints | null {
 			challengeValues.get("token_url") || challengeValues.get("token_uri") || challengeValues.get("token_endpoint");
 		const resource = challengeValues.get("resource") || challengeValues.get("resource_uri");
 
-		if (endpointUrl(authorizationUrl) && endpointUrl(tokenUrl)) {
+		if (isOAuthEndpointUrl(authorizationUrl) && isOAuthEndpointUrl(tokenUrl)) {
 			return {
 				authorizationUrl,
 				tokenUrl,
@@ -501,7 +507,13 @@ export async function discoverOAuthEndpoints(
 	serverUrl: string,
 	authServerUrl?: string,
 	resourceMetadataUrl?: string,
-	opts?: { fetch?: FetchImpl; protectedScopes?: string; signal?: AbortSignal },
+	opts?: {
+		fetch?: FetchImpl;
+		protectedScopes?: string;
+		signal?: AbortSignal;
+		/** Require the explicit document's advertised issuers rather than falling back to challenge hints. */
+		requireResourceMetadata?: boolean;
+	},
 ): Promise<OAuthEndpoints | null> {
 	const fetchImpl: FetchImpl = opts?.fetch ?? fetch;
 	// Authorization servers are not protected resources: probing
@@ -600,6 +612,7 @@ export async function discoverOAuthEndpoints(
 			// Ignore errors, continue to try explicit URLs
 		}
 	}
+	if (opts?.requireResourceMetadata && !advertisedAuthServers) return null;
 
 	// A resource-advertised list takes precedence over the header issuer hint.
 	// Neither source permits an unrelated resource-server fallback.

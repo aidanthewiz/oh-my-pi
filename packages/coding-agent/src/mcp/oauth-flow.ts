@@ -328,6 +328,8 @@ export interface MCPOAuthConfig {
 	clientSecret?: string;
 	/** OAuth scopes (space-separated) */
 	scopes?: string;
+	/** Override an embedded authorization-URL scope, including omission when scopes are empty. */
+	overrideScopes?: boolean;
 	/**
 	 * `prompt` parameter for the authorization request. By default the parameter
 	 * is omitted, matching the reference MCP SDK, except for `offline_access`
@@ -451,7 +453,10 @@ export class MCPOAuthFlow extends OAuthCallbackFlow {
 		} else {
 			params.delete("client_id");
 		}
-		if (this.config.scopes && !params.get("scope")) {
+		if (this.config.overrideScopes) {
+			if (this.config.scopes) params.set("scope", this.config.scopes);
+			else params.delete("scope");
+		} else if (this.config.scopes && !params.get("scope")) {
 			params.set("scope", this.config.scopes);
 		}
 		const prompt = this.config.prompt ?? (hasOAuthScope(params.get("scope"), "offline_access") ? "consent" : "");
