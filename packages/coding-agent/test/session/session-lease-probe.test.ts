@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import * as path from "node:path";
+import { scheduler } from "node:timers/promises";
 import { FileSessionStorage, isSessionLeaseHeld } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
@@ -49,9 +50,8 @@ async function spawnOwner(tempDir: TempDir, sessionId: string) {
 }
 
 /**
- * Probe `sessionId` in a tight loop while another process claims and releases
- * it `rounds` times. Returns that process's failed claims and how often the
- * probe saw the lease held (proving the two actually overlapped).
+ * Hold the first claim until the probe acknowledges it, then race the
+ * remaining claims against free-running probes.
  */
 async function raceProbeAgainstClaims(tempDir: TempDir, sessionId: string, rounds: number) {
 	const child = await spawnScript(
@@ -61,7 +61,15 @@ async function raceProbeAgainstClaims(tempDir: TempDir, sessionId: string, round
 			"const [id, sessionPath, rounds] = process.argv.slice(2);",
 			"const storage = new FileSessionStorage();",
 			"let failures = 0;",
-			"for (let i = 0; i < Number(rounds); i++) {",
+			"const first = storage.claimSession(id, sessionPath);",
+			"if (!first) failures++;",
+			"try {",
+			'	process.stdout.write(first ? "claimed\\n" : "refused\\n");',
+			"	const commands = console[Symbol.asyncIterator]();",
+			"	const { done, value } = await commands.next();",
+			'	if (done || value !== "race") throw new Error("Missing probe acknowledgment");',
+			"} finally { first?.(); }",
+			"for (let i = 1; i < Number(rounds); i++) {",
 			"	const release = storage.claimSession(id, sessionPath);",
 			"	if (release) release();",
 			"	else failures++;",
@@ -70,25 +78,53 @@ async function raceProbeAgainstClaims(tempDir: TempDir, sessionId: string, round
 		],
 		[sessionId, tempDir.join("claimer-session.jsonl"), String(rounds)],
 	);
-	const output = new Response(child.stdout).text();
-	let probes = 0;
-	let sawHeld = 0;
-	let exited = false;
-	void child.exited.then(() => {
-		exited = true;
-	});
-	while (!exited) {
-		for (let i = 0; i < 500; i++) {
-			probes++;
-			if (isSessionLeaseHeld(sessionId)) sawHeld++;
+	const reader = child.stdout.getReader();
+	const decoder = new TextDecoder();
+	try {
+		let status = "";
+		while (!status.includes("\n")) {
+			const { done, value } = await reader.read();
+			if (done) throw new Error(`Claimer exited before readiness: ${await new Response(child.stderr).text()}`);
+			status += decoder.decode(value, { stream: true });
 		}
-		// A zero-delay yield, not a wait: lets the event loop deliver the child's exit.
-		await Bun.sleep(0);
+		const newline = status.indexOf("\n");
+		expect(status.slice(0, newline).trim()).toBe("claimed");
+		let stdout = status.slice(newline + 1);
+		let probes = 0;
+		let sawHeld = 0;
+		const probe = () => {
+			probes++;
+			const held = isSessionLeaseHeld(sessionId);
+			if (held) sawHeld++;
+			return held;
+		};
+		expect(probe()).toBe(true);
+		child.stdin.write("race\n");
+		child.stdin.end();
+		let exited = false;
+		void child.exited.then(() => {
+			exited = true;
+		});
+		while (!exited) {
+			for (let i = 0; i < 500; i++) probe();
+			await scheduler.yield();
+		}
+		for (;;) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			stdout += decoder.decode(value, { stream: true });
+		}
+		stdout += decoder.decode();
+		expect(child.exitCode, await new Response(child.stderr).text()).toBe(0);
+		expect(probe()).toBe(false);
+		const { failures } = JSON.parse(stdout.trim().split("\n").at(-1) ?? "{}") as { failures: number };
+		return { failures, probes, sawHeld };
+	} finally {
+		child.stdin.end();
+		if (child.exitCode === null) child.kill("SIGKILL");
+		await child.exited;
+		reader.releaseLock();
 	}
-	const stdout = await output;
-	expect(child.exitCode, await new Response(child.stderr).text()).toBe(0);
-	const { failures } = JSON.parse(stdout.trim().split("\n").at(-1) ?? "{}") as { failures: number };
-	return { failures, probes, sawHeld };
 }
 
 describe("session lease probe", () => {
