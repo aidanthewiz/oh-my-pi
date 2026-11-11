@@ -16,6 +16,7 @@
 
 ### Fixed
 
+- Separate hosted Chromium readiness from connection deadlines, close timed-out qualification pipes before cleanup, and preserve startup failures.
 - Honor configured MCP `oauth.scope` over metadata, challenge, and authorization-URL scopes during registration and authorization.
 - Preserve MCP metadata environment references across toggles and OAuth write-back; validate their resolved URLs under the original source's environment policy.
 - Require explicit approval for every managed Drata MCP call regardless of read-only annotations or permissive default approval modes.
