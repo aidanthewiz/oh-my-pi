@@ -393,18 +393,6 @@ describe("/mcp auth commands", () => {
 	test("uses tool challenge resource metadata and scopes during reauth", async () => {
 		const authStorage = freshAuthStorage();
 		await authStorage.credentials.reload();
-		await Bun.write(
-			configPath,
-			JSON.stringify({
-				mcpServers: {
-					envserver: {
-						type: "http",
-						url: RAW_SERVER_URL,
-						oauth: { scope: "configured.read" },
-					},
-				},
-			}),
-		);
 		vi.spyOn(mcpClient, "connectToServer").mockRejectedValue(new Error("HTTP 401: Unauthorized"));
 
 		const resourceMetadataUrl = "https://gateway.example.com/.well-known/oauth-protected-resource";

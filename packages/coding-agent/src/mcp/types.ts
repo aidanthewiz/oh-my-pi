@@ -98,13 +98,15 @@ interface MCPServerConfigBase {
 	instructions?: boolean;
 	/** Authentication configuration (optional) */
 	auth?: MCPAuthConfig;
-	/** OAuth configuration for servers requiring explicit client credentials */
+	/** OAuth discovery, client, scope, and callback overrides. */
 	oauth?: {
 		/** Client display name sent during OAuth dynamic client registration */
 		clientName?: string;
 		clientId?: string;
 		clientSecret?: string;
 		scope?: string;
+		/** Explicitly trusted RFC 9728 protected-resource metadata URL. Overrides challenge discovery. */
+		resourceMetadataUrl?: string;
 		redirectUri?: string;
 		/** Local callback port. Set to 0 for an OS-assigned port and fresh dynamic client registration. */
 		callbackPort?: number;
