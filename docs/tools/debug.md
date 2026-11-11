@@ -374,7 +374,9 @@ GDB example for an OpenOCD remote target:
       Replace `v1.117.0` with the latest tag from the [releases page](https://github.com/microsoft/vscode-js-debug/releases).
    - Any other location via `JS_DEBUG_DAP_SERVER=<path-to-dapDebugServer.js>`.
    - Neovim users with Mason: `:MasonInstall js-debug-adapter` → discovered at `~/.local/share/nvim/mason/packages/js-debug-adapter/js-debug/src/dapDebugServer.js`.
-- The adapter runs under `node` if on `PATH`, otherwise under the omp host (Bun); `resolveDefaultJsDebugAdapter()` falls back to `process.execPath`, so a Bun-only setup is supported.
+- Set `JS_DEBUG_NODE` to an adapter-only executable path when js-debug needs a newer Node than the project uses. Absolute paths are supported; relative paths resolve from the debug cwd. An empty or unresolvable value makes the adapter unavailable without fallback.
+- Without `JS_DEBUG_NODE`, the adapter uses project-local `node`, then `node` on `PATH`, then the omp host (`process.execPath`, normally Bun).
+- Custom adapter commands bypass `JS_DEBUG_NODE`. The variable does not select the debuggee runtime; configure `runtimeExecutable` in the DAP launch arguments independently.
 - `configurationDone` is sent automatically during root and child launch/attach handshakes and lazily before later requests if the initial handshake did not complete.
 - `startDebugging` reverse requests create recursive child sessions on the same TCP server; a stopped child becomes the target for thread-level actions.
 - `output` exposes the active session's merged DAP `output` events and `runInTerminal` stdout. DAP stdout/stderr/console categories are not separated; the terminal-spawn path does not add its separately drained stderr to this cache.

@@ -12,6 +12,7 @@
 - Keep job widgets local by default. Remote spec authoring requires managed or runtime consent, current model and account admission, bounded redacted context, and originating-journal accounting.
 - Expose session-bound native MCP calls to extensions. Honor `exposeTools: false` without disabling server startup or discovery.
 - Support explicitly trusted MCP protected-resource metadata through `oauth.resourceMetadataUrl`, including hosted servers whose canonical resource differs from the MCP endpoint.
+- Select the JavaScript debug adapter's executable with `JS_DEBUG_NODE` independently of the target runtime, and reject invalid paths without fallback.
 
 ### Fixed
 

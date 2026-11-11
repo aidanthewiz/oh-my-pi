@@ -9,6 +9,7 @@ import type { DapAdapterConfig, DapResolvedAdapter } from "./types";
 
 const EXTENSIONLESS_DEBUGGER_ORDER: readonly string[] = ["gdb", "lldb-dap"];
 const JS_DEBUG_SERVER_ENV = "JS_DEBUG_DAP_SERVER";
+const JS_DEBUG_NODE_ENV = "JS_DEBUG_NODE";
 const DAP_PORT_ARGUMENT = "$" + "{port}";
 
 interface NormalizedConfig {
@@ -149,15 +150,19 @@ function resolveDefaultJsDebugAdapter(
 	}
 	const serverPath = resolveJsDebugServerPath(cwd);
 	if (!serverPath) return null;
-	const nodeCommand = resolveCommand("node", cwd, {
+	const configuredNode = process.env[JS_DEBUG_NODE_ENV];
+	if (configuredNode === "") return null;
+	const command = configuredNode === undefined ? "node" : path.resolve(cwd, configuredNode);
+	const nodeCommand = resolveCommand(command, cwd, {
 		cache: WhichCachePolicy.Fresh,
 		PATH: process.env.PATH,
-		localRoots,
+		localRoots: configuredNode === undefined ? localRoots : [],
 	});
+	if (configuredNode !== undefined && !nodeCommand) return null;
 	const resolvedCommand = nodeCommand ?? process.execPath;
 	return {
 		name: adapterName,
-		command: nodeCommand ? "node" : "bun",
+		command: nodeCommand ? command : "bun",
 		args: [serverPath, DAP_PORT_ARGUMENT, "127.0.0.1"],
 		resolvedCommand,
 		languages: config.languages ?? [],
