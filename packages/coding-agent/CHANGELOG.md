@@ -16,6 +16,7 @@
 
 ### Fixed
 
+- Synchronize shell TERM-output qualification with a child release gate and controlled cancellation deadlines instead of wall-clock sleeps.
 - Synchronize session lease race qualification with an observed held lease before racing claims and probes.
 - Separate hosted Chromium readiness from connection deadlines, close timed-out qualification pipes before cleanup, and preserve startup failures.
 - Honor configured MCP `oauth.scope` over metadata, challenge, and authorization-URL scopes during registration and authorization.

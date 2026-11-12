@@ -8081,23 +8081,33 @@ replace = [{ pattern = "^.+$", replacement = "PWD" }]
 	}
 
 	#[cfg(unix)]
-	#[tokio::test(flavor = "multi_thread")]
+	#[tokio::test]
 	async fn cancellation_keeps_output_open_for_a_term_trap_that_writes() {
+		async fn wait_for_marker(path: &std::path::Path) -> bool {
+			let deadline = std::time::Instant::now() + Duration::from_secs(5);
+			while !path.exists() {
+				if std::time::Instant::now() >= deadline {
+					return false;
+				}
+				// Keep virtual time frozen while the real child is scheduled.
+				tokio::task::yield_now().await;
+			}
+			true
+		}
+
 		let _guard = shell_test_lock().lock().await;
 		let root = tempfile::tempdir().expect("cleanup directory");
-		// The trap writes once the readers' old 500 ms cancel would have closed
-		// them, and finishes well inside the 1 s TERM grace even when a loaded
-		// runner is slow to start `sleep`.
 		fs::write(
 			root.path().join("cleanup.sh"),
-			"trap 'sleep 0.55; echo flushing; printf cleaned > cleaned; exit 0' TERM\n: > \
-			 ready\nwhile :; do :; done\n",
+			"trap ': > trapped; while [ ! -e flush ]; do :; done; echo flushing; printf cleaned > \
+			 cleaned; exit 0' TERM\n: > ready\nwhile :; do :; done\n",
 		)
 		.expect("cleanup script");
 		let shell = Shell::new(None);
 		let mut cancel = CancelToken::default();
 		let abort = cancel.emplace_abort_token();
 		let cwd = root.path().to_str().expect("utf8 cwd").to_owned();
+		let (output_tx, output_rx) = flume::unbounded::<String>();
 		let task = tokio::spawn(async move {
 			shell
 				.run(
@@ -8106,7 +8116,7 @@ replace = [{ pattern = "^.+$", replacement = "PWD" }]
 						cwd: Some(cwd),
 						..Default::default()
 					},
-					None,
+					Some(output_tx),
 					cancel,
 				)
 				.await
@@ -8118,18 +8128,32 @@ replace = [{ pattern = "^.+$", replacement = "PWD" }]
 		})
 		.await
 		.expect("child ready");
+		time::pause();
 		abort.abort(AbortReason::Signal);
+		let trapped = wait_for_marker(&root.path().join("trapped")).await;
+		if trapped {
+			// Real child scheduling must not consume the TERM cleanup budget
+			// before output is released.
+			time::sleep(Duration::from_millis(600)).await;
+		}
+		let released = fs::write(root.path().join("flush"), "");
+		let cleaned = wait_for_marker(&root.path().join("cleaned")).await;
+		time::resume();
 		let result = time::timeout(Duration::from_secs(5), task)
 			.await
 			.expect("cancel finished")
 			.expect("run task")
 			.expect("shell result");
+		assert!(trapped, "child entered TERM trap");
+		released.expect("release TERM output");
+		assert!(cleaned, "TERM cleanup completed after writing output");
 		assert!(result.cancelled);
 		assert_eq!(
 			fs::read_to_string(root.path().join("cleaned"))
 				.expect("TERM cleanup after writing output"),
 			"cleaned"
 		);
+		assert_eq!(output_rx.try_iter().collect::<String>(), "flushing\n");
 	}
 
 	#[tokio::test(flavor = "multi_thread")]
