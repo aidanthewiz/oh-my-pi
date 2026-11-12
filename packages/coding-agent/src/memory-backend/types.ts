@@ -9,8 +9,8 @@
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { ModelRegistry } from "../config/model-registry";
 import type { Settings } from "../config/settings";
-import type { HindsightSessionState } from "../hindsight/state";
-import type { MnemopiSessionState } from "../mnemopi/state";
+import type { HindsightSessionStateApi } from "../hindsight/state";
+import type { MnemopiSessionStateApi } from "../mnemopi/state";
 import type { AgentSession } from "../session/agent-session";
 
 export type MemoryBackendId = "off" | "local" | "hindsight" | "mnemopi" | "sharpshooter";
@@ -88,9 +88,9 @@ export interface MemoryBackendStartOptions {
 	modelRegistry: ModelRegistry;
 	agentDir: string;
 	taskDepth: number;
-	parentHindsightSessionState?: HindsightSessionState;
-	parentMnemopiSessionState?: MnemopiSessionState;
-	inheritedMnemopiRecall?: Pick<MnemopiSessionState, "hasRecalledForFirstTurn" | "lastRecallSnippet">;
+	parentHindsightSessionState?: HindsightSessionStateApi;
+	parentMnemopiSessionState?: MnemopiSessionStateApi;
+	inheritedMnemopiRecall?: Pick<MnemopiSessionStateApi, "hasRecalledForFirstTurn" | "lastRecallSnippet">;
 }
 
 /** A successful recall, including an empty result, staged until user-turn delivery. */

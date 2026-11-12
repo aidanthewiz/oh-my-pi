@@ -15,6 +15,9 @@
 import { rasterizeSvg } from "@oh-my-pi/pi-natives";
 import { hexToOklch, hueDistance, logger, oklchCusp, oklchToHex } from "@oh-my-pi/pi-utils";
 import { Image, type ImageBudget, imageMaxColumns } from "../components/image";
+import { base64ImageNode } from "../native/blobs";
+import { EMPTY_NODE, text } from "../native/describe";
+import type { DescribeContext, NativeNode } from "../native/node";
 import { fencedCode, type Markdown } from "../components/markdown";
 import { type CellDimensions, getCellDimensions, getImageDimensions } from "../terminal-capabilities";
 import { ensureThemeSync, getThemeEpoch, type ThemeColor, theme } from "../theme";
@@ -114,6 +117,11 @@ export interface SvgFigureOptions {
 	/** Shared inline-image budget; superseded rasters are released from it. */
 	budget?: ImageBudget;
 	/**
+	 * Also release a re-raster's previous image (a cell size, theme or room change), for an
+	 * owner with no scrollback copy that could still show it, such as a form.
+	 */
+	releaseSuperseded?: boolean;
+	/**
 	 * Rows the figure may fill, fallback code included, read on every render;
 	 * zero hides it. Unset or `undefined` takes a share of the terminal viewport.
 	 */
@@ -186,6 +194,7 @@ export class SvgFigure implements Component {
 	/** Last render width; rasters wait for the first render to know their room. */
 	#width: number | undefined;
 	#image: { raster: Raster; component: Image } | undefined;
+	#native: { raster: Raster; maxRows: number | undefined; node: NativeNode } | undefined;
 	#fallback:
 		| {
 				source: string;
@@ -223,6 +232,10 @@ export class SvgFigure implements Component {
 		);
 	}
 
+	get failed(): boolean {
+		return this.#failed === this.#source;
+	}
+
 	/** The caller's row ceiling, if any; a surface shorter than its chrome leaves none. */
 	#maxRows(): number | undefined {
 		const rows = this.#options.maxRows?.();
@@ -248,6 +261,29 @@ export class SvgFigure implements Component {
 		return maxRows !== undefined && rows.length > maxRows ? [] : rows;
 	}
 
+	describe(cx: DescribeContext): NativeNode {
+		this.#width = cx.cols;
+		this.#schedule();
+		const maxRows = this.#maxRows();
+		if (maxRows === 0) return EMPTY_NODE;
+		if (this.#failed === this.#source) return text("SVG could not be rendered", { role: "omp.svg.error" });
+		const raster = this.#raster;
+		if (!raster) return text("Drawing SVG…", { role: "omp.svg.loading" });
+		if (this.#native?.raster !== raster || this.#native.maxRows !== maxRows) {
+			this.#native = {
+				raster,
+				maxRows,
+				node: base64ImageNode(
+					raster.data,
+					"image/png",
+					maxRows === undefined ? undefined : { max: { h: `${maxRows}lines` } },
+					`svg:${this.#id}`,
+				),
+			};
+		}
+		return this.#native.node;
+	}
+
 	invalidate(): void {
 		this.#placeholder = undefined;
 		this.#image?.component.invalidate();
@@ -255,16 +291,29 @@ export class SvgFigure implements Component {
 		this.#fallback = undefined;
 	}
 
+	releaseRenderCaches(): void {
+		this.#placeholder = undefined;
+		this.#image?.component.releaseRenderCaches();
+		this.#fallback?.md.releaseRenderCaches();
+		if (this.#fallback) this.#fallback.clip = undefined;
+	}
+
 	dispose(): void {
 		this.#disposed = true;
 		clearTimeout(this.#timer);
 		this.#timer = undefined;
+		this.#native = undefined;
+	}
+
+	/** Retire the drawn raster as soon as no frame shows it: for an owner that is closing for good. */
+	release(): void {
+		this.#image?.component.release();
 	}
 
 	debugState(): Record<string, unknown> {
 		return {
 			final: this.#final,
-			failed: this.#failed === this.#source,
+			failed: this.failed,
 			raster: this.#raster ? `${this.#raster.widthPx}x${this.#raster.heightPx}` : null,
 			current: this.#raster?.source === this.#source,
 		};
@@ -387,6 +436,8 @@ export class SvgFigure implements Component {
 		// re-raster of the same source (cell size, theme or room change) may still be
 		// standing in scrollback, so the residency sweep keeps deciding for it.
 		if (previous && previous.source !== attempt.source) this.#options.budget?.release(previous.key);
+		else if (previous && this.#options.releaseSuperseded && this.#image?.raster === previous)
+			this.#image.component.release();
 		this.#options.onChange();
 	}
 

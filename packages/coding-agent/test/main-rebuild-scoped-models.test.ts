@@ -285,9 +285,12 @@ describe("rebuildScopedModels after login", () => {
 		const session = new FakeSession([{ model: active }]);
 		const ctx = {
 			settings,
-			session: { model: active, modelRegistry: registry },
-			refreshScopedModelsAfterLogin: async () => {
-				await rebuildScopedModels(session, parseArgs([]), registry, settings);
+			session: {
+				model: active,
+				modelRegistry: registry,
+				refreshScopedModels: async () => {
+					await rebuildScopedModels(session, parseArgs([]), registry, settings);
+				},
 			},
 		};
 
@@ -309,14 +312,16 @@ describe("rebuildScopedModels after login", () => {
 			refreshProvider: () => discovery.promise,
 		});
 		const scope = new FakeSession([{ model: active }]);
-		const owner = { model: active, modelRegistry: registry, sessionId: "original", isDisposed: false };
-		const ctx = {
-			settings,
-			session: owner,
-			refreshScopedModelsAfterLogin: async () => {
+		const owner = {
+			model: active,
+			modelRegistry: registry,
+			sessionId: "original",
+			isDisposed: false,
+			refreshScopedModels: async () => {
 				await rebuildScopedModels(scope, parseArgs([]), registry, settings);
 			},
 		};
+		const ctx = { settings, session: owner };
 		const pending = createSetupHost(ctx as unknown as InteractiveModeContext).refreshProvider("prov");
 		if (transition === "switch") owner.sessionId = "replacement";
 		else owner.isDisposed = true;

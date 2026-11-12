@@ -25,6 +25,7 @@ import type { TaskToolDetails, TaskParams } from "@oh-my-pi/pi-tui/tools/task";
 import { runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
 import { __resetDirsFromEnvForTests, removeWithRetries, setAgentDir } from "@oh-my-pi/pi-utils";
 import { createInMemoryAuthStorage } from "../helpers/agent-session-setup";
+import { localSession } from "../helpers/local-session";
 
 const AGENT_ID = "FocusedYield";
 const PARENT_ID = "Main";
@@ -203,7 +204,7 @@ async function spawnKeptAliveChild(options: { handler?: MockHandler; structured?
 		throw new Error("kept-alive subagent has no live session");
 	}
 	return {
-		session,
+		session: localSession(session),
 		artifact,
 		deliveries,
 		firstDelivery: firstDelivery.promise,
@@ -699,7 +700,7 @@ it.each(["model", "root", "pool", "ref"] as const)(
 				expect(revived.model?.id).toBe("owner-model");
 				await revived.prompt("Return the report with the original child model.");
 				await revived.waitForIrcReplies();
-				expect(revived.getLastAssistantMessage()?.model).toBe("owner-model");
+				expect(revived.messages.findLast(message => message.role === "assistant")?.model).toBe("owner-model");
 			} else {
 				if (change === "root") await fixture.owner.session.dispose();
 				else if (change === "pool")

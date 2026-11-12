@@ -647,7 +647,7 @@ describe("cursor usage provider", () => {
 				expect(blocks[0]?.blockedUntilMs).toBeLessThanOrEqual(Date.now() + 65_000);
 			} finally {
 				vi.restoreAllMocks();
-				storage.close();
+				await storage.close();
 				store.close();
 				await fs.rm(tempDir, { recursive: true, force: true });
 			}
@@ -702,7 +702,7 @@ describe("cursor usage provider", () => {
 				await storage.usage.reports();
 				return [...blocks.keys()].sort();
 			} finally {
-				storage.close();
+				await storage.close();
 			}
 		};
 

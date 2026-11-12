@@ -52,6 +52,7 @@ import {
 import { requestTextPrediction, textPredictionBackend } from "../../predict/client";
 import type { AgentSession, AgentSessionEvent, NavigateTreeResult, PromptOptions } from "../../session/agent-session";
 import { SessionBusyError } from "../../session/agent-session";
+import type { AgentSessionHandle } from "../../session/agent-session-handle";
 import type { MCPManager } from "../../mcp/manager";
 import { reconnectMcpManagerServer } from "../../mcp/oauth-reauth";
 import type { RestoredQueuedMessage } from "../../session/agent-session-types";
@@ -64,7 +65,6 @@ import { buildAvailableSlashCommands } from "../../slash-commands/available-comm
 import { listLogoutAccounts, logoutCredential } from "../../slash-commands/helpers/logout";
 import { cfgSttEnabled } from "../../stt/settings";
 import { defaultLoadModeForToolName } from "../../tools/essential-tools";
-import { USER_TODO_EDIT_CUSTOM_TYPE } from "../../tools/todo";
 import type { EventBus } from "../../utils/event-bus";
 import { selectRpcEntries } from "./rpc-compat";
 import { calculateTokensPerSecond } from "../../utils/token-rate";
@@ -938,7 +938,7 @@ export async function handleRpcSteerSubagent(
 	const notRunning = `Subagent not running: ${subagentId}`;
 	const owned = resolveOwnedLiveSubagent(subagentRegistry, subagentId);
 	if (!owned) return notRunning;
-	let session: AgentSession;
+	let session: AgentSessionHandle;
 	try {
 		session = await AgentLifecycleManager.global().ensureLive(subagentId);
 	} catch {
@@ -1213,55 +1213,56 @@ function parseAskDialogResponse(
 	if (!Array.isArray(answers) || answers.length !== questions.length) {
 		throw new Error(`Ask dialog response must carry ${questions.length} answers in question order`);
 	}
-	return {
-		kind: "submit",
-		results: questions.map((question, index) => {
-			const answer: unknown = answers[index];
-			if (!isRecord(answer) || answer.id !== question.id) {
-				throw new Error(`Ask dialog answer ${index} must have id ${JSON.stringify(question.id)}`);
-			}
-			const labels = question.options.map(option => option.label);
-			const multi = question.multi ?? false;
-			const { selectedOptions, customInput } = answer;
-			if (!Array.isArray(selectedOptions)) {
-				throw new Error(`Ask dialog answer ${JSON.stringify(question.id)} must carry a selectedOptions array`);
-			}
-			const selected: string[] = [];
-			for (const label of selectedOptions) {
-				if (typeof label !== "string" || !labels.includes(label)) {
-					throw new Error(
-						`Ask dialog answer ${JSON.stringify(question.id)} selected unknown option ${JSON.stringify(label)}`,
-					);
-				}
-				if (selected.includes(label)) {
-					throw new Error(
-						`Ask dialog answer ${JSON.stringify(question.id)} selected ${JSON.stringify(label)} twice`,
-					);
-				}
-				selected.push(label);
-			}
-			if (customInput !== undefined && typeof customInput !== "string") {
-				throw new Error(`Ask dialog answer ${JSON.stringify(question.id)} customInput must be a string`);
-			}
-			const custom = customInput?.trim() || undefined;
-			if (!multi && (selected.length > 1 || (selected.length > 0 && custom !== undefined))) {
+	const results = questions.map((question, index) => {
+		const answer: unknown = answers[index];
+		if (!isRecord(answer) || answer.id !== question.id) {
+			throw new Error(`Ask dialog answer ${index} must have id ${JSON.stringify(question.id)}`);
+		}
+		const labels = question.options.map(option => option.label);
+		const multi = question.multi ?? false;
+		const { selectedOptions, customInput, timedOut } = answer;
+		if (!Array.isArray(selectedOptions)) {
+			throw new Error(`Ask dialog answer ${JSON.stringify(question.id)} must carry a selectedOptions array`);
+		}
+		const selected: string[] = [];
+		for (const label of selectedOptions) {
+			if (typeof label !== "string" || !labels.includes(label)) {
 				throw new Error(
-					`Ask dialog answer ${JSON.stringify(question.id)} is single-select but carries more than one answer`,
+					`Ask dialog answer ${JSON.stringify(question.id)} selected unknown option ${JSON.stringify(label)}`,
 				);
 			}
-			return {
-				id: question.id,
-				question: question.question,
-				options: labels,
-				multi,
-				selectedOptions: selected,
-				customInput: custom,
-			};
-		}),
-	};
+			if (selected.includes(label)) {
+				throw new Error(`Ask dialog answer ${JSON.stringify(question.id)} selected ${JSON.stringify(label)} twice`);
+			}
+			selected.push(label);
+		}
+		if (customInput !== undefined && typeof customInput !== "string") {
+			throw new Error(`Ask dialog answer ${JSON.stringify(question.id)} customInput must be a string`);
+		}
+		if (timedOut !== undefined && typeof timedOut !== "boolean") {
+			throw new Error(`Ask dialog answer ${JSON.stringify(question.id)} timedOut must be a boolean`);
+		}
+		const custom = customInput?.trim() || undefined;
+		if (!multi && (selected.length > 1 || (selected.length > 0 && custom !== undefined))) {
+			throw new Error(
+				`Ask dialog answer ${JSON.stringify(question.id)} is single-select but carries more than one answer`,
+			);
+		}
+		return {
+			id: question.id,
+			question: question.question,
+			options: labels,
+			multi,
+			selectedOptions: selected,
+			customInput: custom,
+			...(timedOut === true ? { timedOut: true } : {}),
+		};
+	});
+	if (results.some(answer => answer.timedOut)) dialogOptions.onTimeout?.();
+	return { kind: "submit", results };
 }
 
-/** Sends all ask questions as one RPC `ask` dialog; a timeout answers every question with its recommended option. */
+/** Sends all ask questions as one RPC `ask` dialog, retaining timeout evidence without inventing selections. */
 export async function requestRpcAskDialog(
 	pendingRequests: Map<string, PendingExtensionRequest>,
 	output: RpcOutput,
@@ -1284,7 +1285,7 @@ export async function requestRpcAskDialog(
 		{ method: "ask", questions, timeout: dialogOptions?.timeout },
 		response => parseAskDialogResponse(response, questions, opts),
 	);
-	return timedOut ? timedOutAskDialogResult(questions) : result;
+	return timedOut && result === undefined ? timedOutAskDialogResult(questions) : result;
 }
 
 export function requestRpcEditor(
@@ -1537,6 +1538,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			supportedEventSubscriptionLevels: ["control", "full"],
 			maxFrameBytes: MAX_RPC_FRAME_BYTES,
 			maxReassembledFrameBytes: MAX_RPC_REASSEMBLED_BYTES,
+			supportsBashExcludeFromContext: true,
 		}),
 	);
 	const output = (obj: RpcResponse | RpcExtensionUIRequest | object) => {
@@ -1691,6 +1693,10 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 		}
 
 		rerenderMessage(): void {
+			// No transcript is drawn in RPC mode
+		}
+
+		refreshTranscript(): void {
 			// No transcript is drawn in RPC mode
 		}
 
@@ -2531,9 +2537,8 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			}
 
 			case "set_todos": {
-				session.setTodoPhases(command.phases);
+				session.commitTodoPhases(command.phases);
 				const phases = session.getTodoPhases();
-				session.sessionManager.appendCustomEntry(USER_TODO_EDIT_CUSTOM_TYPE, { phases });
 				return success(id, "set_todos", { todoPhases: phases });
 			}
 
@@ -2809,7 +2814,13 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			// =================================================================
 
 			case "bash": {
-				const result = await session.executeBash(command.command);
+				// Reject rather than coerce: a falsy non-boolean such as `null` would silently share the output.
+				if (command.excludeFromContext !== undefined && typeof command.excludeFromContext !== "boolean") {
+					return error(id, "bash", "excludeFromContext must be a boolean");
+				}
+				const result = await session.executeBash(command.command, undefined, {
+					excludeFromContext: command.excludeFromContext,
+				});
 				return success(id, "bash", result);
 			}
 
@@ -2987,6 +2998,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 						knownProvider.storeCredentialsAs ?? knownProvider.id,
 						"online",
 					);
+					await session.refreshScopedModels();
 					return success(id, "login", { providerId: command.providerId });
 				} catch (err: unknown) {
 					return error(id, "login", err instanceof Error ? err.message : String(err));
@@ -3013,10 +3025,9 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 					return error(id, "logout", "providerId must be a string and credentialId an integer");
 				}
 				const { removed, remainingSource } = await logoutCredential(
-					session.modelRegistry,
+					session,
 					command.providerId,
 					command.credentialId,
-					session.sessionId,
 				);
 				if (!removed) {
 					return error(id, "logout", `Credential ${command.credentialId} is not stored for ${command.providerId}`);

@@ -17,6 +17,7 @@ import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry
 import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import * as sshFileTransfer from "@oh-my-pi/pi-coding-agent/ssh/file-transfer";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import * as scrapers from "@oh-my-pi/pi-coding-agent/web/scrapers/types";
 import { formatOutputNotice } from "@oh-my-pi/pi-tui/tools/output-meta";
 import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
@@ -383,7 +384,44 @@ describe("GrepTool internal URL resolution", () => {
 		expect(result.details?.matchCount).toBe(1);
 	});
 
-	it("keeps a single internal URL whose name ends in a semicolon whole", async () => {
+	it("searches a mixed internal URL and local path semicolon list", async () => {
+		await Bun.write(path.join(artifactsDir, "1.python.log"), "artifact needle\n");
+		await Bun.write(path.join(tmpDir, "notes.txt"), "local needle\n");
+
+		const text = getResultText(
+			await new GrepTool(createSession()).execute("mixed-url-local", {
+				pattern: "needle",
+				path: "artifact://1;notes.txt",
+			}),
+		);
+
+		// Both targets are searched — the list is not one artifact URI.
+		expect(text).toContain("artifact://1");
+		expect(text).toContain("artifact needle");
+		expect(text).toContain("notes.txt");
+		expect(text).toContain("local needle");
+		expect(text).not.toContain("artifact://1;notes.txt");
+	});
+
+	it("globs a mixed internal URL and local path semicolon list", async () => {
+		const localRoot = path.join(artifactsDir, "local");
+		await fs.mkdir(localRoot, { recursive: true });
+		await Bun.write(path.join(localRoot, "PLAN.md"), "# Plan\n");
+		await Bun.write(path.join(tmpDir, "notes.txt"), "local\n");
+		LocalProtocolHandler.setOverride({ getArtifactsDir: () => artifactsDir, getSessionId: () => "session" });
+
+		const text = getResultText(
+			await new GlobTool(createSession()).execute("glob-mixed-url-local", {
+				path: "local://PLAN.md;notes.txt",
+			}),
+		);
+
+		expect(text).toContain("PLAN.md");
+		expect(text).toContain("notes.txt");
+		expect(text).not.toContain("local://PLAN.md;notes.txt");
+	});
+
+	it("keeps a single internal URL with a semicolon in its path whole", async () => {
 		const localRoot = path.join(artifactsDir, "local");
 		await fs.mkdir(localRoot, { recursive: true });
 		await Bun.write(path.join(localRoot, "report;"), "semicolon needle\n");
@@ -395,6 +433,116 @@ describe("GrepTool internal URL resolution", () => {
 		);
 		expect(text).toContain("semicolon needle");
 		expect(text).not.toContain("plain needle");
+
+		registerVirtualDocs(
+			new Map([
+				["report;version:abc", "opaque needle\n"],
+				["report", "plain needle\n"],
+			]),
+		);
+		const opaqueTailResult = await new GrepTool(createSession()).execute("semicolon-opaque-tail", {
+			pattern: "needle",
+			path: "virtual://report;version:abc",
+		});
+		const opaqueTailText = getResultText(opaqueTailResult);
+		expect(opaqueTailText).toContain("opaque needle");
+		expect(opaqueTailText).not.toContain("plain needle");
+		expect(opaqueTailResult.details?.files).toEqual(["virtual://report;version:abc"]);
+		expect(opaqueTailResult.details?.missingPaths ?? []).toEqual([]);
+	});
+
+	it("keeps opaque URI tails while splitting later local and URL targets with selectors", async () => {
+		registerVirtualDocs(
+			new Map([
+				["report;revision:xyz", "needle excluded opaque\nneedle selected opaque\n"],
+				["second.md", "needle selected second start\nneedle excluded second\nneedle selected second end\n"],
+			]),
+		);
+		await Bun.write(path.join(tmpDir, "notes.txt"), "needle selected local\nneedle excluded local\n");
+
+		const result = await new GrepTool(createSession()).execute("opaque-tail-list", {
+			pattern: "needle",
+			path: "virtual://report;revision:xyz:2-2;notes.txt:1-1;virtual://second.md:raw:1,3",
+		});
+
+		const text = getResultText(result);
+		expect(text).toContain("needle selected opaque");
+		expect(text).toContain("needle selected local");
+		expect(text).toContain("needle selected second start");
+		expect(text).toContain("needle selected second end");
+		expect(text).not.toContain("needle excluded");
+		expect(result.details?.files?.slice().sort()).toEqual([
+			"notes.txt",
+			"virtual://report;revision:xyz",
+			"virtual://second.md",
+		]);
+		expect(result.details?.matchCount).toBe(4);
+		expect(result.details?.missingPaths ?? []).toEqual([]);
+	});
+
+	it("preserves opaque URI identity in quoted JSON path lists with escaped URL separators", async () => {
+		registerVirtualDocs(
+			new Map([
+				["report;revision:xyz", "needle excluded opaque\nneedle selected opaque\n"],
+				["second.md", "needle selected second\nneedle excluded second\n"],
+			]),
+		);
+
+		const result = await new GrepTool(createSession()).execute("opaque-json-list", {
+			pattern: "needle",
+			path: String.raw`["virtual:\/\/report;revision:xyz:raw:2-2","virtual:\/\/second.md:1-1"]`,
+		});
+
+		const text = getResultText(result);
+		expect(text).toContain("needle selected opaque");
+		expect(text).toContain("needle selected second");
+		expect(text).not.toContain("needle excluded");
+		expect(result.details?.files?.slice().sort()).toEqual(["virtual://report;revision:xyz", "virtual://second.md"]);
+		expect(result.details?.matchCount).toBe(2);
+		expect(result.details?.missingPaths ?? []).toEqual([]);
+	});
+
+	it("keeps opaque URI tails and collapsed HTTP targets as separate search paths", async () => {
+		registerVirtualDocs(
+			new Map([
+				["report;version:abc", "needle exact opaque resource\n"],
+				["report", "needle wrong opaque prefix\n"],
+			]),
+		);
+		const externalContents: Readonly<Record<string, string>> = {
+			"https://a.example/doc": "needle first external resource\n",
+			"https://b.example/doc": "needle second external resource\n",
+		};
+		vi.spyOn(scrapers, "loadPage").mockImplementation(async requestedUrl => ({
+			ok: true,
+			status: 200,
+			finalUrl: requestedUrl,
+			contentType: "text/plain",
+			content: externalContents[requestedUrl] ?? "unexpected external target\n",
+		}));
+		const session = createSession({
+			getArtifactsDir: () => artifactsDir,
+			settings: Settings.isolated({
+				"fetch.enabled": true,
+				"grep.contextBefore": 0,
+				"grep.contextAfter": 0,
+			}),
+		});
+
+		const result = await new GrepTool(session).execute("opaque-collapsed-http-list", {
+			pattern: "needle",
+			path: "virtual://report;version:abc;https://a.example/doc;https:/b.example/doc",
+		});
+
+		const text = getResultText(result);
+		expect(text).toContain("needle exact opaque resource");
+		expect(text).toContain("needle first external resource");
+		expect(text).toContain("needle second external resource");
+		expect(text).not.toContain("needle wrong opaque prefix");
+		expect(result.details?.files).toContain("virtual://report;version:abc");
+		expect(result.details?.fileCount).toBe(3);
+		expect(result.details?.matchCount).toBe(3);
+		expect(result.details?.missingPaths ?? []).toEqual([]);
 	});
 
 	it("searches virtual internal URL content without a backing file", async () => {

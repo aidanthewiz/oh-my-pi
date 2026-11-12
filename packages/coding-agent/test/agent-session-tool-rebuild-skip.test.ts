@@ -4,10 +4,12 @@ import { Agent, type AgentMessage, type AgentTool } from "@oh-my-pi/pi-agent-cor
 import type { Message, Model } from "@oh-my-pi/pi-ai";
 import { createMockModel, type MockResponseSource } from "@oh-my-pi/pi-ai/providers/mock";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { CustomTool } from "@oh-my-pi/pi-coding-agent/extensibility/custom-tools/types";
 import type { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import type { Skill } from "@oh-my-pi/pi-coding-agent/extensibility/skills";
+import { callRegisteredTool } from "@oh-my-pi/pi-coding-agent/eval/js/session-tool";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { type CustomMessage, convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionMaintenance } from "@oh-my-pi/pi-coding-agent/session/session-maintenance";
@@ -18,7 +20,9 @@ import {
 } from "@oh-my-pi/pi-coding-agent/session/session-tools";
 import { BashTool } from "@oh-my-pi/pi-coding-agent/tools/bash";
 import { listXdevTools, XDEV_EXTERNAL_DESCRIPTION_CAP, type XdevState } from "@oh-my-pi/pi-coding-agent/tools/xdev";
-import { logger } from "@oh-my-pi/pi-utils";
+import { EvalTool } from "@oh-my-pi/pi-coding-agent/tools/eval";
+import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools/index";
+import { logger, TempDir } from "@oh-my-pi/pi-utils";
 
 import { cfgSkillful } from "@oh-my-pi/pi-coding-agent/session/settings";
 import { cfgStartupQuiet } from "@oh-my-pi/pi-coding-agent/modes/settings";
@@ -127,13 +131,15 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 		beforeAgentStartSystemPrompt?: string[];
 		/** Pre-loaded skills handed to the session's hint snapshot. */
 		skills?: Skill[];
+		/** Model binds signed thinking to its prompt prefix, so implicit rebuilds freeze once a reply exists. */
+		prefixBound?: boolean;
 	}
 
 	function newSession(
 		rebuildSystemPrompt: (
 			toolNames: string[],
 			tools: Map<string, AgentTool>,
-			mountedToolNames?: ReadonlySet<string>,
+			xdev: XdevState | undefined,
 		) => Promise<string>,
 		options: NewSessionOptions = {},
 	): {
@@ -163,7 +169,12 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 		const agent = new Agent({
 			getApiKey: () => "test-key",
 			initialState: {
-				model: createModel(),
+				model: options.prefixBound
+					? {
+							...createModel(),
+							thinking: { mode: "anthropic-adaptive", efforts: [Effort.High], prefixBinding: true },
+						}
+					: createModel(),
 				systemPrompt: ["initial"],
 				tools: options.xdev
 					? options.lazyWrite
@@ -212,10 +223,10 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 						emit: async () => undefined,
 					} as unknown as ExtensionRunner)
 				: undefined,
-			rebuildSystemPrompt: async (toolNames, tools, mountedToolNames) => {
-				const base = await rebuildSystemPrompt(toolNames, tools, mountedToolNames);
+			rebuildSystemPrompt: async (toolNames, tools, xdev) => {
+				const base = await rebuildSystemPrompt(toolNames, tools, xdev);
 				if (!options.exposeXdevCatalog) return { systemPrompt: [base] };
-				const catalog = options.xdev ? [...(mountedToolNames ?? options.xdev.mountedNames)] : [];
+				const catalog = xdev ? [...xdev.mountedNames] : [];
 				return { systemPrompt: [`${base}\nxd:// catalog: ${catalog.join(",")}`], xdevCatalogNames: catalog };
 			},
 			getMcpServerInstructions: options.getMcpServerInstructions,
@@ -297,6 +308,23 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 
 		await session.refreshMCPTools([initialMcp]);
 		expect(rebuildCount).toBe(1);
+	});
+
+	it("preserves disabled and enabled MCP tools across refreshes while enabling new tools", async () => {
+		const { session } = newSession(async toolNames => `tools:${toolNames.join(",")}`);
+		const search = createMcpCustomTool("mcp__nucleus_search", "nucleus", "search", "Search nucleus");
+		const fetch = createMcpCustomTool("mcp__nucleus_fetch", "nucleus", "fetch", "Fetch nucleus");
+		const lookup = createMcpCustomTool("mcp__nucleus_lookup", "nucleus", "lookup", "Lookup nucleus");
+
+		await session.refreshMCPTools([search, fetch]);
+		await session.setActiveToolsByName(["read", fetch.name]);
+		await session.refreshMCPTools([search, fetch]);
+		expect(session.getEnabledToolNames()).toEqual(expect.arrayContaining(["read", fetch.name]));
+		expect(session.getEnabledToolNames()).not.toContain(search.name);
+
+		await session.refreshMCPTools([search, fetch, lookup]);
+		expect(session.getEnabledToolNames()).toEqual(expect.arrayContaining(["read", fetch.name, lookup.name]));
+		expect(session.getEnabledToolNames()).not.toContain(search.name);
 	});
 
 	for (const exit of ["restore snapshot", "preserve active"] as const) {
@@ -484,12 +512,10 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 		]);
 		let rebuildCount = 0;
 		const { session } = newSession(
-			async (_toolNames, tools, mountedToolNames) => {
+			async (_toolNames, _tools, xdev) => {
 				rebuildCount++;
 				const projection = projectMountedMCPXdevGuidance(
-					collectMountedMCPToolRoutes(
-						listXdevTools({ ...xdevState, tools, mountedNames: new Set(mountedToolNames) }),
-					),
+					collectMountedMCPToolRoutes(xdev ? listXdevTools(xdev) : []),
 				);
 				return JSON.stringify(projection.mappings.map(mapping => mapping.path));
 			},
@@ -646,38 +672,43 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 	});
 
 	it.each([true, false])(
-		"renders candidate eval guidance without granting live eval authority (fails=%s)",
+		"keeps candidate eval activation unavailable until the prompt rebuild commits (fails=%s)",
 		async fails => {
+			using temp = TempDir.createSync("omp-candidate-eval-");
+			const sessionManager = SessionManager.inMemory(temp.path());
 			const activeNames = new Set(["bash"]);
 			const settings = Settings.isolated({ "compaction.enabled": false });
-			const toolSession = {
-				cwd: "/synthetic/prompt-candidate",
+			const toolSession: ToolSession = {
+				cwd: sessionManager.getCwd(),
 				hasUI: false,
-				getSessionFile: () => null,
+				getSessionFile: () => sessionManager.getSessionFile() ?? null,
 				getSessionSpawns: () => "*",
 				settings,
+				sessionManager,
+				getEvalSessionId: () => sessionManager.getSessionId(),
 				isToolActive: (name: string) => activeNames.has(name),
 				isToolActiveForPrompt: (name: string) => activeNames.has(name),
 			};
 			const bash = new BashTool(toolSession);
-			const evalTool = createBasicTool("eval", "Eval");
+			const evalTool = new EvalTool(toolSession);
 			const toolRegistry = new Map<string, AgentTool<any>>([
 				[bash.name, bash],
 				[evalTool.name, evalTool],
 			]);
-			const rebuildStarted = Promise.withResolvers<string>();
+			const rebuildStarted = Promise.withResolvers<boolean | undefined>();
 			const releaseRebuild = Promise.withResolvers<void>();
 			const agent = new Agent({
 				initialState: {
 					model: createModel(),
-					systemPrompt: [bash.description],
+					systemPrompt: ["initial"],
 					tools: [bash],
 					messages: [],
 				},
 			});
 			const session = new AgentSession({
 				agent,
-				sessionManager: SessionManager.inMemory(),
+				sessionManager,
+				evalToolSession: toolSession,
 				settings,
 				modelRegistry: {} as never,
 				toolRegistry,
@@ -685,34 +716,52 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 					activeNames.clear();
 					for (const name of names) activeNames.add(name);
 				},
-				rebuildSystemPrompt: async (_names, tools) => {
-					const description = tools.get("bash")!.description;
-					rebuildStarted.resolve(description);
+				rebuildSystemPrompt: async () => {
+					rebuildStarted.resolve(toolSession.isToolActiveForPrompt?.("eval"));
 					await releaseRebuild.promise;
 					if (fails) throw new Error("rebuild failed");
-					return { systemPrompt: [description] };
+					return { systemPrompt: ["rebuilt"] };
 				},
 			});
 			toolSession.isToolActiveForPrompt = name => session.getPromptToolActivity(name) ?? activeNames.has(name);
-			sessions.push(session);
-			expect(bash.description).not.toContain("`eval`");
+			toolSession.getEvalKernelOwnerId = () => session.getEvalKernelOwnerId();
+			toolSession.getToolByName = name => session.getToolByName(name);
+			toolSession.getToolForEvalBridge = name => session.getToolForEvalBridge(name);
+			toolSession.assertEvalExecutionAllowed = () => session.assertEvalExecutionAllowed();
+			toolSession.trackEvalExecution = (execution, abortController) =>
+				session.trackEvalExecution(execution, abortController);
+			await using _cleanup = { [Symbol.asyncDispose]: () => session.dispose() };
+			const executeEval = () =>
+				callRegisteredTool("eval", { language: "js", code: "console.log(19 + 23)" }, { session: toolSession });
+			await expect(executeEval()).rejects.toBeInstanceOf(Error);
+			expect(session.getToolForEvalBridge("eval")).toBeUndefined();
 			const outcome = session.setActiveToolsByName(["bash", "eval"]).then(
 				() => undefined,
 				(error: unknown) => error,
 			);
 			try {
-				expect(await rebuildStarted.promise).toContain("`eval`");
-				expect(activeNames.has("eval")).toBe(false);
-				expect(bash.description).not.toContain("`eval`");
+				expect(await rebuildStarted.promise).toBe(true);
+				expect(toolSession.isToolActive?.("eval")).toBe(false);
+				expect(session.getActiveToolNames()).toEqual(["bash"]);
+				expect(session.getToolForEvalBridge("eval")).toBeUndefined();
+				await expect(executeEval()).rejects.toBeInstanceOf(Error);
 				expect(session.getPromptToolActivity("eval")).toBeUndefined();
 			} finally {
 				releaseRebuild.resolve();
+				await outcome;
 			}
 			if (fails) expect(await outcome).toBeInstanceOf(Error);
 			else expect(await outcome).toBeUndefined();
-			expect(activeNames.has("eval")).toBe(!fails);
-			expect(bash.description.includes("`eval`")).toBe(!fails);
-			expect(agent.state.systemPrompt.join("\n").includes("`eval`")).toBe(!fails);
+			expect(toolSession.isToolActive?.("eval")).toBe(!fails);
+			expect(session.getActiveToolNames()).toEqual(fails ? ["bash"] : ["bash", "eval"]);
+			if (fails) {
+				expect(session.getToolForEvalBridge("eval")).toBeUndefined();
+				await expect(executeEval()).rejects.toBeInstanceOf(Error);
+				expect(session.systemPrompt).toEqual(["initial"]);
+			} else {
+				const result = await executeEval();
+				expect(typeof result === "string" ? result : result.text).toBe("42");
+			}
 		},
 	);
 
@@ -1367,6 +1416,70 @@ These tools became available:
 		expect(
 			session.agent.state.messages.filter(m => m.role === "custom" && m.customType === "xdev-mount-notice"),
 		).toHaveLength(0);
+	});
+
+	it("keeps the eval description's tool names fixed when a prefix-bound session mounts an MCP tool", async () => {
+		const { session, contexts } = newSession(async toolNames => `tools:${toolNames.join(",")}`, {
+			xdev: createTestXdevState(),
+			responses: [{ content: ["ok"] }, { content: ["ok"] }],
+			prefixBound: true,
+		});
+		const evalTool = new EvalTool({
+			cwd: session.sessionManager.getCwd(),
+			hasUI: false,
+			settings: session.settings,
+			getSessionFile: () => session.sessionManager.getSessionFile() ?? null,
+			getSessionSpawns: () => "*",
+			getAdvertisedEvalToolNames: () => session.getAdvertisedEvalToolNames(),
+		});
+		const search = createMcpCustomTool("mcp__nucleus_search", "nucleus", "search", "Search nucleus");
+		const fetch = createMcpCustomTool("mcp__nucleus_fetch", "nucleus", "fetch", "Fetch nucleus");
+		await session.refreshMCPTools([search]);
+		await session.prompt("hi");
+		const boundDescription = evalTool.description;
+		const boundPrompt = session.systemPrompt;
+		expect(boundDescription).toContain("mcp__nucleus_search");
+
+		await session.refreshMCPTools([search, fetch]);
+		await session.prompt("again");
+
+		// The cached prefix keeps its bytes; the new tool is callable from cells and announced.
+		expect(evalTool.description).toBe(boundDescription);
+		expect(session.systemPrompt).toEqual(boundPrompt);
+		expect(session.getToolForEvalBridge("mcp__nucleus_fetch")).toBeDefined();
+		expect(mountNoticesIn(contexts[1]).join("\n")).toContain("xd://mcp__nucleus_fetch");
+	});
+
+	it("keeps a held MCP mount out of a prefix-bound prompt across a rebuild that changes nothing else", async () => {
+		const { session, contexts, systemPrompts } = newSession(async toolNames => `tools:${toolNames.join(",")}`, {
+			xdev: createTestXdevState(),
+			responses: [{ content: ["ok"] }, { content: ["ok"] }, { content: ["ok"] }],
+			prefixBound: true,
+			exposeXdevCatalog: true,
+		});
+		const evalTool = new EvalTool({
+			cwd: session.sessionManager.getCwd(),
+			hasUI: false,
+			settings: session.settings,
+			getSessionFile: () => session.sessionManager.getSessionFile() ?? null,
+			getSessionSpawns: () => "*",
+			getAdvertisedEvalToolNames: () => session.getAdvertisedEvalToolNames(),
+		});
+		const search = createMcpCustomTool("mcp__nucleus_search", "nucleus", "search", "Search nucleus");
+		const fetch = createMcpCustomTool("mcp__nucleus_fetch", "nucleus", "fetch", "Fetch nucleus");
+		await session.refreshMCPTools([search]);
+		await session.prompt("hi");
+		const boundDescription = evalTool.description;
+
+		await session.refreshMCPTools([search, fetch]);
+		await session.prompt("again");
+		// e.g. a body-only `manage_skill update`: nothing the prompt renders changed.
+		await session.refreshBaseSystemPrompt();
+		await session.prompt("third");
+
+		expect(evalTool.description).toBe(boundDescription);
+		expect(systemPrompts[2]).toEqual(systemPrompts[0]);
+		expect(mountNoticesIn(contexts[1]).join("\n")).toContain("xd://mcp__nucleus_fetch");
 	});
 
 	it("announces an unmount after a maintenance rebuild delivered the pending addition", async () => {

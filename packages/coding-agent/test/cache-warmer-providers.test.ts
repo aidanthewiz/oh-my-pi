@@ -201,7 +201,7 @@ function createConverseHarness(usage: Usage, deferTerminal = false) {
 				},
 			},
 		},
-		() => true,
+		() => undefined,
 	);
 	return {
 		warmer,
@@ -361,7 +361,7 @@ function createMessagesHarness(provider: "amazon-bedrock" | "bedrock-mantle", ba
 					: {}),
 			},
 		},
-		() => true,
+		() => undefined,
 	);
 	return { warmer, model, capture, refreshEnded: refreshEnded.promise };
 }
@@ -389,6 +389,7 @@ function makeUsage(cacheRead: number, cacheWrite: number): Usage {
 function createResponsesPayloadHarness(
 	options: Pick<SimpleStreamOptions, "onPayload" | "cacheRetention">,
 	decide?: CacheWarmerDeps["decide"],
+	terminal: "completed" | "failed" = "completed",
 ) {
 	const bundled = getBundledModel<"openai-responses">("openai", "gpt-5.6");
 	if (!bundled) throw new Error("Expected bundled openai/gpt-5.6");
@@ -409,12 +410,15 @@ function createResponsesPayloadHarness(
 			status: "completed",
 			content: [{ type: "output_text", text: "Synthetic cache refresh" }],
 		};
-		const completed = {
-			type: "response.completed",
+		const terminalEvent = {
+			type: `response.${terminal}`,
 			response: {
 				id: "resp_warm_payload",
-				status: "completed",
-				output: [item],
+				status: terminal,
+				output: terminal === "failed" ? [] : [item],
+				...(terminal === "failed"
+					? { error: { code: "invalid_request_error", message: "Synthetic paid rejection" } }
+					: {}),
 				usage: {
 					input_tokens: 6000,
 					output_tokens: 0,
@@ -423,22 +427,30 @@ function createResponsesPayloadHarness(
 				},
 			},
 		};
-		const events = [
-			{
-				type: "response.output_item.added",
-				output_index: 0,
-				item: { ...item, status: "in_progress", content: [] },
-			},
-			{
-				type: "response.content_part.added",
-				output_index: 0,
-				content_index: 0,
-				part: { type: "output_text", text: "" },
-			},
-			{ type: "response.output_text.delta", output_index: 0, content_index: 0, delta: "Synthetic cache refresh" },
-			{ type: "response.output_item.done", output_index: 0, item },
-			completed,
-		];
+		const events =
+			terminal === "failed"
+				? [terminalEvent]
+				: [
+						{
+							type: "response.output_item.added",
+							output_index: 0,
+							item: { ...item, status: "in_progress", content: [] },
+						},
+						{
+							type: "response.content_part.added",
+							output_index: 0,
+							content_index: 0,
+							part: { type: "output_text", text: "" },
+						},
+						{
+							type: "response.output_text.delta",
+							output_index: 0,
+							content_index: 0,
+							delta: "Synthetic cache refresh",
+						},
+						{ type: "response.output_item.done", output_index: 0, item },
+						terminalEvent,
+					];
 		return new Response(`${events.map(event => `data: ${JSON.stringify(event)}`).join("\n\n")}\n\n`, {
 			headers: { "content-type": "text/event-stream" },
 		});
@@ -472,7 +484,7 @@ function createResponsesPayloadHarness(
 		context: CONTEXT,
 		options: { apiKey: "test-key", cacheRetention: "long" as const, ...options },
 	};
-	warmer.start(request, () => true);
+	warmer.start(request, () => undefined);
 	return { warmer, request, bodies, warmed, ended: ended.promise };
 }
 
@@ -584,7 +596,7 @@ describe("cache warmer provider replay behavior", () => {
 			getMode: () => "streaming",
 		});
 		warmers.add(warmer);
-		warmer.start({ model, context: CONTEXT, options: { reasoning: Effort.High } }, () => true);
+		warmer.start({ model, context: CONTEXT, options: { reasoning: Effort.High } }, () => undefined);
 		expect(warmer.status).toMatchObject({ state: "inactive", reason: "request cannot be replayed safely" });
 		expect(streamCalls).toBe(0);
 	});
@@ -725,7 +737,7 @@ describe("cache warmer preserves real Responses accounting", () => {
 							serviceTier: scenario.servedTier ? "flex" : undefined,
 						},
 					},
-					() => true,
+					() => undefined,
 				);
 				await advanceWarmTimer();
 				const refresh = await ended.promise;
@@ -743,6 +755,28 @@ describe("cache warmer preserves real Responses accounting", () => {
 			},
 		);
 	}
+
+	test("retains billed usage and cost from a failed Responses replay", async () => {
+		const h = createResponsesPayloadHarness({}, undefined, "failed");
+		await advanceWarmTimer();
+		const ended = await h.ended;
+		await h.warmer.drain();
+		expect(h.bodies).toHaveLength(1);
+		expect(h.warmed).toHaveLength(1);
+		expect(h.warmed[0]).toMatchObject({
+			extensionOverride: false,
+			message: {
+				provider: "openai",
+				model: h.request.model.id,
+				stopReason: "error",
+				usage: { input: 0, output: 0, cacheRead: 6000, cacheWrite: 0, totalTokens: 6000 },
+			},
+		});
+		expect(h.warmed[0]?.message.usage.cost.total).toBeCloseTo(0.0024, 10);
+		expect(ended.outcome).toBe("error");
+		expect(ended.usage?.cost.total).toBeCloseTo(0.0024, 10);
+		expect(h.warmer.status).toMatchObject({ state: "inactive", reason: "refresh failed" });
+	});
 });
 
 describe("cache warmer admits the final Responses payload", () => {
@@ -889,12 +923,12 @@ describe("cache warmer admits the final Responses payload", () => {
 				return payload;
 			});
 			const h = createResponsesPayloadHarness({ onPayload });
-			if (interruption === "context") h.warmer.start(h.request, () => current);
+			if (interruption === "context") h.warmer.start(h.request, () => (current ? undefined : { kind: "history" }));
 			try {
 				await advanceWarmTimer();
 				await entered.promise;
 				if (interruption === "cancel") h.warmer.cancel();
-				if (interruption === "replace") h.warmer.start(h.request, () => true);
+				if (interruption === "replace") h.warmer.start(h.request, () => undefined);
 				if (interruption === "context") current = false;
 			} finally {
 				release.resolve();

@@ -6,6 +6,7 @@ export function createSessionDefaults() {
 		isDisposed: false,
 		loadDeferredExtensions: async () => {},
 		setActiveToolsByName: async (_toolNames: string[]) => {},
+		getMountedXdevToolNames: () => [],
 		waitForIdle: async () => {},
 		prepareForHeadlessAdvisorDrain: () => {},
 		waitForAdvisorCatchup: async () => true,

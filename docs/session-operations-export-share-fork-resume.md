@@ -36,8 +36,9 @@ This document describes operator-visible behavior for session export, sharing, c
 | `/resume [id\|@claude\|@codex]`         | Interactive slash command    | Yes (active in-memory state replaced)         | Switches to a selected/matched session, or imports a selected foreign session              | None                                                                                |
 | `--resume`                              | CLI startup picker           | Yes after session creation                    | Opens selected existing session file (picker opens in current-folder scope; the global list is preloaded only for the empty-everything early exit and instant Tab switching) | None                |
 | `--resume <id\|path>`                   | CLI startup                  | Yes after session creation                    | Opens existing session; a missing recorded cwd may be re-rooted into the current directory | None                                                                                |
-| `/restart`                              | Interactive slash command    | Yes (process relaunches)                      | Keeps configuration flags; resumes a materialized session, otherwise starts fresh          | None                                                                                |
+| `/restart` | Interactive slash command | Yes (process relaunches) | Keeps configuration flags; restores a materialized session (`--restore`), otherwise starts fresh | None |
 | `--continue`                            | CLI startup                  | Yes after session creation                    | Opens terminal breadcrumb or most-recent session; creates new one if none exists           | None                                                                                |
+| `--restore [id\|path]` | CLI startup | Yes after session creation | Resumes the selected session and restores unfinished turns and eligible subagent runs; interactive only | None |
 
 ## Export and dump
 
@@ -494,7 +495,7 @@ With an argument:
 ### `--resume` (no value)
 
 - `main.ts` uses `SessionManager.listForPicker()` for the current cwd/sessionDir and opens the picker in current-folder scope. When that list is empty it preloads `SessionManager.listAllForPicker()` so a user-initiated Tab switch is immediate; it does not auto-switch scopes. `No sessions found` is printed only when the global picker list is also empty.
-- Selected path is opened with `SessionManager.open(selectedPath)` before session creation; the process/project scope then switches to the resumed session's cwd (`switchToResumedProject`), reloading cwd-scoped settings and plugin caches and re-resolving scoped models.
+- The selected session opens before agent-session creation. Its recorded cwd supplies the project scope when enterable; otherwise the launch cwd remains active. The process reloads scoped settings and plugin caches and re-resolves models. An explicit `--session-dir` remains the live continuation directory; it does not replace the source transcript's recorded cwd.
 
 ### `--resume <value>`
 
@@ -507,12 +508,12 @@ With an argument:
 3. Matching accepts case-insensitive session id prefixes, full JSONL filename prefixes, and the id suffix after the timestamp in `<timestamp>_<sessionId>.jsonl`.
 4. When nothing matches, the resolver (`resolveResumeTarget`) looks in the same scopes for a `<timestamp>_<sessionId>.jsonl` file whose name matches but which no longer reads as a session (the listing skips it), and takes the copy that continues it (see below). Otherwise resolution fails with `Session "<value>" not found.`
 
-Id/filename-prefix discovery follows the session's continuations (`findSessionContinuation`, through `resolveResumeTarget`): when its conversation went on in a sibling file whose header names it in `continuationOf`, the copy with the newest turn opens instead, unless the named session has turns that copy lacks. A notice names both files. Discovery can also recover an unlisted replaced `<timestamp>_<sessionId>.jsonl` through that name's id. Literal path arguments and paths selected from a picker remain exact; they never redirect to a continuation or use a generated filename to replace the selected file's identity.
+Id/filename-prefix discovery follows the session's continuations (`findSessionContinuation`, through `resolveResumeTarget`): when its conversation continued in a sibling file whose header names it in `continuationOf`, the newest copy opens unless the named session has turns that copy lacks. A notice names both files. Discovery can recover an unlisted replaced generated filename through its recorded id. Literal path arguments remain exact. The startup picker first reads the selected file's authoritative session metadata, then can follow a validated continuation; that chosen session supplies both the open path and recorded cwd. The interactive in-session picker retains exact selection.
 
 Id/filename-prefix match behavior (local or global):
 
 - If the matched session's recorded directory no longer exists, CLI asks `Session's directory no longer exists (...). Move (re-root) it into the current directory? [Y/n]`.
-   - On yes (default), `SessionManager.open()` is anchored at the missing source cwd with `initialCwd`, then `manager.moveTo(cwd, sessionDir)` re-roots the existing session without duplicating it.
+   - On yes (default), `SessionManager.openRelocated(session.path, session.cwd, cwd, sessionDir)` re-roots the existing session under the session ownership and publication fences. A live writer refuses the move; the runtime does not duplicate or silently replace its transcript.
    - On no, startup is cancelled. In non-TTY mode, startup fails with an error directing the user to run interactively.
 - If the recorded directory still exists, the matched session is opened directly. Startup later changes the process/project scope to the resumed session's cwd and reloads cwd-scoped settings and plugin caches. It is not implicitly forked.
 
@@ -528,10 +529,16 @@ non-empty header fails closed without modifying or redirecting the file.
 
 `--restore [value]` selects and opens its session exactly as `--resume [value]`
 does, then, once the interactive TUI is up, goes on with what the session's last
-process left unfinished when it died (`task/restore.ts`, `restoreSession`). Tern's
+process left unfinished when it ended (`task/restore.ts`, `restoreSession`). Tern's
 session daemon relaunches omp panes with it after a crash: omp reports
 `omp_restore=1` (OSC 1337 user variable) beside its session file to say it
-understands the flag.
+understands the flag. `/restart` relaunches with it too.
+
+A subagent whose turn the process teardown cut off counts as left mid-turn, even
+though the teardown was clean: its owner's shutdown aborts the run with
+`INTERRUPTED_TURN_ERROR` and records its `session_exit` as a process exit
+(`postmortem.Reason.EXIT`), both for a first run the task executor drives and for
+a revived agent's turn the lifecycle teardown disposes.
 
 1. **Subagents first.** Every persisted subagent transcript under the session
    (`<session>/<AgentId>.jsonl`, nested ones included) that its process left
@@ -542,12 +549,12 @@ understands the flag.
    receives the result as the job's ordinary `async-result`, so a parent waiting on
    that job finds it again.
 2. **Then the session's own turn** (`AgentSession.restoreInterruptedTurn`). A turn
-   cut off without a `session_exit` record (a crash, SIGKILL or power loss records
-   none) is first closed the way exit recovery closes one whose exit was recorded:
-   unfinished tool calls get "outcome unknown" results and an interrupted-turn
-   abort ends it. That turn is then retried as `/retry` does: a batch whose every
-   call was cut off runs again; otherwise the model answers from where the
-   transcript stops.
+   cut off without a `session_exit` record is first closed through exit recovery:
+   unfinished tool calls receive "outcome unknown" results and an interrupted-turn
+   abort ends it. Automatic restoration uses `TurnRecovery.retry({ replayTools: false })`.
+   It preserves those tool/result pairs and resumes model continuation without
+   directly reexecuting cut-off calls, even when the entire tool batch was interrupted.
+   Explicit operator `/retry` retains its deliberate tool-retry behavior.
 
 Repeated or concurrent restoration in one live session does not start another copy
 of the same interrupted turn or child job. Existing running, completed, and failed
@@ -565,7 +572,8 @@ Nothing is continued when the last turn finished, failed, or the user interrupte
 it, or when a normal exit was recorded after it (the user quit with it
 interrupted). `--restore` is interactive only, takes no prompt, and cannot be
 combined with `--continue`, `--fork`, imports, `--goal` or `--no-session`.
-`/restart` drops it like the other one-shot selectors.
+`/restart` drops a launch `--restore` like the other one-shot selectors and adds
+its own for the current session.
 
 ## CLI `--continue`
 
@@ -590,9 +598,11 @@ This is startup-only behavior; there is no interactive `/continue` slash command
 Interactive `/restart` performs normal teardown, flushes postmortem cleanup and
 stdout, then relaunches the CLI. `restartArgv()` preserves launch configuration
 flags but strips original prompts/`@file` positionals and one-shot session
-selectors (`--session`, `--resume`, `--continue`, `--fork`, and foreign imports).
-It adds `--resume <current-id>` only when the session actually exists on disk;
-an in-memory or never-materialized session restarts fresh.
+selectors (`--session`, `--resume`, `--restore`, `--continue`, `--fork`, and
+foreign imports). It adds `--restore <session-file>` only when the session
+actually exists on disk, so the subagents the teardown cut off mid-turn go on in
+the new process (see [CLI `--restore`](#cli---restore)); an in-memory or
+never-materialized session restarts fresh.
 
 Restart preserves the live cwd, current session directory, and resolved overlay
 and managed configuration paths. Relative startup flags cannot redirect these

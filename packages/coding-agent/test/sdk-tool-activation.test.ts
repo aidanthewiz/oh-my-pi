@@ -1336,22 +1336,26 @@ describe("createAgentSession defaultInactive tool activation", () => {
 
 	it("releases a timed-out activation so later lifecycle registrations can proceed", async () => {
 		const tempDir = makeTempDir();
+		const recoveryFile = path.join(tempDir, "activation-recovery.txt");
+		let registrationName: string | undefined;
+		const stalledActivation = Promise.withResolvers<AbortSignal>();
 		const registrationExtension: ExtensionFactory = pi => {
-			for (const name of ["stalled_registration_tool", "recovered_registration_tool"]) {
-				pi.on("session_start", async () => {
-					await Promise.resolve();
-					pi.registerTool({
-						name,
-						label: name,
-						description: `${name} lifecycle tool.`,
-						parameters: type({}),
-						loadMode: "essential",
-						async execute() {
-							return { content: [{ type: "text", text: name }] };
-						},
-					});
+			pi.on("session_start", async () => {
+				const name = registrationName;
+				if (!name) return;
+				await Promise.resolve();
+				pi.registerTool({
+					name,
+					label: name,
+					description: `${name} lifecycle tool.`,
+					parameters: type({}),
+					loadMode: "essential",
+					async execute() {
+						fs.writeFileSync(recoveryFile, name, "utf8");
+						return { content: [{ type: "text", text: name }] };
+					},
 				});
-			}
+			});
 		};
 		const { session } = await createAgentSession({
 			...baseOptions(tempDir),
@@ -1359,32 +1363,41 @@ describe("createAgentSession defaultInactive tool activation", () => {
 		});
 
 		try {
+			await initializeExtensions(session, {
+				reportSendError: vi.fn(),
+				reportRuntimeError: vi.fn(),
+			});
+			registrationName = "stalled_registration_tool";
 			const originalSetPresentation = session.setActiveToolPresentation.bind(session);
 			vi.spyOn(session, "setActiveToolPresentation")
-				.mockImplementationOnce((_toolNames, _mountedToolNames, _forcePromptRefresh, signal) =>
-					untilAborted(signal, Promise.withResolvers<void>().promise),
-				)
+				.mockImplementationOnce((_toolNames, _mountedToolNames, _forcePromptRefresh, signal) => {
+					if (!signal) throw new Error("Missing activation cancellation signal");
+					stalledActivation.resolve(signal);
+					return untilAborted(signal, Promise.withResolvers<void>().promise);
+				})
 				.mockImplementation(originalSetPresentation);
 			const runner = session.extensionRunner;
 			if (!runner) throw new Error("expected extension runner");
 			const errors: string[] = [];
 			const unsubscribe = runner.onError(error => {
-				errors.push(error.error);
-				// The 10ms budget exists only to reap the stalled first handler
-				// quickly; handlers run sequentially and the budget is read per
-				// handler, so restoring it here keeps machine load from timing out
-				// the genuine recovery registration too (flaked in full-suite runs).
+				errors.push(error.event);
 				testSetExtensionHandlerTimeoutMs(EXTENSION_HANDLER_TIMEOUT_MS);
 			});
 			testSetExtensionHandlerTimeoutMs(10);
 
 			await runner.emit({ type: "session_start" });
-			unsubscribe();
 
-			expect(errors).toContain("handler timed out after 10ms");
+			expect((await stalledActivation.promise).aborted).toBe(true);
 			expect(session.getToolByName("stalled_registration_tool")).toBeUndefined();
-			expect(session.getToolByName("recovered_registration_tool")?.label).toBe("recovered_registration_tool");
+			registrationName = "recovered_registration_tool";
+			await runner.emit({ type: "session_start" });
+			unsubscribe();
+			expect(errors).toEqual(["session_start"]);
 			expect(session.getEnabledToolNames()).toContain("recovered_registration_tool");
+			const recovered = session.getToolByName("recovered_registration_tool");
+			if (!recovered) throw new Error("Recovery lifecycle registration is not callable");
+			await recovered.execute("activation-recovery", {});
+			expect(fs.readFileSync(recoveryFile, "utf8")).toBe("recovered_registration_tool");
 		} finally {
 			await session.dispose();
 		}

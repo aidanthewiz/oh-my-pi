@@ -1288,9 +1288,8 @@ export async function runUpdateCommand(opts: { force: boolean; check: boolean })
 	const ompPath = resolveOmpPath();
 	const manager = ompPath ? await managedInstallName(ompPath) : undefined;
 	if (manager) {
-		console.log(
-			chalk.yellow(`${ompPath} is installed and kept up to date by ${manager}; update it from ${manager}.`),
-		);
+		const reason = `${ompPath} is installed and kept up to date by ${manager}; update it from ${manager}.`;
+		console.log(chalk.yellow(reason));
 		return;
 	}
 	console.log(chalk.dim(`Current version: ${CF_VERSION}`));

@@ -52,7 +52,7 @@ type AnyFn = (...args: never[]) => unknown;
 /** Partial at every depth; function members keep their exact signature. */
 export type Deep<T> = T extends AnyFn ? T : T extends object ? { [K in keyof T]?: Deep<T[K]> } : T;
 
-export type ContextOverrides = Deep<InteractiveModeContext>;
+export type ContextOverrides = Omit<Deep<InteractiveModeContext>, "viewSession"> & { viewSession?: Deep<AgentSession> };
 export type SessionOverrides = Deep<AgentSession>;
 export type McpManagerOverrides = Deep<MCPManager>;
 
@@ -249,6 +249,10 @@ export function createInteractiveModeContext(overrides: ContextOverrides = {}): 
 		},
 		sessionManager,
 		focusedAgentId: undefined,
+		collabGuest: undefined as InteractiveModeContext["collabGuest"],
+		setCollabGuest(guest: InteractiveModeContext["collabGuest"]) {
+			Object.assign(this, { collabGuest: guest });
+		},
 		settings: contextSettings,
 		mcpManager: undefined,
 		oauthManualInput: new OAuthManualInputManager(),

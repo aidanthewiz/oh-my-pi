@@ -57,7 +57,6 @@ const mode = new InteractiveMode(
 	undefined,
 	undefined,
 	undefined,
-	undefined,
 	new Composer({ terminal: new VirtualTerminal() }),
 );
 const errors: string[] = [];

@@ -1,8 +1,13 @@
 import * as path from "node:path";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { pathToFileURL } from "node:url";
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from "bun:test";
 import { SvgFigure } from "@oh-my-pi/pi-tui/chat/svg-figure";
 import { Markdown } from "@oh-my-pi/pi-tui/components/markdown";
 import { getKittyGraphics, setKittyGraphics } from "@oh-my-pi/pi-tui/kitty-graphics";
+import { getNativeBlob } from "@oh-my-pi/pi-tui/native/blobs";
+import type { DescribeContext } from "@oh-my-pi/pi-tui/native/node";
 import {
 	type CellDimensions,
 	getCellDimensions,
@@ -71,6 +76,57 @@ describe("SvgFigure", () => {
 		setTerminalImageProtocol(originalProtocol);
 		setCellDimensions(originalCell);
 		setKittyGraphics(originalGraphics);
+	});
+
+	it("keeps file and network SVG resources out of native image blobs while rendering inline data", async () => {
+		const dir = await mkdtemp(path.join(tmpdir(), "svg-native-authority-"));
+		const marker =
+			'<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"><rect width="8" height="8" fill="#f00"/></svg>';
+		const file = path.join(dir, "marker.svg");
+		let requests = 0;
+		const server = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch() {
+				requests++;
+				return new Response(marker, { headers: { "Content-Type": "image/svg+xml" } });
+			},
+		});
+		const cx: DescribeContext = {
+			cols: 32,
+			reduceMotion: true,
+			dark: true,
+			supports: () => true,
+			feature: () => true,
+		};
+		const raster = async (source?: string): Promise<Uint8Array> => {
+			const landed = Promise.withResolvers<void>();
+			const svg = new SvgFigure({ maxRows: () => 4, onChange: () => landed.resolve() });
+			const image = source ? `<image href="${source}" width="8" height="8"/>` : "";
+			svg.update(`<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8">${image}</svg>`, true);
+			try {
+				svg.describe(cx);
+				await landed.promise;
+				const node = svg.describe(cx);
+				const id = node.p && "blob" in node.p ? node.p.blob : undefined;
+				const blob = getNativeBlob(String(id));
+				if (!blob || blob.mime !== "image/png") throw new Error("Expected rasterized native PNG");
+				return blob.bytes;
+			} finally {
+				svg.dispose();
+			}
+		};
+		try {
+			await Bun.write(file, marker);
+			const empty = await raster();
+			expect(await raster(`data:image/svg+xml;base64,${Buffer.from(marker).toString("base64")}`)).not.toEqual(empty);
+			expect(await raster(pathToFileURL(file).href)).toEqual(empty);
+			expect(await raster(`${server.url}marker.svg`)).toEqual(empty);
+			expect(requests).toBe(0);
+		} finally {
+			await server.stop(true);
+			await rm(dir, { recursive: true, force: true });
+		}
 	});
 
 	// Regression: a 1886 px raster was placed over 117 cells (1872 px), so the

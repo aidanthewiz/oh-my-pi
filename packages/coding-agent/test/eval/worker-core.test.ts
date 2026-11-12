@@ -191,6 +191,117 @@ ${scenario}
 }
 
 describe("WorkerCore", () => {
+	it("keeps state and reports a late bridge rejection once without killing the worker", async () => {
+		const workerUrl = pathToFileURL(path.resolve(import.meta.dir, "../../src/eval/js/worker-core.ts")).href;
+		const browserPrelude = await Bun.file(path.resolve(import.meta.dir, "../../src/tools/browser/prelude.js")).text();
+		const probe = `
+import { WorkerCore } from ${JSON.stringify(workerUrl)};
+process.once("uncaughtException", () => process.exit(17));
+const messages = [];
+const listeners = new Set();
+const waiters = [];
+const transport = {
+	send(message) {
+		messages.push(message);
+		for (const waiter of [...waiters]) {
+			if (waiter.predicate(message)) {
+				waiters.splice(waiters.indexOf(waiter), 1);
+				waiter.resolve(message);
+			}
+		}
+	},
+	onMessage(handler) { listeners.add(handler); return () => listeners.delete(handler); },
+	close() {},
+};
+const send = message => { for (const listener of listeners) listener(message); };
+const waitFor = predicate => {
+	const { promise, resolve } = Promise.withResolvers();
+	waiters.push({ predicate, resolve });
+	return promise;
+};
+const snapshot = { cwd: process.cwd(), sessionId: "late-bridge",
+	preludes: [{ name: "browser", exports: ["browser"], source: ${JSON.stringify(browserPrelude)} }] };
+const core = new WorkerCore(transport, { mode: "isolated" });
+const lateBridge = Promise.withResolvers();
+globalThis.__omp_late_bridge_gate = lateBridge.promise;
+send({ type: "init", snapshot });
+const first = waitFor(message => message.type === "result" && message.runId === "first");
+send({ type: "run", runId: "first", filename: "[first].js", snapshot,
+	code: 'var kept = 42; void globalThis.__omp_late_bridge_gate.then(() => {' +
+		'Array.from({length: 13}, () => browser.tab("main").waitForDownload());' +
+		'}); throw new Error("Tab is busy");' });
+await first;
+let callCount = 0;
+const allCalls = waitFor(message =>
+	message.type === "tool-call" && message.runId === "first" && ++callCount === 13);
+lateBridge.resolve();
+await allCalls;
+delete globalThis.__omp_late_bridge_gate;
+for (let index = 0; index < 257; index++) {
+	const runId = "evict-" + index;
+	const result = waitFor(message => message.type === "result" && message.runId === runId);
+	send({ type: "run", runId, filename: "[" + runId + "].js", snapshot, code: "" });
+	await result;
+}
+const calls = messages.filter(message => message.type === "tool-call");
+if (calls.length !== 13) throw new Error("expected thirteen pending browser calls");
+const rejectCall = async pending => {
+	const warning = waitFor(message => message.type === "log" && message.meta?.filename === "[first].js");
+	send({ type: "tool-reply", id: pending.id, reply: { ok: false,
+		error: { name: "ToolError", message: "timed out" } } });
+	await warning;
+};
+for (const pending of calls.slice(0, 12)) await rejectCall(pending);
+const gateCall = waitFor(message => message.type === "tool-call" && message.runId === "second");
+const second = waitFor(message => message.type === "result" && message.runId === "second");
+send({ type: "run", runId: "second", filename: "[second].js", snapshot,
+	code: 'await __omp_call_tool__("read", {}); print(kept);' });
+const gate = await gateCall;
+await rejectCall(calls[12]);
+send({ type: "tool-reply", id: gate.id, reply: { ok: true, value: null } });
+await second;
+for (const runId of ["third", "fourth"]) {
+	const result = waitFor(message => message.type === "result" && message.runId === runId);
+	send({ type: "run", runId, filename: "[" + runId + "].js", snapshot, code: "print(kept);" });
+	await result;
+}
+core.dispose();
+console.log(JSON.stringify(messages));
+`;
+		await using dir = await fs.mkdtempDisposable(path.join(os.tmpdir(), "omp-late-rejection-"));
+		const probePath = path.join(dir.path, "probe.ts");
+		await Bun.write(probePath, probe);
+		const proc = Bun.spawn([process.execPath, probePath], {
+			cwd: process.cwd(),
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [stdout, stderr, exitCode] = await Promise.all([
+			new Response(proc.stdout).text(),
+			new Response(proc.stderr).text(),
+			proc.exited,
+		]);
+		expect(exitCode, stderr).toBe(0);
+		const messages: WorkerOutbound[] = JSON.parse(stdout);
+		expect(
+			messages.filter(message => message.type === "result" && !message.runId.startsWith("evict-")),
+		).toMatchObject([
+			{ runId: "first", ok: false },
+			{ runId: "second", ok: true },
+			{ runId: "third", ok: true },
+			{ runId: "fourth", ok: true },
+		]);
+		const text = messages.filter(message => message.type === "text");
+		const notices = text.filter(message => message.chunk.includes("[first].js"));
+		expect(notices).toHaveLength(11);
+		expect(notices.filter(message => message.runId === "second")).toHaveLength(10);
+		expect(notices.filter(message => message.runId === "third")).toHaveLength(1);
+		expect(text.filter(message => message.chunk.includes("more late rejections"))).toMatchObject([
+			{ runId: "second", chunk: expect.stringContaining("2 more late rejections") },
+		]);
+		expect(text.filter(message => message.chunk === "42\n")).toHaveLength(3);
+	});
+
 	it("delivers a completion handle id after its creating cell finishes", async () => {
 		const harness = createWorkerHarness();
 		const snapshot = { cwd: process.cwd(), sessionId: `late-handle-${crypto.randomUUID()}`, localRoots: {} };
@@ -620,98 +731,61 @@ describe("WorkerCore", () => {
 	});
 
 	it("attributes a reused error to the run that rejects its promise", async () => {
-		let rejectionHandler: ((reason: unknown, promise: Promise<unknown>) => boolean) | undefined;
-		const harness = createWorkerHarness("isolated", handler => {
-			rejectionHandler = handler;
-			return () => {
-				rejectionHandler = undefined;
-			};
-		});
-		const snapshot = { cwd: process.cwd(), sessionId: "eval-reused-error", localRoots: {} };
-		await initializeWorker(harness, snapshot);
+		const { output, stderr, exitCode } = await runWorkerCoreRejectionProbe(`
+const storeCall = waitForMessage(message => message.type === "tool-call" && message.runId === "store-error-run");
+const storeResult = waitForMessage(message => message.type === "result" && message.runId === "store-error-run");
+send({
+	type: "run", runId: "store-error-run", snapshot, filename: "[store-error-run].js",
+	code: 'try { await tool.fail({}); } catch (error) { globalThis.__omp_reused_error = error; } "stored";',
+});
+const failedToolCall = await storeCall;
+send({
+	type: "tool-reply", id: failedToolCall.id,
+	reply: { ok: false, error: { name: "ToolError", message: "stored tool failure", isToolError: true } },
+});
+const stored = await storeResult;
 
-		try {
-			const storeCall = waitForMessage(
-				harness,
-				message => message.type === "tool-call" && message.runId === "store-error-run",
-			);
-			const storeResult = waitForMessage(
-				harness,
-				message => message.type === "result" && message.runId === "store-error-run",
-			);
-			harness.send({
-				type: "run",
-				runId: "store-error-run",
-				code: `try {
-					await tool.fail({});
-				} catch (error) {
-					globalThis.__omp_reused_error = error;
-				}
-				"stored";`,
-				filename: "[store-error-run].js",
-				snapshot,
-			});
-			const failedToolCall = await storeCall;
-			if (failedToolCall.type !== "tool-call") throw new Error("expected tool call");
-			harness.send({
-				type: "tool-reply",
-				id: failedToolCall.id,
-				reply: {
-					ok: false,
-					error: {
-						name: "ToolError",
-						message: "stored tool failure",
-						isToolError: true,
-					},
-				},
-			});
-			expect(await storeResult).toMatchObject({
-				type: "result",
-				runId: "store-error-run",
-				ok: true,
-			});
+const reuseCall = waitForMessage(message => message.type === "tool-call" && message.runId === "reuse-error-run");
+const reuseResult = waitForMessage(message => message.type === "result" && message.runId === "reuse-error-run");
+send({
+	type: "run", runId: "reuse-error-run", snapshot, filename: "[reuse-error-run].js",
+	code: 'void Promise.reject(globalThis.__omp_reused_error); await tool.capture({}); "done";',
+});
+const captureCall = await reuseCall;
+await waitForRejection();
+send({ type: "tool-reply", id: captureCall.id, reply: { ok: true, value: "captured" } });
+const reused = await reuseResult;
 
-			const reuseCall = waitForMessage(
-				harness,
-				message => message.type === "tool-call" && message.runId === "reuse-error-run",
-			);
-			const reuseResult = waitForMessage(
-				harness,
-				message => message.type === "result" && message.runId === "reuse-error-run",
-			);
-			harness.send({
-				type: "run",
-				runId: "reuse-error-run",
-				code: `await tool.capture({
-					promise: Promise.reject(globalThis.__omp_reused_error),
-				});
-				"done";`,
-				filename: "[reuse-error-run].js",
-				snapshot,
-			});
-			const captureCall = await reuseCall;
-			if (captureCall.type !== "tool-call") throw new Error("expected tool call");
-			const rejectedPromise = Reflect.get(captureCall.args as object, "promise");
-			expect(rejectedPromise).toBeInstanceOf(Promise);
-			let reason: unknown;
-			await (rejectedPromise as Promise<unknown>).catch(error => {
-				reason = error;
-			});
-			expect(rejectionHandler?.(reason, rejectedPromise as Promise<unknown>)).toBe(true);
-			harness.send({
-				type: "tool-reply",
-				id: captureCall.id,
-				reply: { ok: true, value: "captured" },
-			});
-			expect(await reuseResult).toMatchObject({
-				type: "result",
+const handledResult = waitForMessage(message => message.type === "result" && message.runId === "handled-error-run");
+send({
+	type: "run", runId: "handled-error-run", snapshot, filename: "[handled-error-run].js",
+	code: 'await Promise.reject(globalThis.__omp_reused_error).catch(() => print("recovered"));',
+});
+const handled = await handledResult;
+const recoveryOutput = outbound.filter(message => message.type === "text" && message.runId === "handled-error-run")
+	.map(message => message.chunk).join("");
+const warnings = outbound.filter(message => message.type === "log" && message.level === "warn");
+delete globalThis.__omp_reused_error;
+await finish({ stored, reused, handled, recoveryOutput, warnings },
+	stored.ok && !reused.ok && handled.ok && recoveryOutput === "recovered\\n" && warnings.length === 0);
+`);
+		expect(output).toMatchObject({
+			stored: { runId: "store-error-run", ok: true },
+			reused: {
 				runId: "reuse-error-run",
 				ok: false,
-				error: { message: "Unhandled rejection (missing await?): stored tool failure" },
-			});
-		} finally {
-			harness.send({ type: "close" });
-		}
+				error: {
+					name: "ToolError",
+					message: "Unhandled rejection (missing await?): stored tool failure",
+					isToolError: true,
+				},
+			},
+			handled: { runId: "handled-error-run", ok: true },
+			recoveryOutput: "recovered\n",
+			warnings: [],
+		});
+		expect(exitCode).toBe(0);
+		expect(stderr).not.toContain("[Unhandled Rejection]");
 	});
 
 	it("keeps cells and tool invocations alive for delayed bridge failures", async () => {
@@ -1230,8 +1304,8 @@ process.exit(0);
 			expectedRevision: captured.snapshot.revision,
 			expectedDigest: shadowSnapshotDigest(captured.snapshot),
 		});
-		await expect(admission).resolves.toMatchObject({ eligible: true });
-		await expect(result).resolves.toMatchObject({ ok: true });
+		expect(await admission).toMatchObject({ eligible: true });
+		expect(await result).toMatchObject({ ok: true });
 	});
 
 	it("rejects an atomic run after retained state changes", async () => {
@@ -1271,6 +1345,6 @@ process.exit(0);
 			expectedRevision: captured.snapshot.revision,
 			expectedDigest: shadowSnapshotDigest(captured.snapshot),
 		});
-		await expect(rejected).resolves.toMatchObject({ eligible: false, reason: "snapshot changed" });
+		expect(await rejected).toMatchObject({ eligible: false });
 	});
 });

@@ -328,6 +328,37 @@ describe("OMP-owned browser evaluation", () => {
 		},
 		45_000,
 	);
+	it.skipIf(!CHROMIUM_AVAILABLE)(
+		"refuses a concurrent run without dispatching its page mutation",
+		async () => {
+			const browser = headless();
+			const name = `parallel-calls-${process.pid}`;
+			const session = {
+				cwd: process.cwd(),
+				hasUI: false,
+				settings: Settings.isolated(),
+				getSessionFile: () => null,
+			} as unknown as ToolSession;
+			try {
+				await acquireTab(name, browser, { url: `data:text/html,<title>${name}</title>`, timeoutMs: 30_000 });
+				const results = await Promise.allSettled([
+					runInTab(name, { code: "return await page.title();", timeoutMs: 10_000, session }),
+					runInTab(name, {
+						code: "await page.evaluate(() => { document.title = 'changed'; });",
+						timeoutMs: 10_000,
+						session,
+					}),
+				]);
+				expect(results[0]).toMatchObject({ status: "fulfilled", value: { returnValue: name } });
+				expect(results[1]?.status).toBe("rejected");
+				const result = await runInTab(name, { code: "return await page.title();", timeoutMs: 10_000, session });
+				expect(result.returnValue).toBe(name);
+			} finally {
+				await releaseTab(name, { kill: true });
+			}
+		},
+		45_000,
+	);
 });
 
 describe("OMP-owned browser input", () => {
@@ -825,7 +856,7 @@ describe("browser tabs whose renderer crashed", () => {
 				await userPage.goto(url);
 				// A connected tab: closing it leaves the page there for a reattach to find.
 				const connected = await acquireBrowser(
-					{ kind: "connected", cdpUrl: `http://${new URL(launched.browser.wsEndpoint()).host}` },
+					{ kind: "connected", cdpUrl: `http://${new URL(launched.wsEndpoint).host}` },
 					{ cwd: process.cwd() },
 				);
 				await acquireTab(name, connected, { target: url, timeoutMs: 30_000 });

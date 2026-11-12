@@ -10,7 +10,6 @@ import {
 	type SessionStorageWriteOptions,
 	type WriteTextAtomicOptions,
 } from "./session-storage";
-import { isAssistantMessageLine } from "./session-entries";
 import { enoent } from "./session-storage-errors";
 import {
 	overlayTitleSlotContent,
@@ -357,11 +356,10 @@ export class IndexedSessionStorage implements SessionStorage {
 		return [title ? overlayTitleSlotPrefix(prefix, prefixLimit, title) : prefix, suffix];
 	}
 
-	async hasAssistantTurn(path: string): Promise<boolean> {
+	async scanLines(path: string, visit: (line: string) => boolean): Promise<void> {
 		for (const line of (await this.readText(path)).split("\n")) {
-			if (isAssistantMessageLine(line)) return true;
+			if (visit(line)) return;
 		}
-		return false;
 	}
 
 	async writeText(path: string, content: string): Promise<void> {

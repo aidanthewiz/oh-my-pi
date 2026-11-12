@@ -4,6 +4,8 @@ import * as os from "node:os";
 import path from "node:path";
 import { unregisterCustomApis } from "@oh-my-pi/pi-ai/api-registry";
 import { createMockModel, registerMockApi } from "@oh-my-pi/pi-ai/providers/mock";
+import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { closeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
 import {
 	disableProvider,
@@ -17,6 +19,7 @@ import { getBundledAgent } from "@oh-my-pi/pi-coding-agent/task/agents";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import type { AgentCompactionThresholdOverride } from "@oh-my-pi/pi-coding-agent/config/compaction-threshold";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { ExtensionRuntime } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import {
 	artifactsDirsFromRegistry,
 	resetRegisteredArtifactDirsForTests,
@@ -25,6 +28,9 @@ import * as planHandoff from "@oh-my-pi/pi-coding-agent/plan-mode/plan-handoff";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
+import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
+import type { AgentSession, AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 
 import { TaskTool } from "@oh-my-pi/pi-coding-agent/task";
 import * as discoveryModule from "@oh-my-pi/pi-coding-agent/task/discovery";
@@ -43,6 +49,7 @@ import type { SingleResult, TaskParams } from "@oh-my-pi/pi-tui/tools/task";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { __resetDirsFromEnvForTests, removeWithRetries, setAgentDir } from "@oh-my-pi/pi-utils";
 import { createInMemoryAuthStorage } from "../helpers/agent-session-setup";
+import { createSessionDefaults } from "../helpers/session-defaults";
 
 import { cfgRetryModelFallback } from "@oh-my-pi/pi-coding-agent/session/settings";
 import { cfgTaskAgentModelOverrides, cfgTaskEnableEffort } from "@oh-my-pi/pi-coding-agent/task/settings";
@@ -591,6 +598,83 @@ describe("structured subagent primitive", () => {
 		expect(dispatched[0]?.inheritedSessionAgents).toEqual([inheritedAgent]);
 		await fs.rm(settled.artifactsDir, { recursive: true, force: true });
 	});
+	it("starts a level-tagged agent at its tagged effort and other agents at the capped hint", async () => {
+		const model = buildModel({
+			id: "effort-target",
+			name: "Effort Target",
+			api: "openai-responses",
+			provider: "mock",
+			baseUrl: "https://example.com",
+			reasoning: true,
+			thinking: { mode: "budget", efforts: [Effort.Low, Effort.Medium, Effort.High] },
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 128_000,
+			maxTokens: 1024,
+		});
+		const selector = `${model.provider}/${model.id}`;
+		mockDiscovery({ ...AGENT, model: [selector], thinkingLevel: Effort.High });
+		const tagged: AgentDefinition = { ...AGENT, name: "m1", model: [`${selector}:high`], thinkingLevel: Effort.High };
+		const untagged: AgentDefinition = { ...AGENT, name: "m2", model: [selector], thinkingLevel: Effort.Medium };
+		const settings = Settings.isolated({ "task.maxEffort": "low", "task.isolation.enabled": false });
+		const parent = Object.assign(session({ settings, sessionAgents: [tagged, untagged] }), {
+			modelRegistry: { authStorage: {}, refresh: async () => {}, getAvailable: () => [model] },
+			getApiKey: async () => "test-key",
+		});
+		const create = vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async () => {
+			const listeners: Array<(event: AgentSessionEvent) => void> = [];
+			let disposed = false;
+			const child = {
+				...createSessionDefaults(),
+				get isDisposed() {
+					return disposed;
+				},
+				dispose: async () => {
+					disposed = true;
+				},
+				state: { messages: [] },
+				agent: { state: { systemPrompt: ["test"] } },
+				sessionManager: { appendSessionInit: () => {} },
+				getActiveToolNames: () => ["read", "yield"],
+				getEnabledToolNames: () => ["read", "yield"],
+				subscribe: (listener: (event: AgentSessionEvent) => void) => {
+					listeners.push(listener);
+					return () => {};
+				},
+				prompt: async () => {
+					for (const listener of listeners) {
+						listener({
+							type: "tool_execution_end",
+							toolCallId: "yield",
+							toolName: "yield",
+							result: { content: [], details: { status: "success", data: { agent: true } } },
+							isError: false,
+						});
+					}
+					return true;
+				},
+			} as unknown as AgentSession;
+			return {
+				session: child,
+				captureOwnerCurrent: () => () => !child.isDisposed,
+				captureOwnerLifetimeCurrent: () => () => !child.isDisposed,
+				extensionsResult: { extensions: [], errors: [], runtime: new ExtensionRuntime() },
+				setToolUIContext: () => {},
+				eventBus: new EventBus(),
+			};
+		});
+
+		for (const agent of ["m1", "m2", "worker"]) {
+			await runStructuredSubagent(request({ session: parent, agent, effort: "hi" }));
+		}
+
+		expect(create.mock.calls.map(([options]) => options?.thinkingLevel)).toEqual([
+			Effort.High,
+			Effort.Low,
+			Effort.Low,
+		]);
+		expect(create.mock.calls[0]?.[0]?.thinkingLevelCeiling).toBeUndefined();
+	});
 	it("holds the parent on an inline child until it settles, but not on a detached one", async () => {
 		mockDiscovery();
 		const awaits = AgentRegistry.global().awaits;
@@ -833,7 +917,7 @@ describe("structured subagent primitive", () => {
 		expect(dispatch).not.toHaveBeenCalled();
 	});
 
-	it("returns a prose answer in one turn when structured task results are disabled", async () => {
+	it("delivers literal inline instructions without escape decoding or yield reminders when unstructured", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-unstructured-forwarding-"));
 		const cwd = path.join(root, "project");
 		await fs.mkdir(cwd, { recursive: true });
@@ -842,6 +926,7 @@ describe("structured subagent primitive", () => {
 		const sourceId = "structured-subagent-unstructured-regression";
 		registerMockApi(sourceId);
 		const report = "The direct answer is complete without a yield call.";
+		const assignment = String.raw`Keep literal \n, \u0041, and C:\tmp\source intact.`;
 		const model = createMockModel({
 			id: "structured-subagent-unstructured",
 			handler: () => ({ content: [report] }),
@@ -864,24 +949,31 @@ describe("structured subagent primitive", () => {
 			enableIrc: false,
 		});
 		const agentId = "UnstructuredForwarding";
-		let artifactsDir: string | undefined;
+		const task = await TaskTool.create(parentSession);
 
 		try {
-			const settled = await runStructuredSubagent(
-				request({
-					session: parentSession,
-					structured: false,
-					identity: { id: agentId },
-					keepAlive: false,
-				}),
-			);
-			artifactsDir = settled.artifactsDir;
+			const settled = await task.execute("literal-inline-task", {
+				agent: "worker",
+				name: agentId,
+				task: assignment,
+				solutionSpace: "one literal handoff",
+			});
+			const delivered = settled.details?.results[0];
+			const user = model.calls[0]?.context.messages.find(message => message.role === "user");
+			const received =
+				typeof user?.content === "string"
+					? user.content
+					: user?.content
+							.filter(part => part.type === "text")
+							.map(part => part.text)
+							.join("\n");
+			expect(received).toContain(assignment);
 
 			expect(model.calls).toHaveLength(1);
 			expect(model.calls[0]?.context.tools?.some(tool => tool.name === "yield") ?? false).toBe(false);
-			expect(settled.result.exitCode).toBe(0);
-			expect(settled.result.output).toBe(report);
-			expect(settled.result.structuredOutput).toBeUndefined();
+			expect(delivered?.exitCode).toBe(0);
+			expect(delivered?.output).toBe(report);
+			expect(delivered?.structuredOutput).toBeUndefined();
 		} finally {
 			const ref = AgentRegistry.global().get(agentId);
 			try {
@@ -889,7 +981,6 @@ describe("structured subagent primitive", () => {
 			} finally {
 				try {
 					AgentRegistry.global().unregister(agentId);
-					if (artifactsDir) await fs.rm(artifactsDir, { recursive: true, force: true });
 				} finally {
 					unregisterCustomApis(sourceId);
 					await authStorage.close();
@@ -1175,6 +1266,69 @@ describe("structured subagent primitive", () => {
 		await fs.rm(nonPlanRun.artifactsDir, { recursive: true, force: true });
 		await fs.rm(mcpDisabledRun.artifactsDir, { recursive: true, force: true });
 		await fs.rm(restrictedRun.artifactsDir, { recursive: true, force: true });
+	});
+
+	it("keeps nothing of the spawning session alive in what a parked child retains", async () => {
+		// A parked child keeps its spawn options (its revive capture) for as long as it can be
+		// revived. Nothing in them may hold the session that spawned it: a lead whose lanes spawn
+		// reviewers would otherwise keep every finished lane in memory.
+		mockDiscovery();
+		const roots = { explicit: [], mode: "merge" as const, configured: [], configuredLevel: "user" as const };
+		const extensionRoots = () => roots;
+		// createAgentSession gives every tool session its own protocol options; the fallback
+		// built from a bare test session would close over that session.
+		const localProtocolOptions = { getArtifactsDir: () => null, getSessionId: () => null };
+		const descriptor = {
+			name: "review_echo",
+			description: "Echo a review note.",
+			parameters: { type: "object", properties: {} },
+			language: "python" as const,
+		};
+		// What the executor carries past the run; these four end with it.
+		const runScoped = new Set(["onProgress", "onToolResult", "onCleanupDeferred", "signal"]);
+		const kept: Array<Partial<executorModule.ExecutorOptions>> = [];
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async executorOptions => {
+			kept.push(Object.fromEntries(Object.entries(executorOptions).filter(([key]) => !runScoped.has(key))));
+			return result();
+		});
+		const spawners: WeakRef<ToolSession>[] = [];
+		const spawn = async (): Promise<void> => {
+			const parent = session();
+			Object.assign(parent, { effectiveExtensionRoots: extensionRoots, localProtocolOptions });
+			spawners.push(new WeakRef(parent));
+			const customTools = createEvalCustomTools(parent, [descriptor]);
+			const run = await runStructuredSubagent(request({ session: parent, customTools, retainArtifacts: true }));
+			await fs.rm(run.artifactsDir, { recursive: true, force: true });
+		};
+		for (let i = 0; i < 3; i++) await spawn();
+		// The spy's call log holds each run's whole options; keep only `kept`.
+		vi.restoreAllMocks();
+		// A WeakRef target read in a job stays alive until that job ends: yield, collect, then read.
+		const alive = () => spawners.filter(ref => ref.deref() !== undefined).length;
+		let remaining = alive();
+		for (let i = 0; i < 10 && remaining > 0; i++) {
+			const turn = Promise.withResolvers<void>();
+			setImmediate(turn.resolve);
+			await turn.promise;
+			Bun.gc(true);
+			remaining = alive();
+		}
+
+		expect(kept).toHaveLength(3);
+		for (const options of kept) {
+			expect(options.extensionRoots?.()).toBe(roots);
+			expect(options.customTools?.map(tool => tool.name)).toEqual(["review_echo"]);
+		}
+		expect(remaining).toBe(0);
+		// With its spawner gone, the child's kernel-defined tool reports itself unavailable.
+		const tool = kept[0]!.customTools![0]!;
+		const outcome = await tool.execute("call-1", {}, undefined, undefined as never, undefined);
+		expect(outcome.content).toEqual([
+			{
+				type: "text",
+				text: expect.stringContaining('The session whose python kernel defined "review_echo" has ended.'),
+			},
+		]);
 	});
 
 	it("unregisters and removes a temporary lease when output ID allocation fails", async () => {
@@ -1660,6 +1814,46 @@ describe("per-call model preflight", () => {
 		expect(policy.modelOverride).toEqual(["mock/agent-own"]);
 		expect(policy.perCallModelGrants).toBeUndefined();
 		expect(policy.parentActiveModelPattern).toBe("mock/parent");
+	});
+
+	it("rejects a per-call model for a level-tagged agent, even its own selector", async () => {
+		mockDiscovery();
+		const tagged: AgentDefinition = { ...AGENT, name: "m1", model: ["mock/target:high"], thinkingLevel: Effort.High };
+		const taggedSession = Object.assign(perCallSession({ "task.perCallModel": "on", "task.maxEffort": "low" }), {
+			getSessionAgents: () => [tagged],
+		});
+		const error = await resolveEffectiveSubagentPolicy(
+			request({ session: taggedSession, agent: "m1", perCallModel: "mock/target:high" }),
+		).catch((cause: unknown) => cause);
+		expect(error).toBeInstanceOf(StructuredSubagentError);
+		expect((error as StructuredSubagentError).kind).toBe("preflight");
+		expect((error as Error).message).toContain('agent "m1"');
+		expect((error as Error).message).toContain("Omit model");
+	});
+
+	it("routes a per-call model for an untagged mention through its own model grant", async () => {
+		mockDiscovery();
+		const untagged: AgentDefinition = { ...AGENT, name: "m2", model: ["mock/target"], thinkingLevel: "auto" };
+		const untaggedSession = Object.assign(perCallSession({ "task.perCallModel": "on" }), {
+			getSessionAgents: () => [untagged],
+		});
+		const policy = await resolveEffectiveSubagentPolicy(
+			request({ session: untaggedSession, agent: "m2", perCallModel: "mock/target:low" }),
+		);
+		expect(policy.modelOverride).toEqual(["mock/target:low"]);
+	});
+
+	it("treats a discovered agent's frontmatter level as its own, not a user tag", async () => {
+		mockDiscovery({ ...AGENT, name: "m1", source: "project", thinkingLevel: Effort.High });
+		const tagged: AgentDefinition = { ...AGENT, name: "m1", model: ["mock/target:high"], thinkingLevel: Effort.High };
+		const shadowedSession = Object.assign(
+			perCallSession({ "task.perCallModel": "on", modelRoles: { review: "mock/target" } }),
+			{ getSessionAgents: () => [tagged] },
+		);
+		const policy = await resolveEffectiveSubagentPolicy(
+			request({ session: shadowedSession, agent: "m1", perCallModel: "mock/target:low" }),
+		);
+		expect(policy.modelOverride).toEqual(["mock/target:low"]);
 	});
 
 	describe("an agent shadowing the seance name", () => {

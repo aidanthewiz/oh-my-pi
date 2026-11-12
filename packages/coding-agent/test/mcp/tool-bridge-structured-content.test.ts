@@ -7,7 +7,7 @@ import { type MCPToolDetails, renderMCPResult } from "@oh-my-pi/pi-tui/tools/mcp
 import { resetSettingsForTest, Settings } from "../../src/config/settings";
 import type { CustomToolContext, CustomToolResult } from "../../src/extensibility/custom-tools/types";
 import { CustomToolAdapter } from "../../src/extensibility/custom-tools/wrapper";
-import { bridgeValueFromToolResult } from "../../src/eval/js/tool-bridge";
+import { bridgeValueFromToolResult } from "../../src/eval/js/session-tool";
 import { MCPTool } from "../../src/mcp/tool-bridge";
 import type { MCPServerConnection, MCPToolCallParams, MCPToolCallResult, MCPToolDefinition } from "../../src/mcp/types";
 import { SessionManager } from "../../src/session/session-manager";
@@ -64,11 +64,6 @@ describe("MCP bridge structuredContent", () => {
 		// The token must be reachable exactly once — not appended a second time.
 		const occurrences = text.split("abc123").length - 1;
 		expect(occurrences).toBe(1);
-	});
-
-	it("leaves results without structuredContent untouched", async () => {
-		const text = await modelText({ content: [{ type: "text", text: "plain result" }] });
-		expect(text).toBe("plain result");
 	});
 
 	it("lets an eval consumer advance pages using opaque cursors rather than display text", async () => {

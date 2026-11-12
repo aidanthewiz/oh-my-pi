@@ -14,7 +14,7 @@ import { resolveToCwd } from "../tools/path-utils";
 import { ToolAbortError, throwIfAborted } from "../tools/tool-errors";
 import { isSharedBrowserDaemonName } from "../tools/browser/shared-daemon";
 
-import { cfgLaunchEnabled } from "../tools/settings";
+import { cfgLaunchEnabled, cfgLaunchPersist } from "../tools/settings";
 
 export interface ServiceReady {
 	log?: string;
@@ -242,6 +242,16 @@ export async function serviceLogs(session: ToolSession, name: string, signal?: A
 }
 
 /**
+ * Directory a service process starts in. An absolute path is already resolved —
+ * a hoisted shell `cd /` is the filesystem root — so it must not be passed
+ * through the tool-input alias again. Relative paths still use that alias.
+ */
+function serviceDirectory(cwd: string | undefined, sessionCwd: string): string {
+	const requested = cwd ?? sessionCwd;
+	return path.isAbsolute(requested) ? requested : resolveToCwd(requested, sessionCwd);
+}
+
+/**
  * Start a session-owned daemon and wait for its requested readiness condition.
  * `readyInterrupt` ends only the readiness wait, after the broker acknowledged
  * the launch: the call then resolves `readyInterrupted` with the launched
@@ -277,7 +287,7 @@ export async function startService(
 		application: params.shell.shell,
 		args: [...params.shell.args, `${params.shell.prefix ? `${params.shell.prefix} ` : ""}${params.command}`],
 		env: { ...params.shell.env, ...params.env },
-		cwd: resolveToCwd(params.cwd ?? session.cwd, session.cwd),
+		cwd: serviceDirectory(params.cwd, session.cwd),
 		pty: params.pty ?? true,
 		ready: ready
 			? {
@@ -288,7 +298,7 @@ export async function startService(
 				}
 			: undefined,
 		restart: "no",
-		persist: false,
+		persist: cfgLaunchPersist.get(session.settings),
 		detached: false,
 	};
 	const lifetime = serviceState(session).lifetime.signal;

@@ -8,12 +8,12 @@ import {
 	getActiveProfile,
 	getAgentDbPath,
 	getAgentDir,
-	getConfigAgentDirName,
 	getConfigRootDir,
 	getMnemopiEmbedRuntimeDir,
 	getPythonGatewayDir,
 	getSessionsDir,
 	getStatsDbPath,
+	getWebKitHostPath,
 	normalizeProfileName,
 	resolveProfileEnv,
 	setAgentDir,
@@ -125,11 +125,25 @@ describe("profile directories", () => {
 		const agent = path.join(root, "agent");
 		expect(getActiveProfile()).toBe("work");
 		expect(getConfigRootDir()).toBe(root);
-		expect(getConfigAgentDirName()).toBe(path.join(configDir, "profiles", "work", "agent"));
 		expect(getAgentDir()).toBe(agent);
 		expect(getAgentDbPath()).toBe(path.join(agent, "agent.db"));
 		expect(getSessionsDir()).toBe(path.join(agent, "sessions"));
 		expect(getStatsDbPath()).toBe(path.join(root, "stats.db"));
+	});
+
+	it("keeps installed WebKit hosts private to their profile without installing on lookup", async () => {
+		setProfile("work");
+		const installed = getWebKitHostPath();
+		await fs.mkdir(path.dirname(installed), { recursive: true });
+		await Bun.write(installed, "synthetic work-profile browser");
+
+		setProfile("personal");
+		const other = getWebKitHostPath();
+		expect(await Bun.file(other).exists()).toBe(false);
+		expect(await fs.exists(path.dirname(other))).toBe(false);
+
+		setProfile("work");
+		expect(await Bun.file(getWebKitHostPath()).text()).toBe("synthetic work-profile browser");
 	});
 
 	it("routes different profiles to one shared embedding owner", async () => {

@@ -1,12 +1,21 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, vi } from "bun:test";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { registerCustomApi, unregisterCustomApis } from "@oh-my-pi/pi-ai/api-registry";
+import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
+import { ModelRegistry } from "../src/config/model-registry";
+import { Settings } from "../src/config/settings";
 import {
 	type SkillDescriptionCompressor,
 	SkillDescriptionCatalog,
 	SkillDescriptionStore,
+	createSkillDescriptionCompressor,
 } from "../src/extensibility/skill-descriptions";
 import type { Skill } from "../src/extensibility/skills";
 import { buildSystemPrompt } from "../src/system-prompt";
+import { CostGate } from "../src/session/cost-gate";
+import { SessionManager } from "../src/session/session-manager";
+import type { ToolSession } from "../src/tools";
+import { createAssistantMessage, createInMemoryAuthStorage } from "./helpers/agent-session-setup";
 
 const original: Skill = {
 	name: "browser-research",
@@ -202,5 +211,221 @@ describe("system prompt skill descriptions", () => {
 		expect(new SkillDescriptionCatalog({ store: reopened }).render([original])[0]?.description).toBe(
 			"Use for interactive sites.",
 		);
+	});
+});
+
+describe("skill compression request ownership", () => {
+	function fixture() {
+		const id = Bun.randomUUIDv7();
+		const api = `skill-compression-${id}`;
+		const provider = `skill-owner-${id}`;
+		const temp = TempDir.createSync("omp-skill-request-");
+		const auth = createInMemoryAuthStorage();
+		const settings = Settings.isolated({ modelRoles: { smol: `${provider}/probe` } });
+		const registry = new ModelRegistry(auth, temp.join("models.yml"), { settings });
+		const journal = SessionManager.inMemory(temp.path());
+		const gate = new CostGate(settings, 0, () => {});
+		const started = Promise.withResolvers<void>();
+		const control = {
+			current: true,
+			credentials: 0,
+			calls: [] as string[],
+			reply: Promise.resolve(),
+		};
+		registerCustomApi(
+			api,
+			model => {
+				control.calls.push(`${model.provider}/${model.id}`);
+				started.resolve();
+				const stream = new AssistantMessageEventStream();
+				void control.reply.then(() => {
+					const message = createAssistantMessage("Use for interactive browser tasks.");
+					message.api = model.api;
+					message.provider = model.provider;
+					message.model = model.id;
+					message.usage.cost.total = 0.25;
+					stream.push({ type: "done", reason: "stop", message });
+				});
+				return stream;
+			},
+			id,
+		);
+		registry.registerProvider(provider, {
+			api,
+			baseUrl: "https://synthetic.invalid",
+			apiKey: "synthetic-key",
+			models: [
+				{
+					id: "probe",
+					name: "Probe",
+					reasoning: false,
+					input: ["text"],
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+					contextWindow: 4096,
+					maxTokens: 1024,
+				},
+			],
+		});
+		const session: ToolSession = {
+			cwd: journal.getCwd(),
+			hasUI: false,
+			settings,
+			modelRegistry: registry,
+			sessionManager: journal,
+			costGate: gate,
+			getSessionId: () => journal.getSessionId(),
+			getSessionFile: () => journal.getSessionFile() ?? null,
+			getSessionSpawns: () => "*",
+			captureRequestOwner: () => ({
+				isCurrent: () => control.current,
+				bindCredential: () => control.current,
+			}),
+			getApiKey: () => {
+				control.credentials++;
+				return "synthetic-key";
+			},
+			prepareSimpleStreamOptions: options => options,
+		};
+		return {
+			provider,
+			settings,
+			registry,
+			session,
+			journal,
+			gate,
+			control,
+			started,
+			compressor: createSkillDescriptionCompressor(registry, settings, { session }),
+			async [Symbol.asyncDispose]() {
+				unregisterCustomApis(id);
+				await auth.close();
+				await temp.remove();
+				vi.restoreAllMocks();
+			},
+		};
+	}
+
+	it("does not turn an unconfigured, project-only, or fuzzy role into a paid request", async () => {
+		await using f = fixture();
+		f.settings.setModelRole("smol", undefined);
+		f.settings.setModelRole("default", `${f.provider}/probe`);
+		await expect(f.compressor.compress("skill", "description", "request")).rejects.toThrow("trusted configured");
+		f.settings.setProjectModelRole("smol", `${f.provider}/probe`);
+		await expect(f.compressor.compress("skill", "description", "request")).rejects.toThrow("trusted configured");
+		f.settings.setModelRole("smol", "probe");
+		await expect(f.compressor.compress("skill", "description", "request")).rejects.toThrow("trusted configured");
+		expect(f.control.credentials).toBe(0);
+		expect(f.control.calls).toEqual([]);
+	});
+
+	it("refuses a frozen session at the provider boundary without executing the provider", async () => {
+		await using f = fixture();
+		f.session.prepareSimpleStreamOptions = options => ({
+			...options,
+			beforeDispatch: () => {
+				throw new Error("Session is frozen");
+			},
+		});
+		await expect(f.compressor.compress("skill", "description", "request")).rejects.toThrow("frozen");
+		expect(f.control.calls).toEqual([]);
+		expect(f.gate.spent).toBe(0);
+	});
+
+	it("does not dispatch after credential resolution loses its captured owner", async () => {
+		await using f = fixture();
+		const started = Promise.withResolvers<void>();
+		const credential = Promise.withResolvers<string>();
+		f.session.getApiKey = () => async () => {
+			started.resolve();
+			return credential.promise;
+		};
+		const pending = f.compressor.compress("skill", "description", "request");
+		await started.promise;
+		f.control.current = false;
+		credential.resolve("synthetic-key");
+		await expect(pending).rejects.toThrow("credential changed");
+		expect(f.control.calls).toEqual([]);
+	});
+
+	it("invalidates queued compression before a closing session can mint credentials", async () => {
+		await using f = fixture();
+		using temp = TempDir.createSync("omp-skill-queued-close-");
+		using store = SkillDescriptionStore.open(temp.join("skills.db"));
+		const catalog = new SkillDescriptionCatalog({ store, compress: f.compressor });
+		catalog.render([original]);
+		await catalog.drain();
+		expect(f.control.credentials).toBe(0);
+		expect(f.control.calls).toEqual([]);
+		expect(f.journal.getEntries().filter(entry => entry.type === "model_usage")).toEqual([]);
+	});
+
+	it("drains accepted usage into the initiating journal before releasing transition custody", async () => {
+		await using f = fixture();
+		using temp = TempDir.createSync("omp-skill-owner-drain-");
+		using store = SkillDescriptionStore.open(temp.join("skills.db"));
+		const reply = Promise.withResolvers<void>();
+		f.control.reply = reply.promise;
+		const flushStarted = Promise.withResolvers<void>();
+		const flushAllowed = Promise.withResolvers<void>();
+		const originalFlush = f.journal.flush.bind(f.journal);
+		vi.spyOn(f.journal, "flush").mockImplementation(async () => {
+			await originalFlush();
+			flushStarted.resolve();
+			await flushAllowed.promise;
+		});
+		const catalog = new SkillDescriptionCatalog({ store, compress: f.compressor });
+		const preview = catalog.render([original])[0]?.description;
+		let draining: Promise<void> | undefined;
+		try {
+			await f.started.promise;
+			f.control.current = false;
+			let drained = false;
+			draining = catalog.drain().then(() => {
+				drained = true;
+			});
+			reply.resolve();
+			await flushStarted.promise;
+			expect(drained).toBe(false);
+			expect(f.gate.spent).toBe(0.25);
+			expect(
+				f.journal
+					.getEntries()
+					.filter(entry => entry.type === "model_usage")
+					.map(entry => ({
+						purpose: entry.purpose,
+						provider: entry.provider,
+						cost: entry.usage.cost.total,
+					})),
+			).toEqual([{ purpose: "skill-description", provider: f.provider, cost: 0.25 }]);
+			flushAllowed.resolve();
+			await draining;
+			expect(new SkillDescriptionCatalog({ store }).render([original])[0]?.description).toBe(preview);
+			expect(f.control.calls).toEqual([`${f.provider}/probe`]);
+		} finally {
+			reply.resolve();
+			flushAllowed.resolve();
+			await draining;
+		}
+	});
+
+	it("does not report drained custody when accepted usage could not be persisted", async () => {
+		await using f = fixture();
+		using temp = TempDir.createSync("omp-skill-usage-failure-");
+		using store = SkillDescriptionStore.open(temp.join("skills.db"));
+		const reply = Promise.withResolvers<void>();
+		f.control.reply = reply.promise;
+		vi.spyOn(f.journal, "flush").mockRejectedValue(new Error("journal unavailable"));
+		const catalog = new SkillDescriptionCatalog({ store, compress: f.compressor });
+		catalog.render([original]);
+		try {
+			await f.started.promise;
+			reply.resolve();
+			await expect(catalog.waitForPending()).rejects.toThrow("usage persistence failed");
+			await expect(catalog.drain()).rejects.toThrow("usage persistence failed");
+			expect(f.gate.spent).toBe(0.25);
+		} finally {
+			reply.resolve();
+			await catalog.waitForPending().catch(() => {});
+		}
 	});
 });

@@ -18,7 +18,7 @@ import {
 	resolveRoleChain,
 	roleCandidatePool,
 } from "../../config/model-resolver";
-import { settings } from "../../config/settings";
+import { settings as processSettings, type Settings } from "../../config/settings";
 import type { CustomTool, CustomToolContext } from "../../extensibility/custom-tools/types";
 import webSearchSystemPrompt from "../../prompts/system/web-search.md" with { type: "text" };
 import webSearchDescription from "../../prompts/tools/web-search.md" with { type: "text" };
@@ -40,6 +40,7 @@ import {
 	DEFAULT_WEB_SEARCH_TIMEOUT_SECONDS,
 	MAX_WEB_SEARCH_TIMEOUT_SECONDS,
 	SearchProviderError,
+	type SearchFailureDetail,
 	type SearchResponse,
 	type SearchResultDetails,
 } from "./types";
@@ -119,21 +120,27 @@ function formatForLLM(response: SearchResponse, notes: readonly string[] = []): 
 /** Longest failure reason a fallback note quotes, the cap source snippets get; provider errors can carry whole response bodies. */
 const MAX_FALLBACK_REASON_CHARS = 240;
 
+/** Failed candidates as tool details record them and the fallback note quotes them: reason flattened and capped. */
+function failureDetails(failures: readonly SearchProviderFailure[]): SearchFailureDetail[] {
+	return failures.map(({ provider, error }): SearchFailureDetail => {
+		const reason = formatSearchProviderFailure(error, provider).replace(/\s+/g, " ").trim().replace(/\.$/, "");
+		return {
+			provider: provider.id,
+			label: provider.label,
+			reason: truncate(reason, MAX_FALLBACK_REASON_CHARS),
+			...(error instanceof SearchProviderError && error.status !== undefined ? { status: error.status } : {}),
+		};
+	});
+}
+
 /**
  * Note naming the candidates that failed before `served` answered. Without it a
  * fallback engine's results read as the preferred provider's, e.g. web pages
  * standing in for an X search.
  */
-function fallbackNotes(failures: readonly SearchProviderFailure[], served: { label: string }): string[] {
-	if (failures.length === 0) return [];
-	const failed = failures.map(failure => {
-		const reason = formatSearchProviderFailure(failure.error, failure.provider)
-			.replace(/\s+/g, " ")
-			.trim()
-			.replace(/\.$/, "");
-		return `${failure.provider.label} failed (${truncate(reason, MAX_FALLBACK_REASON_CHARS)})`;
-	});
-	return [`answered by ${served.label} after ${failed.join(" and ")}`];
+function fallbackNotes(failed: readonly SearchFailureDetail[], served: { label: string }): string[] {
+	if (failed.length === 0) return [];
+	return [`answered by ${served.label} after ${failed.map(f => `${f.label} failed (${f.reason})`).join(" and ")}`];
 }
 
 function hasRenderableSearchContent(response: SearchResponse): boolean {
@@ -148,6 +155,7 @@ function hasRenderableSearchContent(response: SearchResponse): boolean {
 interface ExecuteSearchOptions {
 	authStorage: AuthStorage;
 	modelRegistry?: ModelRegistry;
+	settings?: Settings;
 	sessionId?: string;
 	/** The session's active model; `web/hosted` searches through it. */
 	sessionModel?: Model<Api>;
@@ -185,6 +193,21 @@ function preferXAI(chain: RoleChainCandidate[]): RoleChainCandidate[] {
 	return xai.length > 0 ? [...xai, ...chain.filter(candidate => candidate.model.webSearch !== "xai")] : chain;
 }
 
+function isHackerNewsEngine(model: Model<Api>): boolean {
+	return model.provider === "web" && model.id === "hackernews";
+}
+
+/**
+ * Move the chain's `web/hackernews` candidate to the front, or prepend the
+ * pool's as an automatic candidate when the chain has none.
+ */
+function preferHackerNews(chain: RoleChainCandidate[], pool: Model<Api>[]): RoleChainCandidate[] {
+	const listed = chain.filter(candidate => isHackerNewsEngine(candidate.model));
+	if (listed.length > 0) return [...listed, ...chain.filter(candidate => !isHackerNewsEngine(candidate.model))];
+	const model = pool.find(isHackerNewsEngine);
+	return model ? [{ model, explicit: false }, ...chain] : chain;
+}
+
 /** Execute web search */
 async function executeSearch(
 	_toolCallId: string,
@@ -192,6 +215,7 @@ async function executeSearch(
 	options: ExecuteSearchOptions,
 ): Promise<{ content: Array<{ type: "text"; text: string }>; details: SearchResultDetails }> {
 	const { authStorage, sessionId, signal } = options;
+	const settings = options.settings ?? processSettings;
 	const modelRegistry = options.modelRegistry ?? new ModelRegistry(authStorage, undefined, { settings });
 	const pool = roleCandidatePool("web", settings, modelRegistry);
 	const candidates: RoleChainCandidate[] = params.model
@@ -214,6 +238,11 @@ async function executeSearch(
 		settings,
 	);
 	if (!params.model && targetsX(parsedQuery)) expanded = preferXAI(expanded);
+	// General engines index HN threads sparsely and late; a query whose every
+	// `site:` is Hacker News (with or without a path) tries the HN Search API first.
+	const hnOnly =
+		parsedQuery.sites.length > 0 && parsedQuery.sites.every(site => site.split("/", 1)[0] === "news.ycombinator.com");
+	if (!params.model && hnOnly) expanded = preferHackerNews(expanded, pool);
 
 	// Invariant across candidates; resolve once before walking the role chain.
 	let antigravityEndpointMode: "auto" | "production" | "sandbox" | undefined;
@@ -329,7 +358,8 @@ async function executeSearch(
 				throw new SearchProviderError(provider.id, `${provider.label} returned no renderable search content.`, 204);
 			}
 
-			const notes = [...fallbackNotes(failures, provider), ...constraintNotes];
+			const failed = failureDetails(failures);
+			const notes = [...fallbackNotes(failed, provider), ...constraintNotes];
 			if (replacedSelector) {
 				notes.unshift(
 					`configured model "${replacedSelector}" was not found; answered by ${provider.label} (${model.provider}/${model.id})`,
@@ -339,7 +369,7 @@ async function executeSearch(
 
 			return {
 				content: [{ type: "text" as const, text }],
-				details: { response: finalResponse },
+				details: failed.length > 0 ? { response: finalResponse, failures: failed } : { response: finalResponse },
 			};
 		} catch (error) {
 			// Surface user-initiated cancellation immediately so the session sees
@@ -375,6 +405,7 @@ async function executeSearch(
 		details: {
 			response: { provider: failedResponseProvider, sources: [] },
 			error: message,
+			failures: failureDetails(failures),
 		},
 	};
 }
@@ -391,6 +422,7 @@ export async function runSearchQuery(
 	options: {
 		authStorage?: AuthStorage;
 		modelRegistry?: ModelRegistry;
+		settings?: Settings;
 		sessionId?: string;
 		sessionModel?: Model<Api>;
 		signal?: AbortSignal;
@@ -405,6 +437,7 @@ export async function runSearchQuery(
 		return await executeSearch("cli-web-search", params, {
 			authStorage,
 			modelRegistry: options.modelRegistry,
+			settings: options.settings,
 			sessionId: options.sessionId,
 			sessionModel: options.sessionModel,
 			signal: options.signal,
@@ -459,12 +492,11 @@ export class WebSearchTool implements AgentTool<typeof webSearchSchema, SearchRe
 		_onUpdate?: AgentToolUpdateCallback<SearchResultDetails>,
 		_context?: AgentToolContext,
 	): Promise<AgentToolResult<SearchResultDetails>> {
-		const authStorage = this.#session.authStorage ?? (await discoverAuthStorage());
-		const sessionId = this.#session.getSessionId?.() ?? undefined;
-		return executeSearch(_toolCallId, params, {
-			authStorage,
+		return runSearchQuery(params, {
+			authStorage: this.#session.authStorage,
 			modelRegistry: this.#session.modelRegistry,
-			sessionId,
+			settings: this.#session.settings,
+			sessionId: this.#session.getCredentialSourceSessionId?.() ?? this.#session.getSessionId?.() ?? undefined,
 			sessionModel: this.#session.getActiveModel?.(),
 			signal,
 		});
@@ -480,18 +512,16 @@ export const webSearchCustomTool: CustomTool<typeof webSearchSchema, SearchResul
 
 	approval: "read",
 	async execute(
-		toolCallId: string,
+		_toolCallId: string,
 		params: SearchToolParams,
 		_onUpdate,
 		ctx: CustomToolContext,
 		signal?: AbortSignal,
 	) {
-		const authStorage = ctx.modelRegistry?.authStorage ?? (await discoverAuthStorage());
-		const sessionId = ctx.sessionManager.getSessionId();
-		return executeSearch(toolCallId, params, {
-			authStorage,
+		return runSearchQuery(params, {
 			modelRegistry: ctx.modelRegistry,
-			sessionId,
+			settings: ctx.settings,
+			sessionId: ctx.sessionManager.getSessionId(),
 			sessionModel: ctx.model,
 			signal,
 		});

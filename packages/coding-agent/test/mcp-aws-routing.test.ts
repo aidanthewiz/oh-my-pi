@@ -193,12 +193,13 @@ for await (const line of createInterface({ input: process.stdin })) {
 		);
 		const script = `
 import { strict as assert } from "node:assert";
-import { readFileSync } from "node:fs";
+import { readFileSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { connectToServer, disconnectServer, listTools } from ${JSON.stringify(path.resolve(import.meta.dir, "../src/mcp/client.ts"))};
 import { MCPTool } from ${JSON.stringify(path.resolve(import.meta.dir, "../src/mcp/tool-bridge.ts"))};
 import { Settings } from ${JSON.stringify(path.resolve(import.meta.dir, "../src/config/settings.ts"))};
 import { MCPManager } from ${JSON.stringify(path.resolve(import.meta.dir, "../src/mcp/manager.ts"))};
+import { recoverTrustedAwsAuthentication } from ${JSON.stringify(path.resolve(import.meta.dir, "../src/tools/aws.ts"))};
 import { getAgentDir } from ${JSON.stringify(path.resolve(import.meta.dir, "../../utils/src/index.ts"))};
 const config = { command: process.execPath, args: ["--no-env-file", ${JSON.stringify(proxy)}] };
 const options = { preserveOperationalAws: true, awsAnonymousBootstrap: true };
@@ -425,6 +426,22 @@ try {
  await transportManager.disconnectAll();
  transportFixture.stop(true);
 }
+unlinkSync(join(process.env.HOME, "authenticated-expired"));
+const loginsBeforeRetirement = awsCalls().filter(call => call.argv.includes("login")).length;
+let recoveryOwnerCurrent = true;
+const [retiredRecovery] = await Promise.allSettled([
+ recoverTrustedAwsAuthentication("expired", "synthetic retired MCP owner", {
+  ...context,
+  mcpOwnerCurrent: () => recoveryOwnerCurrent,
+  ui: { ...context.ui, confirm: async () => { recoveryOwnerCurrent = false; return true; } },
+ }),
+]);
+assert.equal(retiredRecovery.status, "rejected");
+if (retiredRecovery.status === "rejected") {
+ assert.equal(retiredRecovery.reason.name, "ToolAbortError");
+ assert.equal(retiredRecovery.reason.message, "MCP call owner changed");
+}
+assert.equal(awsCalls().filter(call => call.argv.includes("login")).length, loginsBeforeRetirement);
 console.log("first-use routing passed");
 `;
 		await fs.writeFile(path.join(root, "aws.calls"), "");
@@ -460,6 +477,181 @@ console.log("first-use routing passed");
 		]);
 		expect(exit, `${stdout}\n${stderr}`).toBe(0);
 		expect(stdout).toContain("first-use routing passed");
+	} finally {
+		await fs.rm(root, { recursive: true, force: true });
+	}
+}, 45_000);
+
+test("managed AWS fences expired-credential probes with the worker owner after asynchronous preparation", async () => {
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "mcp-aws-probe-owner-"));
+	try {
+		const config = path.join(root, "config");
+		await fs.writeFile(config, "[profile commercial]\nregion = us-east-1\n");
+		await fs.writeFile(path.join(root, "aws.calls"), "");
+		const aws = path.join(root, process.platform === "win32" ? "aws.exe" : "aws");
+		const recordingAws = path.resolve(import.meta.dir, "fixtures/recording-aws.ts");
+		if (process.platform === "win32") {
+			const build = Bun.spawn([process.execPath, "build", "--compile", recordingAws, "--outfile", aws], {
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			const [error, exit] = await Promise.all([new Response(build.stderr).text(), build.exited]);
+			expect(exit, error).toBe(0);
+		} else {
+			await fs.writeFile(aws, `#!${process.execPath}\n${await fs.readFile(recordingAws, "utf8")}`, { mode: 0o755 });
+		}
+		const probe = path.join(root, "mcp-aws-owner.test.ts");
+		await fs.writeFile(
+			probe,
+			`import { Database } from "bun:sqlite";
+import { spyOn, test } from "bun:test";
+import { strict as assert } from "node:assert";
+import * as fs from "node:fs/promises";
+import { join } from "node:path";
+import { ModelRegistry } from ${JSON.stringify(path.resolve(import.meta.dir, "../src/config/model-registry.ts"))};
+import { Settings } from ${JSON.stringify(path.resolve(import.meta.dir, "../src/config/settings.ts"))};
+import { MCPManager } from ${JSON.stringify(path.resolve(import.meta.dir, "../src/mcp/manager.ts"))};
+import { AgentRegistry } from ${JSON.stringify(path.resolve(import.meta.dir, "../src/registry/agent-registry.ts"))};
+import { AuthStorage, SqliteAuthCredentialStore } from ${JSON.stringify(path.resolve(import.meta.dir, "../src/session/auth-storage.ts"))};
+import { agentsThreadService } from ${JSON.stringify(path.resolve(import.meta.dir, "../src/thread/services/agents.ts"))};
+import { authService } from ${JSON.stringify(path.resolve(import.meta.dir, "../src/thread/services/auth.ts"))};
+import { identityThreadService } from ${JSON.stringify(path.resolve(import.meta.dir, "../src/thread/services/identity.ts"))};
+import { integrationsThreadService } from ${JSON.stringify(path.resolve(import.meta.dir, "../src/thread/services/integrations.ts"))};
+import { settingsThreadService } from ${JSON.stringify(path.resolve(import.meta.dir, "../src/thread/services/settings.ts"))};
+import { startServiceWorker } from ${JSON.stringify(path.resolve(import.meta.dir, "helpers/service-worker.ts"))};
+
+test("worker-owned expired AWS credential probe admission", async () => {
+ const root = process.env.HOME;
+ const aws = process.env.OMP_OPERATIONAL_AWS_EXECUTABLE;
+ for (const retired of [false, true]) {
+  const entered = Promise.withResolvers();
+  const release = Promise.withResolvers();
+  let holdPreparation = false;
+  const stat = fs.stat;
+  const preparation = spyOn(fs, "stat").mockImplementation(async (...args) => {
+   if (holdPreparation && args[0] === aws) {
+    holdPreparation = false;
+    entered.resolve();
+    await release.promise;
+   }
+   return stat(...args);
+  });
+  const dispatched = [];
+  const server = Bun.serve({
+   port: 0, hostname: "127.0.0.1",
+   async fetch(request) {
+    if (request.method !== "POST") return new Response(null, { status: 405 });
+    const rpc = await request.json();
+    if (rpc.id === undefined) return new Response(null, { status: 202 });
+    let result;
+    if (rpc.method === "initialize") {
+     result = { protocolVersion: "2025-11-25", capabilities: { tools: {} }, serverInfo: { name: "synthetic-aws-probe", version: "1" } };
+    } else if (rpc.method === "tools/list") {
+     result = { tools: [{
+      name: "aws___run_script", annotations: { readOnlyHint: true },
+      inputSchema: { type: "object", properties: {
+       code: { type: "string" }, aws_profile: { type: "string", enum: ["commercial"] },
+      }, required: ["code", "aws_profile"] },
+     }] };
+    } else if (rpc.method === "tools/call") {
+     dispatched.push(rpc.params.arguments.code);
+     if (rpc.params.arguments.code === "admitted") {
+      result = { content: [{ type: "text", text: "synthetic inventory" }], structuredContent: { receipt: "admitted-read" } };
+     } else {
+      holdPreparation = true;
+      result = { isError: true, content: [{ type: "text", text: "expired or invalid AWS credentials" }], structuredContent: { receipt: "expired-read" } };
+     }
+    } else result = {};
+    return Response.json({ jsonrpc: "2.0", id: rpc.id, result });
+   },
+  });
+  const manager = new MCPManager(root);
+  const auth = new AuthStorage(new SqliteAuthCredentialStore(new Database(":memory:")));
+  let worker;
+  let child;
+  const id = retired ? "retired-aws-probe-owner" : "current-aws-probe-owner";
+  try {
+   await manager.connectServers({ "coreforge-aws-agent-toolkit": { type: "http", url: server.url.href, exposeTools: false } }, {}, undefined, 0);
+   await manager.waitForStartup(0);
+   worker = await startServiceWorker(
+    new URL(${JSON.stringify(new URL("./fixtures/mcp-extension-worker.ts", import.meta.url).href)}),
+    [identityThreadService, settingsThreadService, authService, agentsThreadService, integrationsThreadService],
+   );
+   child = await worker.probe.open(
+    manager, new ModelRegistry(auth, join(root, "models.yml")),
+    Settings.isolated({ "tools.approvalMode": "yolo" }), root, id,
+   );
+   const admitted = await child.call(
+    "coreforge-aws-agent-toolkit", "aws___run_script", { aws_profile: "commercial", code: "admitted" }, { retry: "read" },
+   );
+   assert.deepEqual(admitted.structuredContent, { receipt: "admitted-read" });
+   const before = await fs.readFile(join(root, "aws.calls"), "utf8");
+   const outcome = child.call(
+    "coreforge-aws-agent-toolkit", "aws___run_script", { aws_profile: "commercial", code: "expired" }, { retry: "read" },
+   ).catch(error => error);
+   await entered.promise;
+   if (retired) {
+    const ref = AgentRegistry.global().get(id);
+    assert.ok(ref && ref.session === child.owner);
+    AgentRegistry.global().unregister(id, ref);
+   }
+   release.resolve();
+   const result = await outcome;
+   const appended = (await fs.readFile(join(root, "aws.calls"), "utf8")).slice(before.length);
+   const probes = appended.trim().split("\\n").filter(Boolean).map(line => JSON.parse(line).argv.slice(-2));
+   assert.deepEqual(probes, retired ? [] : [["sts", "get-caller-identity"]]);
+   assert.deepEqual(dispatched, ["admitted", "expired"]);
+   if (retired) assert.ok(result instanceof Error);
+   else {
+    assert.equal(result.isError, true);
+    assert.deepEqual(result.structuredContent, { receipt: "expired-read" });
+   }
+  } finally {
+   release.resolve();
+   preparation.mockRestore();
+   if (child && !worker.peer.link.closed) await child.dispose();
+   const ref = AgentRegistry.global().get(id);
+   if (ref && (ref.session === child?.owner || ref.session === null)) AgentRegistry.global().unregister(id, ref);
+   await worker?.stop();
+   await manager.disconnectAll();
+   await auth.close();
+   MCPManager.resetForTests();
+   server.stop(true);
+  }
+ }
+}, 25_000);
+`,
+		);
+		const policy = path.join(root, "dcg-policy");
+		await fs.writeFile(policy, "fixture");
+		const child = Bun.spawn([process.execPath, "--no-env-file", "test", probe], {
+			cwd: root,
+			signal: AbortSignal.timeout(35_000),
+			env: {
+				HOME: root,
+				USERPROFILE: root,
+				PATH: process.env.PATH ?? "",
+				...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}),
+				OMP_OPERATIONAL_AWS_CONFIG_FILE: config,
+				OMP_OPERATIONAL_AWS_SHARED_CREDENTIALS_FILE: path.join(root, "credentials"),
+				OMP_OPERATIONAL_AWS_EXECUTABLE: aws,
+				OMP_DCG_PATH: aws,
+				OMP_DCG_VERSION: "fixture",
+				OMP_DCG_BINARY_SHA256: createHash("sha256")
+					.update(await fs.readFile(aws))
+					.digest("hex"),
+				OMP_DCG_CONFIG: policy,
+				OMP_DCG_CONFIG_SHA256: createHash("sha256").update("fixture").digest("hex"),
+			},
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [stdout, stderr, exit] = await Promise.all([
+			new Response(child.stdout).text(),
+			new Response(child.stderr).text(),
+			child.exited,
+		]);
+		expect(exit, `${stdout}\n${stderr}`).toBe(0);
 	} finally {
 		await fs.rm(root, { recursive: true, force: true });
 	}

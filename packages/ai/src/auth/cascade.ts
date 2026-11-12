@@ -1,10 +1,10 @@
 import { authPolicyFor } from "@oh-my-pi/pi-catalog/compat/auth";
 import { $env, $envExact, logger } from "@oh-my-pi/pi-utils";
-import { type ApiKeyResolver, createOAuthProvenance, markAfterSiblingWait, type ResolvedApiKey } from "../auth-retry";
+import { type ApiKeyResolver, createOAuthProvenance, type ResolvedApiKey, resolveAfterRotation } from "../auth-retry";
 import { getEnvApiKey, getEnvApiKeyName } from "../env-api-key";
 import * as AIError from "../error";
-import { isUsageLimitOutcome } from "../error/rate-limit";
 import { getProviderDefinition } from "../registry";
+import { assertProviderEnabled, providerPauseReason } from "../registry/oauth";
 import { AUTHENTICATED_SENTINEL } from "../registry/types";
 import type { SessionAffinity } from "./affinity";
 import type { CredentialPool } from "./pool";
@@ -216,6 +216,7 @@ export class KeyCascade implements KeysApi {
 	 * selects dedicated-only, alias-aware, or no environment fallback.
 	 */
 	source(provider: string, { env = "dedicated" }: AuthSourceOptions = {}): AuthSource | undefined {
+		if (providerPauseReason(provider) !== undefined) return undefined;
 		if (provider === "anthropic-aws") {
 			const key = getProviderDefinition(provider)?.envKeysForRequest?.({});
 			return env !== "none" && key
@@ -263,6 +264,7 @@ export class KeyCascade implements KeysApi {
 	 * one namespace.
 	 */
 	async peek(provider: string, options?: AuthPeekOptions): Promise<string | undefined> {
+		if (providerPauseReason(provider) !== undefined) return undefined;
 		const definition = getProviderDefinition(provider);
 		if (definition?.requestEnvironmentOwnsCredential?.(options ?? {})) {
 			return definition.envKeysForRequest?.(options ?? {});
@@ -340,6 +342,7 @@ export class KeyCascade implements KeysApi {
 		sessionId?: string,
 		options?: AuthApiKeyOptions,
 	): Promise<ResolvedApiKey | undefined> {
+		assertProviderEnabled(provider);
 		let credentialId: number | undefined;
 		let oauthIdentity: OAuthRequestIdentity | undefined;
 		let oauthAccess: string | undefined;
@@ -392,6 +395,9 @@ export class KeyCascade implements KeysApi {
 		options?: AuthApiKeyOptions,
 		onCredentialId?: (id: number, identity?: OAuthRequestIdentity, oauthAccess?: string) => void,
 	): Promise<string | undefined> {
+		// A provider turned off in its auth rules is reached by no key source:
+		// runtime, models.yml, stored, env or broker.
+		if (providerPauseReason(provider) !== undefined) return undefined;
 		const restricted = this.#deps.affinity.isRestricted(provider, sessionId);
 		const definition = getProviderDefinition(provider);
 		if (definition?.requestEnvironmentOwnsCredential?.(options ?? {})) {
@@ -539,19 +545,11 @@ export class KeyCascade implements KeysApi {
 				const rotation = await this.#deps.rotate(provider, sessionId, {
 					error,
 					modelId,
+					baseUrl,
 					signal,
 					apiKey: previousKey,
 				});
-				if (!rotation.switched) {
-					const status = AIError.status(error);
-					const message = error instanceof Error ? error.message : typeof error === "string" ? error : undefined;
-					// Preserve no-sibling quota backoff instead of re-resolving an
-					// already-blocked fallback. Hard-auth declines still re-resolve
-					// because a peer may have refreshed the failed bearer.
-					if (AIError.isUsageLimit(error) || isUsageLimitOutcome(status, message)) return undefined;
-				}
-				const resolved = await resolve({ signal });
-				return rotation.afterSiblingWait ? markAfterSiblingWait(resolved) : resolved;
+				return resolveAfterRotation(rotation, error, () => resolve({ signal }));
 			}
 			return resolve({
 				forceRefresh: true,
@@ -576,6 +574,7 @@ export class KeyCascade implements KeysApi {
 	 * The string is purely informational; consumers must not parse it.
 	 */
 	describe(provider: string, sessionId?: string): string | undefined {
+		if (providerPauseReason(provider) !== undefined) return undefined;
 		if (provider === "anthropic-aws") {
 			return getProviderDefinition(provider)?.envKeysForRequest?.({}) ? "provider-owned environment" : undefined;
 		}

@@ -2,7 +2,7 @@ import * as os from "node:os";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import { AudioCapture } from "@oh-my-pi/pi-natives";
-import { prompt } from "@oh-my-pi/pi-utils";
+import { prompt, toError } from "@oh-my-pi/pi-utils";
 import { isModelEnabledBySettings } from "../config/model-resolver";
 import type { AgentSession } from "../session/agent-session";
 import type { AgentSessionEvent } from "../session/agent-session-events";
@@ -72,10 +72,6 @@ export interface LiveSessionControllerOptions {
 	sdpOffer?: string;
 	/** Host ownership beyond the AgentSession, such as foreground view and collaboration authority. */
 	isCurrent?: () => boolean;
-}
-
-function errorFrom(cause: unknown): Error {
-	return cause instanceof Error ? cause : new Error(String(cause));
 }
 
 function clampLevel(level: number): number {
@@ -275,7 +271,7 @@ export class LiveSessionController {
 			this.#recorder = recorder;
 			this.#refreshAudioPhase();
 		} catch (cause) {
-			const error = errorFrom(cause);
+			const error = toError(cause);
 			this.#reportFailure(error);
 			await this.stop();
 			throw error;
@@ -288,7 +284,7 @@ export class LiveSessionController {
 		try {
 			this.#assertCurrent();
 		} catch (cause) {
-			this.#reportFailure(errorFrom(cause));
+			this.#reportFailure(toError(cause));
 			return;
 		}
 		this.#muted = !this.#muted;
@@ -300,7 +296,7 @@ export class LiveSessionController {
 		this.#refreshAudioPhase();
 		const transport = this.#transport;
 		if (transport) {
-			void transport.setMuted(this.#muted).catch(cause => this.#reportFailure(errorFrom(cause)));
+			void transport.setMuted(this.#muted).catch(cause => this.#reportFailure(toError(cause)));
 		}
 	}
 
@@ -323,7 +319,7 @@ export class LiveSessionController {
 			try {
 				recorder.stop();
 			} catch (cause) {
-				cleanupError = errorFrom(cause);
+				cleanupError = toError(cause);
 			}
 		}
 
@@ -334,13 +330,13 @@ export class LiveSessionController {
 			try {
 				await transport.send(buildSessionClose());
 			} catch (cause) {
-				cleanupError ??= errorFrom(cause);
+				cleanupError ??= toError(cause);
 			}
 			try {
 				this.#lifetime.abort();
 				await transport.close();
 			} catch (cause) {
-				cleanupError ??= errorFrom(cause);
+				cleanupError ??= toError(cause);
 			}
 		}
 		this.#lifetime.abort();
@@ -360,7 +356,7 @@ export class LiveSessionController {
 			this.#assertCurrent();
 			handler();
 		} catch (cause) {
-			this.#reportFailure(errorFrom(cause));
+			this.#reportFailure(toError(cause));
 		}
 	}
 
@@ -412,7 +408,7 @@ export class LiveSessionController {
 				},
 				{ triggerTurn: true },
 			)
-			.catch(cause => this.#reportFailure(errorFrom(cause)));
+			.catch(cause => this.#reportFailure(toError(cause)));
 	}
 
 	#handleSessionEvent(event: AgentSessionEvent): void {
@@ -472,7 +468,7 @@ export class LiveSessionController {
 			this.#assertCurrent();
 			this.#transport.pushAudio(samples);
 		} catch (cause) {
-			this.#reportFailure(errorFrom(cause));
+			this.#reportFailure(toError(cause));
 		}
 	}
 
@@ -554,7 +550,7 @@ export class LiveSessionController {
 				}
 			})
 			.catch(cause => {
-				if (!this.#stopped) this.#reportFailure(errorFrom(cause));
+				if (!this.#stopped) this.#reportFailure(toError(cause));
 			});
 	}
 
@@ -577,7 +573,7 @@ export class LiveSessionController {
 		try {
 			this.#callbacks.onPhase(phase);
 		} catch (cause) {
-			this.#reportFailure(errorFrom(cause));
+			this.#reportFailure(toError(cause));
 		}
 	}
 
@@ -599,7 +595,7 @@ export class LiveSessionController {
 			this.#emittedInputLevel = input;
 			this.#emittedOutputLevel = output;
 		} catch (cause) {
-			this.#reportFailure(errorFrom(cause));
+			this.#reportFailure(toError(cause));
 		}
 	}
 
@@ -608,7 +604,7 @@ export class LiveSessionController {
 		try {
 			this.#callbacks.onTranscript(transcript);
 		} catch (cause) {
-			this.#reportFailure(errorFrom(cause));
+			this.#reportFailure(toError(cause));
 		}
 	}
 

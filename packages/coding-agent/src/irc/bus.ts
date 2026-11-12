@@ -11,14 +11,45 @@
 
 import { type IrcDeliveryReceipt, type IrcMessage } from "@oh-my-pi/pi-tui/tools/irc";
 import { logger, Snowflake, untilAborted } from "@oh-my-pi/pi-utils";
-import { AgentLifecycleManager } from "../registry/agent-lifecycle";
-import { AgentRegistry, type AgentRef, MAIN_AGENT_ID } from "../registry/agent-registry";
+import { type AgentLifecycleApi, AgentLifecycleManager } from "../registry/agent-lifecycle";
+import { AgentRegistry, type AgentRef, type AgentRegistryApi, MAIN_AGENT_ID } from "../registry/agent-registry";
 import type { CustomMessage } from "../session/messages";
 
 interface IrcWaiter {
-	from?: string;
+	filter: IrcWaitFilter;
 	resolve: (msg: IrcMessage) => void;
 	cancel: () => void;
+}
+
+/** The recipient may already have consumed the message; automatic replay is unsafe. */
+export class IrcDeliveryUncertainError extends Error {
+	constructor(cause?: unknown) {
+		super("Peer delivery outcome is unknown because its receipt was lost. Do not resend automatically.", { cause });
+		this.name = "IrcDeliveryUncertainError";
+	}
+}
+
+/** Which messages a bus {@link IrcBusApi.wait} consumes. */
+export interface IrcWaitFilter {
+	/** Only messages from this agent. */
+	from?: string;
+	/**
+	 * Skip broadcast legs and progress notes, which ask the waiter nothing: they
+	 * reach it through ordinary delivery, a non-interrupting aside when it is busy.
+	 */
+	directOnly?: boolean;
+	/**
+	 * With `directOnly`, still take a broadcast from these agents: the waiter
+	 * asked them something, and a broadcast answers it (see {@link IrcBusApi.unansweredSends}).
+	 */
+	repliesFrom?: readonly string[];
+}
+
+/** Whether a bus wait under `filter` consumes `msg`. */
+function ircWaitAccepts(filter: IrcWaitFilter, msg: IrcMessage): boolean {
+	if (filter.from !== undefined && msg.from !== filter.from) return false;
+	if (!filter.directOnly || (!msg.broadcast && !msg.progress)) return true;
+	return !msg.progress && (filter.repliesFrom?.includes(msg.from) ?? false);
 }
 
 /** When a send went out: wall-clock `ts`, and `seq` to order sends within one millisecond. */
@@ -37,14 +68,44 @@ interface SendMark {
 /** Mailbox cap per agent; oldest messages are dropped beyond it. */
 const MAILBOX_CAP = 100;
 
-export class IrcBus {
-	static #global: IrcBus | undefined;
+/** Public surface of the process-global IRC bus, implemented locally on main and by a proxy in workers. */
+export interface IrcBusApi {
+	/** Fire-and-forget delivery; the receipt reports how the message reached the recipient. */
+	send(msg: Omit<IrcMessage, "id" | "ts">, opts?: { signal?: AbortSignal }): Promise<IrcDeliveryReceipt>;
+	/** Whether `from` successfully sent `to` anything, progress included, at or after `sinceTs`. */
+	sentSince(from: string, to: string, sinceTs: number): boolean;
+	/** Agents `from` messaged directly at or after `sinceTs` that have not answered since. */
+	unansweredSends(from: string, sinceTs: number): Array<{ to: string; sentAt: number; promised: boolean }>;
+	/** Block until a message for `agentId` that `filter` accepts arrives; null on timeout. */
+	wait(
+		agentId: string,
+		filter: IrcWaitFilter,
+		timeoutMs: number,
+		signal?: AbortSignal,
+		options?: { drainPending?: boolean },
+	): Promise<IrcMessage | null>;
+	/** Consume the oldest pending message for `agentId` (optionally from `from`). */
+	take(agentId: string, from?: string): IrcMessage | undefined;
+	/** Unread count for the local Agent Hub overlay. */
+	unreadCount(agentId: string): number;
+	/** Capture generation-bound reply credit before work starts; commit only an accepted result. */
+	captureReply(from: AgentRef, to: AgentRef): () => void;
+}
 
-	static global(): IrcBus {
+export class IrcBus implements IrcBusApi {
+	static #global: IrcBusApi | undefined;
+
+	/** The installed bus; lazily a local {@link IrcBus} unless a worker installed a proxy. */
+	static global(): IrcBusApi {
 		if (!IrcBus.#global) {
 			IrcBus.#global = new IrcBus();
 		}
 		return IrcBus.#global;
+	}
+
+	/** Install the process-global bus. Worker bootstrap only. */
+	static installGlobal(api: IrcBusApi): void {
+		IrcBus.#global = api;
 	}
 
 	/** Reset the global bus. Test-only. */
@@ -52,8 +113,8 @@ export class IrcBus {
 		IrcBus.#global = undefined;
 	}
 
-	readonly #registry: AgentRegistry;
-	readonly #lifecycle: () => AgentLifecycleManager;
+	readonly #registry: AgentRegistryApi;
+	readonly #lifecycle: () => AgentLifecycleApi;
 	readonly #mailboxes = new Map<string, IrcMessage[]>();
 	readonly #waiters = new Map<string, IrcWaiter[]>();
 	/** The latest successful non-progress send per `from` → `to`; see {@link sentSince}. */
@@ -67,7 +128,7 @@ export class IrcBus {
 	/** Last {@link SendMark.seq} handed out, taken when a send starts. */
 	#sendSeq = 0;
 
-	constructor(registry: AgentRegistry = AgentRegistry.global(), lifecycle?: AgentLifecycleManager) {
+	constructor(registry: AgentRegistryApi = AgentRegistry.global(), lifecycle?: AgentLifecycleApi) {
 		this.#registry = registry;
 		// Lazy: the lifecycle global self-constructs against the global registry,
 		// so only touch it when a parked recipient actually needs reviving.
@@ -85,16 +146,8 @@ export class IrcBus {
 	 * context, so buffering it too would double-deliver via a later
 	 * `wait`/`inbox` and inflate unread counts. Only a failed live hand-off
 	 * is buffered for the recipient to drain later.
-	 *
-	 * `opts.suppressRelay` skips the display-only main-UI relay for this leg.
-	 * Set by broadcast fan-out when the same broadcast also targets the main
-	 * agent directly: the main agent then already sees the body as its own
-	 * incoming card, so relaying the sibling legs would duplicate it.
 	 */
-	async send(
-		msg: Omit<IrcMessage, "id" | "ts">,
-		opts?: { suppressRelay?: boolean; signal?: AbortSignal },
-	): Promise<IrcDeliveryReceipt> {
+	async send(msg: Omit<IrcMessage, "id" | "ts">, opts?: { signal?: AbortSignal }): Promise<IrcDeliveryReceipt> {
 		const message: IrcMessage = { ...msg, id: Snowflake.next(), ts: Date.now() };
 		// Taken before delivery: a reply sent while this message is still being
 		// delivered must still order after it.
@@ -221,7 +274,7 @@ export class IrcBus {
 
 	async #deliver(
 		message: IrcMessage,
-		opts?: { suppressRelay?: boolean; signal?: AbortSignal },
+		opts?: { signal?: AbortSignal },
 		onDeliver?: (ref: AgentRef) => void,
 	): Promise<IrcDeliveryReceipt> {
 		const ref = this.#registry.get(message.to);
@@ -299,13 +352,13 @@ export class IrcBus {
 		}
 		onDeliver?.(deliveryRef);
 
-		// A pending `wait` from the recipient consumes the message directly —
-		// it is returned from their irc tool call and never hits the inbox or
-		// the session injection path.
-		const waiter = this.#takeMatchingWaiter(message.to, message.from);
+		// A pending bus wait from the recipient consumes the message directly
+		// and never hits the inbox; the `wait` tool hands it to its own session,
+		// which injects it as a user turn.
+		const waiter = this.#takeMatchingWaiter(message);
 		if (waiter) {
 			waiter.resolve(message);
-			if (!opts?.suppressRelay) this.#relayToMainUi(message);
+			this.#relayToMainUi(message);
 			return { to: message.to, outcome: revived ? "revived" : "injected" };
 		}
 
@@ -315,14 +368,17 @@ export class IrcBus {
 
 		try {
 			const delivery = await session.deliverIrcMessage(message);
-			if (!opts?.suppressRelay) this.#relayToMainUi(message);
+			this.#relayToMainUi(message);
 			return { to: message.to, outcome: revived ? "revived" : delivery };
 		} catch (error) {
-			// Live hand-off failed (e.g. recipient disposed mid-shutdown): buffer
-			// the message so a later `wait`/`inbox` from the recipient can still
-			// pick it up. The receipt stays "failed" — the recipient has not
-			// seen it.
-			if (this.#registry.get(message.to) === deliveryRef && deliveryRef.session === session) this.#enqueue(message);
+			// Only a known failed hand-off may be buffered; a lost transport receipt can follow successful injection.
+			if (
+				!(error instanceof IrcDeliveryUncertainError) &&
+				this.#registry.get(message.to) === deliveryRef &&
+				deliveryRef.session === session
+			) {
+				this.#enqueue(message);
+			}
 			return {
 				to: message.to,
 				outcome: "failed",
@@ -332,15 +388,15 @@ export class IrcBus {
 	}
 
 	/**
-	 * Block until a message for `agentId` (optionally from `filter.from`)
-	 * arrives; consume + return it. Null on timeout (`timeoutMs <= 0` waits
+	 * Block until a message for `agentId` that `filter` accepts arrives;
+	 * consume + return it. Null on timeout (`timeoutMs <= 0` waits
 	 * forever). Rejects when `signal` aborts. By default, already-buffered
 	 * mail satisfies the wait before parking a future waiter; callers that
 	 * need a strictly future reply can disable that drain.
 	 */
 	async wait(
 		agentId: string,
-		filter: { from?: string },
+		filter: IrcWaitFilter,
 		timeoutMs: number,
 		signal?: AbortSignal,
 		options?: { drainPending?: boolean },
@@ -351,7 +407,7 @@ export class IrcBus {
 
 		if (options?.drainPending !== false) {
 			// Already-pending mail satisfies the wait without parking a waiter.
-			const pending = this.#takeFromMailbox(agentId, filter.from);
+			const pending = this.#takeFromMailbox(agentId, msg => ircWaitAccepts(filter, msg));
 			if (pending) return pending;
 		}
 
@@ -379,7 +435,7 @@ export class IrcBus {
 		};
 
 		const waiter: IrcWaiter = {
-			from: filter.from,
+			filter,
 			resolve: msg => settle({ kind: "message", msg }),
 			cancel: () => cleanup(),
 		};
@@ -414,7 +470,7 @@ export class IrcBus {
 	 * block without draining the entire backlog.
 	 */
 	take(agentId: string, from?: string): IrcMessage | undefined {
-		return this.#takeFromMailbox(agentId, from);
+		return this.#takeFromMailbox(agentId, msg => from === undefined || msg.from === from);
 	}
 
 	/** Unread count for the local Agent Hub overlay. */
@@ -439,14 +495,14 @@ export class IrcBus {
 		}
 	}
 
-	/** Resolve the OLDEST waiter for `agentId` whose from-filter accepts `from`. */
-	#takeMatchingWaiter(agentId: string, from: string): IrcWaiter | undefined {
-		const waiters = this.#waiters.get(agentId);
+	/** Resolve the OLDEST waiter for the recipient whose filter accepts `message`. */
+	#takeMatchingWaiter(message: IrcMessage): IrcWaiter | undefined {
+		const waiters = this.#waiters.get(message.to);
 		if (!waiters) return undefined;
-		const index = waiters.findIndex(waiter => !waiter.from || waiter.from === from);
+		const index = waiters.findIndex(waiter => ircWaitAccepts(waiter.filter, message));
 		if (index === -1) return undefined;
 		const [waiter] = waiters.splice(index, 1);
-		if (waiters.length === 0) this.#waiters.delete(agentId);
+		if (waiters.length === 0) this.#waiters.delete(message.to);
 		return waiter;
 	}
 
@@ -458,11 +514,11 @@ export class IrcBus {
 		if (waiters.length === 0) this.#waiters.delete(agentId);
 	}
 
-	#takeFromMailbox(agentId: string, from?: string): IrcMessage | undefined {
+	#takeFromMailbox(agentId: string, accepts: (msg: IrcMessage) => boolean): IrcMessage | undefined {
 		const mailbox = this.#mailboxes.get(agentId);
 		if (!mailbox) return undefined;
-		const index = from ? mailbox.findIndex(msg => msg.from === from) : 0;
-		if (index === -1 || mailbox.length === 0) return undefined;
+		const index = mailbox.findIndex(accepts);
+		if (index === -1) return undefined;
 		const [message] = mailbox.splice(index, 1);
 		if (mailbox.length === 0) this.#mailboxes.delete(agentId);
 		return message;
@@ -471,9 +527,9 @@ export class IrcBus {
 	/**
 	 * Surface agent↔agent traffic as a display-only card on the main session
 	 * UI. Skipped when the main agent is either endpoint: as recipient its
-	 * own `deliverIrcMessage` (or `wait` tool result) already shows the
-	 * message, and as sender the irc send tool call already rendered the
-	 * outbound body — relaying it again would duplicate it in the transcript.
+	 * own `deliverIrcMessage` already shows the message, and as sender the
+	 * irc send tool call already rendered the outbound body — relaying it
+	 * again would duplicate it in the transcript.
 	 */
 	#relayToMainUi(message: IrcMessage): void {
 		if (message.to === MAIN_AGENT_ID || message.from === MAIN_AGENT_ID) return;

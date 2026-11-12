@@ -8,6 +8,8 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { ExtensionRuntime, loadExtensionFromFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
+import { USER_AWAIT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-awaits";
+import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
@@ -33,11 +35,12 @@ async function teardown(): Promise<void> {
 }
 
 async function createHarness(options?: {
+	trackWaits?: boolean;
 	extension?: {
 		name: string;
 		register: (api: ExtensionAPI) => void;
 	};
-}): Promise<{ agent: Agent; session: AgentSession; sessionManager: SessionManager }> {
+}): Promise<{ agent: Agent; session: AgentSession; sessionManager: SessionManager; agentRegistry: AgentRegistry }> {
 	const tempDir = TempDir.createSync("@pi-new-session-boundary-");
 	const cwd = tempDir.path();
 	const sessionManager = SessionManager.create(cwd, path.join(cwd, "sessions"));
@@ -60,18 +63,22 @@ async function createHarness(options?: {
 		);
 		extensionRunner = new ExtensionRunner([extension], runtime, cwd, sessionManager, modelRegistry);
 	}
+	const agentRegistry = new AgentRegistry();
 	const session = new AgentSession({
 		agent,
 		sessionManager,
 		settings: Settings.isolated(),
 		modelRegistry,
 		extensionRunner,
+		agentId: options?.trackWaits ? "Main" : undefined,
+		agentRegistry,
 	});
+	if (options?.trackWaits) agentRegistry.register({ id: "Main", displayName: "Main", kind: "main", session });
 	cleanup.push(async () => {
 		await session.dispose();
 		tempDir.removeSync();
 	});
-	return { agent, session, sessionManager };
+	return { agent, session, sessionManager, agentRegistry };
 }
 
 describe("AgentSession.newSession boundary", () => {
@@ -112,6 +119,226 @@ describe("AgentSession.newSession boundary", () => {
 		expect(session.sessionId).toBe(sessionManager.getSessionId());
 	});
 
+	it.each(["reset", "new"] as const)(
+		"retires %s conversation waits without settling outgoing dialogs",
+		async boundary => {
+			const { session, agentRegistry } = await createHarness({ trackWaits: true });
+			await session.goalRuntime.createGoal({ objective: "Original objective" });
+			const oldDecision = Promise.withResolvers<void>();
+			const oldDialog = session.waitForUser(() => oldDecision.promise).catch(error => error);
+			const decision = Promise.withResolvers<void>();
+			let dialog: Promise<void> | undefined;
+			const failure = new Error("Outgoing dialog rejected");
+			try {
+				expect(session.goalRuntime.buildContinuationPrompt()).toBeUndefined();
+				if (boundary === "reset") expect(await session.resetSessionContext()).toBeDefined();
+				else expect(await session.newSession()).toBe(true);
+				await session.goalRuntime.dropGoal();
+				const replacement = await session.goalRuntime.createGoal({ objective: "Replacement objective" });
+				expect(session.isWaitingForUser).toBe(false);
+				expect(session.goalRuntime.buildContinuationPrompt()).toContain("Replacement objective");
+				if (boundary === "reset") {
+					expect(agentRegistry.awaits.blocksOn("Main", USER_AWAIT_ID, Date.now())).toBe(true);
+				}
+
+				dialog = session.waitForUser(() => decision.promise);
+				oldDecision.reject(failure);
+				expect(await oldDialog).toBe(failure);
+				expect(session.isWaitingForUser).toBe(true);
+				expect(agentRegistry.awaits.blocksOn("Main", USER_AWAIT_ID, Date.now())).toBe(true);
+				expect(session.goalRuntime.buildContinuationPrompt()).toBeUndefined();
+				expect(session.getGoalModeState()).toMatchObject({
+					enabled: true,
+					goal: { id: replacement.goal.id, status: "active" },
+				});
+				decision.resolve();
+				await dialog;
+				expect(session.isWaitingForUser).toBe(false);
+				expect(agentRegistry.awaits.blocksOn("Main", USER_AWAIT_ID, Date.now())).toBe(false);
+				expect(session.goalRuntime.buildContinuationPrompt()).toContain("Replacement objective");
+			} finally {
+				oldDecision.resolve();
+				decision.resolve();
+				await oldDialog;
+				await dialog;
+			}
+		},
+	);
+
+	it("does not pause a replacement queued before an original dialog rejects", async () => {
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		let armed = false;
+		const { session } = await createHarness({
+			trackWaits: true,
+			extension: {
+				name: "queued-goal-replacement",
+				register: api =>
+					api.on("goal_updated", async event => {
+						if (armed && event.goal?.objective === "Original objective") {
+							armed = false;
+							entered.resolve();
+							await release.promise;
+						}
+					}),
+			},
+		});
+		await session.goalRuntime.createGoal({ objective: "Original objective" });
+		const decision = Promise.withResolvers<void>();
+		const dialog = session.waitForUser(() => decision.promise).catch(error => error);
+		armed = true;
+		const accounting = session.goalRuntime.onBudgetMutated(100);
+		await entered.promise;
+		const replacement = session.goalRuntime.replaceGoal({ objective: "Replacement objective" });
+		const failure = new Error("Consent rejected");
+		try {
+			decision.reject(failure);
+			await Promise.resolve();
+			expect(session.isWaitingForUser).toBe(true);
+			expect(session.goalRuntime.buildContinuationPrompt()).toBeUndefined();
+			release.resolve();
+			await accounting;
+			const next = await replacement;
+			expect(await dialog).toBe(failure);
+			expect(session.getGoalModeState()).toMatchObject({
+				enabled: true,
+				goal: { id: next.goal.id, objective: "Replacement objective", status: "active" },
+			});
+			expect(session.goalRuntime.buildContinuationPrompt()).toContain("Replacement objective");
+		} finally {
+			release.resolve();
+			decision.resolve();
+			await accounting;
+			await replacement;
+			await dialog;
+		}
+	});
+
+	it.each(["idle", "reset", "new", "dispose"] as const)(
+		"retains a rejected goal-event pause until %s drainage settles",
+		async boundary => {
+			const rejected = Promise.withResolvers<void>();
+			const pauseEntered = Promise.withResolvers<void>();
+			const releasePause = Promise.withResolvers<void>();
+			const failure = new Error("Consent rejected");
+			let rejection: unknown;
+			const harness = await createHarness({
+				trackWaits: true,
+				extension: {
+					name: "reentrant-goal-dialog",
+					register: api =>
+						api.on("goal_updated", async event => {
+							if (event.goal?.status === "active") {
+								try {
+									await session.waitForUser(() => Promise.reject(failure));
+								} catch (error) {
+									rejection = error;
+								}
+								rejected.resolve();
+							} else if (event.goal?.status === "paused") {
+								pauseEntered.resolve();
+								await releasePause.promise;
+							}
+						}),
+				},
+			});
+			const session = harness.session;
+			const creating = session.goalRuntime.createGoal({ objective: "Requires consent" });
+			let idle = false;
+			let settling: Promise<void> | undefined;
+			try {
+				await rejected.promise;
+				await pauseEntered.promise;
+				await creating;
+				expect(rejection).toBe(failure);
+				expect(session.getGoalModeState()).toMatchObject({ enabled: false, goal: { status: "paused" } });
+				expect(session.isWaitingForUser).toBe(true);
+				expect(harness.agentRegistry.awaits.blocksOn("Main", USER_AWAIT_ID, Date.now())).toBe(true);
+				const draining =
+					boundary === "idle"
+						? session.waitForIdle()
+						: boundary === "reset"
+							? session.resetSessionContext()
+							: boundary === "new"
+								? session.newSession()
+								: session.dispose();
+				settling = draining.then(() => {
+					idle = true;
+				});
+				const eventTurn = Promise.withResolvers<void>();
+				setImmediate(eventTurn.resolve);
+				await eventTurn.promise;
+				expect(idle).toBe(false);
+				expect(session.goalRuntime.buildContinuationPrompt()).toBeUndefined();
+			} finally {
+				releasePause.resolve();
+				await creating;
+				await settling;
+			}
+			expect(session.isWaitingForUser).toBe(false);
+			expect(harness.agentRegistry.awaits.blocksOn("Main", USER_AWAIT_ID, Date.now())).toBe(false);
+			expect(idle).toBe(true);
+		},
+	);
+
+	it.each(["idle", "reset"] as const)(
+		"reports reentrant pause persistence failure during %s drainage",
+		async boundary => {
+			const failure = new Error("Goal pause persistence failed");
+			const harness = await createHarness({
+				trackWaits: true,
+				extension: {
+					name: "reentrant-goal-persistence",
+					register: api =>
+						api.on("goal_updated", async event => {
+							if (event.goal?.status === "active") {
+								await session.waitForUser(() => Promise.reject(new Error("Consent rejected"))).catch(() => {});
+							}
+						}),
+				},
+			});
+			const session = harness.session;
+			const appendMode = harness.sessionManager.appendModeChange.bind(harness.sessionManager);
+			const persist = spyOn(harness.sessionManager, "appendModeChange").mockImplementation((...args) => {
+				if (args[0] === "goal_paused") throw failure;
+				return appendMode(...args);
+			});
+			try {
+				await session.goalRuntime.createGoal({ objective: "Requires consent" });
+				const error = await (boundary === "idle" ? session.waitForIdle() : session.resetSessionContext()).catch(
+					error => error,
+				);
+				expect(error).toBeInstanceOf(AggregateError);
+				expect((error as AggregateError).errors).toEqual([failure]);
+				expect(session.isWaitingForUser).toBe(false);
+				expect(harness.agentRegistry.awaits.blocksOn("Main", USER_AWAIT_ID, Date.now())).toBe(false);
+			} finally {
+				persist.mockRestore();
+			}
+		},
+	);
+
+	it("propagates ordinary dialog pause failure to both its caller and transition drainage", async () => {
+		const { session, sessionManager } = await createHarness({ trackWaits: true });
+		await session.goalRuntime.createGoal({ objective: "Requires consent" });
+		const failure = new Error("Goal pause persistence failed");
+		const appendMode = sessionManager.appendModeChange.bind(sessionManager);
+		const persist = spyOn(sessionManager, "appendModeChange").mockImplementation((...args) => {
+			if (args[0] === "goal_paused") throw failure;
+			return appendMode(...args);
+		});
+		try {
+			const dialog = session.waitForUser(() => Promise.reject(new Error("Consent rejected")));
+			await expect(dialog).rejects.toBe(failure);
+			const error = await session.resetSessionContext().catch(error => error);
+			expect(error).toBeInstanceOf(AggregateError);
+			expect((error as AggregateError).errors).toEqual([failure]);
+			expect(session.isWaitingForUser).toBe(false);
+		} finally {
+			persist.mockRestore();
+		}
+	});
+
 	it("keeps unpersisted tree spend when reloading the same session", async () => {
 		const { session, sessionManager } = await createHarness();
 		cfgSessionMaxCost.override(session.settings, 1);
@@ -126,8 +353,8 @@ describe("AgentSession.newSession boundary", () => {
 		expect(() => session.costGate.admit()).toThrow("Cost cap reached");
 	});
 
-	it("restores the outgoing budget when a loaded session switch rolls back", async () => {
-		const { agent, session, sessionManager } = await createHarness();
+	it("restores the outgoing budget and pending wait when a loaded session switch rolls back", async () => {
+		const { agent, session, sessionManager, agentRegistry } = await createHarness({ trackWaits: true });
 		cfgSessionMaxCost.override(session.settings, 1);
 		session.costGate.record(1);
 		await sessionManager.ensureOnDisk();
@@ -139,6 +366,8 @@ describe("AgentSession.newSession boundary", () => {
 		const targetFile = target.getSessionFile();
 		if (!targetFile) throw new Error("Expected target session file");
 		await target.close();
+		const decision = Promise.withResolvers<void>();
+		const dialog = session.waitForUser(() => decision.promise);
 		const replace = spyOn(agent, "replaceMessages").mockImplementationOnce(() => {
 			throw new Error("Target context rejected");
 		});
@@ -147,9 +376,15 @@ describe("AgentSession.newSession boundary", () => {
 			expect(sessionManager.getSessionId()).toBe(previousId);
 			expect(session.costGate.check()).toMatchObject({ spent: 1, cap: 1 });
 			expect(() => session.costGate.admit()).toThrow("Cost cap reached");
+			expect(session.isWaitingForUser).toBe(true);
+			expect(agentRegistry.awaits.blocksOn("Main", USER_AWAIT_ID, Date.now())).toBe(true);
 		} finally {
 			replace.mockRestore();
+			decision.resolve();
+			await dialog;
 		}
+		expect(session.isWaitingForUser).toBe(false);
+		expect(agentRegistry.awaits.blocksOn("Main", USER_AWAIT_ID, Date.now())).toBe(false);
 	});
 
 	it("retires the outgoing budget once a new transcript commits even if its prompt refresh fails", async () => {

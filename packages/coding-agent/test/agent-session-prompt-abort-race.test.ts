@@ -22,6 +22,7 @@ import * as imageLoading from "@oh-my-pi/pi-coding-agent/utils/image-loading";
 import { TempDir, withTimeout } from "@oh-my-pi/pi-utils";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { AskTool } from "@oh-my-pi/pi-coding-agent/tools/ask";
+import { ToolAbortError } from "@oh-my-pi/pi-coding-agent/tools/tool-errors";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
 
 const IMAGE: ImageContent = {
@@ -234,10 +235,13 @@ describe("AgentSession prompt admission racing abort", () => {
 				{ persist: true, providerSessionId: "synthetic-image-provider-session" },
 			);
 			let account = 0;
-			session.setSideRequestOwnerCapture(() => {
-				const original = account;
-				return () => account === original;
-			});
+			session.setSideRequestOwnerCapture(
+				() => {
+					const original = account;
+					return () => account === original;
+				},
+				() => () => false,
+			);
 			const accepted = Promise.withResolvers<void>();
 			const finish = deferredGate();
 			installVisionTransport(async model => {
@@ -466,10 +470,13 @@ describe("AgentSession prompt admission racing abort", () => {
 			let paid = 0;
 			let account = 0;
 			const { session, droppedInputs } = await createSession([], true, { persist: true });
-			session.setSideRequestOwnerCapture(() => {
-				const original = account;
-				return () => account === original;
-			});
+			session.setSideRequestOwnerCapture(
+				() => {
+					const original = account;
+					return () => account === original;
+				},
+				() => () => false,
+			);
 			installVisionTransport(async model => {
 				paid++;
 				return visionResponse(model);
@@ -691,6 +698,8 @@ describe("AgentSession prompt admission racing abort", () => {
 		const { session } = await createSession([], true);
 		await initTheme();
 		const opened = Promise.withResolvers<void>();
+		let current = true;
+		const describeImages = vi.fn(async (): Promise<TextContent[]> => []);
 		const release = deferredGate();
 		const ask = new AskTool({
 			settings: session.settings,
@@ -698,11 +707,13 @@ describe("AgentSession prompt admission racing abort", () => {
 			getSessionId: () => session.sessionId,
 			getActiveModel: () => session.model,
 			isDisposed: () => session.isDisposed,
+			captureOwnerCurrent: () => () => current,
+			describeAttachedImages: describeImages,
 		} as never);
 		const pending = ask.execute(
 			"ask-image",
 			{
-				questions: [{ id: "image", question: "Which image?", options: [{ label: "first" }] }],
+				html: '<form><fieldset><legend>Which image?</legend><label><input type="radio" name="image" value="first">first</label></fieldset></form>',
 			},
 			undefined,
 			undefined,
@@ -713,13 +724,13 @@ describe("AgentSession prompt admission racing abort", () => {
 						opened.resolve();
 						await release.promise;
 						return {
-							kind: "answers",
+							kind: "submit",
 							results: [
 								{
 									id: "image",
 									selectedOptions: ["first"],
-									customInput: "[Image #1]",
-									customInputImages: [IMAGE],
+									note: "See [Image #1]",
+									noteImages: [IMAGE],
 								},
 							],
 						};
@@ -730,9 +741,10 @@ describe("AgentSession prompt admission racing abort", () => {
 		const rejected = observe(pending);
 		await withTimeout(opened.promise, 2_000, "Session admission boundary timed out");
 		if (mode === "disposed") session.beginDispose();
+		else current = false;
 		release.resolve();
-		expect(await rejected).toMatchObject({ error: expect.any(Error) });
-		expect(session.messages.filter(message => message.role === "user")).toEqual([]);
+		expect(await rejected).toMatchObject({ error: expect.any(ToolAbortError) });
+		expect(describeImages).not.toHaveBeenCalled();
 	});
 
 	it("rejects factory-submitted input before deferred guards finish binding", async () => {

@@ -3,7 +3,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { Settings } from "../../src/config/settings";
-import { bridgeValueFromToolResult } from "../../src/eval/js/tool-bridge";
+import { bridgeValueFromToolResult } from "../../src/eval/js/session-tool";
 import { IrcBus } from "../../src/irc/bus";
 import { parseInternalUrl } from "../../src/internal-urls/parse";
 import { AgentProtocolHandler } from "../../src/internal-urls/agent-protocol";
@@ -278,14 +278,18 @@ it("agent:// writes deliver peer messages but reject JSON paths and disabled IRC
 			},
 		} as unknown as AgentSession,
 	});
-	const session = {
+	const session: ToolSession = {
+		cwd: tempDir.path(),
+		hasUI: false,
+		getSessionFile: () => null,
+		getSessionSpawns: () => "*",
 		agentRegistry: registry,
 		getAgentId: () => "Main",
 		settings: Settings.isolated(),
 		taskDepth: 0,
-	} as unknown as ToolSession;
+	};
 	const handler = new AgentProtocolHandler();
-	const context = { session } as never;
+	const context = { session };
 	const receipt = await handler.write(parseInternalUrl("agent://Worker"), "Check context", context);
 	expect(receipt.isError).toBe(false);
 	expect(delivered).toEqual(["Check context"]);
@@ -383,7 +387,16 @@ it.each(["Visuals", "Parent.Child"])(
 
 		const scopedRegistry = new AgentRegistry();
 		scopedRegistry.register({ id, displayName: "scoped", kind: "sub", parentId: "Main", session: wokenSession });
-		const context = { session: { agentRegistry: scopedRegistry } as ToolSession };
+		const context = {
+			session: {
+				cwd: root,
+				hasUI: false,
+				settings: Settings.isolated(),
+				getSessionFile: () => rootSessionFile,
+				getSessionSpawns: () => "*",
+				agentRegistry: scopedRegistry,
+			} satisfies ToolSession,
+		};
 		expect(await handler.locate(parseInternalUrl(url), context)).toBeNull();
 		expect((await handler.resolve(parseInternalUrl(url), context)).notes).toContain(superseded);
 	},

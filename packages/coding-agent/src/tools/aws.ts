@@ -20,6 +20,7 @@ import {
 	untilAborted,
 } from "@oh-my-pi/pi-utils";
 import type { ToolSession } from ".";
+import type { MCPHostCallContext } from "../mcp/types";
 import awsDescription from "../prompts/tools/aws.md" with { type: "text" };
 import { enforceDestructiveCommandGuard, type DcgDecision } from "./destructive-command-guard";
 import {
@@ -34,6 +35,7 @@ import { clampTimeout } from "./tool-timeouts";
 import { readShellWord } from "./shell-tokenize";
 import { OutputSink } from "@oh-my-pi/pi-tui/tools/streaming-output";
 import { cfgToolsMaxTimeout } from "./settings";
+import { ToolAbortError } from "./tool-errors";
 const MAX_AWS_OUTPUT_BYTES = 1024 * 1024;
 
 const PROFILE_CONTROL_RE = /[\u0000-\u001f\u007f]/u;
@@ -153,6 +155,7 @@ interface PreparedAwsCall {
 	dcg?: DcgDecision;
 	expectedIdentity?: AwsIdentity;
 	authRecovery: AwsAuthenticationRecoveryBudget;
+	ownsAuthRecovery: boolean;
 	authenticationGeneration: number;
 	loginReservation?: AwsLoginReservation;
 }
@@ -936,33 +939,58 @@ export interface AwsApprovedLoginResult {
 	declined: boolean;
 }
 
+function assertMcpHostOwner(context: MCPHostCallContext | undefined, signal?: AbortSignal): void {
+	if (!context?.mcpOwnerCurrent && !context?.mcpCheckOwner) return;
+	signal?.throwIfAborted();
+	if (context?.mcpOwnerCurrent?.() === false) throw new ToolAbortError("MCP call owner changed");
+}
+
+async function checkMcpHostOwner(context: MCPHostCallContext | undefined, signal?: AbortSignal): Promise<void> {
+	assertMcpHostOwner(context, signal);
+	if (context?.mcpCheckOwner) {
+		await context.mcpCheckOwner();
+		assertMcpHostOwner(context, signal);
+	}
+}
+
 export async function recoverTrustedAwsAuthentication(
 	profile: string,
 	source: string,
-	context: AgentToolContext | undefined,
+	context: MCPHostCallContext | undefined,
 	signal?: AbortSignal,
 	region?: string,
 	existingTool?: AwsTool,
 ): Promise<boolean> {
 	if (!context?.hasUI || !context.ui || !context.settings) return false;
+	await checkMcpHostOwner(context, signal);
 	const group = (await resolveTrustedAwsProfile(profile))?.ssoGroup;
+	await checkMcpHostOwner(context, signal);
 	if (!group) return false;
 	const { ui, settings } = context;
 	return await untilAborted(signal, () =>
 		awsSessionAuthGroups.recoverOnce(group, async reserveLogin => {
+			await checkMcpHostOwner(context, signal);
 			if (awsSessionAuthGroups.status(group) === "authenticated") {
-				const probe = new AwsTool({
-					cwd: context.sessionManager.getCwd(),
-					hasUI: false,
-					settings,
-					getSessionFile: () => null,
-					getSessionSpawns: () => null,
-				});
+				// Validation runs inside this group's recovery and cannot join that recovery.
+				const probe = new AwsTool(
+					{
+						cwd: context.sessionManager.getCwd(),
+						hasUI: false,
+						settings,
+						getSessionFile: () => null,
+						getSessionSpawns: () => null,
+					},
+					{ attempted: true },
+				);
+				assertMcpHostOwner(context, signal);
 				const validation = await probe.execute(
 					"aws-renewal-authentication-check",
 					{ profile, service: "sts", operation: "get-caller-identity", region, timeout: 15 },
 					signal,
+					undefined,
+					context,
 				);
+				await checkMcpHostOwner(context, signal);
 				if (!validation.isError) return true;
 				if (validation.details?.code !== "AUTH_REQUIRED") return false;
 			}
@@ -980,13 +1008,20 @@ export async function recoverTrustedAwsAuthentication(
 			if (resolveApproval(tool, params, approvalMode, userPolicies).policy === "deny") return false;
 			const callId = `aws-sso-login-${crypto.randomUUID()}`;
 			try {
-				const request = await tool.prepareRuntimeApproval(callId, params, signal, context, reserveLogin);
+				await checkMcpHostOwner(context, signal);
+				assertMcpHostOwner(context, signal);
+				const request = await tool.prepareRuntimeApproval(callId, params, signal, context, () => {
+					assertMcpHostOwner(context, signal);
+					return reserveLogin();
+				});
+				await checkMcpHostOwner(context, signal);
 				if (request) {
 					const capability =
 						existingTool && request.allowSessionApproval === true ? tool.sessionApproval : undefined;
 					const message = `${request.prompt}\nSource: ${source}`;
 					let approveSession = false;
 					let approved: boolean;
+					assertMcpHostOwner(context, signal);
 					if (existingTool) {
 						const choice = await ui.select(
 							`AWS sign-in approval\nReason: ${request.reason}\n${message}`,
@@ -998,7 +1033,9 @@ export async function recoverTrustedAwsAuthentication(
 					} else {
 						approved = await ui.confirm(request.reason, message, { signal, timeout: 120_000 });
 					}
+					await checkMcpHostOwner(context, signal);
 					signal?.throwIfAborted();
+					assertMcpHostOwner(context, signal);
 					if (!approved) {
 						tool.denyRuntimeApproval(callId, params);
 						return false;
@@ -1006,6 +1043,8 @@ export async function recoverTrustedAwsAuthentication(
 					tool.approveRuntimeApproval(callId, params);
 					if (approveSession) capability!.approve();
 				}
+				await checkMcpHostOwner(context, signal);
+				assertMcpHostOwner(context, signal);
 				return !(await tool.execute(callId, params, signal, undefined, context)).isError;
 			} catch (error) {
 				tool.denyRuntimeApproval(callId, params);
@@ -1272,6 +1311,7 @@ export class AwsTool implements AgentTool<typeof awsSchema, AwsToolDetails> {
 			mutation,
 			login,
 			authRecovery: this.authenticationRecovery ?? { attempted: false },
+			ownsAuthRecovery: false,
 			authenticationGeneration: profile.ssoGroup ? awsSessionAuthGroups.generation(profile.ssoGroup) : 0,
 			...(loginProfile ? { loginProfile } : {}),
 			configPath,
@@ -1471,7 +1511,10 @@ export class AwsTool implements AgentTool<typeof awsSchema, AwsToolDetails> {
 		signal?: AbortSignal,
 		onStdout?: (chunk: string) => void,
 		keepStdinOpen = false,
+		context?: MCPHostCallContext,
 	) {
+		if (context?.mcpCheckOwner) await context.mcpCheckOwner();
+		assertMcpHostOwner(context, signal);
 		return await ptree.exec(argv, {
 			cwd: os.tmpdir(),
 			env,
@@ -1494,7 +1537,7 @@ export class AwsTool implements AgentTool<typeof awsSchema, AwsToolDetails> {
 		signal?: AbortSignal,
 	): Promise<boolean> {
 		if (prepared.authRecovery.attempted) {
-			if (prepared.profile.ssoGroup)
+			if (prepared.ownsAuthRecovery && prepared.profile.ssoGroup)
 				awsSessionAuthGroups.recordAuthenticationFailure(
 					prepared.profile.ssoGroup,
 					prepared.authenticationGeneration,
@@ -1502,6 +1545,7 @@ export class AwsTool implements AgentTool<typeof awsSchema, AwsToolDetails> {
 			return false;
 		}
 		prepared.authRecovery.attempted = true;
+		prepared.ownsAuthRecovery = true;
 		const authenticated = await recoverTrustedAwsAuthentication(
 			prepared.params.profile,
 			source,
@@ -1523,7 +1567,7 @@ export class AwsTool implements AgentTool<typeof awsSchema, AwsToolDetails> {
 		context?: AgentToolContext,
 	): Promise<AwsIdentity> {
 		try {
-			return await this.#verifyIdentity(prepared, env, timeoutMs, signal);
+			return await this.#verifyIdentity(prepared, env, timeoutMs, signal, context);
 		} catch (error) {
 			if (!(error instanceof ToolError) || error.context?.code !== "AUTH_REQUIRED") throw error;
 			if (
@@ -1532,7 +1576,7 @@ export class AwsTool implements AgentTool<typeof awsSchema, AwsToolDetails> {
 				throw new AwsToolError(`${error.message}\n${await describeTrustedAwsLogin(prepared.params.profile)}`);
 			}
 			try {
-				return await this.#verifyIdentity(prepared, env, timeoutMs, signal);
+				return await this.#verifyIdentity(prepared, env, timeoutMs, signal, context);
 			} catch (retryError) {
 				if (
 					retryError instanceof ToolError &&
@@ -1554,6 +1598,7 @@ export class AwsTool implements AgentTool<typeof awsSchema, AwsToolDetails> {
 		env: Record<string, string>,
 		timeoutMs: number,
 		signal?: AbortSignal,
+		context?: AgentToolContext,
 	): Promise<AwsIdentity> {
 		if (prepared.profile.ssoGroup)
 			prepared.authenticationGeneration = awsSessionAuthGroups.generation(prepared.profile.ssoGroup);
@@ -1573,6 +1618,9 @@ export class AwsTool implements AgentTool<typeof awsSchema, AwsToolDetails> {
 			env,
 			timeoutMs,
 			signal,
+			undefined,
+			false,
+			context,
 		);
 		if (!identity.ok) {
 			const code = awsFailureCode(identity.stderr, identity.exitError instanceof ptree.TimeoutError) ?? "AWS_ERROR";
@@ -1608,7 +1656,7 @@ export class AwsTool implements AgentTool<typeof awsSchema, AwsToolDetails> {
 		params: AwsToolParams,
 		signal?: AbortSignal,
 		_onUpdate?: AgentToolUpdateCallback<AwsToolDetails, typeof awsSchema>,
-		context?: AgentToolContext,
+		context?: MCPHostCallContext,
 	): Promise<AgentToolResult<AwsToolDetails>> {
 		const fingerprint = JSON.stringify(params);
 		const sessionId = this.#getSessionId();
@@ -1656,6 +1704,8 @@ export class AwsTool implements AgentTool<typeof awsSchema, AwsToolDetails> {
 				) {
 					throw new AwsToolError("AUTH_REQUIRED: explicit AWS SSO login approval is required");
 				}
+				if (context?.mcpCheckOwner) await context.mcpCheckOwner();
+				assertMcpHostOwner(context, signal);
 				const loginResult = await awsSessionAuthGroups.runApprovedLogin(prepared.loginReservation, async () => {
 					let pending = "";
 					const ui = context?.ui;
@@ -1674,6 +1724,8 @@ export class AwsTool implements AgentTool<typeof awsSchema, AwsToolDetails> {
 									}
 								}
 							: undefined,
+						false,
+						context,
 					);
 					if (pending) ui?.notify(redactAwsOutput(pending), "info");
 					return result.ok;
@@ -1730,6 +1782,7 @@ export class AwsTool implements AgentTool<typeof awsSchema, AwsToolDetails> {
 				signal,
 				undefined,
 				prepared.sessionManagerBin !== undefined,
+				context,
 			);
 			if (
 				!result.ok &&
@@ -1764,6 +1817,7 @@ export class AwsTool implements AgentTool<typeof awsSchema, AwsToolDetails> {
 					signal,
 					undefined,
 					prepared.sessionManagerBin !== undefined,
+					context,
 				);
 				if (!result.ok && awsFailureCode(result.stderr, false) === "AUTH_REQUIRED" && prepared.profile.ssoGroup) {
 					awsSessionAuthGroups.recordAuthenticationFailure(

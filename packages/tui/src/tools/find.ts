@@ -61,9 +61,16 @@ export interface FindHit {
 /**
  * How much of a search the judge actually covered. `unavailable`: every judge
  * request failed, so an empty result is not evidence of absence. `partial`:
- * some requests failed. `complete`: none failed (or none were needed).
+ * some requests failed, or the call's deadline cut verification short.
+ * `complete`: none failed (or none were needed).
  */
 export type FindCoverage = "complete" | "partial" | "unavailable";
+
+/** Verification cut short by the call's deadline: complete passages verified of those routed to it. */
+export interface FindTimeout {
+	verified: number;
+	passages: number;
+}
 
 /** Search accounting reported alongside the hits. */
 export interface FindStats {
@@ -100,6 +107,8 @@ export interface FindToolDetails {
 	hits: FindHit[];
 	coverage: FindCoverage;
 	stats: FindStats;
+	/** Set when the deadline ended verification; the hits are those verified before it. */
+	timeout?: FindTimeout;
 	elapsedMs: number;
 	/** Session cwd; hit paths are relative to it. */
 	cwd: string;
@@ -310,11 +319,18 @@ export const findToolRenderer = {
 		if (failed) meta.push(uiTheme.fg("warning", failed));
 		const unanswered = stats.unanswered > 0 ? `${stats.unanswered} unanswered` : undefined;
 		if (unanswered) meta.push(uiTheme.fg("warning", unanswered));
+		const { timeout } = details;
+		if (timeout)
+			meta.push(uiTheme.fg("warning", `timed out, ${timeout.verified}/${timeout.passages} passages verified`));
 
 		if (hits.length === 0) {
 			const emptyMeta = ["0 hits", ...scope, `$${stats.cost.toFixed(4)}`, formatDuration(details.elapsedMs)];
 			if (failed) emptyMeta.push(uiTheme.fg("warning", failed));
 			if (unanswered) emptyMeta.push(uiTheme.fg("warning", unanswered));
+			if (timeout)
+				emptyMeta.push(
+					uiTheme.fg("warning", `timed out, ${timeout.verified}/${timeout.passages} passages verified`),
+				);
 			const header = renderStatusLine(
 				{ icon: "warning", title: "Find", titleColor: "toolTitle", description, meta: emptyMeta },
 				uiTheme,
@@ -412,6 +428,10 @@ export const findToolRenderer = {
 		const failed =
 			stats.failed > 0 ? [span(`${stats.failed}/${stats.requests} requests failed`, "warning")] : undefined;
 		const unanswered = stats.unanswered > 0 ? [span(`${stats.unanswered} unanswered`, "warning")] : undefined;
+		const { timeout } = details;
+		const timedOut = timeout
+			? [span(`timed out, ${timeout.verified}/${timeout.passages} passages verified`, "warning")]
+			: undefined;
 		const accounting = [
 			`${stats.filesRead} files read`,
 			`τ ${threshold.toFixed(2)}`,
@@ -458,6 +478,7 @@ export const findToolRenderer = {
 					scope,
 					failed,
 					unanswered,
+					timedOut,
 				]),
 			),
 			inline: true,

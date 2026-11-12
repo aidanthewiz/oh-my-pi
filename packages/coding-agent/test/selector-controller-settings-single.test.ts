@@ -14,7 +14,7 @@ import { SessionObserverRegistry } from "@oh-my-pi/pi-tui/overlays/session-obser
 import * as activityClient from "@oh-my-pi/pi-coding-agent/stats/activity-client";
 import * as sessionPins from "@oh-my-pi/pi-coding-agent/session/session-pins";
 import { cfgTaskAgentModelOverrides } from "@oh-my-pi/pi-coding-agent/task/settings";
-import type { SessionInfo } from "@oh-my-pi/pi-coding-agent/session/session-listing";
+import type { PickerListing, SessionInfo } from "@oh-my-pi/pi-coding-agent/session/session-listing";
 import * as themeModule from "@oh-my-pi/pi-tui/theme";
 import { createInteractiveModeContext } from "./helpers/interactive-mode-context";
 
@@ -400,7 +400,8 @@ describe("single-instance menus", () => {
 			firstMessage: "Inspect the old session",
 			allMessagesText: "Inspect the old session",
 		};
-		spyOn(SessionManager, "listForPicker").mockResolvedValue([session]);
+		const listed = [session];
+		spyOn(SessionManager, "listForPicker").mockResolvedValue({ sessions: listed, complete: Promise.resolve(listed) });
 		spyOn(sessionPins, "loadPinnedSessionIds").mockResolvedValue(new Set());
 		const { ui, shown, overlayStack } = overlayUi();
 		const ctx = createInteractiveModeContext({
@@ -433,8 +434,10 @@ describe("single-instance menus", () => {
 	});
 
 	it("does not let an older session listing replace the current selection-only picker", async () => {
-		const first = Promise.withResolvers<SessionInfo[]>();
-		spyOn(SessionManager, "listForPicker").mockReturnValueOnce(first.promise).mockResolvedValue([]);
+		const first = Promise.withResolvers<PickerListing>();
+		spyOn(SessionManager, "listForPicker")
+			.mockReturnValueOnce(first.promise)
+			.mockResolvedValue({ sessions: [], complete: Promise.resolve([]) });
 		spyOn(sessionPins, "loadPinnedSessionIds").mockResolvedValue(new Set());
 		const { ui, shown, overlayStack, getFocused } = overlayUi();
 		const ctx = createInteractiveModeContext({
@@ -451,7 +454,7 @@ describe("single-instance menus", () => {
 		const current = overlayStack.at(-1)?.component;
 		if (!(current instanceof SessionSelectorComponent)) throw new Error("Expected current session picker");
 		expect(getFocused()).toBe(current);
-		first.resolve([]);
+		first.resolve({ sessions: [], complete: Promise.resolve([]) });
 		await oldRequest;
 		expect(shown).toHaveLength(1);
 		expect(overlayStack.at(-1)?.component).toBe(current);

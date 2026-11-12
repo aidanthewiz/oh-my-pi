@@ -10,7 +10,7 @@ import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manage
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
 
-async function runPrewalkResumeCase(inherited: boolean): Promise<void> {
+async function runPrewalkResumeCase(inherited: boolean, disableModelFallback = false): Promise<void> {
 	using temp = TempDir.createSync("@pi-prewalk-resume-intent-");
 	const source = "test/sdk-prewalk-resume-intent";
 	const authStorage = createInMemoryAuthStorage();
@@ -81,6 +81,7 @@ async function runPrewalkResumeCase(inherited: boolean): Promise<void> {
 			model,
 			thinkingLevel: Effort.High,
 			prewalk: { target: model, thinkingLevel: Effort.Low },
+			disableModelFallback,
 			...(inherited ? { prewalkInherited: true } : {}),
 			bindProcessState: false,
 			disableExtensionDiscovery: true,
@@ -116,7 +117,7 @@ async function runPrewalkResumeCase(inherited: boolean): Promise<void> {
 		expect(model.calls.map(call => call.options?.reasoning)).toEqual([
 			Effort.High,
 			Effort.High,
-			inherited ? Effort.High : Effort.Low,
+			inherited || disableModelFallback ? Effort.High : Effort.Low,
 		]);
 		expect(
 			manager
@@ -146,3 +147,9 @@ async function runPrewalkResumeCase(inherited: boolean): Promise<void> {
 it("honors a fresh explicit effort-only prewalk after a persisted handoff", () => runPrewalkResumeCase(false), 30_000);
 
 it("does not replay an inherited arm after the operator changed only effort", () => runPrewalkResumeCase(true), 30_000);
+
+it(
+	"keeps the approved effort of an exact-model request instead of applying a configured prewalk",
+	() => runPrewalkResumeCase(false, true),
+	30_000,
+);

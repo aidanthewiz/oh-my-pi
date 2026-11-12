@@ -1,4 +1,5 @@
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
+import { isRecord } from "@oh-my-pi/pi-utils";
 import { JsRuntime, type RuntimeCallIdentity, type RuntimeHooks, shadowSnapshotDigest } from "./shared/runtime";
 import type {
 	RunErrorPayload,
@@ -67,6 +68,8 @@ export type WorkerCoreOptions =
 
 /** Finished eval runs retained for attributing rejections that surface after the run settled. */
 const RECENT_CELL_RUNS_MAX = 256;
+/** Detailed late errors shown by the next cell before summarizing the remainder. */
+const LATE_REJECTION_NOTICES_MAX = 10;
 
 function errorPayload(error: unknown): RunErrorPayload {
 	if (error instanceof Error) {
@@ -119,6 +122,8 @@ export class WorkerCore {
 	#runs = new Map<string, ActiveRun>();
 	#pendingTools = new Map<string, PendingTool>();
 	#recentCells = new Map<string, string>();
+	#lateRejections: string[] = [];
+	#omittedLateRejections = 0;
 	#unsubscribe: () => void;
 	#uninstallRejectionGuard: () => void;
 	#options: WorkerCoreOptions;
@@ -174,15 +179,7 @@ export class WorkerCore {
 				owner.floatingRejections.push(reason);
 				return true;
 			}
-			const filename = this.#recentCells.get(promiseRunId);
-			this.#transport.send({
-				type: "log",
-				level: "warn",
-				msg: filename
-					? "Unhandled rejection from a finished eval cell (missing await?)"
-					: "Unhandled rejection from an unknown finished eval cell",
-				meta: { runId: promiseRunId, filename, error: errorPayload(reason) },
-			});
+			this.#reportLateRejection(this.#recentCells.get(promiseRunId), reason, promiseRunId);
 			return true;
 		}
 		const stack = reason instanceof Error && typeof reason.stack === "string" ? reason.stack : undefined;
@@ -213,12 +210,7 @@ export class WorkerCore {
 				}
 			}
 			if (recent) {
-				this.#transport.send({
-					type: "log",
-					level: "warn",
-					msg: "Unhandled rejection from a finished eval cell (missing await?)",
-					meta: { filename: recent, error: errorPayload(reason) },
-				});
+				this.#reportLateRejection(recent, reason);
 				return true;
 			}
 		}
@@ -240,6 +232,23 @@ export class WorkerCore {
 			return true;
 		}
 		return false;
+	}
+
+	#reportLateRejection(filename: string | undefined, reason: unknown, runId?: string): void {
+		const payload = errorPayload(reason);
+		if (this.#lateRejections.length < LATE_REJECTION_NOTICES_MAX) {
+			this.#lateRejections.push(
+				`Unhandled rejection from finished eval cell ${filename ?? runId ?? "unknown"} (missing await?): ${payload.stack ?? `${payload.name ?? "Error"}: ${payload.message}`}\n`,
+			);
+		} else {
+			this.#omittedLateRejections++;
+		}
+		this.#transport.send({
+			type: "log",
+			level: "warn",
+			msg: "Unhandled rejection from a finished eval cell (missing await?)",
+			meta: { runId, filename, error: payload },
+		});
 	}
 
 	#handle(msg: WorkerInbound): void {
@@ -389,6 +398,11 @@ export class WorkerCore {
 				};
 			},
 		};
+		for (const notice of this.#lateRejections.splice(0)) hooks.onText(notice);
+		if (this.#omittedLateRejections > 0) {
+			hooks.onText(`… and ${this.#omittedLateRejections} more late rejections from finished eval cells.\n`);
+			this.#omittedLateRejections = 0;
+		}
 		let result: RunResult;
 		try {
 			const runtime = this.#ensureRuntime(snapshot, runId);
@@ -529,6 +543,21 @@ export class WorkerCore {
 		}
 		try {
 			return await promise;
+		} catch (error) {
+			// Bridge errors are constructed outside the cell, so retain its origin
+			// even when the call rejects after the run has finished.
+			this.#rememberCell(active.runId, active.filename);
+			if (error instanceof Error) {
+				let call = name;
+				if (name === "__prelude__" && isRecord(args) && typeof args.name === "string") {
+					call = args.name;
+					if (isRecord(args.parameters) && typeof args.parameters.action === "string") {
+						call += `.${args.parameters.action}`;
+					}
+				}
+				error.stack = `${error.stack ?? error.message}\n    at ${call} (${active.filename})`;
+			}
+			throw error;
 		} finally {
 			active.pendingTools.delete(id);
 			this.#notifyToolDrain(active);

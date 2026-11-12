@@ -98,6 +98,73 @@ describe("focused subagent view slash commands", () => {
 		expect(raw.showError).toHaveBeenCalledTimes(1);
 	});
 
+	it("resumes the focused session for . and c", async () => {
+		for (const shortcut of [".", "c"]) {
+			const { prompt, resume, editor, raw } = await submit(shortcut);
+			expect(resume).toHaveBeenCalledTimes(1);
+			expect(prompt).not.toHaveBeenCalled();
+			expect(editor.clearDraft).toHaveBeenCalledWith(shortcut);
+			expect(raw.withLocalSubmission).not.toHaveBeenCalled();
+		}
+	});
+
+	it("runs /usage from the focused view", async () => {
+		const { raw, prompt } = await submit("/usage");
+		expect(raw.handleUsageCommand).toHaveBeenCalledTimes(1);
+		expect(prompt).not.toHaveBeenCalled();
+	});
+
+	it("runs /jobs from the focused view", async () => {
+		for (const [text, full] of [
+			["/jobs", false],
+			["/jobs full", true],
+		] as const) {
+			const { raw, prompt } = await submit(text);
+			expect(raw.handleJobsCommand).toHaveBeenCalledTimes(1);
+			expect(raw.handleJobsCommand).toHaveBeenCalledWith({ full });
+			expect(prompt).not.toHaveBeenCalled();
+		}
+	});
+
+	it("runs /export with its arguments from the focused view", async () => {
+		const { raw, prompt } = await submit("/export out.html");
+		expect(raw.handleExportCommand).toHaveBeenCalledWith("/export out.html");
+		expect(prompt).not.toHaveBeenCalled();
+	});
+
+	it("runs /btw with its question from the focused view instead of steering the agent", async () => {
+		const { raw, prompt } = await submit("/btw what is it doing?");
+		expect(raw.handleBtwCommand).toHaveBeenCalledWith("what is it doing?", undefined);
+		expect(prompt).not.toHaveBeenCalled();
+	});
+
+	it("answers a side file command from the focused view and releases its draft", async () => {
+		const focused = createFocusedContext();
+		Object.assign(focused.raw, { fileSlashCommands: new Set(["sitrep"]) });
+		Object.assign(focused.raw.session, {
+			slashCommands: [
+				{
+					name: "sitrep",
+					description: "",
+					content: "Report. Focus: $ARGUMENTS",
+					side: true,
+					source: "via OMP User",
+				},
+			],
+		});
+		const controller = new InputController(focused.ctx);
+		controller.setupEditorSubmitHandler();
+		focused.editor.setText("/sitrep the migration");
+		await focused.ctx.editor.onSubmit?.("/sitrep the migration");
+		expect(focused.raw.handleBtwCommand).toHaveBeenCalledWith(
+			"Report. Focus: the migration",
+			undefined,
+			"/sitrep the migration",
+		);
+		expect(focused.editor.clearDraft).toHaveBeenCalledTimes(1);
+		expect(focused.prompt).not.toHaveBeenCalled();
+	});
+
 	it("keeps a builtin gated to the main session when a side file command shares its name", async () => {
 		const focused = createFocusedContext();
 		Object.assign(focused.raw, { fileSlashCommands: new Set(["clear"]) });

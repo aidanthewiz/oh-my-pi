@@ -33,7 +33,9 @@
 
 Supported internal and external URL lists split before scope resolution. Each target keeps its own selectors and URL query/path semicolons, including `https://example.test/a?x=1;y=2;https://example.test/b`.
 
-Recognized URL starts or existing local filenames after a semicolon take precedence as list boundaries. Percent-encode a URL-owned semicolon as `%3B` when the following text would otherwise identify such a target. Existing literal filenames, escaped delimiters, and brace-enclosed delimiters remain intact.
+Recognized hierarchical URL starts, supported collapsed HTTP spellings, registered single-slash aliases, readable bare URLs, and existing local filenames after a semicolon take precedence as list boundaries. Opaque `scheme:value` fragments alone do not split a hierarchical URL: `virtual://report;version:abc` remains one resource. Use a JSON-encoded path array to select a separate opaque URI when a semicolon list is ambiguous.
+
+Percent-encode a URL-owned semicolon as `%3B` when the following text would otherwise identify another target. Existing literal filenames, escaped delimiters, and brace-enclosed delimiters remain intact.
 
 Validated local comma or whitespace lists, including `Makefile:1-1, README:1-1`, recover before opaque custom-scheme fallback. This recovery does not split candidates containing recognized URL targets.
 

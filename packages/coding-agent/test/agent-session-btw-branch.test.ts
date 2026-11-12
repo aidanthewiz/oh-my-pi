@@ -10,6 +10,7 @@ import { loadAdvisorTranscriptCosts } from "@oh-my-pi/pi-coding-agent/advisor/tr
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
+import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
@@ -79,6 +80,7 @@ describe("AgentSession.branchFromBtw", () => {
 		extensionRunner?: ExtensionRunner;
 		handler?: MockHandler;
 		model?: Model<Api>;
+		sdk?: boolean;
 	}) {
 		const model = options?.model ?? getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		const mock = createMockModel({ handler: options?.handler ?? (() => ({ content: ["unused"] })) });
@@ -92,14 +94,36 @@ describe("AgentSession.branchFromBtw", () => {
 		const settings = Settings.isolated({ "compaction.enabled": false });
 		authStorage = await AuthStorage.create(":memory:");
 		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
-		authStorage.keys.setRuntime("anthropic", "test-key");
-		session = new AgentSession({
-			agent,
-			sessionManager,
-			settings,
-			modelRegistry,
-			extensionRunner: options?.extensionRunner,
-		});
+		authStorage.keys.setRuntime(model.provider, "test-key");
+		if (options?.sdk) {
+			({ session } = await createAgentSession({
+				cwd: tempDir,
+				agentDir: tempDir,
+				sessionManager,
+				settings,
+				modelRegistry,
+				model,
+				bindProcessState: false,
+				agentId: "btw-owner",
+				disableExtensionDiscovery: true,
+				skills: [],
+				contextFiles: [],
+				promptTemplates: [],
+				slashCommands: [],
+				enableMCP: false,
+				enableLsp: false,
+				skipPythonPreflight: true,
+			}));
+			session.agent.streamFn = mock.stream;
+		} else {
+			session = new AgentSession({
+				agent,
+				sessionManager,
+				settings,
+				modelRegistry,
+				extensionRunner: options?.extensionRunner,
+			});
+		}
 		return session;
 	}
 
@@ -222,6 +246,46 @@ describe("AgentSession.branchFromBtw", () => {
 		);
 	});
 
+	it("admits only the SDK branch's captured image preparation owner during its transition", async () => {
+		const started = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const describe = vi
+			.spyOn(imageVisionFallback, "describeAttachedImagesForTextModel")
+			.mockImplementation(async () => {
+				started.resolve();
+				await release.promise;
+				return [{ type: "text", text: "The approved branch caption." }];
+			});
+		const activeSession = await createSession({
+			sdk: true,
+			model: getBundledModel("deepseek", "deepseek-v4-flash")!,
+		});
+		activeSession.sessionManager.appendMessage({ role: "user", content: "seed", timestamp: 1 });
+		await activeSession.sessionManager.flush();
+		const image: ImageContent = { type: "image", data: "c2NyZWVuc2hvdA==", mimeType: "image/png" };
+		const branch = activeSession.branchFromBtw(
+			"Promote the image.",
+			createBtwAssistant(),
+			requiredLeafId(activeSession),
+			activeSession.sessionId,
+			[image],
+		);
+		try {
+			await started.promise;
+			expect(await activeSession.describeAttachedImages([image])).toEqual([]);
+			expect(describe).toHaveBeenCalledTimes(1);
+			release.resolve();
+			await branch;
+			expect(activeSession.messages.at(-2)).toMatchObject({
+				role: "user",
+				content: [{ type: "text", text: "Promote the image." }, image],
+			});
+		} finally {
+			release.resolve();
+			await branch;
+		}
+	});
+
 	it("does not commit a caption whose model route changes while it is pending", async () => {
 		const started = Promise.withResolvers<void>();
 		const release = Promise.withResolvers<void>();
@@ -230,16 +294,9 @@ describe("AgentSession.branchFromBtw", () => {
 			await release.promise;
 			return [{ type: "text", text: "Caption from the retired route." }];
 		});
-		let beforeBranchCalls = 0;
-		const extensionRunner = {
-			hasHandlers: (eventType: string) => eventType === "session_before_branch",
-			emit: async (event: { type: string }) => {
-				if (event.type === "session_before_branch") beforeBranchCalls++;
-			},
-		} as unknown as ExtensionRunner;
 		const activeSession = await createSession({
-			extensionRunner,
-			model: { ...getBundledModel("anthropic", "claude-sonnet-4-5")!, input: ["text"] },
+			sdk: true,
+			model: getBundledModel("deepseek", "deepseek-v4-flash")!,
 		});
 		activeSession.sessionManager.appendMessage({ role: "user", content: "seed", timestamp: 1 });
 		await activeSession.sessionManager.flush();
@@ -263,7 +320,6 @@ describe("AgentSession.branchFromBtw", () => {
 			activeSession.agent.setModel({ ...current, baseUrl: "https://replacement.invalid" });
 			release.resolve();
 			expect(String(await outcome)).toContain("image preparation owner changed");
-			expect(beforeBranchCalls).toBe(1);
 			expect(activeSession.sessionFile).toBe(originalFile);
 			expect(activeSession.sessionManager.getSessionId()).toBe(originalId);
 			expect(JSON.stringify(activeSession.sessionManager.getBranch())).not.toContain(

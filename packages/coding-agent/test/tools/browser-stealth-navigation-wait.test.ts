@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import {
+	closeLaunchedBrowser,
 	isPuppeteerTimeout,
 	launchHeadlessBrowser,
 	removeUserDataDir,
@@ -35,7 +36,7 @@ test.skipIf(!CHROMIUM_AVAILABLE)(
 				if (userDataDir) await removeUserDataDir(userDataDir);
 			},
 		};
-		await using _browserCleanup = { [Symbol.asyncDispose]: () => browser.close() };
+		await using _browserCleanup = { [Symbol.asyncDispose]: () => closeLaunchedBrowser(browser) };
 		const context = await browser.createBrowserContext();
 		await using _contextCleanup = { [Symbol.asyncDispose]: () => context.close() };
 		const checkout = await context.newPage();

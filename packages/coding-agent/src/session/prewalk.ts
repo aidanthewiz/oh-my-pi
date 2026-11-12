@@ -44,8 +44,11 @@ const PLAN_YOLO_HANDOFF_MESSAGE_TYPE = "plan-yolo-handoff";
 
 /**
  * Whether a completed tool result is the first workspace-mutating action that
- * arms the prewalk hand-off. A direct `edit`/`write` call always counts; a
- * `write` that dispatched an `xd://` device (e.g. `lsp`, `ast_edit`, `debug`)
+ * arms the prewalk hand-off. A direct `edit`/`write` call counts unless the
+ * write touched no files: a subagent messaging its parent through
+ * `write agent://…`, a reply, or a background-work cancellation is
+ * coordination, not implementation, and must not hand the plan off. A `write`
+ * that dispatched an `xd://` device (e.g. `lsp`, `ast_edit`, `debug`)
  * counts only when the wrapped tool resolved to a `write`/`exec` approval tier.
  * Read-only device calls — LSP navigation, `debug` inspection, `ast_edit` on
  * internal URLs, help lookups — leave the tier `read` (or absent) and must not
@@ -56,8 +59,10 @@ const PLAN_YOLO_HANDOFF_MESSAGE_TYPE = "plan-yolo-handoff";
 function isPrewalkImplementationAction(result: ToolResultMessage): boolean {
 	if (!PREWALK_ACTION_TOOLS[result.toolName]) return false;
 	const details = result.details;
+	if (!details || typeof details !== "object") return true;
+	if ("touchesNoFiles" in details && details.touchesNoFiles === true) return false;
 	// A direct filesystem edit/write carries no `xd://` dispatch metadata.
-	if (!details || typeof details !== "object" || !("xdev" in details) || !details.xdev) return true;
+	if (!("xdev" in details) || !details.xdev) return true;
 	const xdev = details.xdev;
 	// Device dispatch: switch only on a genuine mutation tier. An absent tier
 	// (help lookup, unresolved approval) declines the switch.
@@ -107,6 +112,7 @@ export interface PrewalkCoordinatorOptions {
 	planYolo?: PlanYolo;
 	/** Keep `prewalk.auto` away from this session until `/new` (`--no-prewalk`). */
 	suppressAutoPrewalk?: boolean;
+	disableModelFallback?: boolean;
 }
 
 /** The models around a completed handoff, kept to return to the planning model. */
@@ -136,10 +142,12 @@ export class PrewalkCoordinator {
 	#autoArm: Prewalk | undefined;
 	/** Session-local opt-out from auto-prewalk: `/prewalk off`, or `--no-prewalk` at startup. `/new` clears it. */
 	#autoSuppressed: boolean;
+	readonly #disableModelFallback: boolean;
 
 	constructor(host: PrewalkCoordinatorHost, options: PrewalkCoordinatorOptions = {}) {
 		this.#host = host;
-		const prewalk = options.prewalk;
+		this.#disableModelFallback = options.disableModelFallback === true;
+		const prewalk = this.#disableModelFallback ? undefined : options.prewalk;
 		const handoff = prewalk ? host.sessionManager.getSessionLocalModelChange() : undefined;
 		const target = prewalk ? `${prewalk.target.provider}/${prewalk.target.id}` : undefined;
 		const current = host.model();
@@ -149,7 +157,7 @@ export class PrewalkCoordinator {
 			handoff.model === target &&
 			`${current?.provider}/${current?.id}` === target;
 		this.#prewalk = spent ? undefined : prewalk;
-		this.#planYolo = options.planYolo;
+		this.#planYolo = this.#disableModelFallback ? undefined : options.planYolo;
 		this.#autoSuppressed = options.suppressAutoPrewalk === true;
 	}
 
@@ -188,6 +196,11 @@ export class PrewalkCoordinator {
 
 	/** Retire the outgoing cycle and prepare a configured prewalk for a fresh main session. */
 	async resetForNewSession(enabled: boolean): Promise<void> {
+		if (this.#disableModelFallback) {
+			this.#clearPrewalkState();
+			this.releaseHandoff();
+			return;
+		}
 		const handoff = this.#handoff;
 		this.#autoSuppressed = false;
 		const restoreSource =
@@ -243,7 +256,8 @@ export class PrewalkCoordinator {
 
 	/** Effective `prewalk.auto` mode: session opt-outs and plan mode (whose plan-file write would trip a handoff) turn it off. */
 	#autoMode(): "off" | "suggest" | "on" {
-		if (this.#autoSuppressed || this.#host.getPlanModeState()?.enabled === true) return "off";
+		if (this.#disableModelFallback || this.#autoSuppressed || this.#host.getPlanModeState()?.enabled === true)
+			return "off";
 		return cfgPrewalkAuto.get(this.#host.settings);
 	}
 
@@ -416,6 +430,7 @@ export class PrewalkCoordinator {
 
 	/** Arms a prewalk immediately for an explicit slash-command request; it takes over a matching auto arm. */
 	arm(target: Model, thinkingLevel?: ConfiguredThinkingLevel): boolean {
+		if (this.#disableModelFallback) return false;
 		const active = this.#prewalk;
 		if (active) {
 			this.#host.emitNotice(
@@ -472,6 +487,7 @@ export class PrewalkCoordinator {
 		target: Model,
 		targetThinkingLevel: ConfiguredThinkingLevel | undefined,
 	): Promise<PrewalkRestartResult> {
+		if (this.#disableModelFallback) return "rejected";
 		const active = this.#prewalk;
 		if (
 			active &&

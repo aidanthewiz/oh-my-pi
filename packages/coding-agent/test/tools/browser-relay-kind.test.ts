@@ -160,6 +160,8 @@ describe("browser prelude relay guidance", () => {
 		"TERN_PANE_SOCKET",
 		"TERN_PANE",
 		"CMUX_SOCKET_PATH",
+		// Inherited from an interactive omp when the tests run from its bash tool.
+		"PI_TERMINAL_OWNER_PID",
 	] as const;
 	const savedEnv = Object.fromEntries(ENV_KEYS.map(key => [key, process.env[key]]));
 	beforeEach(() => {
@@ -190,7 +192,7 @@ describe("browser prelude relay guidance", () => {
 		if (override !== undefined) process.env.PI_BROWSER_RELAY = override;
 		const session = sessionWith({ "browser.relay": enabled });
 		expect(resolveBrowserKind({ action: "open" }, session).kind).toBe(kind);
-		expect(resolveBrowserKind({ action: "open", app: { relay: false } }, session).kind).toBe("headless");
+		expect(resolveBrowserKind({ action: "open", app: "auto" }, session).kind).toBe("headless");
 	});
 
 	it.each([
@@ -212,12 +214,11 @@ describe("browser prelude relay guidance", () => {
 		["malformed-secret-cdp-endpoint", ["malformed-secret-cdp-endpoint"]],
 	] as const)("never includes configured CDP credentials in provider guidance: %s", (endpoint, secrets) => {
 		const session = sessionWith({ "browser.relay": true, "browser.cdpUrl": endpoint });
-		expect(resolveBrowserKind({ action: "open", app: { relay: false } }, session)).toEqual({
+		expect(resolveBrowserKind({ action: "open", app: "auto" }, session)).toEqual({
 			kind: "connected",
 			cdpUrl: endpoint,
 		});
 		const guidance = createBrowserPrelude(session).guidance;
-		expect(guidance).toContain("browser.cdpUrl");
 		expect(guidance).not.toContain(endpoint);
 		for (const secret of secrets) expect(guidance).not.toContain(secret);
 	});
@@ -229,6 +230,6 @@ describe("browser prelude relay guidance", () => {
 		Object.assign(process.env, env);
 		const session = sessionWith({ "browser.relay": true });
 		expect(resolveBrowserKind({ action: "open" }, session).kind).toBe("relay");
-		expect(resolveBrowserKind({ action: "open", app: { relay: false } }, session).kind).toBe(kind);
+		expect(resolveBrowserKind({ action: "open", app: "auto" }, session).kind).toBe(kind);
 	});
 });

@@ -229,7 +229,7 @@ describe("EventController — error toast gated while auto-retry is pending", ()
 					},
 				},
 			});
-			if (boundary !== "local-idle") ctx.collabGuest = {} as NonNullable<typeof ctx.collabGuest>;
+			if (boundary !== "local-idle") ctx.setCollabGuest({} as NonNullable<typeof ctx.collabGuest>);
 			const controller = new EventController(ctx);
 			try {
 				await controller.handleEvent({
@@ -248,7 +248,7 @@ describe("EventController — error toast gated while auto-retry is pending", ()
 				await controller.handleEvent(end);
 				expect(spy).not.toHaveBeenCalled();
 				streaming = false;
-				ctx.collabGuest = undefined;
+				ctx.setCollabGuest(undefined);
 				await controller.handleEvent(makeAgentEndEvent([makeAssistantMessage("error")]));
 				expect(spy).not.toHaveBeenCalled();
 			} finally {
@@ -264,7 +264,7 @@ describe("EventController — error toast gated while auto-retry is pending", ()
 		const ctx = createInteractiveModeContext({
 			session: { lifecycleState: { runId: "current", phase: "idle", outcome: "error" } },
 		});
-		ctx.collabGuest = {} as NonNullable<typeof ctx.collabGuest>;
+		ctx.setCollabGuest({} as NonNullable<typeof ctx.collabGuest>);
 		const controller = new EventController(ctx);
 		try {
 			await controller.handleEvent({

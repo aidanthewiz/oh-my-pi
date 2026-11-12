@@ -42,6 +42,23 @@ async function run(tool: BashTool, command: string) {
 	return { text, async: result.details?.async, exitCode: result.details?.exitCode, isError: result.isError };
 }
 
+it.each([
+	{ managed: false, settings: { "bash.autoBackground.enabled": false } },
+	{ managed: true, settings: { "bash.autoBackground.enabled": true } },
+])("does not stream or return a run trace when visualization is disabled (managed: $managed)", async ({ settings }) => {
+	const tool = bashTool({ ...settings, "display.shellVisualization": false });
+	let frames = 0;
+	let tracedFrames = 0;
+	const result = await tool.execute("trace-disabled", { command: "printf 'plain output\\n'" }, undefined, update => {
+		frames++;
+		if (update.details?.trace) tracedFrames++;
+	});
+	expect(frames).toBeGreaterThan(0);
+	expect(tracedFrames).toBe(0);
+	expect(result.details?.trace).toBeUndefined();
+	expect(result.content.find(block => block.type === "text")?.text).toContain("plain output");
+});
+
 it.skipIf(process.platform === "win32")("keeps a variable set by one call for the next call", async () => {
 	const tool = bashTool();
 	await run(tool, "PI_STATE_VAR=kept");
@@ -74,14 +91,14 @@ it.skipIf(process.platform === "win32")("keeps state and options after a call th
 });
 
 it.skipIf(process.platform === "win32")(
-	"isolates calls that overlap a backgrounded one and leaves the session shell intact",
+	"runs calls that overlap a backgrounded one in a copy of the session shell and leaves it intact",
 	async () => {
 		const tool = bashTool({ "bash.autoBackground.thresholdMs": 100 });
 		await run(tool, "PI_STATE_VAR=kept");
 		expect((await run(tool, "sleep 2")).async?.state).toBe("running");
 
 		const overlapping = await run(tool, 'printf "[%s]" "$PI_STATE_VAR"; PI_STATE_VAR=lost');
-		expect(overlapping.text).toStartWith("[]");
+		expect(overlapping.text).toStartWith("[kept]");
 		const promoted = await run(tool, "PI_STATE_VAR=lost-again; sleep 0.5");
 		expect(promoted.async?.state).toBe("running");
 

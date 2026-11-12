@@ -8,7 +8,7 @@ import { afterEach, describe, expect, it, vi } from "bun:test";
 import type { AuthStorage } from "@oh-my-pi/pi-ai";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { runSearchQuery } from "@oh-my-pi/pi-coding-agent/web/search";
+import { runSearchQuery, type SearchQueryParams } from "@oh-my-pi/pi-coding-agent/web/search";
 import type { SearchParams } from "@oh-my-pi/pi-coding-agent/web/search/provider";
 import * as provider from "@oh-my-pi/pi-coding-agent/web/search/provider";
 import type { SearchProviderId, SearchResponse, SearchSource } from "@oh-my-pi/pi-coding-agent/web/search/types";
@@ -123,6 +123,59 @@ describe("web search directive pipeline", () => {
 			expect(grounded).not.toHaveBeenCalled();
 		},
 	);
+
+	it("keeps an isolated session's search scope when process settings select a different credentialed provider", async () => {
+		const context = await stubRoleProvider("brave", async () => ({ provider: "brave", sources: SOURCES }));
+		const settings = Settings.isolated({
+			modelRoles: { web: "web/brave" },
+			"retry.fallbackChains": { web: [] },
+			enabledModels: ["web/brave"],
+		});
+		context.settings.setModelRole("web", "xai/grok-4.7");
+		context.authStorage.keys.setRuntime("xai", "synthetic-xai-key");
+		const grounded = vi.spyOn(provider, "getGroundedSearchProvider");
+		const result = await runSearchQuery({ query: "tern site:x.com" }, { ...context, settings });
+		expect(result.details.response.provider).toBe("brave");
+		expect(grounded).not.toHaveBeenCalled();
+	});
+	it.each<[string, SearchQueryParams, SearchProviderId]>([
+		[
+			"routes a Hacker News-only query to the HN engine ahead of the role's engine",
+			{ query: "tern site:news.ycombinator.com/item" },
+			"hackernews",
+		],
+		[
+			"keeps the role's engine when another site shares the query",
+			{ query: "tern site:news.ycombinator.com site:github.com" },
+			"brave",
+		],
+		[
+			"keeps a per-request model selector for a Hacker News-only query",
+			{ query: "tern site:news.ycombinator.com", model: "web/brave" },
+			"brave",
+		],
+	])("%s", async (_caseName, params, expectedProvider) => {
+		const context = await stubRoleProvider("brave", async () => ({ provider: "brave", sources: SOURCES }));
+		const brave = await provider.getSearchProvider("brave");
+		context.getProvider.mockImplementation(async requested => {
+			if (requested === "brave") return brave;
+			if (requested !== "hackernews") throw new Error(`Unexpected provider: ${requested}`);
+			return {
+				id: "hackernews",
+				label: "Hacker News",
+				isAvailable: () => true,
+				isExplicitlyAvailable: () => true,
+				search: async () => ({
+					provider: "hackernews",
+					sources: [{ title: "Thread", url: "https://news.ycombinator.com/item?id=1" }],
+				}),
+			};
+		});
+
+		const result = await runSearchQuery(params, context);
+
+		expect(result.details.response.provider).toBe(expectedProvider);
+	});
 
 	it("uses a request model override instead of modelRoles.web", async () => {
 		const context = await stubRoleProvider("jina", async params => ({

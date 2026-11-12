@@ -95,7 +95,15 @@ describe("eval js wait options", () => {
 		const gate = Promise.withResolvers<string>();
 		const entered = Promise.withResolvers<void>();
 		const id = manager.register("task", "controlled agent", () => gate.promise, { ownerId: "Main" });
-		const session = { asyncJobManager: manager, getAgentId: () => "Main" } as ToolSession;
+		const session: ToolSession = {
+			cwd: process.cwd(),
+			hasUI: false,
+			settings: Settings.isolated(),
+			getSessionFile: () => null,
+			getSessionSpawns: () => "*",
+			asyncJobManager: manager,
+			getAgentId: () => "Main",
+		};
 		const sandbox = loadPrelude(async (name, args) => {
 			if (name === "__agent__") return { id, agent: "task" };
 			if (name === "__wait__") {

@@ -290,6 +290,7 @@ export interface MCPAuthChallenge {
 /** Context supplied to an MCP OAuth handler for lifecycle cancellation. */
 export interface MCPAuthHandlerContext {
 	readonly signal: AbortSignal;
+	readonly isCurrent?: () => boolean;
 }
 
 /** tools/call response */
@@ -308,6 +309,8 @@ export interface MCPToolCallResult {
 /** Trusted host context; extension call options cannot supply lifecycle authority. */
 export interface MCPHostCallContext extends AgentToolContext {
 	mcpOwnerCurrent?: () => boolean;
+	/** Await the owning thread's lifecycle fence, then recheck local authority. */
+	mcpCheckOwner?: () => void | Promise<void>;
 }
 
 /** Explicit replay contract for trusted extension callers. */
@@ -341,6 +344,8 @@ export interface MCPRequestOptions {
 	allowAuthRetry?: boolean;
 	/** Host-only lifecycle fence; never serialized into protocol parameters. */
 	mcpOwnerCurrent?: () => boolean;
+	/** Host-only cross-thread checkpoint; never part of an MCP request's parameters. */
+	mcpCheckOwner?: () => void | Promise<void>;
 }
 
 /** Transport interface - abstracts stdio/http */

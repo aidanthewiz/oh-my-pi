@@ -1,5 +1,5 @@
 import type { AgentTool, AgentToolContext } from "@oh-my-pi/pi-agent-core";
-import { isRecord, untilAborted } from "@oh-my-pi/pi-utils";
+import { isRecord } from "@oh-my-pi/pi-utils";
 import type { MCPToolDetails } from "@oh-my-pi/pi-tui/tools/mcp";
 import { formatArgsInline } from "@oh-my-pi/pi-tui/tools/json-tree";
 import type { ExtensionRunner } from "../extensibility/extensions/runner";
@@ -7,13 +7,13 @@ import { ExtensionToolWrapper } from "../extensibility/extensions/wrapper";
 import type { CustomToolResult } from "../extensibility/custom-tools/types";
 import { throwIfAborted } from "../tools/tool-errors";
 import { mcpToolApproval } from "./approval-policy";
-import type { MCPManager } from "./manager";
+import type { MCPManagerApi } from "./manager";
 import { buildErrorResult, buildResult, createLegacyMCPToolName, createMCPToolName } from "./tool-bridge";
 import type { ExtensionMCPContext } from "./types";
 
 /** Bind extension calls to their owning session and its policy handlers. */
 export function createExtensionMCPContext(
-	getManager: () => MCPManager | undefined,
+	getManager: () => MCPManagerApi | undefined,
 	runner: ExtensionRunner,
 	getToolContext: () => AgentToolContext,
 	captureOwnerCurrent: () => () => boolean,
@@ -77,9 +77,7 @@ export function createExtensionMCPContext(
 				},
 			};
 			const wrapper = new ExtensionToolWrapper(tool, runner);
-			const result = await untilAborted(signal, () =>
-				wrapper.execute(crypto.randomUUID(), args, signal, undefined, getToolContext()),
-			);
+			const result = await wrapper.execute(crypto.randomUUID(), args, signal, undefined, getToolContext());
 			assertOwnerCurrent();
 			const details: unknown = result.details;
 			const changed =

@@ -1283,6 +1283,124 @@ describe("ModelRegistry runtime provider registration", () => {
 		expect(getProviderModels(registry, "projecting-provider")).toEqual([]);
 	});
 
+	test.each(["provider", "full"])(
+		"cross-provider projections follow OAuth transitions (%s snapshot)",
+		async snapshot => {
+			const config: ProviderConfigInput = {
+				api: "custom-gated-api",
+				baseUrl: "https://example.invalid/",
+				streamSimple,
+				models: [baseModel],
+				oauth: {
+					name: "Gated OAuth",
+					login: async () => ({ access: "a", refresh: "r", expires: Date.now() + 60_000 }),
+					refreshToken: async credentials => credentials,
+					getApiKey: credentials => credentials.access,
+					modifyModels: (models, credentials) =>
+						models.map(model =>
+							model.provider === "anthropic"
+								? { ...model, name: `${model.name} (${credentials.accountId})` }
+								: model,
+						),
+				},
+			};
+			registry.registerProvider("gated-provider", config, "ext://oauth");
+			const unprojected = registry.getProviderModels("anthropic");
+			const originalNames = unprojected.map(model => model.name);
+			const target = unprojected.find(model => model.id === "claude-sonnet-4-5");
+			expect(target).toBeDefined();
+			if (snapshot === "full") registry.getAll();
+
+			const credential = {
+				type: "oauth" as const,
+				access: "access-token",
+				refresh: "refresh-token",
+				expires: Date.now() + 60_000,
+				accountId: "first-account",
+			};
+			await authStorage.credentials.set("gated-provider", credential);
+			await registry.refreshProvider("gated-provider", "offline");
+			const firstProjection = registry.getProviderModels("anthropic");
+			const firstNames = originalNames.map(name => `${name} (first-account)`);
+			expect(firstProjection.map(model => model.name)).toEqual(firstNames);
+			expect(registry.find("anthropic", target!.id)?.name).toBe(`${target!.name} (first-account)`);
+
+			await authStorage.credentials.set("gated-provider", {
+				...credential,
+				access: "replacement-token",
+				accountId: "second-account",
+			});
+			await registry.refreshProvider("gated-provider", "offline");
+			expect(registry.getProviderModels("anthropic").map(model => model.name)).toEqual(
+				originalNames.map(name => `${name} (second-account)`),
+			);
+			expect(registry.find("anthropic", target!.id)?.name).toBe(`${target!.name} (second-account)`);
+
+			await authStorage.credentials.remove("gated-provider");
+			await registry.refreshProvider("gated-provider", "offline");
+			expect(registry.getProviderModels("anthropic").map(model => model.name)).toEqual(originalNames);
+			expect(registry.find("anthropic", target!.id)?.name).toBe(target!.name);
+			expect(unprojected.map(model => model.name)).toEqual(originalNames);
+			expect(firstProjection.map(model => model.name)).toEqual(firstNames);
+		},
+	);
+
+	test("a scoped discovery refresh invalidates another provider's projected lookup", async () => {
+		const target = registry.find("anthropic", "claude-sonnet-4-5");
+		expect(target).toBeDefined();
+		let discoveredName = "First catalog";
+		registry.registerProvider(
+			"catalog-input",
+			{
+				api: "custom-catalog-input-api",
+				baseUrl: "https://example.invalid/",
+				apiKey: "test-key",
+				streamSimple,
+				fetchDynamicModels: async () => [{ ...baseModel, name: discoveredName }],
+			},
+			"ext://runtime",
+		);
+		registry.registerProvider(
+			"gated-provider",
+			{
+				api: "custom-gated-api",
+				baseUrl: "https://example.invalid/",
+				streamSimple,
+				models: [baseModel],
+				oauth: {
+					name: "Gated OAuth",
+					login: async () => ({ access: "a", refresh: "r", expires: Date.now() + 60_000 }),
+					refreshToken: async credentials => credentials,
+					getApiKey: credentials => credentials.access,
+					modifyModels: models => {
+						const inputName = models.find(model => model.provider === "catalog-input")?.name ?? "undiscovered";
+						return models.map(model =>
+							model.provider === "anthropic" ? { ...model, name: `${model.name} (${inputName})` } : model,
+						);
+					},
+				},
+			},
+			"ext://oauth",
+		);
+		await authStorage.credentials.set("gated-provider", {
+			type: "oauth",
+			access: "access-token",
+			refresh: "refresh-token",
+			expires: Date.now() + 60_000,
+		});
+		expect(registry.find("anthropic", target!.id)?.name).toBe(`${target!.name} (undiscovered)`);
+
+		await registry.refreshDiscoverableProviders(["catalog-input"], "online");
+		const firstProjection = registry.find("anthropic", target!.id);
+		expect(firstProjection?.name).toBe(`${target!.name} (First catalog)`);
+
+		discoveredName = "Second catalog";
+		await registry.refreshDiscoverableProviders(["catalog-input"], "online");
+		expect(registry.find("anthropic", target!.id)?.name).toBe(`${target!.name} (Second catalog)`);
+		expect(registry.find("catalog-input", baseModel.id)?.name).toBe("Second catalog");
+		expect(firstProjection?.name).toBe(`${target!.name} (First catalog)`);
+	});
+
 	test("oauth.modifyModels output is materialized through buildModel", async () => {
 		await authStorage.credentials.set("materializing-provider", {
 			type: "oauth",

@@ -167,6 +167,7 @@ function createHarness(options?: { hangPrompt?: boolean; asyncJobManager?: Async
 		sessionManager: SessionManager.inMemory(),
 		getActiveToolNames: () => ["read", "yield"],
 		getEnabledToolNames: () => ["read", "yield"],
+		getMountedXdevToolNames: () => [],
 		getToolByName: () => undefined,
 		setActiveToolsByName: async () => {},
 		setWorkPoolYieldItems: () => {},
@@ -207,6 +208,7 @@ function createHarness(options?: { hangPrompt?: boolean; asyncJobManager?: Async
 			wakeObserver = observer;
 		},
 		trackIrcReply: () => {},
+		hasIrcInterrupts: () => false,
 		holdIrcWakes: () => () => {},
 		hasQueuedIrcFrom: () => false,
 		subscribeRunState: () => () => {},
@@ -1098,7 +1100,7 @@ await withArtifactPublicationLock(async () => {
 	it("blocks the parent's wait on a turn its message woke and returns the turn's answer once", async () => {
 		const manager = new AsyncJobManager({});
 		const harness = createHarness({ asyncJobManager: manager });
-		const ircReplies: string[] = [];
+		const inbox: IrcMessage[] = [];
 		const asyncReplies: string[] = [];
 		manager.registerDeliverySink("Parent", (_id, text) => {
 			asyncReplies.push(text);
@@ -1109,8 +1111,9 @@ await withArtifactPublicationLock(async () => {
 			kind: "main",
 			session: {
 				sessionManager: SessionManager.inMemory(),
-				deliverIrcMessage: async (message: { body: string }) => {
-					ircReplies.push(message.body);
+				hasIrcInterrupts: () => inbox.length > 0,
+				deliverIrcMessage: async (message: IrcMessage) => {
+					inbox.push(message);
 					return "injected";
 				},
 			} as unknown as AgentSession,
@@ -1148,8 +1151,15 @@ await withArtifactPublicationLock(async () => {
 				} as unknown as AgentMessage,
 			]);
 			expect(manager.getRunningJobs({ ownerId: "Parent" }).map(job => job.agentId)).toEqual([AGENT_ID]);
+			const receipt = await IrcBus.global().send({ from: "Peer", to: "Parent", body: "review the parser too" });
+			expect(receipt.outcome).not.toBe("failed");
+			const waitTool = new WaitTool(parent);
+			const interrupted = await waitTool.execute("queued-mail-wait", {});
+			expect(interrupted.details).toMatchObject({ interrupted: true, jobs: [] });
+			expect(inbox.splice(0)).toMatchObject([{ from: "Peer", to: "Parent", body: "review the parser too" }]);
+			expect(manager.getRunningJobs({ ownerId: "Parent" }).map(job => job.agentId)).toEqual([AGENT_ID]);
 			let settled = false;
-			const waiting = new WaitTool(parent).execute("parent-wait", {}).then(result => {
+			const waiting = waitTool.execute("parent-wait", {}).then(result => {
 				settled = true;
 				return result;
 			});
@@ -1163,7 +1173,7 @@ await withArtifactPublicationLock(async () => {
 				{ id: AGENT_ID, status: "completed", resultText: "mask path fixed too" },
 			]);
 			await manager.drainDeliveries({ timeoutMs: 1000 });
-			expect(ircReplies).toEqual([]);
+			expect(inbox).toEqual([]);
 			expect(asyncReplies).toEqual([]);
 		} finally {
 			await manager.dispose({ timeoutMs: 1000 });

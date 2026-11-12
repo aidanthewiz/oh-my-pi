@@ -32,6 +32,7 @@ import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { clampThinkingLevelForModel, getSupportedEfforts } from "@oh-my-pi/pi-catalog/model-thinking";
 import { type ModelKind, modelKind } from "@oh-my-pi/pi-catalog/types";
 import { logger } from "@oh-my-pi/pi-utils";
+import * as AIError from "../error";
 import { classifyGatewayError } from "../error/gateway";
 import * as anthropicMessages from "../providers/anthropic-messages-server";
 import * as openaiChat from "../providers/openai-chat-server";
@@ -62,6 +63,7 @@ import {
 	hasMisplacedBearer,
 	isAuthorized,
 	json,
+	noStoreErrorResponse,
 	readBearerToken,
 	resolveClientIdentity,
 	withCors,
@@ -189,7 +191,7 @@ function normalizeGatewayThinking(model: Model<Api>, options: SimpleStreamOption
 }
 
 function buildStreamOptions(parsed: ParsedFormatRequest, model: Model<Api>, signal: AbortSignal): SimpleStreamOptions {
-	const opts: SimpleStreamOptions = { signal, cursorExternalToolExecutor: true };
+	const opts: SimpleStreamOptions = { signal, cursorExternalToolExecutor: true, waitForTerminalDrain: true };
 	const { options } = parsed;
 	// Backends that reject sampling controls (Codex: `Unsupported parameter: …`, #3117)
 	// get the full set stripped; everything else is harmless to forward —
@@ -312,6 +314,7 @@ async function handleFormatEndpoint(
 	req: Request,
 	peer: string,
 	sessionStates: AuthGatewaySessionStateStore,
+	retain: (operation: Promise<void>) => void,
 ): Promise<Response> {
 	const startedAt = performance.now();
 	const requestId = crypto.randomUUID();
@@ -511,15 +514,17 @@ async function handleFormatEndpoint(
 			logger.warn("auth-gateway streamSimple threw", { format: route.label, error: classified.message, peer });
 			return route.module.formatError(classified.status, classified.type, classified.message);
 		}
-		if (controller.signal.aborted) return clientClosedResponse(route);
-		void events
-			.result()
-			.then(message =>
-				recordGatewayUsage(bootOpts.storage, model, client, message.usage, message.timestamp || undefined),
-			)
-			.catch(() => {})
-			.finally(settle);
+		retain(
+			events
+				.result()
+				.then(message =>
+					recordGatewayUsage(bootOpts.storage, model, client, message.usage, message.timestamp || undefined),
+				)
+				.catch(() => {})
+				.finally(settle),
+		);
 		streamOwnsLease = true;
+		if (controller.signal.aborted) return clientClosedResponse(route);
 
 		const sseStream = route.module.encodeStream(events, parsed.modelId, parsed.options, {
 			signal: controller.signal,
@@ -566,11 +571,12 @@ async function handlePiNative(
 	req: Request,
 	peer: string,
 	sessionStates: AuthGatewaySessionStateStore,
+	retain: (operation: Promise<void>) => void,
 ): Promise<Response> {
 	const startedAt = performance.now();
 	const requestId = crypto.randomUUID();
 	const controller = mirrorRequestAbort(req);
-	const aborted = (): Response => piNative.formatError(499, "request_aborted", "client closed request");
+	const aborted = (): Response => noStoreErrorResponse(499, "request_aborted", "client closed request");
 	if (controller.signal.aborted) return aborted();
 
 	let body: unknown;
@@ -578,7 +584,7 @@ async function handlePiNative(
 		body = await req.json();
 	} catch (error) {
 		if (controller.signal.aborted) return aborted();
-		return piNative.formatError(400, "invalid_request_error", `Invalid JSON body: ${String(error)}`);
+		return noStoreErrorResponse(400, "invalid_request_error", `Invalid JSON body: ${String(error)}`);
 	}
 	if (controller.signal.aborted) return aborted();
 
@@ -588,15 +594,15 @@ async function handlePiNative(
 	} catch (error) {
 		if (controller.signal.aborted) return aborted();
 		const message = error instanceof Error ? error.message : String(error);
-		return piNative.formatError(400, "invalid_request_error", message);
+		return noStoreErrorResponse(400, "invalid_request_error", message);
 	}
 
 	const model = bootOpts.resolveModel(parsed.modelId);
 	if (!model) {
-		return piNative.formatError(404, "invalid_request_error", `Unknown model: ${parsed.modelId}`);
+		return noStoreErrorResponse(404, "invalid_request_error", `Unknown model: ${parsed.modelId}`);
 	}
 	const kindRejection = chatRouteRejection(model);
-	if (kindRejection) return piNative.formatError(400, "invalid_request_error", kindRejection);
+	if (kindRejection) return noStoreErrorResponse(400, "invalid_request_error", kindRejection);
 	const client = resolveClientIdentity(req.headers);
 	// Pi-native already parsed `streamOpts.sessionId` (when set by the
 	// client); fall back to the derived key so credential-stickiness lines
@@ -610,7 +616,7 @@ async function handlePiNative(
 
 	const apiKey = await resolveGatewayApiKey(bootOpts, model, sessionId, controller.signal, peer);
 	if (controller.signal.aborted) return aborted();
-	if ("status" in apiKey) return piNative.formatError(apiKey.status, apiKey.type, apiKey.message);
+	if ("status" in apiKey) return noStoreErrorResponse(apiKey.status, apiKey.type, apiKey.message);
 
 	// Per-session provider learning, owned by this gateway instance. The map is
 	// non-serializable, so `parseRequest` cannot accept one from the wire and
@@ -631,6 +637,7 @@ async function handlePiNative(
 	const streamOpts: SimpleStreamOptions = {
 		...parsed.options,
 		signal: controller.signal,
+		waitForTerminalDrain: true,
 		cursorExternalToolExecutor: true,
 		providerSessionState: lease.states,
 	};
@@ -689,10 +696,10 @@ async function handlePiNative(
 					peer,
 				});
 				if (message.stopReason === "aborted") {
-					return piNative.formatError(499, "request_aborted", errorMessage);
+					return noStoreErrorResponse(499, "request_aborted", errorMessage);
 				}
 				const classified = classifyGatewayError(message.errorClassificationMessage ?? errorMessage);
-				return piNative.formatError(classified.status, classified.type, errorMessage);
+				return noStoreErrorResponse(classified.status, classified.type, errorMessage);
 			}
 			return json(
 				200,
@@ -703,7 +710,7 @@ async function handlePiNative(
 			if (controller.signal.aborted) return aborted();
 			const classified = classifyGatewayError(error);
 			logger.warn("auth-gateway non-streaming aborted", { format: "pi-native", error: classified.message, peer });
-			return piNative.formatError(classified.status, classified.type, classified.message);
+			return noStoreErrorResponse(classified.status, classified.type, classified.message);
 		} finally {
 			// Every non-streaming outcome — answered, upstream error, thrown,
 			// client gone — is done with the provider state here.
@@ -729,17 +736,19 @@ async function handlePiNative(
 		} catch (error) {
 			const classified = classifyGatewayError(error);
 			logger.warn("auth-gateway streamSimple threw", { format: "pi-native", error: classified.message, peer });
-			return piNative.formatError(classified.status, classified.type, classified.message);
+			return noStoreErrorResponse(classified.status, classified.type, classified.message);
 		}
-		if (controller.signal.aborted) return aborted();
-		void events
-			.result()
-			.then(message =>
-				recordGatewayUsage(bootOpts.storage, model, client, message.usage, message.timestamp || undefined),
-			)
-			.catch(() => {})
-			.finally(settle);
+		retain(
+			events
+				.result()
+				.then(message =>
+					recordGatewayUsage(bootOpts.storage, model, client, message.usage, message.timestamp || undefined),
+				)
+				.catch(() => {})
+				.finally(settle),
+		);
 		streamOwnsLease = true;
+		if (controller.signal.aborted) return aborted();
 
 		const sseStream = piNative.encodeStream(events, parsed.modelId, parsed.options, {
 			signal: controller.signal,
@@ -891,10 +900,10 @@ export interface AuthGatewayRouter {
 	/** Whether this route accepts a top-level model selector. */
 	isModelRequest(req: Request): boolean;
 	/**
-	 * Closes the retained provider session state (Codex WebSockets, GitLab Duo
-	 * workflows), whose sockets and timers would otherwise keep the process alive.
+	 * Refuse new requests, cancel and drain admitted operations, then close
+	 * retained provider sessions.
 	 */
-	close(): void;
+	close(): Promise<void>;
 }
 
 /** Why a scoped client cannot read `/v1/usage` or `/v1/credentials/check`: both cover every account the gateway holds. */
@@ -928,7 +937,18 @@ function scopeRouteOptions(opts: AuthGatewayRouteOptions, client: AuthGatewayCli
  */
 export function createAuthGatewayRouter(hostOpts: AuthGatewayRouteOptions): AuthGatewayRouter {
 	const sessionStates = new AuthGatewaySessionStateStore();
-	const route = async (
+	const shutdown = new AbortController();
+	const inFlight = new Set<Promise<unknown>>();
+	let closing: Promise<void> | undefined;
+	const retain = <T>(operation: Promise<T>): Promise<T> => {
+		inFlight.add(operation);
+		void operation.then(
+			() => inFlight.delete(operation),
+			() => inFlight.delete(operation),
+		);
+		return operation;
+	};
+	const dispatch = async (
 		req: Request,
 		peer: string,
 		client?: AuthGatewayClientScope,
@@ -957,13 +977,13 @@ export function createAuthGatewayRouter(hostOpts: AuthGatewayRouteOptions): Auth
 			// Provider-format dispatch.
 			const formatRoute = FORMAT_ROUTES[pathname];
 			if (formatRoute && req.method === "POST") {
-				return await handleFormatEndpoint(formatRoute, opts, req, peer, sessionStates);
+				return await handleFormatEndpoint(formatRoute, opts, req, peer, sessionStates, retain);
 			}
 
 			// Pi-native fast path. Same auth + provider plumbing as the
 			// foreign-wire routes, just without the wire-format translation.
 			if (req.method === "POST" && pathname === "/v1/pi/stream") {
-				return await handlePiNative(opts, req, peer, sessionStates);
+				return await handlePiNative(opts, req, peer, sessionStates, retain);
 			}
 
 			const modelRoute = MODEL_ROUTES[pathname];
@@ -995,6 +1015,11 @@ export function createAuthGatewayRouter(hostOpts: AuthGatewayRouteOptions): Auth
 			return json(500, { error: "internal error" });
 		}
 	};
+	const route: AuthGatewayRouter["route"] = (req, peer, client, resolveModel) => {
+		if (shutdown.signal.aborted) return Promise.resolve(json(503, { error: "auth-gateway is closed" }));
+		const owned = new Request(req, { signal: AbortSignal.any([req.signal, shutdown.signal]) });
+		return retain(dispatch(owned, peer, client, resolveModel));
+	};
 	return {
 		route,
 		isModelRequest: req => {
@@ -1006,7 +1031,15 @@ export function createAuthGatewayRouter(hostOpts: AuthGatewayRouteOptions): Auth
 					Object.hasOwn(MODEL_ROUTES, pathname))
 			);
 		},
-		close: () => sessionStates.close(),
+		close: () => {
+			if (closing) return closing;
+			closing = Promise.resolve().then(async () => {
+				while (inFlight.size > 0) await Promise.allSettled(inFlight);
+				sessionStates.close();
+			});
+			shutdown.abort(new AIError.AbortError("Auth gateway shut down"));
+			return closing;
+		},
 	};
 }
 
@@ -1078,10 +1111,7 @@ export function startAuthGateway(opts: AuthGatewayBootOptions): AuthGatewayServe
 		hostname: boundHost,
 		close: async () => {
 			server.stop(true);
-			// Drain after the listener is down: the retained provider states own
-			// sockets and timers (Codex WebSockets, GitLab Duo workflows), so the
-			// process can't settle until each one is closed.
-			router.close();
+			await router.close();
 			clients.close();
 		},
 		setClients: list => {

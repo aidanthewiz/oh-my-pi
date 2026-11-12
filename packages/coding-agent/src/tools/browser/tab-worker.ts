@@ -14,6 +14,8 @@ import type {
 	HTTPResponse,
 	JSHandle,
 	KeyInput,
+	KeyPressOptions,
+	MouseButton,
 	Page,
 	Protocol,
 	Realm,
@@ -62,6 +64,7 @@ import {
 	connectPuppeteer,
 	DEFAULT_VIEWPORT,
 	isPuppeteerHandle,
+	isPuppeteerTargetClose,
 	isPuppeteerTimeout,
 	loadPuppeteerInWorker,
 	loadedKnownDevices,
@@ -96,7 +99,7 @@ import {
 	readReactTree,
 } from "./react/tree";
 import { collectVitals, installVitalsObservers, type VitalsOptions, type VitalsResult } from "./react/vitals";
-import { registerSemanticQueryHandlers } from "./query-handlers";
+import { parseRoleSelector, registerSemanticQueryHandlers } from "./query-handlers";
 import {
 	type ElementQueryHelpers,
 	enrichElementQueries,
@@ -115,7 +118,7 @@ import {
 } from "./queries";
 import { DownloadManager, type BrowserDownload } from "./downloads";
 import { InitScriptManager, type InitScriptInfo } from "./init-scripts";
-import { applyIgnoreHttpsErrors } from "./open-options";
+import { applyInsecure } from "./open-options";
 import {
 	BrowserNetworkManager,
 	type HarContentPolicy,
@@ -170,16 +173,19 @@ import {
 	clickElement,
 	composedContains,
 	clickQueryHandlerText,
+	dragBetween,
 	fillViaHandle,
 	highlightElement,
 	type HighlightOptions,
 	type InteractionHandle,
+	installCancelledReleaseGuard,
 	keyDown,
 	keyUp,
 	mouseDown,
 	mouseMove,
 	mouseUp,
 	pressKey,
+	releaseButtonOffPage,
 	selectElementOptions,
 	setElementChecked,
 	type PreparedUpload,
@@ -188,6 +194,7 @@ import {
 	TypingInterruptedError,
 	typeIntoElement,
 	wheel,
+	withLiveElement,
 } from "./interactions";
 import {
 	captureScreenshotBuffer,
@@ -233,6 +240,7 @@ import { type UploadRoute, UploadStaging } from "./upload-files";
 import {
 	type Observation,
 	type ObservationEntry,
+	isMissingPageGlobal,
 	ownsPage,
 	type ReadyInfo,
 	type RunErrorPayload,
@@ -340,6 +348,8 @@ const FRAME_SNAPSHOT_TIMEOUT_MS = 5_000;
 const ATTACHED_TARGET_EXPOSE_TIMEOUT_MS = 5_000;
 /** Bound on counting a timed-out selector's matches for its error message. */
 const MATCH_COUNT_PROBE_TIMEOUT_MS = 1_000;
+/** Bound on the page command that lets a relay detach report overtake a run's failure; inside the supervisor's grace. */
+const DETACH_REPORT_TIMEOUT_MS = 500;
 /** Longest a page call waits for a main-frame navigation the page requested to replace the document. */
 const REQUESTED_NAVIGATION_WAIT_MS = 5_000;
 
@@ -386,7 +396,10 @@ interface TabApi {
 	diffScreenshot(baselinePath: string, opts?: DiffScreenshotOptions): Promise<DiffScreenshotResult>;
 	pdf(opts?: PdfOptions): Promise<string>;
 	extract(format?: ReadableFormat, opts?: ReadableExtractOptions): Promise<string>;
-	click(selector: string): Promise<void>;
+	click(
+		selector: string,
+		opts?: { button?: "left" | "right" | "middle" | "back" | "forward"; count?: number },
+	): Promise<void>;
 	type(selector: string, text: string): Promise<void>;
 	fill(selector: string, value: string): Promise<void>;
 	press(key: string, opts?: { selector?: string }): Promise<void>;
@@ -532,6 +545,15 @@ export function normalizeSelector(selector: string): string {
 		const name = nameMatch?.[1] ?? nameMatch?.[2] ?? nameMatch?.[3];
 		if (name) return `aria/${name.trim()}`;
 		return `aria/${rest}`;
+	}
+	if (selector.startsWith("role/")) {
+		// The role/ handler refuses a selector it cannot fully read. Parsing it here surfaces that as a tool error before
+		// the op, so a wait fails at once instead of at its timeout.
+		try {
+			parseRoleSelector(selector.slice(5));
+		} catch (error) {
+			throw new ToolError(error instanceof Error ? error.message : String(error));
+		}
 	}
 	return selector;
 }
@@ -794,11 +816,12 @@ export function toActionableHandle(
 		}
 		// Puppeteer's `ElementHandle.press` takes a single key name; focus and press
 		// through `pressKey` so combos and the macOS editing commands work on handles too.
+		// The guard below passes its signal, so a cut-off press releases what it held.
 		const focus = interactive.focus;
 		if (focus) {
-			const press: ElementHandle["press"] = async (key, options) => {
-				await focus();
-				await pressKey(enriched.frame.page(), key, options);
+			const press = async (key: KeyInput, options?: KeyPressOptions, signal?: AbortSignal): Promise<void> => {
+				await untilAborted(signal, () => focus());
+				await pressKey(enriched.frame.page(), key, options, signal);
 			};
 			interactive.press = press as RawHandleMethod;
 		}
@@ -817,7 +840,7 @@ export function toActionableHandle(
 					originals,
 					`handle.${method}()`,
 					signal,
-					() => original(...args),
+					() => (method === "press" ? original(args[0], args[1], signal) : original(...args)),
 					invalidate,
 				),
 			);
@@ -1194,7 +1217,14 @@ function errorPayload(error: unknown): RunErrorPayload {
 		};
 	}
 	if (error instanceof Error) {
-		return { name: error.name, message: error.message, stack: error.stack, isToolError: false, isAbort: false };
+		return {
+			name: error.name,
+			message: error.message,
+			stack: error.stack,
+			isToolError: false,
+			isAbort: false,
+			missingPageGlobal: isMissingPageGlobal(error) || undefined,
+		};
 	}
 	return { name: "Error", message: String(error), isToolError: false, isAbort: false };
 }
@@ -1538,7 +1568,7 @@ export class WorkerCore {
 	#emulation?: BrowserEmulationController;
 	#screenshotHistory = new Map<string, ScreenshotHistory>();
 	#webmcp?: WebMcpController;
-	/** Session holding `ignore_https_errors`; Chromium drops the override once it detaches. */
+	/** Session holding `insecure`; Chromium drops the override once it detaches. */
 	#certificateOverride?: CDPSession;
 	readonly #recording = new RecordingController();
 	/** Set once the core stops for good: by {@link terminate}, or by a close. */
@@ -1580,6 +1610,11 @@ export class WorkerCore {
 
 	/** The renderer crashed; the supervisor recycles this worker, so it runs nothing more. */
 	#crashed = false;
+	/** The user drives this browser (connected, relay); only there can Chrome detach omp under a run. */
+	#userDriven = false;
+	/** Buttons and keys `tab.mouseDown` / `tab.keyDown` pressed and nothing released yet; a run that is cut off releases them. */
+	readonly #heldButtons = new Set<MouseButton>();
+	readonly #heldKeys = new Set<KeyInput>();
 	/** `ready` was sent; a crash before it fails the start instead. */
 	#started = false;
 	/** The run whose result is not sent yet; it outlives `#active` while the result is being put together. */
@@ -1715,7 +1750,7 @@ export class WorkerCore {
 				this.#deliverToolReply(msg.id, msg.reply);
 				return;
 			case "close":
-				await this.#close();
+				await this.#close(msg.keepPage ?? false);
 				return;
 		}
 	}
@@ -1744,7 +1779,10 @@ export class WorkerCore {
 			this.#transport.send({ type: "setup" });
 			// Page.getFrameTree can wait for an accepted navigation's response.
 			const knownInfo =
-				payload.mode === "attach" && payload.page.kind !== "create" && payload.recover === false
+				payload.mode === "attach" &&
+				payload.page.kind !== "create" &&
+				payload.recover === false &&
+				!payload.viewport
 					? payload.knownInfo
 					: undefined;
 			const target =
@@ -1828,15 +1866,16 @@ export class WorkerCore {
 			if (payload.dialogs) this.#applyDialogPolicy(payload.dialogs);
 		}
 		const page = this.#requirePage();
-		page.mainFrame().client.on("Page.frameNavigated", this.#onFrameNavigated);
-		page.mainFrame().client.on("Page.frameRequestedNavigation", this.#onFrameRequestedNavigation);
-		page.mainFrame().client.on("Page.navigatedWithinDocument", this.#onMainFrameNavigationSettled);
-		page.mainFrame().client.on("Page.frameStoppedLoading", this.#onMainFrameNavigationSettled);
-		page.mainFrame().client.on("Page.javascriptDialogOpening", this.#onDialogOpening);
-		page.mainFrame().client.on("Page.javascriptDialogClosed", this.#onDialogClosed);
-		page.mainFrame().client.on("OMP.debuggerDetached", this.#onDebuggerDetached);
+		const client = page.mainFrame().client;
+		client.on("Page.frameNavigated", this.#onFrameNavigated);
+		client.on("Page.frameRequestedNavigation", this.#onFrameRequestedNavigation);
+		client.on("Page.navigatedWithinDocument", this.#onMainFrameNavigationSettled);
+		client.on("Page.frameStoppedLoading", this.#onMainFrameNavigationSettled);
+		client.on("Page.javascriptDialogOpening", this.#onDialogOpening);
+		client.on("Page.javascriptDialogClosed", this.#onDialogClosed);
+		client.on("OMP.debuggerDetached", this.#onDebuggerDetached);
 		page.on("error", this.#onPageCrashed);
-		if (this.#ownsPage) await page.emulateFocusedPage(true);
+		if (this.#ownsPage || (payload.mode === "attach" && payload.userDriven)) await page.emulateFocusedPage(true);
 		const targetId = await targetIdForPage(page);
 		this.#targetId = targetId;
 		this.#lastViewport = payload.mode === "headless" ? payload.viewport : payload.knownInfo?.viewport;
@@ -1849,14 +1888,17 @@ export class WorkerCore {
 			return;
 		}
 		await installVitalsObservers(page);
+		await installCancelledReleaseGuard(page);
 		if (payload.userAgent !== undefined) await applyUserAgentOverride(page, payload.userAgent);
-		if (payload.ignoreHttpsErrors) this.#certificateOverride = await applyIgnoreHttpsErrors(page);
+		if (payload.insecure) this.#certificateOverride = await applyInsecure(page);
 		this.#initScripts = new InitScriptManager(page);
 		for (const source of payload.initScripts ?? []) await this.#initScripts.add(source);
+		this.#userDriven = payload.mode !== "headless" && payload.userDriven === true;
 		this.#downloads = new DownloadManager(browser, page, targetId, {
-			perTab: payload.mode === "headless" || payload.userDriven !== true,
+			perTab: !this.#userDriven,
+			pageEvents: payload.mode === "attach" && payload.relay === true,
 		});
-		if (payload.downloadsPath) await this.#downloads.enable(payload.downloadsPath);
+		await this.#downloads.start(payload.downloadsPath);
 		const baseUserAgent = await page.evaluate(() => navigator.userAgent);
 		this.#emulation = new BrowserEmulationController(
 			page,
@@ -1868,6 +1910,13 @@ export class WorkerCore {
 		this.#tracing = new BrowserTracingController(page);
 		this.#network = new BrowserNetworkManager(page, payload.allowedDomains);
 		await this.#network.start();
+		// A failed open must not resize a borrowed tab.
+		if (payload.viewport && (payload.mode === "attach" || payload.emulateViewport === false)) {
+			await page.setViewport({
+				...payload.viewport,
+				deviceScaleFactor: payload.viewport.deviceScaleFactor ?? 0,
+			});
+		}
 	}
 
 	async #findAttachedTarget(targetId: string): Promise<Target> {
@@ -1903,9 +1952,10 @@ export class WorkerCore {
 	}
 
 	/**
-	 * Tell the omp browser relay this worker drives the adopted page, so the
-	 * relay adds it to the per-window "omp" tab group. Best-effort: plain CDP
-	 * backends (real Chrome, cmux) reject the relay-private method.
+	 * Tell the omp browser relay this worker drives the adopted page, so the relay adds it to the per-window "omp"
+	 * tab group. The supervisor's connect URL claims it already (`?claim=`); an older relay still serving this
+	 * machine ignores that and learns of the claim only here. Best-effort: plain CDP backends (real Chrome, cmux)
+	 * reject the relay-private method.
 	 */
 	async #claimRelayTarget(page: Page): Promise<void> {
 		let session: CDPSession | undefined;
@@ -2162,6 +2212,8 @@ export class WorkerCore {
 			// Detach first: the stop below fails the cancelled requests, and run handlers that see
 			// those events would touch the aborted run's facade.
 			runPage?.detach();
+			// A cancelled or timed-out run leaves no button or key pressed for the user's next move.
+			if (ac.signal.aborted || timeoutSignal.aborted) this.#releaseHeldInput();
 			// A cancelled run abandons its main-frame navigation: left loading, it still replaces the
 			// page later and holds up any interception restore below. Stopping is gated on
 			// that navigation because Page.stopLoading also cancels every fetch and subresource
@@ -2186,6 +2238,20 @@ export class WorkerCore {
 		// A renderer crash or a debugger detach answers the run itself.
 		if (this.#unanswered !== active) return;
 		if (failure) {
+			// Chrome ends a cross-site frame's session the moment it detaches omp from a relay tab, ahead of the
+			// relay's `OMP.debuggerDetached`. Chrome reports that detach to the relay extension before it answers a
+			// later command, so one more page command lets the report answer a run the closed frame session failed.
+			if (this.#userDriven && isPuppeteerTargetClose(failure.error)) {
+				const page = this.#page;
+				if (page && !page.isClosed()) {
+					await withTimeout(
+						page.mainFrame().client.send("Target.getTargetInfo"),
+						DETACH_REPORT_TIMEOUT_MS,
+						"Timed out waiting for the relay's detach report",
+					).catch(() => undefined);
+				}
+				if (this.#unanswered !== active) return;
+			}
 			this.#unanswered = null;
 			this.#transport.send({ type: "result", id: msg.id, ok: false, error: errorPayload(failure.error) });
 			return;
@@ -2206,6 +2272,20 @@ export class WorkerCore {
 				},
 			});
 		}
+	}
+
+	/**
+	 * Release what `tab.mouseDown` / `tab.keyDown` still hold, buttons off the page (`releaseButtonOffPage`). Sent at
+	 * once and not awaited: the page the run gave up on may not answer before this worker is replaced.
+	 */
+	#releaseHeldInput(): void {
+		const page = this.#page;
+		if (page) {
+			for (const button of this.#heldButtons) releaseButtonOffPage(page, { button });
+			for (const key of this.#heldKeys) void page.keyboard.up(key).catch(() => {});
+		}
+		this.#heldButtons.clear();
+		this.#heldKeys.clear();
 	}
 
 	#ensureRuntime(session: SessionSnapshot): JsRuntime {
@@ -2580,23 +2660,21 @@ export class WorkerCore {
 					}
 					return content;
 				}),
-			click: selector =>
+			click: (selector, opts) =>
 				act(
 					`tab.click(${JSON.stringify(selector)})`,
 					actionOpMs,
 					async sig => {
 						const label = `tab.click(${JSON.stringify(selector)})`;
+						const click = { button: opts?.button, clickCount: opts?.count };
 						const resolved = normalizeSelector(selector);
 						if (resolved.startsWith("text/") && parseAriaRefSelector(selector) === null) {
-							await clickQueryHandlerText(page, resolved, label, actionOpMs, sig);
+							await clickQueryHandlerText(page, resolved, label, actionOpMs, sig, click);
 							return;
 						}
-						const handle = await this.#resolveActionHandle(selector, actionOpMs, sig);
-						try {
-							await clickElement(handle, label, sig);
-						} finally {
-							void handle.dispose().catch(() => undefined);
-						}
+						await this.#clickSelector(selector, actionOpMs, sig, handle =>
+							clickElement(handle, label, sig, click),
+						);
 					},
 					{ selector, zeroMatchAfterMs: ZERO_MATCH_FAIL_FAST_MS },
 				),
@@ -2642,7 +2720,7 @@ export class WorkerCore {
 							}
 						} else await untilAborted(sig, () => page.focus(normalizeSelector(selector)));
 					}
-					await untilAborted(sig, () => pressKey(page, key));
+					await pressKey(page, key, undefined, sig);
 				}),
 			scroll: (deltaX, deltaY, opts) =>
 				act("tab.scroll()", actionOpMs, async sig => {
@@ -3061,12 +3139,9 @@ export class WorkerCore {
 					`tab.dblclick(${JSON.stringify(selector)})`,
 					actionOpMs,
 					async sig => {
-						const handle = await this.#resolveActionHandle(selector, actionOpMs, sig);
-						try {
-							await clickElement(handle, `tab.dblclick(${JSON.stringify(selector)})`, sig, { clickCount: 2 });
-						} finally {
-							await handle.dispose().catch(() => undefined);
-						}
+						await this.#clickSelector(selector, actionOpMs, sig, handle =>
+							clickElement(handle, `tab.dblclick(${JSON.stringify(selector)})`, sig, { clickCount: 2 }),
+						);
 					},
 					{ selector, zeroMatchAfterMs: ZERO_MATCH_FAIL_FAST_MS },
 				),
@@ -3103,12 +3178,9 @@ export class WorkerCore {
 					`tab.check(${JSON.stringify(selector)})`,
 					actionOpMs,
 					async sig => {
-						const handle = await this.#resolveActionHandle(selector, actionOpMs, sig);
-						try {
-							await setElementChecked(handle, true, `tab.check(${JSON.stringify(selector)})`, sig);
-						} finally {
-							await handle.dispose().catch(() => undefined);
-						}
+						await this.#clickSelector(selector, actionOpMs, sig, handle =>
+							setElementChecked(handle, true, `tab.check(${JSON.stringify(selector)})`, sig),
+						);
 					},
 					{ selector, zeroMatchAfterMs: ZERO_MATCH_FAIL_FAST_MS },
 				),
@@ -3117,20 +3189,34 @@ export class WorkerCore {
 					`tab.uncheck(${JSON.stringify(selector)})`,
 					actionOpMs,
 					async sig => {
-						const handle = await this.#resolveActionHandle(selector, actionOpMs, sig);
-						try {
-							await setElementChecked(handle, false, `tab.uncheck(${JSON.stringify(selector)})`, sig);
-						} finally {
-							await handle.dispose().catch(() => undefined);
-						}
+						await this.#clickSelector(selector, actionOpMs, sig, handle =>
+							setElementChecked(handle, false, `tab.uncheck(${JSON.stringify(selector)})`, sig),
+						);
 					},
 					{ selector, zeroMatchAfterMs: ZERO_MATCH_FAIL_FAST_MS },
 				),
-			keyDown: key => op(`tab.keyDown(${JSON.stringify(key)})`, actionOpMs, sig => keyDown(page, key, sig)),
-			keyUp: key => op(`tab.keyUp(${JSON.stringify(key)})`, actionOpMs, sig => keyUp(page, key, sig)),
+			// A press is held from when it lands; one cut off on its way is released by the helper itself.
+			keyDown: key =>
+				op(`tab.keyDown(${JSON.stringify(key)})`, actionOpMs, async sig => {
+					await keyDown(page, key, sig);
+					this.#heldKeys.add(key);
+				}),
+			keyUp: key =>
+				op(`tab.keyUp(${JSON.stringify(key)})`, actionOpMs, sig => {
+					this.#heldKeys.delete(key);
+					return keyUp(page, key, sig);
+				}),
 			mouseMove: (x, y, opts) => op("tab.mouseMove()", actionOpMs, sig => mouseMove(page, x, y, opts, sig)),
-			mouseDown: opts => op("tab.mouseDown()", actionOpMs, sig => mouseDown(page, opts, sig)),
-			mouseUp: opts => op("tab.mouseUp()", actionOpMs, sig => mouseUp(page, opts, sig)),
+			mouseDown: opts =>
+				op("tab.mouseDown()", actionOpMs, async sig => {
+					await mouseDown(page, opts, sig);
+					this.#heldButtons.add(opts?.button ?? "left");
+				}),
+			mouseUp: opts =>
+				op("tab.mouseUp()", actionOpMs, sig => {
+					this.#heldButtons.delete(opts?.button ?? "left");
+					return mouseUp(page, opts, sig);
+				}),
 			// Raw pointer input runs at once, as on main: sent the moment a new document had parsed, a click did not
 			// reach it.
 			clickAt: (x, y, opts) => op("tab.clickAt()", actionOpMs, sig => clickAt(page, x, y, opts, sig)),
@@ -3164,14 +3250,9 @@ export class WorkerCore {
 				op("tab.clipboardWrite()", actionOpMs, sig =>
 					untilAborted(sig, () => this.#requireEmulation().clipboardWrite(text)),
 				),
-			clipboardCopy: () =>
-				op("tab.clipboardCopy()", actionOpMs, sig =>
-					untilAborted(sig, () => this.#requireEmulation().clipboardCopy()),
-				),
+			clipboardCopy: () => op("tab.clipboardCopy()", actionOpMs, sig => this.#requireEmulation().clipboardCopy(sig)),
 			clipboardPaste: () =>
-				op("tab.clipboardPaste()", actionOpMs, sig =>
-					untilAborted(sig, () => this.#requireEmulation().clipboardPaste()),
-				),
+				op("tab.clipboardPaste()", actionOpMs, sig => this.#requireEmulation().clipboardPaste(sig)),
 		};
 	}
 
@@ -3460,10 +3541,7 @@ export class WorkerCore {
 		let end: { x: number; y: number; handle?: ElementHandle } | undefined;
 		try {
 			end = await resolveDragPoint(to, "to");
-			await untilAborted(signal, () => page.mouse.move(start.x, start.y));
-			await untilAborted(signal, () => page.mouse.down());
-			await untilAborted(signal, () => page.mouse.move(end!.x, end!.y, { steps: 12 }));
-			await untilAborted(signal, () => page.mouse.up());
+			await dragBetween(page, start, end, signal);
 		} finally {
 			if (start.handle) await start.handle.dispose().catch(() => undefined);
 			if (end?.handle) await end.handle.dispose().catch(() => undefined);
@@ -3479,8 +3557,11 @@ export class WorkerCore {
 		}
 	}
 
-	/** Find what takes a `tab.uploadFile` under the action deadline; the result owns the resolved handle. */
-	async #prepareTabUpload(
+	/**
+	 * Find what takes a `tab.uploadFile` under the action deadline, looking the selector up again when the page
+	 * replaced a chooser trigger before its click ({@link withLiveElement}); the result owns the resolved handle.
+	 */
+	#prepareTabUpload(
 		selector: string,
 		filePaths: string[],
 		label: string,
@@ -3490,32 +3571,38 @@ export class WorkerCore {
 		session: SessionSnapshot,
 	): Promise<PreparedUpload> {
 		const page = this.#requirePage();
-		const handle = await this.#resolveActionHandle(selector, timeoutMs, signal);
-		try {
-			const absolute = filePaths.map(filePath => resolveToCwd(filePath, session.cwd));
-			const prepared = await prepareElementUpload(
-				page,
-				handle,
-				absolute,
-				label,
-				route,
-				this.#requireUploads(),
-				signal,
-			);
-			return {
-				...prepared,
-				dispose: async () => {
-					try {
-						await prepared.dispose();
-					} finally {
-						await handle.dispose().catch(() => undefined);
-					}
-				},
-			};
-		} catch (error) {
-			await handle.dispose().catch(() => undefined);
-			throw error;
-		}
+		const absolute = filePaths.map(filePath => resolveToCwd(filePath, session.cwd));
+		return withLiveElement(
+			() => this.#resolveActionHandle(selector, timeoutMs, signal),
+			async handle => {
+				try {
+					const prepared = await prepareElementUpload(
+						page,
+						handle,
+						absolute,
+						label,
+						route,
+						this.#requireUploads(),
+						signal,
+					);
+					return {
+						...prepared,
+						dispose: async () => {
+							try {
+								await prepared.dispose();
+							} finally {
+								await handle.dispose().catch(() => undefined);
+							}
+						},
+					};
+				} catch (error) {
+					await handle.dispose().catch(() => undefined);
+					throw error;
+				}
+			},
+			signal,
+			{ retry: parseAriaRefSelector(selector) === null },
+		);
 	}
 
 	async #waitForUrl(pattern: string | RegExp, timeout: number, signal: AbortSignal): Promise<string> {
@@ -3613,6 +3700,32 @@ export class WorkerCore {
 			this.#requirePage().locator(normalizeSelector(selector)).setTimeout(timeoutMs).waitHandle({ signal: sig }),
 		)) as ElementHandle;
 	}
+
+	/**
+	 * Runs `click` on the element `selector` resolves to, resolving it again whenever the page replaced it before the
+	 * click reached it ({@link withLiveElement}). An `aria-ref` resolves to the replaced node again, so its replacement
+	 * fails at once.
+	 */
+	#clickSelector(
+		selector: string,
+		timeoutMs: number,
+		sig: AbortSignal,
+		click: (handle: ElementHandle) => Promise<void>,
+	): Promise<void> {
+		return withLiveElement(
+			() => this.#resolveActionHandle(selector, timeoutMs, sig),
+			async handle => {
+				try {
+					await click(handle);
+				} finally {
+					void handle.dispose().catch(() => undefined);
+				}
+			},
+			sig,
+			{ retry: parseAriaRefSelector(selector) === null },
+		);
+	}
+
 	#clearElementCache(): void {
 		this.#observedElements.clear();
 		if (this.#elementCache.size === 0) {
@@ -3662,7 +3775,7 @@ export class WorkerCore {
 		return true;
 	}
 
-	async #close(): Promise<void> {
+	async #close(keepPage: boolean): Promise<void> {
 		if (!this.#stop()) return;
 		this.#clearElementCache();
 		const page = this.#page;
@@ -3682,7 +3795,7 @@ export class WorkerCore {
 		await this.#certificateOverride?.detach().catch(() => undefined);
 		this.#certificateOverride = undefined;
 		this.#emulation?.dispose();
-		if (this.#ownsPage && page && !page.isClosed()) await page.close().catch(() => undefined);
+		if (this.#ownsPage && !keepPage && page && !page.isClosed()) await page.close().catch(() => undefined);
 		if (this.#browser?.connected) this.#browser.disconnect();
 		this.#transport.send({ type: "closed" });
 		this.#transport.close();

@@ -2,7 +2,13 @@ import * as path from "node:path";
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import { Shell, ShellFsOp, type ShellFilesystem } from "@oh-my-pi/pi-natives";
 import type { ReadToolDetails } from "@oh-my-pi/pi-tui/tools/read";
-import { DEFAULT_MAX_LINES, truncateHead, truncateMiddle, truncateTail } from "@oh-my-pi/pi-tui/tools/streaming-output";
+import {
+	DEFAULT_MAX_BYTES,
+	DEFAULT_MAX_LINES,
+	truncateHead,
+	truncateMiddle,
+	truncateTail,
+} from "@oh-my-pi/pi-tui/tools/streaming-output";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import {
 	filterChildShellEnv,
@@ -49,10 +55,10 @@ const MAX_QUERY_CAPTURE_CHARS = 5 * 1024 * 1024;
 const JSON_QUERY_TIMEOUT_MS = 30_000;
 /**
  * Aborting a shell run costs a reader grace period (hundreds of ms), while a
- * filled page usually means jaq is about to exit; let it finish first.
+ * filled page usually means jq is about to exit; let it finish first.
  */
 const PAGE_FULL_ABORT_DELAY_MS = 50;
-/** jaq interpolates the offending value into a diagnostic; middle-eliding each line keeps its reason and key. */
+/** jq interpolates the offending value into a diagnostic; middle-eliding each line keeps its reason and key. */
 const JSON_QUERY_ERROR_LINE_MAX_BYTES = 512;
 /** Bounds the jq stderr quoted in a result; the tail keeps the error after any `debug` lines. */
 const JSON_QUERY_ERROR_MAX_BYTES = 8 * 1024;
@@ -207,7 +213,7 @@ function stringEnd(text: string, open: number): number {
 }
 
 /**
- * Lays out one compact JSON value the way jaq pretty-prints it. Works on the
+ * Lays out one compact JSON value the way jq pretty-prints it. Works on the
  * text, so number literals beyond f64 precision stay verbatim.
  */
 function prettyJson(compact: string): string {
@@ -305,8 +311,8 @@ function pageStream(values: string[], selector: JsonSelector, page: JsonPage, mo
  * sink bounds diagnostics as they arrive, separately from result values.
  * Capture stops at {@link MAX_QUERY_CAPTURE_CHARS} or after `stopAfterLines` newlines.
  *
- * Like jq, jaq reports an input that fails and goes on with the rest, exiting
- * 0 unless the last input failed; `stderr` carries those reports.
+ * jq reports an input that fails and goes on with the rest, exiting 0 unless
+ * the last input failed; `stderr` carries those reports.
  *
  * @throws ToolError when jq fails, times out, or the caller aborts.
  */
@@ -380,13 +386,13 @@ function withStderr(text: string, stderr: string): string {
 }
 
 /**
- * Evaluates `selector.query` over `filePath` with the bundled jaq.
+ * Evaluates `selector.query` over `filePath` with the shell's builtin jq.
  *
- * Without a page, returns jaq's output verbatim (minus the final newline).
- * With one, jaq runs compact so each line is exactly one value and stops once
+ * Without a page, returns jq's output verbatim (minus the final newline).
+ * With one, jq runs compact so each line is exactly one value and stops once
  * the page plus one lookahead value is captured; a single array result pages
  * its elements instead. Values are re-rendered from text, never reparsed.
- * Anything jaq wrote to stderr leads the result.
+ * Anything jq wrote to stderr leads the result.
  *
  * @throws ToolError on jq errors and timeouts, or when the values before the
  * requested page exceed the capture cap.
@@ -410,7 +416,7 @@ export async function executeJsonQuery(
 		stopAfterLines: page.offset + page.limit + 1,
 	});
 	const values = output.split("\n");
-	// jaq ends every compact value with a newline; text after the last one is a cut-off value.
+	// jq ends every compact value with a newline; text after the last one is a cut-off value.
 	const tail = values.pop();
 	if (tail && !stopped) values.push(tail);
 	if (stopped === "capture-cap" && values.length <= page.offset) {
@@ -540,7 +546,7 @@ export async function readJson(
 	if (resource) resultBuilder.sourceInternal(resource.url);
 	else if (file) resultBuilder.sourcePath(file.absolutePath);
 	if (truncation.truncated) {
-		resultBuilder.truncation(truncation, { direction: "head" });
+		resultBuilder.truncation(truncation, { direction: "head", maxBytes: DEFAULT_MAX_BYTES });
 	}
 
 	return resultBuilder.done();

@@ -12,7 +12,7 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
-import type { CollabGuestLink } from "@oh-my-pi/pi-coding-agent/collab/guest";
+import { CollabGuestLink } from "@oh-my-pi/pi-coding-agent/collab/guest";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type {
@@ -24,13 +24,13 @@ import { GuestLifecycleEmitter } from "@oh-my-pi/pi-coding-agent/extensibility/e
 import { ExtensionRuntime, loadExtensionFromFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
 import { ExtensionUiController } from "@oh-my-pi/pi-coding-agent/modes/controllers/extension-ui-controller";
-import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { createInteractiveModeContext } from "../helpers/interactive-mode-context";
 
 describe("collab guest extension turn guard", () => {
 	let tempDir: TempDir;
@@ -107,15 +107,16 @@ describe("collab guest extension turn guard", () => {
 		const baselineMessages = JSON.stringify(agentSession.messages);
 
 		const errors: string[] = [];
-		const ctx = {
+		const ctx = createInteractiveModeContext({
 			session: agentSession,
 			sessionManager,
-			collabGuest: {} as CollabGuestLink,
+			settings,
 			showStatus: () => {},
 			showError: (message: string) => errors.push(message),
 			syncComposerShape: () => {},
 			syncExtensionLinks: () => {},
-		} as unknown as InteractiveModeContext;
+		});
+		ctx.setCollabGuest(new CollabGuestLink(ctx));
 		new ExtensionUiController(ctx).initializeHookRunner({} as ExtensionUIContext, false);
 
 		const mirror = new GuestLifecycleEmitter();
@@ -156,7 +157,7 @@ describe("collab guest extension turn guard", () => {
 		expect(blocked.map(result => result.status)).toEqual(["rejected", "rejected"]);
 
 		// Left the session: the same reaction now owns a real local turn.
-		ctx.collabGuest = undefined;
+		ctx.setCollabGuest(undefined);
 		handled = Promise.withResolvers<void>();
 		onAgentEnd = pi => {
 			pi.sendMessage({ customType: "plan-execute", content: "EXECUTE_PLAN", display: true }, { triggerTurn: true });

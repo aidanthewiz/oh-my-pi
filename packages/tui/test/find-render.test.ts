@@ -187,6 +187,19 @@ describe("findToolRenderer", () => {
 		expect(view).toContain("2 unanswered");
 	});
 
+	it("warns in the head, ANSI and native, when the deadline cut verification short", async () => {
+		const uiTheme = (await getThemeByName("dark"))!;
+		const cut = { ...result, details: { ...details, timeout: { verified: 3, passages: 8 } } };
+		const options = { expanded: false, isPartial: false };
+		const ansi = (input: typeof result) =>
+			sanitizeText(findToolRenderer.renderResult(input, options, uiTheme, args).render(200).join("\n"));
+		const native = (input: typeof result) => JSON.stringify(findToolRenderer.describeResult(input, options, args));
+		expect(ansi(cut)).toContain("timed out, 3/8 passages verified");
+		expect(native(cut)).toContain("timed out, 3/8 passages verified");
+		expect(ansi(result)).not.toContain("timed out");
+		expect(native(result)).not.toContain("timed out");
+	});
+
 	it("renders the streamed phase while the call is still running", async () => {
 		const uiTheme = (await getThemeByName("dark"))!;
 		const partial = findToolRenderer.renderResult(

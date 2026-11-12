@@ -161,6 +161,30 @@ describe("InteractiveMode loop auto-submit", () => {
 		expect(resolved[0].text).toBe("deliver this");
 	});
 
+	it("does not submit a loop turn while a user decision owns the session", async () => {
+		vi.useFakeTimers();
+		const decision = Promise.withResolvers<void>();
+		const waiting = session.waitForUser(() => decision.promise);
+		mode.loopModeEnabled = true;
+		mode.loopPrompt = "continue only after the decision";
+		const resolved: SubmittedUserInput[] = [];
+		pendingInput = mode.getUserInput();
+		void pendingInput.then(input => resolved.push(input));
+		try {
+			vi.advanceTimersByTime(800);
+			await flushMicrotasks();
+			expect(resolved).toEqual([]);
+			decision.resolve();
+			await waiting;
+			vi.advanceTimersByTime(800);
+			await flushMicrotasks();
+			expect(resolved.map(input => input.text)).toEqual(["continue only after the decision"]);
+		} finally {
+			decision.resolve();
+			await waiting;
+		}
+	});
+
 	it("disables reset loops when vibe blocks the session transition", async () => {
 		vi.useFakeTimers();
 		cfgLoopMode.set(settings, "reset");

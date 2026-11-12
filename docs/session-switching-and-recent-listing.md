@@ -79,7 +79,7 @@ For `SessionInfo` list entries:
 5. If the breadcrumb's cwd differs, no longer exists, and no genuine current-cwd session takes precedence, re-root only when its recorded device/inode matches the current directory (`open` + `moveTo`). A deleted, unmounted, or cross-filesystem-moved project is not positive evidence of a rename.
 6. Otherwise use a breadcrumb whose cwd matches current cwd (and is within an explicit `sessionDir`, when supplied); for a cwd mismatch use the newest non-empty current-bucket session.
 7. Without a usable breadcrumb, choose the newest non-empty session by mtime; if none exists, create a new session.
-8. When the chosen session (including one re-rooted in step 5) went on in another file of its directory (a sibling whose header names it in `continuationOf`), open that copy instead and report it to `onSessionContinuation`. A breadcrumb uses `findSessionContinuation`, as id-based resume discovery does; a pick by mtime uses `findRecentSessionContinuation`, which looks at linked copies in both directions. Literal paths and picker selections remain exact.
+8. When the chosen session (including one re-rooted in step 5) continued in a sibling whose header names it in `continuationOf`, open that copy and report it to `onSessionContinuation`. A breadcrumb uses `findSessionContinuation`; a pick by mtime uses `findRecentSessionContinuation`, which follows links in both directions. Literal path arguments and interactive in-session picker selections remain exact; the startup picker follows a validated continuation after reading the selected file's authoritative metadata.
 
 Terminal ID derivation prefers TTY path and falls back to env-based identifiers (`ZELLIJ_PANE_ID`, `TMUX_PANE`, `CMUX_SURFACE_ID`, `KITTY_WINDOW_ID`, `WEZTERM_PANE`, `TERM_SESSION_ID`, `WT_SESSION`). Zellij IDs also include `ZELLIJ_SESSION_NAME` when present, with path separators normalized.
 
@@ -102,9 +102,9 @@ Breadcrumb writes are best-effort and non-fatal.
    - first match in modified-descending order is used (no ambiguity prompt)
    - with no match, the resolver (`resolveResumeTarget`) looks in the same scopes for a `<timestamp>_<id>.jsonl` file whose name matches but which no longer reads as a session (the listing skips it)
 
-Resume-key discovery follows the session's continuations: when its conversation went on in a sibling file whose header names it in `continuationOf`, the copy with the newest turn opens instead (unless the named session has turns that copy lacks), and a notice names both files. Discovery can also follow an unlisted replaced generated filename through its recorded id. Literal path arguments and picker-selected paths remain exact and do not use continuation or generated-filename recovery.
+Resume-key discovery follows validated continuations unless the named session has turns the copy lacks. A notice names both files. Discovery can recover an unlisted replaced generated filename through its recorded id. Literal path arguments never use continuation or generated-filename recovery. The startup picker re-reads the selected file's metadata, then can choose its continuation; the chosen record supplies both path and cwd. Interactive in-session picker selection remains exact.
 
-If a matched session's recorded cwd no longer exists, CLI prompts `Move (re-root) it into the current directory? [Y/n]`. Acceptance opens it and `moveTo(cwd)` relocates it; decline exits cleanly. A non-TTY cannot answer and raises `SessionResolutionError`.
+If a matched session's recorded cwd no longer exists, CLI prompts `Move (re-root) it into the current directory? [Y/n]`. Acceptance uses `SessionManager.openRelocated(...)` under ownership and publication fences; a live writer refuses relocation. Decline exits cleanly. A non-TTY cannot answer and raises `SessionResolutionError`.
 
 Otherwise the session is opened in its recorded project, including global matches; startup switches process cwd, reloads project-scoped settings/plugins, and re-resolves enabled models before constructing the agent. It does **not** fork merely because the match is cross-project.
 

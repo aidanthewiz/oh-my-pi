@@ -210,6 +210,9 @@ async function makeHarness(
 		syncRunningSubagentBadge: () => {},
 		syncComposerShape: () => {},
 		syncExtensionLinks: () => {},
+		setCollabGuest: (guest: InteractiveModeContext["collabGuest"]) => {
+			Object.assign(ctx, { collabGuest: guest });
+		},
 		eventBus: new EventBus(),
 	}) as unknown as InteractiveModeContext;
 	const showError = ctx.showError.bind(ctx);
@@ -611,10 +614,17 @@ describe("collab guest extension lifecycle mirror", () => {
 				if (dropPause && frame.t === "event" && frame.event.type === "agent_end") {
 					physicalPause = frame.event;
 					hostSocket = this;
-					return;
+					return true;
 				}
-				if (dropPause && frame.t === "state" && frame.state.lifecycle?.phase === "continuing") return;
-				originalSend.call(this, wireFrame, peer);
+				return originalSend.call(this, wireFrame, peer);
+			},
+		);
+		const originalBroadcastAdvisory = CollabSocket.prototype.broadcastAdvisory;
+		const advisorySpy = spyOn(CollabSocket.prototype, "broadcastAdvisory").mockImplementation(
+			function (this: CollabSocket, wireFrame) {
+				const frame: CollabFrame = typeof wireFrame === "string" ? JSON.parse(wireFrame) : wireFrame;
+				if (dropPause && frame.t === "state" && frame.state.lifecycle?.phase === "continuing") return true;
+				return originalBroadcastAdvisory.call(this, wireFrame);
 			},
 		);
 		let snapshotApplied = Promise.withResolvers<void>();
@@ -791,6 +801,7 @@ describe("collab guest extension lifecycle mirror", () => {
 			bus.clear();
 			controller.dispose();
 			sendSpy.mockRestore();
+			advisorySpy.mockRestore();
 			renderSpy.mockRestore();
 			errorSpy.mockRestore();
 			disposeTerminalTitleState();
@@ -914,25 +925,32 @@ describe("collab guest extension lifecycle mirror", () => {
 					if (
 						outcome === "retry-error" &&
 						((frame.t === "event" && frame.event.type === "auto_retry_end") ||
-							(disconnected && (frame.t === "event" || frame.t === "state" || frame.t === "entry")))
+							(disconnected && (frame.t === "event" || frame.t === "entry")))
 					) {
 						if (frame.t === "event" && frame.event.type === "agent_end") {
 							physical = frame.event;
 							hostSocket = this;
 						}
-						return;
+						return true;
 					}
 					if (frame.t === "event" && frame.event.type === "agent_end") {
 						physical = frame.event;
 						hostSocket = this;
-						return;
+						return true;
 					}
+					return originalSend.call(this, wireFrame, peer);
+				},
+			);
+			const originalBroadcastAdvisory = CollabSocket.prototype.broadcastAdvisory;
+			const advisorySpy = spyOn(CollabSocket.prototype, "broadcastAdvisory").mockImplementation(
+				function (this: CollabSocket, wireFrame) {
+					const frame: CollabFrame = typeof wireFrame === "string" ? JSON.parse(wireFrame) : wireFrame;
+					if (outcome === "retry-error" && disconnected && frame.t === "state") return true;
 					if (outcome === "unknown" && frame.t === "state" && frame.state.lifecycle) {
 						const { outcome: _outcome, ...lifecycle } = frame.state.lifecycle;
-						originalSend.call(this, { ...frame, state: { ...frame.state, lifecycle } }, peer);
-						return;
+						return originalBroadcastAdvisory.call(this, { ...frame, state: { ...frame.state, lifecycle } });
 					}
-					originalSend.call(this, wireFrame, peer);
+					return originalBroadcastAdvisory.call(this, wireFrame);
 				},
 			);
 			let harness: Harness | undefined;
@@ -1006,6 +1024,7 @@ describe("collab guest extension lifecycle mirror", () => {
 				notificationSpy.mockRestore();
 				showErrorSpy.mockRestore();
 				sendSpy.mockRestore();
+				advisorySpy.mockRestore();
 				await auth.close();
 				resetSettingsForTest();
 				homedirSpy.mockRestore();
@@ -1705,8 +1724,10 @@ describe("collab guest extension lifecycle mirror", () => {
 					transition = harness.barrier();
 				}
 				await Promise.race([drainStarted.promise, replaced.promise]);
+				expect(ctx.collabGuest).toBe(harness.guest);
 				lookup.resolve(new Map([["local://guest-ownership", "file:///synthetic-guest-ownership"]]));
 				await transition;
+				expect(ctx.collabGuest).toBe(boundary === "leave" ? undefined : harness.guest);
 				await controller.dispatchSessionEvent({ type: "turn_start" });
 				expect(ctx.chatContainer.children).toEqual([replacement!]);
 				expect(ctx.chatContainer.render(100).join("\n")).toContain(`${boundary} replacement`);

@@ -37,8 +37,8 @@ describe.each([
 	},
 	{
 		label: "wire-stripped",
-		provider: "venice",
-		id: "deepseek-v4-1-flash",
+		provider: "deepseek",
+		id: "deepseek-v4-flash",
 	},
 ] as const)("AgentSession manual snapcompact $label fallback", ({ provider, id }) => {
 	let session: AgentSession | undefined;

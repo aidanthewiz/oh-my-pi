@@ -82,6 +82,53 @@ pub(crate) struct RunOptions {
 	pub env:       Option<BTreeMap<String, String>>,
 }
 
+struct ChildGroup {
+	#[cfg(unix)]
+	pid: Option<libc::pid_t>,
+}
+
+impl ChildGroup {
+	fn new(pid: Option<u32>) -> Self {
+		#[cfg(unix)]
+		{
+			Self { pid: pid.and_then(|pid| libc::pid_t::try_from(pid).ok()) }
+		}
+		#[cfg(not(unix))]
+		{
+			let _ = pid;
+			Self {}
+		}
+	}
+
+	#[cfg(unix)]
+	fn signal(&self, signal: libc::c_int) {
+		if let Some(pid) = self.pid {
+			// SAFETY: the unreaped setsid leader pins this owned group's identity.
+			unsafe {
+				libc::kill(-pid, signal);
+			}
+		}
+	}
+
+	fn kill(&self) {
+		#[cfg(unix)]
+		self.signal(libc::SIGKILL);
+	}
+
+	const fn disarm(&mut self) {
+		#[cfg(unix)]
+		{
+			self.pid = None;
+		}
+	}
+}
+
+impl Drop for ChildGroup {
+	fn drop(&mut self) {
+		self.kill();
+	}
+}
+
 /// Build the hardened argv prefix.
 ///
 /// Reads get `--no-optional-locks`, which already keeps them from rewriting
@@ -205,9 +252,35 @@ fn is_utf8_locale(value: &str) -> bool {
 	})
 }
 
+/// Start `cmd` in a new session with no controlling terminal, the embedded
+/// shell's policy for externals. Without it git and everything it starts (ssh,
+/// credential helpers, signers, hooks) share the host's terminal: any of them
+/// can read the user's keystrokes and the terminal's protocol replies out from
+/// under the TUI, or prompt on it. Detached, a `/dev/tty` open fails
+/// (`ENXIO`), so a prompt errors out instead.
+#[cfg(unix)]
+pub(crate) fn detach_from_terminal(cmd: &mut std::process::Command) {
+	std::os::unix::process::CommandExt::setsid(cmd, true);
+}
+
+#[cfg(not(unix))]
+#[allow(
+	clippy::needless_pass_by_ref_mut,
+	reason = "no controlling terminal to detach from off unix; the signature matches the unix \
+	          variant"
+)]
+pub(crate) const fn detach_from_terminal(_cmd: &mut std::process::Command) {}
+
 /// Run `git` asynchronously with bounded capture and a deadline.
 /// Non-zero exits are returned in [`CliOutput`], not raised.
 pub(crate) async fn run(cwd: &Path, args: &[String], options: &RunOptions) -> Result<CliOutput> {
+	if options
+		.cancel
+		.as_ref()
+		.is_some_and(CancellationToken::is_cancelled)
+	{
+		return Err(Error::Canceled);
+	}
 	let argv = hardened_args(args, options.read_only);
 	let mut cmd = tokio::process::Command::new("git");
 	cmd.args(&argv)
@@ -221,7 +294,9 @@ pub(crate) async fn run(cwd: &Path, args: &[String], options: &RunOptions) -> Re
 		.stderr(Stdio::piped())
 		.kill_on_drop(true);
 	apply_env(&mut cmd, options.env.as_ref());
+	detach_from_terminal(cmd.as_std_mut());
 	let mut child = cmd.spawn().map_err(|err| spawn_error(cwd, err))?;
+	let mut group = ChildGroup::new(child.id());
 
 	let stdin_pipe = child.stdin.take();
 	let write_stdin = async {
@@ -237,38 +312,44 @@ pub(crate) async fn run(cwd: &Path, args: &[String], options: &RunOptions) -> Re
 
 	let stdout = child.stdout.take().expect("stdout piped");
 	let stderr = child.stderr.take().expect("stderr piped");
-	let stdout_task = tokio::spawn(read_capped(stdout));
-	let stderr_task = tokio::spawn(read_capped(stderr));
+	// TERM handlers may write to these pipes before publishing cleanup.
+	// Boxing bounds caller futures despite the two 8 KiB read buffers.
+	let mut drain = Box::pin(async { tokio::join!(read_capped(stdout), read_capped(stderr)) });
+	let mut drained = false;
+	let completion = async {
+		// Keep the leader unreaped while helpers can still hold captured pipes.
+		let ((), (stdout, stderr)) = tokio::join!(write_stdin, async {
+			let output = drain.as_mut().await;
+			drained = true;
+			output
+		});
+		let status = child.wait().await;
+		group.disarm();
+		Ok(CliOutput {
+			exit_code: status.map_err(Error::Io)?.code().unwrap_or(-1),
+			stdout:    stdout?,
+			stderr:    stderr?,
+		})
+	};
 
 	let timeout = options.timeout.unwrap_or(COMMAND_TIMEOUT);
 	let cancel = options.cancel.clone().unwrap_or_default();
-	let exit = tokio::select! {
-		status = tokio::time::timeout(timeout, async {
-			tokio::join!(write_stdin, child.wait()).1
-		}) => match status {
-			Ok(status) => status.map_err(Error::Io)?,
-			Err(_elapsed) => {
-				terminate(&mut child).await;
-				stdout_task.abort();
-				stderr_task.abort();
-				return Err(Error::CliTimeout { command: format!("git {}", argv.join(" ")) });
-			},
-		},
-		() = cancel.cancelled() => {
-			terminate(&mut child).await;
-			stdout_task.abort();
-			stderr_task.abort();
-			return Err(Error::Canceled);
-		},
+	let outcome = tokio::select! {
+		result = tokio::time::timeout(timeout, completion) => Some(result),
+		() = cancel.cancelled() => None,
 	};
-
-	let stdout = stdout_task
-		.await
-		.map_err(|err| Error::backend("git run", err))??;
-	let stderr = stderr_task
-		.await
-		.map_err(|err| Error::backend("git run", err))??;
-	Ok(CliOutput { exit_code: exit.code().unwrap_or(-1), stdout, stderr })
+	let error = match outcome {
+		Some(Ok(result)) => return result,
+		Some(Err(_elapsed)) => Error::CliTimeout { command: format!("git {}", argv.join(" ")) },
+		None => Error::Canceled,
+	};
+	let termination = terminate(&mut child, &mut group);
+	tokio::pin!(termination);
+	tokio::select! {
+		() = &mut termination => {},
+		_ = drain.as_mut(), if !drained => termination.await,
+	}
+	Err(error)
 }
 
 /// Run `git` asynchronously and map a non-zero exit to [`Error::Cli`].
@@ -348,26 +429,47 @@ pub(crate) fn run_sync_capped(
 		.stdout(Stdio::piped())
 		.stderr(Stdio::piped());
 	apply_env(&mut cmd, None);
+	detach_from_terminal(&mut cmd);
 	let mut child = cmd.spawn().map_err(|err| spawn_error(cwd, err))?;
+	let mut group = ChildGroup::new(Some(child.id()));
 	let stdout = spawn_sync_reader("git-cli-stdout", child.stdout.take(), limit);
 	let stderr = spawn_sync_reader("git-cli-stderr", child.stderr.take(), limit);
 	let deadline = std::time::Instant::now() + timeout;
-	let status = loop {
-		match child.try_wait()? {
-			Some(status) => break Some(status),
-			None if std::time::Instant::now() >= deadline => {
-				let _ = child.kill();
-				let _ = child.wait();
-				break None;
-			},
-			None => std::thread::sleep(Duration::from_millis(10)),
+	let status: std::io::Result<_> = loop {
+		let drained = stdout
+			.as_ref()
+			.is_none_or(std::thread::JoinHandle::is_finished)
+			&& stderr
+				.as_ref()
+				.is_none_or(std::thread::JoinHandle::is_finished);
+		if drained {
+			match child.try_wait() {
+				Ok(Some(status)) => {
+					group.disarm();
+					break Ok(Some(status));
+				},
+				Ok(None) => {},
+				Err(error) => {
+					group.kill();
+					group.disarm();
+					let _ = child.kill();
+					let _ = child.wait();
+					break Err(error);
+				},
+			}
 		}
+		if std::time::Instant::now() >= deadline {
+			group.kill();
+			group.disarm();
+			let _ = child.kill();
+			let _ = child.wait();
+			break Ok(None);
+		}
+		std::thread::sleep(Duration::from_millis(10));
 	};
-	// The child has exited (or been killed), so the pipes reach EOF and the
-	// readers terminate; join can only block briefly on the final drain.
 	let stdout = stdout.map_or_default(|h| h.join().unwrap_or_default());
 	let stderr = stderr.map_or_default(|h| h.join().unwrap_or_default());
-	let Some(status) = status else {
+	let Some(status) = status? else {
 		return Err(Error::CliTimeout { command: format!("git {}", argv.join(" ")) });
 	};
 	Ok(CliOutput { exit_code: status.code().unwrap_or(-1), stdout, stderr })
@@ -463,23 +565,18 @@ async fn read_capped(mut stream: impl tokio::io::AsyncRead + Unpin) -> Result<St
 	Ok(text)
 }
 
-/// SIGTERM, grace period, then SIGKILL.
-async fn terminate(child: &mut tokio::process::Child) {
+/// Keep the session leader unreaped through TERM grace and group escalation.
+async fn terminate(child: &mut tokio::process::Child, group: &mut ChildGroup) {
 	#[cfg(unix)]
-	if let Some(pid) = child.id() {
-		// SAFETY: plain kill(2) on a pid we own; no memory is touched.
-		unsafe {
-			libc::kill(pid as i32, libc::SIGTERM);
-		}
-		if tokio::time::timeout(TERMINATE_GRACE, child.wait())
-			.await
-			.is_ok()
-		{
-			return;
-		}
+	{
+		group.signal(libc::SIGTERM);
+		tokio::time::sleep(TERMINATE_GRACE).await;
+		group.kill();
+		group.disarm();
 	}
 	let _ = child.kill().await;
 	let _ = tokio::time::timeout(TERMINATE_GRACE, child.wait()).await;
+	group.disarm();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -607,6 +704,97 @@ pub async fn clone(
 mod tests {
 	use super::*;
 
+	#[tokio::test]
+	async fn cancelled_run_rejects_before_process_admission() {
+		let root = tempfile::tempdir().unwrap();
+		let cancel = CancellationToken::new();
+		cancel.cancel();
+		let result = run(&root.path().join("absent"), &["status".into()], &RunOptions {
+			cancel: Some(cancel),
+			..RunOptions::default()
+		})
+		.await;
+		assert!(matches!(result, Err(Error::Canceled)), "{result:?}");
+	}
+
+	#[cfg(unix)]
+	async fn wait_for_fixture(path: &Path) {
+		tokio::time::timeout(Duration::from_secs(5), async {
+			while !path.exists() {
+				tokio::time::sleep(Duration::from_millis(10)).await;
+			}
+		})
+		.await
+		.expect("git helper did not reach its fixture boundary");
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn cancellation_completes_owned_helper_term_cleanup() {
+		use std::os::unix::fs::PermissionsExt;
+
+		let root = tempfile::tempdir().unwrap();
+		let git = root.path().join("git");
+		std::fs::write(&git, "#!/bin/sh\n/bin/sh ./helper &\nwait\n").unwrap();
+		std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
+		std::fs::write(
+			root.path().join("helper"),
+			"trap '/bin/cat cleanup-output || exit 1; /bin/cat cleanup-output >&2 || exit 1; printf \
+			 cleaned > cleaned; printf done > done; exit 0' TERM\nprintf ready > ready\n/bin/sleep \
+			 2\nprintf late > late\nprintf done > done\n",
+		)
+		.unwrap();
+		std::fs::write(root.path().join("cleanup-output"), "output\n".repeat(32 * 1024)).unwrap();
+		let cancel = CancellationToken::new();
+		let args = ["custody".into()];
+		let options = RunOptions {
+			cancel: Some(cancel.clone()),
+			env: Some(BTreeMap::from([("PATH".into(), root.path().to_str().unwrap().to_owned())])),
+			..RunOptions::default()
+		};
+		let trigger = async {
+			wait_for_fixture(&root.path().join("ready")).await;
+			cancel.cancel();
+		};
+		let (result, ()) = tokio::join!(run(root.path(), &args, &options), trigger);
+		assert!(matches!(result, Err(Error::Canceled)), "{result:?}");
+		assert_eq!(std::fs::read(root.path().join("cleaned")).unwrap(), b"cleaned");
+		assert_eq!(std::fs::read(root.path().join("done")).unwrap(), b"done");
+		assert!(!root.path().join("late").exists());
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn sync_deadline_includes_inherited_output_pipes() {
+		let root = tempfile::tempdir().unwrap();
+		let ready = root.path().join("ready");
+		let observed_ready = ready.clone();
+		let release = root.path().join("release");
+		let releaser = std::thread::spawn(move || {
+			let deadline = std::time::Instant::now() + Duration::from_secs(5);
+			while !ready.exists() && std::time::Instant::now() < deadline {
+				std::thread::sleep(Duration::from_millis(10));
+			}
+			std::thread::sleep(Duration::from_secs(2));
+			std::fs::write(release, b"release").unwrap();
+		});
+		let result = run_sync(
+			root.path(),
+			&[
+				"-c".into(),
+				"alias.held=!{ printf ready > ready; while [ ! -f release ]; do sleep 0.01; done; \
+				 printf escaped > escaped; } &"
+					.into(),
+				"held".into(),
+			],
+			Duration::from_secs(1),
+		);
+		releaser.join().unwrap();
+		assert!(observed_ready.exists(), "git helper never started");
+		assert!(matches!(result, Err(Error::CliTimeout { .. })), "{result:?}");
+		assert!(!root.path().join("escaped").exists());
+	}
+
 	#[cfg(unix)]
 	#[tokio::test]
 	async fn async_runner_drains_output_while_delivering_stdin() {
@@ -647,6 +835,28 @@ mod tests {
 	/// Asks git to report the ambient variables it was started with. A `!`-alias
 	/// is the only way to make git print its own environment.
 	const ENV_PROBE_ALIAS: &str = r#"!printf 'LC_ALL=[%s] LC_CTYPE=[%s] LC_MESSAGES=[%s] LITERAL=[%s] ICASE=[%s]' "$LC_ALL" "$LC_CTYPE" "$LC_MESSAGES" "$GIT_LITERAL_PATHSPECS" "$GIT_ICASE_PATHSPECS""#;
+
+	/// A git left in the host's process group shares its terminal and can read
+	/// the TUI's keystrokes and terminal replies (Tern TSP events leaked into
+	/// the composer with their leading bytes missing). Both runners must start
+	/// it in its own session.
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn runners_start_git_outside_the_host_process_group() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		let args = ["-c".to_owned(), "alias.pgid=!ps -o pgid= -p $$".to_owned(), "pgid".to_owned()];
+		// SAFETY: getpgrp has no preconditions.
+		let host = unsafe { libc::getpgrp() };
+		let sync = run_sync(dir.path(), &args, SYNC_TIMEOUT).expect("sync runner");
+		let spawned = run(dir.path(), &args, &RunOptions::default())
+			.await
+			.expect("async runner");
+		for out in [sync, spawned] {
+			assert_eq!(out.exit_code, 0, "alias failed: {out:?}");
+			let pgid: i32 = out.stdout.trim().parse().expect("pgid");
+			assert_ne!(pgid, host, "git shares the host's process group: {out:?}");
+		}
+	}
 
 	/// Two guarantees this crate builds on top of, both of which depend on what
 	/// the child process actually receives:

@@ -1443,7 +1443,7 @@ describe("AuthStorage usage cache: terminal refresh failure", () => {
 				{ type: "oauth", refresh: "refresh-leased" },
 			]);
 		} finally {
-			storage.close();
+			await storage.close();
 			vi.restoreAllMocks();
 		}
 	});

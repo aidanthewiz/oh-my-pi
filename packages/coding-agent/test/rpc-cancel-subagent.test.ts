@@ -226,6 +226,7 @@ describe("handleRpcCancelSubagent", () => {
 			sessionManager: { appendSessionInit: () => {} },
 			getActiveToolNames: () => ["read", "yield"],
 			getEnabledToolNames: () => ["read", "yield"],
+			getMountedXdevToolNames: () => [],
 			getToolByName: () => undefined,
 			setActiveToolsByName: async () => {},
 			setWorkPoolYieldItems: () => {},

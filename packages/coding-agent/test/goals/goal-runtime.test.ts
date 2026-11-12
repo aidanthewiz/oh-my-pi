@@ -67,6 +67,7 @@ function createHarness(initial: { state?: GoalModeState; usage?: GoalTokenUsage;
 			state = cloneState(next);
 		},
 		getCurrentUsage: () => createUsage(usage),
+		isWaitingForUser: () => false,
 		emit: async event => {
 			events.push(cloneEvent(event));
 		},
@@ -378,6 +379,66 @@ describe("goal runtime", () => {
 		expect(state?.goal.tokensUsed).toBe(4);
 		expect(state?.goal.timeUsedSeconds).toBe(1);
 		expect(harness.persists.at(-1)?.mode).toBe("goal_paused");
+	});
+
+	it.each([true, false])("keeps queued replacement ownership distinct from a guarded=%s pause", async guarded => {
+		const harness = createHarness({ state: { enabled: true, mode: "active", goal: createGoal() } });
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const emit = harness.host.emit;
+		let blocked = false;
+		harness.host.emit = async event => {
+			await emit(event);
+			if (!blocked) {
+				blocked = true;
+				entered.resolve();
+				await release.promise;
+			}
+		};
+		const accounting = harness.runtime.onBudgetMutated(100);
+		await entered.promise;
+		const replacing = harness.runtime.replaceGoal({ objective: "Replacement objective" });
+		const pausing = harness.runtime.pauseGoal(
+			guarded ? { isCurrent: () => harness.getState()?.goal.id === "goal-1" } : undefined,
+		);
+		release.resolve();
+		await accounting;
+		const replacement = await replacing;
+		await pausing;
+		expect(harness.getState()).toMatchObject({
+			enabled: guarded,
+			goal: { id: replacement.goal.id, objective: "Replacement objective", status: guarded ? "active" : "paused" },
+		});
+		expect(harness.persists.at(-1)).toMatchObject({
+			mode: guarded ? "goal" : "goal_paused",
+			state: { goal: { id: replacement.goal.id } },
+		});
+	});
+
+	it("rechecks an implicit pause owner after awaited usage notifications", async () => {
+		const harness = createHarness({ state: { enabled: true, mode: "active", goal: createGoal() } });
+		harness.runtime.onTurnStart("original", createUsage());
+		harness.setUsage({ input: 5 });
+		const emit = harness.host.emit;
+		let current = true;
+		harness.host.emit = async event => {
+			await emit(event);
+			if (event.type === "goal_updated" && event.goal?.id === "goal-1") {
+				current = false;
+				harness.setState({ enabled: true, mode: "active", goal: createGoal({ id: "goal-2" }) });
+				harness.runtime.onTurnStart("successor", createUsage({ input: 5 }));
+			}
+		};
+		expect(await harness.runtime.pauseGoal({ isCurrent: () => current })).toBeUndefined();
+		expect(harness.getState()).toMatchObject({ enabled: true, goal: { id: "goal-2", status: "active" } });
+		expect(harness.runtime.snapshot.turnSnapshot).toMatchObject({ turnId: "successor", activeGoalId: "goal-2" });
+		harness.setUsage({ input: 8 });
+		await harness.runtime.flushUsage("suppressed");
+		expect(harness.getState()?.goal.tokensUsed).toBe(3);
+		expect(harness.persists).toMatchObject([
+			{ mode: "goal", state: { goal: { id: "goal-1", tokensUsed: 5 } } },
+			{ mode: "goal", state: { goal: { id: "goal-2", tokensUsed: 3 } } },
+		]);
 	});
 
 	it("auto-pauses active goals when a thread resumes", async () => {

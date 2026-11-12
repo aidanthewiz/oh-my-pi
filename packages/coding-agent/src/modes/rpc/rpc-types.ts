@@ -123,7 +123,7 @@ export type RpcCommand =
 	| { id?: string; type: "abort_retry" }
 
 	// Bash
-	| { id?: string; type: "bash"; command: string }
+	| { id?: string; type: "bash"; command: string; excludeFromContext?: boolean }
 	| { id?: string; type: "abort_bash" }
 
 	// Session
@@ -381,6 +381,8 @@ export interface RpcReadyFrame {
 	supportedEventSubscriptionLevels: ["control", "full"];
 	maxFrameBytes: number;
 	maxReassembledFrameBytes: number;
+	/** `bash` accepts `excludeFromContext`; older runtimes omit this capability. Require exactly `true`. */
+	supportsBashExcludeFromContext?: boolean;
 }
 
 export interface RpcChunkFrame {
@@ -996,7 +998,7 @@ export type RpcExtensionUIResponse =
 	| {
 			type: "extension_ui_response";
 			id: string;
-			answers: Array<{ id: string; selectedOptions: string[]; customInput?: string }>;
+			answers: Array<{ id: string; selectedOptions: string[]; customInput?: string; timedOut?: boolean }>;
 	  };
 
 // ============================================================================

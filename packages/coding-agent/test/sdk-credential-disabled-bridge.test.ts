@@ -52,7 +52,7 @@ const initializeRunnerForTest = (runner: ExtensionRunner | undefined): void => {
 	runner.initialize(
 		{
 			sendMessage: () => {},
-			sendUserMessage: () => {},
+			sendUserMessage: async () => {},
 			appendEntry: () => {},
 			setLabel: () => {},
 			getActiveTools: () => [],
@@ -457,6 +457,7 @@ describe("createAgentSession credential_disabled subscription", () => {
 				tools: new Map(),
 				assistantThinkingRenderers: [],
 				assistantTextRenderers: [],
+				transcriptPresenters: [],
 				linkSchemes: [],
 				fileWriteFallbackHandlers: [],
 				fileDeleteFallbackHandlers: [],
@@ -477,7 +478,7 @@ describe("createAgentSession credential_disabled subscription", () => {
 			runner.initialize(
 				{
 					sendMessage: () => {},
-					sendUserMessage: () => {},
+					sendUserMessage: async () => {},
 					appendEntry: () => {},
 					setLabel: () => {},
 					getActiveTools: () => [],

@@ -9,7 +9,7 @@ import type { ToolSession } from "../tools";
 import { isIrcEnabled } from "../irc/messaging";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { isCompletionProbeEnabled } from "./completion-probe";
-import { runSubagentFollowUpTurn } from "./executor";
+import { runSubagentFollowUpTurn, softRequestBudgetFor } from "./executor";
 import {
 	type EffectiveSubagentPolicy,
 	reserveStructuredSubagentId,
@@ -422,6 +422,7 @@ export class WorkPool {
 								this.session.taskDepth ?? 0,
 								this.session.hasUI,
 							),
+							...softRequestBudgetFor(this.policy.agent.name, this.session.settings),
 						});
 					}
 				} catch (error) {

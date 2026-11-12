@@ -161,7 +161,25 @@ function forwardStream<TApi extends Api>(
 			}
 		} catch (error) {
 			const stopReason = abortTracker.wasCallerAbort() ? "aborted" : "error";
-			const message = createProviderStreamError(model, error, stopReason);
+			let message = createProviderStreamError(model, error, stopReason);
+			if (options.waitForTerminalDrain) {
+				if (!hasFinalResult(source)) {
+					target.fail(error);
+					return;
+				}
+				try {
+					const settled = await source.result();
+					message = {
+						...settled,
+						stopReason,
+						errorId: message.errorId,
+						errorMessage: message.errorMessage,
+					};
+				} catch {
+					target.fail(error);
+					return;
+				}
+			}
 			target.push({ type: "error", reason: stopReason, error: message });
 			target.end(message);
 		}

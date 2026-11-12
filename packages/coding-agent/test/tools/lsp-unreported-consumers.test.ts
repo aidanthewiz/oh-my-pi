@@ -77,6 +77,8 @@ function installTransport(cwd: string): void {
 		proc: {} as ptree.ChildProcess<"pipe">,
 		requestId: 0,
 		diagnostics: new EquivalentUriMap(),
+		publishedDiagnostics: new EquivalentUriMap(),
+		pulledDiagnostics: new EquivalentUriMap(),
 		diagnosticsVersion: 0,
 		openFiles: new Map(),
 		pendingRequests: new Map(),
@@ -98,6 +100,7 @@ function installTransport(cwd: string): void {
 	vi.spyOn(lspClient, "syncContent").mockImplementation(async (target, filePath) => {
 		const uri = fileToUri(filePath);
 		target.diagnostics.delete(uri);
+		target.pulledDiagnostics.delete(uri);
 		target.openFiles.set(uri, {
 			version: (target.openFiles.get(uri)?.version ?? 0) + 1,
 			languageId: "typescript",
@@ -153,7 +156,10 @@ describe("unreported diagnostics consumers", () => {
 		installTransport(dir.path());
 		vi.spyOn(lspClient, "notifySaved").mockImplementation(async (client, filePath) => {
 			const uri = fileToUri(filePath);
-			client.diagnostics.set(uri, { diagnostics: [], version: client.openFiles.get(uri)!.version });
+			const report = { diagnostics: [], version: client.openFiles.get(uri)!.version };
+			client.publishedDiagnostics.set(uri, report);
+			client.diagnostics.set(uri, report);
+			client.publishesDocumentVersions = true;
 			client.diagnosticsVersion++;
 		});
 		const written = await wrapToolWithMetaNotice(new WriteTool(session)).execute("clean-write", {

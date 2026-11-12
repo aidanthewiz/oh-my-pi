@@ -154,31 +154,43 @@ describe("headless Chromium profile cleanup (issue #7058)", () => {
 		}
 	});
 
-	it("removes the handle's profile directory when the headless browser is disposed", async () => {
+	it("waits for a disconnected owned browser to close before removing its profile", async () => {
 		const dir = await makeProfileDir();
+		const closeStarted = Promise.withResolvers<void>();
+		const finishClose = Promise.withResolvers<void>();
 		const handle = {
 			key: "headless:1",
 			kind: { kind: "headless", headless: true },
 			refCount: 1,
 			userDataDir: dir,
 			browser: {
-				connected: true,
+				connected: false,
 				process: () => ({ pid: 4242 }),
-				close: () => Promise.resolve(),
+				close: async () => {
+					closeStarted.resolve();
+					await finishClose.promise;
+				},
 			},
 			stealth: { browserSession: null, override: null },
 		} as unknown as BrowserHandle;
 
-		await releaseBrowser(handle, { kill: false });
-
+		const released = releaseBrowser(handle, { kill: false });
+		try {
+			await closeStarted.promise;
+			expect(fs.existsSync(dir)).toBe(true);
+		} finally {
+			finishClose.resolve();
+			await released;
+		}
 		expect(fs.existsSync(dir)).toBe(false);
 	});
 });
 
 describe("owned Chromium profile preferences", () => {
-	it("disables password leak detection while keeping a reused profile's other preferences", async () => {
+	it("disables password leak detection and printing while keeping a reused profile's other preferences", async () => {
 		const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "omp-chrome-profile-test-"));
 		const file = path.join(dir, "Default", "Preferences");
+		const seeded = { password_manager_leak_detection: false };
 		try {
 			await Bun.write(
 				file,
@@ -187,14 +199,21 @@ describe("owned Chromium profile preferences", () => {
 			await seedOwnedProfilePreferences(dir);
 			expect(JSON.parse(await Bun.file(file).text())).toEqual({
 				intl: { accept_languages: "en-US" },
-				profile: { exit_type: "Normal", password_manager_leak_detection: false },
+				profile: { exit_type: "Normal", ...seeded },
+				printing: { enabled: false },
+			});
+
+			// A profile seeded before printing was turned off already has leak detection off.
+			await Bun.write(file, JSON.stringify({ profile: seeded, printing: { print_preview_sticky_settings: "{}" } }));
+			await seedOwnedProfilePreferences(dir);
+			expect(JSON.parse(await Bun.file(file).text())).toEqual({
+				profile: seeded,
+				printing: { print_preview_sticky_settings: "{}", enabled: false },
 			});
 
 			await fs.promises.rm(path.join(dir, "Default"), { recursive: true });
 			await seedOwnedProfilePreferences(dir);
-			expect(JSON.parse(await Bun.file(file).text())).toEqual({
-				profile: { password_manager_leak_detection: false },
-			});
+			expect(JSON.parse(await Bun.file(file).text())).toEqual({ profile: seeded, printing: { enabled: false } });
 		} finally {
 			await fs.promises.rm(dir, { recursive: true, force: true });
 		}
@@ -255,7 +274,10 @@ describe("owned Chromium profile preferences", () => {
 			expect(winner?.wsEndpoint).toBe(wsEndpoint);
 			expect(loser?.wsEndpoint).toBe(wsEndpoint);
 			expect(broker.starts).toBe(1);
-			expect(launchPrefs).toEqual({ profile: { password_manager_leak_detection: false } });
+			expect(launchPrefs).toEqual({
+				profile: { password_manager_leak_detection: false },
+				printing: { enabled: false },
+			});
 			// One seed, by the client that launched Chrome, before the launch. A
 			// seed after the launch can rename a snapshot it read before Chrome
 			// started over the live profile's Preferences.

@@ -170,8 +170,8 @@ export class IdleMaintenance {
 	}
 
 	/**
-	 * Nothing is live, admitted, queued or scheduled. Background work may still wake the session: that holds
-	 * back only idle compaction (see {@link #isSettled}), as it did before the scheduler owned this work.
+	 * Nothing is live, admitted, queued or scheduled. Wakeable background work holds back only idle
+	 * compaction (see {@link #isSettled}).
 	 */
 	#isQuiet(): boolean {
 		const session = this.#session;
@@ -221,7 +221,7 @@ export class IdleMaintenance {
 		}
 		if (this.#isBlocked() || !this.#isQuiet()) return;
 		this.#armRecap();
-		// Compacting while a background result is still due would rewrite the context that result wakes into.
+		// Compaction must not rewrite the context while a background result can still wake the session.
 		const settled = await waitForSessionSettlement(session, {
 			isCurrent,
 			scheduledTurn: this.#options.scheduledTurn,

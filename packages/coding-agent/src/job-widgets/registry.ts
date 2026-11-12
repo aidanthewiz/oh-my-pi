@@ -242,6 +242,7 @@ export class JobWidgets implements JobWidgetRegistry {
 			this.#authorEnabled() &&
 			this.#entries.get(entry.job.id) === entry &&
 			entry.job.widgetInputs === entry.inputs &&
+			!entry.inputs.authorSignal?.aborted &&
 			entry.inputs.canAuthor?.() === true &&
 			entry.job.status === "running"
 		);
@@ -356,17 +357,19 @@ export class JobWidgets implements JobWidgetRegistry {
 		const controller = new AbortController();
 		entry.captionRequest = controller;
 		this.#requests.add(controller);
+		const signal = entry.inputs.authorSignal
+			? AbortSignal.any([controller.signal, this.#disposal.signal, entry.inputs.authorSignal])
+			: AbortSignal.any([controller.signal, this.#disposal.signal]);
 		try {
 			const reply = await this.#captioner?.(
 				{ ...brief, jobId: entry.job.id, canAuthor: () => this.#authorCurrent(entry) },
-				AbortSignal.any([controller.signal, this.#disposal.signal]),
+				signal,
 			);
-			if (!this.#active() || !this.#authorCurrent(entry) || controller.signal.aborted) return;
+			if (!this.#active() || !this.#authorCurrent(entry) || signal.aborted) return;
 			entry.caption = normalizeJobCaption(reply ?? "");
 			if (entry.caption) this.#notify();
 		} catch (error) {
-			if (!controller.signal.aborted)
-				logger.debug("Job caption failed", { jobId: entry.job.id, error: String(error) });
+			if (!signal.aborted) logger.debug("Job caption failed", { jobId: entry.job.id, error: String(error) });
 		} finally {
 			this.#requests.delete(controller);
 			if (entry.captionRequest === controller) entry.captionRequest = undefined;
@@ -391,6 +394,9 @@ export class JobWidgets implements JobWidgetRegistry {
 		const author = this.#author;
 		if (!author || !this.#active() || !this.#authorCurrent(entry)) return;
 		const controller = new AbortController();
+		const signal = entry.inputs.authorSignal
+			? AbortSignal.any([controller.signal, entry.inputs.authorSignal])
+			: controller.signal;
 		entry.request = controller;
 		entry.attempts += 1;
 		this.#requests.add(controller);
@@ -410,9 +416,9 @@ export class JobWidgets implements JobWidgetRegistry {
 		let installable: JobWidgetRuntime | undefined;
 		try {
 			for (let round = 0; round < 2 && !installable; round++) {
-				if (!this.#active() || !this.#authorCurrent(entry) || controller.signal.aborted) return;
-				const answer = await author(request, controller.signal);
-				if (!this.#active() || !this.#authorCurrent(entry) || controller.signal.aborted) return;
+				if (!this.#active() || !this.#authorCurrent(entry) || signal.aborted) return;
+				const answer = await author(request, signal);
+				if (!this.#active() || !this.#authorCurrent(entry) || signal.aborted) return;
 				if (answer === undefined) {
 					entry.authorUnavailable = true;
 					break;
@@ -439,14 +445,14 @@ export class JobWidgets implements JobWidgetRegistry {
 				}
 			}
 		} catch (error) {
-			if (!controller.signal.aborted) {
+			if (!signal.aborted) {
 				logger.debug("Job widget spec request failed", { jobId: entry.job.id, error: String(error) });
 			}
 		} finally {
 			this.#requests.delete(controller);
 			if (entry.request === controller) entry.request = undefined;
 		}
-		if (!this.#active() || !this.#authorCurrent(entry) || controller.signal.aborted || entry.frozen) return;
+		if (!this.#active() || !this.#authorCurrent(entry) || signal.aborted || entry.frozen) return;
 		if (installable) this.#install(entry, installable, brief);
 		if (this.#recompute(entry, brief)) this.#notify();
 		this.#syncTimer();

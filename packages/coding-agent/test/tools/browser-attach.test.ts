@@ -18,13 +18,18 @@ import {
 	attachPageWithTimeout,
 	findFreeCdpPort,
 	findReusableCdp,
+	gracefulKillTreeOnce,
 	pickElectronTarget,
 	probeCdpStatus,
 	resolveSpawnArgs,
 	waitForCdp,
 	waitForMainFrame,
 } from "@oh-my-pi/pi-coding-agent/tools/browser/attach";
-import { ensureChromiumExecutable, loadPuppeteer } from "@oh-my-pi/pi-coding-agent/tools/browser/launch";
+import {
+	ensureChromiumExecutable,
+	loadPuppeteer,
+	RENDERER_PRIORITY_ARGS,
+} from "@oh-my-pi/pi-coding-agent/tools/browser/launch";
 import {
 	acquireBrowser,
 	type BrowserHandle,
@@ -56,6 +61,8 @@ function makeSession(): ToolSession {
 		getSessionFile: () => null,
 		getSessionSpawns: () => "*",
 		settings: Settings.isolated({
+			// Managed Chromium, whether or not omp's WebKit engine is installed on this machine.
+			"browser.webkit": false,
 			"browser.enabled": true,
 			"browser.headless": true,
 		}),
@@ -230,6 +237,7 @@ describe("pickElectronTarget", () => {
 					"--no-default-browser-check",
 					"--use-mock-keychain",
 					"--password-store=basic",
+					...RENDERER_PRIORITY_ARGS,
 					`--user-data-dir=${root}`,
 					`--remote-debugging-port=${port}`,
 				],
@@ -265,7 +273,7 @@ describe("pickElectronTarget", () => {
 							name,
 							url: "data:text/html,<title>First attached page</title>",
 							timeout: 15,
-							app: { cdp_url: cdpUrl },
+							app: cdpUrl,
 						},
 						{ ...context, signal: controller.signal },
 					)
@@ -293,7 +301,7 @@ describe("pickElectronTarget", () => {
 				restoreWait?.();
 				await prelude.invoke({ action: "close", name }, context).catch(() => {});
 				if (attached) await releaseBrowser(attached, { kill: false });
-				child.kill();
+				await gracefulKillTreeOnce(child.pid);
 				await child.exited;
 				await fs.rm(root, { recursive: true, force: true });
 			}
@@ -357,7 +365,7 @@ describe("pickElectronTarget", () => {
 
 	test("rejects websocket cdp_url values with an actionable diagnostic", () => {
 		expect(() => normalizeConnectedCdpUrl("ws://127.0.0.1:9222/devtools/browser/id")).toThrow(
-			"browser app.cdp_url must be the HTTP CDP discovery endpoint",
+			"browser app CDP URL must be the HTTP CDP discovery endpoint",
 		);
 		expect(normalizeConnectedCdpUrl("http://127.0.0.1:9222/")).toBe("http://127.0.0.1:9222");
 	});
@@ -514,6 +522,7 @@ describe("pickElectronTarget", () => {
 				"--no-default-browser-check",
 				"--use-mock-keychain",
 				"--password-store=basic",
+				...RENDERER_PRIORITY_ARGS,
 			];
 			const child = Bun.spawn(
 				[exe, ...flags, `--user-data-dir=${borrowedProfile}`, `--remote-debugging-port=${port}`],
@@ -538,13 +547,15 @@ describe("pickElectronTarget", () => {
 					action: "open",
 					name: borrowedName,
 					url: "data:text/html,<title>Borrowed</title>",
-					app: { path: exe, args: [...flags, "--user-data-dir", borrowedProfile] },
+					app: exe,
+					argv: [...flags, "--user-data-dir", borrowedProfile],
 				});
 				await invoke({
 					action: "open",
 					name: ownedName,
 					url: "data:text/html,<title>Owned</title>",
-					app: { path: exe, args: [...flags, "--user-data-dir", path.join(root, "owned")] },
+					app: exe,
+					argv: [...flags, "--user-data-dir", path.join(root, "owned")],
 				});
 				const borrowedTab = getTab(borrowedName);
 				const ownedTab = getTab(ownedName);
@@ -564,7 +575,7 @@ describe("pickElectronTarget", () => {
 			} finally {
 				await invoke({ action: "close", name: ownedName, kill: true }).catch(() => {});
 				await invoke({ action: "close", name: borrowedName, kill: true }).catch(() => {});
-				child.kill();
+				await gracefulKillTreeOnce(child.pid);
 				await child.exited;
 				await fs.rm(root, { recursive: true, force: true });
 			}
@@ -586,6 +597,7 @@ describe("pickElectronTarget", () => {
 				"--no-first-run",
 				"--use-mock-keychain",
 				"--password-store=basic",
+				...RENDERER_PRIORITY_ARGS,
 				`--user-data-dir=${profile}`,
 			];
 			const session = makeSession();
@@ -600,7 +612,8 @@ describe("pickElectronTarget", () => {
 				await invoke({
 					action: "open",
 					name,
-					app: { path: exe, args: flags },
+					app: exe,
+					argv: flags,
 					url: "data:text/html,<title>Fresh profile</title>",
 				});
 				const tab = getTab(name);
@@ -619,7 +632,7 @@ describe("pickElectronTarget", () => {
 	);
 
 	test.skipIf(!CHROMIUM_AVAILABLE)(
-		"reports the connected browser's current viewport on open and after an external resize",
+		"reports external viewport changes and applies requested sizes without resizing a failed adoption",
 		async () => {
 			const exe = await ensureChromiumExecutable();
 			if (!exe) throw new Error("Expected a Chromium executable");
@@ -632,6 +645,9 @@ describe("pickElectronTarget", () => {
 					"--no-sandbox",
 					"--no-first-run",
 					"--use-mock-keychain",
+					"--window-size=900,700",
+					"--force-device-scale-factor=2",
+					...RENDERER_PRIORITY_ARGS,
 					`--user-data-dir=${root}`,
 					`--remote-debugging-port=${port}`,
 				],
@@ -643,26 +659,26 @@ describe("pickElectronTarget", () => {
 				prelude.invoke(parameters, { session, toolCallId: "connected-viewport" });
 			const name = `connected-viewport-${crypto.randomUUID()}`;
 			let browser: Browser | undefined;
-			let opened = false;
 			try {
-				const cdpUrl = `http://127.0.0.1:${port}`;
-				await waitForCdp(cdpUrl, 15_000);
+				const app = `http://127.0.0.1:${port}`;
+				await waitForCdp(app, 15_000);
 				const puppeteer = await loadPuppeteer();
-				browser = await puppeteer.connect({ browserURL: cdpUrl, defaultViewport: null });
-				const target = await browser.waitForTarget(target => target.type() === "page");
-				const page = await target.page();
+				browser = await puppeteer.connect({ browserURL: app, defaultViewport: null });
+				const browserTarget = await browser.waitForTarget(target => target.type() === "page");
+				const page = await browserTarget.page();
 				if (!page) throw new Error("Expected the connected browser's page");
 				await page.goto("data:text/html,<title>Viewport</title>");
+				const target = "Viewport";
 				const initialViewport = { width: 900, height: 700, deviceScaleFactor: 2 };
 				await page.setViewport(initialViewport);
-				const opening = await invoke({
-					action: "open",
-					name,
-					app: { cdp_url: cdpUrl, target: "Viewport" },
-				});
-				opened = true;
+				const viewport = { width: 390, height: 844 };
+				const notAFolder = path.join(root, "not-a-folder");
+				await Bun.write(notAFolder, "");
+				expect(
+					await rejectionOf(invoke({ action: "open", name, app, target, viewport, downloads: notAFolder })),
+				).toBeInstanceOf(Error);
+				const opening = await invoke({ action: "open", name, app, target });
 				expect(opening.details).toMatchObject({ viewport: initialViewport });
-
 				const resizedViewport = { width: 1100, height: 800, deviceScaleFactor: 2 };
 				await page.setViewport(resizedViewport);
 				const result = await invoke({
@@ -680,19 +696,27 @@ describe("pickElectronTarget", () => {
 				const { observed, window } = details.value as { observed: unknown; window: unknown };
 				expect(window).toEqual(resizedViewport);
 				expect(observed).toEqual(resizedViewport);
-				expect(opening.details).toMatchObject({ viewport: initialViewport });
+				await invoke({ action: "close", name });
+				expect(page.isClosed()).toBe(false);
+				const pageSize = {
+					action: "run",
+					name,
+					code: "return await tab.evaluate(() => ({ width: innerWidth, height: innerHeight, deviceScaleFactor: devicePixelRatio }));",
+				};
+				const sized = await invoke({ action: "open", name, app, target, viewport });
+				const asked = { width: 390, height: 844, deviceScaleFactor: 2 };
+				expect(sized.details).toMatchObject({ viewport: asked });
+				expect((await invoke(pageSize)).details).toMatchObject({ value: asked });
+				await invoke({ action: "open", name, app, target, viewport: { width: 400, height: 800 } });
+				expect((await invoke(pageSize)).details).toMatchObject({
+					value: { width: 400, height: 800, deviceScaleFactor: 2 },
+				});
 			} finally {
-				try {
-					if (opened) await invoke({ action: "close", name });
-				} finally {
-					try {
-						await browser?.disconnect();
-					} finally {
-						child.kill();
-						await child.exited;
-						await fs.rm(root, { recursive: true, force: true });
-					}
-				}
+				await invoke({ action: "close", name }).catch(() => {});
+				browser?.disconnect();
+				await gracefulKillTreeOnce(child.pid);
+				await child.exited;
+				await fs.rm(root, { recursive: true, force: true });
 			}
 		},
 		30_000,
@@ -704,7 +728,7 @@ describe("pickElectronTarget", () => {
 		async () => {
 			const launched = sharedHeadless;
 			if (!launched || !("browser" in launched)) throw new Error("Expected a shared Puppeteer browser");
-			const endpoint = new URL(launched.browser.wsEndpoint());
+			const endpoint = new URL(launched.wsEndpoint);
 			const session = makeSession();
 			const prelude = createBrowserPrelude(session);
 			const invokeBrowser = (parameters: unknown) =>
@@ -720,7 +744,7 @@ describe("pickElectronTarget", () => {
 					action: "open",
 					name: tabName,
 					url: requested,
-					app: { cdp_url: `http://${endpoint.host}` },
+					app: `http://${endpoint.host}`,
 				});
 				opened = true;
 
@@ -749,7 +773,7 @@ describe("pickElectronTarget", () => {
 			// navigate again and read 2.
 			const launched = sharedHeadless;
 			if (!launched || !("browser" in launched)) throw new Error("Expected a shared Puppeteer browser");
-			const endpoint = new URL(launched.browser.wsEndpoint());
+			const endpoint = new URL(launched.wsEndpoint);
 			const targetPage = (await launched.browser.pages())[0];
 			if (!targetPage) throw new Error("Expected the launched browser to expose a page target");
 
@@ -827,7 +851,7 @@ describe("pickElectronTarget", () => {
 					{
 						action: "open",
 						name: `refused-${crypto.randomUUID()}`,
-						app: { cdp_url: `http://127.0.0.1:${cdp.port}` },
+						app: `http://127.0.0.1:${cdp.port}`,
 					},
 					{ session, toolCallId: "refused-websocket" },
 				),

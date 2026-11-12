@@ -21,6 +21,7 @@ describe("createAgentSession Factory server-side fallback", () => {
 		using tempDir = TempDir.createSync("@pi-factory-server-side-fallback-");
 		const model = factoryModel("claude-fable-5", ["anthropic"]);
 		model.factoryDroidOrgId = "org-1";
+		model.factoryDroidRefusalFallbacks = ["claude-opus-5"];
 		const chunks = anthropicChunks("OK").map(chunk => {
 			const frame = JSON.parse(chunk) as { type?: string; message?: { model?: string } };
 			if (frame.type === "message_start" && frame.message) frame.message.model = model.id;

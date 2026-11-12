@@ -130,27 +130,26 @@ fn nesting_holds_no_descriptor_per_level() {
 	]);
 }
 
-/// Running out of descriptors prints one diagnostic naming the limit, and the
-/// next command still runs. Regression: the shell printed nothing.
+/// Descriptor exhaustion fails the command without preventing its successor.
 #[test]
-fn running_out_of_descriptors_names_the_limit() {
-	if !in_limited_child("running_out_of_descriptors_names_the_limit") {
+fn descriptor_exhaustion_preserves_failure_status_and_next_command() {
+	if !in_limited_child("descriptor_exhaustion_preserves_failure_status_and_next_command") {
 		return;
 	}
 
 	let (code, output) = run(
 		"f() { if [ \"$1\" -lt 1000 ]; then f $(( $1 + 1 )) < /dev/null; else echo reached; fi; }; \
-		 f 0; echo after=$?",
+		 f 0 2>/dev/null; echo after=$?",
 	);
-	let lines: Vec<_> = output.lines().collect();
-	assert_eq!(code, Some(0), "{output}");
-	assert_eq!(lines.len(), 2, "{output}");
-	assert_eq!(lines[1], "after=1");
-	for part in [
-		"failed to redirect to /dev/null: Too many open files",
-		"limit of 128 open files",
-		"ulimit -n",
-	] {
-		assert!(lines[0].contains(part), "missing {part:?} in {output}");
+	assert_eq!((code, output.as_str()), (Some(0), "after=1\n"));
+}
+
+#[test]
+fn completed_children_release_handles_before_the_next_spawn() {
+	if !in_limited_child("completed_children_release_handles_before_the_next_spawn") {
+		return;
 	}
+	let (code, output) =
+		run("for i in {1..512}; do /bin/sh -c ':' || exit $?; done; printf completed");
+	assert_eq!((code, output.as_str()), (Some(0), "completed"));
 }

@@ -25,11 +25,16 @@ export const INLINE_OUTPUT_CHARS = ASYNC_INLINE_RESULT_MAX_CHARS - 500;
 /** Head shown for an output over {@link INLINE_OUTPUT_CHARS}, with a pointer to `agent://<id>`. */
 const PREVIEW_CHARS = 5000;
 
-const resultOwners = new WeakMap<SingleResult, WeakRef<AgentRef>>();
+const resultOwners = new WeakMap<object, WeakRef<AgentRef>>();
 
 /** Keeps summary resume guidance bound to the result's originating generation. */
 export function recordTaskResultOwner(result: SingleResult, owner: AgentRef): void {
 	resultOwners.set(result, new WeakRef(owner));
+}
+
+/** The exact originating ref, when retained by an executor-produced result. */
+export function getTaskResultOwner(result: object): AgentRef | undefined {
+	return resultOwners.get(result)?.deref();
 }
 
 /**
@@ -74,7 +79,7 @@ export function formatTaskResultSummary(
 	// <abort-reason>; an empty output already previews the error itself.
 	const error = result.exitCode !== 0 && !result.aborted && result.output.trim().length > 0 ? result.error : undefined;
 	const outputCharCount = result.outputMeta?.charCount ?? output.length;
-	const owner = resultOwners.get(result)?.deref();
+	const owner = getTaskResultOwner(result);
 	const resumable =
 		result.aborted &&
 		!result.isolated &&

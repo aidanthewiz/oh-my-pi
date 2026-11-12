@@ -1,6 +1,7 @@
 import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import * as path from "node:path";
+import { setImmediate } from "node:timers/promises";
 import { SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -543,6 +544,41 @@ describe("session-owned extension MCP", () => {
 		release.resolve();
 		await expect(pending).rejects.toThrow();
 		expect(f.calls).toEqual([]);
+	});
+
+	it("drains an admitted result policy hook before cancellation settles the call", async () => {
+		const f = await fixture();
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		let completed = false;
+		const s = await session(f.manager, pi => {
+			pi.on("tool_result", async event => {
+				if (event.mcpServerName !== "minions") return;
+				entered.resolve();
+				await release.promise;
+				completed = true;
+			});
+		});
+		cleanup.push(() => release.resolve());
+		const controller = new AbortController();
+		let settled = false;
+		const pending = s
+			.extensionRunner!.createContext()
+			.mcp!.callTool("minions", "create_task", {}, { retry: "never", signal: controller.signal });
+		const outcome = pending
+			.catch(error => error)
+			.finally(() => {
+				settled = true;
+			});
+		await entered.promise;
+		controller.abort();
+		await setImmediate();
+		expect(settled).toBe(false);
+		expect(completed).toBe(false);
+		release.resolve();
+		expect(await outcome).toBeInstanceOf(Error);
+		expect(completed).toBe(true);
+		expect(f.calls).toEqual([{ name: "create_task", arguments: {} }]);
 	});
 
 	it("does not leak original structured data after in-place content redaction", async () => {

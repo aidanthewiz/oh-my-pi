@@ -10,7 +10,8 @@
 import { logger, postmortem } from "@oh-my-pi/pi-utils";
 import type { ToolSession } from "../../tools";
 import type { RuntimeCallIdentity } from "../js/shared/runtime";
-import { bridgeValueFromToolResult, callSessionTool, type JsStatusEvent } from "../js/tool-bridge";
+import { bridgeValueFromToolResult } from "../js/session-tool";
+import { callSessionTool, type JsStatusEvent } from "../js/tool-bridge";
 import type { EvalShadowCellSession } from "../speculation/cell-session";
 
 export interface PyToolBridgeEntry {
@@ -30,7 +31,7 @@ export interface PyToolBridgeEntry {
 	shieldedSignal?: AbortSignal;
 	shadowCell?: EvalShadowCellSession;
 	emitStatus?: (event: JsStatusEvent) => void;
-	/** Shows the user `out://` replies of bridged calls (`ToolBridgeOptions.onReply`). */
+	/** Shows the user `out://` replies of bridged calls (`SessionToolCallOptions.onReply`). */
 	onReply?: (text: string) => void;
 	abortRequested?: () => boolean;
 }
