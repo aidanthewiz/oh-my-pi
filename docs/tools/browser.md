@@ -180,3 +180,18 @@ By default, omp-owned managed Chromium tabs freeze at turn settle and unfreeze o
 - Attached target missing: inspect available pages and use a precise `app.target`.
 
 `tab.run` and direct helpers execute against live browser state. Verify the actual page after every UI-changing action.
+
+## Hosted browser qualification
+
+`scripts/qualification/controls/adapt.ts` launches an owned Chromium process with a fresh private profile, native sandbox, and loopback-only DNS.
+It waits for `Browser.getVersion` on the owned CDP pipe before Puppeteer connects.
+Readiness uses `BROWSER_PROTOCOL_TIMEOUT_MS`, the existing browser protocol budget; no aggregate 15-second timer competes with connection initialization.
+Connected protocol commands retain their five-second deadline, and the complete fixture retains its 240-second process deadline.
+
+A readiness timeout closes the transport before cleanup, so a late response cannot resume connection setup.
+Spawn, pipe, and protocol failures retain their original errors.
+Cleanup closes the transport, waits for the owned process to exit, and verifies profile removal.
+The retained authority and all twelve click scenarios remain unchanged.
+
+Run the transport regressions with `bun test scripts/qualification/controls/browser-pipe.test.ts`.
+Run both head-bound consumer modes before accepting qualification: `bun --no-env-file scripts/qualification/run.ts controls source` and `bun --no-env-file scripts/qualification/run.ts controls compiled`.
