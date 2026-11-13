@@ -243,10 +243,10 @@ jobs:
         env:
           CARGO_TERM_COLOR: never
         run: |
-          cargo test --locked --profile ci --target aarch64-pc-windows-msvc -p brush-core --lib pipetap::tests:: -- --nocapture 2>&1 | Tee-Object -Variable relayOutput
+          cargo test --locked --profile ci --target aarch64-pc-windows-msvc -p pi-shell --lib pipe_contracts:: -- --nocapture 2>&1 | Tee-Object -Variable relayOutput
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          foreach ($name in @("idle_producer_is_released_when_consumer_exits", "producer_eof_preserves_every_byte_and_closes_the_mirror", "windows_query_failure_is_not_eof")) {
-            if (-not ($relayOutput -match "^test pipetap::tests::$name \.\.\. ok$")) {
+          foreach ($name in @("bash::mem::pipe_contracts::idle_producer_is_released_when_consumer_exits", "bash::mem::pipe_contracts::producer_eof_preserves_every_byte_and_closes_the_mirror", "sys::pump::os::imp::pipe_contracts::windows_query_failure_is_not_eof")) {
+            if (-not ($relayOutput -match "^test $name \.\.\. ok$")) {
               throw "Windows pipe relay case did not pass: $name"
             }
           }

@@ -173,7 +173,7 @@ try {
   };
   const terminal = new RecordingTerminal();
   const composer = new Composer({ terminal, preferences: { quiet: true } });
-  const interactive = new InteractiveMode(session, version, undefined, undefined, undefined, undefined, undefined, composer);
+  const interactive = new InteractiveMode(session, version, undefined, undefined, undefined, undefined, composer);
   modes.push(interactive);
   // Skip init's host integrations; the real constructor owns both replay and event controllers.
   interactive.isInitialized = true;
