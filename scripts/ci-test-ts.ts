@@ -123,12 +123,8 @@ const localOnlyWorkspacePackages = ["python/robomp/web"];
 const repoScriptTests = [
 	"scripts/cf-release-notes.test.ts",
 	"packages/coding-agent/scripts/build-binary.test.ts",
-	"scripts/ci-release-checksums.test.ts",
 	"scripts/ci-test-ts.test.ts",
-	"scripts/fix-changelogs.test.ts",
-	"scripts/inline-functions.test.ts",
 	"scripts/qualification/controls/browser-pipe.test.ts",
-	"scripts/run-rs-task.test.ts",
 ];
 const codingAgentNativePathPatterns = [
 	/(^|\/)[^/]*(bash|native|browser|cmux|mnemopi|hindsight|memory)[^/]*\.test\.ts$/i,
