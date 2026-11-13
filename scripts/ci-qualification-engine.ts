@@ -348,7 +348,7 @@ async function packedLicense(): Promise<void> {
 		const consumer = path.join(staging, "consumer");
 		const modules = path.join(consumer, "node_modules");
 		await fs.cp(path.join(root, "node_modules"), modules, { recursive: true, verbatimSymlinks: true });
-		for (const name of ["utils", "ai", "catalog"]) {
+		for (const name of ["utils", "ai", "catalog", "tui"]) {
 			const source = path.join(root, "packages", name);
 			const destination = path.join(modules, "@oh-my-pi", `pi-${name}`);
 			await fs.rm(destination, { recursive: true, force: true });

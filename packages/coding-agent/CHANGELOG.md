@@ -16,6 +16,7 @@
 
 ### Fixed
 
+- Materialize dependency-free TUI bootstrap modules in packed-license qualification while preserving offline checkout isolation and complete legal payload checks.
 - Synchronize browser and language-server qualification with observed frame attachment and peer session release without changing deadlines.
 - Follow actual browser dispatch phases and current legal attribution sections while preserving qualification cases and license checks.
 - Use the pinned Bun type checker for the collaboration relay instead of an undeclared `tsgo` executable.
