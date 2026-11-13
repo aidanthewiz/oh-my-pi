@@ -54,6 +54,7 @@
 - Initialize Bash terminal control when `set -m` enables it after shell startup.
 - Keep waiting for externally continued foreground stages when shell job control is disabled.
 - Drain owned Git process pipes through cancellation while preserving the existing TERM, grace, and reap policy.
+- Close unrelated inherited descriptors before child FIFO opens so blocked jobs cannot retain another pipeline's writer. Preserve explicitly inherited descriptors.
 
 ## [18.19.0] - 2026-11-12
 

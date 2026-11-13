@@ -148,6 +148,29 @@ async fn pipeline_status_tracks_stage_order_and_launch_policy() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn blocked_fifo_spawn_does_not_hold_another_jobs_pipe_open() {
+	let root = tempfile::tempdir().expect("independent pipe directory");
+	let external_cat = external_command(root.path(), "cat");
+	for name in ["producer-gate", "blocked"] {
+		pi_vfs::BlockingFs::native()
+			.make_node(root.path().join(name), pi_vfs::NodeKind::Fifo, 0o600)
+			.expect("owned FIFO");
+	}
+	let command = format!(
+		"{{ /bin/sh -c 'read -r token < producer-gate; printf \"hi\\n\"' | {external_cat} \
+		 >pipe.payload & reader=$!; /bin/sh -c 'printf retained >&7' <blocked & fifo=$!; printf \
+		 'release\\n' >producer-gate; wait \"$reader\"; reader_status=$?; : >blocked; wait \
+		 \"$fifo\"; fifo_status=$?; printf '%s|%s\\n' \"$reader_status\" \"$fifo_status\"; }} \
+		 7>extra.payload"
+	);
+	let (result, output) = run(&command, root.path()).await;
+	assert_eq!(result.exit_code, Some(0), "{output}");
+	assert_eq!(output, "0|0\n");
+	assert_eq!(std::fs::read(root.path().join("pipe.payload")).unwrap(), b"hi\n");
+	assert_eq!(std::fs::read(root.path().join("extra.payload")).unwrap(), b"retained");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn command_expansions_keep_ambient_descriptors_outside_own_redirects() {
 	let root = tempfile::tempdir().expect("expansion descriptor directory");
 	let external_printf = external_command(root.path(), "printf");

@@ -191,7 +191,8 @@ content: ""
    - `xd://` dispatches a mounted tool and may therefore have that tool's documented side effects.
 - Background work / cancellation
    - Marks the tool `concurrency = "exclusive"` in `WriteTool`.
-   - The write body is wrapped with `untilAborted`; LSP writethrough can schedule deferred diagnostics fetches after a timeout.
+   - Plain-file writes check cancellation before publication. Once admitted, the mutation is awaited rather than raced against cancellation.
+   - Cancellation does not roll back an admitted write. LSP writethrough can schedule deferred diagnostics fetches after a timeout.
 
 ## Limits & Caps
 

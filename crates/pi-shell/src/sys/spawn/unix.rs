@@ -1022,6 +1022,169 @@ fn errno() -> i32 {
 	io::Error::last_os_error().raw_os_error().unwrap_or(0)
 }
 
+#[cfg(target_os = "macos")]
+fn child_close_unrelated(
+	keep: &[(i32, RawFd)],
+	buffer: &mut smallvec::SmallVec<[libc::proc_fdinfo; 128]>,
+	bytes: i32,
+) -> Result<(), i32> {
+	loop {
+		// SAFETY: proc_pidinfo is a syscall wrapper; storage was reserved before
+		// fork.
+		let n = unsafe {
+			*libc::__error() = 0;
+			libc::proc_pidinfo(
+				libc::getpid(),
+				libc::PROC_PIDLISTFDS,
+				0,
+				buffer.as_mut_ptr().cast(),
+				bytes,
+			)
+		};
+		if n == 0 {
+			return match errno() {
+				0 => Ok(()),
+				e => Err(e),
+			};
+		}
+		// SAFETY: the kernel initialized n bytes of complete proc_fdinfo records.
+		let entries = unsafe {
+			std::slice::from_raw_parts(
+				buffer.as_ptr(),
+				n as usize / std::mem::size_of::<libc::proc_fdinfo>(),
+			)
+		};
+		let mut closed = false;
+		for entry in entries {
+			if keep
+				.binary_search_by_key(&entry.proc_fd, |&(target, _)| target)
+				.is_err()
+			{
+				// SAFETY: this child has one thread and owns its inherited
+				// descriptor table.
+				if unsafe { libc::close(entry.proc_fd) } < 0 {
+					return Err(errno());
+				}
+				closed = true;
+			}
+		}
+		if !closed {
+			return Ok(());
+		}
+	}
+}
+
+#[cfg(target_os = "linux")]
+fn child_close_unrelated(keep: &[(i32, RawFd)]) -> Result<(), i32> {
+	let mut first = 3_u32;
+	for &(target, _) in keep {
+		if target < 3 {
+			continue;
+		}
+		let target = target as u32;
+		if first < target
+			// SAFETY: closes only gaps outside the installed command descriptors.
+			&& unsafe { libc::syscall(libc::SYS_close_range, first, target - 1, 0_u32) } < 0
+		{
+			return child_close_unrelated_proc(keep);
+		}
+		first = first.max(target + 1);
+	}
+	// SAFETY: every command descriptor precedes first.
+	if unsafe { libc::syscall(libc::SYS_close_range, first, u32::MAX, 0_u32) } < 0 {
+		child_close_unrelated_proc(keep)
+	} else {
+		Ok(())
+	}
+}
+
+#[cfg(target_os = "linux")]
+fn child_close_unrelated_proc(keep: &[(i32, RawFd)]) -> Result<(), i32> {
+	// Older kernels and seccomp policies may not provide close_range.
+	// SAFETY: open(2) on a constant path, without Rust allocation after fork.
+	let directory = unsafe {
+		libc::open(c"/proc/self/fd".as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC)
+	};
+	if directory < 0 {
+		return Err(errno());
+	}
+	let result = (|| {
+		let mut buffer = std::mem::MaybeUninit::<[u8; 4096]>::uninit();
+		loop {
+			// SAFETY: getdents64 writes at most the supplied buffer capacity.
+			let n = unsafe {
+				libc::syscall(libc::SYS_getdents64, directory, buffer.as_mut_ptr(), 4096_usize)
+			};
+			if n < 0 {
+				if errno() == libc::EINTR {
+					continue;
+				}
+				return Err(errno());
+			}
+			if n == 0 {
+				return Ok(());
+			}
+			let mut offset = 0;
+			while offset < n as usize {
+				// SAFETY: getdents64 returns complete records with terminated
+				// names.
+				let (length, name) = unsafe {
+					let entry = buffer
+						.as_ptr()
+						.cast::<u8>()
+						.add(offset)
+						.cast::<libc::dirent64>();
+					(
+						std::ptr::addr_of!((*entry).d_reclen).read_unaligned() as usize,
+						std::ffi::CStr::from_ptr(std::ptr::addr_of!((*entry).d_name).cast()).to_bytes(),
+					)
+				};
+				let fd = name.iter().try_fold(0_i32, |value, &digit| {
+					let digit = digit.checked_sub(b'0')?;
+					if digit > 9 {
+						return None;
+					}
+					value.checked_mul(10)?.checked_add(i32::from(digit))
+				});
+				if let Some(fd) = fd
+					&& fd != directory
+					&& keep
+						.binary_search_by_key(&fd, |&(target, _)| target)
+						.is_err()
+				{
+					// SAFETY: inherited descriptors cannot be replaced by another
+					// child thread.
+					if unsafe { libc::close(fd) } < 0 {
+						return Err(errno());
+					}
+				}
+				offset += length;
+			}
+		}
+	})();
+	// SAFETY: closes only the directory opened above.
+	unsafe { libc::close(directory) };
+	result
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn child_close_unrelated(keep: &[(i32, RawFd)]) -> Result<(), i32> {
+	let last = keep.last().map_or(2, |&(target, _)| target).max(2);
+	for fd in 3..=last {
+		if keep
+			.binary_search_by_key(&fd, |&(target, _)| target)
+			.is_err()
+		{
+			// SAFETY: this descriptor is not part of the command's installed
+			// wiring.
+			unsafe { libc::close(fd) };
+		}
+	}
+	// SAFETY: all command descriptors precede this bound.
+	unsafe { libc::closefrom(last + 1) };
+	Ok(())
+}
+
 /// The spawn of a process that applies redirections itself
 /// ([`ChildRedirs`]): a bare `fork` whose child installs its fds, applies
 /// the redirections in order (an open may wait for a FIFO's other end:
@@ -1045,7 +1208,14 @@ fn fork_redirs(
 	let ignore = ignored(prog.ign);
 	let mask = prog.umask as libc::mode_t;
 	let limits = limits(prog);
-	let raw: Vec<(i32, RawFd)> = fds.iter().map(|(t, fd)| (*t, fd.as_raw_fd())).collect();
+	let mut raw: Vec<(i32, RawFd)> = fds.iter().map(|(t, fd)| (*t, fd.as_raw_fd())).collect();
+	#[cfg(target_os = "macos")]
+	let mut fd_buffer =
+		smallvec::SmallVec::<[libc::proc_fdinfo; 128]>::with_capacity(raw.len().saturating_mul(2));
+	#[cfg(target_os = "macos")]
+	let fd_buffer_bytes =
+		i32::try_from(fd_buffer.capacity() * std::mem::size_of::<libc::proc_fdinfo>())
+			.map_err(invalid)?;
 	let closed = prog.closed;
 	// Every signal stays blocked across the fork: the child runs with the
 	// host's handlers until it resets them, and a signal delivered then (a
@@ -1099,6 +1269,14 @@ fn fork_redirs(
 			}
 			for &target in closed {
 				libc::close(target);
+			}
+			raw.sort_unstable_by_key(|&(target, _)| target);
+			#[cfg(target_os = "macos")]
+			let pruned = child_close_unrelated(&raw, &mut fd_buffer, fd_buffer_bytes);
+			#[cfg(not(target_os = "macos"))]
+			let pruned = child_close_unrelated(&raw);
+			if let Err(e) = pruned {
+				child_fail(&exec_diag, e, 126, texts);
 			}
 			libc::umask(mask);
 			for (n, &ign) in ignore.iter().enumerate().skip(1) {
