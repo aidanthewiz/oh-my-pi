@@ -4,6 +4,7 @@ import { TranscriptContainer } from "@oh-my-pi/pi-tui/chrome/transcript-containe
 import { Composer } from "@oh-my-pi/pi-tui/prompt/composer";
 import { formatExtensionLink, setExtensionLinks } from "@oh-my-pi/pi-tui/render/extension-links";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
+import { sliceByColumn } from "../src/utils";
 import { withoutTerminalMultiplexer } from "./helpers/terminal-multiplexer";
 import { VirtualRenderScheduler } from "./virtual-render-scheduler";
 import { VirtualTerminal } from "./virtual-terminal";
@@ -33,12 +34,6 @@ afterEach(() => {
 
 class UnansweredProbeTerminal extends VirtualTerminal {
 	droppedReports = 0;
-	written = "";
-
-	override write(data: string): void {
-		this.written += data;
-		super.write(data);
-	}
 
 	override start(onInput: (data: string) => void, onResize: () => void): void {
 		super.start(data => {
@@ -62,9 +57,14 @@ class LinkTail implements Component {
 }
 
 function shownHint(terminal: UnansweredProbeTerminal): string {
-	const tag = [...terminal.written.matchAll(/\x1b\[1;7m(.*?)\x1b\[22;27m/g)].at(-1)?.[1];
-	if (tag === undefined) throw new Error("No link hint is displayed");
-	return Bun.stripANSI(tag);
+	for (const [row, line] of terminal.getViewport().entries()) {
+		const tag = terminal
+			.getViewportRowReverseColumns(row)
+			.map(column => sliceByColumn(line, column, 1))
+			.join("");
+		if (/^[a-z]+$/.test(tag)) return tag;
+	}
+	throw new Error("No link hint is displayed");
 }
 
 describe("link hints require a displayed viewport", () => {
