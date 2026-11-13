@@ -480,6 +480,29 @@ mod imp {
 		is_os(e, ERROR_BROKEN_PIPE) || is_os(e, ERROR_PIPE_NOT_CONNECTED)
 	}
 
+	fn pipe_readable_bytes(handle: HANDLE) -> io::Result<usize> {
+		let mut waiting = 0u32;
+		// SAFETY: the peek writes only to `waiting`; optional buffers are null.
+		let ok = unsafe {
+			PeekNamedPipe(
+				handle,
+				ptr::null_mut(),
+				0,
+				ptr::null_mut(),
+				&raw mut waiting,
+				ptr::null_mut(),
+			)
+		};
+		if ok == 0 {
+			let error = io::Error::last_os_error();
+			if !hung_up(&error) {
+				return Err(error);
+			}
+			return Ok(0);
+		}
+		Ok(waiting as usize)
+	}
+
 	/// Where this process may create named pipes: `\\.\pipe\LOCAL\` inside an
 	/// `AppContainer`, which may create them nowhere else (any other name fails
 	/// with access denied, so every spawn would), else `\\.\pipe\`. Not
@@ -1180,27 +1203,7 @@ mod imp {
 					self.took(r)?;
 				}
 			}
-			let mut waiting = 0u32;
-			// SAFETY: a zero-size peek on our open pipe handle takes no buffer
-			// and reports the bytes waiting.
-			let ok = unsafe {
-				PeekNamedPipe(
-					self.raw(),
-					ptr::null_mut(),
-					0,
-					ptr::null_mut(),
-					&raw mut waiting,
-					ptr::null_mut(),
-				)
-			};
-			if ok == 0 {
-				let e = io::Error::last_os_error();
-				if !hung_up(&e) {
-					return Err(e);
-				}
-				waiting = 0;
-			}
-			Ok(self.end - self.start + waiting as usize)
+			Ok(self.end - self.start + pipe_readable_bytes(self.raw())?)
 		}
 
 		/// Close at once (see `Drop`); the part of a write in flight the pipe
@@ -1379,6 +1382,20 @@ mod imp {
 			} else {
 				st.owner_gone = true;
 			}
+		}
+	}
+
+	#[cfg(test)]
+	mod pipe_contracts {
+		use super::*;
+
+		#[test]
+		fn windows_query_failure_is_not_eof() {
+			let error = pipe_readable_bytes(ptr::null_mut()).expect_err("invalid pipe is not EOF");
+			assert_eq!(
+				error.raw_os_error(),
+				Some(windows_sys::Win32::Foundation::ERROR_INVALID_HANDLE as i32)
+			);
 		}
 	}
 }

@@ -606,3 +606,101 @@ mod tests {
 		assert_eq!(a.seek(SeekFrom::Current(-1)).unwrap(), 3);
 	}
 }
+
+#[cfg(test)]
+mod pipe_contracts {
+	use std::{future::poll_fn, time::Duration};
+
+	use super::*;
+
+	struct RecordingMirror(Mutex<(Vec<u8>, usize)>);
+
+	impl PipeMirror for RecordingMirror {
+		fn write(&self, bytes: &[u8]) {
+			let mut state = self.0.lock();
+			assert_eq!(state.1, 0, "write after mirror close");
+			state.0.extend_from_slice(bytes);
+		}
+
+		fn close(&self) {
+			self.0.lock().1 += 1;
+		}
+	}
+
+	#[tokio::test]
+	async fn idle_producer_is_released_when_consumer_exits() {
+		tokio::time::timeout(Duration::from_secs(2), async {
+			let bytes = "界𝄞".as_bytes();
+			let mirror = Arc::new(RecordingMirror(Mutex::new((Vec::with_capacity(bytes.len()), 0))));
+			let (mut consumer, mut producer) = tapped_pipe(mirror.clone());
+			let mut sent = 0;
+			while sent < bytes.len() {
+				let n = poll_fn(|cx| producer.poll_write(cx, &bytes[sent..]))
+					.await
+					.unwrap();
+				assert!(n > 0);
+				sent += n;
+			}
+			let mut forwarded = [0; 7];
+			let mut read = 0;
+			while read < forwarded.len() {
+				let n = poll_fn(|cx| consumer.poll_read(cx, &mut forwarded[read..]))
+					.await
+					.unwrap();
+				assert!(n > 0);
+				read += n;
+			}
+			drop(consumer);
+			assert_eq!(mirror.0.lock().1, 1, "idle producer must not hold the mirror open");
+			let error = poll_fn(|cx| producer.poll_write(cx, b"late"))
+				.await
+				.unwrap_err();
+			assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+			assert_eq!(forwarded, bytes);
+			drop(producer);
+			assert_eq!(*mirror.0.lock(), (bytes.to_vec(), 1));
+		})
+		.await
+		.expect("consumer closure exceeded the original two-second bound");
+	}
+
+	#[tokio::test]
+	async fn producer_eof_preserves_every_byte_and_closes_the_mirror() {
+		let expected: Vec<u8> = (0..PIPE_CAPACITY * 3 + 17).map(|n| n as u8).collect();
+		let mirror = Arc::new(RecordingMirror(Mutex::new((Vec::with_capacity(expected.len()), 0))));
+		let (mut consumer, mut producer) = tapped_pipe(mirror.clone());
+		let payload = &expected;
+		let write = async move {
+			let mut sent = 0;
+			while sent < payload.len() {
+				let n = poll_fn(|cx| producer.poll_write(cx, &payload[sent..]))
+					.await
+					.unwrap();
+				assert!(n > 0);
+				sent += n;
+			}
+			drop(producer);
+		};
+		let read = async {
+			let mut forwarded = Vec::with_capacity(expected.len());
+			let mut buf = [0; 4096];
+			loop {
+				let n = poll_fn(|cx| consumer.poll_read(cx, &mut buf))
+					.await
+					.unwrap();
+				if n == 0 {
+					assert_eq!(mirror.0.lock().1, 1, "mirror must close before consumer EOF");
+					return forwarded;
+				}
+				forwarded.extend_from_slice(&buf[..n]);
+			}
+		};
+		let (_, forwarded) =
+			tokio::time::timeout(Duration::from_secs(2), async { tokio::join!(write, read) })
+				.await
+				.expect("tapped pipe failed to drain");
+		assert_eq!(forwarded, expected);
+		drop(consumer);
+		assert_eq!(*mirror.0.lock(), (expected, 1));
+	}
+}
