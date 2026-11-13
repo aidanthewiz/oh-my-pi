@@ -5,6 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { AssistantMessage } from "../../packages/ai/src/types";
 import type { Terminal, TspHelloHandler } from "../../packages/tui/src/terminal";
+import type { DescribeContext } from "../../packages/tui/src/native/node";
 import type { AgentSession } from "../../packages/coding-agent/src/session/agent-session";
 
 const required = (name: string): string => {
@@ -172,6 +173,10 @@ try {
    return stream;
   };
   const terminal = new RecordingTerminal();
+  const describeContext: DescribeContext = {
+   cols: terminal.columns, reduceMotion: false, dark: true,
+   supports: kind => kind === "tool" || kind === "ansi" || kind === "code", feature: () => false,
+  };
   const composer = new Composer({ terminal, preferences: { quiet: true } });
   const interactive = new InteractiveMode(session, version, undefined, undefined, undefined, undefined, composer);
   modes.push(interactive);
@@ -232,7 +237,7 @@ try {
   assert(persisted?.role === "toolResult"); assert.equal(asyncJobState(persisted.details), "running");
   const live = interactive.chatContainer.children.filter((child): child is InstanceType<typeof ToolExecutionComponent> => child instanceof ToolExecutionComponent);
   assert.equal(live.length, 1); assert.equal(interactive.pendingTools.has(callId), false);
-  const liveDescription = live[0]!.describe();
+  const liveDescription = live[0]!.describe(describeContext);
   const expectedStatus = state === "failed" ? "error" : "done";
   assert(liveDescription.k === "card" || liveDescription.k === "tool");
   assert.equal(liveDescription.p?.status, expectedStatus);
@@ -242,7 +247,7 @@ try {
   const rebuilt = interactive.chatContainer.children.filter((child): child is InstanceType<typeof ToolExecutionComponent> => child instanceof ToolExecutionComponent);
   assert.equal(rebuilt.length, 1); assert.notEqual(rebuilt[0], live[0], "replay must create a new card, not retain the live owner");
   rebuilt[0]!.setExpanded(true);
-  const rebuiltDescription = rebuilt[0]!.describe();
+  const rebuiltDescription = rebuilt[0]!.describe(describeContext);
   assert(rebuiltDescription.k === "card" || rebuiltDescription.k === "tool");
   assert.equal(rebuiltDescription.p?.status, expectedStatus);
   assert.deepEqual(strings(rebuiltDescription).filter(value => value.includes(first) || value.includes(last)), liveOutput);

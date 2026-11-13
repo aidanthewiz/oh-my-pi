@@ -97,8 +97,20 @@ class MuxTestClient {
 		return (await withTimeout(promise, `notification ${method}`)).params as T;
 	}
 
-	waitForClose(): Promise<void> {
-		return withTimeout(this.#closed.promise, "connection close");
+	async waitForClose(idleMux?: LspMuxServer): Promise<void> {
+		if (!idleMux) return withTimeout(this.#closed.promise, "connection close");
+		const idle = Promise.withResolvers<void>();
+		let immediate: NodeJS.Immediate;
+		const checkIdle = (): void => {
+			if (idleMux.sessionCount === 0) idle.resolve();
+			else immediate = setImmediate(checkIdle);
+		};
+		immediate = setImmediate(checkIdle);
+		try {
+			await withTimeout(Promise.all([this.#closed.promise, idle.promise]), "connection close");
+		} finally {
+			clearImmediate(immediate);
+		}
 	}
 
 	destroy(): void {
@@ -325,7 +337,7 @@ describe("LspMuxServer", () => {
 			diagnostics: [{ message: "fake", severity: 2, range: expect.any(Object) }],
 		});
 
-		const closed = first.client.waitForClose();
+		const closed = first.client.waitForClose(server);
 		first.client.destroy();
 		await closed;
 		const second = await link();

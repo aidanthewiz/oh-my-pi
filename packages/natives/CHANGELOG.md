@@ -24,6 +24,7 @@
 - Reject fractional, non-finite, negative, and wrapping SIXEL background values before native integer conversion.
 - Release tapped Windows pipe producers when an idle downstream consumer closes. Preserve buffered bytes, backpressure, and exactly-once mirror closure.
 - Initialize Windows shell test sessions with production's run-owner identity so retained native pipe contracts compile.
+- Preserve full-screen ZPTY vared qualification by delimiting captured variables and waiting for actual command completion.
 - Reject multi-hunk character matches that would discard unmatched surrounding text.
 - Native patch application and checks now convert only affected source and destination paths, ignoring unrelated required filter failures.
 - Keep create-new cloning compatible with descriptor-returning Linux and Windows backends.

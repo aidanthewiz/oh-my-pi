@@ -336,7 +336,7 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("relay tab ownership", () => {
 			second = await fixture.connect();
 			const firstPage = (await first.pages()).find(page => page.url() === source.url())!;
 			const secondPage = (await second.pages()).find(page => page.url() === source.url())!;
-			const frame = secondPage.frames().find(frame => frame.parentFrame())!;
+			const frame = await secondPage.waitForFrame(frame => frame.parentFrame() !== null);
 			expect(
 				await frame.client.send("Runtime.evaluate", { expression: "document.title", returnByValue: true }),
 			).toMatchObject({

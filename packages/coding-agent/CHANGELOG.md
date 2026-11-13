@@ -16,6 +16,8 @@
 
 ### Fixed
 
+- Synchronize browser and language-server qualification with observed frame attachment and peer session release without changing deadlines.
+- Follow actual browser dispatch phases and current legal attribution sections while preserving qualification cases and license checks.
 - Use the pinned Bun type checker for the collaboration relay instead of an undeclared `tsgo` executable.
 - Keep compiled qualification and replay fixtures aligned with current compiler and interactive-mode APIs while preserving provenance, checkout isolation, and every required gate.
 - Remove obsolete repository-test callers deleted by upstream while retaining every fork maintenance and release check.

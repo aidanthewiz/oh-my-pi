@@ -168,10 +168,14 @@ fn vared_edits_a_parameter() {
 /// shell sleeps meanwhile.
 #[test]
 fn vared_in_a_zpty_command_edits_on_the_pty() {
-	let rc = "zmodload zsh/zpty\ncap() { zpty v 'vared -c x; print -r -- \"got:$x:end\"'; zpty -w \
-	          v $'typed\\r'; sleep 0.5; zpty -r -m v out '*:end*'; print -r -- st=$? \
+	let rc = "zmodload zsh/zpty\ncap() { zpty v 'vared -c x; print -r -- \"got:${x}:end\"'; zpty \
+	          -w v $'typed\\r'; sleep 0.5; zpty -r -m v out '*:end*'; print -r -- st=$? \
 	          ${${out##*got:}%%:end*}; zpty -d v }\n";
-	same(rc, |pty| keys(pty, "cap\r"));
+	same(rc, |pty| {
+		keys(pty, "cap\r")?;
+		pty.read_until("st=0 typed", TIMEOUT)?;
+		pty.settle(QUIET, TIMEOUT)
+	});
 }
 
 /// A byte read past a key sequence (`^X` bound, `^Xe` not) is pushed back

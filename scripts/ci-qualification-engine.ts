@@ -580,9 +580,9 @@ async function legal(): Promise<void> {
 		lockedNpm.add(id);
 	}
 	const bundledStart = notice.indexOf("BUNDLED/DISTRIBUTED (", inventoryStart);
-	const downloadedStart = notice.indexOf("DOWNLOADED-AT-RUNTIME", bundledStart);
-	assert(bundledStart >= 0 && downloadedStart > bundledStart, "Missing bundled npm classification");
-	for (const [, name, version] of notice.slice(bundledStart, downloadedStart).matchAll(/^- (.+?) (\S+) — (.+)$/gm)) {
+	const externalStart = notice.indexOf("RUNTIME-EXTERNAL ROOT-LOCK DEPENDENCIES (", bundledStart);
+	assert(bundledStart >= 0 && externalStart > bundledStart, "Missing bundled npm classification");
+	for (const [, name, version] of notice.slice(bundledStart, externalStart).matchAll(/^- (.+?) (\S+) — (.+)$/gm)) {
 		assert(notice.includes(`- ${name}@${version}: `), `Bundled package license payload missing: ${name}@${version}`);
 	}
 	await json(path.join(receipts, "legal-provenance.json"), {
