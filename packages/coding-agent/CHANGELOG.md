@@ -16,6 +16,7 @@
 
 ### Fixed
 
+- Use the pinned Bun type checker for the collaboration relay instead of an undeclared `tsgo` executable.
 - Initialize Ask independently of eval runtime helpers while preserving approved form-media reads.
 - Refresh credential-aware catalog projections across provider lookups after OAuth changes and scoped discovery updates without discarding unrelated catalog state.
 - Keep subagent worker startup independent of the retired speculative-launch implementation.
