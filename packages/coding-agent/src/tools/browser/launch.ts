@@ -16,6 +16,7 @@ import {
 	withTimeout,
 } from "@oh-my-pi/pi-utils";
 import type * as BrowsersNs from "@oh-my-pi/pi-utils/browsers";
+import { isBunTestRuntime } from "@oh-my-pi/pi-utils/env";
 import type { BunFile } from "bun";
 import type {
 	Browser,
@@ -365,8 +366,9 @@ async function loadBrowsers(): Promise<typeof BrowsersNs> {
 /**
  * Resolve the Chromium executable puppeteer will launch.
  *
- * `PUPPETEER_EXECUTABLE_PATH` always wins. On macOS the isolated Chrome for
- * Testing binary is preferred over a detected system Chrome: a headless
+ * `PUPPETEER_EXECUTABLE_PATH` always wins. Test runtimes require Puppeteer's
+ * pinned Chrome for Testing. Outside tests, macOS prefers the isolated Chrome for
+ * Testing binary over a detected system Chrome: a headless
  * daemon launched from a system `Google Chrome.app` bundle shares its
  * LaunchServices bundle identity (`com.google.Chrome`), so macOS can deliver
  * the user's open-URL Apple Events to the daemon and silently swallow their
@@ -375,8 +377,8 @@ async function loadBrowsers(): Promise<typeof BrowsersNs> {
  * system Chrome is used on macOS only when Chrome for Testing cannot be
  * obtained. Other platforms keep the download-avoiding system Chrome
  * preference and fall back to Chrome for Testing. The managed browser is
- * cached under ~/.omp/puppeteer (getPuppeteerDir). Returns undefined when
- * platform detection fails (puppeteer default resolution takes over).
+ * cached under ~/.omp/puppeteer (getPuppeteerDir). Outside tests, returns
+ * undefined when platform detection fails (puppeteer default resolution takes over).
  * Exported so real-browser tests can probe launchability and skip on hosts
  * missing Chrome's system libraries.
  */
@@ -384,6 +386,15 @@ let chromiumExecutablePromise: Promise<string | undefined> | undefined;
 export async function ensureChromiumExecutable(): Promise<string | undefined> {
 	const envPath = filterChildShellEnv(Bun.env, getProjectDir()).PUPPETEER_EXECUTABLE_PATH;
 	if (envPath) return envPath;
+	if (isBunTestRuntime()) {
+		const executablePath = await ensureManagedChromium();
+		if (!executablePath) {
+			throw new ToolError(
+				`Managed Chromium is unavailable on ${process.platform}/${os.arch()} in the test runtime.`,
+			);
+		}
+		return executablePath;
+	}
 	// macOS: never route a background daemon through the user's GUI Chrome
 	// bundle; prefer the isolated Chrome for Testing binary instead (#8673).
 	const preferManagedChromium = process.platform === "darwin";
@@ -442,12 +453,12 @@ export async function ensureSignInChromiumExecutable(): Promise<string | undefin
 /**
  * Whether launching managed Chromium would first download Chrome for Testing,
  * as {@link ensureChromiumExecutable} decides: no `PUPPETEER_EXECUTABLE_PATH`,
- * no usable system Chrome where one is preferred (every platform but macOS),
+ * no usable system Chrome where production prefers one,
  * and no Chrome for Testing under ~/.omp/puppeteer yet.
  */
 export async function chromiumNeedsDownload(): Promise<boolean> {
 	if (filterChildShellEnv(Bun.env, getProjectDir()).PUPPETEER_EXECUTABLE_PATH) return false;
-	if (process.platform !== "darwin" && (await resolveSystemChromium())) return false;
+	if (!isBunTestRuntime() && process.platform !== "darwin" && (await resolveSystemChromium())) return false;
 	const managed = await managedChromiumLocation();
 	return managed !== undefined && !fs.existsSync(managed.executablePath);
 }
@@ -456,7 +467,14 @@ export async function chromiumNeedsDownload(): Promise<boolean> {
 async function managedChromiumLocation() {
 	const browsers = await loadBrowsers();
 	const platform = browsers.detectBrowserPlatform();
-	if (!platform) return undefined;
+	if (!platform) {
+		if (isBunTestRuntime()) {
+			throw new ToolError(
+				`Managed Chromium is unsupported on ${process.platform}/${os.arch()} in the test runtime.`,
+			);
+		}
+		return undefined;
+	}
 	const cacheDir = getPuppeteerDir();
 	const { PUPPETEER_REVISIONS } = await import("puppeteer-core/internal/revisions.js");
 	const buildId = PUPPETEER_REVISIONS.chrome;

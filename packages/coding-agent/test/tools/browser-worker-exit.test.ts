@@ -1,3 +1,4 @@
+import type { Worker as BunWorker } from "bun";
 import { afterAll, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -13,6 +14,8 @@ import {
 	releaseAllTabs,
 	releaseTab,
 	runInTab,
+	spawnTabWorker,
+	type WorkerHandle,
 } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
 import type { WorkerInbound } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-protocol";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools/index";
@@ -149,6 +152,97 @@ afterAll(async () => {
 	await releaseAllTabs({ kill: true });
 	await disposeAllVmContexts();
 });
+
+it.serial(
+	"waits for native tab worker closure across concurrent and repeated termination",
+	async () => {
+		const descriptor = Object.getOwnPropertyDescriptor(globalThis, "Worker");
+		const NativeWorker = globalThis.Worker;
+		if (!descriptor || descriptor.value !== NativeWorker)
+			throw new Error("expected the native global Worker descriptor");
+		const created: Array<{
+			worker: BunWorker;
+			closed: Promise<void>;
+			closeObserved: boolean;
+			closeTurnReached: boolean;
+		}> = [];
+		const observer = new Proxy(NativeWorker, {
+			construct(target, args, newTarget) {
+				const worker = Reflect.construct(target, args, newTarget) as BunWorker;
+				const completion = Promise.withResolvers<void>();
+				const record = { worker, closed: completion.promise, closeObserved: false, closeTurnReached: false };
+				worker.addEventListener(
+					"close",
+					() => {
+						record.closeObserved = true;
+						setImmediate(() => {
+							record.closeTurnReached = true;
+							completion.resolve();
+						});
+					},
+					{ once: true },
+				);
+				created.push(record);
+				return worker;
+			},
+		});
+		let handle: WorkerHandle | undefined;
+		let unsubscribeExit: (() => void) | undefined;
+		let exitNotifications = 0;
+		try {
+			Object.defineProperty(globalThis, "Worker", { ...descriptor, value: observer });
+			try {
+				handle = await spawnTabWorker();
+			} finally {
+				Object.defineProperty(globalThis, "Worker", descriptor);
+			}
+			const native = created[0];
+			if (created.length !== 1 || !native) throw new Error("expected one actual native tab worker");
+			expect(native.closeObserved).toBe(false);
+			unsubscribeExit = handle.onExit(() => {
+				exitNotifications += 1;
+			});
+			const snapshot = (): {
+				closeObserved: boolean;
+				closeTurnReached: boolean;
+				threadId: number;
+				exitNotifications: number;
+			} => ({
+				closeObserved: native.closeObserved,
+				closeTurnReached: native.closeTurnReached,
+				threadId: native.worker.threadId,
+				exitNotifications,
+			});
+			const first = handle.terminate().then(snapshot);
+			const second = handle.terminate().then(snapshot);
+			for (const boundary of await Promise.all([first, second])) {
+				expect(boundary).toEqual({
+					closeObserved: true,
+					closeTurnReached: true,
+					threadId: -1,
+					exitNotifications: 0,
+				});
+			}
+			expect(await handle.terminate().then(snapshot)).toEqual({
+				closeObserved: true,
+				closeTurnReached: true,
+				threadId: -1,
+				exitNotifications: 0,
+			});
+		} finally {
+			if (globalThis.Worker === observer) Object.defineProperty(globalThis, "Worker", descriptor);
+			try {
+				for (const record of created) {
+					if (!record.closeObserved) record.worker.terminate();
+					await record.closed;
+				}
+			} finally {
+				unsubscribeExit?.();
+			}
+		}
+	},
+	30_000,
+);
 
 describe.skipIf(!CHROMIUM_AVAILABLE)("browser tab worker exit", () => {
 	it("fails the call at once and continues on the same page with a new worker", async () => {

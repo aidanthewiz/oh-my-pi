@@ -16,7 +16,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/tools/browser/launch";
 import { readJsonl, TempDir } from "@oh-my-pi/pi-utils";
 import { BrowserPlatform, computeExecutablePath, detectBrowserPlatform } from "@oh-my-pi/pi-utils/browsers";
-import { APP_NAME } from "@oh-my-pi/pi-utils/dirs";
+import { APP_NAME, CONFIG_DIR_NAME } from "@oh-my-pi/pi-utils/dirs";
 import type { Browser } from "puppeteer-core";
 import { PUPPETEER_REVISIONS } from "puppeteer-core/internal/revisions.js";
 import { chromiumAvailable } from "./chromium-probe";
@@ -39,7 +39,62 @@ function probeEnv(): Record<string, string | undefined> {
 		if (key.startsWith("XDG_") || key.startsWith("PUPPETEER_")) delete env[key];
 	}
 	for (const key of ["PI_CODING_AGENT_DIR", "PI_CONFIG_DIR", "OMP_PROFILE", "PI_PROFILE"]) delete env[key];
+	env.PI_TEST_RUNTIME = "0";
 	return env;
+}
+
+async function runtimeExecutableFixture(root: string) {
+	const home = path.join(root, "home");
+	const tmp = path.join(root, "tmp");
+	const xdgCache = path.join(root, "cache");
+	const xdgData = path.join(root, "data");
+	const xdgState = path.join(root, "state");
+	for (const directory of [
+		home,
+		tmp,
+		path.join(xdgCache, APP_NAME),
+		path.join(xdgData, APP_NAME),
+		path.join(xdgState, APP_NAME),
+	]) {
+		await fs.promises.mkdir(directory, { recursive: true });
+	}
+	const windows = process.platform === "win32";
+	const bin = path.join(root, "bin");
+	const programFiles = path.join(root, "program-files");
+	const systemChrome = windows
+		? path.join(programFiles, "Google", "Chrome", "Application", "chrome.exe")
+		: path.join(bin, "google-chrome-stable");
+	await Bun.write(systemChrome, windows ? "synthetic system browser" : "#!/bin/sh\nprintf 'Chromium fixture\\n'\n");
+	await fs.promises.chmod(systemChrome, 0o755);
+	const cacheDir = windows
+		? path.join(home, CONFIG_DIR_NAME, "puppeteer")
+		: path.join(xdgCache, APP_NAME, "puppeteer");
+	const chromeForTesting = computeExecutablePath({
+		buildId: PUPPETEER_REVISIONS.chrome,
+		cacheDir,
+		platform: windows ? BrowserPlatform.WIN64 : BrowserPlatform.LINUX,
+	});
+	const env: Record<string, string | undefined> = {
+		...probeEnv(),
+		HOME: home,
+		USERPROFILE: home,
+		TMPDIR: tmp,
+		TEMP: tmp,
+		TMP: tmp,
+		XDG_CACHE_HOME: xdgCache,
+		XDG_DATA_HOME: xdgData,
+		XDG_STATE_HOME: xdgState,
+		PATH: bin,
+		ProgramFiles: programFiles,
+		"ProgramFiles(x86)": path.join(root, "program-files-x86"),
+		LOCALAPPDATA: path.join(root, "local"),
+		PI_TEST_RUNTIME: "1",
+		PUPPETEER_EXECUTABLE_PATH: "",
+		OMP_BROWSER_PROBE_PLATFORM: windows ? "win32" : "linux",
+		OMP_BROWSER_PROBE_ARCH: "x64",
+		OMP_BROWSER_PROBE_PURPOSE: "browser",
+	};
+	return { env, systemChrome, chromeForTesting };
 }
 
 const AUTOMATION_FLAG = "--enable-automation";
@@ -387,6 +442,138 @@ describe("browser executable selection", () => {
 				// Edge must keep `--enable-automation` to launch, which Google sign-in rejects.
 				expect(probe("sign-in")).toBe(chromeForTesting);
 				expect(probe("browser")).toBe(edge);
+			} finally {
+				await tempDir.remove();
+			}
+		},
+	);
+});
+
+describe("canonical test-runtime browser dependency", () => {
+	it("selects the pinned managed browser instead of a usable system browser", async () => {
+		const tempDir = TempDir.createSync("@browser-test-runtime-");
+		try {
+			const fixture = await runtimeExecutableFixture(tempDir.path());
+			await Bun.write(fixture.chromeForTesting, "#!/bin/sh\nprintf 'managed browser fixture\\n'\n");
+			await fs.promises.chmod(fixture.chromeForTesting, 0o755);
+
+			const production = Bun.spawnSync([process.execPath, "--no-env-file", EXECUTABLE_PROBE], {
+				env: { ...fixture.env, PI_TEST_RUNTIME: "0" },
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			expect(production.exitCode, new TextDecoder().decode(production.stderr)).toBe(0);
+			expect(new TextDecoder().decode(production.stdout)).toBe(fixture.systemChrome);
+
+			const selected = Bun.spawnSync([process.execPath, "--no-env-file", EXECUTABLE_PROBE], {
+				env: fixture.env,
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			expect(selected.exitCode, new TextDecoder().decode(selected.stderr)).toBe(0);
+			expect(new TextDecoder().decode(selected.stdout)).toBe(fixture.chromeForTesting);
+
+			const preflight = Bun.spawnSync([process.execPath, "--no-env-file", EXECUTABLE_PROBE], {
+				env: { ...fixture.env, OMP_BROWSER_PROBE_PURPOSE: "needs-download" },
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			expect(preflight.exitCode, new TextDecoder().decode(preflight.stderr)).toBe(0);
+			expect(JSON.parse(new TextDecoder().decode(preflight.stdout))).toBe(false);
+		} finally {
+			await tempDir.remove();
+		}
+	});
+
+	it("honors an explicit test-runtime executable without requiring a managed download", async () => {
+		const tempDir = TempDir.createSync("@browser-test-override-");
+		try {
+			const fixture = await runtimeExecutableFixture(tempDir.path());
+			const override = path.join(tempDir.path(), "explicit-chrome");
+			await Bun.write(override, "synthetic explicit browser");
+			const env = { ...fixture.env, PUPPETEER_EXECUTABLE_PATH: override };
+
+			const selected = Bun.spawnSync([process.execPath, "--no-env-file", EXECUTABLE_PROBE], {
+				env,
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			expect(selected.exitCode, new TextDecoder().decode(selected.stderr)).toBe(0);
+			expect(new TextDecoder().decode(selected.stdout)).toBe(override);
+
+			const preflight = Bun.spawnSync([process.execPath, "--no-env-file", EXECUTABLE_PROBE], {
+				env: { ...env, OMP_BROWSER_PROBE_PURPOSE: "needs-download" },
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			expect(preflight.exitCode, new TextDecoder().decode(preflight.stderr)).toBe(0);
+			expect(JSON.parse(new TextDecoder().decode(preflight.stdout))).toBe(false);
+		} finally {
+			await tempDir.remove();
+		}
+	});
+
+	it("requires the missing managed dependency without falling back to an available system browser", async () => {
+		const tempDir = TempDir.createSync("@browser-test-missing-");
+		try {
+			const fixture = await runtimeExecutableFixture(tempDir.path());
+			const production = Bun.spawnSync([process.execPath, "--no-env-file", EXECUTABLE_PROBE], {
+				env: { ...fixture.env, PI_TEST_RUNTIME: "0" },
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			expect(production.exitCode, new TextDecoder().decode(production.stderr)).toBe(0);
+			expect(new TextDecoder().decode(production.stdout)).toBe(fixture.systemChrome);
+
+			const preflight = Bun.spawnSync([process.execPath, "--no-env-file", EXECUTABLE_PROBE], {
+				env: { ...fixture.env, OMP_BROWSER_PROBE_PURPOSE: "needs-download" },
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			expect(preflight.exitCode, new TextDecoder().decode(preflight.stderr)).toBe(0);
+			expect(JSON.parse(new TextDecoder().decode(preflight.stdout))).toBe(true);
+
+			const selected = Bun.spawnSync([process.execPath, "--no-env-file", EXECUTABLE_PROBE], {
+				env: fixture.env,
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			expect(selected.exitCode, new TextDecoder().decode(selected.stderr)).not.toBe(0);
+			expect(new TextDecoder().decode(selected.stdout)).toBe("");
+		} finally {
+			await tempDir.remove();
+		}
+	});
+
+	it.each([
+		["freebsd", "x64"],
+		["linux", "arm64"],
+	] as const)(
+		"rejects an unsupported managed test platform (%s/%s) instead of resolving a default",
+		async (platform, arch) => {
+			const tempDir = TempDir.createSync("@browser-test-platform-");
+			try {
+				const fixture = await runtimeExecutableFixture(tempDir.path());
+				const env = {
+					...fixture.env,
+					OMP_BROWSER_PROBE_PLATFORM: platform,
+					OMP_BROWSER_PROBE_ARCH: arch,
+				};
+				const preflight = Bun.spawnSync([process.execPath, "--no-env-file", EXECUTABLE_PROBE], {
+					env: { ...env, OMP_BROWSER_PROBE_PURPOSE: "needs-download" },
+					stdout: "pipe",
+					stderr: "pipe",
+				});
+				expect(preflight.exitCode, new TextDecoder().decode(preflight.stderr)).not.toBe(0);
+				expect(new TextDecoder().decode(preflight.stdout)).toBe("");
+
+				const selected = Bun.spawnSync([process.execPath, "--no-env-file", EXECUTABLE_PROBE], {
+					env,
+					stdout: "pipe",
+					stderr: "pipe",
+				});
+				expect(selected.exitCode, new TextDecoder().decode(selected.stderr)).not.toBe(0);
+				expect(new TextDecoder().decode(selected.stdout)).toBe("");
 			} finally {
 				await tempDir.remove();
 			}

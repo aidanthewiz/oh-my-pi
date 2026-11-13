@@ -72,6 +72,7 @@ export interface WorkerHandle {
 	onError(handler: (error: Error) => void): () => void;
 	/** Fires when the worker exits on its own (crash, `process.exit`); never after `terminate()`. */
 	onExit(handler: (exitCode: number) => void): () => void;
+	/** Resolves after native worker closure and thread teardown complete. */
 	terminate(): Promise<void>;
 	readonly mode: "worker";
 }
@@ -2647,6 +2648,17 @@ export function buildTabWorkerEnv(): Record<string, string> {
 
 function wrapBunWorker(worker: Worker): WorkerHandle {
 	let terminated = false;
+	let closed = false;
+	const { promise: completion, resolve, reject } = Promise.withResolvers<void>();
+	worker.addEventListener(
+		"close",
+		() => {
+			closed = true;
+			// Bun dispatches close before joining the thread; settle on the next parent turn.
+			setImmediate(resolve);
+		},
+		{ once: true },
+	);
 	return {
 		mode: "worker",
 		send(msg, transferList) {
@@ -2675,9 +2687,18 @@ function wrapBunWorker(worker: Worker): WorkerHandle {
 			worker.addEventListener("close", onClose);
 			return () => worker.removeEventListener("close", onClose);
 		},
-		async terminate() {
-			terminated = true;
-			worker.terminate();
+		terminate() {
+			if (!terminated) {
+				terminated = true;
+				if (!closed) {
+					try {
+						worker.terminate();
+					} catch (error) {
+						reject(error);
+					}
+				}
+			}
+			return completion;
 		},
 	};
 }

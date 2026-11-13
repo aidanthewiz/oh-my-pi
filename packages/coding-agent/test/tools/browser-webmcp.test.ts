@@ -139,6 +139,7 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser WebMCP helpers", () => {
 			const page = await headless().browser.newPage();
 			const controller = new WebMcpController(page);
 			try {
+				await controller.initialize();
 				await page.goto(`http://localhost:${rootServer.port}/`, { waitUntil: "load" });
 				const leaf = page.frames().find(frame => frame.url() === `http://127.0.0.1:${leafServer.port}/tool`);
 				if (!leaf) throw new Error("Missing synthetic grandchild");

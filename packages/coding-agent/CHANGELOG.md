@@ -16,6 +16,9 @@
 
 ### Fixed
 
+- Await native tab-worker closure and thread teardown before replacing a worker or releasing its browser resources.
+- Resolve automatic test browsers from the managed Chromium pin and initialize native WebMCP observation before fixture navigation.
+- Restore vendored JaQ doctest coverage with declared development dependencies and a scoped core/JSON example.
 - Create weak row targets in synchronous test scopes, retaining live components and the original cache-release and replay assertions.
 - Wait for terminal-mode admission before the single EOF key in PTY qualification; preserve exit and parity checks.
 - Keep accepted proxy-fixture sockets blocking on Darwin while preserving connect-deadline and bounded I/O checks.

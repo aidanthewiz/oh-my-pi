@@ -2,9 +2,9 @@
 //!
 //! This crate allows you to parse, compile, and execute jq-like filters.
 //!
-//! The example below demonstrates how to use this crate.
-//! See the implementation in the `jaq` crate if you are interested in
-//! more complex use cases, such as lazy JSON file loading, error handling etc.
+//! This example uses core definitions, base standard-library natives, and JSON values.
+//! It does not load the full jq standard library or host-specific filters.
+//! The `jq` builtin supplies that integration.
 //!
 //! ~~~
 //! use jaq_core::{data, unwrap_valr, Compiler, Ctx, Vars};
@@ -16,8 +16,10 @@
 //! let program = File { code: ".[]", path: () };
 //!
 //! // named filters, such as `keys`, `map`, ...
-//! let defs = jaq_core::defs().chain(jaq_std::defs()).chain(jaq_json::defs());
-//! let funs = jaq_core::funs().chain(jaq_std::funs()).chain(jaq_json::funs());
+//! let defs = jaq_core::defs();
+//! let funs = jaq_core::funs()
+//!     .chain(jaq_std::base_funs())
+//!     .chain(jaq_json::funs());
 //!
 //! let loader = Loader::new(defs);
 //! let arena = Arena::default();
