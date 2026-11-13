@@ -85,6 +85,7 @@ function resumed(capture: NativeCapture): Message[] {
 async function encode(capture: NativeCapture, turn: 0 | 1): Promise<NativeRequest | undefined> {
 	const model = factoryModel(capture.model, [capture.upstream]);
 	model.factoryDroidOrgId = "org-capture";
+	model.factoryDroidRefusalFallbacks = ["claude-opus-5"];
 	// The capture pinned each upstream through live routing.
 	model.factoryDroidRoutingSource = "configured_order";
 	const disabled = capture.effort === "off" || capture.effort === "none";

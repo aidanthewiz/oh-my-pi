@@ -500,8 +500,11 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser uploadFile into a browser omp laun
 			result.details && typeof result.details === "object" && "value" in result.details
 				? result.details.value
 				: undefined;
-		const before = await stagingFolders();
 		await prelude.invoke({ action: "open", name, url }, context);
+		const tab = getTab(name);
+		if (tab?.backend !== "worker") throw new Error("Expected the launched tab's upload owner");
+		const staging = tab.uploadDir;
+		ownedStaging.add(staging);
 		try {
 			const file = path.join(tempDir, "recycled.txt");
 			await Bun.write(file, "outlives its worker");
@@ -520,7 +523,7 @@ return "done";`);
 			await prelude.invoke({ action: "close", name }, context);
 		}
 		// omp closed the page it launched, the last reader of the copies.
-		expect([...(await stagingFolders())].filter(folder => !before.has(folder))).toEqual([]);
+		await expect(fs.stat(staging)).rejects.toMatchObject({ code: "ENOENT" });
 	}, 60_000);
 });
 

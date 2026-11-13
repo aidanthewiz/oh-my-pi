@@ -29,7 +29,9 @@ function context() {
 
 async function capture(id: string, options: Parameters<typeof streamFactoryDroid>[2] = {}, upstream?: string) {
 	const captured: CapturedRequest[] = [];
-	await streamFactoryDroid(factoryModel(id, upstream ? [upstream] : undefined), context(), {
+	const model = factoryModel(id, upstream ? [upstream] : undefined);
+	model.factoryDroidOrgId = "org-1";
+	await streamFactoryDroid(model, context(), {
 		apiKey: WORKOS_TOKEN_WITH_USER,
 		fetch: captureFetch(captured, responsesChunks("GPT_OK")),
 		sessionId: "sess-1",
@@ -136,6 +138,7 @@ describe("Factory Droid Muse Spark 1.3 on Vertex Responses", () => {
 
 	it("drops its encrypted reasoning from the replayed tool turn, as native does", async () => {
 		const model = factoryModel("muse-spark-1.3");
+		model.factoryDroidOrgId = "org-1";
 		const options = { apiKey: WORKOS_TOKEN_WITH_USER, sessionId: "sess-1", reasoning: Effort.High };
 		const captured: CapturedRequest[] = [];
 		const first = await streamFactoryDroid(model, context(), {

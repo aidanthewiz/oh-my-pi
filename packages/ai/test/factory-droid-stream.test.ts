@@ -78,7 +78,9 @@ describe("Factory Droid public stream controls", () => {
 		["gpt-6-astra-ultrafast", "ultrafast"],
 	])("requests %s on OpenAI's %s service tier", async (id, tier) => {
 		const captured: CapturedRequest[] = [];
-		const result = await streamSimple(factoryModel(id), context, {
+		const model = factoryModel(id);
+		model.factoryDroidOrgId = "org-1";
+		const result = await streamSimple(model, context, {
 			apiKey: WORKOS_TOKEN,
 			reasoning: Effort.Low,
 			fetch: captureFetch(captured, responsesChunks("ok")),
@@ -91,7 +93,9 @@ describe("Factory Droid public stream controls", () => {
 
 	it("asks Factory to accept Beam tool-call turns that arrive without reasoning", async () => {
 		const captured: CapturedRequest[] = [];
-		const result = await streamSimple(factoryModel("beam-1.0"), context, {
+		const model = factoryModel("beam-1.0");
+		model.factoryDroidOrgId = "org-1";
+		const result = await streamSimple(model, context, {
 			apiKey: WORKOS_TOKEN,
 			reasoning: Effort.High,
 			fetch: captureFetch(captured, completionsChunks("ok", "beam-1.0")),

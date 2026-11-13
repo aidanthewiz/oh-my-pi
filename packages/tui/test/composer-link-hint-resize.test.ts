@@ -33,6 +33,12 @@ afterEach(() => {
 
 class UnansweredProbeTerminal extends VirtualTerminal {
 	droppedReports = 0;
+	written = "";
+
+	override write(data: string): void {
+		this.written += data;
+		super.write(data);
+	}
 
 	override start(onInput: (data: string) => void, onResize: () => void): void {
 		super.start(data => {
@@ -53,6 +59,12 @@ class LinkTail implements Component {
 			...Array.from({ length: 9 }, (_, index) => `tail-${index}`),
 		];
 	}
+}
+
+function shownHint(terminal: UnansweredProbeTerminal): string {
+	const tag = [...terminal.written.matchAll(/\x1b\[1;7m(.*?)\x1b\[22;27m/g)].at(-1)?.[1];
+	if (tag === undefined) throw new Error("No link hint is displayed");
+	return Bun.stripANSI(tag);
 }
 
 describe("link hints require a displayed viewport", () => {
@@ -83,11 +95,12 @@ describe("link hints require a displayed viewport", () => {
 				expect(composer.viewportLinkCount()).toBe(1);
 				composer.startLinkHints(() => {});
 				composer.ui.renderNow();
-				terminal.sendInput("a");
+				terminal.sendInput(shownHint(terminal));
 				expect(activations).toEqual(["demo:open/7"]);
 				activations.length = 0;
 				composer.startLinkHints(() => {});
 				composer.ui.renderNow();
+				const staleTag = shownHint(terminal);
 				expect(composer.linkHintsActive).toBe(true);
 				terminal.droppedReports = 0;
 
@@ -100,7 +113,7 @@ describe("link hints require a displayed viewport", () => {
 					expect(terminal.droppedReports).toBe(0);
 				}
 				expect(composer.ui.getMutableViewport().length).toBe(0);
-				terminal.sendInput("a");
+				terminal.sendInput(staleTag);
 				expect(activations).toEqual([]);
 				expect(composer.linkHintsActive).toBe(false);
 
@@ -111,7 +124,7 @@ describe("link hints require a displayed viewport", () => {
 				expect(composer.viewportLinkCount()).toBe(1);
 				composer.startLinkHints(() => {});
 				composer.ui.renderNow();
-				terminal.sendInput("a");
+				terminal.sendInput(shownHint(terminal));
 				expect(activations).toEqual(["demo:open/7"]);
 			} finally {
 				removeInput();

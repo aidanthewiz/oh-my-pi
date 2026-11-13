@@ -426,6 +426,7 @@ describe("ProcessTerminal win32-input-mode fallback", () => {
 		vi.advanceTimersByTime(74);
 		expect(recorder.received).toEqual([]);
 		vi.advanceTimersByTime(1);
+		vi.advanceTimersByTime(0);
 		expect(recorder.received).toEqual(Array.from({ length: count }, () => "\x1b"));
 	});
 

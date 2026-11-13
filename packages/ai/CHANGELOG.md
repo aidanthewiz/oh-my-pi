@@ -14,6 +14,7 @@
 ### Fixed
 
 - Price billed usage retained by failed OpenAI Responses streams before reporting their terminal error.
+- Bind Factory transport qualification to explicit synthetic organization and discovered fallback authority without relaxing production admission.
 - Cancel parked Cursor runs before accepting tool results after credentials, endpoint, provider, transport, or tenant headers change. This fixes an inherited upstream relay defect from #17382.
 - Rebuild parked Cursor runs when instructions, tool schemas, or earlier conversation content changes, including caller-owned objects mutated in place.
 - Preserve received PI-native text, usage, and completed tool calls when gateway transport fails without a canonical terminal message.

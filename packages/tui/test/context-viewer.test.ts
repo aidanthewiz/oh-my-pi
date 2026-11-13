@@ -647,10 +647,11 @@ describe("ContextViewer entry content", () => {
 		const h = harness(data);
 		h.render();
 		select(h.viewer, "system-prompt");
-		const ansi = h.render(160).join("\n");
+		const cols = Math.max(160, visibleWidth(`Source: ${path}`) + 16);
+		const ansi = h.render(cols).join("\n");
 		expect(ansi).toContain(`Source: ${path}`);
 		expect(ansi).not.toContain("\t");
-		const body = nodes(h.viewer.describe({ ...cx, cols: 160 }))
+		const body = nodes(h.viewer.describe({ ...cx, cols }))
 			.filter(node => node.k === "text")
 			.flatMap(node =>
 				node.k === "text" ? [node.p?.text ?? "", ...(node.p?.spans?.map(span => span.t) ?? [])] : [],

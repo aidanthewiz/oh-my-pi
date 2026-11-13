@@ -13,6 +13,7 @@ import {
 	isSameModelTurn,
 	shouldDropTruncatedThinkingOnlyAssistant,
 } from "@oh-my-pi/pi-ai/providers/transform-messages";
+import { resolveFactoryDroidPolicy } from "@oh-my-pi/pi-catalog/compat/factory-droid";
 import { resolveThinkingReplayTokens, type ThinkingReplayTokens } from "@oh-my-pi/pi-catalog/compat/thinking-replay";
 import type { ModelTokenizer } from "@oh-my-pi/pi-catalog/types";
 import * as natives from "@oh-my-pi/pi-natives";
@@ -83,10 +84,20 @@ function reasoningReplayReader(model: TokenizerModel | null | undefined): Reason
 	return { api: model.api, provider: model.provider, id: model.id };
 }
 
+function reasoningPayloadReader(
+	reader: ReasoningReplayReader | undefined,
+	requestModelId: string | undefined,
+): ReasoningReplayReader | undefined {
+	if (reader?.api !== "factory-droid-agent") return reader;
+	const wire = resolveFactoryDroidPolicy({ id: reader.id, requestModelId })?.wire ?? "openai-completions";
+	return wire === "google-generate" ? reader : { ...reader, api: wire };
+}
+
 /** Identity of the reader whose replayed reasoning a {@link Tokenizer} counts; equal keys count it alike. */
 export function reasoningReplayKey(model: TokenizerModel | null | undefined): string {
 	const reader = reasoningReplayReader(model);
-	return reader ? `${reader.api}\0${reader.provider}\0${reader.id}` : "";
+	const payloadApi = reasoningPayloadReader(reader, model?.requestModelId)?.api;
+	return reader ? `${reader.api}\0${reader.provider}\0${reader.id}\0${payloadApi}` : "";
 }
 
 /** Request state a {@link Tokenizer} counts for, beyond its model. */
@@ -236,6 +247,7 @@ export class Tokenizer {
 	readonly #frameBilling: snapcompact.FrameBilling;
 	readonly frameBillingKey: string;
 	readonly #reasoningReader: ReasoningReplayReader | undefined;
+	readonly #reasoningPayloadReader: ReasoningReplayReader | undefined;
 	readonly #dropsOllamaThinking: boolean;
 	readonly #dropsCompletionsThinking: boolean;
 	/** Claude's own API and prefix-bound hosts keep another model's signature from their deployment. */
@@ -277,6 +289,7 @@ export class Tokenizer {
 		this.#frameBilling = snapcompact.frameBilling(model ?? undefined);
 		this.frameBillingKey = snapcompact.frameBillingKey(this.#frameBilling);
 		this.#reasoningReader = reasoningReplayReader(model);
+		this.#reasoningPayloadReader = reasoningPayloadReader(this.#reasoningReader, model?.requestModelId);
 		this.#dropsOllamaThinking = ollamaChatDropsOwnThinking(model);
 		this.#dropsCompletionsThinking = completionsDropsOwnThinking(model);
 		this.#readsDeploymentSignatures = readsDeploymentSignatures(model);
@@ -393,7 +406,7 @@ export class Tokenizer {
 	 * which overcounts a filtering reader's foreign turns.
 	 */
 	#receivesReasoningPayload(message: AssistantMessage): boolean {
-		const reader = this.#reasoningReader;
+		const reader = this.#reasoningPayloadReader;
 		if (reader === undefined) return true;
 		if (this.#factoryGeminiWire) return keepsFactoryGeminiReasoning(message);
 		return !dropsForeignReasoningPayload(message, reader);

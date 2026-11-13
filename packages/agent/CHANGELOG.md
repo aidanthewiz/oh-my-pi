@@ -9,6 +9,8 @@
 - Fixed queued follow-ups being delayed by non-triggering custom messages appended at the end of a turn.
 - Invalidate cached tool context when NUL-bearing names and descriptions form different identity tuples.
 - Recount cross-model Claude signed thinking when the same reader's endpoint or prefix-binding policy changes.
+- Count opaque reasoning payloads by Factory's selected request wire and invalidate estimates when that wire changes.
+
 ## [18.18.9] - 2026-11-11
 
 ### Added
