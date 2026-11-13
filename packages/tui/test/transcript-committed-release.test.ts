@@ -471,12 +471,15 @@ describe("committed transcript blocks release render caches", () => {
 			sanitizeSpy.mockRestore();
 		}
 
-		// Generic fallback WidthAwareText drops its width-formatted string so rendered rows become collectible.
-		const genericCard = settledGeneric();
-		const genericTranscript = new TranscriptContainer();
-		genericTranscript.addChild(genericCard);
-		const liveGenericRef = new WeakRef(genericCard.render(80));
-		const retiredGeneric = commitAll(genericTranscript, 80);
+		// The weak target is the generic card's row array, not the formatter's cached string.
+		const { liveGenericRef, genericTranscript, retiredGeneric } = (() => {
+			const genericCard = settledGeneric();
+			const genericTranscript = new TranscriptContainer();
+			genericTranscript.addChild(genericCard);
+			const liveGenericRef = new WeakRef(genericCard.render(80));
+			const retiredGeneric = commitAll(genericTranscript, 80);
+			return { liveGenericRef, genericTranscript, retiredGeneric };
+		})();
 		expect(await becomesCollectible(liveGenericRef)).toBe(true);
 		expect(replay(genericTranscript, 80)).toEqual(retiredGeneric);
 

@@ -16,6 +16,9 @@
 
 ### Fixed
 
+- Create weak row targets in synchronous test scopes, retaining live components and the original cache-release and replay assertions.
+- Wait for terminal-mode admission before the single EOF key in PTY qualification; preserve exit and parity checks.
+- Keep accepted proxy-fixture sockets blocking on Darwin while preserving connect-deadline and bounded I/O checks.
 - Materialize dependency-free TUI bootstrap modules in packed-license qualification while preserving offline checkout isolation and complete legal payload checks.
 - Synchronize browser and language-server qualification with observed frame attachment and peer session release without changing deadlines.
 - Follow actual browser dispatch phases and current legal attribution sections while preserving qualification cases and license checks.
