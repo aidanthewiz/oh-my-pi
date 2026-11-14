@@ -4498,6 +4498,7 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 			// Stops and continues come first (job control, zsh's
 			// `WUNTRACED`): the shell's own foreground job stopping is
 			// suspended; anything else waits on.
+			let event_checkpoint = super::jobctl::ext_event_checkpoint(k);
 			let exit = loop {
 				let event = match &mut scratch(vp).live {
 					Live::Ext(child) => child.poll_event(&mut tcx),
@@ -4513,6 +4514,9 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 					Poll::Pending => return Some(Flow::Block(WaitKey::Ext { pid })),
 				}
 			};
+			if exit.is_some() {
+				super::jobctl::ext_exited_since(k, event_checkpoint);
+			}
 			let killed = match exit {
 				Some(ExitStatus::Signaled(sig)) => Some(sig),
 				_ => None,

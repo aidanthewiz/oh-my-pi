@@ -623,6 +623,17 @@ pub fn pipeline_started(k: &mut Kernel, job: Vpid, stages: &[(Vpid, bool)]) {
 	print_settled(k, i);
 }
 
+pub(super) const fn ext_event_checkpoint(k: &Kernel) -> usize {
+	k.jobctl.events.len()
+}
+
+pub(super) fn ext_exited_since(k: &mut Kernel, checkpoint: usize) {
+	k.jobctl
+		.events
+		.extract_if(checkpoint.., |(_, event)| matches!(event, ProcEvent::Stopped(_)))
+		.for_each(drop);
+}
+
 /// An external `vp` waits for stopped or continued ([`ExtProc::poll_event`]).
 /// The root's controlled foreground job stopping is suspended at once
 /// (`Some`: the flow of the op that waited); any other change is applied

@@ -325,7 +325,9 @@ describe("browser cleanup — timed-out target close in a shared browser", () =>
 					);
 				});
 			}
-			terminate(): void {}
+			terminate(): void {
+				this.dispatchEvent(new CloseEvent("close", { code: 0 }));
+			}
 		}
 		const RealWorker = globalThis.Worker;
 		try {

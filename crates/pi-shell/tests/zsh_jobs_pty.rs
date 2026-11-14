@@ -223,7 +223,8 @@ fn a_suspended_job_does_not_leave_its_terminal_modes() -> io::Result<()> {
 			continue;
 		}
 		let mut pty = shell(real)?;
-		line(&mut pty, "sh -c 'stty -echo; sleep 100'")?;
+		line(&mut pty, "sh -c 'stty -echo && printf \"mode-%s\\n\" ready; sleep 100'")?;
+		pty.read_until("mode-ready", TIMEOUT)?;
 		thread::sleep(START);
 		pty.write("\x1a")?;
 		pty.read_until("suspended  sh -c", TIMEOUT)?;

@@ -17,6 +17,10 @@
 ### Fixed
 
 - Await native tab-worker closure and thread teardown before replacing a worker or releasing its browser resources.
+- Align failed-startup worker fixtures with close completion while preserving durable owned-target cleanup.
+- Keep async-job fixture manager proxies alive through invalidation and admitted persistence drains.
+- Discard same-command stop events superseded by an accepted exit before resuming compound jobs.
+- Wait for terminal-mode fixture children to finish disabling echo before sending Ctrl-Z.
 - Resolve automatic test browsers from the managed Chromium pin and initialize native WebMCP observation before fixture navigation.
 - Restore vendored JaQ doctest coverage with declared development dependencies and a scoped core/JSON example.
 - Create weak row targets in synchronous test scopes, retaining live components and the original cache-release and replay assertions.

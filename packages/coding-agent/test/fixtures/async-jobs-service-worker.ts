@@ -36,9 +36,12 @@ interface CapturedOwner {
 	lifetime: (() => boolean) | undefined;
 }
 
+const widgetManagers = new Set<AsyncJobManagerApi>();
+
 function widgets(manager: AsyncJobManagerApi): JobWidgetRegistry {
 	const registry = manager.widgets;
 	if (!registry) throw new Error("Root has no widget registry");
+	widgetManagers.add(manager);
 	return registry;
 }
 

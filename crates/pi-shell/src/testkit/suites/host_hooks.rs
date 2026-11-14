@@ -18,13 +18,13 @@ use parking_lot::Mutex;
 
 use crate::{
 	bash::{
-		Budget, CallOutcome, Cx, ExitStatus, ExtProc, PipeMirror, PipeTap, Script, ShellApi, Signal,
-		SpawnFuture, SpawnSpec, Step,
+		Budget, CallOutcome, Cx, ExitStatus, ExtProc, PipeMirror, PipeTap, ProcEvent, Script,
+		ShellApi, Signal, SpawnFuture, SpawnSpec, Step,
 	},
 	testkit::{
 		FakeHost, Rig,
 		fault::skeleton_init,
-		run::{Stop, advance, wait_runnable},
+		run::{Stop, advance, advance_or_blocked, wait_runnable},
 	},
 };
 
@@ -390,4 +390,79 @@ fn snapshot_of_a_pending_spawn_reissues_it_without_duplicating_the_process() {
 	assert_eq!(until_done(&mut r), 0);
 	assert_eq!(r.parts().1.stdout.bytes(), b"status 7\n");
 	assert_eq!(tally(&gate), (2, 2, 1), "one process for one command");
+}
+
+/// A host model that publishes terminal status after its stop is consumed.
+struct StopThenExit {
+	stop_pending: bool,
+	waker:        Option<Waker>,
+}
+
+impl ExtProc for StopThenExit {
+	fn pid(&self) -> u32 {
+		5001
+	}
+
+	fn poll_wait(&mut self, cx: &mut Context<'_>) -> Poll<ExitStatus> {
+		if self.stop_pending {
+			self.waker = Some(cx.waker().clone());
+			Poll::Pending
+		} else {
+			Poll::Ready(ExitStatus::Exited(42))
+		}
+	}
+
+	fn poll_event(&mut self, _cx: &mut Context<'_>) -> Poll<ProcEvent> {
+		if self.stop_pending {
+			self.stop_pending = false;
+			if let Some(waker) = self.waker.take() {
+				waker.wake();
+			}
+			Poll::Ready(ProcEvent::Stopped(Signal::Stop))
+		} else {
+			Poll::Ready(ProcEvent::Exited(ExitStatus::Exited(42)))
+		}
+	}
+
+	fn signal(&mut self, _sig: Signal) -> io::Result<()> {
+		Err(io::ErrorKind::Unsupported.into())
+	}
+
+	fn stop(&mut self) -> io::Result<()> {
+		Err(io::ErrorKind::Unsupported.into())
+	}
+
+	fn cont(&mut self) -> io::Result<()> {
+		Err(io::ErrorKind::Unsupported.into())
+	}
+}
+
+// Failure mode: an exited external strands its job's remaining work and
+// leaves its parent's forced wait blocked.
+#[test]
+fn exited_external_does_not_stop_remaining_job_work() {
+	let host = FakeHost::new().with_spawner(Box::new(|spec: SpawnSpec<'_>| {
+		if spec.argv[0].as_slice() != b"/fake/stop-exit" {
+			return Err(io::ErrorKind::NotFound.into());
+		}
+		Ok(Box::new(StopThenExit { stop_pending: true, waker: None }) as Box<dyn ExtProc>)
+	}));
+	let mut rig = Rig::new(host, skeleton_init(&[]));
+	let (shell, host, store) = rig.parts();
+	let src = b"set -m; { /fake/stop-exit; printf 'continued:%s\\n' \"$?\"; } & \
+		wait -f %1; printf 'joined:%s\\n' \"$?\"";
+	let run = shell.submit(Script::command(src.as_slice()));
+	let budget = Budget { max_ops: 1, max_ns: u64::MAX };
+	loop {
+		match advance_or_blocked(shell, host, store, run, budget) {
+			Stop::Done(status) => {
+				assert_eq!(status, 0);
+				break;
+			},
+			Stop::Yield => {},
+			Stop::Blocked => panic!("completed external left its job's remaining work blocked"),
+			Stop::Paused => panic!("host model unexpectedly paused the VM"),
+		}
+	}
+	assert_eq!(host.stdout.bytes(), b"continued:42\njoined:0\n");
 }
