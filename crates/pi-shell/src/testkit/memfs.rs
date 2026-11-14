@@ -352,9 +352,10 @@ const fn trim(path: &[u8]) -> &[u8] {
 
 /// A `Pending` answer that becomes ready on a timer thread.
 struct Delayed<T> {
-	res:   Option<io::Result<T>>,
-	ready: Arc<AtomicBool>,
-	waker: Arc<Mutex<Option<Waker>>>,
+	res:        Option<io::Result<T>>,
+	ready:      Arc<AtomicBool>,
+	waker:      Arc<Mutex<Option<Waker>>>,
+	first_poll: bool,
 }
 
 impl<T> Delayed<T> {
@@ -370,17 +371,22 @@ impl<T> Delayed<T> {
 				waker.wake();
 			}
 		});
-		Self { res: Some(res), ready, waker }
+		Self { res: Some(res), ready, waker, first_poll: true }
 	}
 }
 
 impl<T: Send> FsPending<T> for Delayed<T> {
 	fn poll(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<T>> {
+		let first_poll = std::mem::take(&mut self.first_poll);
 		if !self.ready.load(Ordering::Acquire) {
 			*self.waker.lock() = Some(cx.waker().clone());
 			if !self.ready.load(Ordering::Acquire) {
 				return Poll::Pending;
 			}
+		}
+		if first_poll {
+			cx.waker().wake_by_ref();
+			return Poll::Pending;
 		}
 		Poll::Ready(
 			self
@@ -869,6 +875,36 @@ mod tests {
 				}
 			},
 		}
+	}
+
+	#[test]
+	fn a_pending_answer_yields_and_wakes_when_already_ready() {
+		struct Notified(AtomicBool);
+
+		impl Wake for Notified {
+			fn wake(self: Arc<Self>) {
+				self.0.store(true, Ordering::Release);
+			}
+		}
+
+		let notified = Arc::new(Notified(AtomicBool::new(false)));
+		let waker = Waker::from(Arc::clone(&notified));
+		let mut cx = Context::from_waker(&waker);
+		let mut pending = Delayed::start(Ok(37_u32), 0);
+		pending.ready.store(true, Ordering::Release);
+
+		let first = pending.poll(&mut cx);
+		assert!(
+			matches!(first, Poll::Pending),
+			"an already-ready pending answer must yield before completion, got {first:?}"
+		);
+		assert!(notified.0.load(Ordering::Acquire), "a pending poll must notify its consumer");
+
+		let next = pending.poll(&mut cx);
+		assert!(
+			matches!(next, Poll::Ready(Ok(37))),
+			"the next poll must deliver the original result, got {next:?}"
+		);
 	}
 
 	#[test]

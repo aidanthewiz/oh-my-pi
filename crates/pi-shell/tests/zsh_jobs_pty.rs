@@ -70,13 +70,23 @@ fn both(
 	drive: impl Fn(&mut Pty) -> io::Result<()>,
 ) -> io::Result<(Vec<String>, Option<Vec<String>>)> {
 	let mut ours = shell(false)?;
-	drive(&mut ours)?;
+	drive(&mut ours).inspect_err(|_| {
+		let _ = io::Write::write_all(
+			&mut io::stderr().lock(),
+			b"zsh_jobs_pty: obash-as-zsh drive failed\n",
+		);
+	})?;
 	let ours = job_lines(&ours.output());
 	if !have_real_zsh() {
 		return Ok((ours, None));
 	}
 	let mut real = shell(true)?;
-	drive(&mut real)?;
+	drive(&mut real).inspect_err(|_| {
+		let _ = io::Write::write_all(
+			&mut io::stderr().lock(),
+			b"zsh_jobs_pty: real-/bin/zsh drive failed\n",
+		);
+	})?;
 	Ok((ours, Some(job_lines(&real.output()))))
 }
 

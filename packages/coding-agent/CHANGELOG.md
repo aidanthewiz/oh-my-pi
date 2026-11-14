@@ -16,6 +16,8 @@
 
 ### Fixed
 
+- Keep injected pending filesystem operations pending for their first poll, even when their latency timer is already ready.
+- Label differential job-control drive failures with their actual shell arm while preserving the original error.
 - Await native tab-worker closure and thread teardown before replacing a worker or releasing its browser resources.
 - Align failed-startup worker fixtures with close completion while preserving durable owned-target cleanup.
 - Keep async-job fixture manager proxies alive through invalidation and admitted persistence drains.
