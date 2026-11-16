@@ -30,6 +30,7 @@ import {
 	fetchResourceMetadataScopes,
 	type OAuthEndpoints,
 	preserveOAuthDiscoveryHints,
+	validateOAuthResourceMetadataUrl,
 } from "./oauth-discovery";
 import {
 	hasMcpAuthorizationHeader,
@@ -513,6 +514,11 @@ export async function resolveMcpOAuthEndpointsFromServer(
 				: `stdio servers manage their own credentials, so OMP has no OAuth to reauthorize. If the service supports OAuth over HTTP, configure it as ${httpHint} instead.`,
 		);
 	}
+	const metadataError = validateOAuthResourceMetadataUrl(config.oauth?.resourceMetadataUrl);
+	if (metadataError) throw new Error(metadataError);
+	const configuredMetadataUrl =
+		config.oauth?.resourceMetadataUrl === undefined ? undefined : new URL(config.oauth.resourceMetadataUrl).href;
+
 	let connectionSucceeded = false;
 	let connectionError: Error | undefined;
 	try {
@@ -534,9 +540,15 @@ export async function resolveMcpOAuthEndpointsFromServer(
 	if (connectionSucceeded && !opts.authChallenge) {
 		const discovered =
 			"url" in config && config.url
-				? await discoverOAuthEndpoints(config.url, undefined, undefined, { signal: opts.signal })
+				? await discoverOAuthEndpoints(config.url, undefined, configuredMetadataUrl, {
+						signal: opts.signal,
+						requireResourceMetadata: configuredMetadataUrl !== undefined,
+					})
 				: null;
 		if (!discovered) {
+			if (configuredMetadataUrl !== undefined) {
+				throw new Error("Could not discover OAuth endpoints from configured resource metadata.");
+			}
 			throw new McpReauthRefusalError("Server connection succeeded without OAuth; reauthorization is not required.");
 		}
 		return discovered;
@@ -550,18 +562,19 @@ export async function resolveMcpOAuthEndpointsFromServer(
 		: connectionError!;
 	if (opts.authChallenge && connectionError) preserveOAuthDiscoveryHints(authError, connectionError);
 	const authResult = analyzeAuthError(authError, "url" in config ? config.url : undefined);
-	let oauth = authResult.authType === "oauth" ? (authResult.oauth ?? null) : null;
+	const resourceMetadataUrl = configuredMetadataUrl ?? authResult.resourceMetadataUrl;
+	let oauth = !configuredMetadataUrl && authResult.authType === "oauth" ? (authResult.oauth ?? null) : null;
 
 	if (!oauth && (config.type === "http" || config.type === "sse") && config.url) {
-		oauth = await discoverOAuthEndpoints(config.url, authResult.authServerUrl, authResult.resourceMetadataUrl, {
+		oauth = await discoverOAuthEndpoints(config.url, authResult.authServerUrl, resourceMetadataUrl, {
 			protectedScopes: authResult.scopes,
 			signal: opts.signal,
+			requireResourceMetadata: configuredMetadataUrl !== undefined,
 		});
 	}
-	if (oauth && !oauth.scopes && authResult.resourceMetadataUrl) {
-		// JSON-error-body path skips `discoverOAuthEndpoints`; fetch the
-		// advertised protected-resource metadata for the required scopes.
-		const scopes = await fetchResourceMetadataScopes(authResult.resourceMetadataUrl, { signal: opts.signal });
+	if (oauth && config.oauth?.scope === undefined && !oauth.scopes && resourceMetadataUrl) {
+		// JSON-error-body endpoints may omit scopes advertised by the resource.
+		const scopes = await fetchResourceMetadataScopes(resourceMetadataUrl, { signal: opts.signal });
 		if (scopes) oauth = { ...oauth, scopes };
 	}
 
@@ -591,6 +604,7 @@ export interface McpOAuthFlowRunOptions extends McpOAuthFlowPresentation {
 	clientSecret: string;
 	clientName?: string;
 	scopes: string;
+	overrideScopes?: boolean;
 	serverUrl?: string;
 	registrationUrl?: string;
 	issuerUrl?: string;
@@ -709,6 +723,7 @@ export async function runMcpOAuthFlow(opts: McpOAuthFlowRunOptions): Promise<OAu
 				clientId: resolvedClientId,
 				clientSecret: resolvedClientSecret,
 				scopes: opts.scopes || undefined,
+				overrideScopes: opts.overrideScopes,
 				prompt: opts.prompt,
 				redirectUri: opts.redirectUri,
 				callbackPort: opts.callbackPort,
@@ -1043,6 +1058,7 @@ export async function reauthorizeMcpServer(
 			await updateMCPServer(found.filePath, name, updatedConfig, {
 				expectedConfig: found.discovered ? undefined : found.config,
 				assertCurrent: assertCommitCurrent,
+				sourceLevel: configLevel,
 			});
 		}
 		assertCommitCurrent();
@@ -1061,7 +1077,8 @@ export async function reauthorizeMcpServer(
 		clientId: flowClientId,
 		clientName: runtimeBaseConfig.oauth?.clientName,
 		clientSecret: flowClientSecret,
-		scopes: oauth.scopes || runtimeBaseConfig.oauth?.scope || "",
+		scopes: runtimeBaseConfig.oauth?.scope ?? oauth.scopes ?? "",
+		overrideScopes: runtimeBaseConfig.oauth?.scope !== undefined,
 		callbackPort: runtimeBaseConfig.oauth?.callbackPort,
 		callbackPath: runtimeBaseConfig.oauth?.callbackPath,
 		redirectUri: runtimeBaseConfig.oauth?.redirectUri,
