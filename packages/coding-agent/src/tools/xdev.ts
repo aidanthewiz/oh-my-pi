@@ -143,7 +143,7 @@ function renderDocs(inst: Tool, heading = "#", descriptionCap?: number): string 
  * Content is a model-written payload, so lenience strips forged
  * `__parseError`/`__rawJson` sentinels (see `validateAgentToolArguments`).
  */
-function parseDeviceArgs(
+export function parseDeviceArgs(
 	device: Tool,
 	content: string,
 	toolCallId: string,

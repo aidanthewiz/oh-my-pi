@@ -47,6 +47,43 @@ export interface AwsSecretInputWorkerProcessDependencies {
 	spawn?: (command: string[], options: AwsSecretInputWorkerSpawnOptions) => OwnedWorker;
 	beforeDirectoryRemoval?: (directory: string) => void | Promise<void>;
 }
+async function reapOwnedConsumer(anchor: Process): Promise<boolean> {
+	let reaped = true;
+	try {
+		if (anchor.status() === ProcessStatus.Running)
+			reaped = await anchor.terminate({ group: true, gracefulMs: -1, timeoutMs: 5_000 });
+	} catch {
+		reaped = false;
+	}
+	try {
+		if (!(await anchor.waitForExit({ timeoutMs: 5_000 }))) reaped = false;
+	} catch {
+		reaped = false;
+	}
+	return reaped;
+}
+
+async function reapOwnedConsumerScope(guardian: Process, receiver: Process | undefined): Promise<boolean> {
+	let reaped = true;
+	let guardianExited = false;
+	try {
+		// Receiver group termination also kills the guardian.
+		guardianExited = await guardian.waitForExit({ timeoutMs: 5_000 });
+	} catch {
+		reaped = false;
+	}
+	if (!guardianExited) {
+		if (!(await reapOwnedConsumer(guardian))) reaped = false;
+		try {
+			guardianExited = guardian.status() === ProcessStatus.Exited;
+		} catch {
+			reaped = false;
+		}
+	}
+	if (receiver && (!guardianExited || !(await reapOwnedConsumer(receiver)))) reaped = false;
+	return reaped;
+}
+
 async function workerOperation(
 	request: AwsSecretInputRequest | undefined,
 	launch: AwsSecretInputLaunchFiles | undefined,
@@ -74,8 +111,11 @@ async function workerOperation(
 	let child: OwnedWorker | undefined;
 	let worker: Process | undefined;
 	let consumer: Process | undefined;
+	let receiver: Process | undefined;
 	let settled = false;
 	let compatible = false;
+	let runDispatched = false;
+	let workerOutcomeReceived = false;
 	let authorizing = false;
 	let lastAuthorization = 0;
 	let consumerStarted = false;
@@ -90,9 +130,11 @@ async function workerOperation(
 		child.send(message);
 	};
 	const fail = (code: AwsSecretInputFailureCode): void => {
+		if (code === "WORKER_FAILED") cleanupFailed = true;
 		if (settled) return;
 		settled = true;
-		reject(new AwsSecretInputFailure(code));
+		failure = new AwsSecretInputFailure(code);
+		reject(failure);
 	};
 	const stop = (code: "CANCELLED" | "TIMEOUT"): void => {
 		if (cancellation) return;
@@ -100,7 +142,7 @@ async function workerOperation(
 		try {
 			send({ type: "stop" });
 		} catch {
-			fail(code);
+			fail(runDispatched ? "WORKER_FAILED" : code);
 		}
 		escalation = setTimeout(() => fail(code), 5_000);
 	};
@@ -131,12 +173,18 @@ async function workerOperation(
 			detached: true,
 			windowsHide: true,
 			ipc(data: unknown) {
-				if (settled) return;
 				try {
 					assertAwsSecretInputPlainData(data);
 					if (!data || typeof data !== "object" || Array.isArray(data))
 						throw new AwsSecretInputFailure("UNSAFE_OUTPUT");
 					const message = data as AwsSecretInputWorkerOutbound;
+					if (message.type === "failure" && Object.keys(message).length === 2) {
+						workerOutcomeReceived = true;
+						const code = workerFailureCode(message.code);
+						fail(code === "WORKER_FAILED" ? code : (cancellation ?? code));
+						return;
+					}
+					if (settled) return;
 					if (message.type === "capabilities") {
 						if (compatible) throw new AwsSecretInputFailure("UNSAFE_OUTPUT");
 						if (
@@ -152,9 +200,10 @@ async function workerOperation(
 						}
 						if (!worker || worker.ppid !== process.pid || worker.groupId() !== child?.pid)
 							throw new AwsSecretInputFailure("CAPABILITY_INCOMPATIBLE");
-						if (request && launch && directory)
+						if (request && launch && directory) {
+							runDispatched = true;
 							send({ type: "run", request, launch: { ...launch, runtimeDirectory: directory } });
-						else {
+						} else {
 							settled = true;
 							resolve(message.value);
 							send({ type: "stop" });
@@ -265,10 +314,15 @@ async function workerOperation(
 						const anchor = Process.fromPid(message.pid);
 						if (!anchor || anchor.ppid !== child.pid || anchor.groupId() !== message.groupId)
 							throw new AwsSecretInputFailure("UNSAFE_OUTPUT");
-						const receiver = message.receiverPid === null ? undefined : Process.fromPid(message.receiverPid);
-						if (receiver && (receiver.ppid !== anchor.pid || receiver.groupId() !== message.groupId))
+						const receiverAnchor =
+							message.receiverPid === null ? undefined : Process.fromPid(message.receiverPid);
+						if (
+							receiverAnchor &&
+							(receiverAnchor.ppid !== anchor.pid || receiverAnchor.groupId() !== message.groupId)
+						)
 							throw new AwsSecretInputFailure("UNSAFE_OUTPUT");
 						consumer = anchor;
+						receiver = receiverAnchor ?? undefined;
 						consumerStarted = true;
 						send({ type: "consumer-registered" });
 						return;
@@ -283,13 +337,10 @@ async function workerOperation(
 							Object.keys(message).length !== 2
 						)
 							throw new AwsSecretInputFailure("UNSAFE_OUTPUT");
+						workerOutcomeReceived = true;
 						assertAwsSecretInputResult(message.value, false);
 						settled = true;
 						resolve(message.value);
-						return;
-					}
-					if (message.type === "failure" && Object.keys(message).length === 2) {
-						fail(cancellation ?? workerFailureCode(message.code));
 						return;
 					}
 					throw new AwsSecretInputFailure("UNSAFE_OUTPUT");
@@ -300,7 +351,19 @@ async function workerOperation(
 			},
 			onExit() {
 				finished = true;
-				if (!settled) fail(cancellation ?? (compatible ? "WORKER_FAILED" : "CAPABILITY_INCOMPATIBLE"));
+				if (
+					!settled ||
+					(runDispatched &&
+						!workerOutcomeReceived &&
+						(failure?.code === "CANCELLED" || failure?.code === "TIMEOUT"))
+				)
+					fail(
+						cancellation && !runDispatched
+							? cancellation
+							: compatible
+								? "WORKER_FAILED"
+								: "CAPABILITY_INCOMPATIBLE",
+					);
 			},
 		});
 		worker = Process.fromPid(child.pid) ?? undefined;
@@ -318,20 +381,10 @@ async function workerOperation(
 		if (child && !finished) {
 			const exited = await Promise.race([child.exited.then(() => true), Bun.sleep(5_000).then(() => false)]);
 			if (!exited) {
-				try {
-					if (consumer) {
-						const stopped = await consumer.terminate({ group: true, gracefulMs: -1, timeoutMs: 5_000 });
-						if (!stopped && consumer.status() !== ProcessStatus.Exited) cleanupFailed = true;
-					}
-				} catch {
-					cleanupFailed = true;
-				}
+				if (consumer && !(await reapOwnedConsumerScope(consumer, receiver))) cleanupFailed = true;
 				try {
 					if (worker) {
-						if (
-							!(await worker.terminate({ group: true, gracefulMs: -1, timeoutMs: 5_000 })) &&
-							worker.status() !== ProcessStatus.Exited
-						)
+						if (!(await worker.terminate({ group: true, gracefulMs: -1, timeoutMs: 5_000 })))
 							cleanupFailed = true;
 					} else child.kill("SIGKILL");
 				} catch {
@@ -339,15 +392,7 @@ async function workerOperation(
 				}
 			}
 		}
-		if (consumer) {
-			try {
-				if (consumer.status() === ProcessStatus.Running)
-					await consumer.terminate({ group: true, gracefulMs: -1, timeoutMs: 5_000 });
-				if (!(await consumer.waitForExit({ timeoutMs: 5_000 }))) cleanupFailed = true;
-			} catch {
-				cleanupFailed = true;
-			}
-		}
+		if (consumer && !(await reapOwnedConsumerScope(consumer, receiver))) cleanupFailed = true;
 		if (child) {
 			try {
 				await child.exited;
@@ -356,6 +401,7 @@ async function workerOperation(
 			}
 		}
 		consumer = undefined;
+		receiver = undefined;
 		worker = undefined;
 		child = undefined;
 		if (directory) {

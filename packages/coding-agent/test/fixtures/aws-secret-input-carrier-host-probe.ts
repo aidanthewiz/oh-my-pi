@@ -135,6 +135,7 @@ async function run(root: string, language: "js" | "py") {
 		"eval.autoBackground.enabled": false,
 		"python.interpreter": process.env.CARRIER_PYTHON ?? "",
 		"tools.xdev": true,
+		"edit.mode": "hashline",
 		"tools.approvalMode": "yolo",
 		"approval.notify": "off",
 		"tools.approval": { aws: "allow", bash: "allow" },
@@ -333,7 +334,7 @@ async function run(root: string, language: "js" | "py") {
 				enableLsp: false,
 				enableIrc: false,
 				skipPythonPreflight: true,
-				toolNames: ["aws", "eval", "read", "write"],
+				toolNames: ["aws", "edit", "eval", "read", "write"],
 				mountedToolNames: ["aws"],
 				requireYieldTool: false,
 				preloadedCustomToolPaths: [],
@@ -416,6 +417,40 @@ async function run(root: string, language: "js" | "py") {
 			active.add(pending);
 			void pending.finally(() => active.delete(pending)).catch(() => {});
 			return { id, pending };
+		};
+		const capabilityRoutes: {
+			stage: string;
+			capability: typeof AWS_SECRET_INPUT_CAPABILITY | null;
+			protectedActivity: Omit<typeof counts, "probeWorker">;
+		}[] = [];
+		const probeCapability = async (name: string, tool: string, args: Record<string, unknown>) => {
+			stage = name;
+			const before = { ...counts };
+			let discovered: typeof AWS_SECRET_INPUT_CAPABILITY | null = null;
+			try {
+				const turn = dispatch(tool, args);
+				await turn.pending;
+				const result = results.get(turn.id);
+				proof(result && result.isError !== true);
+				const value = response(result);
+				assertAwsSecretInputCapability(value);
+				discovered = value;
+			} catch {}
+			capabilityRoutes.push({
+				stage: name,
+				capability: discovered,
+				protectedActivity: {
+					ui: counts.ui - before.ui,
+					launch: counts.launch - before.launch,
+					runWorker: counts.runWorker - before.runWorker,
+					providerFiles: counts.providerFiles - before.providerFiles,
+					providerClients: counts.providerClients - before.providerClients,
+					providerRequests: counts.providerRequests - before.providerRequests,
+					providerDestroyed: counts.providerDestroyed - before.providerDestroyed,
+					receiver: counts.receiver - before.receiver,
+					cleanupComplete: counts.cleanupComplete - before.cleanupComplete,
+				},
+			});
 		};
 		for (const [kind, args] of [
 			["transfer", request],
@@ -510,6 +545,19 @@ async function run(root: string, language: "js" | "py") {
 		const discoveredCapability = response(capabilityResult);
 		assertAwsSecretInputCapability(discoveredCapability);
 		proof(Bun.deepEquals(counts, { ...beforeCapability, probeWorker: counts.probeWorker }));
+		await probeCapability("native-hashline-content-capability", "write", {
+			path: "xd://aws",
+			content: JSON.stringify(capabilityRequest, null, 2)
+				.split("\n")
+				.map((line, index) => `${index + 1}:${line}`)
+				.join("\n"),
+		});
+		await probeCapability(
+			"native-inner-intent-capability",
+			"write",
+			writeArgs({ ...capabilityRequest, i: "Checking synthetic AWS capability" }),
+		);
+		await probeCapability("native-mounted-aws-capability", "aws", capabilityRequest);
 
 		stage = "native-approved-result";
 		captureStale = async () => {
@@ -615,8 +663,9 @@ async function run(root: string, language: "js" | "py") {
 		hold = undefined;
 
 		stage = "native-direct-presentation";
-		await live.setActiveToolPresentation(["aws", "eval", "read", "write"], []);
+		await live.setActiveToolPresentation(["aws", "edit", "eval", "read", "write"], []);
 		proof(live.agent.state.tools.some(tool => tool.name === "aws"));
+		await probeCapability("native-top-level-write-capability", "write", writeArgs(capabilityRequest));
 		await rejectPreflight("aws");
 		stage = "native-direct-approved-result";
 		const directResultHook: CarrierResultHook = {
@@ -666,6 +715,7 @@ async function run(root: string, language: "js" | "py") {
 			counts,
 			native: {
 				capability: discoveredCapability,
+				capabilityRoutes,
 				stdout: approvedResponse.result.stdout,
 				directStdout: directResponse.result.stdout,
 				resultHandlers: { write: writeResultHook.completed, aws: directResultHook.completed },

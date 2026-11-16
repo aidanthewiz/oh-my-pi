@@ -9,6 +9,13 @@ import { Process } from "@oh-my-pi/pi-natives";
 import type { Subprocess } from "bun";
 import { TempDir } from "./temp";
 
+export class OwnedInputError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "OwnedInputError";
+	}
+}
+
 export interface OwnedInputIdentity {
 	pid: number;
 	groupId: number;
@@ -422,7 +429,7 @@ export class OwnedInputSupervisor {
 			typeof descriptors[5] !== "number"
 		) {
 			void this.#fail("PTREE_OWNED_INPUT_UNSUPPORTED");
-			throw new Error("PTREE_OWNED_INPUT_UNSUPPORTED");
+			throw new OwnedInputError("PTREE_OWNED_INPUT_UNSUPPORTED");
 		}
 		// Bun adopts connected descriptors through connect({ fd }), outside Node's typed options.
 		this.#out = connect({ fd: descriptors[3] } as NetConnectOpts);
@@ -523,7 +530,7 @@ export class OwnedInputSupervisor {
 	}
 
 	#send(message: unknown): void {
-		if (!this.#control || this.#control.destroyed) throw new Error("PTREE_OWNED_INPUT_OWNERSHIP_LOST");
+		if (!this.#control || this.#control.destroyed) throw new OwnedInputError("PTREE_OWNED_INPUT_OWNERSHIP_LOST");
 		this.#control.write(`${JSON.stringify(message)}\n`);
 	}
 
@@ -580,7 +587,7 @@ export class OwnedInputSupervisor {
 		try {
 			this.#removeStartupDirectory();
 		} catch {}
-		const error = new Error(code);
+		const error = new OwnedInputError(code);
 		this.#ready.reject(error);
 		this.#started.reject(error);
 		this.#finished.reject(error);

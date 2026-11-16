@@ -87,7 +87,7 @@ import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { ToolAbortError } from "./tool-errors";
 import { toolResult } from "./tool-result";
 import { maybeWriteSnapshotHeader, stripWriteContent } from "./write-content";
-import { resolveXdevTool } from "./xdev";
+import { parseDeviceArgs, resolveXdevTool } from "./xdev";
 import { REPORT_ISSUE_DEVICE_NAME } from "@oh-my-pi/pi-tui/tools/report-tool-issue";
 import { isResolutionDeviceName } from "@oh-my-pi/pi-tui/tools/resolve";
 import { dispatchReportIssueDevice } from "./report-tool-issue";
@@ -606,25 +606,34 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 			return undefined;
 		}
 	};
-	async prepareRuntimeApproval(_toolCallId: string, args: unknown, signal?: AbortSignal): Promise<undefined> {
+	async prepareRuntimeApproval(toolCallId: string, args: unknown, signal?: AbortSignal): Promise<undefined> {
 		const input = args as Partial<WriteParams>;
 		if (typeof input.path !== "string" || typeof input.content !== "string") return undefined;
-		const url = InternalUrlRouter.instance().writeTarget(unwrapHashlineHeaderPath(input.path))?.url;
+		const router = InternalUrlRouter.instance();
+		const { path } = recoverConflictUriPrefix(
+			router.peelWriteSelector(unwrapHashlineHeaderPath(input.path), "write"),
+		);
+		const target = router.writeTarget(path);
+		const url = target?.url;
 		if (url?.protocol !== "xd:") return undefined;
 		const name = parseXdUrl(url.rawHref ?? url.href)?.name;
 		const inst = name && this.session.xdev ? resolveXdevTool(this.session.xdev, name) : undefined;
 		const prepare = (
 			inst as { prepareApprovalTier?: (args: unknown, signal?: AbortSignal) => Promise<void> } | undefined
 		)?.prepareApprovalTier;
-		if (!prepare) return undefined;
-		let parsed: unknown;
+		if (!inst || !prepare) return undefined;
+		const content =
+			target?.spec.write?.payload === "verbatim"
+				? input.content
+				: stripWriteContent(this.session, input.content).text;
+		let parsed: Record<string, unknown>;
 		try {
-			parsed = JSON.parse(input.content);
+			parsed = parseDeviceArgs(inst, content, toolCallId, () => "");
 		} catch {
 			return undefined;
 		}
 		// Resolve async device tiers before the outer synchronous xd:// approval gate.
-		if (isRecord(parsed)) await prepare.call(inst, parsed, signal);
+		await prepare.call(inst, parsed, signal);
 		return undefined;
 	}
 

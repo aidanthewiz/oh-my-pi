@@ -230,7 +230,13 @@ export async function runAwsSecretInputScope(
 					return dependencies.onConsumerSpawn?.(child);
 				},
 			});
-		} catch {
+		} catch (error) {
+			if (
+				error instanceof ptree.OwnedInputError ||
+				(error instanceof AwsSecretInputFailure && safeAwsSecretInputFailure(error) === "WORKER_FAILED") ||
+				(consumer && consumer.ownedInputCleanedUp !== true)
+			)
+				throw new AwsSecretInputFailure("WORKER_FAILED");
 			throw new AwsSecretInputFailure(
 				controller.signal.aborted ? (timedOut ? "TIMEOUT" : "CANCELLED") : "CONSUMER_FAILED",
 			);
@@ -250,16 +256,18 @@ export async function runAwsSecretInputScope(
 			teardown: { consumerReaped: true, referencesReleased: true },
 		};
 	} catch (error) {
+		const code = safeAwsSecretInputFailure(error);
 		failure = new AwsSecretInputFailure(
-			timedOut ? "TIMEOUT" : controller.signal.aborted ? "CANCELLED" : safeAwsSecretInputFailure(error),
+			code === "WORKER_FAILED" ? code : timedOut ? "TIMEOUT" : controller.signal.aborted ? "CANCELLED" : code,
 		);
 	} finally {
 		clearTimeout(timer);
 		signal.removeEventListener("abort", cancel);
-		if (consumer && consumer.proc.exitCode === null && consumer.proc.signalCode === null) {
-			consumer.kill(new ptree.AbortError("CANCELLED", ""), -1);
+		if (consumer && consumer.ownedInputCleanedUp !== true) {
 			try {
-				await consumer.wait({ allowAbort: true, allowNonZero: true, maxOutputBytes: 0 });
+				consumer.kill(new ptree.AbortError("CANCELLED", ""), -1);
+				const cleanup = await consumer.wait({ allowAbort: true, allowNonZero: true, maxOutputBytes: 0 });
+				if (cleanup.ownedInputCleanedUp !== true) failedCleanup = true;
 			} catch {
 				failedCleanup = true;
 			}

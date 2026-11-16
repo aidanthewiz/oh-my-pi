@@ -11,7 +11,7 @@ import { Process, type ProcessTerminateOptions } from "@oh-my-pi/pi-natives";
 import type { Spawn, Subprocess } from "bun";
 import { OwnedInputSupervisor, type OwnedInputIdentity } from "./ptree-owned-input";
 
-export { PTREE_OWNED_INPUT_SUPPORTED } from "./ptree-owned-input";
+export { OwnedInputError, PTREE_OWNED_INPUT_SUPPORTED } from "./ptree-owned-input";
 
 export const PTREE_EXEC_INPUT_POLICY = "finite-stdin-owned-process-group/v2";
 

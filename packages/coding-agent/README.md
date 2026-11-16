@@ -123,7 +123,7 @@ Only the receiver uses the approved working directory, environment, and argv.
 Stdin closes after the bounded input.
 Cancellation, timeout, and session disposal terminate and reap the owned consumer group and worker, close streams, and release owned references.
 An independent owned finite-input guardian handles worker SIGKILL or disconnect and receiver leader exit while foreground descendants or pipes remain.
-The intrinsic `await-cleanup` execution policy keeps admitted native invocations pending until owned teardown completes.
+The intrinsic `await-cleanup` policy keeps admitted native invocations pending until owned teardown completes or reports an ownership failure.
 There is no automatic retry or replacement.
 Interrupted writes may already have committed; uncertain completion does not imply rollback or retry safety.
 After worker execution starts, failures report `{ok:false,code,completion:"uncertain"}`; pre-run failures report only `{ok:false,code}`.
@@ -131,6 +131,9 @@ Successful `completion:"exited"` means process exit, not transaction atomicity o
 Consumers that deliberately daemonize or escape the owned process group are outside the cleanup guarantee.
 External forced termination of all independent owners and OS crashes also exceed that guarantee.
 Lost ownership does not establish successful teardown.
+Known receiver identities are recovered independently if the guardian exits.
+Unproved cleanup returns `WORKER_FAILED`, and the affected native handler rejects later handoffs.
+That error does not prove that every process exited.
 
 Audit evidence contains only non-secret request bindings and lifecycle metadata, never a secret payload hash.
 Provider and IPC errors expose fixed non-secret codes, not SDK diagnostic objects.

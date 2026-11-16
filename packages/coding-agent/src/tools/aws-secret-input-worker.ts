@@ -208,10 +208,11 @@ export async function startAwsSecretInputWorker(dependencies: AwsSecretInputScop
 				assertAwsSecretInputResult(result, false);
 				await send({ type: "result", value: result });
 			} catch (error) {
+				const code = safeAwsSecretInputFailure(error);
 				try {
 					await send({
 						type: "failure",
-						code: controller.signal.aborted ? "CANCELLED" : safeAwsSecretInputFailure(error),
+						code: code === "WORKER_FAILED" ? code : controller.signal.aborted ? "CANCELLED" : code,
 					});
 				} catch {}
 			} finally {

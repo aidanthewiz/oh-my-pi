@@ -162,6 +162,37 @@ for (const language of ["js", "py"] as const) {
 						expect(counts?.cleanupComplete).toBe(3);
 						const native = isRecord(summary?.native) ? summary.native : undefined;
 						expect(native?.capability).toEqual(AWS_SECRET_INPUT_CAPABILITY);
+						const capabilityRoutes = native?.capabilityRoutes;
+						expect(Array.isArray(capabilityRoutes)).toBe(true);
+						if (!Array.isArray(capabilityRoutes)) throw new Error("Missing native capability receipts");
+						expect(
+							capabilityRoutes.map(route => ({
+								stage: route.stage,
+								compatible: Bun.deepEquals(route.capability, AWS_SECRET_INPUT_CAPABILITY),
+								protectedActivity: route.protectedActivity,
+							})),
+						).toEqual(
+							[
+								"native-hashline-content-capability",
+								"native-inner-intent-capability",
+								"native-mounted-aws-capability",
+								"native-top-level-write-capability",
+							].map(stage => ({
+								stage,
+								compatible: true,
+								protectedActivity: {
+									ui: 0,
+									launch: 0,
+									runWorker: 0,
+									providerFiles: 0,
+									providerClients: 0,
+									providerRequests: 0,
+									providerDestroyed: 0,
+									receiver: 0,
+									cleanupComplete: 0,
+								},
+							})),
+						);
 						expect(native?.stdout).toBe("carrier-input-approved\n");
 						expect(native?.directStdout).toBe("carrier-input-approved\n");
 						expect(native?.resultHandlers).toEqual({ write: 1, aws: 1 });

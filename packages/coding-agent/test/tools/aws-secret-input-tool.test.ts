@@ -7,6 +7,7 @@ import { AwsTool } from "../../src/tools/aws";
 import {
 	AWS_SECRET_INPUT_CAPABILITY,
 	AWS_SECRET_INPUT_PROTOCOL,
+	AwsSecretInputFailure,
 	type AwsSecretInputCapability,
 	type AwsSecretInputCapabilityRequest,
 	type AwsSecretInputFailureCode,
@@ -15,6 +16,7 @@ import {
 	TOOL_EXECUTION_HOST_CAPABILITIES,
 	type ToolExecutionHostCapabilities,
 } from "../../src/tools/tool-execution-host";
+import { awsSecretInputLifecycleRequest } from "../fixtures/aws-secret-input-lifecycle-client";
 
 type Dependencies = NonNullable<ConstructorParameters<typeof AwsTool>[2]>;
 
@@ -27,6 +29,7 @@ function fixture(
 	options: {
 		configureSession?: (session: ToolSession) => void;
 		workerCapability?: unknown;
+		failFirstProbe?: boolean;
 	} = {},
 ) {
 	const settings = Settings.isolated({
@@ -76,6 +79,7 @@ function fixture(
 	const dependencies: Dependencies = {
 		probeWorker: async () => {
 			counts.probes++;
+			if (options.failFirstProbe && counts.probes === 1) throw new AwsSecretInputFailure("WORKER_FAILED");
 			return (options.workerCapability ?? AWS_SECRET_INPUT_CAPABILITY) as AwsSecretInputCapability;
 		},
 		launch: () => {
@@ -189,6 +193,21 @@ describe.skipIf(process.platform === "win32")("AWS secret input local host admis
 			}
 		});
 	}
+
+	it("rejects later secret approval and execution after a capability worker failure", async () => {
+		const current = fixture({ failFirstProbe: true });
+		const request = awsSecretInputLifecycleRequest(import.meta.dir);
+		try {
+			failure(await current.tool.execute("failed-capability-worker", capabilityRequest), "WORKER_FAILED");
+			await expect(current.tool.prepareRuntimeApproval("blocked-secret-approval", request)).rejects.toThrow(
+				"WORKER_FAILED",
+			);
+			failure(await current.tool.execute("blocked-secret-execution", request), "WORKER_FAILED");
+			expect(current.counts).toEqual({ probes: 1, launch: 0, workers: 0 });
+		} finally {
+			current.dispose();
+		}
+	});
 
 	for (const [name, workerCapability] of [
 		["protocol", { ...AWS_SECRET_INPUT_CAPABILITY, protocol: "aws-secret-input/v0" }],

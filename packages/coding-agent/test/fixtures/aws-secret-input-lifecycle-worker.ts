@@ -132,6 +132,11 @@ async function runWorker() {
 		process.send = new Proxy(originalSend, {
 			apply(target, receiver, args) {
 				observe(args[0]);
+				if (scenario === "pause-capabilities" && args[0]?.type === "capabilities" && control) {
+					control.send({ kind: "worker-capabilities-blocked", pid: process.pid });
+					void control.waitForCommand("release-capabilities").then(() => Reflect.apply(target, receiver, args));
+					return true;
+				}
 				if (scenario === "malformed-result-after-consumer" && args[0]?.type === "result") {
 					args[0] = { ...args[0], value: { ...args[0].value, cause: { message: LIFECYCLE_DIAGNOSTIC } } };
 				}

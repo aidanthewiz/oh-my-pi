@@ -459,7 +459,7 @@ describe.skipIf(process.platform === "win32")("AWS secret input real worker and 
 		}, 30_000);
 	}
 
-	test("maps a real consumer spawn error to a fixed code and releases provider references", async () => {
+	test("reports supervised receiver spawn failure without a cleanup acknowledgment as a worker failure", async () => {
 		await withBoundary("success", "text", async boundary => {
 			const request = normalizeAwsSecretInputRequest({
 				...boundary.request,
@@ -469,8 +469,20 @@ describe.skipIf(process.platform === "win32")("AWS secret input real worker and 
 				},
 			});
 			if ("action" in request) throw new Error("UNEXPECTED_CAPABILITY_REQUEST");
-			expectFixedFailure(await captureFailure(boundary.run(request)), "CONSUMER_FAILED");
+			expectFixedFailure(await captureFailure(boundary.run(request)), "WORKER_FAILED");
 			await expectWorkerDone(boundary, COMPLETE_COUNTS);
+			await expectQuiescent(boundary);
+		});
+	}, 30_000);
+
+	test("cancels an undispatched request without misreporting a worker ownership failure", async () => {
+		await withBoundary("pause-capabilities", "text", async boundary => {
+			const operation = boundary.run();
+			await boundary.control.waitForEvent("worker-capabilities-blocked");
+			boundary.controller.abort();
+			boundary.control.send("release-capabilities");
+			expectFixedFailure(await captureFailure(operation), "CANCELLED");
+			await expectWorkerDone(boundary, NO_PROVIDER_COUNTS);
 			await expectQuiescent(boundary);
 		});
 	}, 30_000);
@@ -546,18 +558,77 @@ describe.skipIf(process.platform === "win32")("AWS secret input real worker and 
 		}, 30_000);
 	}
 
-	for (const fault of ["disconnect", "kill"] as const) {
-		test(`unexpected worker ${fault} cannot orphan a ready receiver or its descendant`, async () => {
+	for (const [fault, abortAfterWorkerLoss] of [
+		["disconnect", false],
+		["kill", false],
+		["kill", true],
+	] as const) {
+		const cancellation = abortAfterWorkerLoss ? " racing cancellation" : "";
+		test(`unexpected worker ${fault}${cancellation} cannot orphan a ready receiver or its descendant`, async () => {
 			await withBoundary("success", "hold", async boundary => {
 				const operation = boundary.run();
 				await waitForAwsSecretInputLifecycleConsumerReady(boundary.control, boundary.workers);
 				if (fault === "disconnect") boundary.workers[0]!.disconnect();
 				else boundary.workers[0]!.kill("SIGKILL");
+				if (abortAfterWorkerLoss) boundary.controller.abort();
 				expectFixedFailure(await captureFailure(operation), "WORKER_FAILED");
 				if (fault === "disconnect") await expectWorkerDone(boundary, COMPLETE_COUNTS);
 				await expectQuiescent(boundary);
 			});
 		}, 30_000);
+	}
+
+	for (const abortAfterGuardianLoss of [false, true]) {
+		const cancellation = abortAfterGuardianLoss ? "racing cancellation" : "without cancellation";
+		test(`guardian-only SIGKILL ${cancellation} reaps the receiver and descendant and preserves ownership failure`, async () => {
+			await withBoundary("success", "hold", async boundary => {
+				const operation = boundary.run();
+				const ready = await waitForAwsSecretInputLifecycleConsumerReady(boundary.control, boundary.workers);
+				expect(boundary.workers.length).toBe(1);
+				expect(typeof ready.parentPid).toBe("number");
+				expect(typeof ready.pid).toBe("number");
+				expect(typeof ready.descendantPid).toBe("number");
+				const guardian = Process.fromPid(ready.parentPid as number);
+				const receiver = Process.fromPid(ready.pid!);
+				const descendant = Process.fromPid(ready.descendantPid!);
+				expect(guardian?.status()).toBe(ProcessStatus.Running);
+				expect(guardian?.ppid, "fault target was not the tracked synthetic worker's guardian").toBe(
+					boundary.workers[0]!.pid,
+				);
+				expect(guardian?.groupId()).toBe(guardian!.pid);
+				expect(receiver?.status()).toBe(ProcessStatus.Running);
+				expect(receiver?.ppid).toBe(guardian!.pid);
+				expect(receiver?.groupId()).toBe(guardian!.pid);
+				expect(descendant?.status()).toBe(ProcessStatus.Running);
+				expect(descendant?.ppid).toBe(receiver!.pid);
+				expect(descendant?.groupId()).toBe(guardian!.pid);
+
+				// Fake timers cannot bound real child-process exit notifications.
+				const deadline = Promise.withResolvers<never>();
+				const timer = setTimeout(
+					() => deadline.reject(new Error("AWS_SECRET_INPUT_LIFECYCLE_GUARDIAN_DISPOSITION_TIMEOUT")),
+					10_000,
+				);
+				let failure: unknown;
+				try {
+					process.kill(guardian!.pid, "SIGKILL");
+					if (abortAfterGuardianLoss) boundary.controller.abort();
+					failure = await Promise.race([captureFailure(operation), deadline.promise]);
+				} finally {
+					clearTimeout(timer);
+				}
+
+				expect(guardian!.status(), "positive control guardian survived SIGKILL").toBe(ProcessStatus.Exited);
+				expect(receiver!.status(), "guardian loss abandoned the ordinary owned receiver").toBe(
+					ProcessStatus.Exited,
+				);
+				expect(descendant!.status(), "guardian loss abandoned the ordinary owned descendant").toBe(
+					ProcessStatus.Exited,
+				);
+				expectFixedFailure(failure, "WORKER_FAILED");
+				await expectQuiescent(boundary);
+			});
+		}, 60_000);
 	}
 
 	test("worker failure still sweeps its owned group after the actual receiver has exited", async () => {

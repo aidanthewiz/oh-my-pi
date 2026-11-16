@@ -159,7 +159,7 @@ import {
 } from "./extensibility/skills";
 import { type FileSlashCommand, loadSlashCommands as loadSlashCommandsInternal } from "./extensibility/slash-commands";
 import type { HindsightSessionState } from "./hindsight/state";
-import { LocalProtocolHandler, type LocalProtocolOptions, outRepliesActive } from "./internal-urls";
+import { InternalUrlRouter, LocalProtocolHandler, type LocalProtocolOptions, outRepliesActive } from "./internal-urls";
 import { stripXdUrlPrefix } from "@oh-my-pi/pi-tui/tools/xd-url";
 import { holdSharedLsp } from "./lsp/client";
 import { LSP_STARTUP_EVENT_CHANNEL, type LspStartupEvent } from "./lsp/startup-events";
@@ -333,8 +333,11 @@ import { ToolContextStore } from "./tools/context";
 import { isIrcEnabled } from "./irc/messaging";
 import { imageGenTool } from "./tools/image-gen";
 import { wrapToolWithMetaNotice } from "./tools/output-meta";
+import { recoverConflictUriPrefix } from "./tools/conflict-detect";
 import { isFilesystemSourcePath } from "./tools/path-utils";
 import { unwrapHashlineHeaderPath } from "./tools/plan-mode-guard";
+import { stripWriteContent } from "./tools/write-content";
+import { parseDeviceArgs, resolveXdevTool } from "./tools/xdev";
 import { queueResolveHandler } from "./tools/resolve";
 import { USER_TODO_EDIT_CUSTOM_TYPE } from "./tools/todo";
 import { ttsTool } from "./tools/tts";
@@ -3036,16 +3039,25 @@ async function createAgentSessionScoped(
 					resolveToolCancellationBehavior(tool, args) !== "await-cleanup"
 				)
 					return undefined;
-				const direct = agent.state.tools.find(candidate => candidate.name === tool.name);
+				const direct =
+					agent.state.tools.find(candidate => candidate.name === tool.name) ??
+					(toolSession.xdev && resolveMountedXdevExecutable(toolSession.xdev, tool.name));
 				if (
 					direct &&
 					resolveToolCancellationBehavior(direct, args) === "await-cleanup" &&
 					Bun.deepEquals(getCleanupOwnedToolCallArgs(direct), args)
 				)
 					return TOOL_EXECUTION_HOST_CAPABILITIES;
-				const mounted = toolSession.xdev && resolveMountedXdevExecutable(toolSession.xdev, tool.name);
+				const target = toolSession.xdev && resolveXdevTool(toolSession.xdev, tool.name);
+				const executable =
+					target && toolSession.xdev ? (toolSession.xdev.decorateExecution?.(target) ?? target) : undefined;
 				const writer = agent.state.tools.find(candidate => candidate.name === "write");
-				if (!mounted || !writer || resolveToolCancellationBehavior(mounted, args) !== "await-cleanup")
+				if (
+					!target ||
+					!executable ||
+					!writer ||
+					resolveToolCancellationBehavior(executable, args) !== "await-cleanup"
+				)
 					return undefined;
 				const invocation = getCleanupOwnedToolCallArgs(writer);
 				if (
@@ -3053,16 +3065,24 @@ async function createAgentSessionScoped(
 					typeof invocation !== "object" ||
 					!("path" in invocation) ||
 					typeof invocation.path !== "string" ||
-					unwrapHashlineHeaderPath(invocation.path) !== `xd://${tool.name}` ||
 					!("content" in invocation) ||
 					typeof invocation.content !== "string" ||
 					resolveToolCancellationBehavior(writer, invocation) !== "await-cleanup"
 				)
 					return undefined;
 				try {
-					return Bun.deepEquals(JSON.parse(invocation.content), args)
-						? TOOL_EXECUTION_HOST_CAPABILITIES
-						: undefined;
+					const router = InternalUrlRouter.instance();
+					const { path } = recoverConflictUriPrefix(
+						router.peelWriteSelector(unwrapHashlineHeaderPath(invocation.path), "write"),
+					);
+					if (path !== `xd://${tool.name}`) return undefined;
+					const writeTarget = router.writeTarget(path);
+					const content =
+						writeTarget?.spec.write?.payload === "verbatim"
+							? invocation.content
+							: stripWriteContent(toolSession, invocation.content).text;
+					const normalized = parseDeviceArgs(target, content, "execution-capability", () => "");
+					return Bun.deepEquals(normalized, args) ? TOOL_EXECUTION_HOST_CAPABILITIES : undefined;
 				} catch {
 					return undefined;
 				}

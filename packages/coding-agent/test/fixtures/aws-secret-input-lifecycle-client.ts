@@ -54,6 +54,7 @@ function ownedWorkerState(worker: AwsSecretInputLifecycleWorker): OwnedWorkerSta
 }
 export type AwsSecretInputLifecycleWorkerScenario =
 	| "success"
+	| "pause-capabilities"
 	| "global-bun-preload"
 	| "pause-result"
 	| "binary"
