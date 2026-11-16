@@ -1677,6 +1677,49 @@ describe("ExtensionRunner", () => {
 	});
 
 	describe("tool_result chaining", () => {
+		it("isolates deferred completion observers and ignores outcome or context patches", async () => {
+			const observedPath = path.join(tempDir.path(), "deferred-observed.json");
+			fs.writeFileSync(
+				path.join(extensionsDir, "deferred-observers.ts"),
+				`
+				import { writeFileSync } from "node:fs";
+				export default function(pi) {
+					pi.on("tool_result", event => {
+						event.content[0].text = "tampered";
+						event.details.exitCode = 9;
+						event.isError = true;
+						return { content: event.content, isError: true, additionalContext: "must not enter a model turn" };
+					});
+					pi.on("tool_result", () => { throw new Error("observer failure"); });
+					pi.on("tool_result", event => writeFileSync(${JSON.stringify(observedPath)}, JSON.stringify(event)));
+				}
+			`,
+			);
+			const loaded = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				loaded.extensions,
+				loaded.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const event = {
+				type: "tool_result" as const,
+				toolName: "bash",
+				toolCallId: "async-original",
+				completion: "deferred" as const,
+				sessionId: "origin-session",
+				cwd: tempDir.path(),
+				input: { command: "gh pr create" },
+				content: [{ type: "text" as const, text: "https://github.com/example/repository/pull/3" }],
+				details: { exitCode: 0 },
+				isError: false,
+			};
+			expect(await runner.emitToolResult(event)).toBeUndefined();
+			expect(JSON.parse(fs.readFileSync(observedPath, "utf8"))).toEqual(event);
+			expect(event.isError).toBe(false);
+		});
+
 		it("chains content modifications across handlers", async () => {
 			const extCode1 = `
 				export default function(pi) {
