@@ -20,8 +20,9 @@
 - Keep session-owned OAuth account restrictions until deferred startup cleanup finishes.
 - Keep erased TypeScript type declarations out of legacy extension runtime graphs, including inline-only named imports and exports.
 - Preserve Bun's native loader for attributed imports, mixed module/file use and package self-exports. Select dynamic import loaders at runtime without losing ordinary dependency remapping, CommonJS identity or reload behavior.
-- Prepare only newly activated extension closures. Preserve cached module state and identity across unrelated source edits, and isolate failed activation.
+- Preserve evaluated extension identities during lazy graph activation. Refresh only reachable, unconsumed frontiers when cached entries load again.
 - Preserve module- and parameter-scoped bindings in rewritten dynamic imports.
+- Keep hashbangs first for LF, CRLF, CR, U+2028 and U+2029 source.
 - Enable native WebMCP directly for current Chrome versions and managed Chrome for Testing.
 - Synchronize shell TERM-output qualification with a child release gate and controlled cancellation deadlines instead of wall-clock sleeps.
 - Synchronize session lease race qualification with an observed held lease before racing claims and probes.

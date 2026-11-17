@@ -592,4 +592,113 @@ assert.equal((await loaded.after({})).default.token, cached.token);
 			await runConsumer(fixture, program);
 		}
 	});
+
+	it.each(["mjs", "cjs"] as const)(
+		"refreshes reachable unconsumed %s helpers on repeated nonreloading entry loads",
+		async extension => {
+			const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "omp-cold-helper-refresh-")));
+			roots.push(root);
+			for (const mode of ["native", "legacy"] as const) {
+				const fixture = path.join(root, mode);
+				for (const directory of [fixture, path.join(fixture, "home"), path.join(fixture, "tmp")]) {
+					fs.mkdirSync(directory);
+				}
+				fs.writeFileSync(path.join(fixture, "package.json"), '{"type":"module"}');
+				const cold = path.join(fixture, `cold.${extension}`);
+				const fresh = path.join(fixture, `fresh.${extension}`);
+				const orphan = path.join(fixture, `orphan.${extension}`);
+				fs.writeFileSync(orphan, extension === "mjs" ? "export const obsolete = 1;" : "module.exports = 1;");
+				const counter = "globalThis.__ownedColdLoads = (globalThis.__ownedColdLoads ?? 0) + 1;";
+				fs.writeFileSync(
+					cold,
+					counter +
+						(extension === "mjs"
+							? 'import "./orphan.mjs"; export default 1;'
+							: 'require("./orphan.cjs"); module.exports = 1;'),
+				);
+				const required = `require("./cold.${extension}")${extension === "mjs" ? ".default" : ""}`;
+				fs.writeFileSync(path.join(fixture, "optional.cjs"), `module.exports = { read: () => ${required} };`);
+				fs.writeFileSync(path.join(fixture, "late.cjs"), `module.exports = ${required};`);
+				const warm = path.join(fixture, "warm.mjs");
+				fs.writeFileSync(warm, "let uses = 0; export default { next: () => ++uses };");
+				const entry = path.join(fixture, "entry.mjs");
+				fs.writeFileSync(
+					entry,
+					'import optional from "./optional.cjs"; import warm from "./warm.mjs"; export { optional, warm }; export const late = options => import("./late.cjs", options);',
+				);
+				const nextSource =
+					counter +
+					(extension === "mjs"
+						? 'import { value } from "./fresh.mjs"; export default value;'
+						: 'module.exports = require("./fresh.cjs");');
+				const program = path.join(fixture, "consumer.mjs");
+				fs.writeFileSync(
+					program,
+					`
+import assert from "node:assert/strict";
+import fs from "node:fs";
+globalThis.fetch = Object.assign(async () => { throw Error("Owned cold-helper consumer refuses network"); }, { preconnect() { throw Error("Owned cold-helper consumer refuses network"); } });
+const entry = ${JSON.stringify(entry)};
+const loadEntry = async () => ${mode === "native" ? "await import(entry)" : `await (await import(${JSON.stringify(loaderUrl)})).loadLegacyPiModule(entry, { reload: false })`};
+const loaded = await loadEntry();
+assert.equal(loaded.warm.next(), 1);
+assert.equal(globalThis.__ownedColdLoads ?? 0, 0);
+fs.writeFileSync(${JSON.stringify(cold)}, ${JSON.stringify(nextSource)});
+fs.writeFileSync(${JSON.stringify(fresh)}, ${JSON.stringify(extension === "mjs" ? "export const value = 2;" : "module.exports = 2;")});
+fs.writeFileSync(${JSON.stringify(orphan)}, ${JSON.stringify(extension === "mjs" ? "export const = ;" : "module.exports = ;")});
+fs.writeFileSync(${JSON.stringify(warm)}, "export const = ;");
+const repeated = await loadEntry();
+assert.equal(repeated, loaded);
+assert.equal(repeated.warm.next(), 2);
+assert.equal(globalThis.__ownedColdLoads ?? 0, 0);
+assert.equal((await repeated.late({})).default, 2);
+assert.equal(globalThis.__ownedColdLoads, 1);
+assert.equal(repeated.optional.read(), 2);
+assert.equal(globalThis.__ownedColdLoads, 1);
+assert.equal(repeated.warm.next(), 3);
+`,
+				);
+				await runConsumer(fixture, program);
+			}
+		},
+	);
+
+	it.each([
+		["LF", "\n"],
+		["CRLF", "\r\n"],
+		["CR", "\r"],
+		["LS", "\u2028"],
+		["PS", "\u2029"],
+	] as const)("preserves native %s hashbang termination with lexical bridge bindings", async (_name, terminator) => {
+		const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "omp-hashbang-bridge-")));
+		roots.push(root);
+		for (const mode of ["native", "legacy"] as const) {
+			const fixture = path.join(root, mode);
+			for (const directory of [fixture, path.join(fixture, "home"), path.join(fixture, "tmp")]) {
+				fs.mkdirSync(directory);
+			}
+			fs.writeFileSync(path.join(fixture, "package.json"), '{"type":"module"}');
+			const helper = path.join(fixture, "helper.mjs");
+			fs.writeFileSync(helper, "export default 42;");
+			const entry = path.join(fixture, "entry.mjs");
+			fs.writeFileSync(
+				entry,
+				`#!/usr/bin/env bun${terminator}const globalThis = {}; const __ompLegacyPiImportWithOptions = null; export const load = (options, globalThis = {}) => import("./helper.mjs", options);`,
+			);
+			const program = path.join(fixture, "consumer.mjs");
+			fs.writeFileSync(
+				program,
+				`
+import assert from "node:assert/strict";
+import fs from "node:fs";
+globalThis.fetch = Object.assign(async () => { throw Error("Owned hashbang consumer refuses network"); }, { preconnect() { throw Error("Owned hashbang consumer refuses network"); } });
+const entry = ${JSON.stringify(entry)};
+const loaded = ${mode === "native" ? "await import(entry)" : `await (await import(${JSON.stringify(loaderUrl)})).loadLegacyPiModule(entry)`};
+assert.equal((await loaded.load({})).default, 42);
+assert.equal(fs.realpathSync((await loaded.load({ with: { type: "file" } })).default), ${JSON.stringify(helper)});
+`,
+			);
+			await runConsumer(fixture, program);
+		}
+	});
 });
