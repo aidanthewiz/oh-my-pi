@@ -18,6 +18,12 @@ omp downloads agy from Google's release manifests, checks SHA-512, and keeps ver
 
 Login exports the resulting OAuth grant into omp's credential store so normal refresh and broker distribution can manage it. The ACP child uses a private, account-scoped native credential file rather than modifying your ordinary agy login. A child-only headless-auth environment selects agy's file storage. Do not copy access tokens into `--api-key`: the transport expects the structured OAuth credential produced by login.
 
+Staged access and refresh tokens belong to active ACP transports, not durable storage. Cleanup waits for startup settlement and actual process exit. Overlapping hosts retain their account's file until the final owner exits.
+
+Account removal drains this runtime's exact-account hosts before deleting the stored credential. If another runtime still owns the account, removal fails without deleting that credential. Close that runtime and retry logout; logout does not revoke or terminate foreign processes.
+
+Removal fences delayed staging attempts before changing durable storage. Filesystem or storage failures remain visible and keep staging closed. Only a successfully saved explicit login reopens that account; refreshes and ordinary credential updates cannot reopen it.
+
 omp supplies the system prompt and tool schemas through ACP and an IDE MCP bridge. Tool names remain bare in omp; agy presents them to the model as `mcp_ide-tools_<name>`. The built-in agent prompt and coding tools are removed, but agy's `manage_task` and MCP resource tools remain internal to agy. Tool execution and approvals for the supplied tools stay with omp.
 
 The transport retains agy's conversation between model steps, including while omp executes a tool. Edits, branches and changed context restore a matching saved turn boundary when possible; otherwise the retained transcript is supplied to a fresh conversation. Native conversations and credentials are local to the machine running inference. agy's three-minute MCP timeout means longer tool operations require cancelling its waiting turn and delivering the completed result as a subsequent message.

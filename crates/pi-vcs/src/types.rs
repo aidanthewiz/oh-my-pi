@@ -246,16 +246,19 @@ pub struct CommitOptions {
 	pub allow_empty:   bool,
 	/// Amend HEAD instead of appending.
 	pub amend:         bool,
-	/// Commit only these paths (pathspec commit).
+	/// Commit the working copies of these tracked paths, leaving unrelated
+	/// staged entries out. With `index_path`, select entries from that index.
+	/// Selected entries staged concurrently during hooks keep their newer
+	/// content.
 	pub files:         Vec<String>,
 	/// Build the commit from this index file instead of the repository's
 	/// index. The file must exist; the repository's index is neither read nor
 	/// written, and hooks run with `GIT_INDEX_FILE` pointing here.
 	pub index_path:    Option<PathBuf>,
-	/// Compare-and-swap guard: fail with [`crate::Error::HeadMoved`]
-	/// unless HEAD (the commit being amended, for `amend`) resolves to this
-	/// revision.
-	pub expected_head: Option<String>,
+	/// Fail with [`crate::Error::HeadMoved`] unless HEAD matches the expected
+	/// revision. `Some(None)` requires an unborn HEAD; `None` disables this
+	/// caller guard. Ref publication always compares against the captured HEAD.
+	pub expected_head: Option<Option<String>>,
 	/// Skip the `pre-commit` and `commit-msg` hooks (`git commit --no-verify`).
 	pub no_verify:     bool,
 	/// Complete child-process environment for commit hooks and signing.

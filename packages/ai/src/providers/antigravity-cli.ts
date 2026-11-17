@@ -9,7 +9,7 @@ import type { Effort } from "@oh-my-pi/pi-catalog/effort";
 import type { Context, Model, StreamFunction, StreamOptions } from "../types";
 import { AssistantMessageEventStream } from "../utils/event-stream";
 import { agyGeminiDir } from "./antigravity-cli/binary";
-import { agyCredentialKey, agyCredentialVersion, stageAgyCredentials } from "./antigravity-cli/credentials";
+import { agyCredentialKey } from "./antigravity-cli/credentials";
 import { AgyHost } from "./antigravity-cli/host";
 import { StepWriter } from "./antigravity-cli/step-writer";
 
@@ -55,12 +55,11 @@ async function runStep(
 	if (!options.apiKey) throw new Error("Antigravity CLI requires sign-in. Run /login antigravity-cli.");
 	const account = agyCredentialKey(options.apiKey);
 	const directory = path.join(agyGeminiDir(), account);
-	await stageAgyCredentials(options.apiKey, directory);
 	const stepOptions = {
 		cwd: options.cwd,
 		reasoning: options.reasoning,
 		signal: options.signal,
-		credentialVersion: agyCredentialVersion(options.apiKey),
+		apiKey: options.apiKey,
 	};
 	const sessions = options.providerSessionState;
 	const key = `antigravity-acp:${account}:${options.sessionId ?? "default"}`;

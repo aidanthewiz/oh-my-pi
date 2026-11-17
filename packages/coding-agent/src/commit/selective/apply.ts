@@ -132,7 +132,7 @@ export async function commitSelection(
 					message,
 					{
 						indexPath,
-						expectedHead: head ?? undefined,
+						expectedHead: head,
 						amend: request.amend ?? false,
 						noVerify: request.noVerify ?? false,
 					},

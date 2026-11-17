@@ -207,11 +207,14 @@ pub struct VcsCommitOptions {
 	pub author:        Option<VcsCommitAuthor>,
 	pub allow_empty:   Option<bool>,
 	pub amend:         Option<bool>,
+	/// Commit working copies of tracked paths, or entries from `indexPath`.
+	/// Keep any newer content staged concurrently during hooks.
 	pub files:         Option<Vec<String>>,
 	/// Build the commit from this index file instead of the repository's.
 	pub index_path:    Option<String>,
-	/// Fail with `HeadMoved` unless HEAD resolves to this revision.
-	pub expected_head: Option<String>,
+	/// Fail with `HeadMoved` unless HEAD matches this revision; `null` requires
+	/// an unborn HEAD. Omit to disable the caller guard.
+	pub expected_head: Option<Either<String, Null>>,
 	/// Skip the `pre-commit` and `commit-msg` hooks (`git commit --no-verify`).
 	pub no_verify:     Option<bool>,
 	pub env:           Option<HashMap<String, String>>,
@@ -388,7 +391,10 @@ impl From<VcsCommitOptions> for core::CommitOptions {
 			amend:         v.amend.unwrap_or(false),
 			files:         v.files.unwrap_or_default(),
 			index_path:    v.index_path.map(PathBuf::from),
-			expected_head: v.expected_head,
+			expected_head: v.expected_head.map(|expected| match expected {
+				Either::A(revision) => Some(revision),
+				Either::B(_) => None,
+			}),
 			no_verify:     v.no_verify.unwrap_or(false),
 			env:           v.env.map(|values| values.into_iter().collect()),
 		}

@@ -1406,6 +1406,7 @@ async fn uutils_exec_runs_programs_by_verbatim_path() {
 
 	let config = ShellConfig {
 		session_env:   None,
+		clear_env:     false,
 		snapshot_path: None,
 		minimizer:     None,
 		filesystem:    Fs::native(),

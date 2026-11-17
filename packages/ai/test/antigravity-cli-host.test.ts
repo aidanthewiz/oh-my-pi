@@ -1,10 +1,13 @@
 import { Database } from "bun:sqlite";
-import { afterEach, describe, expect, it } from "bun:test";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { afterEach, describe, expect, it, vi } from "bun:test";
+import { mkdir, mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { type } from "@oh-my-pi/omptype";
+import { AuthStorage, SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai/auth-storage";
+import * as agyBinary from "@oh-my-pi/pi-ai/providers/antigravity-cli/binary";
 import { conversationStorePath } from "@oh-my-pi/pi-ai/providers/antigravity-cli/conversation-store";
+import { agyCredentialKey, stageAgyCredentials } from "@oh-my-pi/pi-ai/providers/antigravity-cli/credentials";
 import {
 	AgyHost,
 	type AgyConnection,
@@ -35,6 +38,12 @@ const model = buildModel({
 });
 const tools: Tool[] = [{ name: "read", description: "Read a file", parameters: type({ path: "string" }) }];
 const user = (text: string): Message => ({ role: "user", content: text, timestamp: 0 });
+const apiKey = JSON.stringify({
+	token: "synthetic-access",
+	refreshToken: "synthetic-refresh",
+	expiresAt: Date.now() + 3_600_000,
+	email: "host@example.test",
+});
 
 class Queue<T> {
 	#items: T[] = [];
@@ -92,6 +101,7 @@ class FakeAgy implements AgyTransport {
 	readonly connection: AgyConnection;
 	closed = false;
 	cancelMode: "ack" | "hold" | "reject" = "ack";
+	holdExit = false;
 	autoSteer = true;
 	failLoad = false;
 	configureGate: Promise<void> | undefined;
@@ -179,17 +189,21 @@ class FakeAgy implements AgyTransport {
 		this.closed = true;
 		this.abort.abort();
 		for (const prompt of this.#pending) prompt.response.reject(new Error("connection closed"));
-		this.exit.resolve(0);
+		if (!this.holdExit) this.exit.resolve(0);
 	}
 }
 
 const cleanup: (() => Promise<void>)[] = [];
 afterEach(async () => {
-	for (const dispose of cleanup.splice(0).reverse()) await dispose();
+	try {
+		for (const dispose of cleanup.splice(0).reverse()) await dispose();
+	} finally {
+		vi.restoreAllMocks();
+	}
 });
 
-async function fixture(options: AgyHostOptions = {}) {
-	const dir = await mkdtemp(path.join(tmpdir(), "agy-host-test-"));
+async function fixture(options: AgyHostOptions = {}, directory?: string) {
+	const dir = directory ?? (await mkdtemp(path.join(tmpdir(), "agy-host-test-")));
 	const started = new Queue<FakeAgy>();
 	const clock = new Clock();
 	const instances: FakeAgy[] = [];
@@ -208,7 +222,7 @@ async function fixture(options: AgyHostOptions = {}) {
 	});
 	cleanup.push(async () => {
 		await host.dispose();
-		await rm(dir, { recursive: true, force: true });
+		if (!directory) await rm(dir, { recursive: true, force: true });
 	});
 	return { host, started, instances, dir, clock };
 }
@@ -218,11 +232,11 @@ function step(
 	messages: Message[],
 	extra: Partial<Context> = {},
 	signal?: AbortSignal,
-	options: Omit<AgyStepOptions, "signal"> = {},
+	options: Partial<Omit<AgyStepOptions, "signal">> = {},
 ) {
 	const stream = new AssistantMessageEventStream();
 	const writer = new StepWriter(model, stream);
-	const done = host.step(model, { messages, tools, ...extra }, { ...options, signal }, writer);
+	const done = host.step(model, { messages, tools, ...extra }, { apiKey, ...options, signal }, writer);
 	done.catch(() => undefined);
 	return { writer, done, stream };
 }
@@ -467,7 +481,7 @@ describe("AgyHost stateful steps", () => {
 		const state = await parked();
 		state.fake.cancelMode = "hold";
 		const next = step(state.host, [...state.messages, result(state.first.writer.output)], {}, undefined, {
-			credentialVersion: "new-version",
+			apiKey: JSON.stringify({ ...JSON.parse(apiKey), token: "rotated-access" }),
 		});
 		await state.fake.cancellations.next();
 		expect(state.instances).toHaveLength(1);
@@ -629,11 +643,22 @@ describe("AgyHost stateful steps", () => {
 		await started.promise;
 		abort.abort();
 		await expect(first.done).rejects.toThrow("aborted");
+		const disposing = state.host.dispose();
 		if (!startup) throw new Error("Missing transport options");
 		const late = new FakeAgy(startup);
+		late.holdExit = true;
+		const closed = Promise.withResolvers<void>();
+		const close = late.close.bind(late);
+		late.close = () => {
+			close();
+			closed.resolve();
+		};
 		gate.resolve(late);
-		await late.exited;
-		expect(late.closed).toBe(true);
+		await closed.promise;
+		expect(JSON.parse(await readFile(tokenPath(state.dir), "utf8")).token.refresh_token).toBe("synthetic-refresh");
+		late.exit.resolve(0);
+		await disposing;
+		await expect(stat(tokenPath(state.dir))).rejects.toMatchObject({ code: "ENOENT" });
 	});
 
 	it("times out setup without leaking the old transport", async () => {
@@ -704,5 +729,129 @@ describe("AgyHost stateful steps", () => {
 		fake.text("Done.");
 		prompt.response.resolve({ stopReason: "end_turn" });
 		await first.done;
+	});
+});
+
+function tokenPath(directory: string): string {
+	return path.join(directory, "antigravity-cli", "antigravity-oauth-token");
+}
+
+describe("AgyHost credential lifetime", () => {
+	it("keeps a rotated grant until the last overlapping host exits", async () => {
+		const first = await fixture();
+		const initial = step(first.host, [user("first")]);
+		const old = await first.started.next();
+		const initialPrompt = await old.prompts.next();
+		old.text("First answer.");
+		initialPrompt.response.resolve({ stopReason: "end_turn" });
+		await initial.done;
+		const second = await fixture({}, first.dir);
+		const nextKey = JSON.stringify({ ...JSON.parse(apiKey), token: "new-access", refreshToken: "new-refresh" });
+		const next = step(second.host, [user("second")], {}, undefined, { apiKey: nextKey });
+		const current = await second.started.next();
+		const nextPrompt = await current.prompts.next();
+		current.text("Second answer.");
+		nextPrompt.response.resolve({ stopReason: "end_turn" });
+		await next.done;
+		await first.host.dispose();
+		expect(JSON.parse(await readFile(tokenPath(first.dir), "utf8")).token).toMatchObject({
+			access_token: "new-access",
+			refresh_token: "new-refresh",
+		});
+		expect(current.closed).toBe(false);
+		await second.host.dispose();
+		await expect(stat(tokenPath(first.dir))).rejects.toMatchObject({ code: "ENOENT" });
+	});
+
+	it("removes a staged grant when transport startup fails", async () => {
+		const state = await fixture({
+			startTransport: async () => {
+				throw new Error("synthetic startup failure");
+			},
+		});
+		await expect(step(state.host, [user("hello")]).done).rejects.toThrow("synthetic startup failure");
+		await state.host.dispose();
+		await expect(stat(tokenPath(state.dir))).rejects.toMatchObject({ code: "ENOENT" });
+	});
+
+	it("does not release credentials on an exit timeout before the child actually exits", async () => {
+		const state = await fixture();
+		const run = step(state.host, [user("hello")]);
+		const fake = await state.started.next();
+		await fake.prompts.next();
+		fake.holdExit = true;
+		const disposing = state.host.dispose();
+		state.clock.fire(60);
+		await expect(disposing).rejects.toThrow("did not exit");
+		await expect(run.done).rejects.toThrow("session closed");
+		expect(JSON.parse(await readFile(tokenPath(state.dir), "utf8")).token.access_token).toBe("synthetic-access");
+		fake.exit.resolve(0);
+		await state.host.dispose();
+		await expect(stat(tokenPath(state.dir))).rejects.toMatchObject({ code: "ENOENT" });
+	});
+
+	it("drains the exact account's local host before logout completes and preserves its sibling", async () => {
+		const root = await mkdtemp(path.join(tmpdir(), "agy-logout-host-"));
+		cleanup.push(() => rm(root, { recursive: true, force: true }));
+		vi.spyOn(agyBinary, "agyGeminiDir").mockReturnValue(root);
+		const store = await SqliteAuthCredentialStore.open(path.join(root, "agent.db"));
+		const storage = new AuthStorage(store);
+		cleanup.push(() => storage.close());
+		const grant = {
+			type: "oauth" as const,
+			access: "synthetic-access",
+			refresh: "synthetic-refresh",
+			expires: JSON.parse(apiKey).expiresAt as number,
+			email: "host@example.test",
+		};
+		const sibling = { ...grant, access: "other-access", refresh: "other-refresh", email: "other@example.test" };
+		await storage.credentials.set("antigravity-cli", [grant, sibling]);
+		const target = storage.credentials
+			.list("antigravity-cli")
+			.find(row => row.credential.type === "oauth" && row.credential.email === grant.email);
+		if (!target) throw new Error("Missing target account");
+		const selected = await fixture({}, path.join(root, agyCredentialKey(apiKey)));
+		const selectedRun = step(selected.host, [user("selected account")]);
+		const selectedChild = await selected.started.next();
+		await selectedChild.prompts.next();
+		selectedChild.holdExit = true;
+		const stopped = Promise.withResolvers<void>();
+		const close = selectedChild.close.bind(selectedChild);
+		selectedChild.close = () => {
+			close();
+			stopped.resolve();
+		};
+		const siblingKey = JSON.stringify({
+			token: sibling.access,
+			refreshToken: sibling.refresh,
+			expiresAt: sibling.expires,
+			email: sibling.email,
+		});
+		const other = await fixture({}, path.join(root, agyCredentialKey(siblingKey)));
+		const otherRun = step(other.host, [user("other account")], {}, undefined, { apiKey: siblingKey });
+		const otherChild = await other.started.next();
+		const otherPrompt = await otherChild.prompts.next();
+		const removing = storage.credentials.removeById("antigravity-cli", target.id);
+		await stopped.promise;
+		await expect(selectedRun.done).rejects.toThrow("session closed");
+		expect(store.listAuthCredentials("antigravity-cli").some(row => row.id === target.id)).toBe(true);
+		expect(JSON.parse(await readFile(tokenPath(selected.dir), "utf8")).token.refresh_token).toBe(grant.refresh);
+		await expect(step(selected.host, [user("late request")]).done).rejects.toThrow("being removed");
+		const siblingRow = storage.credentials
+			.list("antigravity-cli")
+			.find(row => row.credential.type === "oauth" && row.credential.email === sibling.email);
+		if (!siblingRow) throw new Error("Missing sibling account");
+		const rotatedSibling = { ...sibling, access: "rotated-other-access", refresh: "rotated-other-refresh" };
+		await store.updateAuthCredential(siblingRow.id, rotatedSibling);
+		selectedChild.exit.resolve(0);
+		expect(await removing).toBe(true);
+		await expect(stat(tokenPath(selected.dir))).rejects.toMatchObject({ code: "ENOENT" });
+		await expect(stageAgyCredentials(apiKey, selected.dir)).rejects.toThrow("account was removed");
+		expect(otherChild.closed).toBe(false);
+		expect(JSON.parse(await readFile(tokenPath(other.dir), "utf8")).token.refresh_token).toBe(sibling.refresh);
+		expect(storage.credentials.list("antigravity-cli").map(row => row.credential)).toEqual([rotatedSibling]);
+		otherChild.text("Other account remains usable.");
+		otherPrompt.response.resolve({ stopReason: "end_turn" });
+		await otherRun.done;
 	});
 });

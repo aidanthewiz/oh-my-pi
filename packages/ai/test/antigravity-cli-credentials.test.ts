@@ -1,8 +1,12 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { acquireFileLock } from "@oh-my-pi/pi-utils";
+import { AuthBrokerClient, RemoteAuthCredentialStore, startAuthBroker } from "../src/auth-broker";
+import { AuthStorage, SqliteAuthCredentialStore } from "../src/auth-storage";
 import { isDefinitiveOAuthFailure } from "../src/error";
+import * as agyBinary from "../src/providers/antigravity-cli/binary";
 import {
 	AGY_OAUTH_CLIENT_ID,
 	agyCredentialEnv,
@@ -14,11 +18,14 @@ import {
 	refreshAgyCredentials,
 	stageAgyCredentials,
 } from "../src/providers/antigravity-cli/credentials";
+import * as registry from "../src/registry";
 import { AgyAuthUrlParser, agyAuthorizationCode } from "../src/registry/oauth/antigravity-cli";
 import { getOAuthApiKey } from "../src/registry/oauth";
 import type { OAuthCredentials } from "../src/registry/oauth/types";
 
 const directories: string[] = [];
+const credentialReleases: (() => Promise<void>)[] = [];
+const authStorages: AuthStorage[] = [];
 const grant: OAuthCredentials = {
 	access: "fixture-access",
 	refresh: "fixture-refresh",
@@ -46,7 +53,13 @@ const apiKey = JSON.stringify({
 });
 
 afterEach(async () => {
-	await Promise.all(directories.splice(0).map(directory => fs.rm(directory, { recursive: true, force: true })));
+	try {
+		for (const release of credentialReleases.splice(0).reverse()) await release();
+		for (const storage of authStorages.splice(0)) await storage.close();
+		await Promise.all(directories.splice(0).map(directory => fs.rm(directory, { recursive: true, force: true })));
+	} finally {
+		vi.restoreAllMocks();
+	}
 });
 
 describe("Antigravity CLI credential ownership", () => {
@@ -113,11 +126,15 @@ describe("Antigravity CLI credential ownership", () => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "agy-credentials-"));
 		directories.push(directory);
 		const account = path.join(directory, agyCredentialKey(apiKey));
-		await stageAgyCredentials(apiKey, account);
+		const releaseOriginal = await stageAgyCredentials(apiKey, account);
+		credentialReleases.push(releaseOriginal);
 		const tokenPath = path.join(account, "antigravity-cli", "antigravity-oauth-token");
 		const previous = await fs.open(tokenPath, "r");
 		try {
-			await stageAgyCredentials(JSON.stringify({ ...JSON.parse(apiKey), token: "new-access" }), account);
+			credentialReleases.push(
+				await stageAgyCredentials(JSON.stringify({ ...JSON.parse(apiKey), token: "new-access" }), account),
+			);
+			await releaseOriginal();
 			expect(JSON.parse(await previous.readFile("utf8")).token.access_token).toBe(grant.access);
 			expect((await exportAgyCredentials(account)).access).toBe("new-access");
 		} finally {
@@ -127,7 +144,9 @@ describe("Antigravity CLI credential ownership", () => {
 			expect((await fs.stat(account)).mode & 0o777).toBe(0o700);
 			expect((await fs.stat(tokenPath)).mode & 0o777).toBe(0o600);
 		}
-		expect(await fs.readdir(path.join(account, "antigravity-cli"))).toEqual(["antigravity-oauth-token"]);
+		expect((await fs.readdir(path.join(account, "antigravity-cli"))).filter(name => name.endsWith(".tmp"))).toEqual(
+			[],
+		);
 		const otherKey = JSON.stringify({
 			...JSON.parse(apiKey),
 			accountId: "second",
@@ -135,7 +154,7 @@ describe("Antigravity CLI credential ownership", () => {
 			token: "second-access",
 		});
 		const otherAccount = path.join(directory, agyCredentialKey(otherKey));
-		await stageAgyCredentials(otherKey, otherAccount);
+		credentialReleases.push(await stageAgyCredentials(otherKey, otherAccount));
 		expect((await exportAgyCredentials(account)).access).toBe("new-access");
 		expect((await exportAgyCredentials(otherAccount)).access).toBe("second-access");
 	});
@@ -154,13 +173,279 @@ describe("Antigravity CLI credential ownership", () => {
 		const before = process.env.SSH_TTY;
 		expect(agyCredentialEnv()).toEqual({ SSH_TTY: "omp-agy-file-auth" });
 		expect(process.env.SSH_TTY).toBe(before);
-		await stageAgyCredentials(JSON.stringify({ ...JSON.parse(apiKey), refreshToken: "__remote__" }), directory);
+		credentialReleases.push(
+			await stageAgyCredentials(JSON.stringify({ ...JSON.parse(apiKey), refreshToken: "__remote__" }), directory),
+		);
 		const contents = await fs.readFile(path.join(directory, "antigravity-cli", "antigravity-oauth-token"), "utf8");
 		expect(contents).not.toContain("__remote__");
 		expect(JSON.parse(contents).token.refresh_token).toBeUndefined();
 		await expect(
 			stageAgyCredentials(JSON.stringify({ ...JSON.parse(apiKey), expiresAt: 1 }), directory),
 		).rejects.toThrow("refreshed");
+	});
+});
+
+async function accountFixture() {
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "agy-account-removal-"));
+	directories.push(root);
+	vi.spyOn(agyBinary, "agyGeminiDir").mockReturnValue(root);
+	const store = await SqliteAuthCredentialStore.open(path.join(root, "agent.db"));
+	const storage = new AuthStorage(store);
+	authStorages.push(storage);
+	const credential = { type: "oauth" as const, ...grant };
+	await storage.credentials.set("antigravity-cli", credential);
+	const row = storage.credentials.list("antigravity-cli")[0];
+	if (!row) throw new Error("Missing synthetic account");
+	const directory = path.join(root, agyCredentialKey(apiKey));
+	const file = path.join(directory, "antigravity-cli", "antigravity-oauth-token");
+	return { root, store, storage, credential, row, directory, file };
+}
+
+describe("Antigravity CLI account removal", () => {
+	it("preserves an account added during provider logout", async () => {
+		const state = await accountFixture();
+		await fs.mkdir(state.directory, { recursive: true });
+		const lock = await acquireFileLock(path.join(state.directory, ".credential-ownership"));
+		const removing = state.storage.credentials.remove("antigravity-cli");
+		try {
+			const sibling = {
+				...state.credential,
+				access: "new-account-access",
+				refresh: "new-account-refresh",
+				email: "new-account@example.test",
+				accountId: "new-account",
+			};
+			await state.store.upsertAuthCredential("antigravity-cli", sibling);
+			const siblingDirectory = path.join(state.root, agyCredentialKey(sibling));
+			const release = await stageAgyCredentials(
+				JSON.stringify({
+					token: sibling.access,
+					refreshToken: sibling.refresh,
+					expiresAt: sibling.expires,
+					email: sibling.email,
+					accountId: sibling.accountId,
+				}),
+				siblingDirectory,
+			);
+			credentialReleases.push(release);
+			lock.release();
+			await removing;
+			expect(state.store.listAuthCredentials("antigravity-cli").map(row => row.credential)).toEqual([sibling]);
+			expect(state.storage.credentials.list("antigravity-cli").map(row => row.credential)).toEqual([sibling]);
+			expect(await exportAgyCredentials(siblingDirectory)).toEqual({
+				access: sibling.access,
+				refresh: sibling.refresh,
+				expires: sibling.expires,
+				email: sibling.email,
+				accountId: undefined,
+			});
+		} finally {
+			lock.release();
+			await removing;
+		}
+	});
+
+	it("reauthenticates through a broker-redacted grant without staging its refresh sentinel", async () => {
+		const state = await accountFixture();
+		const token = "synthetic-antigravity-broker";
+		const broker = startAuthBroker({
+			storage: state.storage,
+			bind: "127.0.0.1:0",
+			bearerTokens: [token],
+			disableRefresher: true,
+		});
+		let clientStorage: AuthStorage | undefined;
+		try {
+			const client = new AuthBrokerClient({ url: broker.url, token });
+			const initial = await client.fetchSnapshot();
+			if (initial.status !== 200) throw new Error("Missing initial broker snapshot");
+			clientStorage = new AuthStorage(new RemoteAuthCredentialStore({ client, initialSnapshot: initial.snapshot }));
+			await clientStorage.credentials.reload();
+			expect(await clientStorage.credentials.removeById("antigravity-cli", state.row.id)).toBe(true);
+			const definition = registry.getProviderDefinition("antigravity-cli");
+			if (!definition) throw new Error("Missing Antigravity login definition");
+			const authenticated = { ...grant, access: "broker-access", refresh: "broker-refresh" };
+			vi.spyOn(registry, "getProviderDefinition").mockReturnValue({
+				...definition,
+				login: async () => authenticated,
+			});
+			await clientStorage.oauth.login("antigravity-cli", { onAuth: () => {}, onPrompt: async () => "yes" });
+			const credential = clientStorage.credentials.list("antigravity-cli")[0]?.credential;
+			if (credential?.type !== "oauth") throw new Error("Missing saved broker login");
+			const resolved = await getOAuthApiKey("antigravity-cli", { "antigravity-cli": credential });
+			if (!resolved) throw new Error("Missing broker API grant");
+			const release = await stageAgyCredentials(resolved.apiKey, state.directory);
+			credentialReleases.push(release);
+			const staged = JSON.parse(await fs.readFile(state.file, "utf8")).token;
+			expect(staged.access_token).toBe(authenticated.access);
+			expect(staged.refresh_token).toBeUndefined();
+			expect(state.store.listAuthCredentials("antigravity-cli")[0]?.credential).toMatchObject(authenticated);
+		} finally {
+			await clientStorage?.close();
+			await broker.close();
+		}
+	});
+
+	it("refuses a foreign live owner without deleting the durable account, then succeeds after actual release", async () => {
+		const state = await accountFixture();
+		const release = await stageAgyCredentials(apiKey, state.directory);
+		credentialReleases.push(release);
+		const staged = await fs.readFile(state.file, "utf8");
+		await expect(state.storage.credentials.removeById("antigravity-cli", state.row.id)).rejects.toThrow(
+			"still running in another runtime",
+		);
+		expect(state.store.listAuthCredentials("antigravity-cli").map(row => row.credential)).toEqual([state.credential]);
+		expect(await fs.readFile(state.file, "utf8")).toBe(staged);
+		await release();
+		expect(await state.storage.credentials.removeById("antigravity-cli", state.row.id)).toBe(true);
+		expect(state.store.listAuthCredentials("antigravity-cli")).toEqual([]);
+		await expect(fs.stat(state.file)).rejects.toMatchObject({ code: "ENOENT" });
+	});
+
+	it("rejects a delayed staging acquisition queued behind successful durable removal", async () => {
+		const state = await accountFixture();
+		const deleting = Promise.withResolvers<void>();
+		const finishDeletion = Promise.withResolvers<void>();
+		const remove = state.store.deleteAuthCredential.bind(state.store);
+		vi.spyOn(state.store, "deleteAuthCredential").mockImplementation(async (id, cause) => {
+			deleting.resolve();
+			await finishDeletion.promise;
+			return remove(id, cause);
+		});
+		const removing = state.storage.credentials.removeById("antigravity-cli", state.row.id);
+		await deleting.promise;
+		const delayed = stageAgyCredentials(apiKey, state.directory);
+		void delayed.catch(() => undefined);
+		finishDeletion.resolve();
+		expect(await removing).toBe(true);
+		await expect(delayed).rejects.toThrow("account was removed");
+		await expect(fs.stat(state.file)).rejects.toMatchObject({ code: "ENOENT" });
+	});
+
+	it("retains the account fence and reports a durable deletion failure", async () => {
+		const state = await accountFixture();
+		vi.spyOn(state.store, "deleteAuthCredential").mockRejectedValueOnce(new Error("synthetic store failure"));
+		await expect(state.storage.credentials.removeById("antigravity-cli", state.row.id)).rejects.toThrow(
+			"synthetic store failure",
+		);
+		expect(state.store.listAuthCredentials("antigravity-cli").map(row => row.credential)).toEqual([state.credential]);
+		await expect(stageAgyCredentials(apiKey, state.directory)).rejects.toThrow("account was removed");
+		expect(await state.storage.credentials.removeById("antigravity-cli", state.row.id)).toBe(true);
+	});
+
+	it("does not delete the durable account when the filesystem cannot establish its removal fence", async () => {
+		const state = await accountFixture();
+		await fs.mkdir(path.join(state.directory, ".credentials-removed"), { recursive: true });
+		await expect(state.storage.credentials.removeById("antigravity-cli", state.row.id)).rejects.toThrow();
+		expect(state.store.listAuthCredentials("antigravity-cli").map(row => row.credential)).toEqual([state.credential]);
+		await expect(stageAgyCredentials(apiKey, state.directory)).rejects.toThrow("account was removed");
+	});
+
+	it("allows only a durably saved explicit login to reopen staging, not a delayed credential update", async () => {
+		const state = await accountFixture();
+		expect(await state.storage.credentials.removeById("antigravity-cli", state.row.id)).toBe(true);
+		await state.storage.credentials.set("antigravity-cli", state.credential);
+		await expect(stageAgyCredentials(apiKey, state.directory)).rejects.toThrow("account was removed");
+		const definition = registry.getProviderDefinition("antigravity-cli");
+		if (!definition) throw new Error("Missing Antigravity login definition");
+		const authenticated = { ...grant, access: "reauthenticated-access", refresh: "reauthenticated-refresh" };
+		vi.spyOn(registry, "getProviderDefinition").mockReturnValue({
+			...definition,
+			login: async () => authenticated,
+		});
+		vi.spyOn(state.store, "upsertAuthCredential").mockRejectedValueOnce(new Error("synthetic login save failure"));
+		const controller = { onAuth: () => {}, onPrompt: async () => "yes" };
+		await expect(state.storage.oauth.login("antigravity-cli", controller)).rejects.toThrow(
+			"synthetic login save failure",
+		);
+		await expect(stageAgyCredentials(apiKey, state.directory)).rejects.toThrow("account was removed");
+		await state.storage.oauth.login("antigravity-cli", controller);
+		const resolved = await getOAuthApiKey("antigravity-cli", { "antigravity-cli": authenticated });
+		if (!resolved) throw new Error("Missing structured authenticated grant");
+		const release = await stageAgyCredentials(resolved.apiKey, state.directory);
+		credentialReleases.push(release);
+		expect(JSON.parse(await fs.readFile(state.file, "utf8")).token).toMatchObject({
+			access_token: authenticated.access,
+			refresh_token: authenticated.refresh,
+		});
+		expect(state.storage.credentials.list("antigravity-cli").map(row => row.credential)).toEqual([
+			{ type: "oauth", ...authenticated, authorizedAt: expect.any(Number) },
+		]);
+		await release();
+		await expect(fs.stat(state.file)).rejects.toMatchObject({ code: "ENOENT" });
+	});
+
+	it("keeps a saved explicit login visible when the native grant omits account metadata", async () => {
+		const state = await accountFixture();
+		await state.storage.credentials.remove("antigravity-cli");
+		const definition = registry.getProviderDefinition("antigravity-cli");
+		if (!definition) throw new Error("Missing Antigravity login definition");
+		const authenticated = {
+			access: "identity-less-access",
+			refresh: "identity-less-refresh",
+			expires: grant.expires,
+		};
+		vi.spyOn(registry, "getProviderDefinition").mockReturnValue({
+			...definition,
+			login: async () => authenticated,
+		});
+		await state.storage.oauth.login("antigravity-cli", { onAuth: () => {}, onPrompt: async () => "yes" });
+		expect(state.storage.credentials.list("antigravity-cli").map(row => row.credential)).toEqual([
+			{ type: "oauth", ...authenticated, authorizedAt: expect.any(Number) },
+		]);
+	});
+
+	it("does not reopen an account when a saved login finishes after that exact row was removed", async () => {
+		const state = await accountFixture();
+		const definition = registry.getProviderDefinition("antigravity-cli");
+		if (!definition) throw new Error("Missing Antigravity login definition");
+		const authenticated = { ...grant, access: "late-login-access", refresh: "late-login-refresh" };
+		vi.spyOn(registry, "getProviderDefinition").mockReturnValue({
+			...definition,
+			login: async () => authenticated,
+		});
+		const saved = Promise.withResolvers<void>();
+		const finishLogin = Promise.withResolvers<void>();
+		const persist = state.store.upsertAuthCredential.bind(state.store);
+		vi.spyOn(state.store, "upsertAuthCredential").mockImplementation(async (provider, credential) => {
+			const rows = await persist(provider, credential);
+			saved.resolve();
+			await finishLogin.promise;
+			return rows;
+		});
+		const login = state.storage.oauth.login("antigravity-cli", { onAuth: () => {}, onPrompt: async () => "yes" });
+		void login.catch(() => undefined);
+		await saved.promise;
+		await state.storage.credentials.reload();
+		const target = state.storage.credentials.list("antigravity-cli")[0];
+		if (!target) throw new Error("Missing saved login");
+		expect(await state.storage.credentials.removeById("antigravity-cli", target.id)).toBe(true);
+		finishLogin.resolve();
+		await expect(login).rejects.toThrow("login is no longer the stored account");
+		expect(state.storage.credentials.list("antigravity-cli")).toEqual([]);
+		const resolved = await getOAuthApiKey("antigravity-cli", { "antigravity-cli": authenticated });
+		if (!resolved) throw new Error("Missing structured login grant");
+		await expect(stageAgyCredentials(resolved.apiKey, state.directory)).rejects.toThrow("account was removed");
+		await expect(fs.stat(state.file)).rejects.toMatchObject({ code: "ENOENT" });
+	});
+
+	it("removes only the provider's stored accounts, including old unowned native files", async () => {
+		const state = await accountFixture();
+		const sibling = { ...state.credential, email: "sibling@example.test", accountId: "sibling" };
+		await state.storage.credentials.set("antigravity-cli", [state.credential, sibling]);
+		const unrelated = { ...sibling, email: "not-stored@example.test", accountId: "not-stored" };
+		const files = [state.credential, sibling, unrelated].map(credential =>
+			path.join(state.root, agyCredentialKey(credential), "antigravity-cli", "antigravity-oauth-token"),
+		);
+		for (const file of files) {
+			await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
+			await fs.writeFile(file, JSON.stringify(stored), { mode: 0o600 });
+		}
+		await state.storage.credentials.remove("antigravity-cli");
+		await expect(fs.stat(files[0]!)).rejects.toMatchObject({ code: "ENOENT" });
+		await expect(fs.stat(files[1]!)).rejects.toMatchObject({ code: "ENOENT" });
+		expect(JSON.parse(await fs.readFile(files[2]!, "utf8"))).toEqual(stored);
+		expect(state.storage.credentials.list("antigravity-cli")).toEqual([]);
 	});
 });
 

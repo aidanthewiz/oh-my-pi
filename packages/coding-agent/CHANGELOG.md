@@ -16,6 +16,10 @@
 
 ### Fixed
 
+- Guard unborn HEADs and commit selected working copies without changing unrelated staged entries. Keep hook messages private per commit.
+- Serialize task patch application and ownership snapshots in one repository transaction.
+- Remove staged Antigravity grants only after their transports exit. Fence logout against delayed staging, preserve concurrent accounts, and allow explicit broker-backed reauthentication.
+- Keep the Windows verbatim-path shell fixture on the explicit inherited-environment configuration.
 - Require explicit saved-reset consent or `autoRedeem: yes` before spending credits, including imminent expirations in headless sessions.
 - Derive directory depth from the traversal stack to keep symlink-aware walker frames compact without extra allocations.
 - Keep injected pending filesystem operations pending for their first poll, even when their latency timer is already ready.

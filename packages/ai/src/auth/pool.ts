@@ -1,5 +1,7 @@
 import { authPolicyFor } from "@oh-my-pi/pi-catalog/compat/auth";
 import { providerPauseReason, providerPauseRevision } from "../registry/oauth";
+import { agyCredentialKey, readmitAgyCredentials } from "../providers/antigravity-cli/credentials";
+import { drainAgyAccountHosts } from "../providers/antigravity-cli/host";
 import { logger } from "@oh-my-pi/pi-utils";
 import { resolveCredentialIdentityKey, serializeCredential } from "./sqlite-credential-store";
 import type { BlockStoreHealth } from "./blocks";
@@ -663,40 +665,89 @@ export class CredentialPool implements CredentialsApi {
 			credential,
 		]);
 		this.#options.policies.validateFor(provider, prospectiveCredentials);
-		const stored = await this.#store.upsertAuthCredential(provider, credential);
+		const store = this.#store;
+		const stored = await store.upsertAuthCredential(provider, credential);
 		this.#options.policies.validateFor(
 			provider,
 			stored.map(entry => entry.credential),
 		);
-		this.replace(
-			provider,
-			stored.map(entry => ({ id: entry.id, credential: entry.credential })),
-		);
-		this.reset(provider);
+		if (provider === "antigravity-cli") {
+			const redacted = { ...credential, refresh: REMOTE_REFRESH_SENTINEL };
+			const matchesLogin = (current: AuthCredential) =>
+				current.type === "oauth" &&
+				authCredentialEquals(current, current.refresh === REMOTE_REFRESH_SENTINEL ? redacted : credential) &&
+				current.authorizedAt === credential.authorizedAt;
+			const signedIn = stored.find(entry => matchesLogin(entry.credential));
+			await readmitAgyCredentials(credential, () => {
+				if (this.#closed || this.#store !== store || !signedIn) return false;
+				const current = this.reloadProvider(provider).find(entry => entry.id === signedIn.id)?.credential;
+				this.reset(provider);
+				return current !== undefined && matchesLogin(current);
+			});
+		} else {
+			this.replace(
+				provider,
+				stored.map(entry => ({ id: entry.id, credential: entry.credential })),
+			);
+			this.reset(provider);
+		}
 	}
 
 	/**
 	 * Remove credential for a provider.
 	 */
 	async remove(provider: string): Promise<void> {
-		await this.#store.deleteAuthCredentials(provider, "deleted by user");
-		this.replace(provider, []);
-		this.reset(provider);
+		if (provider !== "antigravity-cli") {
+			await this.#store.deleteAuthCredentials(provider, "deleted by user");
+			this.replace(provider, []);
+			this.reset(provider);
+			return;
+		}
+		const entries = this.#store.listAuthCredentials(provider);
+		const accounts = new Map<string, OAuthCredential>();
+		for (const { credential } of entries) {
+			if (credential.type === "oauth" && (credential.email || credential.accountId)) {
+				accounts.set(agyCredentialKey(credential), credential);
+			}
+		}
+		const releases: (() => void)[] = [];
+		try {
+			for (const [, credential] of [...accounts].sort(([left], [right]) => left.localeCompare(right))) {
+				const release = await drainAgyAccountHosts(credential);
+				if (release) releases.push(release);
+			}
+			for (const entry of entries) await this.#store.deleteAuthCredential(entry.id, "deleted by user");
+			this.reloadProvider(provider);
+			this.reset(provider);
+		} finally {
+			for (const release of releases.reverse()) release();
+		}
 	}
 
 	/**
 	 * Remove one stored credential for a provider.
 	 */
 	async removeById(provider: string, credentialId: number): Promise<boolean> {
-		const entries = this.entries(provider);
+		const entries =
+			provider === "antigravity-cli" ? this.#store.listAuthCredentials(provider) : this.entries(provider);
 		const index = entries.findIndex(entry => entry.id === credentialId);
 		if (index === -1) return false;
+		const credential = entries[index].credential;
 		const remainingEntries = entries.filter((_entry, entryIndex) => entryIndex !== index);
-		const deleted = await this.#store.deleteAuthCredential(credentialId, "deleted by user");
-		if (!deleted) return false;
-		this.replace(provider, remainingEntries);
-		this.reset(provider);
-		return true;
+		const release =
+			provider === "antigravity-cli" && credential.type === "oauth"
+				? await drainAgyAccountHosts(credential)
+				: undefined;
+		try {
+			const deleted = await this.#store.deleteAuthCredential(credentialId, "deleted by user");
+			if (!deleted) return false;
+			if (provider === "antigravity-cli") this.reloadProvider(provider);
+			else this.replace(provider, remainingEntries);
+			this.reset(provider);
+			return true;
+		} finally {
+			release?.();
+		}
 	}
 
 	/**

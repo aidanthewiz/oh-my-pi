@@ -15,6 +15,8 @@ import {
 	type SessionConfigOption,
 	type SessionNotification,
 } from "@oh-my-pi/pi-utils/acp";
+import { OAuthError } from "../../error";
+import type { OAuthCredentials } from "../../registry/oauth/types";
 import type {
 	AntigravityCliCheckpoint,
 	Context,
@@ -27,14 +29,20 @@ import type {
 import { normalizeSchemaForCCA, toolWireSchema } from "../../utils/schema";
 import { validateJsonSchemaValue } from "../../utils/schema/json-schema-validator";
 import agentDefinition from "./agent.md" with { type: "text" };
-import { resolveAgyBinary } from "./binary";
+import { agyGeminiDir, resolveAgyBinary } from "./binary";
 import {
 	conversationStorePath,
 	deleteConversation,
 	forkConversation,
 	readConversationCheckpoint,
 } from "./conversation-store";
-import { agyCredentialEnv } from "./credentials";
+import {
+	agyCredentialEnv,
+	agyCredentialKey,
+	agyCredentialVersion,
+	removeAgyCredentials,
+	stageAgyCredentials,
+} from "./credentials";
 import { type McpCallHandler, McpBridge, type McpToolDefinition, type McpToolOutput } from "./mcp-bridge";
 import { inputBlocks, type Ledger, lateToolResultPrompt, planTurn, replayPrompt, transcriptDigest } from "./reconcile";
 import type { StepWriter } from "./step-writer";
@@ -46,14 +54,43 @@ const ANNOUNCEMENT_TIMEOUT_MS = 2_000;
 const HOLD_LIMIT_MS = 165_000;
 const CANCEL_TIMEOUT_MS = 5_000;
 const MCP_TOOL_NAME = /\bmcp_ide-tools_(\S+)/;
+const accountHosts = new Map<string, Set<AgyHost>>();
+const removingAccounts = new Set<string>();
+
+class UnconfirmedAgyExit extends Error {
+	constructor(cause: unknown) {
+		super("Antigravity CLI child exit could not be confirmed", { cause });
+	}
+}
+
+/** Hold exact-account admission closed until the registry finishes removing its durable row. */
+export async function drainAgyAccountHosts(
+	credentials: Pick<OAuthCredentials, "email" | "accountId">,
+): Promise<(() => void) | undefined> {
+	if (!credentials.email && !credentials.accountId) return undefined;
+	const directory = path.resolve(agyGeminiDir(), agyCredentialKey(credentials));
+	if (removingAccounts.has(directory)) throw new Error("Antigravity CLI account removal is already in progress");
+	removingAccounts.add(directory);
+	try {
+		await Promise.all([...(accountHosts.get(directory) ?? [])].map(host => host.dispose()));
+		const releaseCredentials = await removeAgyCredentials(credentials);
+		return () => {
+			releaseCredentials?.();
+			removingAccounts.delete(directory);
+		};
+	} catch (error) {
+		removingAccounts.delete(directory);
+		throw error;
+	}
+}
 
 /** Per-step request settings. */
 export interface AgyStepOptions {
 	cwd?: string;
 	reasoning?: string;
 	signal?: AbortSignal;
-	/** Non-secret credential revision; a changed revision restarts agy's native token cache. */
-	credentialVersion?: string;
+	/** Resolved structured grant; plaintext staging belongs to the transport generation. */
+	apiKey: string;
 }
 
 /** ACP operations required by the host; injectable without module or environment mutation. */
@@ -96,6 +133,7 @@ export type AgyScheduler = (delayMs: number, callback: () => void) => AgyTimer;
 
 /** Dependency seam for deterministic ACP lifecycle tests, not an alternative inference API. */
 export interface AgyHostOptions {
+	/** Rejection requires either no child or confirmed child exit. */
 	startTransport?: (options: AgyTransportOptions) => Promise<AgyTransport>;
 	holdLimitMs?: number;
 	cancelTimeoutMs?: number;
@@ -154,6 +192,8 @@ export class AgyHost implements ProviderSessionState {
 	readonly #options: Required<AgyHostOptions>;
 	readonly #ownedConversations = new Set<string>();
 	readonly #exits = new Set<Promise<number>>();
+	/** Keep native leases alive when process exit cannot be confirmed. */
+	readonly #credentialOwners = new Set<() => Promise<void>>();
 	#process: AgyProcess | undefined;
 	#conversation: Conversation | undefined;
 	#ledger: Ledger | undefined;
@@ -168,7 +208,7 @@ export class AgyHost implements ProviderSessionState {
 
 	/** geminiDir is the account-scoped agy configuration and conversation directory. */
 	constructor(geminiDir: string, options: AgyHostOptions = {}) {
-		this.#geminiDir = geminiDir;
+		this.#geminiDir = path.resolve(geminiDir);
 		this.#options = {
 			startTransport: options.startTransport ?? startTransport,
 			holdLimitMs: options.holdLimitMs ?? HOLD_LIMIT_MS,
@@ -198,6 +238,7 @@ export class AgyHost implements ProviderSessionState {
 
 	/** Emit one assistant step, parking at a tool call or finishing at the ACP turn end. */
 	async step(model: Model, context: Context, options: AgyStepOptions, writer: StepWriter): Promise<void> {
+		if (removingAccounts.has(this.#geminiDir)) throw new Error("Antigravity CLI account is being removed");
 		if (this.#step) throw new Error("Antigravity CLI is already running a request for this session");
 		const step: ActiveStep = {
 			writer,
@@ -210,6 +251,9 @@ export class AgyHost implements ProviderSessionState {
 		step.done.promise.catch(() => undefined);
 		step.interrupted.promise.catch(() => undefined);
 		this.#step = step;
+		const hosts = accountHosts.get(this.#geminiDir) ?? new Set<AgyHost>();
+		accountHosts.set(this.#geminiDir, hosts);
+		hosts.add(this);
 		const onAbort = () => {
 			step.aborted = true;
 			this.#fail(new Error("Request was aborted"));
@@ -217,6 +261,7 @@ export class AgyHost implements ProviderSessionState {
 		options.signal?.addEventListener("abort", onAbort, { once: true });
 		try {
 			if (options.signal?.aborted) onAbort();
+			const credentialVersion = agyCredentialVersion(options.apiKey);
 			step.controller.signal.throwIfAborted();
 			const cwd = options.cwd ?? process.cwd();
 			const tools = (context.tools ?? []).map(toMcpTool);
@@ -229,7 +274,7 @@ export class AgyHost implements ProviderSessionState {
 				this.#pending !== undefined &&
 				(this.#process?.toolsKey !== toolsKey ||
 					this.#process.cwd !== cwd ||
-					this.#process.credentialVersion !== options.credentialVersion ||
+					this.#process.credentialVersion !== credentialVersion ||
 					this.#conversation?.systemKey !== systemKey ||
 					this.#conversation.model !== model.id ||
 					this.#conversation.requestedEffort !== options.reasoning);
@@ -243,9 +288,9 @@ export class AgyHost implements ProviderSessionState {
 			if (
 				this.#process?.toolsKey !== toolsKey ||
 				this.#process.cwd !== cwd ||
-				this.#process.credentialVersion !== options.credentialVersion
+				this.#process.credentialVersion !== credentialVersion
 			) {
-				await this.#startProcess(tools, toolsKey, cwd, step, options.credentialVersion);
+				await this.#startProcess(tools, toolsKey, cwd, step, options.apiKey, credentialVersion);
 			}
 			let loadId: string | undefined;
 			if (plan.kind === "resume") {
@@ -271,7 +316,7 @@ export class AgyHost implements ProviderSessionState {
 					if (step.controller.signal.aborted) throw error;
 					// A store can outlive an incompatible native CLI version. Do not reuse a partial load.
 					this.#stopProcess();
-					await this.#startProcess(tools, toolsKey, cwd, step, options.credentialVersion);
+					await this.#startProcess(tools, toolsKey, cwd, step, options.apiKey, credentialVersion);
 					plan = { kind: "fresh", replay: [...context.messages] };
 				}
 			}
@@ -333,6 +378,10 @@ export class AgyHost implements ProviderSessionState {
 		} finally {
 			options.signal?.removeEventListener("abort", onAbort);
 			if (this.#step === step) this.#step = undefined;
+			if (this.#exits.size === 0) {
+				hosts.delete(this);
+				if (hosts.size === 0) accountHosts.delete(this.#geminiDir);
+			}
 		}
 	}
 
@@ -342,7 +391,7 @@ export class AgyHost implements ProviderSessionState {
 		this.#conversation = undefined;
 	}
 
-	/** Stop first, await process exit, then remove only conversations this host created (never fork sources). */
+	/** Stop and drain every admitted startup, child and credential cleanup before deleting owned conversations. */
 	async dispose(): Promise<void> {
 		this.close();
 		await withTimeout(
@@ -376,6 +425,7 @@ export class AgyHost implements ProviderSessionState {
 		toolsKey: string,
 		cwd: string,
 		step: ActiveStep,
+		apiKey: string,
 		credentialVersion: string | undefined,
 	): Promise<void> {
 		const detached = this.#pending?.state === "detached" ? this.#pending : undefined;
@@ -386,28 +436,75 @@ export class AgyHost implements ProviderSessionState {
 			this.#ledger = ledger;
 		}
 		const token = {};
-		const starting = this.#options.startTransport({
-			geminiDir: this.#geminiDir,
-			cwd,
-			tools,
-			signal: step.controller.signal,
-			onCall: async (name, args, id) => {
-				try {
-					return await this.#onToolCall(token, name, args, id);
-				} catch (error) {
-					if (this.#process?.token === token) this.#fail(error);
-					return errorOutput("Tool transport failed; the turn was stopped.");
+		const hosts = accountHosts.get(this.#geminiDir)!;
+		let startupDrained = true;
+		const starting = (async () => {
+			step.controller.signal.throwIfAborted();
+			startupDrained = false;
+			const releaseCredentials = await stageAgyCredentials(apiKey, this.#geminiDir).catch(error => {
+				if (error instanceof OAuthError) startupDrained = true;
+				throw error;
+			});
+			this.#credentialOwners.add(releaseCredentials);
+			try {
+				step.controller.signal.throwIfAborted();
+				const transport = await this.#options.startTransport({
+					geminiDir: this.#geminiDir,
+					cwd,
+					tools,
+					signal: step.controller.signal,
+					onCall: async (name, args, id) => {
+						try {
+							return await this.#onToolCall(token, name, args, id);
+						} catch (error) {
+							if (this.#process?.token === token) this.#fail(error);
+							return errorOutput("Tool transport failed; the turn was stopped.");
+						}
+					},
+					onUpdate: update => {
+						if (this.#process?.token !== token) return;
+						try {
+							this.#onUpdate(update);
+						} catch (error) {
+							this.#fail(error);
+						}
+					},
+				});
+				return {
+					connection: transport.connection,
+					close: () => transport.close(),
+					exited: transport.exited.then(async code => {
+						await releaseCredentials();
+						this.#credentialOwners.delete(releaseCredentials);
+						return code;
+					}),
+				};
+			} catch (error) {
+				if (error instanceof UnconfirmedAgyExit) throw error;
+				await releaseCredentials();
+				this.#credentialOwners.delete(releaseCredentials);
+				startupDrained = true;
+				throw error;
+			}
+		})();
+		const drained = starting.then(
+			transport => transport.exited,
+			error => {
+				if (!startupDrained) throw error;
+				return 0;
+			},
+		);
+		this.#exits.add(drained);
+		void drained.then(
+			() => {
+				this.#exits.delete(drained);
+				if (this.#exits.size === 0 && !this.#step) {
+					hosts.delete(this);
+					if (hosts.size === 0) accountHosts.delete(this.#geminiDir);
 				}
 			},
-			onUpdate: update => {
-				if (this.#process?.token !== token) return;
-				try {
-					this.#onUpdate(update);
-				} catch (error) {
-					this.#fail(error);
-				}
-			},
-		});
+			() => logger.warn("Antigravity CLI process or credential cleanup did not complete"),
+		);
 		void starting.then(
 			transport => {
 				if (step.controller.signal.aborted) transport.close();
@@ -429,10 +526,8 @@ export class AgyHost implements ProviderSessionState {
 			},
 		};
 		this.#process = agy;
-		this.#exits.add(transport.exited);
 		void transport.exited.then(
 			code => {
-				this.#exits.delete(transport.exited);
 				if (this.#process === agy) this.#fail(new Error(`Antigravity CLI exited with code ${code}`));
 			},
 			() => {
@@ -829,6 +924,11 @@ async function startTransport(options: AgyTransportOptions): Promise<AgyTranspor
 			return { connection, exited: child.exited, close };
 		} catch (error) {
 			close();
+			try {
+				await child.exited;
+			} catch (exitError) {
+				throw new UnconfirmedAgyExit(exitError);
+			}
 			throw error;
 		}
 	} catch (error) {

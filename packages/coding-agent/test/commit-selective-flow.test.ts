@@ -36,6 +36,7 @@ async function emptyRepo() {
 	await git(root, ["config", "user.email", "test@example.com"]);
 	await git(root, ["config", "user.name", "Test"]);
 	await git(root, ["config", "commit.gpgSign", "false"]);
+	await git(root, ["config", "core.hooksPath", ".git/hooks"]);
 	const journal = ChangeJournal.at(artifacts);
 	const write = async (agent: string, parent: string | undefined, file: string, after: string) => {
 		const absolute = path.join(root, file);
@@ -176,6 +177,43 @@ describe("selective commit flow", () => {
 		expect(await git(root, ["ls-tree", "--name-only", "HEAD"])).toBe("first.txt\n");
 		expect(await git(root, ["status", "--porcelain"])).toBe("?? second.txt\n");
 	});
+
+	it.skipIf(process.platform === "win32")(
+		"rebuilds an unborn private index when a pre-commit hook creates HEAD",
+		async () => {
+			const { root, journal, write } = await emptyRepo();
+			await write("Main", undefined, "first.txt", "selected first\n");
+			await journal.flush();
+			const draft = await createDraft({ cwd: root, journal, caller: "Main" });
+			const hook = path.join(root, ".git", "hooks", "pre-commit");
+			await fs.writeFile(
+				hook,
+				"#!/bin/sh\n\
+if ! git rev-parse --verify HEAD >/dev/null 2>&1; then\n\
+  (\n\
+    unset GIT_INDEX_FILE\n\
+    printf 'other agent\\n' > other.txt\n\
+    git add other.txt\n\
+    git -c core.hooksPath=/dev/null commit -qm 'concurrent first'\n\
+  ) || exit 1\n\
+fi\n",
+			);
+			await fs.chmod(hook, 0o755);
+
+			const outcome = await commitSelection(
+				draft,
+				{ subject: "feat: first" },
+				{ journal, agent: { agent: "Main" } },
+			);
+			expect(outcome.parent).toBe((await git(root, ["rev-parse", "HEAD^"])).trim());
+			expect(outcome.paths).toEqual(["first.txt"]);
+			expect(await git(root, ["rev-list", "--count", "HEAD"])).toBe("2\n");
+			expect(await git(root, ["show", "HEAD^:other.txt"])).toBe("other agent\n");
+			expect(await git(root, ["show", "HEAD:other.txt"])).toBe("other agent\n");
+			expect(await git(root, ["show", "HEAD:first.txt"])).toBe("selected first\n");
+			expect(await git(root, ["status", "--porcelain"])).toBe("");
+		},
+	);
 
 	it("attributes edits journaled through a symlinked directory", async () => {
 		const { root, journal } = await emptyRepo();

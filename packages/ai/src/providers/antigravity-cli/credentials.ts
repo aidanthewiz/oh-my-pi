@@ -6,15 +6,20 @@
 import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { acquireFileLock, isEnoent, isFileLockHeld, tryAcquireFileLock, withFileLock } from "@oh-my-pi/pi-utils";
 import { REMOTE_REFRESH_SENTINEL } from "../../auth/types";
 import * as AIError from "../../error";
 import type { OAuthCredentials } from "../../registry/oauth/types";
 import type { FetchImpl } from "../../types";
+import { agyGeminiDir } from "./binary";
 
 const PROVIDER = "antigravity-cli";
 // ACP stores credentials under app-data-dir, whose default is the
 // antigravity-cli subdirectory of --gemini-dir (not directly in gemini-dir).
 const TOKEN_FILE = path.join("antigravity-cli", "antigravity-oauth-token");
+const OWNER_PREFIX = ".credential-owner-";
+const OWNER_NAME = /^\.credential-owner-[0-9a-f-]{36}$/;
+const TEMPORARY_TOKEN_NAME = /^antigravity-oauth-token\.[0-9a-f-]{36}\.tmp$/;
 const REQUEST_TIMEOUT_MS = 30_000;
 const EXPIRY_SKEW_MS = 60_000;
 // These public installed-application credentials match agy's getOauthParams
@@ -120,8 +125,8 @@ export function parseAgyApiKey(apiKey: string): OAuthCredentials {
 }
 
 /** Stable account namespace: token rotation never changes conversation ownership. */
-export function agyCredentialKey(apiKey: string): string {
-	const credentials = parseAgyApiKey(apiKey);
+export function agyCredentialKey(value: string | Pick<OAuthCredentials, "email" | "accountId">): string {
+	const credentials = typeof value === "string" ? parseAgyApiKey(value) : value;
 	// Native ACP login retains id_token_email, often without a subject. Prefer
 	// that identity so a later refresh adding an ID token cannot move accounts.
 	const account = credentials.email
@@ -153,12 +158,11 @@ export function agyCredentialEnv(): Record<string, string> {
 }
 
 /**
- * Atomically import a resolved grant into the account's private --gemini-dir.
- * The caller must use agyCredentialEnv and agyCredentialKey-isolated directories.
- * Broker refresh sentinels are NEVER sent to Google: the host must reload its
- * persisted conversation when agyCredentialVersion changes after broker refresh.
+ * Stage one transport generation's grant and retain its account-private file.
+ * Release only after startup fails without a child or the child actually exits.
+ * Broker refresh sentinels are never sent to Google.
  */
-export async function stageAgyCredentials(apiKey: string, geminiDir: string): Promise<void> {
+export async function stageAgyCredentials(apiKey: string, geminiDir: string): Promise<() => Promise<void>> {
 	const credentials = parseAgyApiKey(apiKey);
 	agyCredentialKey(apiKey);
 	if (credentials.expires <= Date.now()) throw invalid("Antigravity CLI credentials must be refreshed before use");
@@ -169,37 +173,132 @@ export async function stageAgyCredentials(apiKey: string, geminiDir: string): Pr
 		expiry: new Date(credentials.expires).toISOString(),
 	};
 	const file = path.join(geminiDir, TOKEN_FILE);
+	const directory = path.dirname(file);
+	const owner = path.join(directory, `${OWNER_PREFIX}${randomUUID()}`);
 	const temporary = `${file}.${randomUUID()}.tmp`;
-	try {
-		await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
-		await fs.chmod(geminiDir, 0o700);
-		await fs.chmod(path.dirname(file), 0o700);
-		await fs.writeFile(
-			temporary,
-			JSON.stringify({ token, auth_method: "consumer", id_token_email: credentials.email }),
-			{
-				mode: 0o600,
-				flag: "wx",
-			},
-		);
-		await fs.rename(temporary, file);
-		// Check only local bytes; never send an identity-probing inference request.
-		const staged = record(json(await fs.readFile(file, "utf8")));
-		const stagedToken = record(staged?.token);
-		if (
-			staged?.auth_method !== "consumer" ||
-			stagedToken?.access_token !== token.access_token ||
-			stagedToken.refresh_token !== token.refresh_token ||
-			stagedToken.expiry !== token.expiry ||
-			staged.id_token_email !== credentials.email
-		) {
-			throw new Error();
+	await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+	return withFileLock(credentialLock(geminiDir), async () => {
+		try {
+			await fs.stat(path.join(geminiDir, ".credentials-removed"));
+			throw invalid("Antigravity CLI account was removed; sign in again before use");
+		} catch (error) {
+			if (!isEnoent(error)) throw error;
 		}
-	} catch {
-		throw invalid("Could not stage the isolated Antigravity CLI account credentials");
-	} finally {
-		await fs.rm(temporary, { force: true }).catch(() => {});
+		await fs.chmod(geminiDir, 0o700);
+		await fs.chmod(directory, 0o700);
+		await fs.writeFile(owner, "", { mode: 0o600, flag: "wx" });
+		const lease = tryAcquireFileLock(owner);
+		if (!lease) {
+			await fs.rm(owner, { force: true });
+			throw invalid("Could not retain the isolated Antigravity CLI account credentials");
+		}
+		let released: Promise<void> | undefined;
+		const release = () =>
+			(released ??= withFileLock(credentialLock(geminiDir), async () => {
+				lease.release();
+				await removeCredentialOwner(owner);
+				await removeUnownedCredentials(geminiDir);
+			}));
+		try {
+			await fs.writeFile(
+				temporary,
+				JSON.stringify({ token, auth_method: "consumer", id_token_email: credentials.email }),
+				{ mode: 0o600, flag: "wx" },
+			);
+			await fs.rename(temporary, file);
+			// Check only local bytes; never send an identity-probing inference request.
+			const staged = record(json(await fs.readFile(file, "utf8")));
+			const stagedToken = record(staged?.token);
+			if (
+				staged?.auth_method !== "consumer" ||
+				stagedToken?.access_token !== token.access_token ||
+				stagedToken.refresh_token !== token.refresh_token ||
+				stagedToken.expiry !== token.expiry ||
+				staged.id_token_email !== credentials.email
+			) {
+				throw new Error();
+			}
+			return release;
+		} catch {
+			lease.release();
+			await fs.rm(temporary, { force: true });
+			await removeCredentialOwner(owner);
+			await removeUnownedCredentials(geminiDir);
+			throw invalid("Could not stage the isolated Antigravity CLI account credentials");
+		}
+	});
+}
+
+/** Logout completes only after this exact account has no active transport owner. */
+export async function removeAgyCredentials(
+	credentials: Pick<OAuthCredentials, "email" | "accountId">,
+): Promise<(() => void) | undefined> {
+	if (!credentials.email && !credentials.accountId) return undefined;
+	const geminiDir = path.join(agyGeminiDir(), agyCredentialKey(credentials));
+	await fs.mkdir(geminiDir, { recursive: true, mode: 0o700 });
+	const lock = await acquireFileLock(credentialLock(geminiDir));
+	const removedFile = path.join(geminiDir, ".credentials-removed");
+	try {
+		if (!(await removeUnownedCredentials(geminiDir))) {
+			throw invalid("Antigravity CLI account is still running in another runtime; close it before logging out");
+		}
+		await fs.writeFile(removedFile, "", { mode: 0o600 });
+		return () => lock.release();
+	} catch (error) {
+		lock.release();
+		throw error;
 	}
+}
+
+/** Only a completed explicit login can reopen a removed account's staging admission. */
+export async function readmitAgyCredentials(
+	credentials: Pick<OAuthCredentials, "email" | "accountId">,
+	isCurrent: () => boolean,
+): Promise<void> {
+	if (!credentials.email && !credentials.accountId) {
+		if (!isCurrent()) throw invalid("Antigravity CLI login is no longer the stored account; sign in again");
+		return;
+	}
+	const directory = path.join(agyGeminiDir(), agyCredentialKey(credentials));
+	await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+	await withFileLock(credentialLock(directory), async () => {
+		if (!isCurrent()) throw invalid("Antigravity CLI login is no longer the stored account; sign in again");
+		await fs.rm(path.join(directory, ".credentials-removed"), { force: true });
+	});
+}
+
+function credentialLock(geminiDir: string): string {
+	return path.join(geminiDir, ".credential-ownership");
+}
+
+async function removeCredentialOwner(owner: string): Promise<void> {
+	await fs.rm(owner, { force: true });
+	await fs.rm(`${owner}.lock`, { force: true });
+}
+
+/** The account lock serializes staging, owner registration and last-owner deletion across processes. */
+async function removeUnownedCredentials(geminiDir: string): Promise<boolean> {
+	const directory = path.join(geminiDir, path.dirname(TOKEN_FILE));
+	let names: string[];
+	try {
+		names = await fs.readdir(directory);
+	} catch (error) {
+		if (isEnoent(error)) return true;
+		throw error;
+	}
+	for (const name of names) {
+		if (!OWNER_NAME.test(name)) continue;
+		const owner = path.join(directory, name);
+		if (isFileLockHeld(owner)) return false;
+		await removeCredentialOwner(owner);
+	}
+	await fs.rm(path.join(geminiDir, TOKEN_FILE), { force: true });
+	await Promise.all(
+		names
+			.filter(name => TEMPORARY_TOKEN_NAME.test(name))
+			.map(name => fs.rm(path.join(directory, name), { force: true })),
+	);
+	return true;
 }
 
 /** Bounded, secret-safe refresh; only known OAuth error codes reach callers. */

@@ -5,6 +5,7 @@ use std::{
 	collections::{BTreeMap, BTreeSet, HashSet},
 	ffi::OsStr,
 	fs,
+	io::{BufWriter, Write},
 	path::{Path, PathBuf},
 };
 
@@ -80,6 +81,19 @@ pub(crate) fn update_reference(
 	repo
 		.edit_references_as(Some(edit), Some(committer))
 		.map_err(|err| Error::backend(op, err))?;
+	Ok(())
+}
+
+fn ensure_commit_head(
+	expected: Option<gix::hash::ObjectId>,
+	actual: Option<gix::hash::ObjectId>,
+) -> Result<()> {
+	if actual != expected {
+		return Err(Error::HeadMoved {
+			expected: expected.map_or_else(|| "unborn HEAD".to_owned(), |id| id.to_hex().to_string()),
+			actual:   actual.map(|id| id.to_hex().to_string()),
+		});
+	}
 	Ok(())
 }
 
@@ -210,13 +224,86 @@ impl GitRepo {
 				.map_err(|err| Error::backend("git commit read commit.gpgSign", err))?
 				.unwrap_or(false)
 		};
+		let mut path_index = if !options.files.is_empty() && options.index_path.is_none() {
+			let repo = self.gix_fresh()?;
+			let head = repo
+				.head()
+				.map_err(|err| Error::backend("git commit", err))?
+				.try_peel_to_id()
+				.map_err(|err| Error::backend("git commit", err))?
+				.map(|id| id.detach());
+			let mut partial = index_for_tree(
+				&repo,
+				head
+					.as_ref()
+					.map(|id| commit_tree(&repo, id))
+					.transpose()?
+					.as_ref(),
+			)?;
+			let shared = load_index_or_head(&repo, "git commit")?;
+			let requested: Vec<_> = options
+				.files
+				.iter()
+				.map(|path| normalize_stage_path(path))
+				.collect();
+			let mut selected = BTreeSet::new();
+			for source in [&partial, &shared] {
+				for entry in source.entries() {
+					let path = entry.path(source).to_str_lossy();
+					if requested
+						.iter()
+						.any(|wanted| stage_path_matches(&path, wanted))
+						&& !selected.contains(path.as_ref())
+					{
+						selected.insert(path.into_owned());
+					}
+				}
+			}
+			if selected.is_empty() {
+				return Err(Error::backend("git commit", "pathspec did not match any tracked files"));
+			}
+			partial.remove_entries(|_, path, _| selected.contains(path.to_str_lossy().as_ref()));
+			let mut filter = WorktreeFilter::staging(&repo, "git commit")?;
+			for path in &selected {
+				if let Staged::Entry(entry) = stage_one(self.root(), &mut filter, path, 0)? {
+					partial.dangerously_push_entry(
+						entry.stat,
+						entry.id,
+						gix::index::entry::Flags::empty(),
+						entry.mode,
+						entry.path.as_bstr(),
+					);
+				}
+			}
+			partial.sort_entries();
+			let mut file = gix::tempfile::new(
+				&self.info().git_dir,
+				gix::tempfile::ContainingDirectory::Exists,
+				gix::tempfile::AutoRemove::Tempfile,
+			)?
+			.take()
+			.ok_or_else(|| Error::backend("git commit", "private index file was removed"))?;
+			{
+				let mut out = BufWriter::new(file.as_file_mut());
+				partial
+					.write_to(&mut out, INDEX_WRITE)
+					.map_err(|err| Error::backend("git commit write private index", err))?;
+				out.flush()?;
+			}
+			Some((file.into_temp_path(), head, selected.into_iter().collect::<Vec<_>>(), shared))
+		} else {
+			None
+		};
+		let index_path = options
+			.index_path
+			.as_deref()
+			.or_else(|| path_index.as_ref().map(|(path, ..)| path.as_ref()));
 		let process = RunOptions {
 			cancel,
 			env: options.env.clone(),
-			index_path: options.index_path.clone(),
+			index_path: index_path.map(Path::to_path_buf),
 			..RunOptions::default()
 		};
-		let index_path = options.index_path.as_deref();
 		if !options.no_verify {
 			run_commit_hook(self, "pre-commit", &[], &process).await?;
 		}
@@ -229,17 +316,20 @@ impl GitRepo {
 				.try_peel_to_id()
 				.map_err(|err| Error::backend("git commit", err))?
 				.map(|id| id.detach());
-			if let Some(expected) = options.expected_head.as_deref() {
-				let expected = repo
-					.rev_parse_single(expected)
-					.map_err(|err| Error::backend("git commit resolve expected HEAD", err))?
-					.detach();
-				if old_commit != Some(expected) {
-					return Err(Error::HeadMoved {
-						expected: expected.to_hex().to_string(),
-						actual:   old_commit.map(|id| id.to_hex().to_string()),
-					});
-				}
+			if let Some(expected) = options.expected_head.as_ref() {
+				let expected = expected
+					.as_deref()
+					.map(|revision| {
+						repo
+							.rev_parse_single(revision)
+							.map(|id| id.detach())
+							.map_err(|err| Error::backend("git commit resolve expected HEAD", err))
+					})
+					.transpose()?;
+				ensure_commit_head(expected, old_commit)?;
+			}
+			if let Some((_, expected, ..)) = &path_index {
+				ensure_commit_head(*expected, old_commit)?;
 			}
 			let index = match index_path {
 				// An alternate index that does not exist is a caller error, never a
@@ -249,7 +339,7 @@ impl GitRepo {
 				})?,
 				None => load_index_or_head(&repo, "git commit")?,
 			};
-			let tree = if options.files.is_empty() {
+			let tree = if options.files.is_empty() || path_index.is_some() {
 				write_index_tree(&repo, &index)?
 			} else {
 				let base = index_for_tree(
@@ -317,13 +407,47 @@ impl GitRepo {
 				.map_err(|err| Error::backend("git commit", err))?;
 			(tree, parents, old_commit, author, committer)
 		};
-		let message_path = self.info().git_dir.join("COMMIT_EDITMSG");
-		fs::write(&message_path, message)?;
-		if !options.no_verify {
+		let message = if !options.no_verify && self.hook_path("commit-msg")?.is_some() {
+			let mut message_file = gix::tempfile::new(
+				&self.info().git_dir,
+				gix::tempfile::ContainingDirectory::Exists,
+				gix::tempfile::AutoRemove::Tempfile,
+			)?
+			.take()
+			.ok_or_else(|| Error::backend("git commit", "commit message file was removed"))?;
+			message_file.write_all(message.as_bytes())?;
+			let message_path = message_file.into_temp_path();
 			run_commit_hook(self, "commit-msg", &[message_path.as_os_str()], &process).await?;
-		}
-		let message = fs::read_to_string(&message_path)
-			.map_err(|err| Error::backend("git commit read commit-msg result", err))?;
+			Cow::Owned(
+				fs::read_to_string(&message_path)
+					.map_err(|err| Error::backend("git commit read commit-msg result", err))?,
+			)
+		} else {
+			Cow::Borrowed(message)
+		};
+		// Match git commit's terminal whitespace cleanup, including its final LF.
+		let message = match message {
+			Cow::Borrowed(message) => {
+				let trimmed = message.trim_ascii_end();
+				if trimmed.is_empty() {
+					Cow::Borrowed(trimmed)
+				} else if message.as_bytes().get(trimmed.len()) == Some(&b'\n') {
+					Cow::Borrowed(&message[..=trimmed.len()])
+				} else {
+					let mut terminated = String::with_capacity(trimmed.len() + 1);
+					terminated.push_str(trimmed);
+					terminated.push('\n');
+					Cow::Owned(terminated)
+				}
+			},
+			Cow::Owned(mut message) => {
+				message.truncate(message.trim_ascii_end().len());
+				if !message.is_empty() {
+					message.push('\n');
+				}
+				Cow::Owned(message)
+			},
+		};
 		let mut author_time = gix::date::parse::TimeBuf::default();
 		let mut committer_time = gix::date::parse::TimeBuf::default();
 		let author = author.to_ref(&mut author_time);
@@ -335,6 +459,48 @@ impl GitRepo {
 		};
 		let id = {
 			let repo = self.gix_fresh()?;
+			let index_update = if let Some((_, _, files, original)) = &mut path_index {
+				// Read after locking so entries staged during hooks are preserved.
+				let mut lock = gix::lock::File::acquire_to_update_resource(
+					repo.index_path(),
+					gix::lock::acquire::Fail::Immediately,
+					None,
+				)
+				.map_err(|err| Error::backend("git commit lock index", err))?;
+				let mut shared = load_index_or_head(&repo, "git commit")?;
+				files.retain(|path| {
+					let path = path.as_bytes().as_bstr();
+					let before = original
+						.entry_by_path(path)
+						.map(|entry| (entry.id, entry.mode, entry.flags));
+					let now = shared
+						.entry_by_path(path)
+						.map(|entry| (entry.id, entry.mode, entry.flags));
+					before == now
+				});
+				if files.is_empty() {
+					None
+				} else {
+					let committed = index_for_tree(&repo, Some(&tree))?;
+					copy_index_paths(&mut shared, &committed, files);
+					let racy_from = shared.timestamp();
+					for entry in shared.entries_mut() {
+						if entry.stat.is_racy(racy_from, Default::default()) {
+							entry.stat = gix::index::entry::Stat::default();
+						}
+					}
+					{
+						let mut out = BufWriter::new(&mut lock);
+						shared
+							.write_to(&mut out, INDEX_WRITE)
+							.map_err(|err| Error::backend("git commit write index", err))?;
+						out.flush()?;
+					}
+					Some(lock)
+				}
+			} else {
+				None
+			};
 			let id = match signed {
 				Some(id) => id,
 				None => {
@@ -370,6 +536,11 @@ impl GitRepo {
 					deref:  true,
 				})
 				.map_err(|err| Error::backend("git commit", err))?;
+			if let Some(lock) = index_update {
+				lock
+					.commit()
+					.map_err(|err| Error::backend("git commit publish index", err))?;
+			}
 			id
 		};
 		let _ = run_commit_hook(self, "post-commit", &[], &process).await;
@@ -1304,9 +1475,8 @@ pub fn detach_git_dir(
 /// Author signature for an explicit [`CommitAuthor`]; a missing date means now.
 fn signature_for(author: &CommitAuthor) -> Result<gix::actor::Signature> {
 	let time = match &author.date {
-		Some(date) => {
-			gix::date::parse(date, None).map_err(|err| Error::backend("git commit", err))?
-		},
+		Some(date) => gix::date::parse(date.strip_prefix('@').unwrap_or(date), None)
+			.map_err(|err| Error::backend("git commit", err))?,
 		None => gix::date::Time::now_local_or_utc(),
 	};
 	Ok(gix::actor::Signature {
@@ -2502,7 +2672,7 @@ mod tests {
 				"alt",
 				&CommitOptions {
 					index_path: Some(alt.clone()),
-					expected_head: Some(head),
+					expected_head: Some(Some(head)),
 					..Default::default()
 				},
 				None,
@@ -2529,6 +2699,28 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn path_only_commit_from_explicit_index_does_not_read_worktree_or_write_shared_index() {
+		let (temp, repo) = fixture();
+		fs::write(temp.path().join("a"), "working copy\n").unwrap();
+		fs::write(temp.path().join("b"), "unrelated staged\n").unwrap();
+		git(temp.path(), &["add", "b"]);
+		let index_before = fs::read(temp.path().join(".git/index")).unwrap();
+		let alt = alternate_index(&temp);
+		repo
+			.commit_create(
+				"explicit selected index",
+				&CommitOptions { files: vec!["a".into()], index_path: Some(alt), ..Default::default() },
+				None,
+			)
+			.await
+			.unwrap();
+		assert_eq!(git(temp.path(), &["show", "HEAD:a"]), "alt");
+		assert_eq!(git(temp.path(), &["show", "HEAD:b"]), "two");
+		assert_eq!(fs::read(temp.path().join(".git/index")).unwrap(), index_before);
+		assert_eq!(fs::read(temp.path().join("a")).unwrap(), b"working copy\n");
+	}
+
+	#[tokio::test]
 	async fn commit_expected_head_mismatch_is_head_moved() {
 		let (temp, repo) = fixture();
 		let base = git(temp.path(), &["rev-parse", "HEAD"]);
@@ -2541,7 +2733,7 @@ mod tests {
 					"stale",
 					&CommitOptions {
 						index_path: Some(alt.clone()),
-						expected_head: Some(base.clone()),
+						expected_head: Some(Some(base.clone())),
 						amend,
 						..Default::default()
 					},
@@ -2553,6 +2745,239 @@ mod tests {
 			assert!(matches!(&err, Error::HeadMoved { expected, actual }
 				if *expected == base && actual.as_deref() == Some(moved.as_str())));
 			assert_eq!(git(temp.path(), &["rev-parse", "HEAD"]), moved);
+		}
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn commit_expected_unborn_rejects_a_first_commit_from_pre_commit() {
+		let (temp, repo) = fixture();
+		git(temp.path(), &["checkout", "-q", "--orphan", "unborn"]);
+		let alt = temp.path().join(".git/empty-index");
+		repo
+			.apply_patch(
+				"diff --git a/selected b/selected\nnew file mode 100644\n--- /dev/null\n+++ \
+				 b/selected\n@@ -0,0 +1 @@\n+selected\n",
+				&crate::types::ApplyOptions {
+					cached: true,
+					index_path: Some(alt.clone()),
+					..Default::default()
+				},
+			)
+			.unwrap();
+		write_hook(
+			&temp.path().join(".git/hooks/pre-commit"),
+			"unset GIT_INDEX_FILE\ngit -c core.hooksPath=/dev/null commit -qm 'concurrent first'",
+			true,
+		);
+		let error = repo
+			.commit_create(
+				"stale root",
+				&CommitOptions {
+					index_path: Some(alt),
+					expected_head: Some(None),
+					..Default::default()
+				},
+				None,
+			)
+			.await
+			.unwrap_err();
+		let first = git(temp.path(), &["rev-parse", "HEAD"]);
+		assert!(matches!(
+			error,
+			Error::HeadMoved { expected, actual }
+				if expected == "unborn HEAD" && actual.as_deref() == Some(first.as_str())
+		));
+		assert_eq!(git(temp.path(), &["log", "-1", "--format=%s"]), "concurrent first");
+		assert_eq!(git(temp.path(), &["rev-list", "--count", "HEAD"]), "1");
+		assert_eq!(git(temp.path(), &["ls-tree", "--name-only", "HEAD"]), "a\nb");
+		assert_eq!(git(temp.path(), &["show", ":a"]), "one");
+		assert_eq!(git(temp.path(), &["show", ":b"]), "two");
+	}
+
+	#[tokio::test]
+	async fn path_only_commit_uses_worktree_bytes_and_preserves_other_staged_entries() {
+		for stale_stage in [false, true] {
+			let (temp, repo) = fixture();
+			fs::write(temp.path().join("b"), "someone else's staged content\n").unwrap();
+			git(temp.path(), &["add", "b"]);
+			let staged_b = git(temp.path(), &["rev-parse", ":b"]);
+			if stale_stage {
+				fs::write(temp.path().join("a"), "stale staged content\n").unwrap();
+				git(temp.path(), &["add", "a"]);
+			}
+			fs::write(temp.path().join("a"), "selected working copy\n").unwrap();
+			let id = repo
+				.commit_create(
+					"selected",
+					&CommitOptions { files: vec!["a".into()], ..Default::default() },
+					None,
+				)
+				.await
+				.unwrap();
+			assert_eq!(git(temp.path(), &["rev-parse", "HEAD"]), id);
+			assert_eq!(git(temp.path(), &["show", "HEAD:a"]), "selected working copy");
+			assert_eq!(git(temp.path(), &["show", "HEAD:b"]), "two");
+			assert_eq!(git(temp.path(), &["show", ":a"]), "selected working copy");
+			assert_eq!(git(temp.path(), &["rev-parse", ":b"]), staged_b);
+			assert_eq!(git(temp.path(), &["diff", "--cached", "--name-only"]), "b");
+			assert_eq!(fs::read(temp.path().join("a")).unwrap(), b"selected working copy\n");
+			assert_eq!(git(temp.path(), &["diff", "--name-only"]), "");
+		}
+	}
+
+	#[tokio::test]
+	async fn path_only_commit_records_worktree_deletions_without_reversing_stale_staging() {
+		for stale_stage in [false, true] {
+			let (temp, repo) = fixture();
+			fs::write(temp.path().join("b"), "unrelated staged\n").unwrap();
+			git(temp.path(), &["add", "b"]);
+			if stale_stage {
+				fs::write(temp.path().join("a"), "stale staged\n").unwrap();
+				git(temp.path(), &["add", "a"]);
+			}
+			fs::remove_file(temp.path().join("a")).unwrap();
+			repo
+				.commit_create(
+					"delete selected",
+					&CommitOptions { files: vec!["a".into()], ..Default::default() },
+					None,
+				)
+				.await
+				.unwrap();
+			assert_eq!(git(temp.path(), &["ls-tree", "--name-only", "HEAD"]), "b");
+			assert_eq!(git(temp.path(), &["ls-files"]), "b");
+			assert_eq!(git(temp.path(), &["show", "HEAD:b"]), "two");
+			assert_eq!(git(temp.path(), &["show", ":b"]), "unrelated staged");
+			assert_eq!(git(temp.path(), &["diff", "--cached", "--name-only"]), "b");
+			assert_eq!(git(temp.path(), &["diff", "--name-only"]), "");
+		}
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn path_only_commit_preserves_entries_staged_during_awaited_hooks() {
+		let (temp, repo) = fixture();
+		fs::write(temp.path().join("a"), "selected before hook\n").unwrap();
+		fs::write(temp.path().join("b"), "staged before hook\n").unwrap();
+		git(temp.path(), &["add", "b"]);
+		write_hook(
+			&temp.path().join(".git/hooks/pre-commit"),
+			"unset GIT_INDEX_FILE\nprintf 'a staged during hook\\n' > a\nprintf 'b staged during \
+			 hook\\n' > b\nprintf 'new staged during hook\\n' > c\ngit add a b c",
+			true,
+		);
+		repo
+			.commit_create(
+				"selected before hook",
+				&CommitOptions { files: vec!["a".into()], ..Default::default() },
+				None,
+			)
+			.await
+			.unwrap();
+		assert_eq!(git(temp.path(), &["show", "HEAD:a"]), "selected before hook");
+		assert_eq!(git(temp.path(), &["show", "HEAD:b"]), "two");
+		assert_eq!(git(temp.path(), &["ls-tree", "--name-only", "HEAD"]), "a\nb");
+		assert_eq!(git(temp.path(), &["show", ":a"]), "a staged during hook");
+		assert_eq!(git(temp.path(), &["show", ":b"]), "b staged during hook");
+		assert_eq!(git(temp.path(), &["show", ":c"]), "new staged during hook");
+		assert_eq!(git(temp.path(), &["diff", "--cached", "--name-only"]), "a\nb\nc");
+		assert_eq!(git(temp.path(), &["diff", "--name-only"]), "");
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn path_only_commit_hooks_edit_the_selected_private_index() {
+		let (temp, repo) = fixture();
+		fs::write(temp.path().join("a"), "selected\n").unwrap();
+		fs::write(temp.path().join("b"), "unrelated staged\n").unwrap();
+		git(temp.path(), &["add", "b"]);
+		write_hook(
+			&temp.path().join(".git/hooks/pre-commit"),
+			"test \"$(git show :a)\" = selected || exit 1\ntest \"$(git show :b)\" = two || exit \
+			 1\nprintf 'hook selected\\n' > a\ngit add a",
+			true,
+		);
+		repo
+			.commit_create(
+				"hook selected",
+				&CommitOptions { files: vec!["a".into()], ..Default::default() },
+				None,
+			)
+			.await
+			.unwrap();
+		assert_eq!(git(temp.path(), &["show", "HEAD:a"]), "hook selected");
+		assert_eq!(git(temp.path(), &["show", "HEAD:b"]), "two");
+		assert_eq!(git(temp.path(), &["show", ":a"]), "hook selected");
+		assert_eq!(git(temp.path(), &["show", ":b"]), "unrelated staged");
+		assert_eq!(git(temp.path(), &["diff", "--cached", "--name-only"]), "b");
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn interleaved_commit_msg_hooks_keep_messages_owned_and_head_compare_and_swap() {
+		async fn wait_for(path: &Path) -> bool {
+			tokio::time::timeout(std::time::Duration::from_secs(10), async {
+				while !path.exists() {
+					tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+				}
+			})
+			.await
+			.is_ok()
+		}
+
+		let (temp, repo) = fixture();
+		write_hook(
+			&temp.path().join(".git/hooks/commit-msg"),
+			"IFS= read -r subject < \"$1\"\nprintf '%s' \"$1\" > \".git/message-$subject-path\"\n: > \
+			 \".git/$subject-ready\"\nwhile test ! -f \".git/release-$subject\"; do sleep 0.01; \
+			 done\nprintf '\\nchecked:%s\\n' \"$subject\" >> \"$1\"",
+			true,
+		);
+		let cancel = CancellationToken::new();
+		let options = CommitOptions { allow_empty: true, ..Default::default() };
+		let first = async {
+			let result = repo
+				.commit_create("first\n", &options, Some(cancel.clone()))
+				.await;
+			fs::write(temp.path().join(".git/first-done"), b"").unwrap();
+			result
+		};
+		let second = async {
+			if !wait_for(&temp.path().join(".git/first-ready")).await {
+				cancel.cancel();
+				return Err(Error::backend("test", "first commit-msg hook did not start"));
+			}
+			repo
+				.commit_create("second\n", &options, Some(cancel.clone()))
+				.await
+		};
+		let release = async {
+			if !wait_for(&temp.path().join(".git/second-ready")).await {
+				cancel.cancel();
+				return false;
+			}
+			fs::write(temp.path().join(".git/release-first"), b"").unwrap();
+			if !wait_for(&temp.path().join(".git/first-done")).await {
+				cancel.cancel();
+				return false;
+			}
+			fs::write(temp.path().join(".git/release-second"), b"").unwrap();
+			true
+		};
+		let (first, second, released) = tokio::join!(first, second, release);
+		assert!(released, "commit-msg rendezvous did not complete");
+		let first = first.unwrap();
+		assert!(second.is_err(), "the second commit must lose the captured HEAD CAS");
+		assert_eq!(git(temp.path(), &["rev-parse", "HEAD"]), first);
+		assert_eq!(git(temp.path(), &["log", "-1", "--format=%B"]), "first\n\nchecked:first");
+		for subject in ["first", "second"] {
+			let message_path =
+				fs::read_to_string(temp.path().join(format!(".git/message-{subject}-path"))).unwrap();
+			assert!(
+				!Path::new(&message_path).exists(),
+				"finished commit must release its message file"
+			);
 		}
 	}
 

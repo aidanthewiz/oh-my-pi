@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { vcsDiscover, vcsGitClone, vcsGitDiscover, vcsGitRepoInfo } from "../native/index.js";
@@ -32,6 +32,8 @@ async function repository() {
 	await git(root, "init", "-b", "main");
 	await git(root, "config", "user.name", "Native Test");
 	await git(root, "config", "user.email", "native@example.test");
+	await git(root, "config", "commit.gpgSign", "false");
+	await git(root, "config", "core.hooksPath", ".git/hooks");
 	// Assertions compare exact LF bytes; Git for Windows' system
 	// `core.autocrlf=true` would check files out as CRLF.
 	await git(root, "config", "core.autocrlf", "false");
@@ -91,6 +93,59 @@ describe("in-process VCS bindings", () => {
 		const sha = await repo!.commitCreate("native commit", {});
 		expect(sha).toBe(await git(root, "rev-parse", "HEAD"));
 	});
+
+	test("path-only commits use tracked working copies instead of stale staged bytes", async () => {
+		for (const staleStage of [false, true]) {
+			const root = await repository();
+			const repo = vcsGitDiscover(root)!;
+			await writeFile(join(root, "unrelated.txt"), "unrelated staged\n");
+			await git(root, "add", "unrelated.txt");
+			const unrelated = await git(root, "rev-parse", ":unrelated.txt");
+			if (staleStage) {
+				await writeFile(join(root, "tracked.txt"), "stale staged\n");
+				await git(root, "add", "tracked.txt");
+			}
+			await writeFile(join(root, "tracked.txt"), "selected working copy\n");
+			const sha = await repo.commitCreate("selected", { files: ["tracked.txt"] });
+
+			expect(await git(root, "rev-parse", "HEAD")).toBe(sha);
+			expect(await git(root, "show", "HEAD:tracked.txt")).toBe("selected working copy");
+			expect(await git(root, "ls-tree", "--name-only", "HEAD")).toBe("tracked.txt");
+			expect(await git(root, "show", ":tracked.txt")).toBe("selected working copy");
+			expect(await git(root, "rev-parse", ":unrelated.txt")).toBe(unrelated);
+			expect(await git(root, "diff", "--cached", "--name-only")).toBe("unrelated.txt");
+			expect(await git(root, "diff", "--name-only")).toBe("");
+		}
+	});
+
+	test.skipIf(process.platform === "win32")(
+		"an explicit unborn guard rejects an interleaved first commit",
+		async () => {
+			const root = await repository();
+			await git(root, "checkout", "--orphan", "unborn");
+			const repo = vcsGitDiscover(root)!;
+			const indexPath = join(root, ".git", "private.index");
+			await repo.applyPatch(
+				"diff --git a/selected.txt b/selected.txt\nnew file mode 100644\n--- /dev/null\n+++ b/selected.txt\n@@ -0,0 +1 @@\n+selected\n",
+				{ cached: true, indexPath },
+			);
+			const hook = join(root, ".git", "hooks", "pre-commit");
+			await writeFile(
+				hook,
+				"#!/bin/sh\nunset GIT_INDEX_FILE\ngit -c core.hooksPath=/dev/null commit -qm 'concurrent first'\n",
+			);
+			await chmod(hook, 0o755);
+
+			await expect(repo.commitCreate("stale root", { indexPath, expectedHead: null })).rejects.toMatchObject({
+				name: "VcsError",
+				code: "HeadMoved",
+			});
+			expect(await git(root, "log", "-1", "--format=%s")).toBe("concurrent first");
+			expect(await git(root, "rev-list", "--count", "HEAD")).toBe("1");
+			expect(await git(root, "ls-tree", "--name-only", "HEAD")).toBe("tracked.txt");
+			expect(await git(root, "show", ":tracked.txt")).toBe("one\ntwo");
+		},
+	);
 
 	test("throws rich VcsError objects", async () => {
 		const root = await repository();

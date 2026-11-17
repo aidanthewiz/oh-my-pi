@@ -844,29 +844,13 @@ export async function mergeIsolatedChanges(opts: IsolationMergeOptions): Promise
 				hadAnyChanges = false;
 			} else {
 				const normalized = patchText.endsWith("\n") ? patchText : `${patchText}\n`;
-				const touched = opts.recordFileChange
-					? await Promise.all(
-							patchPaths(normalized).map(async file => {
-								const absolute = path.join(repoRoot, file);
-								return { absolute, before: await readSnapshot(absolute) };
-							}),
-						)
-					: [];
-				({ changesApplied, hadAnyChanges } = await applyRootPatch(repo, repoRoot, normalized));
-				if (changesApplied && hadAnyChanges) {
-					for (const { absolute, before } of touched) {
-						const after = await readSnapshot(absolute);
-						if (!before || !after || before.text === after.text) continue;
-						opts.recordFileChange?.({
-							path: absolute,
-							tool: "task",
-							before: before.text,
-							after: after.text,
-							beforeMtimeMs: before.mtimeMs,
-							agent: { agent: result.id, parent: opts.parentAgentId },
-						});
-					}
-				}
+				const record = opts.recordFileChange;
+				({ changesApplied, hadAnyChanges } = await applyRootPatch(
+					repo,
+					repoRoot,
+					normalized,
+					record ? { record, agent: result.id, parent: opts.parentAgentId } : undefined,
+				));
 			}
 		}
 
@@ -902,15 +886,15 @@ export async function mergeIsolatedChanges(opts: IsolationMergeOptions): Promise
 /**
  * Check and apply one isolated run's root patch to the parent worktree.
  *
- * Holds the per-repo lock across the checks and the apply: `git apply`
- * rewrites each touched file whole, so concurrent merge-backs touching the
- * same file would otherwise read the same preimage and the last writer would
- * silently drop the others' hunks while every caller reports success.
+ * Holds the per-repo lock across checks, apply, and ownership journaling.
+ * Concurrent merge-backs must neither overwrite each other's hunks nor
+ * attribute another agent's changes to their own snapshot.
  */
 async function applyRootPatch(
 	repo: natives.VcsGitRepo,
 	repoRoot: string,
 	patch: string,
+	journal?: { record: (change: FileChangeReport) => void; agent: string; parent?: string },
 ): Promise<{ changesApplied: boolean; hadAnyChanges: boolean }> {
 	return withRepoLock(repoRoot, async () => {
 		// Idempotence: declare a no-op only when the reverse patch applies AND
@@ -927,12 +911,32 @@ async function applyRootPatch(
 		]);
 		if (alreadyApplied && !forwardApplies) return { changesApplied: true, hadAnyChanges: false };
 		if (!forwardApplies) return { changesApplied: false, hadAnyChanges: false };
+		const touched = journal
+			? await Promise.all(
+					patchPaths(patch).map(async file => {
+						const absolute = path.join(repoRoot, file);
+						return { absolute, before: await readSnapshot(absolute) };
+					}),
+				)
+			: [];
 		try {
 			await repo.applyPatch(patch, {});
-			return { changesApplied: true, hadAnyChanges: true };
 		} catch {
 			return { changesApplied: false, hadAnyChanges: false };
 		}
+		for (const { absolute, before } of touched) {
+			const after = await readSnapshot(absolute);
+			if (!before || !after || before.text === after.text) continue;
+			journal?.record({
+				path: absolute,
+				tool: "task",
+				before: before.text,
+				after: after.text,
+				beforeMtimeMs: before.mtimeMs,
+				agent: { agent: journal.agent, parent: journal.parent },
+			});
+		}
+		return { changesApplied: true, hadAnyChanges: true };
 	});
 }
 

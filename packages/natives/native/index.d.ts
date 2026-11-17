@@ -4264,11 +4264,18 @@ export interface VcsCommitOptions {
   author?: VcsCommitAuthor
   allowEmpty?: boolean
   amend?: boolean
+  /**
+   * Commit working copies of tracked paths, or entries from `indexPath`.
+   * Keep any newer content staged concurrently during hooks.
+   */
   files?: Array<string>
   /** Build the commit from this index file instead of the repository's. */
   indexPath?: string
-  /** Fail with `HeadMoved` unless HEAD resolves to this revision. */
-  expectedHead?: string
+  /**
+   * Fail with `HeadMoved` unless HEAD matches this revision; `null` requires
+   * an unborn HEAD. Omit to disable the caller guard.
+   */
+  expectedHead?: string | null
   /** Skip the `pre-commit` and `commit-msg` hooks (`git commit --no-verify`). */
   noVerify?: boolean
   env?: Record<string, string>
