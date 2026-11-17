@@ -17,6 +17,7 @@ import {
 	stripWindowsExtendedLengthPathPrefix,
 } from "@oh-my-pi/pi-utils";
 import { registerPluginCacheInvalidator } from "../../discovery/helpers";
+import { isModuleNamespaceObject } from "node:util/types";
 
 const USE_BUNDLED_PI_MODULES = isCompiledBinary() || Boolean(process.env.PI_BUNDLED);
 
@@ -618,9 +619,9 @@ function collectExtensionSpecifierReferences(
 	return references;
 }
 
-const EXTENSION_PARSE_CACHE_SCHEMA_VERSION = 6;
+const EXTENSION_PARSE_CACHE_SCHEMA_VERSION = 7;
 const CREATE_EXTENSION_PARSE_CACHE_TABLE =
-	"CREATE TABLE IF NOT EXISTS extension_parse_cache (cache_key TEXT PRIMARY KEY, source_type TEXT NOT NULL, [references] TEXT NOT NULL, commonjs_syntax INTEGER NOT NULL)";
+	"CREATE TABLE IF NOT EXISTS extension_parse_cache (cache_key TEXT PRIMARY KEY, source_type TEXT NOT NULL, [references] TEXT NOT NULL, commonjs_syntax INTEGER NOT NULL, dynamic_import_binding TEXT)";
 const EXTENSION_PARSE_CACHE_MAX_BYTES = 8 * 1024 * 1024;
 const EXTENSION_PARSE_CACHE_MAX_ENTRIES = 10_000;
 
@@ -629,12 +630,14 @@ interface ExtensionSourceAnalysis {
 	readonly references: readonly ExtensionSpecifierReference[];
 	/** Script source with an unshadowed `require(...)`, `exports`, or `module.exports` use. Always false for modules. */
 	readonly hasCommonJsSyntax: boolean;
+	readonly dynamicImportBinding: string | null;
 }
 
 interface ExtensionParseCacheRow {
 	source_type: "script" | "module";
 	references: string;
 	commonjs_syntax: number;
+	dynamic_import_binding: string | null;
 }
 
 let extensionParseCacheDb: Database | null | undefined;
@@ -741,10 +744,19 @@ function parseCachedAnalysis(row: ExtensionParseCacheRow): ExtensionSourceAnalys
 		) {
 			return null;
 		}
+		if (
+			(row.dynamic_import_binding !== null &&
+				(typeof row.dynamic_import_binding !== "string" ||
+					!/^[$A-Z_a-z][$\w]*$/.test(row.dynamic_import_binding))) ||
+			(references.some(reference => reference.kind === "dynamic-import") && row.dynamic_import_binding === null)
+		) {
+			return null;
+		}
 		return {
 			sourceType: row.source_type,
 			references: references as ExtensionSpecifierReference[],
 			hasCommonJsSyntax: row.commonjs_syntax === 1,
+			dynamicImportBinding: row.dynamic_import_binding,
 		};
 	} catch {
 		return null;
@@ -757,8 +769,14 @@ function writeExtensionSourceAnalysis(cacheKey: string, analysis: ExtensionSourc
 			const db = getExtensionParseCacheDb();
 			if (!db) return;
 			db.run(
-				"INSERT OR REPLACE INTO extension_parse_cache (cache_key, source_type, [references], commonjs_syntax) VALUES (?, ?, ?, ?)",
-				[cacheKey, analysis.sourceType, JSON.stringify(analysis.references), analysis.hasCommonJsSyntax ? 1 : 0],
+				"INSERT OR REPLACE INTO extension_parse_cache (cache_key, source_type, [references], commonjs_syntax, dynamic_import_binding) VALUES (?, ?, ?, ?, ?)",
+				[
+					cacheKey,
+					analysis.sourceType,
+					JSON.stringify(analysis.references),
+					analysis.hasCommonJsSyntax ? 1 : 0,
+					analysis.dynamicImportBinding,
+				],
 			);
 			const count =
 				db.query<{ count: number }, []>("SELECT count(*) AS count FROM extension_parse_cache").get()?.count ?? 0;
@@ -773,6 +791,16 @@ function writeExtensionSourceAnalysis(cacheKey: string, analysis: ExtensionSourc
 		});
 }
 
+function dynamicImportBinding(ast: ParseResult, references: readonly ExtensionSpecifierReference[]): string | null {
+	if (!references.some(reference => reference.kind === "dynamic-import")) return null;
+	const identifiers = new Set(
+		collectScopedAstNodes(ast, node => node.type === "Identifier").map(({ node }) => node.name),
+	);
+	let binding = DYNAMIC_IMPORT_GLOBAL;
+	while (identifiers.has(binding)) binding += "_";
+	return binding;
+}
+
 function getExtensionSourceAnalysis(source: string, importerPath: string): ExtensionSourceAnalysis {
 	const cacheKey = extensionParseCacheKey(source, importerPath);
 	const memoryCached = extensionSourceAnalysisCache.get(cacheKey);
@@ -782,7 +810,7 @@ function getExtensionSourceAnalysis(source: string, importerPath: string): Exten
 	try {
 		const row = db
 			?.query<ExtensionParseCacheRow, [string]>(
-				"SELECT source_type, [references], commonjs_syntax FROM extension_parse_cache WHERE cache_key = ?",
+				"SELECT source_type, [references], commonjs_syntax, dynamic_import_binding FROM extension_parse_cache WHERE cache_key = ?",
 			)
 			.get(cacheKey);
 		if (row) {
@@ -800,9 +828,11 @@ function getExtensionSourceAnalysis(source: string, importerPath: string): Exten
 
 	const ast = parseExtensionSource(source, importerPath);
 	const sourceType = ast.program.sourceType;
+	const references = collectExtensionSpecifierReferences(source, importerPath, ast);
 	const analysis: ExtensionSourceAnalysis = {
 		sourceType,
-		references: collectExtensionSpecifierReferences(source, importerPath, ast),
+		references,
+		dynamicImportBinding: dynamicImportBinding(ast, references),
 		hasCommonJsSyntax:
 			sourceType === "script" &&
 			collectScopedAstNodes(ast, node => node.type === "CallExpression" || node.type === "MemberExpression").some(
@@ -824,15 +854,17 @@ function createSpecifierReplacements(
 	reference: ExtensionSpecifierReference,
 	target: ResolvedExtensionSpecifier,
 	importerPath: string,
+	binding: string | null,
 ): ExtensionSourceReplacement[] {
 	if (reference.kind !== "dynamic-import") {
 		return [{ start: reference.start, end: reference.end, replacement: JSON.stringify(target.specifier) }];
 	}
+	if (!binding) throw new Error("Missing dynamic import bridge binding");
 	return [
 		{
 			start: reference.callStart,
 			end: reference.optionsStart,
-			replacement: `(globalThis[${JSON.stringify(DYNAMIC_IMPORT_GLOBAL)}](${JSON.stringify(target.graphContextKey)}, ${JSON.stringify(importerPath)}, (`,
+			replacement: `(${binding}(${JSON.stringify(target.graphContextKey)}, ${JSON.stringify(importerPath)}, (`,
 		},
 		{
 			start: reference.optionsEnd,
@@ -842,12 +874,21 @@ function createSpecifierReplacements(
 	];
 }
 
-function applySpecifierReplacements(source: string, replacements: readonly ExtensionSourceReplacement[]): string {
+function applySpecifierReplacements(
+	source: string,
+	replacements: readonly ExtensionSourceReplacement[],
+	binding: string | null = null,
+): string {
 	let rewritten = source;
 	for (const reference of [...replacements].sort((left, right) => right.start - left.start)) {
 		rewritten = `${rewritten.slice(0, reference.start)}${reference.replacement}${rewritten.slice(reference.end)}`;
 	}
-	return rewritten;
+	if (!binding) return rewritten;
+	const prelude = `import ${binding} from ${JSON.stringify(DYNAMIC_IMPORT_SPECIFIER)};\n`;
+	const hashbangEnd = rewritten.startsWith("#!") ? rewritten.indexOf("\n") : -1;
+	return hashbangEnd >= 0
+		? `${rewritten.slice(0, hashbangEnd + 1)}${prelude}${rewritten.slice(hashbangEnd + 1)}`
+		: prelude + rewritten;
 }
 
 const loadedBundledModules: Record<string, BundledModule> = {};
@@ -1262,7 +1303,8 @@ async function rewriteLegacyExtensionSource(
 	// Compiled mode completes the override map from the build-supplied module
 	// keys on first use; every rewrite path must see the full map.
 	await ensureLegacyPiOverridesReady();
-	const references = getExtensionSourceAnalysis(source, importerPath).references;
+	const analysis = getExtensionSourceAnalysis(source, importerPath);
+	const { references } = analysis;
 	const replacements: ExtensionSourceReplacement[] = [];
 	for (const reference of references) {
 		if (reference.kind !== "import" && reference.kind !== "dynamic-import") continue;
@@ -1298,6 +1340,7 @@ async function rewriteLegacyExtensionSource(
 					reference,
 					{ specifier: replacement ?? specifier, graphContextKey: graphContext?.key ?? null },
 					importerPath,
+					analysis.dynamicImportBinding,
 				),
 			);
 		}
@@ -1307,7 +1350,7 @@ async function rewriteLegacyExtensionSource(
 	// would give every load a fresh parse-cache key and force a Babel reparse.
 	// Import and require references never overlap, so one pass applies both.
 	replacements.push(...(await collectExtensionSpecifierReplacements(source, importerPath)));
-	return applySpecifierReplacements(source, replacements);
+	return applySpecifierReplacements(source, replacements, analysis.dynamicImportBinding);
 }
 
 /** Test seam for compiled-binary legacy extension source rewriting. */
@@ -2159,9 +2202,8 @@ async function collectExtensionSpecifierReplacements(
 	sources?: ExtensionGraphSources,
 	graphContext?: ExtensionGraphContext,
 ): Promise<ExtensionSourceReplacement[]> {
-	const { references } = sources
-		? await sources.analyze(importerPath)
-		: getExtensionSourceAnalysis(source, importerPath);
+	const analysis = sources ? await sources.analyze(importerPath) : getExtensionSourceAnalysis(source, importerPath);
+	const { references } = analysis;
 	const resolvedSpecifierTargets = new Map<string, ResolvedExtensionSpecifier>();
 	const replacements: ExtensionSourceReplacement[] = [];
 	for (const reference of references) {
@@ -2170,7 +2212,9 @@ async function collectExtensionSpecifierReplacements(
 			if (replacement && replacement !== reference.specifier) {
 				const target = { specifier: replacement, graphContextKey: null };
 				resolvedSpecifierTargets.set(`${reference.kind}\0${reference.specifier}`, target);
-				replacements.push(...createSpecifierReplacements(reference, target, importerPath));
+				replacements.push(
+					...createSpecifierReplacements(reference, target, importerPath, analysis.dynamicImportBinding),
+				);
 			}
 			continue;
 		}
@@ -2199,7 +2243,7 @@ async function collectExtensionSpecifierReplacements(
 			graphContextKey: graphContext?.key ?? null,
 		};
 		resolvedSpecifierTargets.set(`${reference.kind}\0${reference.specifier}`, target);
-		replacements.push(...createSpecifierReplacements(reference, target, importerPath));
+		replacements.push(...createSpecifierReplacements(reference, target, importerPath, analysis.dynamicImportBinding));
 	}
 	extensionSynchronousSpecifierTargets.set(importerPath, resolvedSpecifierTargets);
 	return replacements;
@@ -2211,10 +2255,13 @@ function rewriteExtensionSpecifiersFromCache(source: string, importerPath: strin
 		return source;
 	}
 	const replacements: ExtensionSourceReplacement[] = [];
-	for (const reference of getExtensionSourceAnalysis(source, importerPath).references) {
+	const analysis = getExtensionSourceAnalysis(source, importerPath);
+	for (const reference of analysis.references) {
 		const target = resolvedSpecifierTargets.get(`${reference.kind}\0${reference.specifier}`);
 		if (target) {
-			replacements.push(...createSpecifierReplacements(reference, target, importerPath));
+			replacements.push(
+				...createSpecifierReplacements(reference, target, importerPath, analysis.dynamicImportBinding),
+			);
 		}
 	}
 	return applySpecifierReplacements(source, replacements);
@@ -2271,18 +2318,32 @@ const synchronousModuleSources = new Map<string, string>();
 const commonJsGraphModulePaths = new Set<string>();
 const COMMONJS_REQUIRE_GLOBAL = "__ompLegacyPiRequireGraphModule";
 const DYNAMIC_IMPORT_GLOBAL = "__ompLegacyPiImportWithOptions";
+const DYNAMIC_IMPORT_NAMESPACE = "omp-legacy-pi-import-options";
+const DYNAMIC_IMPORT_SPECIFIER = `${DYNAMIC_IMPORT_NAMESPACE}:options`;
 
 interface ExtensionGraphContext {
 	readonly key: string;
 	readonly entryRealPath: string;
+	readonly mtimeTag: string | null;
 	readonly activeDynamicImports: Map<string, Set<string>>;
 	readonly preparedModules: Map<string, "commonjs" | "sync" | "async">;
+	readonly loadedModules: Map<string, Set<string>>;
+	readonly esmBranchPaths: Set<string>;
 	pending?: Promise<void>;
+}
+
+interface ExtensionGraphActivation {
+	readonly importerPath: string;
+	readonly specifier: string;
 }
 
 const extensionGraphContexts = new Map<string, ExtensionGraphContext>();
 const latestExtensionGraphContexts = new Map<string, ExtensionGraphContext>();
-const commonJsModuleDefinitions = new Map<string, { source: string; filename: string; dirname: string }>();
+const commonJsModuleDefinitions = new Map<
+	string,
+	{ source: string; filename: string; dirname: string; dynamicImportBinding: string | null }
+>();
+const commonJsModuleGraphContexts = new Map<string, ExtensionGraphContext>();
 const commonJsModuleCache = new Map<
 	string,
 	{
@@ -2295,6 +2356,30 @@ const commonJsModuleCache = new Map<
 	}
 >();
 const commonJsTypeScriptTranspiler = new Bun.Transpiler({ loader: "ts" });
+
+function loadedExtensionModuleKind(
+	graphContext: ExtensionGraphContext | undefined,
+	modulePath: string,
+): "commonjs" | "sync" | "async" | undefined {
+	const kind = graphContext?.preparedModules.get(modulePath);
+	return kind && graphContext?.loadedModules.has(modulePath) ? kind : undefined;
+}
+
+function recordLoadedExtensionModule(
+	graphContext: ExtensionGraphContext | undefined,
+	modulePath: string,
+	loadPath = modulePath,
+): void {
+	if (!graphContext || (loadPath !== modulePath && loadPath !== `${modulePath}?mtime=${graphContext.mtimeTag}`)) {
+		return;
+	}
+	let identities = graphContext.loadedModules.get(modulePath);
+	if (!identities) {
+		identities = new Set();
+		graphContext.loadedModules.set(modulePath, identities);
+	}
+	identities.add(loadPath);
+}
 
 /**
  * Node-compatible `require.cache` for graph-owned CommonJS: Bun's process-wide
@@ -2326,16 +2411,26 @@ function getCommonJsRequireCache(cache: NodeJS.Dict<NodeJS.Module>): NodeJS.Dict
 	return commonJsRequireCache;
 }
 
-function evaluateGraphCommonJs(modulePath: string): unknown {
+function evaluateGraphCommonJs(
+	modulePath: string,
+	graphContext = commonJsModuleGraphContexts.get(modulePath),
+): unknown {
 	const cached = commonJsModuleCache.get(modulePath);
 	if (cached) {
+		if (cached.loaded) recordLoadedExtensionModule(graphContext, modulePath);
 		return cached.exports;
 	}
 	let definition = commonJsModuleDefinitions.get(modulePath);
 	if (!definition && commonJsGraphModulePaths.has(modulePath)) {
 		const targetPath = commonJsFallbackModulePaths.get(modulePath) ?? modulePath;
-		const source = rewriteExtensionSpecifiersFromCache(fs.readFileSync(targetPath, "utf8"), modulePath);
-		prepareGraphCommonJsDefinition(modulePath, source, targetPath);
+		const raw = fs.readFileSync(targetPath, "utf8");
+		const source = rewriteExtensionSpecifiersFromCache(raw, modulePath);
+		prepareGraphCommonJsDefinition(
+			modulePath,
+			source,
+			targetPath,
+			getExtensionSourceAnalysis(raw, modulePath).dynamicImportBinding,
+		);
 		definition = commonJsModuleDefinitions.get(modulePath);
 	}
 	if (!definition) {
@@ -2369,7 +2464,36 @@ function evaluateGraphCommonJs(modulePath: string): unknown {
 			} catch {
 				// Builtins and virtual modules have no filesystem realpath.
 			}
-			return commonJsGraphModulePaths.has(graphPath) ? evaluateGraphCommonJs(graphPath) : nativeRequire(specifier);
+			if (commonJsGraphModulePaths.has(graphPath)) {
+				return evaluateGraphCommonJs(graphPath, graphContext);
+			}
+			const loadedPaths = graphContext?.loadedModules.get(graphPath);
+			if (loadedPaths) {
+				// Bun's raw cache getter retrieves evaluated ESM without invoking async source hooks.
+				let cachedModule = loadedPaths.has(graphPath) ? nativeRequire.cache[graphPath] : undefined;
+				if (!cachedModule?.loaded) {
+					for (const loadPath of loadedPaths) {
+						const candidate = nativeRequire.cache[loadPath];
+						if (candidate?.loaded) {
+							cachedModule = candidate;
+							break;
+						}
+					}
+				}
+				if (cachedModule?.loaded) {
+					let exports = cachedModule.exports;
+					if (isModuleNamespaceObject(exports)) {
+						if (exports.__esModule === undefined) Reflect.set(exports, "__esModule", true);
+						exports = exports["module.exports"] ?? exports;
+						cachedModule.exports = exports;
+					}
+					return exports;
+				}
+				return nativeRequire(
+					loadedPaths.has(graphPath) ? graphPath : (loadedPaths.values().next().value ?? specifier),
+				);
+			}
+			return nativeRequire(specifier);
 		},
 		{
 			resolve: nativeRequire.resolve,
@@ -2379,10 +2503,16 @@ function evaluateGraphCommonJs(modulePath: string): unknown {
 		},
 	);
 	module.require = graphRequire;
-	const execute = new Function("exports", "require", "module", "__filename", "__dirname", definition.source);
+	const execute = definition.dynamicImportBinding
+		? new Function(
+				definition.dynamicImportBinding,
+				`return function(exports, require, module, __filename, __dirname) {\n${definition.source}\n};`,
+			)(Reflect.get(globalThis, DYNAMIC_IMPORT_GLOBAL))
+		: new Function("exports", "require", "module", "__filename", "__dirname", definition.source);
 	try {
 		execute.call(module.exports, module.exports, graphRequire, module, definition.filename, definition.dirname);
 		module.loaded = true;
+		recordLoadedExtensionModule(graphContext, modulePath);
 		return module.exports;
 	} catch (error) {
 		commonJsModuleCache.delete(modulePath);
@@ -2411,6 +2541,19 @@ export function ensureGraphCommonJsRequireRegistered(): void {
 ensureGraphCommonJsRequireRegistered();
 if (!Reflect.get(globalThis, DYNAMIC_IMPORT_GLOBAL)) {
 	Reflect.set(globalThis, DYNAMIC_IMPORT_GLOBAL, importExtensionWithOptions);
+	Bun.plugin({
+		name: DYNAMIC_IMPORT_NAMESPACE,
+		setup(build) {
+			build.onResolve(
+				{ filter: new RegExp(`^${escapeRegExp(DYNAMIC_IMPORT_SPECIFIER)}$`), namespace: "file" },
+				() => ({ path: "options", namespace: DYNAMIC_IMPORT_NAMESPACE }),
+			);
+			build.onLoad({ filter: /^options$/, namespace: DYNAMIC_IMPORT_NAMESPACE }, () => ({
+				exports: { default: Reflect.get(globalThis, DYNAMIC_IMPORT_GLOBAL) },
+				loader: "object",
+			}));
+		},
+	});
 }
 
 let legacyPiLoadTag = 0;
@@ -2443,11 +2586,13 @@ interface ExtensionModuleGraph {
 	readonly cacheBustResolvedImportModules: Set<string>;
 	readonly commonJsPaths: Set<string>;
 	readonly synchronousSourcePaths: Set<string>;
+	readonly dynamicImportBindings: Map<string, string>;
+	readonly esmBranchPaths: Set<string>;
 }
 
 /**
- * Walk the extension's import graph starting at `entryRealPath`, returning the
- * realpath of every reachable source module OMP must rewrite at load time.
+ * Walk new source reachable from an entry or one activated import edge.
+ * Stop at modules whose source or exports already belong to the module cache.
  * Relative imports, package `imports` aliases, and ESM bare dependencies are
  * graph-owned recursively because compiled Bun cannot resolve runtime
  * `node_modules` from those modules. Graph-owned CommonJS modules also own
@@ -2458,20 +2603,37 @@ interface ExtensionModuleGraph {
 async function collectExtensionModules(
 	entryRealPath: string,
 	graphContext?: ExtensionGraphContext,
+	activation?: ExtensionGraphActivation,
 ): Promise<ExtensionModuleGraph> {
 	const modules = new Map<string, string>();
 	const commonJsPaths = new Set<string>();
 	const synchronousSourcePaths = new Set<string>();
-	const queuedCacheBustResolvedImports = new Map<string, boolean>([[entryRealPath, true]]);
-	const queuedModuleKinds = new Map<string, ExtensionModuleKind>([[entryRealPath, "esm"]]);
-	const queuedEsmBranchPaths = new Set<string>();
+	const dynamicImportBindings = new Map<string, string>();
+	const rootFile = activation?.importerPath ?? entryRealPath;
+	const rootCacheBust = activation
+		? extensionGraphCacheBustResolvedImportModules.get(entryRealPath)?.has(rootFile) === true
+		: true;
+	const rootKind = graphContext?.preparedModules.get(rootFile) === "commonjs" ? "commonjs" : "esm";
+	const rootEsmBranch = activation !== undefined && graphContext?.esmBranchPaths.has(rootFile) === true;
+	const queuedCacheBustResolvedImports = new Map<string, boolean>([[rootFile, rootCacheBust]]);
+	const queuedModuleKinds = new Map<string, ExtensionModuleKind>([[rootFile, rootKind]]);
+	const queuedEsmBranchPaths = new Set<string>(rootEsmBranch ? [rootFile] : []);
 	const sources = new ExtensionGraphSources();
 	const queue: Array<{
 		file: string;
 		cacheBustResolvedImports: boolean;
 		moduleKind?: ExtensionModuleKind;
 		esmBranch?: boolean;
-	}> = [{ file: entryRealPath, cacheBustResolvedImports: true, moduleKind: "esm" }];
+		reference?: string;
+	}> = [
+		{
+			file: rootFile,
+			cacheBustResolvedImports: rootCacheBust,
+			moduleKind: rootKind,
+			esmBranch: rootEsmBranch,
+			reference: activation?.specifier,
+		},
+	];
 	while (queue.length > 0) {
 		const item = queue.pop();
 		if (!item) {
@@ -2481,33 +2643,37 @@ async function collectExtensionModules(
 		const cacheBustResolvedImports = queuedCacheBustResolvedImports.get(file) ?? item.cacheBustResolvedImports;
 		const inheritedModuleKind = queuedModuleKinds.get(file) ?? item.moduleKind;
 		const esmBranch = queuedEsmBranchPaths.has(file) || item.esmBranch === true;
-		if (modules.has(file)) {
+		if (modules.has(file) || (item.reference === undefined && loadedExtensionModuleKind(graphContext, file))) {
 			continue;
 		}
-		let source: string;
-		try {
-			source = await sources.read(file);
-		} catch {
-			continue;
-		}
-		modules.set(file, source);
-		const analysis = await sources.analyze(file);
-		const sourceIsCommonJs = await isGraphOwnedCommonJsModule(
-			sources,
-			file,
-			entryRealPath,
-			analysis.sourceType,
-			inheritedModuleKind,
-		);
-		if (sourceIsCommonJs) {
-			commonJsPaths.add(file);
-			commonJsGraphModulePaths.add(file);
+		let sourceIsCommonJs: boolean;
+		let references: readonly Pick<ExtensionSpecifierReference, "kind" | "specifier">[];
+		if (item.reference !== undefined) {
+			sourceIsCommonJs = inheritedModuleKind === "commonjs";
+			references = [{ kind: "import", specifier: item.reference }];
+		} else {
+			let source: string;
+			try {
+				source = await sources.read(file);
+			} catch {
+				continue;
+			}
+			modules.set(file, source);
+			const analysis = await sources.analyze(file);
+			sourceIsCommonJs = await isGraphOwnedCommonJsModule(
+				sources,
+				file,
+				entryRealPath,
+				analysis.sourceType,
+				inheritedModuleKind,
+			);
+			if (sourceIsCommonJs) {
+				commonJsPaths.add(file);
+				commonJsGraphModulePaths.add(file);
+			}
+			references = analysis.references;
 		}
 		const dir = path.dirname(file);
-		const activeImports = graphContext?.activeDynamicImports.get(file);
-		const references: readonly Pick<ExtensionSpecifierReference, "kind" | "specifier">[] = activeImports
-			? [...analysis.references, ...Array.from(activeImports, specifier => ({ kind: "import" as const, specifier }))]
-			: analysis.references;
 		for (const reference of references) {
 			if (reference.kind === "native-import" || reference.kind === "dynamic-import") continue;
 			const specifier = reference.specifier;
@@ -2525,6 +2691,7 @@ async function collectExtensionModules(
 						? await sources.resolveRelativeRequire(specifier, file)
 						: Bun.resolveSync(specifier, dir);
 					if (candidate && hasSourceModuleExtension(candidate)) {
+						if (loadedExtensionModuleKind(graphContext, await realpathOrSelf(candidate))) continue;
 						const inheritedTargetKind = isRequired
 							? sourceIsCommonJs
 								? "commonjs"
@@ -2553,6 +2720,7 @@ async function collectExtensionModules(
 				} else if (specifier.startsWith("#")) {
 					const candidate = packageImportPath(specifier, await resolvePackageImportSpecifier(specifier, file));
 					if (candidate) {
+						if (loadedExtensionModuleKind(graphContext, await realpathOrSelf(candidate))) continue;
 						const inheritedTargetKind = isRequired
 							? sourceIsCommonJs
 								? "commonjs"
@@ -2588,6 +2756,12 @@ async function collectExtensionModules(
 						? await resolveExtensionBareRequire(specifier, file)
 						: await resolveExtensionBareDependency(specifier, file);
 					const isHookableEntry = Boolean(dependencyEntry && hasSourceModuleExtension(dependencyEntry));
+					if (
+						isHookableEntry &&
+						dependencyEntry &&
+						loadedExtensionModuleKind(graphContext, await realpathOrSelf(dependencyEntry))
+					)
+						continue;
 					const selectedEsmBranch =
 						!isRequired &&
 						isHookableEntry &&
@@ -2668,6 +2842,8 @@ async function collectExtensionModules(
 	}
 	for (const [modulePath, source] of modules) {
 		if (commonJsPaths.has(modulePath)) {
+			const binding = (await sources.analyze(modulePath)).dynamicImportBinding;
+			if (binding) dynamicImportBindings.set(modulePath, binding);
 			modules.set(
 				modulePath,
 				applySpecifierReplacements(
@@ -2683,6 +2859,8 @@ async function collectExtensionModules(
 		modules,
 		commonJsPaths,
 		synchronousSourcePaths,
+		dynamicImportBindings,
+		esmBranchPaths: queuedEsmBranchPaths,
 		cacheBustResolvedImportModules: new Set(
 			[...queuedCacheBustResolvedImports]
 				.filter(([modulePath, enabled]) => enabled && modules.has(modulePath))
@@ -2705,7 +2883,12 @@ export async function __collectLegacyPiExtensionSourcesForTests(
  * ESM imports and sibling `require()` calls the same `module.exports` value and
  * cycle-aware cache.
  */
-function prepareGraphCommonJsDefinition(modulePath: string, source: string, targetPath = modulePath): void {
+function prepareGraphCommonJsDefinition(
+	modulePath: string,
+	source: string,
+	targetPath = modulePath,
+	dynamicImportBinding: string | null = null,
+): void {
 	let commonJsSource = source;
 	if (commonJsSource.startsWith("#!")) {
 		const firstLineEnd = commonJsSource.indexOf("\n");
@@ -2719,6 +2902,7 @@ function prepareGraphCommonJsDefinition(modulePath: string, source: string, targ
 		source: executableSource,
 		filename: targetPath,
 		dirname: path.dirname(targetPath),
+		dynamicImportBinding,
 	});
 	commonJsModuleCache.delete(modulePath);
 }
@@ -2727,7 +2911,12 @@ function prepareGraphCommonJsDefinition(modulePath: string, source: string, targ
  * Linkedom's canvas bridge uses its bundled fallback because OMP does not ship
  * native canvas.
  */
-async function prepareGraphCommonJsModule(modulePath: string, source: string): Promise<void> {
+async function prepareGraphCommonJsModule(
+	modulePath: string,
+	source: string,
+	dynamicImportBinding: string | null,
+	graphContext: ExtensionGraphContext,
+): Promise<void> {
 	const packageRoot = await findPackageRoot(modulePath);
 	const manifest = packageRoot ? await readPackageManifest(packageRoot) : null;
 	const packageRelativePath = packageRoot ? path.relative(packageRoot, modulePath).split(path.sep).join("/") : null;
@@ -2737,8 +2926,10 @@ async function prepareGraphCommonJsModule(modulePath: string, source: string): P
 		targetPath = path.join(packageRoot, "commonjs", "canvas-shim.cjs");
 		commonJsFallbackModulePaths.set(modulePath, targetPath);
 		executableSource = await Bun.file(targetPath).text();
+		dynamicImportBinding = null;
 	}
-	prepareGraphCommonJsDefinition(modulePath, executableSource, targetPath);
+	commonJsModuleGraphContexts.set(modulePath, graphContext);
+	prepareGraphCommonJsDefinition(modulePath, executableSource, targetPath, dynamicImportBinding);
 }
 
 /**
@@ -2774,6 +2965,9 @@ async function installExtensionGraphHook(
 					const queryIndex = args.path.indexOf("?mtime=");
 					const sourcePath = queryIndex >= 0 ? args.path.slice(0, queryIndex) : args.path;
 					const mtimeTag = queryIndex >= 0 ? args.path.slice(queryIndex + "?mtime=".length) : null;
+					const graphContext =
+						extensionGraphContexts.get(`${entryRealPath}\0${mtimeTag ?? ""}`) ??
+						latestExtensionGraphContexts.get(entryRealPath);
 					// A later reload can upgrade this module to synchronous loading (a
 					// new `require()` edge reaches it) without re-registering hooks:
 					// this filter keeps matching and `require()` rejects async onLoad
@@ -2781,13 +2975,11 @@ async function installExtensionGraphHook(
 					// `ensureExtensionGraphHook` refreshes it on every (re)load.
 					const synchronousSource = synchronousModuleSources.get(sourcePath);
 					if (synchronousSource !== undefined) {
+						recordLoadedExtensionModule(graphContext, sourcePath, args.path);
 						return { contents: synchronousSource, loader: getLoader(sourcePath) };
 					}
 					const cached = asyncModules.get(sourcePath);
 					const resolvedImportMtimeTag = cacheBustResolvedImportModules.has(sourcePath) ? mtimeTag : null;
-					const graphContext =
-						extensionGraphContexts.get(`${entryRealPath}\0${mtimeTag ?? ""}`) ??
-						latestExtensionGraphContexts.get(entryRealPath);
 					return (async () => {
 						let raw: string;
 						if (cached !== undefined) {
@@ -2797,16 +2989,15 @@ async function installExtensionGraphHook(
 						} else {
 							raw = await Bun.file(sourcePath).text();
 						}
-						return {
-							contents: await rewriteLegacyExtensionSource(
-								raw,
-								sourcePath,
-								mtimeTag,
-								resolvedImportMtimeTag,
-								graphContext,
-							),
-							loader: getLoader(sourcePath),
-						};
+						const contents = await rewriteLegacyExtensionSource(
+							raw,
+							sourcePath,
+							mtimeTag,
+							resolvedImportMtimeTag,
+							graphContext,
+						);
+						recordLoadedExtensionModule(graphContext, sourcePath, args.path);
+						return { contents, loader: getLoader(sourcePath) };
 					})();
 				});
 			},
@@ -2856,6 +3047,11 @@ async function installExtensionGraphHook(
 					if (source === undefined) {
 						throw new Error(`Missing pre-rewritten synchronous extension source: ${sourcePath}`);
 					}
+					const mtimeTag = queryIndex >= 0 ? args.path.slice(queryIndex + "?mtime=".length) : null;
+					const graphContext =
+						extensionGraphContexts.get(`${entryRealPath}\0${mtimeTag ?? ""}`) ??
+						latestExtensionGraphContexts.get(entryRealPath);
+					recordLoadedExtensionModule(graphContext, sourcePath, args.path);
 					return { contents: source, loader: getLoader(sourcePath) };
 				});
 			},
@@ -2865,9 +3061,9 @@ async function installExtensionGraphHook(
 }
 
 /**
- * Ensure every currently reachable extension source module has a load-time
- * rewrite hook. The entry graph can grow across reloads, so each call collects
- * the current graph and registers hooks for paths not covered by earlier loads.
+ * Install hooks for newly reachable source. Initial and explicit reload walks
+ * start at the entry; lazy activation starts at its importing edge.
+ * Loaded modules keep their existing cache identity.
  *
  * Returns a clearable handle to drop cached sources that weren't consumed
  * during the initial load; `undefined` when no new modules were discovered.
@@ -2875,13 +3071,16 @@ async function installExtensionGraphHook(
 async function ensureExtensionGraphHook(
 	entryRealPath: string,
 	graphContext: ExtensionGraphContext,
+	activation?: ExtensionGraphActivation,
 ): Promise<{ clear(): void } | undefined> {
 	const {
 		modules: currentModules,
 		commonJsPaths,
 		cacheBustResolvedImportModules: discoveredCacheBustModules,
 		synchronousSourcePaths,
-	} = await collectExtensionModules(entryRealPath, graphContext);
+		dynamicImportBindings,
+		esmBranchPaths,
+	} = await collectExtensionModules(entryRealPath, graphContext, activation);
 	let cacheBustResolvedImportModules = extensionGraphCacheBustResolvedImportModules.get(entryRealPath);
 	if (!cacheBustResolvedImportModules) {
 		cacheBustResolvedImportModules = new Set<string>();
@@ -2892,6 +3091,8 @@ async function ensureExtensionGraphHook(
 	}
 	const preparedCommonJsPaths = new Set<string>();
 	for (const [modulePath, source] of currentModules) {
+		if (esmBranchPaths.has(modulePath)) graphContext.esmBranchPaths.add(modulePath);
+		else graphContext.esmBranchPaths.delete(modulePath);
 		const kind = commonJsPaths.has(modulePath)
 			? "commonjs"
 			: synchronousSourcePaths.has(modulePath)
@@ -2899,7 +3100,12 @@ async function ensureExtensionGraphHook(
 				: "async";
 		if (graphContext.preparedModules.get(modulePath) === kind) continue;
 		if (commonJsPaths.has(modulePath)) {
-			await prepareGraphCommonJsModule(modulePath, source);
+			await prepareGraphCommonJsModule(
+				modulePath,
+				source,
+				dynamicImportBindings.get(modulePath) ?? null,
+				graphContext,
+			);
 			preparedCommonJsPaths.add(modulePath);
 		}
 		if (synchronousSourcePaths.has(modulePath)) {
@@ -2958,7 +3164,7 @@ async function ensureExtensionGraphHook(
 			asyncModules.clear();
 			for (const modulePath of preparedCommonJsPaths) {
 				commonJsModuleDefinitions.delete(modulePath);
-				commonJsModuleCache.delete(modulePath);
+				if (!commonJsModuleCache.get(modulePath)?.loaded) commonJsModuleCache.delete(modulePath);
 			}
 		},
 	};
@@ -3014,7 +3220,10 @@ async function importExtensionWithOptions(
 			}
 			activeImports.add(nativeSpecifier);
 			try {
-				const pendingSources = await ensureExtensionGraphHook(graphContext.entryRealPath, graphContext);
+				const pendingSources = await ensureExtensionGraphHook(graphContext.entryRealPath, graphContext, {
+					importerPath,
+					specifier: nativeSpecifier,
+				});
 				pendingSources?.clear();
 			} catch (error) {
 				activeImports.delete(nativeSpecifier);
@@ -3056,8 +3265,11 @@ export async function loadLegacyPiModule(resolvedPath: string, options: { reload
 		graphContext = {
 			key: graphContextKey,
 			entryRealPath,
+			mtimeTag,
 			activeDynamicImports: new Map(),
 			preparedModules: new Map(),
+			loadedModules: new Map(),
+			esmBranchPaths: new Set(),
 		};
 		extensionGraphContexts.set(graphContextKey, graphContext);
 	}

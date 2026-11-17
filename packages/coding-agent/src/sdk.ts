@@ -5655,10 +5655,10 @@ async function createAgentSessionScoped(
 			autoTitle: options.autoTitle === true && !isSubagentSession,
 		});
 		hasSession = true;
+		accountPoolOwnedBySession = true;
 		session.addDisposer(retireSubagentApprovalScope);
 		session.addDisposer(session.registerSessionChangeCallback(retireSubagentApprovalScope));
 		session.setSideRequestOwnerCapture(toolSession.captureOwnerCurrent!);
-		accountPoolOwnedBySession = true;
 		credentialNoticeSession = session;
 		// Hashline snapshots are session-scoped: /new and switchSession fire the
 		// change callbacks, so clear the tool-side store there — stale tags would

@@ -319,4 +319,277 @@ fs.writeFileSync(${JSON.stringify(output)}, JSON.stringify({ value: loaded.defau
 		},
 		30_000,
 	);
+
+	// Static imports would contaminate native controls and cannot exercise runtime import options.
+
+	it.each([
+		["mjs", "module", true],
+		["mjs", "module", false],
+		["mjs", "parameter", true],
+		["mjs", "parameter", false],
+		["cjs", "module", true],
+		["cjs", "module", false],
+		["cjs", "parameter", true],
+		["cjs", "parameter", false],
+	] as const)(
+		"preserves dynamic imports with %s %s globalThis bindings and reload=%s",
+		async (extension, binding, reload) => {
+			const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "omp-import-binding-")));
+			roots.push(root);
+			for (const mode of ["native", "legacy"] as const) {
+				const fixture = path.join(root, mode);
+				for (const directory of [fixture, path.join(fixture, "home"), path.join(fixture, "tmp")]) {
+					fs.mkdirSync(directory);
+				}
+				fs.writeFileSync(path.join(fixture, "package.json"), '{"type":"module"}');
+				const helper = path.join(fixture, "helper.mjs");
+				fs.writeFileSync(helper, "export default 42;");
+				const entry = path.join(fixture, `entry.${extension}`);
+				fs.writeFileSync(
+					entry,
+					[
+						binding === "module" ? "#!/usr/bin/env bun\nconst globalThis = {};" : "",
+						"const \\u005F_ompLegacyPiImportWithOptions = null;",
+						`${extension === "mjs" ? "export const load" : "module.exports.load"} = (options${binding === "parameter" ? ", globalThis = {}" : ""}) => import("./helper.mjs", options);`,
+					].join("\n"),
+				);
+				const program = path.join(fixture, "consumer.mjs");
+				fs.writeFileSync(
+					program,
+					`
+import assert from "node:assert/strict";
+import fs from "node:fs";
+globalThis.fetch = Object.assign(async () => { throw Error("Owned import-binding consumer refuses network"); }, { preconnect() { throw Error("Owned import-binding consumer refuses network"); } });
+const entry = ${JSON.stringify(entry)};
+const loaded = ${mode === "native" ? "await import(entry)" : `await (await import(${JSON.stringify(loaderUrl)})).loadLegacyPiModule(entry, { reload: ${reload} })`};
+const load = loaded.load ?? loaded.default.load;
+assert.equal((await load({})).default, 42);
+assert.equal(fs.realpathSync((await load({ with: { type: "file" } })).default), ${JSON.stringify(helper)});
+let reads = 0;
+const sentinel = new RangeError("owned binding options");
+const pending = load({ get with() { reads++; throw sentinel; } });
+assert(pending instanceof Promise);
+await assert.rejects(pending, error => error === sentinel);
+assert.equal(reads, 1);
+`,
+				);
+				await runConsumer(fixture, program);
+			}
+		},
+		30_000,
+	);
+
+	it.each([
+		["mjs", "static"],
+		["mjs", "dynamic"],
+		["cjs", "static"],
+		["cjs", "dynamic"],
+	] as const)("keeps cached %s %s siblings isolated from a new lazy closure", async (extension, activation) => {
+		const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "omp-warm-closure-")));
+		roots.push(root);
+		for (const mode of ["native", "legacy"] as const) {
+			const fixture = path.join(root, mode);
+			for (const directory of [fixture, path.join(fixture, "home"), path.join(fixture, "tmp")]) {
+				fs.mkdirSync(directory);
+			}
+			fs.writeFileSync(path.join(fixture, "package.json"), '{"type":"module"}');
+			const warm = path.join(fixture, `warm.${extension}`);
+			fs.writeFileSync(
+				warm,
+				`let uses = 0; ${extension === "mjs" ? "export default" : "module.exports ="} { next: () => ++uses };`,
+			);
+			fs.writeFileSync(path.join(fixture, "good.mjs"), "export default 42;");
+			fs.writeFileSync(path.join(fixture, "linked.mjs"), `import warm from "./warm.${extension}"; export { warm };`);
+			if (extension === "cjs") {
+				fs.writeFileSync(path.join(fixture, "required.cjs"), 'module.exports = require("./warm.cjs");');
+			}
+			const entry = path.join(fixture, "entry.mjs");
+			fs.writeFileSync(
+				entry,
+				[
+					activation === "static"
+						? `import * as warm from "./warm.${extension}"; export { warm };`
+						: `export const warm = options => import("./warm.${extension}", options);`,
+					'export const good = options => import("./good.mjs", options);',
+					'export const linked = options => import("./linked.mjs", options);',
+					...(extension === "cjs"
+						? ['export const required = options => import("./required.cjs", options);']
+						: []),
+				].join("\n"),
+			);
+			const program = path.join(fixture, "consumer.mjs");
+			fs.writeFileSync(
+				program,
+				`
+import assert from "node:assert/strict";
+import fs from "node:fs";
+globalThis.fetch = Object.assign(async () => { throw Error("Owned warm-closure consumer refuses network"); }, { preconnect() { throw Error("Owned warm-closure consumer refuses network"); } });
+const entry = ${JSON.stringify(entry)};
+const loaded = ${mode === "native" ? "await import(entry)" : `await (await import(${JSON.stringify(loaderUrl)})).loadLegacyPiModule(entry, { reload: false })`};
+const cached = ${activation === "static" ? "loaded.warm" : "await loaded.warm({})"};
+assert.equal(cached.default.next(), 1);
+fs.writeFileSync(${JSON.stringify(warm)}, ${JSON.stringify(extension === "mjs" ? "export const = ;" : "module.exports = ;")});
+assert.equal((await loaded.good({})).default, 42);
+const same = ${activation === "static" ? "loaded.warm" : "await loaded.warm({ with: {} })"};
+assert.equal(same, cached);
+assert.equal(same.default.next(), 2);
+assert.equal((await loaded.linked({})).warm, cached.default);
+assert.equal(cached.default.next(), 3);
+${extension === "cjs" ? "assert.equal((await loaded.required({})).default, cached.default); assert.equal(cached.default.next(), 4);" : ""}
+`,
+			);
+			await runConsumer(fixture, program);
+		}
+	});
+
+	it.each([
+		["static", true],
+		["static", false],
+		["dynamic", true],
+		["dynamic", false],
+	] as const)(
+		"keeps cached %s ESM identity for late synchronous require with reload=%s",
+		async (activation, reload) => {
+			const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "omp-cached-esm-require-")));
+			roots.push(root);
+			for (const mode of ["native", "legacy"] as const) {
+				const fixture = path.join(root, mode);
+				for (const directory of [fixture, path.join(fixture, "home"), path.join(fixture, "tmp")]) {
+					fs.mkdirSync(directory);
+				}
+				fs.writeFileSync(
+					path.join(fixture, "package.json"),
+					JSON.stringify({ type: "module", imports: { "#warm": "./warm.mjs" } }),
+				);
+				const warm = path.join(fixture, "warm.mjs");
+				fs.writeFileSync(warm, "let uses = 0; export const next = () => ++uses;");
+				fs.writeFileSync(path.join(fixture, "late.cjs"), 'module.exports = require("./warm.mjs");');
+				fs.writeFileSync(path.join(fixture, "alias.cjs"), 'module.exports = require("#warm");');
+				const entry = path.join(fixture, "entry.mjs");
+				fs.writeFileSync(
+					entry,
+					[
+						activation === "static"
+							? 'import * as warm from "./warm.mjs"; export { warm };'
+							: 'export const warm = options => import("./warm.mjs", options);',
+						'export const late = options => import("./late.cjs", options);',
+						'export const alias = options => import("./alias.cjs", options);',
+					].join("\n"),
+				);
+				const program = path.join(fixture, "consumer.mjs");
+				fs.writeFileSync(
+					program,
+					`
+import assert from "node:assert/strict";
+import fs from "node:fs";
+globalThis.fetch = Object.assign(async () => { throw Error("Owned cached ESM consumer refuses network"); }, { preconnect() { throw Error("Owned cached ESM consumer refuses network"); } });
+const entry = ${JSON.stringify(entry)};
+const loaded = ${mode === "native" ? "await import(entry)" : `await (await import(${JSON.stringify(loaderUrl)})).loadLegacyPiModule(entry, { reload: ${reload} })`};
+const cached = ${activation === "static" ? "loaded.warm" : "await loaded.warm({})"};
+assert.equal(cached.next(), 1);
+fs.writeFileSync(${JSON.stringify(warm)}, "export const = ;");
+assert.equal((await loaded.late({})).default, cached);
+assert.equal(cached.next(), 2);
+assert.equal((await loaded.alias({})).default, cached);
+assert.equal(cached.next(), 3);
+`,
+				);
+				await runConsumer(fixture, program);
+			}
+		},
+		30_000,
+	);
+
+	it.each(["namespace", "override"] as const)("preserves cached ESM %s require interop", async interop => {
+		const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "omp-cached-esm-interop-")));
+		roots.push(root);
+		for (const mode of ["native", "legacy"] as const) {
+			const fixture = path.join(root, mode);
+			for (const directory of [fixture, path.join(fixture, "home"), path.join(fixture, "tmp")]) {
+				fs.mkdirSync(directory);
+			}
+			fs.writeFileSync(path.join(fixture, "package.json"), '{"type":"module"}');
+			const warm = path.join(fixture, "warm.mjs");
+			fs.writeFileSync(
+				warm,
+				[
+					"let uses = 0; export const token = { next: () => ++uses };",
+					interop === "override" ? 'export { token as "module.exports" };' : "export const __esModule = false;",
+				].join("\n"),
+			);
+			fs.writeFileSync(path.join(fixture, "late.cjs"), 'module.exports = require("./warm.mjs");');
+			const entry = path.join(fixture, "entry.mjs");
+			fs.writeFileSync(
+				entry,
+				'import * as warm from "./warm.mjs"; export { warm }; export const late = options => import("./late.cjs", options);',
+			);
+			const program = path.join(fixture, "consumer.mjs");
+			fs.writeFileSync(
+				program,
+				`
+import assert from "node:assert/strict";
+import fs from "node:fs";
+globalThis.fetch = Object.assign(async () => { throw Error("Owned ESM interop consumer refuses network"); }, { preconnect() { throw Error("Owned ESM interop consumer refuses network"); } });
+const entry = ${JSON.stringify(entry)};
+const loaded = ${mode === "native" ? "await import(entry)" : `await (await import(${JSON.stringify(loaderUrl)})).loadLegacyPiModule(entry)`};
+assert.equal(loaded.warm.token.next(), 1);
+fs.writeFileSync(${JSON.stringify(warm)}, "export const = ;");
+const required = (await loaded.late({})).default;
+assert.equal(required, ${interop === "override" ? "loaded.warm.token" : "loaded.warm"});
+assert.equal(loaded.warm.__esModule, ${interop === "override"});
+assert.equal(loaded.warm.token.next(), 2);
+`,
+			);
+			await runConsumer(fixture, program);
+		}
+	});
+
+	it("keeps pending ESM evaluation unavailable to require and reuses its settled namespace", async () => {
+		const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "omp-pending-esm-require-")));
+		roots.push(root);
+		for (const mode of ["native", "legacy"] as const) {
+			const fixture = path.join(root, mode);
+			for (const directory of [fixture, path.join(fixture, "home"), path.join(fixture, "tmp")]) {
+				fs.mkdirSync(directory);
+			}
+			fs.writeFileSync(path.join(fixture, "package.json"), '{"type":"module"}');
+			fs.writeFileSync(
+				path.join(fixture, "warm.mjs"),
+				"globalThis.__ownedCachedEsmGate.enter(); await globalThis.__ownedCachedEsmGate.wait; export const token = {};",
+			);
+			for (const filename of ["late.cjs", "after.cjs"]) {
+				fs.writeFileSync(path.join(fixture, filename), 'module.exports = require("./warm.mjs");');
+			}
+			const entry = path.join(fixture, "entry.mjs");
+			fs.writeFileSync(
+				entry,
+				[
+					'export const warm = options => import("./warm.mjs", options);',
+					'export const late = options => import("./late.cjs", options);',
+					'export const after = options => import("./after.cjs", options);',
+				].join("\n"),
+			);
+			const program = path.join(fixture, "consumer.mjs");
+			fs.writeFileSync(
+				program,
+				`
+import assert from "node:assert/strict";
+globalThis.fetch = Object.assign(async () => { throw Error("Owned pending ESM consumer refuses network"); }, { preconnect() { throw Error("Owned pending ESM consumer refuses network"); } });
+const { promise: entered, resolve: enter } = Promise.withResolvers();
+const { promise: wait, resolve: release } = Promise.withResolvers();
+globalThis.__ownedCachedEsmGate = { enter, wait };
+const entry = ${JSON.stringify(entry)};
+const loaded = ${mode === "native" ? "await import(entry)" : `await (await import(${JSON.stringify(loaderUrl)})).loadLegacyPiModule(entry)`};
+const pending = loaded.warm({});
+await entered;
+await assert.rejects(loaded.late({}), TypeError);
+release();
+const cached = await pending;
+assert.equal((await loaded.after({})).default, cached);
+assert.equal((await loaded.after({})).default.token, cached.token);
+`,
+			);
+			await runConsumer(fixture, program);
+		}
+	});
 });

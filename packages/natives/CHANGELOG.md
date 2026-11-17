@@ -8,6 +8,7 @@
 
 ### Fixed
 
+- Use native background requests for macOS spelling checks. Preserve per-request UTF-16 ranges and omit whole-string orthography results.
 - Pin the Windows cross-build SDK to the catalog and MSI format supported by xwin 0.6.5. Preserve Linux/macOS build hosts and the ARM64 SDK selection.
 
 - Grow recursive shell execution stacks on demand before constructing, polling and dropping borrowed interpreter futures. Preserve cancellation and owned-pipe EOF. Reserve headroom for unoptimized command and error frames without enlarging default Tokio worker stacks.
