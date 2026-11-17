@@ -9,6 +9,11 @@ import {
 	isLocallyAnonymousStdinChannel,
 	isVerifiedStdinProducerWitness,
 } from "./fixtures/aws-secret-input-stdin-metadata";
+import { LIFECYCLE_SENSITIVE_MARKER } from "./fixtures/aws-secret-input-lifecycle-values";
+import {
+	assertAwsSecretInputNativeFileBytes,
+	assertAwsSecretInputNativeFiles,
+} from "./fixtures/aws-secret-input-native";
 
 const CASES = [
 	"schema-before-access",
@@ -43,6 +48,17 @@ const CASES = [
 	"paused-identity-replacement-revokes-live-authority",
 	"cross-account-secret-binds-approved-resource",
 ] as const;
+const CASE_NAMES = new Set<string>(["setup", ...CASES]);
+const PHASE_NAMES = new Set<string>([
+	"case",
+	"result",
+	"files",
+	"done",
+	"cleanup",
+	"cleanup-files",
+	"inspection",
+	"inspection-done",
+]);
 
 async function capture(stream: ReadableStream<Uint8Array>, maxBytes: number) {
 	const reader = stream.getReader();
@@ -119,6 +135,46 @@ async function compileSyntheticWorker(entry: string, outfile: string): Promise<v
 	});
 }
 
+test("owned-file inspection reads beyond eight MiB without rejecting public binary assets", async () => {
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "aws-native-file-inspection-"));
+	try {
+		const file = await fs.open(path.join(root, "public.bin"), "w+");
+		try {
+			await file.truncate(9 * 1024 * 1024);
+			await file.write(new Uint8Array([0xff, 0x80, 0, 0xc0]), 0, 4, 0);
+			await assertAwsSecretInputNativeFiles(root);
+			const marker = Buffer.from(LIFECYCLE_SENSITIVE_MARKER);
+			await file.write(marker, 0, marker.length, 8 * 1024 * 1024 + 31);
+		} finally {
+			await file.close();
+		}
+		await expect(assertAwsSecretInputNativeFiles(root)).rejects.toThrow();
+	} finally {
+		await fs.rm(root, { recursive: true, force: true });
+	}
+});
+
+test("owned-file inspection rejects a marker split across byte-sized chunks and closes the stream", async () => {
+	const marker = Buffer.from(LIFECYCLE_SENSITIVE_MARKER);
+	await assertAwsSecretInputNativeFileBytes(
+		(async function* () {
+			yield marker.subarray(0, -1);
+			yield new Uint8Array([0xff]);
+		})(),
+	);
+	let closed = false;
+	const chunks = (async function* () {
+		try {
+			yield new Uint8Array([0xff, 0, 0x80]);
+			for (let index = 0; index < marker.length; index++) yield marker.subarray(index, index + 1);
+		} finally {
+			closed = true;
+		}
+	})();
+	await expect(assertAwsSecretInputNativeFileBytes(chunks)).rejects.toThrow();
+	expect(closed).toBe(true);
+});
+
 for (const mode of ["source", "compiled"] as const) {
 	test.skipIf(process.platform === "win32")(
 		`native Write xd://aws preserves admission, immutable approval, guards, and real stdin delivery (${mode} worker)`,
@@ -143,6 +199,8 @@ for (const mode of ["source", "compiled"] as const) {
 				const policyPath = path.join(root, "dcg.toml");
 				const policy = '[packs]\nenabled = ["fixture_aws_secret_input"]\n';
 				await fs.writeFile(policyPath, policy);
+				let lastCase = "setup";
+				let lastPhase = "startup";
 				const child = Bun.spawn(
 					[
 						process.execPath,
@@ -178,6 +236,22 @@ for (const mode of ["source", "compiled"] as const) {
 						stdin: "ignore",
 						stdout: "pipe",
 						stderr: "pipe",
+						serialization: "json",
+						ipc(message) {
+							if (!message || typeof message !== "object" || Array.isArray(message)) return;
+							const frame = message as Record<string, unknown>;
+							if (
+								Object.keys(frame).length !== 3 ||
+								frame.type !== "native-phase" ||
+								typeof frame.case !== "string" ||
+								!CASE_NAMES.has(frame.case) ||
+								typeof frame.phase !== "string" ||
+								!PHASE_NAMES.has(frame.phase)
+							)
+								return;
+							lastCase = frame.case;
+							lastPhase = frame.phase;
+						},
 						signal: AbortSignal.timeout(150_000),
 					},
 				);
@@ -199,7 +273,7 @@ for (const mode of ["source", "compiled"] as const) {
 							: undefined;
 					expect(
 						exit === 0,
-						`Native secret-input fixture failed; case=${failedCase ?? "startup"}; diagnostics are withheld`,
+						`Native secret-input fixture failed; case=${failedCase ?? lastCase}; phase=${lastPhase}; exit=${exit}; signal=${child.signalCode ?? "none"}; diagnostics are withheld`,
 					).toBe(true);
 					expect(stdout.overflow || stderr.overflow, "Fixture diagnostics exceeded their public bounds").toBe(
 						false,

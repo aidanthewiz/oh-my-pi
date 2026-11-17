@@ -25,6 +25,9 @@
 - Read socket-backed stdin directly in native preload qualification. Preserve exact-byte comparison and real non-Bun receivers on Linux.
 - Enable native WebMCP on current Chrome while preserving legacy testing flags.
 - Keep Python zoom qualification JSON within bounded output columns when temporary paths are long.
+- Scan every owned qualification-file byte without decoding binary assets. Preserve cross-chunk leak checks and fixed, nonsecret failure phases.
+- Separate synthetic tmux executable readiness from bounded protocol queries. Preserve runtime query deadlines and credential-filtering checks.
+- Isolate home-dotenv cache qualification from managed-launch markers without changing production dotenv authority.
 - Apply normalized device authorization before capability probes, including policy revocation during approval. Preserve active and mounted AWS dispatch and exact native invocation ownership.
 - Join owned process cleanup using kernel creation identities and actual reaping. Preserve a pinned Darwin group anchor until acknowledged retirement, and reject unknown or replaced receiver identities.
 - Preserve constructor-registered tool session callbacks so active native scopes stop when the SDK adopts or forks a session.

@@ -154,6 +154,8 @@ describe("composer startup cache", () => {
 				...process.env,
 				HOME: home,
 				XDG_CACHE_HOME: undefined,
+				OMP_DOTENV_OVERRIDE: undefined,
+				OMP_CF_PRODUCT_VERSION: undefined,
 				PI_CODING_AGENT_DIR: undefined,
 				OMP_PROFILE: undefined,
 				PI_PROFILE: undefined,
