@@ -29,6 +29,7 @@ export async function runInteractiveBashPty(
 		env?: Record<string, string>;
 		artifactPath?: string;
 		artifactId?: string;
+		validate?: () => void;
 	},
 ): Promise<BashInteractiveResult> {
 	const settings = await Settings.init();
@@ -100,6 +101,7 @@ export async function runInteractiveBashPty(
 						}
 					},
 				);
+				options.validate?.();
 				void session
 					.start(
 						{

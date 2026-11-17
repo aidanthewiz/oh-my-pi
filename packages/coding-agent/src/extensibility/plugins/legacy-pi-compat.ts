@@ -55,7 +55,7 @@ interface BundledVirtualResolveResult {
 }
 
 interface ExtensionSpecifierReference {
-	readonly kind: "import" | "require";
+	readonly kind: "import" | "native-import" | "require";
 	readonly specifier: string;
 	readonly start: number;
 	readonly end: number;
@@ -269,15 +269,15 @@ function registerScopeBindings(node: StructuralAstNode, scope: BindingScope): vo
 	if (isClassScopeNode(node)) addPatternBindings(scope, node.id);
 	if (node.type === "CatchClause") addPatternBindings(scope, node.param);
 
-	if (node.type === "ImportDeclaration") {
+	if (node.type === "ImportDeclaration" && node.importKind !== "type") {
 		const specifiers = nodeArray(node, "specifiers");
 		if (specifiers) {
 			for (const value of specifiers) {
 				const specifier = asAstNode(value);
-				if (specifier) addPatternBindings(scope, specifier.local);
+				if (specifier && specifier.importKind !== "type") addPatternBindings(scope, specifier.local);
 			}
 		}
-	} else if (node.type === "TSImportEqualsDeclaration") {
+	} else if (node.type === "TSImportEqualsDeclaration" && node.importKind !== "type") {
 		addPatternBindings(scope, node.id);
 	} else if (node.type === "VariableDeclaration") {
 		const target = node.kind === "var" ? nearestVarScope(scope) : scope;
@@ -461,6 +461,45 @@ function staticMemberPropertyName(node: StructuralAstNode): string | null {
 	return null;
 }
 
+function hasNativeImportType(attributes: readonly unknown[] | null): boolean {
+	if (!attributes) return false;
+	for (const value of attributes) {
+		const attribute = asAstNode(value);
+		if (!attribute) continue;
+		if (attribute.type === "SpreadElement" || attribute.computed === true) return true;
+		const key = asAstNode(attribute.key);
+		if (isIdentifier(key, "type") || (key?.type === "StringLiteral" && key.value === "type")) return true;
+	}
+	return false;
+}
+
+function usesNativeImportLoader(node: StructuralAstNode): boolean {
+	if (hasNativeImportType(nodeArray(node, "attributes")) || hasNativeImportType(nodeArray(node, "assertions")))
+		return true;
+	const options = asAstNode(
+		node.type === "ImportExpression" ? node.options : node.type === "CallExpression" ? nodeArgument(node, 1) : null,
+	);
+	if (!options) return false;
+	if (options.type !== "ObjectExpression") return true;
+	for (const value of nodeArray(options, "properties") ?? []) {
+		const property = asAstNode(value);
+		if (!property) continue;
+		if (property.type === "SpreadElement" || property.computed === true) return true;
+		const key = asAstNode(property.key);
+		if (
+			!(
+				(property.computed !== true && (isIdentifier(key, "with") || isIdentifier(key, "assert"))) ||
+				(key?.type === "StringLiteral" && (key.value === "with" || key.value === "assert"))
+			)
+		)
+			continue;
+		const attributes = asAstNode(property.value);
+		if (attributes?.type !== "ObjectExpression") return true;
+		if (hasNativeImportType(nodeArray(attributes, "properties"))) return true;
+	}
+	return false;
+}
+
 function collectExtensionSpecifierReferences(
 	source: string,
 	importerPath: string,
@@ -481,10 +520,12 @@ function collectExtensionSpecifierReferences(
 	const createRequireBindings = new Set<string>();
 	const moduleNamespaceBindings = new Set<string>();
 	for (const { node } of collectScopedAstNodes(ast, candidate => candidate.type === "ImportDeclaration")) {
+		if (node.importKind === "type") continue;
 		const source = asAstNode(node.source);
 		if (source?.type !== "StringLiteral" || (source.value !== "node:module" && source.value !== "module")) continue;
 		for (const value of Array.isArray(node.specifiers) ? node.specifiers : []) {
 			const specifier = asAstNode(value);
+			if (specifier?.importKind === "type") continue;
 			const local = asAstNode(specifier?.local);
 			if (local?.type !== "Identifier" || typeof local.name !== "string") continue;
 			if (specifier?.type === "ImportNamespaceSpecifier") {
@@ -501,14 +542,15 @@ function collectExtensionSpecifierReferences(
 		}
 	}
 	for (const { node, scope } of collectScopedAstNodes(ast, isSpecifierReferenceNode)) {
+		if (node.importKind === "type" || node.exportKind === "type") continue;
 		if (
 			node.type === "ImportDeclaration" ||
 			node.type === "ExportNamedDeclaration" ||
 			node.type === "ExportAllDeclaration"
 		) {
-			record("import", node.source);
+			record(usesNativeImportLoader(node) ? "native-import" : "import", node.source);
 		} else if (node.type === "ImportExpression") {
-			record("import", node.source);
+			record(usesNativeImportLoader(node) ? "native-import" : "import", node.source);
 		} else if (node.type === "TSImportEqualsDeclaration") {
 			const moduleReference = asAstNode(node.moduleReference);
 			if (moduleReference?.type === "TSExternalModuleReference") {
@@ -517,7 +559,7 @@ function collectExtensionSpecifierReferences(
 		} else if (node.type === "CallExpression") {
 			const callee = asAstNode(node.callee);
 			if (callee?.type === "Import") {
-				record("import", nodeArgument(node, 0));
+				record(usesNativeImportLoader(node) ? "native-import" : "import", nodeArgument(node, 0));
 			} else if (isIdentifier(callee, "require") && !scopeHasBinding(scope, REQUIRE_BINDING)) {
 				record("require", nodeArgument(node, 0));
 			} else if (isCreateRequireInvocation(callee, createRequireBindings, moduleNamespaceBindings)) {
@@ -538,7 +580,7 @@ function collectExtensionSpecifierReferences(
 	return references;
 }
 
-const EXTENSION_PARSE_CACHE_SCHEMA_VERSION = 3;
+const EXTENSION_PARSE_CACHE_SCHEMA_VERSION = 5;
 const CREATE_EXTENSION_PARSE_CACHE_TABLE =
 	"CREATE TABLE IF NOT EXISTS extension_parse_cache (cache_key TEXT PRIMARY KEY, source_type TEXT NOT NULL, [references] TEXT NOT NULL, commonjs_syntax INTEGER NOT NULL)";
 const EXTENSION_PARSE_CACHE_MAX_BYTES = 8 * 1024 * 1024;
@@ -645,7 +687,7 @@ function parseCachedAnalysis(row: ExtensionParseCacheRow): ExtensionSourceAnalys
 				reference =>
 					reference &&
 					typeof reference === "object" &&
-					(reference.kind === "import" || reference.kind === "require") &&
+					(reference.kind === "import" || reference.kind === "native-import" || reference.kind === "require") &&
 					typeof reference.specifier === "string" &&
 					typeof reference.start === "number" &&
 					typeof reference.end === "number",
@@ -1223,6 +1265,72 @@ function toGraphImportSpecifier(resolvedPath: string, mtimeTag: string | null): 
 		return url.pathToFileURL(stripWindowsExtendedLengthPathPrefix(resolvedPath)).href;
 	}
 	return `${stripWindowsExtendedLengthPathPrefix(resolvedPath)}?mtime=${mtimeTag}`;
+}
+
+async function resolveNativeImportSpecifier(specifier: string, importerPath: string): Promise<string | null> {
+	const queryIndex = specifier.indexOf("?");
+	const hashIndex = specifier.indexOf("#", specifier.startsWith("#") ? 1 : 0);
+	const suffixIndex = queryIndex < 0 ? hashIndex : hashIndex < 0 ? queryIndex : Math.min(queryIndex, hashIndex);
+	const target = suffixIndex < 0 ? specifier : specifier.slice(0, suffixIndex);
+	if (
+		isBuiltin(target) ||
+		target.startsWith("node:") ||
+		target.startsWith("bun:") ||
+		(/^[a-z][a-z0-9+.-]*:/i.test(target) && !/^file:/i.test(target) && !path.win32.isAbsolute(target))
+	)
+		return null;
+	let resolved: string | null = null;
+	const remappedSpecifier = remapLegacyPiSpecifier(target);
+	if (remappedSpecifier) {
+		try {
+			resolved = resolveCanonicalPiSpecifier(remappedSpecifier);
+		} catch {
+			// An unresolved host mapping can still resolve through native package rules.
+		}
+	}
+	if (!resolved && TYPEBOX_SHIM_PATH && (target === "typebox" || target === "@sinclair/typebox")) {
+		resolved = TYPEBOX_SHIM_PATH;
+	}
+	if (!resolved && target.startsWith("#")) {
+		resolved = packageImportPath(target, await resolvePackageImportSpecifier(target, importerPath));
+	}
+	if (!resolved && isBareExtensionDependencySpecifier(target)) {
+		const parsed = splitBarePackageSpecifier(target);
+		const packageRoot = parsed ? await findPackageRoot(importerPath) : null;
+		const manifest = packageRoot ? await readPackageManifest(packageRoot) : null;
+		if (parsed && packageRoot && manifest?.name === parsed.name && Object.hasOwn(manifest, "exports")) {
+			resolved = await resolveNodePackageExport(packageRoot, parsed.subpath, manifest);
+			if (!resolved) return null;
+		} else {
+			resolved = await resolveExtensionBareDependency(target, importerPath);
+		}
+	}
+	if (!resolved && /^file:/i.test(target)) {
+		try {
+			resolved = url.fileURLToPath(target);
+		} catch {
+			return null;
+		}
+	}
+	if (!resolved && (target.startsWith(".") || path.isAbsolute(target) || path.win32.isAbsolute(target))) {
+		try {
+			resolved = Bun.resolveSync(target, path.dirname(importerPath));
+		} catch {
+			return null;
+		}
+	}
+	if (!resolved || isBundledVirtualSpecifier(resolved) || !hasSourceModuleExtension(resolved)) return null;
+	const query =
+		queryIndex < 0 || (hashIndex >= 0 && queryIndex > hashIndex)
+			? ""
+			: specifier.slice(queryIndex, hashIndex < 0 ? undefined : hashIndex);
+	const fragment = hashIndex < 0 ? "" : specifier.slice(hashIndex);
+	const separator = query.length === 0 ? "?" : query.endsWith("?") || query.endsWith("&") ? "" : "&";
+	const bypass = /(?:^|[?&])omp-native-loader=1(?:&|$)/.test(query)
+		? query
+		: `${query}${separator}omp-native-loader=1`;
+	// Bun ignores file-URL queries, so native loader bypasses use bare paths.
+	return `${stripWindowsExtendedLengthPathPrefix(resolved)}${bypass}${fragment}`;
 }
 
 async function pathExists(p: string): Promise<boolean> {
@@ -1984,6 +2092,14 @@ async function collectExtensionSpecifierReplacements(
 	const resolvedSpecifierTargets = new Map<string, string>();
 	const replacements: Array<ExtensionSpecifierReference & { replacement: string }> = [];
 	for (const reference of references) {
+		if (reference.kind === "native-import") {
+			const replacement = await resolveNativeImportSpecifier(reference.specifier, importerPath);
+			if (replacement && replacement !== reference.specifier) {
+				resolvedSpecifierTargets.set(`${reference.kind}\0${reference.specifier}`, replacement);
+				replacements.push({ ...reference, replacement });
+			}
+			continue;
+		}
 		let resolved: string | null = null;
 		if (reference.kind === "require") {
 			resolved = await resolveExtensionCommonJsRequire(reference.specifier, importerPath, sources);
@@ -2292,6 +2408,7 @@ async function collectExtensionModules(entryRealPath: string): Promise<Extension
 		const dir = path.dirname(file);
 		const references = analysis.references;
 		for (const reference of references) {
+			if (reference.kind === "native-import") continue;
 			const specifier = reference.specifier;
 			try {
 				let resolved: string | null = null;

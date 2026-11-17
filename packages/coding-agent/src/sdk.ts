@@ -312,6 +312,10 @@ import {
 import { resolveYieldReportText } from "./tools/yield";
 import { forgetSessionApprovals } from "./tools/approval-cache";
 import {
+	createSubagentRuntimeApprovalHandler,
+	type SubagentRuntimeApprovalHandler,
+} from "./tools/subagent-runtime-approval";
+import {
 	createModelJobCaptionWriter,
 	createModelJobWidgetAuthor,
 	type JobCaptionWriter,
@@ -946,6 +950,8 @@ export interface CreateAgentSessionOptions {
 
 	/** Whether UI is available (enables interactive tools like ask). Default: false */
 	hasUI?: boolean;
+	/** @internal Live parent DCG decision capability; never serialized as a grant. */
+	parentRuntimeApproval?: SubagentRuntimeApprovalHandler;
 	/**
 	 * When a resumed session's saved models cannot be restored even after
 	 * discovery, allow continuing with a warning on another model: the settings
@@ -4148,6 +4154,38 @@ async function createAgentSessionScoped(
 		});
 		const toolContextStore = new ToolContextStore(getSessionContext, trackUserWait);
 		toolSession.getToolContext = () => toolContextStore.getContext();
+		let subagentApprovalScope:
+			| { sessionId: string; controller: AbortController; handler: SubagentRuntimeApprovalHandler }
+			| undefined;
+		const retireSubagentApprovalScope = (): void => {
+			subagentApprovalScope?.controller.abort();
+			subagentApprovalScope = undefined;
+		};
+		toolSession.getSubagentRuntimeApproval = () => {
+			if (!hasSession || session.isDisposed || session.isSessionTransitioning) return undefined;
+			if (isSubagentSession) return options.parentRuntimeApproval;
+			if (!extensionRunner.hasUI() || extensionRunner.createContext().mode !== "tui") return undefined;
+			const sessionId = sessionManager.getSessionId();
+			if (subagentApprovalScope?.sessionId !== sessionId) {
+				retireSubagentApprovalScope();
+				const controller = new AbortController();
+				subagentApprovalScope = {
+					sessionId,
+					controller,
+					handler: createSubagentRuntimeApprovalHandler({
+						root: session,
+						registry: agentRegistry,
+						toolSession,
+						signal: controller.signal,
+					}),
+				};
+			}
+			return subagentApprovalScope.handler;
+		};
+		extensionRunner.setRuntimeApprovalBridge(
+			isSubagentSession ? options.parentRuntimeApproval : undefined,
+			toolSession.getSubagentRuntimeApproval,
+		);
 		extensionRunner.setMCPContext(
 			createExtensionMCPContext(
 				() => toolSession.mcpManager,
@@ -5617,6 +5655,8 @@ async function createAgentSessionScoped(
 			autoTitle: options.autoTitle === true && !isSubagentSession,
 		});
 		hasSession = true;
+		session.addDisposer(retireSubagentApprovalScope);
+		session.addDisposer(session.registerSessionChangeCallback(retireSubagentApprovalScope));
 		session.setSideRequestOwnerCapture(toolSession.captureOwnerCurrent!);
 		accountPoolOwnedBySession = true;
 		credentialNoticeSession = session;

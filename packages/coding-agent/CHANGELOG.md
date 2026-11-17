@@ -14,6 +14,8 @@
 
 ### Fixed
 
+- Route headless task DCG reviews to the live parent TUI without enabling child UI or reusing grants. Revalidate both sessions' authority and the exact invocation through backend dispatch. Preserve typed denial, cancellation, and unavailable errors.
+- Keep erased TypeScript type imports out of legacy extension runtime graphs. Preserve Bun's native loader for attributed imports, including mixed module/file use and package self-exports.
 - Preserve the exact durable journal and its parent directory in shutdown, fork-return and fatal-recovery commands. Quote paths for POSIX shells and PowerShell, including sessions opened with a different future-session directory.
 - Separate MCP fixture startup from request deadlines. Make connected-browser viewport qualification deterministic and preserve navigation failures during cleanup.
 - Serialize and atomically publish shared ACP handle mappings. Fork unloaded handles from their continued conversation instead of the original transcript.

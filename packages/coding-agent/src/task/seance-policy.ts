@@ -15,6 +15,7 @@ export function seanceIsolationOptions(cwd: string) {
 		spawns: "",
 		additionalDirectories: [],
 		inheritedSessionAgents: undefined,
+		parentRuntimeApproval: undefined,
 		contextFiles: [],
 		skills: [],
 		workspaceTree: {
