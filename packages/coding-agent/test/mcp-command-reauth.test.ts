@@ -206,6 +206,8 @@ describe("/mcp auth commands", () => {
 
 	test.each([
 		{ scenario: "user placeholders and force-enable", project: false, invalidation: "none" },
+		{ scenario: "URL-only user placeholders and force-enable", project: false, invalidation: "none", inferred: true },
+		{ scenario: "an approved URL-only project", project: true, invalidation: "none", inferred: true },
 		{
 			scenario: "an exactly approved project with general project loading disabled",
 			project: true,
@@ -273,8 +275,8 @@ describe("/mcp auth commands", () => {
 		const runtimeUrl = `${server.url}mcp`;
 		Bun.env.MCP_HOST = server.url.host;
 		process.env.MCP_HOST = server.url.host;
-		const config: MCPHttpServerConfig = {
-			type: "http",
+		const config = {
+			...("inferred" in row ? {} : { type: "http" as const }),
 			url: row.project ? runtimeUrl : `http://\${MCP_HOST}/mcp`,
 			enabled: false,
 			oauth: { clientId: "test-client" },
@@ -297,7 +299,7 @@ describe("/mcp auth commands", () => {
 				configPath,
 				JSON.stringify({ mcpServers: { envserver: config }, enabledServers: ["envserver"] }),
 			);
-			configs = { envserver: { ...config, url: runtimeUrl, enabled: true } };
+			configs = { envserver: { ...config, type: "http", url: runtimeUrl, enabled: true } };
 			sources = { envserver: { provider: "native", providerName: "OMP", path: configPath, level: "user" } };
 		}
 		const manager = new MCPManager(projectDir);

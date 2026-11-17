@@ -54,9 +54,12 @@ function needsAuthentication(error: unknown, config: MCPServerConfig): boolean {
 }
 
 async function findTarget(name: string, config: MCPServerConfig, source: SourceMeta, cwd: string): Promise<AuthTarget> {
-	const writableSource = ["native", "mcp-json", "coreforge"].includes(source.provider);
+	const writableSource =
+		source.provider === "native" ||
+		source.provider === "mcp-json" ||
+		(source.provider === "coreforge" && source.level !== "project");
 	const rawConfig =
-		source.path && (writableSource || source.provider === "mcp-managed")
+		source.path && (writableSource || source.provider === "mcp-managed" || source.provider === "coreforge")
 			? (await readMCPConfigFile(source.path)).mcpServers?.[name]
 			: undefined;
 	return {
@@ -66,7 +69,7 @@ async function findTarget(name: string, config: MCPServerConfig, source: SourceM
 		found: {
 			config: rawConfig ?? config,
 			filePath: writableSource && rawConfig && source.path ? source.path : getMCPConfigPath("user", cwd),
-			scope: source.level === "project" ? "project" : "user",
+			scope: writableSource && source.level === "project" ? "project" : "user",
 			sourceLevel: source.level,
 			source,
 			profileIdentity: getActiveProfile() ?? "default",

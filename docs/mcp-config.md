@@ -277,6 +277,10 @@ Neither command enables a disabled server or grants project trust.
 Coreforge's `coreforge mcp auth` wrapper also checks selected CLI-backed integrations.
 Native hosted authentication does not sign in stdio servers.
 
+Trusted `.coreforge/mcp.json` definitions remain unchanged during authentication.
+Their explicit Authorization headers and API keys are not replaced by browser
+grants. Update the source and approve the changed definition before using OAuth.
+
 Results distinguish verified connections from saved grants whose connection
 could not be verified. Exit codes are `0` for ready, `1` for unresolved readiness,
 `2` for invalid arguments or selection, and `130` for cancellation.

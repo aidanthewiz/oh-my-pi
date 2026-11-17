@@ -242,7 +242,13 @@ describe.skipIf(process.platform === "win32")("native MCP auth command", () => {
 
 	async function run(
 		argv: string[],
-		options: { tty?: boolean; cancel?: boolean; freshManager?: boolean; env?: Record<string, string> } = {},
+		options: {
+			tty?: boolean;
+			cancel?: boolean;
+			freshManager?: boolean;
+			approveProject?: boolean;
+			env?: Record<string, string>;
+		} = {},
 	) {
 		const code = `
 			import Mcp from ${JSON.stringify(commandPath)};
@@ -255,6 +261,12 @@ describe.skipIf(process.platform === "win32")("native MCP auth command", () => {
 				Object.defineProperty(process.stdin, 'isTTY', { value: true });
 				Object.defineProperty(process.stdout, 'isTTY', { value: true });
 			}
+			if (${Boolean(options.approveProject)}) {
+				await loadAllMCPConfigs(process.cwd(), {
+					enableProjectConfig: false, discoveryProviders: ['coreforge'],
+					requestProjectTrust: async () => true,
+				});
+			}
 			await run({ bin: 'cf', version: 'test', argv: ['mcp', ...${JSON.stringify(argv)}],
 				commands: [{ name: 'mcp', load: async () => Mcp }] });
 			if (${Boolean(options.freshManager)} && process.exitCode === 0) {
@@ -264,7 +276,7 @@ describe.skipIf(process.platform === "win32")("native MCP auth command", () => {
 				manager.setAuthStorage(storage);
 				try {
 					const { configs, sources } = await loadAllMCPConfigs(process.cwd(), {
-						enableProjectConfig: false, discoveryProviders: ['native', 'mcp-managed'] });
+						enableProjectConfig: false, discoveryProviders: ['native', 'mcp-managed', 'coreforge'] });
 					await manager.connectServers(configs, sources, undefined, 0);
 					await manager.waitForStartup(0);
 					const result = await manager.callTool('synthetic', 'identity');
@@ -564,6 +576,70 @@ describe.skipIf(process.platform === "win32")("native MCP auth command", () => {
 		expect((await run(["auth", "optional", "--check"])).exitCode).toBe(2);
 		expect(fixture.handshakes).toEqual([""]);
 	}, 30_000);
+
+	test.each(["auth", "reauth"] as const)(
+		"%s preserves exact project trust when replacing stale client authentication",
+		async action => {
+			fixture = oauthServer();
+			const projectPath = path.join(project, ".coreforge", "mcp.json");
+			await fs.mkdir(path.dirname(projectPath));
+			const projectText = JSON.stringify({
+				mcpServers: {
+					synthetic: {
+						...fixture.config,
+						enabled: false,
+						auth: {
+							type: "oauth",
+							credentialId: mcpOAuthCredentialId(fixture.url, "default"),
+							tokenUrl: fixture.url.replace("/mcp", "/token"),
+							clientId: "native-client",
+							resource: fixture.url,
+						},
+					},
+				},
+			});
+			await fs.writeFile(projectPath, projectText);
+			await configure({ enabledServers: ["synthetic"] });
+			const result = await run([action, "synthetic"], {
+				tty: true,
+				approveProject: true,
+				freshManager: true,
+			});
+			expect(result.exitCode, result.stderr + result.stdout).toBe(0);
+			expect(result.stdout).toContain('FRESH_CONNECTION=[{"type":"text","text":"native-grant-1"}]');
+			expect(await fs.readFile(projectPath, "utf8")).toBe(projectText);
+			expect(fixture.handshakes).toContain("Bearer native-grant-1");
+			expect(await credential()).toMatchObject({ access: "native-grant-1" });
+		},
+		30_000,
+	);
+
+	test.each(["auth", "reauth"] as const)(
+		"%s does not replace immutable project authorization with an unusable grant",
+		async action => {
+			fixture = oauthServer();
+			const projectPath = path.join(project, ".coreforge", "mcp.json");
+			await fs.mkdir(path.dirname(projectPath));
+			const projectText = JSON.stringify({
+				mcpServers: {
+					synthetic: {
+						...fixture.config,
+						headers: { Authorization: "synthetic-project-authorization" },
+					},
+				},
+			});
+			await fs.writeFile(projectPath, projectText);
+			await configure({ enabledServers: ["synthetic"] });
+			const result = await run([action, "synthetic"], { tty: true, approveProject: true });
+			expect(result.exitCode, result.stderr + result.stdout).toBe(1);
+			expect(fixture.authorizations).toEqual([]);
+			expect(fixture.tokenRequests).toEqual([]);
+			expect(await credential()).toBeUndefined();
+			expect(await fs.readFile(projectPath, "utf8")).toBe(projectText);
+			expect(await Bun.file(browserLog).exists()).toBe(false);
+		},
+		30_000,
+	);
 
 	test("does not bypass project trust or discovery exclusions", async () => {
 		fixture = oauthServer({ anonymous: true });

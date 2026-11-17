@@ -401,12 +401,17 @@ export function matchingManagerServerConfig(
 	name: string,
 	selected: MCPServerConfig,
 ): MCPServerConfig | undefined {
-	if (selected.type !== "http" && selected.type !== "sse") return undefined;
+	const hasCommand = "command" in selected && selected.command;
+	const hasUrl = "url" in selected && selected.url;
+	const transport = selected.type ?? (hasCommand ? "stdio" : hasUrl ? "http" : "stdio");
+	if (transport !== "http" && transport !== "sse") return undefined;
 	const managerConfig = manager?.getServerConfig(name);
-	if (!managerConfig || managerConfig.type !== selected.type) return undefined;
+	if (!managerConfig || managerConfig.type !== transport) return undefined;
+	const runtimeSelected =
+		selected.type === transport ? selected : ({ ...selected, type: transport } as MCPServerConfig);
 	const level = manager?.getSource(name)?.level === "project" ? "project" : "user";
-	const expanded = expandEnvVarsDeepForConfigLevel(selected, level);
-	return matchingMcpDefinition(managerConfig, selected) || matchingMcpDefinition(managerConfig, expanded)
+	const expanded = expandEnvVarsDeepForConfigLevel(runtimeSelected, level);
+	return matchingMcpDefinition(managerConfig, runtimeSelected) || matchingMcpDefinition(managerConfig, expanded)
 		? managerConfig
 		: undefined;
 }
@@ -996,6 +1001,16 @@ export async function reauthorizeMcpServer(
 	const runtimeBaseConfig = opts.effectiveTransport
 		? ({ ...expandedBaseConfig, type: opts.effectiveTransport } as MCPServerConfig)
 		: expandedBaseConfig;
+	if (
+		found.discovered &&
+		found.acpOwned !== true &&
+		configLevel === "project" &&
+		(currentAuth?.type === "apikey" || hasMcpAuthorizationHeader(runtimeBaseConfig))
+	) {
+		throw new McpReauthRefusalError(
+			`Server "${name}" supplies explicit project authentication. Update its source and approve it again; browser sign-in cannot replace immutable project credentials.`,
+		);
+	}
 	// Resolve endpoints first: this fails fast for stdio transports and
 	// probes http/sse with { oauth: false }, so nothing destructive has
 	// happened yet if the server turns out not to need (or support) OAuth.

@@ -1833,14 +1833,14 @@ export class MCPCommandController {
 				);
 			}
 			const source = manager?.getSource(name);
+			const effectiveConfig = matchingManagerServerConfig(manager, name, { ...found.config, enabled: true });
 			const effectiveEnabled =
-				manager?.getServerConfig(name)?.enabled === true &&
+				effectiveConfig?.enabled === true &&
 				source !== undefined &&
 				found.source !== undefined &&
 				source.provider === found.source.provider &&
 				source.path === found.source.path &&
-				source.level === found.source.level &&
-				matchingManagerServerConfig(manager, name, { ...found.config, enabled: true }) !== undefined;
+				source.level === found.source.level;
 			const disabled = await readDisabledServers(getMCPConfigPath("user", getProjectDir()));
 			this.#assertCurrentOwner();
 			if (disabled.includes(name) || (found.config.enabled === false && !effectiveEnabled)) {
@@ -1854,6 +1854,7 @@ export class MCPCommandController {
 						authStorage: session.modelRegistry.authStorage,
 						authChallenge: options.authChallenge,
 						effectiveEnabled: effectiveEnabled || undefined,
+						effectiveTransport: effectiveConfig?.type,
 						mcpManager: manager,
 						isCurrent,
 						silent: options.silent,
@@ -1903,7 +1904,14 @@ export class MCPCommandController {
 					outcome.config,
 					(found.sourceLevel ?? found.scope) === "project" ? "project" : "user",
 				);
-				return effectiveEnabled ? { ...runtimeConfig, enabled: true } : runtimeConfig;
+				const transport = runtimeConfig.type ?? effectiveConfig?.type;
+				return effectiveEnabled || transport !== runtimeConfig.type
+					? ({
+							...runtimeConfig,
+							type: transport,
+							enabled: effectiveEnabled ? true : runtimeConfig.enabled,
+						} as MCPServerConfig)
+					: runtimeConfig;
 			} finally {
 				release();
 			}
