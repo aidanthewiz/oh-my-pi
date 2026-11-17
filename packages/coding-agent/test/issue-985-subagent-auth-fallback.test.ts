@@ -66,12 +66,10 @@ interface MockRegistryOptions {
 	authedProviders: Set<string>;
 }
 
-function createMockRegistry(
-	options: MockRegistryOptions,
-): ModelLookupRegistry & Pick<ModelRegistry, "getApiKeyForProvider"> {
+function createMockRegistry(options: MockRegistryOptions): ModelLookupRegistry & Pick<ModelRegistry, "getApiKey"> {
 	return {
 		getAvailable: () => options.models,
-		getApiKeyForProvider: async provider => (options.authedProviders.has(provider) ? "sk-test-token" : undefined),
+		getApiKey: async model => (options.authedProviders.has(model.provider) ? "sk-test-token" : undefined),
 	};
 }
 
@@ -168,15 +166,15 @@ describe("issue #985: subagent dispatch auth fallback", () => {
 
 	test("treats keyless providers (kNoAuth marker) as authenticated", async () => {
 		// Keyless-by-design providers (Ollama, llama.cpp, lm-studio) advertise the
-		// kNoAuth sentinel from getApiKeyForProvider to signal that they do not require
+		// kNoAuth sentinel from getApiKey to signal that they do not require
 		// credentials. The helper treats this as authenticated so an explicitly
 		// configured local model is never silently rerouted to the parent's
 		// remote provider (see #1008).
-		const registry: ModelLookupRegistry & Pick<ModelRegistry, "getApiKeyForProvider"> = {
+		const registry: ModelLookupRegistry & Pick<ModelRegistry, "getApiKey"> = {
 			getAvailable: () => [parentModel, unauthedTaskModel],
-			getApiKeyForProvider: async provider => {
-				if (provider === "deepseek") return "sk-test";
-				if (provider === "opencode-zen") return kNoAuth;
+			getApiKey: async model => {
+				if (model.provider === "deepseek") return "sk-test";
+				if (model.provider === "opencode-zen") return kNoAuth;
 				return undefined;
 			},
 		};

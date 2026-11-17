@@ -726,6 +726,46 @@ function isOpaquePathListUri(entry: string, parts: readonly string[]): boolean {
 	);
 }
 
+const MISSING_OR_INVALID_URL_CODES = new Set(["ENOENT", "ENOTDIR", "ENAMETOOLONG", "EINVAL"]);
+
+async function probeInternalUrlTarget(
+	url: string,
+	filesystem: InternalUrlFilesystem,
+	requireDirectory = false,
+): Promise<boolean> {
+	try {
+		const stat = await filesystem.stat(url);
+		// A missing JSON field stats as a file of the "null" sentinel. Readers keep
+		// that sentinel; only this probe treats it as not found.
+		if (stat.absent === true) return false;
+		return !requireDirectory || stat.type === "directory";
+	} catch (err) {
+		return !(err instanceof UrlFsError && MISSING_OR_INVALID_URL_CODES.has(err.code));
+	}
+}
+
+async function internalUrlEntryResolves(entry: string, filesystem: InternalUrlFilesystem): Promise<boolean> {
+	const router = InternalUrlRouter.instance();
+	const peeledUrl = router.split(expandPath(entry)).path;
+	if (router.isGlob(peeledUrl)) {
+		let parsedUrl: ParsedSearchPath | undefined;
+		try {
+			parsedUrl = parseUrlSearchPath(peeledUrl);
+		} catch {
+			return false;
+		}
+		if (parsedUrl?.glob !== undefined) {
+			const rawGlobTail = peeledUrl.slice(parsedUrl.basePath.length);
+			if (
+				(await splitTopLevelDelimitedPath(rawGlobTail, "semicolon", part => router.canResolve(part))).length === 1
+			) {
+				return probeInternalUrlTarget(parsedUrl.basePath, filesystem, true);
+			}
+		}
+	}
+	return probeInternalUrlTarget(peeledUrl, filesystem);
+}
+
 export async function splitDelimitedPathEntry(
 	entry: string,
 	cwd: string,
@@ -735,11 +775,12 @@ export async function splitDelimitedPathEntry(
 		queryOwner?: (part: string) => Promise<boolean>;
 		exclusionParts?: boolean;
 		/**
-		 * Split a `;` list that starts with an internal URL and also names existing
-		 * local paths (`artifact://1;notes.txt`). Search tools opt in. Rewrite tools
-		 * leave this off so a `;` inside one internal URL cannot select an extra file.
+		 * Filesystem that probes a `;` list starting with an internal URL and also
+		 * naming local paths or globs (`artifact://1;src/*.ts`). Search tools pass
+		 * the filesystem they search with. Omit it so a `;` inside one internal
+		 * URL cannot select an extra file.
 		 */
-		mixedLocalPaths?: boolean;
+		mixedLocalPaths?: InternalUrlFilesystem;
 	} = {},
 ): Promise<string[] | null> {
 	const normalizedEntry = normalizePathLikeInput(entry);
@@ -750,13 +791,24 @@ export async function splitDelimitedPathEntry(
 		((part: string) =>
 			isReadableUrlPath(part) || /^(?:ftp|wss?):\/\//i.test(part) || InternalUrlRouter.instance().canResolve(part));
 	const isBoundary = (part: string) => isUrl(part) || (options.exclusionParts === true && isExclusionPart(part));
+	if (isInternalUrlPath(normalizedEntry)) {
+		const parts = await tryDelimitedPathSplit(
+			normalizedEntry,
+			cwd,
+			splitter,
+			"semicolon",
+			"none",
+			isUrl,
+			false,
+			options.queryOwner,
+		);
+		if (!parts || parts.length <= 1) return null;
+		if (parts.every(isBoundary)) return parts;
+		if (!options.mixedLocalPaths) return null;
+		return (await internalUrlEntryResolves(normalizedEntry, options.mixedLocalPaths)) ? null : parts;
+	}
 	const urlParts = await splitMixedUrlPathList(normalizedEntry, cwd, isBoundary, options.queryOwner);
-	if (
-		urlParts &&
-		(options.mixedLocalPaths === true || !isInternalUrlPath(normalizedEntry) || urlParts.every(isBoundary))
-	)
-		return urlParts;
-	if (isInternalUrlPath(normalizedEntry)) return null;
+	if (urlParts) return urlParts;
 	const semicolonParts = await splitTopLevelDelimitedPath(normalizedEntry, "semicolon", isUrl, options.queryOwner);
 	const opaqueUrl = isUrl(normalizedEntry) || isOpaquePathListUri(normalizedEntry, semicolonParts);
 	// A real POSIX file may contain a delimiter and a selector-shaped tail
@@ -919,7 +971,11 @@ async function findLiteralPathListPart(
 export async function expandDelimitedPathEntries(
 	entries: readonly string[],
 	cwd: string,
-	options: { splitter?: PathEntrySplitter; exclusionParts?: boolean; mixedLocalPaths?: boolean } = {},
+	options: {
+		splitter?: PathEntrySplitter;
+		exclusionParts?: boolean;
+		mixedLocalPaths?: InternalUrlFilesystem;
+	} = {},
 ): Promise<string[]> {
 	const expanded: string[] = [];
 	for (const entry of entries) {

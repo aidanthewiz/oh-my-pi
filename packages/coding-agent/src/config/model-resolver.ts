@@ -49,6 +49,7 @@ import {
 	resolveThinkingLevelForModel,
 } from "@oh-my-pi/pi-tui/thinking";
 import { isAuthenticated, kNoAuth, type ModelRegistry } from "./model-registry";
+import { cfgOffline } from "./auxiliary-model-policy";
 import {
 	DEFAULT_MODEL_ROLE_ALIAS,
 	formatModelRoleAlias,
@@ -375,7 +376,7 @@ type ModelsWithProviderIndex = readonly Model<Api>[] & {
  * `gpt-4-1`). Only digit-bounded dots are separators; anything else stays
  * verbatim so unrelated punctuation never coalesces.
  */
-function revisionSpellingKey(id: string): string {
+export function revisionSpellingKey(id: string): string {
 	return id.toLowerCase().replace(/(?<=\d)\.(?=\d)/g, "-");
 }
 
@@ -1838,7 +1839,7 @@ export function sessionModelDiscoveryProviders(
  * the credential is usable once the subagent session starts — see #5325.
  *
  * Keyless-by-design providers (llama.cpp, ollama, lm-studio) advertise the
- * `kNoAuth` sentinel from `getApiKeyForProvider` to signal that they do not require
+ * `kNoAuth` sentinel from `getApiKey` to signal that they do not require
  * credentials. Those are treated as authenticated here so an explicitly
  * configured local model is never silently rerouted to the parent's remote
  * provider (see #1008).
@@ -1850,10 +1851,10 @@ export function sessionModelDiscoveryProviders(
 export async function resolveModelOverrideWithAuthFallback(
 	modelPatterns: string[],
 	parentActiveModelPattern: string | undefined,
-	modelRegistry: ModelLookupRegistry & Pick<ModelRegistry, "getApiKeyForProvider">,
+	modelRegistry: ModelLookupRegistry & Pick<ModelRegistry, "getApiKey">,
 	settings?: Settings,
 	sessionId?: string,
-	options?: { exactOnly?: boolean },
+	options?: { exactOnly?: boolean; allowedProvider?: string | null },
 ): Promise<{
 	model?: Model<Api>;
 	thinkingLevel?: ConfiguredThinkingLevel;
@@ -1862,20 +1863,36 @@ export async function resolveModelOverrideWithAuthFallback(
 	warning?: string;
 }> {
 	const disabledProviders = disabledProviderIds(settings);
+	const allowedProvider =
+		options?.allowedProvider !== undefined
+			? options.allowedProvider
+			: settings && cfgOffline.get(settings)
+				? parentActiveModelPattern
+					? (resolveModelOverride([parentActiveModelPattern], modelRegistry, settings, { exactOnly: true }).model
+							?.provider ?? null)
+					: null
+				: undefined;
 	let lookupRegistry: ModelLookupRegistry = modelRegistry;
-	if (disabledProviders.size > 0) {
-		const enabledModels = modelRegistry.getAvailable().filter(model => !disabledProviders.has(model.provider));
+	if (disabledProviders.size > 0 || allowedProvider !== undefined) {
+		const enabledModels = modelRegistry
+			.getAvailable()
+			.filter(
+				model =>
+					!disabledProviders.has(model.provider) &&
+					(allowedProvider === undefined || model.provider === allowedProvider),
+			);
 		lookupRegistry = { getAvailable: () => enabledModels };
 	}
 	const primary = resolveModelOverride(modelPatterns, lookupRegistry, settings, options);
+	if (!primary.model && allowedProvider !== undefined && parentActiveModelPattern && !options?.exactOnly) {
+		const fallback = resolveModelOverride([parentActiveModelPattern], lookupRegistry, settings);
+		if (fallback.model) return { ...fallback, authFallbackUsed: true };
+	}
 	if (!primary.model || !parentActiveModelPattern) {
 		return { ...primary, authFallbackUsed: false };
 	}
 
-	const primaryKey = await modelRegistry.getApiKeyForProvider(primary.model.provider, sessionId, {
-		baseUrl: primary.model.baseUrl,
-		modelId: primary.model.id,
-	});
+	const primaryKey = await modelRegistry.getApiKey(primary.model, sessionId);
 	if (primaryKey === kNoAuth || isAuthenticated(primaryKey)) {
 		return { ...primary, authFallbackUsed: false };
 	}
@@ -1884,10 +1901,7 @@ export async function resolveModelOverrideWithAuthFallback(
 	for (const pattern of resolveConfiguredModelPatterns(modelPatterns, settings)) {
 		const candidate = resolveModelOverride([pattern], lookupRegistry, settings);
 		if (!candidate.model || modelsAreEqual(candidate.model, primary.model)) continue;
-		const candidateKey = await modelRegistry.getApiKeyForProvider(candidate.model.provider, sessionId, {
-			baseUrl: candidate.model.baseUrl,
-			modelId: candidate.model.id,
-		});
+		const candidateKey = await modelRegistry.getApiKey(candidate.model, sessionId);
 		if (candidateKey === kNoAuth || isAuthenticated(candidateKey)) {
 			return { ...candidate, authFallbackUsed: false };
 		}
@@ -1900,10 +1914,7 @@ export async function resolveModelOverrideWithAuthFallback(
 	if (modelsAreEqual(fallback.model, primary.model)) {
 		return { ...primary, authFallbackUsed: false };
 	}
-	const fallbackKey = await modelRegistry.getApiKeyForProvider(fallback.model.provider, sessionId, {
-		baseUrl: fallback.model.baseUrl,
-		modelId: fallback.model.id,
-	});
+	const fallbackKey = await modelRegistry.getApiKey(fallback.model, sessionId);
 	if (!isAuthenticated(fallbackKey)) {
 		return { ...primary, authFallbackUsed: false };
 	}

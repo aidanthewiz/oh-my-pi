@@ -439,11 +439,9 @@ export interface ResolvedJsonReadPath {
 }
 
 /** An already-bounded virtual text resource, queried locally without exposing scratch paths. */
-export interface ResolvedJsonReadResource {
-	url: string;
+export type ResolvedJsonReadResource = {
 	content: string;
-	selector: JsonSelector;
-}
+} & (ResolvedJsonReadPath | { url: string; selector: JsonSelector });
 
 /**
  * Resolves `file?q=…` to an existing non-image file, falling back to a unique
@@ -511,7 +509,7 @@ export async function readJson(
 	};
 
 	let queryOutput: string;
-	if ("url" in resolvedJsonPath) {
+	if ("content" in resolvedJsonPath) {
 		await using scratch = await TempDir.create("@omp-read-json-");
 		const inputPath = scratch.join("input.json");
 		await Bun.write(inputPath, resolvedJsonPath.content);

@@ -55,6 +55,7 @@ import { cfgDisabledModels, cfgDisabledProviders, cfgModelProviderOrder } from "
 import type { Settings } from "../config/settings";
 import {
 	type AuthBrokerClientConfig,
+	applyUnpausedProviders,
 	loadEffectiveAuthAccountPolicyConfig,
 	resolveAuthBrokerConfig,
 	resolveEffectiveSettings,
@@ -390,6 +391,7 @@ async function runServe(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 	// in sdk.ts. The gateway never touches local SQLite.
 	const accountPool = await loadAuthBrokerAccountPool();
 	const settings = await resolveEffectiveSettings();
+	applyUnpausedProviders(settings);
 	const { accountPolicies, defaultReservePct } = await loadEffectiveAuthAccountPolicyConfig({ settings });
 	const client = createBrokerClient(brokerConfig);
 	const initialSnapshot = await fetchBrokerSnapshot(client);
@@ -873,6 +875,7 @@ async function runCheck(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 
 	const accountPool = await loadAuthBrokerAccountPool();
 	const settings = await resolveEffectiveSettings();
+	applyUnpausedProviders(settings);
 	const { accountPolicies, defaultReservePct } = await loadEffectiveAuthAccountPolicyConfig({ settings });
 	const client = createBrokerClient(brokerConfig);
 	const initialSnapshot = await fetchBrokerSnapshot(client);

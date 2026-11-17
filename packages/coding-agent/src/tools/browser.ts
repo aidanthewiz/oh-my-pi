@@ -18,6 +18,7 @@ import {
 	releaseBrowser,
 } from "./browser/registry";
 import { chromiumNeedsDownload, ensureChromiumExecutable } from "./browser/launch";
+import { sameAddress } from "./browser/navigation";
 import { resolveInitScriptSources } from "./browser/open-options";
 import { resolveRelayKind } from "./browser/relay/kind";
 import { relayExtensionNotice } from "./browser/relay/probe";
@@ -26,8 +27,8 @@ import { resolveTernKind } from "./browser/tern/kind";
 import { isTernUnavailable } from "./browser/tern/wire";
 import { ownsTerminal } from "./browser/terminal-owner";
 import { WebKitUnavailableError } from "./browser/webkit/host";
-import { installWebKitEngine } from "./browser/webkit/install";
-import { resolveWebKitKind, VIEWER_PLATFORMS, webKitEngineToInstall } from "./browser/webkit/kind";
+import { ABKIT_VERSION, installWebKitEngine, webKitEngineToInstall } from "./browser/webkit/install";
+import { resolveWebKitKind, VIEWER_PLATFORMS } from "./browser/webkit/kind";
 import type { AriaSnapshotOptions } from "./browser/aria/aria-snapshot";
 import type { ScreenshotResult } from "./browser/tab-protocol";
 import type { OutputMeta } from "@oh-my-pi/pi-tui/tools/output-meta";
@@ -52,7 +53,7 @@ import {
 } from "./browser/tab-supervisor";
 import { renderTabCall, tabCallBudgetSeconds } from "./browser/tab-call";
 import { resolveToCwd } from "./path-utils";
-import { renderCallChain, renderFunctionRun } from "./run-code";
+import { renderFunctionRun, renderStatusCallChain } from "./run-code";
 import { ToolAbortError, throwIfAborted } from "./tool-errors";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { toolResult } from "./tool-result";
@@ -338,12 +339,31 @@ function describeBrowserCall(parameters: unknown, result: AgentToolResult<unknow
 			return parsed.all ? "close all" : `close ${name}`;
 		case "run":
 			return `${name}.run(${parsed.fn !== undefined ? "fn" : (parsed.code?.trim().split("\n", 1)[0] ?? "")})`;
-		case "call":
-			return `${name}.${renderCallChain(parsed.chain ?? [])}`;
+		case "call": {
+			const chain = parsed.chain ?? [];
+			return `${name}.${renderStatusCallChain(chain, (step, index) => browserTextStart(step.method, chain[index - 1]?.method))}`;
+		}
 		case "tabs":
 			return "tabs";
 		case "targets":
 			return "targets";
+	}
+}
+
+/**
+ * Where the text a browser helper enters starts in its arguments: after the selector of a tab or
+ * frame `fill`/`type`, first on an element handle and for clipboard and dialog text.
+ */
+function browserTextStart(method: string, previous: string | undefined): number | undefined {
+	switch (method) {
+		case "fill":
+		case "type":
+			return previous === undefined || previous === "frame" ? 1 : 0;
+		case "clipboardWrite":
+		case "handleDialog":
+			return 0;
+		default:
+			return undefined;
 	}
 }
 
@@ -404,7 +424,11 @@ async function invokeBrowser(
 
 	try {
 		throwIfAborted(context.signal);
-		const requested = parsed.timeout ?? (parsed.action === "call" ? tabCallBudgetSeconds(parsed.chain) : undefined);
+		const requested =
+			parsed.timeout ??
+			(parsed.action === "call" || parsed.action === "run"
+				? tabCallBudgetSeconds(parsed.chain, context.cellTimeoutMs)
+				: undefined);
 		const timeoutSeconds = clampTimeout("browser", requested, cfgToolsMaxTimeout.get(session.settings));
 		const timeoutMs = timeoutSeconds * 1000;
 		const name = parsed.name ?? DEFAULT_TAB_NAME;
@@ -508,10 +532,13 @@ async function openBrowser(
 	}
 }
 
+/** Engine directories whose update failed in this process: their installed engine runs without another attempt. */
+const failedWebKitUpdates = new Set<string>();
+
 /**
- * Install a missing engine before the open deadline only when the installer
- * admits the operator's trusted settings and explicit build service.
- * Automatic selection falls back to Chromium on refusal; explicit WebKit fails.
+ * Install or update the selected profile-owned engine before the open deadline
+ * only with trusted enablement and an explicit build service. A refused
+ * automatic install falls back to Chromium; an installed engine survives a failed update.
  */
 async function installWebKitForOpen(
 	session: ToolSession,
@@ -519,11 +546,28 @@ async function installWebKitForOpen(
 	signal?: AbortSignal,
 ): Promise<string | undefined> {
 	const explicit = params.app === "webkit";
-	const engineDir = webKitEngineToInstall({
+	const pending = await webKitEngineToInstall({
 		settingEnabled: explicit || cfgBrowserWebKit.get(session.settings),
 		settingPath: cfgBrowserWebKitPath.get(session.settings),
 	});
-	if (engineDir === null) return undefined;
+	if (pending === null) return undefined;
+	const { engineDir } = pending;
+	if (pending.outdated) {
+		if (failedWebKitUpdates.has(engineDir)) return undefined;
+		if (!explicit && resolveBrowserKind(params, session).kind !== "webkit") return undefined;
+		try {
+			await untilAborted(signal, () => installWebKitEngine(engineDir, { settings: session.settings }));
+		} catch (error) {
+			if (signal?.aborted) throw error;
+			failedWebKitUpdates.add(engineDir);
+			logger.warn(`Could not update ${CF_BRAND}'s WebKit engine; running the installed one`, {
+				engineDir,
+				version: ABKIT_VERSION,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+		return undefined;
+	}
 	if (!explicit) {
 		const kind = resolveBrowserKind(params, session);
 		if (kind.kind !== "headless" || params.app === "chromium") return undefined;
@@ -716,10 +760,12 @@ async function openOnKind(
 		details.url = url;
 		details.viewport = tab.info.viewport;
 		const verb = result.created ? "Opened" : "Reused";
+		// One line: the tab and its browser, where it landed unless that is the URL the call asked for, and its title.
+		let opened = `${verb} tab ${JSON.stringify(name)} on ${describeBrowser(tab)}`;
+		if (!params.url || !sameAddress(params.url, url)) opened += `, at ${url}`;
+		if (title) opened += `, titled ${JSON.stringify(title)}`;
 		const lines = [
-			`${verb} tab ${JSON.stringify(name)} on ${describeBrowser(tab)}`,
-			`URL: ${url}`,
-			title ? `Title: ${title}` : null,
+			opened,
 			...(tab.backend === "tern" ? ternNotes(tab) : []),
 			...notes,
 			result.note,

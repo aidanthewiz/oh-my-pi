@@ -87,7 +87,9 @@ describe("browser handle enrichment — guarded actions", () => {
 		const page = Object.assign(new EventEmitter(), {
 			mouse: { move: async () => {}, down: mousePress, up: async () => {} },
 			isClosed: () => false,
+			mainFrame: () => frame,
 		});
+		const frame = { page: () => page };
 		return {
 			boundingBox: async () => ({ x: 10, y: 10, width: 20, height: 20 }),
 			evaluate: async () => ({ ok: true, x: 20, y: 20 }),
@@ -96,7 +98,7 @@ describe("browser handle enrichment — guarded actions", () => {
 					fn({ detached: false, delivered: () => true, stop: () => {} }),
 				dispose: async () => {},
 			}),
-			frame: { page: () => page },
+			frame,
 			type: async () => {},
 			dispose: async () => {},
 			...extra,

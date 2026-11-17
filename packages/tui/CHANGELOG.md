@@ -33,6 +33,39 @@
 - Scrub provider and operational AWS credentials from tmux capability queries while preserving terminal session identity.
 - Keep tool-image links bound to captured blob copies instead of reopening mutable read paths. Refresh native image links when hyperlink policy or file identity changes.
 - Preserve the focused worker's live loader when an older completion arrives. Fence teardown across view changes and asynchronous model switches.
+## [18.20.1] - 2026-11-14
+
+### Added
+
+- Added task counts to the Todo status line when work is assigned to multiple targets.
+- Preserved pasted images when copying Composer drafts in Tern.
+- Added the ability to delete the selected prompt from history by pressing Delete at the end of the Ctrl+R search field.
+- Added distinct theming for Markdown links using registered extension schemes, with a muted fallback for themes that do not define the new color.
+- Improved compound Bash command approval dialogs by distinguishing allowed and approval-required segments and opening at the first segment requiring approval.
+- Added an optional Branch action to chat, including the `b` shortcut in the BTW history sheet.
+
+### Fixed
+
+- Fixed asynchronous Bash commands switching from the interpreted shell view to the raw command line.
+- Improved transcript rendering when switching to a subagent, resuming a session, or rebuilding a long transcript so the newest messages appear immediately.
+- Fixed Markdown task lists displaying the wrong checkbox state for completed and open items.
+- Fixed iTerm2 inserting terminal resize data into the composer when reporting in-band resizes.
+- Improved working-row animation while waiting for tools or models on terminals without synchronized output, including tmux 3.6.
+- Fixed expanded IRC tool cards to show complete soft-wrapped output and added an expand hint to collapsed cards containing hidden text.
+- Fixed premature scrolling in the `/resume` session picker when navigating near the middle of the list.
+
+## [18.20.0] - 2026-11-12
+
+### Added
+
+- The Spotlight sheet of a `;`/`,` path `read` shows each part as its own section, numbered from its file's lines with its own ranking ([#18713](https://github.com/can1357/oh-my-pi/pull/18713) by [@eggpeat](https://github.com/eggpeat))
+
+### Fixed
+
+- Fixed `grep` tool results in ANSI and native Tern views to show a `binary matches` warning on both zero-match and matching searches ([#18988](https://github.com/can1357/oh-my-pi/pull/18988) by [@alphastorm](https://github.com/alphastorm))
+- The `/resume` picker deletes sessions through the `app.session.delete` action (default Backspace or Delete) and shows its keys in the hints, so `keybindings.yml` can replace the shortcut, for example with Ctrl+D, or disable it with `[]`; a bound key that also deletes backward, such as Backspace or Ctrl+W, still edits a typed search query ([#17938](https://github.com/can1357/oh-my-pi/issues/17938), [#18961](https://github.com/can1357/oh-my-pi/pull/18961) by [@wolfiesch](https://github.com/wolfiesch))
+- Typing `/job` lists the `jobs` command first again instead of jumping whole-hyphen-segment skill matches like `skill:…-job-…` above it: inner-segment skill hits now tie (rather than outrank) command-prefix matches, so the tie keeps the popup command-first ([#18891](https://github.com/can1357/oh-my-pi/issues/18891), [#18916](https://github.com/can1357/oh-my-pi/pull/18916) by [@yuzu-octopus](https://github.com/yuzu-octopus))
+
 ## [18.19.0] - 2026-11-12
 
 ### Added
@@ -2888,3 +2921,4 @@ Older entries are archived in [packages/tui/CHANGELOG.md@3deb6751027b](https://g
 Older entries are archived in [packages/tui/CHANGELOG.md@6693ddbfd58c](https://github.com/can1357/oh-my-pi/blob/6693ddbfd58ce9edcdc0dc3fe98a8882c9bae834/packages/tui/CHANGELOG.md).
 Older entries are archived in [packages/tui/CHANGELOG.md@6b354a56a890](https://github.com/can1357/oh-my-pi/blob/6b354a56a890b69b6bc9503c16c510be33675b5a/packages/tui/CHANGELOG.md).
 Older entries are archived in [packages/tui/CHANGELOG.md@7049d1b1afeb](https://github.com/can1357/oh-my-pi/blob/7049d1b1afeb8e421e7f9fba5c1dcebd7c382232/packages/tui/CHANGELOG.md).
+Older entries are archived in [packages/tui/CHANGELOG.md@89a034e2c7df](https://github.com/can1357/oh-my-pi/blob/89a034e2c7dfe2e55f68ce21eb86e6b9c905faf9/packages/tui/CHANGELOG.md).

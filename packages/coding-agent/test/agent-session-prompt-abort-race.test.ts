@@ -89,7 +89,11 @@ describe("AgentSession prompt admission racing abort", () => {
 			initialState: { model, systemPrompt: ["Test"], tools: [] },
 			streamFn: mock.stream,
 		});
-		const fallbackRegistry = new ModelRegistry(authStorage);
+		const modelRegistry = new ModelRegistry(authStorage);
+		if (options.modelRegistry) {
+			const keySpy = spyOn(modelRegistry, "getApiKey").mockImplementation(options.modelRegistry.getApiKey);
+			restores.push(() => keySpy.mockRestore());
+		}
 		if (options.persist) temporary = TempDir.createSync("@pi-image-owner-");
 		session = new AgentSession({
 			agent,
@@ -97,7 +101,7 @@ describe("AgentSession prompt admission racing abort", () => {
 				? SessionManager.create(temporary!.path(), `${temporary!.path()}/sessions`)
 				: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false, "todo.enabled": false, ...options.settings }),
-			modelRegistry: (options.modelRegistry ?? fallbackRegistry) as never,
+			modelRegistry,
 			...(options.extensionRunner ? { extensionRunner: options.extensionRunner as never } : {}),
 			onPayload: options.onPayload,
 			providerSessionId: options.providerSessionId,
@@ -111,7 +115,7 @@ describe("AgentSession prompt admission racing abort", () => {
 			dropped.push(prompt.text);
 			droppedInputs.push(prompt);
 		});
-		return { session, dropped, droppedInputs, modelRegistry: options.modelRegistry ?? fallbackRegistry };
+		return { session, dropped, droppedInputs, modelRegistry };
 	}
 
 	/** Holds image normalization for image-bearing calls until released. */

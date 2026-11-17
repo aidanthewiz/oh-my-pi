@@ -14,7 +14,7 @@ use super::{
 use crate::{
 	error::{Error, Result},
 	types::{
-		CommitAuthor, CommitDetails, HeadState, ShowResult, StatusOptions, StatusSummary,
+		CommitAuthor, CommitDetails, HeadState, ShowResult, StatusOptions, StatusSummary, TreeEntry,
 		UntrackedMode, WorktreeEntry,
 	},
 };
@@ -861,17 +861,12 @@ impl GitRepo {
 		Ok(out)
 	}
 
-	/// List recursive blob paths in a tree, optionally filtered by pathspec-like
-	/// prefixes.
-	pub fn ls_tree(&self, rev: &str, paths: &[String]) -> Result<Vec<String>> {
+	/// List the blobs and symlinks of a tree recursively with their modes,
+	/// sorted by path, optionally filtered by pathspec-like prefixes.
+	pub fn ls_tree(&self, rev: &str, paths: &[String]) -> Result<Vec<TreeEntry>> {
 		if self.is_reftable() {
-			let mut owned = vec![
-				"ls-tree".to_owned(),
-				"--name-only".to_owned(),
-				"-r".to_owned(),
-				"-z".to_owned(),
-				rev.to_owned(),
-			];
+			let mut owned =
+				vec!["ls-tree".to_owned(), "-r".to_owned(), "-z".to_owned(), rev.to_owned()];
 			if !paths.is_empty() {
 				owned.push("--".to_owned());
 				owned.extend(paths.iter().cloned());
@@ -890,8 +885,12 @@ impl GitRepo {
 			}
 			return Ok(text
 				.split('\0')
-				.filter(|s| !s.is_empty())
-				.map(str::to_owned)
+				.filter_map(|record| {
+					let (meta, path) = record.split_once('\t')?;
+					let mut fields = meta.split(' ');
+					let mode = u32::from_str_radix(fields.next()?, 8).ok()?;
+					(fields.next()? == "blob").then(|| TreeEntry { path: path.to_owned(), mode })
+				})
 				.collect());
 		}
 		let repo = self.gix()?;
@@ -909,10 +908,13 @@ impl GitRepo {
 			.map_err(|e| Error::backend("git ls-tree", e))?
 			.into_iter()
 			.filter(|e| e.mode.is_blob() || e.mode.is_link())
-			.map(|e| bytes_to_path(e.filepath.as_bstr()))
-			.filter(|p| paths.is_empty() || paths.iter().any(|wanted| path_matches(p, wanted)))
+			.map(|e| TreeEntry {
+				path: bytes_to_path(e.filepath.as_bstr()),
+				mode: u32::from(e.mode.value()),
+			})
+			.filter(|e| paths.is_empty() || paths.iter().any(|wanted| path_matches(&e.path, wanted)))
 			.collect();
-		out.sort();
+		out.sort_by(|a, b| a.path.cmp(&b.path));
 		Ok(out)
 	}
 
@@ -1598,34 +1600,62 @@ mod tests {
 		let literal_names =
 			["literal\nname.txt", "literal[abc]?.txt", "plain.txt"].map(str::to_owned);
 		let literal_tree = tree_with_names(root, &literal_names)?;
-		assert_eq!(repo.ls_tree(&literal_tree, &[])?, literal_names);
-		assert_eq!(repo.ls_tree(&literal_tree, &["plain.txt".to_owned()])?, ["plain.txt"]);
+		let entries = |names: &[String]| {
+			names
+				.iter()
+				.map(|path| TreeEntry { path: path.clone(), mode: 0o100644 })
+				.collect::<Vec<_>>()
+		};
+		assert_eq!(repo.ls_tree(&literal_tree, &[])?, entries(&literal_names));
+		assert_eq!(repo.ls_tree(&literal_tree, &["plain.txt".to_owned()])?, [TreeEntry {
+			path: "plain.txt".to_owned(),
+			mode: 0o100644,
+		}]);
 
 		let limit = super::super::cli::OUTPUT_LIMIT_BYTES;
-		let mut names: Vec<_> = (0..limit / 240)
+		let overhead =
+			format!("100644 blob {}\t\0", git(root, &["hash-object", "--stdin"])?.trim()).len();
+		let record_bytes = 239 + overhead;
+		let full_entries = limit / record_bytes - 1;
+		let mut names: Vec<_> = (0..full_entries)
 			.map(|index| format!("{index:06}-{}", "x".repeat(232)))
 			.collect();
-		let remainder = limit % 240;
-		assert!((2..=255).contains(&remainder));
-		names.push(format!("z{}", "x".repeat(remainder - 2)));
-		assert_eq!(names.iter().map(|name| name.len() + 1).sum::<usize>(), limit);
+		let remainder = limit - full_entries * record_bytes;
+		for (prefix, size) in [("y", remainder / 2), ("z", remainder - remainder / 2)] {
+			let name_bytes = size - overhead;
+			assert!((1..=255).contains(&name_bytes));
+			names.push(format!("{prefix}{}", "x".repeat(name_bytes - 1)));
+		}
+		assert_eq!(
+			names
+				.iter()
+				.map(|name| name.len() + overhead)
+				.sum::<usize>(),
+			limit
+		);
 		let exact_tree = tree_with_names(root, &names)?;
-		assert_eq!(repo.ls_tree(&exact_tree, &[])?, names);
+		assert_eq!(repo.ls_tree(&exact_tree, &[])?, entries(&names));
 
 		names
 			.last_mut()
 			.ok_or("missing final tree entry")?
 			.push('x');
-		assert_eq!(names.iter().map(|name| name.len() + 1).sum::<usize>(), limit + 1);
+		assert_eq!(
+			names
+				.iter()
+				.map(|name| name.len() + overhead)
+				.sum::<usize>(),
+			limit + 1
+		);
 		let oversized_tree = tree_with_names(root, &names)?;
-		let args = ["ls-tree", "--name-only", "-r", "-z", &oversized_tree].map(str::to_owned);
+		let args = ["ls-tree", "-r", "-z", &oversized_tree].map(str::to_owned);
 		let capture = cli_text_owned_capped(root, &args, super::super::cli::SYNC_TIMEOUT, limit)?;
 		assert!(super::super::cli::is_truncated(&capture), "fixture must exceed the real cap");
 		assert!(
 			matches!(repo.ls_tree(&oversized_tree, &[]), Err(Error::Backend { .. })),
 			"an incomplete reftable tree must not become an authoritative path list"
 		);
-		assert_eq!(repo.ls_tree(&literal_tree, &[])?, literal_names);
+		assert_eq!(repo.ls_tree(&literal_tree, &[])?, entries(&literal_names));
 		Ok(())
 	}
 
@@ -1794,7 +1824,10 @@ mod tests {
 				.collect();
 		assert_eq!(repo.log_onelines(2)?, expected_onelines);
 		assert_eq!(repo.rev_list_touching("HEAD", "two", 10)?, vec![second.clone()]);
-		assert_eq!(repo.ls_tree("HEAD", &[])?, vec!["one", "two"]);
+		assert_eq!(repo.ls_tree("HEAD", &[])?, vec![
+			TreeEntry { path: "one".to_owned(), mode: 0o100644 },
+			TreeEntry { path: "two".to_owned(), mode: 0o100644 },
+		]);
 		let shown = repo.show_blob("HEAD:two", Some(3))?;
 		assert_eq!(shown.bytes, b"two");
 		assert!(shown.truncated);

@@ -4,6 +4,7 @@ import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import { AudioCapture } from "@oh-my-pi/pi-natives";
 import { prompt, toError } from "@oh-my-pi/pi-utils";
 import { isModelEnabledBySettings } from "../config/model-resolver";
+import { cfgOffline } from "../config/auxiliary-model-policy";
 import type { AgentSession } from "../session/agent-session";
 import type { AgentSessionEvent } from "../session/agent-session-events";
 import { LIVE_DELEGATION_MESSAGE_TYPE } from "../session/messages";
@@ -113,6 +114,7 @@ export class LiveSessionController {
 	readonly #lifetime = new AbortController();
 
 	#transport: CodexLiveTransport | undefined;
+	readonly #transportAbort = new AbortController();
 	#recorder: AudioCapture | undefined;
 	#unsubscribeSession: (() => void) | undefined;
 	#sendChain: Promise<void> = Promise.resolve();
@@ -162,6 +164,7 @@ export class LiveSessionController {
 		const gate = session.costGate;
 		this.#assertOwnerCurrent = () => {
 			this.#lifetime.signal.throwIfAborted();
+			this.#assertProviderAllowed();
 			if (
 				session.isDisposed ||
 				session.isSessionTransitioning ||
@@ -220,6 +223,9 @@ export class LiveSessionController {
 
 		try {
 			this.#assertOwnerCurrent();
+			this.#unsubscribeSession = this.#session.subscribe(event =>
+				this.#guardEvent(() => this.#handleSessionEvent(event)),
+			);
 			const user = currentUser();
 			const instructions = prompt.render(this.#instructionsTemplate, user);
 			const transport = new CodexLiveTransport({
@@ -228,7 +234,7 @@ export class LiveSessionController {
 				instructions,
 				voice: this.#voice,
 				sdpOffer: this.#sdpOffer,
-				signal: this.#lifetime.signal,
+				signal: AbortSignal.any([this.#lifetime.signal, this.#transportAbort.signal]),
 				assertCurrent: this.#assertOwnerCurrent,
 				callbacks: {
 					onEvent: event => this.#guardEvent(() => this.#handleLiveEvent(event)),
@@ -241,9 +247,7 @@ export class LiveSessionController {
 			if (this.#stopped) {
 				throw this.#failure ?? new Error("The live session stopped while connecting.");
 			}
-			this.#unsubscribeSession = this.#session.subscribe(event =>
-				this.#guardEvent(() => this.#handleSessionEvent(event)),
-			);
+			this.#assertProviderAllowed();
 			if (this.#muted) await transport.setMuted(true);
 			this.#assertOwnerCurrent();
 			if (this.#stopped) {
@@ -308,6 +312,12 @@ export class LiveSessionController {
 
 	async #stop(): Promise<void> {
 		this.#stopped = true;
+		if (
+			this.#phase === "connecting" ||
+			(cfgOffline.get(this.#session.settings) && this.#session.model?.provider !== "openai-codex")
+		) {
+			this.#transportAbort.abort();
+		}
 		this.#outputActivity.dispose();
 		this.#unsubscribeSession?.();
 		this.#unsubscribeSession = undefined;
@@ -328,12 +338,17 @@ export class LiveSessionController {
 		this.#transport = undefined;
 		if (transport) {
 			try {
-				await transport.send(buildSessionClose());
+				if (
+					!this.#transportAbort.signal.aborted &&
+					(!cfgOffline.get(this.#session.settings) || this.#session.model?.provider === "openai-codex")
+				) {
+					await transport.send(buildSessionClose());
+				}
 			} catch (cause) {
 				cleanupError ??= toError(cause);
 			}
 			try {
-				this.#lifetime.abort();
+				this.#transportAbort.abort();
 				await transport.close();
 			} catch (cause) {
 				cleanupError ??= toError(cause);
@@ -411,7 +426,14 @@ export class LiveSessionController {
 			.catch(cause => this.#reportFailure(toError(cause)));
 	}
 
+	#assertProviderAllowed(): void {
+		if (cfgOffline.get(this.#session.settings) && this.#session.model?.provider !== "openai-codex") {
+			throw new Error("Live audio requires the openai-codex session provider in offline mode.");
+		}
+	}
+
 	#handleSessionEvent(event: AgentSessionEvent): void {
+		if (event.type === "model_changed") this.#assertProviderAllowed();
 		if (event.type === "message_end" && event.message.role === "assistant") {
 			if (event.message.stopReason === "toolUse") this.#appendProgress(event.message);
 			return;
@@ -457,6 +479,12 @@ export class LiveSessionController {
 
 	#handleMicrophoneAudio(samples: Float32Array): void {
 		if (this.#stopped || !this.#transport) return;
+		try {
+			this.#assertProviderAllowed();
+		} catch (cause) {
+			this.#reportFailure(toError(cause));
+			return;
+		}
 		if (this.#muted) return;
 		try {
 			this.#assertCurrent();

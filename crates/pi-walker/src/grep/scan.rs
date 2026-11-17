@@ -31,6 +31,9 @@ pub const STREAM_LINE_LIMIT: usize = 64 * 1024 * 1024;
 /// What one scan reports.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ScanParams {
+	/// Search NUL-containing buffered input as text instead of skipping it as
+	/// binary.
+	pub text:        bool,
 	/// Render [`Match`] entries (line numbers, text, context).
 	pub content:     bool,
 	/// Context lines before each match (content only).
@@ -52,6 +55,9 @@ pub struct ScanParams {
 /// Outcome of one scan.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ScanOutcome {
+	/// Binary detection skipped input holding a match (grep's "binary file
+	/// matches"); a NUL that only cuts context or match-free bytes is not one.
+	pub binary_match:  bool,
 	/// Matches found: skipped, collected, and the probe match.
 	pub count:         u64,
 	/// Matches collected (after `offset`, up to the cap).
@@ -222,9 +228,7 @@ impl Scanner {
 		out: &mut Vec<Match>,
 	) -> Result<ScanOutcome, M::Error> {
 		let mut res = ScanOutcome::default();
-		if memchr::memchr(0, &buf[..buf.len().min(BINARY_WINDOW)]).is_some() {
-			return Ok(res);
-		}
+		let binary = !p.text && memchr::memchr(0, &buf[..buf.len().min(BINARY_WINDOW)]).is_some();
 		let multi = multiline && spans_lines;
 		let strategy = if multi {
 			Strategy::Multi
@@ -237,7 +241,14 @@ impl Scanner {
 			Strategy::Confirm
 		};
 		let mut blocks = Blocks { matcher, buf, strategy, from: 0, pending: None, done: false };
-		let nul = |s: usize, e: usize| e > BINARY_WINDOW && memchr::memchr(0, &buf[s..e]).is_some();
+		if binary {
+			// A binary input is not searched, only probed for a first match.
+			res.binary_match = blocks.next()?.is_some();
+			return Ok(res);
+		}
+		let nul = |s: usize, e: usize| {
+			!p.text && e > BINARY_WINDOW && memchr::memchr(0, &buf[s..e]).is_some()
+		};
 		let (before, after) = if p.content {
 			(p.before, p.after)
 		} else {
@@ -280,6 +291,7 @@ impl Scanner {
 			self.starts.clear();
 			if p.content {
 				if !flush_after(&mut pending, &mut floor, &mut *out, bs) {
+					res.binary_match = true;
 					return Ok(res);
 				}
 				let mut pos = bs;
@@ -292,6 +304,7 @@ impl Scanner {
 				// The probe: grep-searcher reports a match's context before
 				// the match, so a NUL in either keeps it from counting.
 				if self.starts.iter().any(|&s| nul(s, line_end(buf, s))) || nul(bs, be) {
+					res.binary_match = true;
 					return Ok(res);
 				}
 				res.count += 1;
@@ -299,6 +312,7 @@ impl Scanner {
 			}
 			if !p.content {
 				if nul(bs, be) {
+					res.binary_match = true;
 					return Ok(res);
 				}
 				res.count += 1;
@@ -323,6 +337,7 @@ impl Scanner {
 			for (i, &s) in self.starts.iter().rev().enumerate() {
 				let e = line_end(buf, s);
 				if nul(s, e) {
+					res.binary_match = true;
 					return Ok(res);
 				}
 				if skipped >= p.offset {
@@ -331,6 +346,7 @@ impl Scanner {
 				}
 			}
 			if nul(bs, be) {
+				res.binary_match = true;
 				return Ok(res);
 			}
 			res.count += 1;
@@ -368,6 +384,7 @@ impl Scanner {
 			}
 		}
 		if p.content {
+			// No match follows: a NUL here only cuts trailing context.
 			flush_after(&mut pending, &mut floor, &mut *out, buf.len());
 		}
 		Ok(res)
@@ -377,18 +394,24 @@ impl Scanner {
 /// pi's `MatchCollector` over grep-searcher: the streamed search of a file
 /// root too large to hold in memory.
 struct StreamCollector<'a, M> {
-	matcher: &'a M,
-	params:  &'a ScanParams,
-	out:     &'a mut Vec<Match>,
-	res:     ScanOutcome,
-	skipped: u64,
-	before:  Vec<ContextLine>,
+	matcher:    &'a M,
+	params:     &'a ScanParams,
+	out:        &'a mut Vec<Match>,
+	res:        ScanOutcome,
+	skipped:    u64,
+	before:     Vec<ContextLine>,
+	/// Suppress reports after a binary boundary, probing for a hidden match.
+	binary_cut: bool,
 }
 
 impl<M: Matcher> Sink for StreamCollector<'_, M> {
 	type Error = io::Error;
 
 	fn matched(&mut self, _: &Searcher, mat: &SinkMatch<'_>) -> Result<bool, io::Error> {
+		if self.binary_cut || (!self.params.text && memchr::memchr(0, mat.bytes()).is_some()) {
+			self.res.binary_match = true;
+			return Ok(false);
+		}
 		self.res.count += 1;
 		if self.res.limit_reached {
 			return Ok(false);
@@ -432,6 +455,14 @@ impl<M: Matcher> Sink for StreamCollector<'_, M> {
 		if !self.params.content {
 			return Ok(true);
 		}
+		if self.binary_cut {
+			return Ok(true);
+		}
+		if !self.params.text && memchr::memchr(0, ctx.bytes()).is_some() {
+			self.binary_cut = true;
+			self.before.clear();
+			return Ok(true);
+		}
 		let line = ContextLine {
 			line: ctx.line_number().unwrap_or(0),
 			text: truncate_line(trimmed(ctx.bytes()), self.params.max_columns),
@@ -451,7 +482,8 @@ impl<M: Matcher> Sink for StreamCollector<'_, M> {
 
 /// Searches `reader` line by line through grep-searcher's bounded buffer
 /// (lines up to [`STREAM_LINE_LIMIT`]), with the semantics of
-/// [`Scanner::scan`] in line mode.
+/// [`Scanner::scan`] in line mode. Only explicit file roots stream, so the
+/// input is always searched as text.
 pub fn scan_reader<M: Matcher>(
 	matcher: &M,
 	reader: impl io::Read,
@@ -464,7 +496,7 @@ pub fn scan_reader<M: Matcher>(
 		(0, 0)
 	};
 	let mut searcher = SearcherBuilder::new()
-		.binary_detection(BinaryDetection::quit(0))
+		.binary_detection(BinaryDetection::none())
 		.line_number(p.content)
 		.before_context(before)
 		.after_context(after)
@@ -477,6 +509,7 @@ pub fn scan_reader<M: Matcher>(
 		res: ScanOutcome::default(),
 		skipped: 0,
 		before: Vec::new(),
+		binary_cut: false,
 	};
 	searcher.search_reader(matcher, reader, &mut sink)?;
 	Ok(sink.res)
@@ -556,29 +589,45 @@ pub(super) async fn stream_matches<M: Matcher + Sync>(
 		res: ScanOutcome::default(),
 		skipped: 0,
 		before: Vec::new(),
+		binary_cut: false,
 	});
 	let mut searcher = SearcherBuilder::new()
-		.binary_detection(BinaryDetection::quit(0))
+		.binary_detection(BinaryDetection::none())
 		.line_number(true)
 		.before_context(params.before)
 		.after_context(params.after)
 		.heap_limit(Some(STREAM_LINE_LIMIT))
 		.build();
 	let mut search = searcher.search_push(matcher, SharedCollector(&collector));
-	let mut buf = vec![0; 64 * 1024];
+	let mut buf = vec![0; BINARY_WINDOW];
+	let mut first = !params.text;
 	while limit > 0 {
-		if halt.load(std::sync::atomic::Ordering::Relaxed) {
-			return Err(super::GrepError::Search("grep stopped".to_owned()));
-		}
 		let size = usize::try_from(limit).unwrap_or(usize::MAX).min(buf.len());
-		let n = file
-			.read(&mut buf[..size])
-			.await
-			.map_err(|err| super::GrepError::Search(err.to_string()))?;
+		let mut n = 0;
+		loop {
+			if halt.load(std::sync::atomic::Ordering::Relaxed) {
+				return Err(super::GrepError::Search("grep stopped".to_owned()));
+			}
+			let read = file
+				.read(&mut buf[n..size])
+				.await
+				.map_err(|err| super::GrepError::Search(err.to_string()))?;
+			if read == 0 {
+				break;
+			}
+			n += read;
+			if !first || n == size {
+				break;
+			}
+		}
 		if n == 0 {
 			break;
 		}
 		limit -= n as u64;
+		if first {
+			collector.lock().binary_cut = memchr::memchr(0, &buf[..n]).is_some();
+			first = false;
+		}
 		let more = search
 			.push(&buf[..n])
 			.map_err(|err| super::GrepError::Search(err.to_string()))?;

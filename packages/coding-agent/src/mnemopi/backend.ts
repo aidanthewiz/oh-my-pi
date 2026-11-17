@@ -8,6 +8,7 @@ import type { MnemopiLlmCompleteOptions } from "@oh-my-pi/pi-mnemopi/core/runtim
 import type * as MnemopiDiagnoseNs from "@oh-my-pi/pi-mnemopi/diagnose";
 import type { DiagnosticSummary } from "@oh-my-pi/pi-mnemopi/diagnose";
 import { logger, prompt, withLoopPhase } from "@oh-my-pi/pi-utils";
+import { cfgOffline } from "../config/auxiliary-model-policy";
 import type { ModelRegistry } from "../config/model-registry";
 import { isModelEnabledBySettings, resolveRoleChain, roleCandidatePool } from "../config/model-resolver";
 import type {
@@ -492,16 +493,10 @@ async function loadMnemopiConfigWithProviders(
 	agentDir: string,
 	modelRegistry: ModelRegistry,
 	sessionId: string,
-	ownerSession: AgentSession,
+	session: AgentSession,
 ): Promise<MnemopiBackendConfig> {
 	const config = loadMnemopiConfig(settings, agentDir);
-	config.providerOptions = await resolveMnemopiProviderOptions(
-		config,
-		settings,
-		modelRegistry,
-		sessionId,
-		ownerSession,
-	);
+	config.providerOptions = await resolveMnemopiProviderOptions(config, settings, modelRegistry, sessionId, session);
 	return config;
 }
 
@@ -529,10 +524,31 @@ async function resolveMnemopiProviderOptions(
 	settings: MemoryBackendStartOptions["settings"],
 	modelRegistry: ModelRegistry,
 	sessionId: string,
-	ownerSession: AgentSession,
+	session: AgentSession,
 ): Promise<MnemopiProviderOptions> {
 	const base: MnemopiProviderOptions = {
 		noEmbeddings: config.providerOptions.noEmbeddings,
+		embeddings: {
+			allowLocal: () => !cfgOffline.get(settings) || session.model?.api === "local-inference",
+			// Initializing fastembed can download missing or corrupt files, even when
+			// the cache initially appears complete. Reuse only an already loaded model.
+			allowLocalLoad: () => !cfgOffline.get(settings),
+			allowRemote: baseUrl => {
+				if (!cfgOffline.get(settings)) return true;
+				const model = session.model;
+				if (!model?.provider || !model.baseUrl) return false;
+				try {
+					const endpoint = new URL(baseUrl);
+					const sessionEndpoint = new URL(model.baseUrl);
+					return (
+						(endpoint.protocol === "https:" || endpoint.protocol === "http:") &&
+						endpoint.origin === sessionEndpoint.origin
+					);
+				} catch {
+					return false;
+				}
+			},
+		},
 		embeddingModel: config.providerOptions.embeddingModel,
 		embeddingApiUrl: config.providerOptions.embeddingApiUrl,
 		embeddingApiKey:
@@ -549,6 +565,8 @@ async function resolveMnemopiProviderOptions(
 		return {
 			...base,
 			llm: {
+				// A custom endpoint has no trusted provider identity.
+				allowRemote: () => !cfgOffline.get(settings),
 				baseUrl: config.llmBaseUrl,
 				apiKey:
 					config.llmApiKey ??
@@ -561,8 +579,19 @@ async function resolveMnemopiProviderOptions(
 	}
 
 	try {
-		const candidates = resolveRoleChain("memory", settings, roleCandidatePool("memory", settings, modelRegistry));
-		const primary = candidates[0]?.model;
+		const resolveCandidates = () => {
+			const pool = roleCandidatePool("memory", settings, modelRegistry);
+			if (!cfgOffline.get(settings)) return resolveRoleChain("memory", settings, pool);
+			const provider = session.model?.provider;
+			return provider
+				? resolveRoleChain(
+						"memory",
+						settings,
+						pool.filter(model => model.provider === provider),
+					)
+				: [];
+		};
+		const primary = resolveCandidates()[0]?.model;
 		if (!primary) {
 			logger.warn("Mnemopi: llmMode=smol but no memory model resolved; continuing without LLM.");
 			return base;
@@ -571,8 +600,8 @@ async function resolveMnemopiProviderOptions(
 		const complete = async (prompt: string, opts?: MnemopiLlmCompleteOptions): Promise<string | null> => {
 			const queuedOwner = mnemopiRequestOwner.getStore();
 			if (opts?.task?.kind === "memory-extraction" && !queuedOwner) return null;
-			const owner = queuedOwner ?? captureMnemopiRequestOwner(ownerSession);
-			if (owner.manager !== ownerSession.sessionManager || !owner.isCurrent()) return null;
+			const owner = queuedOwner ?? captureMnemopiRequestOwner(session);
+			if (owner.manager !== session.sessionManager || !owner.isCurrent()) return null;
 			const sessionId = owner.sessionId;
 			const usageOwner = { sessionId, parentId: owner.parentId };
 			const candidates = resolveRoleChain("memory", settings, roleCandidatePool("memory", settings, modelRegistry));
@@ -583,15 +612,20 @@ async function resolveMnemopiProviderOptions(
 					: undefined;
 			const assertOwnerCurrent = (model: (typeof candidates)[number]["model"]): void => {
 				signal?.throwIfAborted();
+				if (cfgOffline.get(settings) && session.model?.provider !== model.provider)
+					throw new Error("Memory model provider differs from the active session provider");
 				if (!owner.isCurrent() || !isModelEnabledBySettings(model, settings, modelRegistry))
 					throw new Error("Memory completion owner changed before provider dispatch.");
 			};
 
-			for (const { model, thinkingLevel } of candidates) {
+			for (const { model, thinkingLevel } of resolveCandidates()) {
 				if (signal?.aborted) return null;
+				if (cfgOffline.get(settings) && session.model?.provider !== model.provider) continue;
 				try {
 					assertOwnerCurrent(model);
 					if (model.api === "local-inference") {
+						// The tiny worker may download its runtime or model on first use.
+						if (cfgOffline.get(settings)) continue;
 						const result = await tinyModelClient.complete(model.id, request.prompt, {
 							maxTokens: opts?.maxTokens,
 							systemPrompt: request.systemPrompt,

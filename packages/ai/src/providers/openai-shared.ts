@@ -15,6 +15,7 @@ import type {
 	VercelGatewayRouting,
 } from "@oh-my-pi/pi-catalog/types";
 import { parseAlibabaTokenPlanCredential } from "@oh-my-pi/pi-catalog/wire/alibaba-token-plan";
+import { resolveXiaomiRequestBaseUrl } from "../registry/oauth/xiaomi";
 import {
 	COREWEAVE_PROJECT_HEADER,
 	coreWeaveProjectHeaders,
@@ -84,6 +85,7 @@ import {
 } from "../utils";
 import {
 	clearStreamingPartialJson,
+	demotedThinkingSource,
 	isCarriedReasoning,
 	kStreamingArgumentsDone,
 	kStreamingLastParseLen,
@@ -282,6 +284,7 @@ export function resolveOpenAIRequestSetup(
 			baseUrl = moonshotBaseUrl;
 		}
 	}
+	baseUrl = resolveXiaomiRequestBaseUrl({ provider: model.provider, baseUrl }, rawApiKey);
 	if (model.provider === "sakana") {
 		const sakanaBaseUrl = resolveSakanaRequestBaseUrl();
 		if (sakanaBaseUrl) {
@@ -2120,6 +2123,29 @@ export interface BuildResponsesInputOptions<TApi extends Api> {
 	requiresReasoningReplayForToolCalls?: boolean;
 	/** Naming rule for rebuilt `function_call` names; see {@link ResponsesToolNaming}. */
 	toolNaming?: ResponsesToolNaming;
+	/**
+	 * Replay no earlier turn's encrypted reasoning: the request retrying a
+	 * refused replay ({@link isOpenAIResponsesRefusedEncryptedReasoningError}).
+	 * Without it, only turns before the latest
+	 * {@link OpenAIResponsesHistoryPayload.encryptedReasoningFloor} lose theirs.
+	 */
+	dropEncryptedReasoning?: boolean;
+}
+
+/** A reasoning item carrying an opaque server-issued `encrypted_content` blob. */
+function isEncryptedReasoningItem(item: object | undefined): boolean {
+	return (
+		item !== undefined &&
+		"type" in item &&
+		item.type === "reasoning" &&
+		"encrypted_content" in item &&
+		typeof item.encrypted_content === "string"
+	);
+}
+
+/** Whether a built request replays any encrypted reasoning blob. */
+export function replaysEncryptedReasoning(input: ResponseInput | string | undefined): boolean {
+	return Array.isArray(input) && input.some(isEncryptedReasoningItem);
 }
 
 /**
@@ -2362,8 +2388,24 @@ export function buildResponsesInput<TApi extends Api>(options: BuildResponsesInp
 		undefined,
 		filteredCompat,
 	);
-	const filterReasoning = <T extends { type?: string }>(items: T[]): T[] =>
-		options.nativeHistory?.filterReasoning ? items.filter(item => item?.type !== "reasoning") : items;
+	const filterReasoning = <T extends { type?: string }>(items: T[], dropEncrypted: boolean): T[] =>
+		options.nativeHistory?.filterReasoning
+			? items.filter(item => item?.type !== "reasoning")
+			: dropEncrypted
+				? items.filter(item => !isEncryptedReasoningItem(item))
+				: items;
+	// Turns before this index replay no encrypted reasoning: the server refused
+	// it once, and the turn that recovered (it carries the floor marker) was
+	// requested without it. Later turns' blobs were issued after the refusal.
+	let encryptedReasoningFloor = options.dropEncryptedReasoning ? transformedMessages.length : 0;
+	for (let index = transformedMessages.length - 1; index > encryptedReasoningFloor; index--) {
+		const candidate = transformedMessages[index];
+		const payload = candidate.role === "assistant" ? candidate.providerPayload : undefined;
+		if (payload?.type === "openaiResponsesHistory" && payload.encryptedReasoningFloor === true) {
+			encryptedReasoningFloor = index;
+			break;
+		}
+	}
 	const includeThinkingSignatures = options.includeThinkingSignatures ?? options.nativeHistory?.replay ?? true;
 	// Harmony-server models (gpt-5.x) reject requests whose input data reproduces
 	// reserved control-token spellings; escape the transport copy of untrusted
@@ -2372,7 +2414,9 @@ export function buildResponsesInput<TApi extends Api>(options: BuildResponsesInp
 	const escapeControlTokens = isHarmonyDialectModel(options.model);
 
 	let msgIndex = 0;
-	for (const msg of transformedMessages) {
+	for (let position = 0; position < transformedMessages.length; position++) {
+		const msg = transformedMessages[position];
+		const dropEncryptedReasoning = position < encryptedReasoningFloor;
 		if (msg.role === "user" || msg.role === "developer") {
 			const providerPayload = (msg as { providerPayload?: AssistantMessage["providerPayload"] }).providerPayload;
 			const historyItems = options.nativeHistory
@@ -2387,10 +2431,13 @@ export function buildResponsesInput<TApi extends Api>(options: BuildResponsesInp
 				}) ??
 					false);
 			if (historyItems && shouldReplayPayloadItems) {
-				const sanitizedItems = sanitizeOpenAIResponsesHistoryItemsForReplay(filterReasoning(historyItems), {
-					supportsImageDetailOriginal,
-					supportsComputerUse: options.model.supportsComputerUse === true,
-				});
+				const sanitizedItems = sanitizeOpenAIResponsesHistoryItemsForReplay(
+					filterReasoning(historyItems, dropEncryptedReasoning),
+					{
+						supportsImageDetailOriginal,
+						supportsComputerUse: options.model.supportsComputerUse === true,
+					},
+				);
 				const replayItems = adaptResponsesReplayItemsForModel(
 					sanitizedItems,
 					supportsCustomToolCalls,
@@ -2440,7 +2487,7 @@ export function buildResponsesInput<TApi extends Api>(options: BuildResponsesInp
 			let suppressHiddenEmptyFallback = false;
 			if (historyItems) {
 				const rawSanitizedHistoryItems = sanitizeOpenAIResponsesAssistantHistoryItemsForReplay(
-					filterReasoning(historyItems),
+					filterReasoning(historyItems, dropEncryptedReasoning),
 					{
 						supportsImageDetailOriginal,
 						supportsComputerUse: options.model.supportsComputerUse === true,
@@ -2517,7 +2564,8 @@ export function buildResponsesInput<TApi extends Api>(options: BuildResponsesInp
 				options.model,
 				msgIndex,
 				knownCallIds,
-				suppressHiddenEmptyFallback ? false : includeThinkingSignatures,
+				// A thinking signature embeds the turn's reasoning item, blob included.
+				suppressHiddenEmptyFallback || dropEncryptedReasoning ? false : includeThinkingSignatures,
 				customCallIds,
 				options.preserveAssistantMessageIds,
 				supportsCustomToolCalls,
@@ -2593,9 +2641,10 @@ function parseResponseReasoningReplayItem(signature: string | undefined): Respon
  * `reasoning_text` is empty — "The reasoning_text in the thinking mode must be
  * passed back to the API" (#8248 covered the missing case, #10690 the empty
  * one). The item's presence plus a non-empty payload is what satisfies the
- * contract; the exact text is immaterial once the source turn's reasoning is
- * gone. Kept out of `reasoning_content="."`-territory since DeepSeek rejects the
- * bare-dot synthetic placeholder on the chat-completions path.
+ * contract. Last resort only: these targets read replayed reasoning, so a
+ * placeholder repeated across many turns is a few-shot pattern the model copies
+ * into its own reasoning. Kept out of `reasoning_content="."`-territory since
+ * DeepSeek rejects the bare-dot synthetic placeholder on the chat-completions path.
  */
 export const SYNTHETIC_REASONING_REPLAY_PLACEHOLDER = "reasoning unavailable";
 
@@ -2753,6 +2802,10 @@ export function convertResponsesAssistantMessage<TApi extends Api>(
 		}
 
 		if (block.type === "text") {
+			// Another model's thinking, demoted to text by `transformMessages`:
+			// its source text fills the required reasoning item below.
+			const demotedThinking = requiresReasoningItem ? demotedThinkingSource(block) : undefined;
+			if (demotedThinking) carriedReasoningTexts.push(demotedThinking);
 			const parsedSignature = parseTextSignature(block.textSignature);
 			let msgId = parsedSignature?.id;
 			if (!msgId) {
@@ -2855,11 +2908,11 @@ export function convertResponsesAssistantMessage<TApi extends Api>(
 		// Replay the demoted reasoning (already present in `content` as visible
 		// text) as a structured reasoning item so the thinking-mode continuation
 		// carries the `reasoning_text` the provider requires. When no thinking
-		// text survived reconstruction (source turn minted by another model, or
-		// reasoning dropped by compaction/archive budget) the carried text is
-		// empty — and DeepSeek-family targets reject an empty `reasoning_text`
-		// exactly like a missing item (#10690), so substitute a non-empty
-		// placeholder. The `id` is only set when an upstream item id survived:
+		// text survived reconstruction (source turn had none, or reasoning was
+		// dropped by compaction/archive budget) the carried text is empty — and
+		// DeepSeek-family targets reject an empty `reasoning_text` exactly like a
+		// missing item (#10690), so substitute a non-empty placeholder. The
+		// `id` is only set when an upstream item id survived:
 		// providers that validate reasoning ids against their own store (Meta via
 		// OpenRouter) reject a fabricated `rs_…` with "Referenced reasoning item
 		// … was not found or has expired", and the targets that need the item
@@ -3398,15 +3451,12 @@ export function finalizeCustomToolCallInputDone(block: ResponsesToolCallBlock, i
 }
 
 type OpenAIResponsesTerminalStreamEvent =
-	| Extract<ResponseStreamEvent, { type: "response.completed" | "response.incomplete" | "response.failed" }>
+	| Extract<ResponseStreamEvent, { type: "response.completed" | "response.incomplete" }>
 	| { type: "response.done"; response?: Partial<OpenAIResponse> };
 
 function getOpenAIResponsesTerminalEvent(event: ResponseStreamEvent): OpenAIResponsesTerminalStreamEvent | undefined {
 	const type = (event as { type?: unknown }).type;
-	return type === "response.completed" ||
-		type === "response.incomplete" ||
-		type === "response.failed" ||
-		type === "response.done"
+	return type === "response.completed" || type === "response.incomplete" || type === "response.done"
 		? (event as OpenAIResponsesTerminalStreamEvent)
 		: undefined;
 }
@@ -4089,8 +4139,8 @@ export async function processResponsesStream<TApi extends Api>(
 					{ provider: model.provider, kind: "output" },
 				);
 			}
-			if (event.type === "response.failed" || response?.status === "failed" || response?.status === "cancelled") {
-				throwOpenAIResponsesEventError(event, model.provider);
+			if (response?.status === "failed" || response?.status === "cancelled") {
+				throwOpenAIResponsesEventError(event, output, model.provider);
 			}
 			if (response?.status === "incomplete" && response.incomplete_details?.reason === "content_filter") {
 				// A content-filtered turn is a failure, not a token-cap truncation —
@@ -4123,8 +4173,8 @@ export async function processResponsesStream<TApi extends Api>(
 			// Breaking unwinds the iterator chain (the consumer's `.return()`
 			// reaches the SDK stream), actively releasing the connection.
 			break;
-		} else if (event.type === "error") {
-			throwOpenAIResponsesEventError(event, model.provider);
+		} else if (event.type === "error" || event.type === "response.failed") {
+			throwOpenAIResponsesEventError(event, output, model.provider);
 		}
 	}
 }
@@ -4619,8 +4669,28 @@ export function isOpenAIResponsesStalePreviousResponseError(error: unknown): boo
 	);
 }
 
-/** Preserve one error mapping for ordinary processing and pre-generation validation negotiation. */
-export function throwOpenAIResponsesEventError(event: ResponseStreamEvent, provider: string): never {
+/**
+ * The server refused a replayed `encrypted_content` blob it no longer honors:
+ * issued under another key or credential (Meta: "reasoning `encrypted_content`
+ * was not issued to this caller", also behind gateways that prefix their own
+ * wording), expired, or unverifiable (OpenAI `invalid_encrypted_content`).
+ * Resending the same history fails the same way; one without the blobs does not.
+ */
+export function isOpenAIResponsesRefusedEncryptedReasoningError(error: unknown): boolean {
+	if (!error || typeof error !== "object") return false;
+	if ("code" in error && error.code === "invalid_encrypted_content") return true;
+	if (!("message" in error) || typeof error.message !== "string") return false;
+	return /encrypted[ _]content\b.*?\b(?:was not issued to this caller|has expired|could not be verified)/i.test(
+		error.message,
+	);
+}
+
+/** Preserve one error/usage mapping for ordinary processing and pre-generation validation negotiation. */
+export function throwOpenAIResponsesEventError(
+	event: ResponseStreamEvent,
+	output: AssistantMessage,
+	provider: string,
+): never {
 	const envelope = event as unknown as Record<string, unknown>;
 	if (event.type === "error") {
 		const error = isRecord(envelope.error) ? envelope.error : envelope;
@@ -4632,6 +4702,7 @@ export function throwOpenAIResponsesEventError(event: ResponseStreamEvent, provi
 		);
 	}
 	const response = isRecord(envelope.response) ? envelope.response : undefined;
+	if (event.type === "response.failed") populateResponsesUsageFromResponse(output, event.response?.usage);
 	const statusDetails = isRecord(response?.status_details) ? response.status_details : undefined;
 	const error = isRecord(response?.error)
 		? response.error

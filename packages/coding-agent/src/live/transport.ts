@@ -333,6 +333,7 @@ export class CodexLiveTransport {
 			"Content-Type": "application/json",
 		});
 		const fetchImpl = wrapFetchForProxy(fetch, LIVE_PROVIDER);
+		this.#options.signal?.throwIfAborted();
 		const response = await fetchImpl(SIGNALING_URL, {
 			method: "POST",
 			headers,

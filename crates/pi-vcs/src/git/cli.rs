@@ -14,7 +14,12 @@
 //! disabled for writes, ambient `GIT_DIR`-family vars stripped, bounded output
 //! capture, and deadline + SIGTERM→SIGKILL termination via tokio.
 
-use std::{collections::BTreeMap, path::Path, process::Stdio, time::Duration};
+use std::{
+	collections::BTreeMap,
+	path::{Path, PathBuf},
+	process::Stdio,
+	time::Duration,
+};
 
 use tokio::io::AsyncReadExt;
 use tokio_util::sync::CancellationToken;
@@ -70,16 +75,19 @@ impl CliOutput {
 pub(crate) struct RunOptions {
 	/// Prefix `--no-optional-locks` instead of pinning fsmonitor/untracked-cache
 	/// off.
-	pub read_only: bool,
+	pub read_only:  bool,
 	/// Deadline; [`COMMAND_TIMEOUT`] when unset.
-	pub timeout:   Option<Duration>,
+	pub timeout:    Option<Duration>,
 	/// Bytes piped to stdin (commit messages, `update-ref --stdin` scripts).
-	pub stdin:     Option<Vec<u8>>,
+	pub stdin:      Option<Vec<u8>>,
 	/// Cooperative cancellation: the child is terminated when triggered.
-	pub cancel:    Option<CancellationToken>,
+	pub cancel:     Option<CancellationToken>,
 	/// Complete environment for the child process. Inheritance is disabled when
 	/// set.
-	pub env:       Option<BTreeMap<String, String>>,
+	pub env:        Option<BTreeMap<String, String>>,
+	/// Explicit alternate index; installed after inherited overrides are
+	/// stripped.
+	pub index_path: Option<PathBuf>,
 }
 
 struct ChildGroup {
@@ -294,6 +302,9 @@ pub(crate) async fn run(cwd: &Path, args: &[String], options: &RunOptions) -> Re
 		.stderr(Stdio::piped())
 		.kill_on_drop(true);
 	apply_env(&mut cmd, options.env.as_ref());
+	if let Some(index_path) = &options.index_path {
+		cmd.env("GIT_INDEX_FILE", index_path);
+	}
 	detach_from_terminal(cmd.as_std_mut());
 	let mut child = cmd.spawn().map_err(|err| spawn_error(cwd, err))?;
 	let mut group = ChildGroup::new(child.id());

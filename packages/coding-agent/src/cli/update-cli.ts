@@ -9,7 +9,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
-import { $env, $which, APP_NAME, compareVersions, isEnoent } from "@oh-my-pi/pi-utils";
+import { $env, $which, APP_NAME, compareVersions, isCompiledBinary, isEnoent } from "@oh-my-pi/pi-utils";
 import chalk from "@oh-my-pi/pi-utils/chalk";
 import { withFileLock } from "@oh-my-pi/pi-utils/file-lock";
 import { $ } from "bun";
@@ -23,6 +23,7 @@ import {
 import type { CfFetchOptions, CfRelease } from "./cf-channel";
 import { CF_ENGINE_RELEASE_REPO, fetchCfAsset, fetchCfLatestRelease } from "./cf-channel";
 import { CF_COMMAND, CF_VERSION, compareCfVersions } from "./cf-version";
+import { managedInstallName } from "./managed-install";
 
 const COREFORGE_VERSION_PRODUCT = "coreforge";
 const HOMEBREW_FORMULA = "can1357/tap/omp";
@@ -336,25 +337,25 @@ function tryRealpath(p: string): string | undefined {
 }
 
 /**
- * Name of the app that manages the omp at `binaryPath`, or undefined when none does.
- *
- * A manager (Tern) keeps `manager.json` (`{"manager": "tern", "name": "Tern"}`) two
- * directories above every binary it installs (`<root>/versions/<version>`,
- * `<root>/bin/omp.exe`) and updates them itself, so `omp update` must leave them alone.
- * A missing or unreadable manifest means unmanaged.
+ * Whether this omp runs from a source checkout (the dev launcher or a `bun link` of
+ * `src/cli.ts`) rather than a compiled binary or a package-manager install, which
+ * always lives under `node_modules`. Checkouts update through git, so update
+ * prompts are noise there.
  */
-export async function managedInstallName(binaryPath: string): Promise<string | undefined> {
-	const resolved = tryRealpath(binaryPath);
-	if (!resolved) return undefined;
-	let manifest: unknown;
-	try {
-		manifest = await Bun.file(path.join(path.dirname(path.dirname(resolved)), "manager.json")).json();
-	} catch {
-		return undefined;
-	}
-	if (!isRecord(manifest)) return undefined;
-	const name = typeof manifest.name === "string" && manifest.name ? manifest.name : manifest.manager;
-	return typeof name === "string" && name ? name : undefined;
+export function isSourceCheckout(): boolean {
+	return !isCompiledBinary() && !import.meta.dir.split(path.sep).includes("node_modules");
+}
+
+/**
+ * Whether the running omp may install its own updates: not a source checkout
+ * (git updates it), not kept by a managing app (Tern updates its omp itself),
+ * and not in the Nix store. Judged from the running build alone, without the
+ * package-manager probes `omp update` runs.
+ */
+export async function canSelfUpdate(): Promise<boolean> {
+	if (isSourceCheckout()) return false;
+	if (isPathInDirectory(isCompiledBinary() ? process.execPath : import.meta.dir, NIX_STORE_DIR)) return false;
+	return (await managedInstallName(process.execPath)) === undefined;
 }
 
 function isSymlinkPath(p: string): boolean {

@@ -297,6 +297,8 @@ export class AgentProtocolHandler implements ProtocolHandler {
 
 		let extractedFrom = scan.foundPath;
 		let sidecarSnapshot: { generation: string; ctime: bigint } | undefined;
+		const shape: InternalResource["shape"] = extraction || hasQueryExtraction ? "value" : "document";
+		let absent: true | undefined;
 		if (extraction || hasQueryExtraction) {
 			let jsonValue: unknown;
 			let parsed = false;
@@ -337,6 +339,7 @@ export class AgentProtocolHandler implements ProtocolHandler {
 			const extracted = hasQueryExtraction
 				? applyQuery(jsonValue, queryParam!)
 				: extractJsonPath(jsonValue, decodedSegments);
+			if (extracted === undefined) absent = true;
 			if (typeof extracted === "string") {
 				// A string field (e.g. a scout's markdown `report`) reads as prose,
 				// not as a JSON-escaped single line.
@@ -351,6 +354,7 @@ export class AgentProtocolHandler implements ProtocolHandler {
 			}
 			notes.push(`Extracted: ${hasQueryExtraction ? queryParam : `/${decodedSegments.join("/")}`}`);
 			if (parsed) notes.push(`Source: ${path.basename(extractedFrom!)}`);
+			if (absent) notes.push("JSON path not found");
 		}
 		const currentPrimary = statSync(scan.foundPath, { bigint: true });
 		if (artifactFileGeneration(currentPrimary) !== snapshot.generation || currentPrimary.ctimeNs !== snapshot.ctime)
@@ -371,7 +375,8 @@ export class AgentProtocolHandler implements ProtocolHandler {
 			size: Buffer.byteLength(content, "utf-8"),
 			sourcePath: extractedFrom,
 			notes,
-			shape: extraction || hasQueryExtraction ? "value" : "document",
+			shape,
+			...(absent ? { absent } : {}),
 		};
 	}
 

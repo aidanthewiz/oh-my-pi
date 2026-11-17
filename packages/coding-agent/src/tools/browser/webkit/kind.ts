@@ -76,6 +76,11 @@ function viewerOf(executable: string): string | undefined {
  * next. Like `resolveTernKind`, the
  * setting opts in and the env flag is the final override in both directions.
  * `platform` picks the executable's file name inside an engine directory.
+ *
+ * The path is the executable's real path: the engine finds its helper
+ * processes beside its library as loaded, so a host started through a link
+ * (Tern links `~/.o2/lib/abkit` to a version) keeps its own version's helpers
+ * when the link moves on.
  */
 export function resolveWebKitKind(
 	options?: ResolveWebKitKindOptions | null,
@@ -87,28 +92,9 @@ export function resolveWebKitKind(
 ): WebKitKind | null {
 	if (!parseFlag(env.PI_BROWSER_WEBKIT, options?.settingEnabled ?? false)) return null;
 	const location = env.PI_BROWSER_WEBKIT_PATH?.trim() || options?.settingPath?.trim() || getWebKitHostPath(platform);
-	const executable = hostExecutableAt(location, platform);
-	if (executable === null) return null;
+	const found = hostExecutableAt(location, platform);
+	if (found === null) return null;
+	const executable = fs.realpathSync.native(found);
 	const viewer = viewerOf(executable);
 	return viewer === undefined ? { kind: "webkit", path: executable } : { kind: "webkit", path: executable, viewer };
-}
-
-/**
- * The engine directory a download would fill for this configuration, or null:
- * only the profile-owned default, while the backend is selected and neither
- * `PI_BROWSER_WEBKIT_PATH` nor `browser.webkitPath` names another location.
- * This resolves a destination; it does not authorize installation.
- */
-export function webKitEngineToInstall(
-	options?: ResolveWebKitKindOptions | null,
-	env: Record<string, string | undefined> = {
-		PI_BROWSER_WEBKIT: getTrustedEnvValue("PI_BROWSER_WEBKIT"),
-		PI_BROWSER_WEBKIT_PATH: getTrustedEnvValue("PI_BROWSER_WEBKIT_PATH"),
-	},
-	platform: NodeJS.Platform = process.platform,
-): string | null {
-	if (!parseFlag(env.PI_BROWSER_WEBKIT, options?.settingEnabled ?? false)) return null;
-	if (env.PI_BROWSER_WEBKIT_PATH?.trim() || options?.settingPath?.trim()) return null;
-	const engineDir = path.dirname(getWebKitHostPath(platform));
-	return hostExecutableAt(engineDir, platform) === null ? engineDir : null;
 }

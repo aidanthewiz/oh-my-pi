@@ -132,7 +132,6 @@ async function chooseSeanceModel(
 		const source = await resolveSeanceSource(selector, {
 			cwd: ctx.sessionManager.getCwd(),
 			sessionDirHint,
-			includeGlobal: true,
 		});
 		if (!isCurrentSeanceOwner(ctx, owner)) return;
 		const sourceSession = source.file;

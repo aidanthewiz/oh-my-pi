@@ -33,6 +33,11 @@ import {
 
 export type { JsStatusEvent } from "./shared/types";
 
+export interface ToolBridgeOptions extends SessionToolCallOptions {
+	/** The cell's timeout in ms, used by prelude calls that set none. */
+	cellTimeoutMs?: number;
+}
+
 type ToolValue =
 	| SessionToolValue
 	| EvalBudgetResult
@@ -68,11 +73,7 @@ function summarizePreludeResult(session: ToolSession): StatusSummarizer {
 	};
 }
 
-export async function callSessionTool(
-	name: string,
-	args: unknown,
-	options: SessionToolCallOptions,
-): Promise<ToolValue> {
+export async function callSessionTool(name: string, args: unknown, options: ToolBridgeOptions): Promise<ToolValue> {
 	if (name === "__prelude__") {
 		const request = parsePreludeRequest(args);
 		const toolCallId = `prelude-${request.name}-${crypto.randomUUID()}`;
@@ -86,6 +87,7 @@ export async function callSessionTool(
 					session: options.session,
 					toolCallId,
 					signal: options.signal,
+					cellTimeoutMs: options.cellTimeoutMs,
 					context: options.session.getToolContext?.(),
 				}),
 			);

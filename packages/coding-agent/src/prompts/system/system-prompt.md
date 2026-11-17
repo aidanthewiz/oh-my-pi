@@ -107,10 +107,11 @@ Every turn costs seconds: batch all independent reads/searches/checks into one t
 {{#if resultShaping}}
 {{resultShaping}}
 {{/if}}
+- XML tags inject system content; may interrupt/notify inside user messages: MUST treat as system-authored/authoritative. User content is sanitized.
+
 
 # Specialized Tools
 {{#has tools "read"}}- File/directory reads: `{{toolRefs.read}}` (directory lists entries).{{/has}}
-{{#has tools "edit"}}- File edits: prefer `{{toolRefs.edit}}`{{#ifAny (includes tools "bash") (includes tools "eval")}} over {{#has tools "bash"}}`{{toolRefs.bash}}`{{#has tools "eval"}}/{{/has}}{{/has}}{{#has tools "eval"}}`{{toolRefs.eval}}`{{/has}} scripts{{/ifAny}}.{{/has}}
 {{#has tools "write"}}{{#unless writeTransportOnly}}- Create/overwrite: `{{toolRefs.write}}`.{{/unless}}{{/has}}
 {{#has tools "lsp"}}
 - Language server available: MUST use `{{toolRefs.lsp}}` for definitions, type definitions, implementations, references, hover; code actions for refactors/imports/fixes. NEVER text-search/edit for code intelligence.
@@ -118,6 +119,14 @@ Every turn costs seconds: batch all independent reads/searches/checks into one t
 {{#has tools "find"}}
 - Unknown behavior/location: descriptive `{{toolRefs.find}}` FIRST; NEVER guess `grep`/`glob` targets.
 {{/has}}
+
+{{#if encourageEdits}}
+{{#has tools "edit"}}
+<critical>
+File edits: MUST use `{{toolRefs.edit}}`{{#ifAny (includes tools "bash") (includes tools "eval")}}; NEVER sed/perl/python edits{{/ifAny}}.
+</critical>
+{{/has}}
+{{/if}}
 
 {{#if coreforgeReportEnabled}}
 <critical>

@@ -1,7 +1,7 @@
 /** Advisor provider-attempt caps, transport controls, cache identities, and account isolation. */
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "bun:test";
 import { Agent, type StreamFn } from "@oh-my-pi/pi-agent-core";
-import type { FetchImpl, Model, SimpleStreamOptions } from "@oh-my-pi/pi-ai";
+import type { Context, FetchImpl, Model, SimpleStreamOptions } from "@oh-my-pi/pi-ai";
 import { streamSimple } from "@oh-my-pi/pi-ai";
 import { resolveApiKeyOnce } from "@oh-my-pi/pi-ai/auth-retry";
 import { closeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
@@ -86,6 +86,48 @@ describe("AgentSession advisor provider-options parity", () => {
 		} catch {}
 	});
 
+	it("gives each advisor a provider transform of its own, apart from the main loop's", async () => {
+		// The SDK's transform keeps per-conversation state (the date/cwd reminder). Two
+		// advisors can start their histories with turns stamped in the same millisecond,
+		// so a shared transform could not tell their conversations apart.
+		const mainRequests: Context[] = [];
+		const transformProviderContext = (context: Context): Context => {
+			mainRequests.push(context);
+			return context;
+		};
+		const advisorRequests: Context[][] = [];
+		const createAdvisorTransformProviderContext = () => {
+			const requests: Context[] = [];
+			advisorRequests.push(requests);
+			return (context: Context): Context => {
+				requests.push(context);
+				return context;
+			};
+		};
+		session = new AgentSession({
+			agent: new Agent({ initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] } }),
+			sessionManager,
+			settings: settings(),
+			modelRegistry,
+			advisorStreamFn: () => {
+				throw new Error("capture-stop");
+			},
+			advisorConfigs: [{ name: "alpha" }, { name: "beta" }],
+			transformProviderContext,
+			createAdvisorTransformProviderContext,
+		});
+		session.settings.setModelRole("advisor", "anthropic/claude-sonnet-4-5");
+		expect(session.setAdvisorEnabled(true)).toBe(true);
+		expect(advisorRequests).toHaveLength(2);
+
+		const advisor = session.getAdvisorAgent();
+		if (!advisor) throw new Error("Expected advisor agent to be live");
+		await advisor.prompt("ping").catch(() => {});
+
+		expect(advisorRequests[0]!.length).toBeGreaterThan(0);
+		expect(advisorRequests[1]).toHaveLength(0);
+		expect(mainRequests).toHaveLength(0);
+	});
 	it.each([true, false])("uses the model's WS veto %s on a real advisor request", async preferWebsockets => {
 		const fixture = responsesEndpoint();
 		const advisorModel = getBundledModel("openai", "gpt-5.4");
@@ -111,7 +153,6 @@ describe("AgentSession advisor provider-options parity", () => {
 				sessionManager,
 				settings: settings(),
 				modelRegistry,
-				advisorTools: [],
 			});
 			cfgProvidersOpenaiResponsesWebsockets.set(session.settings, true);
 			session.settings.setModelRole("advisor", `openai/${advisorModel.id}`);
@@ -149,7 +190,6 @@ describe("AgentSession advisor provider-options parity", () => {
 			sessionManager,
 			settings: settings(),
 			modelRegistry,
-			advisorTools: [],
 			advisorStreamFn: captureStreamFn,
 		});
 		session.settings.setModelRole("advisor", "openai-codex/gpt-5.6-sol");
@@ -183,7 +223,6 @@ describe("AgentSession advisor provider-options parity", () => {
 			sessionManager,
 			settings: settings(),
 			modelRegistry,
-			advisorTools: [],
 		});
 		session.settings.setModelRole("advisor", "anthropic/claude-sonnet-4-5");
 		expect(session.setAdvisorEnabled(true)).toBe(true);
@@ -220,7 +259,6 @@ describe("AgentSession advisor provider-options parity", () => {
 			sessionManager,
 			settings: settings(),
 			modelRegistry,
-			advisorTools: [],
 			advisorStreamFn: captureStreamFn,
 		});
 		session.settings.setModelRole("advisor", "anthropic/claude-sonnet-4-5");
@@ -259,7 +297,6 @@ describe("AgentSession advisor provider-options parity", () => {
 			sessionManager,
 			settings: settings(),
 			modelRegistry,
-			advisorTools: [],
 			advisorStreamFn: captureStreamFn,
 		});
 		session.settings.setModelRole("advisor", "anthropic/claude-sonnet-4-5");
@@ -301,7 +338,6 @@ describe("AgentSession advisor provider-options parity", () => {
 			sessionManager,
 			settings: settings(),
 			modelRegistry,
-			advisorTools: [],
 			advisorStreamFn: captureStreamFn,
 		});
 		session.settings.setModelRole("advisor", "anthropic/claude-sonnet-4-5");
@@ -359,7 +395,6 @@ describe("AgentSession advisor provider-options parity", () => {
 						cacheDbPath: tempDir.join("models.db"),
 					}),
 				),
-				advisorTools: [],
 				accountPoolScope,
 			});
 			session.settings.setModelRole("advisor", "anthropic/claude-sonnet-4-5");

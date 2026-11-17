@@ -40,6 +40,7 @@ import "./mcp-json";
 import "./mcp-managed";
 import "./omp-plugins";
 import "./ssh";
+import "./ssh-config";
 import "./vscode";
 import "./windsurf";
 

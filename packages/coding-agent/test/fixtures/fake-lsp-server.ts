@@ -30,6 +30,7 @@ const didClose: string[] = [];
 const notifications: string[] = [];
 const documents = new Map<string, { version: number; text: string }>();
 const workspaceFolders = new Set<string>();
+const watchedFileChanges: unknown[] = [];
 let nextServerRequestId = 1;
 const pendingServerRequests = new Map<
 	string | number,
@@ -106,6 +107,7 @@ async function handleRequest(message: JsonRpcMessage): Promise<void> {
 				openAiKey: process.env.OPENAI_API_KEY ?? "",
 				path: process.env.PATH ?? "",
 				workspaceFolders: [...workspaceFolders],
+				watchedFileChanges: [...watchedFileChanges],
 			});
 			break;
 		}
@@ -170,6 +172,11 @@ function handleNotification(message: JsonRpcMessage): void {
 			const { event } = message.params as { event: { added: { uri: string }[]; removed: { uri: string }[] } };
 			for (const folder of event.removed) workspaceFolders.delete(folder.uri);
 			for (const folder of event.added) workspaceFolders.add(folder.uri);
+			break;
+		}
+		case "workspace/didChangeWatchedFiles": {
+			const { changes } = message.params as { changes: unknown[] };
+			watchedFileChanges.push(...changes);
 			break;
 		}
 		case "exit":

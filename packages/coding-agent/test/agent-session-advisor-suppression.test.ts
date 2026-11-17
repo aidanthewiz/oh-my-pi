@@ -31,6 +31,7 @@ import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { convertToLlm, USER_INTERRUPT_LABEL } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { Snowflake, TempDir } from "@oh-my-pi/pi-utils";
+import { fixedAdvisorTools } from "./helpers/agent-session-setup";
 
 interface MockYieldDetails {
 	status: "success";
@@ -237,7 +238,6 @@ describe("AgentSession advisor auto-resume suppression", () => {
 			sessionManager,
 			settings,
 			modelRegistry,
-			advisorTools: [],
 			advisorStreamFn: advisorMock.stream,
 			extensionRunner: extensionRunner as never,
 		});
@@ -325,7 +325,6 @@ describe("AgentSession advisor auto-resume suppression", () => {
 			sessionManager,
 			settings,
 			modelRegistry,
-			advisorTools: [],
 			advisorStreamFn: advisorMock.stream,
 		});
 		expect(session.setAdvisorEnabled(true)).toBe(true);
@@ -737,7 +736,7 @@ describe("AgentSession advisor auto-resume suppression", () => {
 			sessionManager,
 			settings,
 			modelRegistry,
-			advisorTools: [parkTool],
+			advisorTools: fixedAdvisorTools(parkTool),
 			advisorStreamFn: advisorMock.stream,
 		});
 		expect(session.setAdvisorEnabled(true)).toBe(true);

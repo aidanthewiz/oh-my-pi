@@ -27,6 +27,7 @@ import {
 	pathIsWithin,
 	stringifyJson,
 	toError,
+	withLoopPhase,
 } from "@oh-my-pi/pi-utils";
 import { isTaskToolDetails, type StructuredSubagentSchemaMode } from "@oh-my-pi/pi-tui/tools/task";
 import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
@@ -1910,7 +1911,10 @@ export class SessionManager {
 		});
 	}
 
-	/** Serialize the whole file — title slot, header, entries — as lines, stamped with the state they came from. */
+	/**
+	 * Serialize the whole file — title slot, header, entries — as lines, stamped with the state they came from.
+	 * Runs as the `session.rewrite` loop phase: a long transcript takes hundreds of milliseconds to stringify.
+	 */
 	#serializeBody(): SessionFileBody {
 		const titleLine = this.#titleSlotLine();
 		this.#header.titleUpdatedAt = this.#titleUpdatedAt || this.#header.timestamp;
@@ -1920,12 +1924,14 @@ export class SessionManager {
 		const lines = [titleLine, headerLine];
 		let bytes = Buffer.byteLength(titleLine, "utf8") + Buffer.byteLength(headerLine, "utf8");
 		const fingerprint = createHash("sha1").update(titleLine).update(headerLine);
-		for (const entry of entries) {
-			const line = this.#lineFor(entry);
-			bytes += Buffer.byteLength(line, "utf8");
-			fingerprint.update(line);
-			lines.push(line);
-		}
+		withLoopPhase("session.rewrite", () => {
+			for (const entry of entries) {
+				const line = this.#lineFor(entry);
+				bytes += Buffer.byteLength(line, "utf8");
+				fingerprint.update(line);
+				lines.push(line);
+			}
+		});
 		const stamp: SessionBodyStamp = {
 			entries,
 			entryCount: entries.length,
@@ -3649,6 +3655,17 @@ export class SessionManager {
 		return !storage.defersSyncPublish && storage.existsSync(sessionFile);
 	}
 
+	/**
+	 * Whether another live omp process owns this session, so this process's
+	 * next write would move it to a sibling (`"open-elsewhere"`) instead of
+	 * appending. Claims the session when it is free, as a write would.
+	 * `AgentSession` checks it before writing its exit record: a process that
+	 * only loaded a session it does not own has nothing of its own to save.
+	 */
+	isOwnedElsewhere(): boolean {
+		return this.#sessionOwnedElsewhere();
+	}
+
 	getArtifactsDir(): string | null {
 		if (this.#adoptedArtifactManager) return this.#adoptedArtifactManager.dir;
 		return artifactsDirectoryFor(this.#sessionFile);
@@ -4937,19 +4954,23 @@ export class SessionManager {
 	}
 
 	/**
-	 * Whether `session` was recorded in a worktree of `cwd`'s repository that no
-	 * longer exists, e.g. a `/wt` worktree removed since. Resume such a session
-	 * through {@link openRelocated} into `cwd`: its own directory cannot be entered.
+	 * Whether `session` is filed under `cwd` (its cwd-derived session directory,
+	 * or a worktree sibling's) while the directory it recorded no longer exists:
+	 * a `/wt` worktree removed since, or the project folder moved or renamed.
+	 * Such a session belongs to `cwd`; resume it through {@link openRelocated},
+	 * its own directory cannot be entered. A custom `--session-dir` is shared
+	 * across projects, so filing there proves nothing.
 	 * @param sessionDir `cwd`'s session directory; defaults to the cwd-derived one.
 	 */
-	static async isFromRemovedWorktree(
+	static async isStrandedIn(
 		session: Pick<SessionInfo, "path" | "cwd">,
 		cwd: string,
 		sessionDir?: string,
 	): Promise<boolean> {
 		if (!session.cwd || !(await directoryIsMissing(session.cwd))) return false;
-		const dir = sessionDir ?? SessionManager.getDefaultSessionDir(cwd);
+		const dir = path.resolve(sessionDir ?? SessionManager.getDefaultSessionDir(cwd));
 		const home = path.resolve(path.dirname(session.path));
+		if (home === dir) return resolveManagedSessionRoot(dir, cwd) !== undefined;
 		return (await worktreeSessionDirs(cwd, dir)).some(sibling => path.resolve(sibling) === home);
 	}
 

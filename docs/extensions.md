@@ -515,6 +515,7 @@ Canonical event unions and payload types are in `types.ts`.
 
 - `session_start`
 - `session_before_switch` / `session_switch`
+- `session_clear`
 - `session_before_branch` / `session_branch`
 - `session_before_compact` / `session.compacting` / `session_compact`
 - `session_before_tree` / `session_tree`
@@ -536,6 +537,13 @@ Late extensions win name collisions with earlier-loaded extensions.
 Managed source admission and mandatory eager policy apply independently of the
 cache. Resumed sessions, `--tools`, unknown flags, and trusted or mandatory
 extension launches load extensions before the session starts.
+
+`session_clear` receives `{ type: "session_clear" }` after a successful in-place
+context reset (`/clear` or `AgentSession.resetSessionContext()`), including an
+empty clear. Handlers are awaited before the reset returns and can invalidate
+caches of instructions already injected into model context. The session id,
+file, and persisted history are unchanged; this is not `session_switch` and
+cannot cancel the reset. A busy/rejected reset emits no event.
 
 `session.compacting` receives `{ sessionId, messages }` and can return
 `{ context?: string[]; prompt?: string; preserveData?: Record<string, unknown> }`

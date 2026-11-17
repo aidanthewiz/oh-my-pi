@@ -70,9 +70,10 @@ import { sendsImageInputOnWire } from "@oh-my-pi/pi-ai/providers/vision-guard";
 import { resolvePromptCacheLookback } from "@oh-my-pi/pi-catalog/compat/prompt-cache-lookback";
 import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
 import type { CatalogPolicyInputs } from "@oh-my-pi/pi-catalog/types";
-import { isRecord, logger, prompt, Snowflake, toError } from "@oh-my-pi/pi-utils";
+import { isRecord, logger, prompt, Snowflake, toError, withLoopPhase } from "@oh-my-pi/pi-utils";
 import * as snapcompact from "@oh-my-pi/snapcompact";
 import { writeArtifact } from "./artifacts";
+import { cfgOffline } from "../config/auxiliary-model-policy";
 import type { ModelRegistry } from "../config/model-registry";
 import { getAllowedAvailableModels, isModelEnabledBySettings } from "../config/model-resolver";
 import { CHAT_MODEL_ROLE_IDS } from "../config/model-roles";
@@ -1483,22 +1484,24 @@ export class SessionMaintenance {
 					: `${this.#model.id} is text-only`;
 				throw snapcompactFailure(`snapcompact needs a vision-capable model (${reason})`);
 			} else if (snapcompactReady) {
-				const text = snapcompact.serializeConversation(
-					convertToLlm(preparation.messagesToSummarize.concat(preparation.turnPrefixMessages)),
-					{ includeThinking: snapcompactIncludeThinking },
+				const renderScan = this.#snapcompactPreflight(
+					preparation,
+					snapcompactIncludeThinking,
+					snapcompactShapeSetting,
 				);
-				const probeText = snapcompact.renderabilityProbeText(
-					text,
-					preparation.previousPreserveData,
-					preparation.previousSummary,
-				);
-				snapcompactShape = snapcompact.resolveShapeForText(probeText, this.#model, snapcompactShapeSetting);
-				const renderScan = snapcompact.scanRenderability(probeText, { shape: snapcompactShape });
+				snapcompactShape = renderScan.shape;
 				if (!renderScan.isSafe) {
 					const percent = (renderScan.unrenderableRatio * 100).toFixed(1);
 					throw snapcompactFailure(
 						`snapcompact cannot render this conversation: unsupported characters for selected snapcompact font (${percent}%)`,
 					);
+				}
+				// The preflight and the render each block the loop for a long history; let it breathe between them.
+				// The yield lets a model switch land, and the scanned shape belongs to the model it was resolved for.
+				const scannedModel = this.#model;
+				await Bun.sleep(0);
+				if (this.#model !== scannedModel) {
+					throw snapcompactFailure("snapcompact stopped: the active model changed while it was preparing");
 				}
 			}
 
@@ -1531,7 +1534,7 @@ export class SessionMaintenance {
 						{
 							convertToLlm,
 							model: this.#model,
-							...(snapcompactShapeSetting === "auto" ? {} : { shape }),
+							shape,
 							maxFrames,
 							includeThinking: snapcompactIncludeThinking,
 						},
@@ -3780,9 +3783,14 @@ export class SessionMaintenance {
 		availableModels = availableModels.map(model => registry.fitContextWindow(model, settings));
 		const candidates: Model[] = [];
 		const seen = new Set<string>();
+		const activeProvider = this.#model?.provider;
+		const offline = cfgOffline.get(settings);
+		// Offline mode keeps auxiliary requests on the active provider.
+		const offlineBlocked = (model: Model): boolean =>
+			offline && (!activeProvider || model.provider !== activeProvider);
 
 		const addCandidate = (model: Model | undefined): void => {
-			if (!model) return;
+			if (!model || offlineBlocked(model)) return;
 			const key = `${model.provider}/${model.id}`;
 			if (seen.has(key)) return;
 			seen.add(key);
@@ -3805,6 +3813,9 @@ export class SessionMaintenance {
 
 		const sortedByContext = [...availableModels].sort((a, b) => (b.contextWindow ?? 0) - (a.contextWindow ?? 0));
 		for (const model of sortedByContext) {
+			// Offline skips other providers' models without consuming the single
+			// largest-context slot; a caller-filter rejection still consumes it.
+			if (offlineBlocked(model)) continue;
 			if (!seen.has(`${model.provider}/${model.id}`)) {
 				addCandidate(model);
 				break;
@@ -4157,6 +4168,31 @@ export class SessionMaintenance {
 			snapcompact.maxFramesForDataBudget(shape, snapcompact.frameDataBytesBudget(this.#model)),
 			snapcompact.providerFrameBudget(this.#model),
 		);
+	}
+
+	/**
+	 * Pick the snapcompact shape for `preparation`'s history and check the font can render it.
+	 * The resolved shape is what {@link snapcompact.compact} would pick from the same probe text,
+	 * so callers pass it through instead of letting compact resolve it again.
+	 * Runs as the `compaction.snapcompact` loop phase: serializing and scanning a long history blocks the loop.
+	 */
+	#snapcompactPreflight(
+		preparation: CompactionPreparation,
+		includeThinking: boolean,
+		shapeSetting: snapcompact.ShapeVariantName | "auto",
+	): snapcompact.ShapeScan {
+		return withLoopPhase("compaction.snapcompact", () => {
+			const text = snapcompact.serializeConversation(
+				convertToLlm(preparation.messagesToSummarize.concat(preparation.turnPrefixMessages)),
+				{ includeThinking },
+			);
+			const probeText = snapcompact.renderabilityProbeText(
+				text,
+				preparation.previousPreserveData,
+				preparation.previousSummary,
+			);
+			return snapcompact.resolveShapeAndScan(probeText, this.#model, shapeSetting);
+		});
 	}
 
 	#snapcompactFramePayloadBytes(result: snapcompact.CompactionResult): number {
@@ -5824,18 +5860,12 @@ export class SessionMaintenance {
 			let snapcompactBlocker: string | undefined;
 			if (action === "snapcompact" && compactionPrep.kind !== "fromHook") {
 				const snapcompactIncludeThinking = snapcompact.readerIncludesThinking(this.#model);
-				const text = snapcompact.serializeConversation(
-					convertToLlm(preparation.messagesToSummarize.concat(preparation.turnPrefixMessages)),
-					{ includeThinking: snapcompactIncludeThinking },
+				const renderScan = this.#snapcompactPreflight(
+					preparation,
+					snapcompactIncludeThinking,
+					cfgSnapcompactShape.get(this.#host.settings),
 				);
-				const probeText = snapcompact.renderabilityProbeText(
-					text,
-					preparation.previousPreserveData,
-					preparation.previousSummary,
-				);
-				const shapeSetting = cfgSnapcompactShape.get(this.#host.settings);
-				const shape = snapcompact.resolveShapeForText(probeText, this.#model, shapeSetting);
-				const renderScan = snapcompact.scanRenderability(probeText, { shape });
+				const shape = renderScan.shape;
 				if (!renderScan.isSafe) {
 					const percent = (renderScan.unrenderableRatio * 100).toFixed(1);
 					logger.warn("Snapcompact disabled: unsupported characters for selected snapcompact font", {
@@ -5853,12 +5883,26 @@ export class SessionMaintenance {
 						snapcompactBlocker =
 							"snapcompact: kept history alone exceeds the context budget; trying the next preferred compaction method.";
 					} else {
+						// The preflight and the render each block the loop for a long history; let it breathe between them.
+						// The yield lets a model switch land, and the scanned shape and frame cap belong to the model they were sized for.
+						const scannedModel = this.#model;
+						await Bun.sleep(0);
+						if (this.#model !== scannedModel) {
+							logger.warn("Snapcompact skipped: the active model changed during preflight", {
+								from: scannedModel?.id,
+								to: this.#model?.id,
+							});
+							snapcompactBlocker =
+								"snapcompact: the active model changed during preflight; trying the next preferred compaction method.";
+						}
+					}
+					if (!snapcompactBlocker) {
 						const rendered = await this.#renderSnapcompactArchive(
 							preparation,
 							{
 								convertToLlm,
 								model: this.#model,
-								...(shapeSetting === "auto" ? {} : { shape }),
+								shape,
 								maxFrames,
 								includeThinking: snapcompactIncludeThinking,
 							},

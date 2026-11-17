@@ -10,6 +10,7 @@ import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallb
 import type { Api, AuthStorage, Model } from "@oh-my-pi/pi-ai";
 import { modelKind } from "@oh-my-pi/pi-catalog/types";
 import { formatAge, formatCount, prompt, truncate } from "@oh-my-pi/pi-utils";
+import { cfgOffline } from "../../config/auxiliary-model-policy";
 import { ModelRegistry } from "../../config/model-registry";
 import {
 	isModelEnabledBySettings,
@@ -278,6 +279,18 @@ async function executeSearch(
 				(candidate.model.id === "exa" && !!Bun.env.EXA_API_KEY))
 		)
 			continue;
+		if (cfgOffline.get(options.settings ?? settings)) {
+			const activeProvider = options.sessionModel?.provider;
+			// Search-only catalog entries use the synthetic "web" provider; their
+			// backend is not the session's model endpoint, so do not infer a match.
+			if (
+				!activeProvider ||
+				candidate.model.provider !== activeProvider ||
+				modelKind(candidate.model) === "search"
+			) {
+				continue;
+			}
+		}
 		let provider: SearchProvider | undefined;
 		const candidateMeta = { id: candidate.model.id, label: candidate.model.name };
 		lastProvider = candidateMeta;
@@ -384,9 +397,11 @@ async function executeSearch(
 	}
 
 	if (availableProviderCount === 0 && failures.length === 0) {
-		const message = params.model
-			? `No web search model matches selector "${params.model}".`
-			: "No web search model configured.";
+		const message = cfgOffline.get(options.settings ?? settings)
+			? "No web search backend is available on the active model's provider under --offline."
+			: params.model
+				? `No web search model matches selector "${params.model}".`
+				: "No web search model configured.";
 		return {
 			content: [{ type: "text" as const, text: `Error: ${message}` }],
 			details: { response: { provider: "none", sources: [] }, error: message },

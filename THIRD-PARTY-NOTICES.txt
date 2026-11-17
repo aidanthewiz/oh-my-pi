@@ -28189,7 +28189,6 @@ License: MIT License (MIT)
 Used by:
 - atspi 0.30.0 (https://github.com/odilia-app/atspi)
 - atspi-common 0.14.0 (https://github.com/odilia-app/atspi)
-- atspi-connection 0.14.0 (https://github.com/odilia-app/atspi/)
 - atspi-proxies 0.14.0 (https://github.com/odilia-app/atspi)
 
 Full license text:
@@ -30670,13 +30669,13 @@ SOFTWARE.
 -------------------------------------------------------------------------------
 License: MIT License (MIT)
 Used by:
-- pi-ast 18.19.0 (https://github.com/can1357/oh-my-pi)
-- pi-builtins 18.19.0 (https://github.com/can1357/oh-my-pi)
-- pi-iso 18.19.0 (https://github.com/can1357/oh-my-pi)
-- pi-natives 18.19.0 (https://github.com/can1357/oh-my-pi)
-- pi-shell 18.19.0 (https://github.com/can1357/oh-my-pi)
-- pi-voice 18.19.0 (https://github.com/can1357/oh-my-pi)
-- pi-walker 18.19.0 (https://github.com/can1357/oh-my-pi)
+- pi-ast 18.20.2 (https://github.com/can1357/oh-my-pi)
+- pi-builtins 18.20.2 (https://github.com/can1357/oh-my-pi)
+- pi-iso 18.20.2 (https://github.com/can1357/oh-my-pi)
+- pi-natives 18.20.2 (https://github.com/can1357/oh-my-pi)
+- pi-shell 18.20.2 (https://github.com/can1357/oh-my-pi)
+- pi-voice 18.20.2 (https://github.com/can1357/oh-my-pi)
+- pi-walker 18.20.2 (https://github.com/can1357/oh-my-pi)
 
 Full license text:
 
@@ -30801,11 +30800,11 @@ Used by:
 - objc2-foundation 0.3.2 (https://github.com/madsmtm/objc2)
 - objc2-metal 0.3.2 (https://github.com/madsmtm/objc2)
 - objc2-quartz-core 0.3.2 (https://github.com/madsmtm/objc2)
-- pi-diff 18.19.0 (https://github.com/can1357/oh-my-pi)
-- pi-edit 18.19.0 (https://github.com/can1357/oh-my-pi)
-- pi-predict 18.19.0 (https://github.com/can1357/oh-my-pi)
-- pi-vcs 18.19.0 (https://github.com/can1357/oh-my-pi)
-- pi-vfs 18.19.0 (https://github.com/can1357/oh-my-pi)
+- pi-diff 18.20.2 (https://github.com/can1357/oh-my-pi)
+- pi-edit 18.20.2 (https://github.com/can1357/oh-my-pi)
+- pi-predict 18.20.2 (https://github.com/can1357/oh-my-pi)
+- pi-vcs 18.20.2 (https://github.com/can1357/oh-my-pi)
+- pi-vfs 18.20.2 (https://github.com/can1357/oh-my-pi)
 - pulp-wasm-simd-flag 0.1.1 (https://github.com/sarah-quinones/pulp/)
 - rcgen 0.13.2 (https://github.com/rustls/rcgen)
 - sptr 0.3.2 (https://github.com/Gankra/sptr)
