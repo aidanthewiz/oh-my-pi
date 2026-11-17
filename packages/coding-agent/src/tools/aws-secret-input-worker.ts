@@ -273,12 +273,12 @@ export async function startAwsSecretInputWorker(dependencies: AwsSecretInputScop
 				await reaper?.reap();
 				await send({ type: "result", value: result });
 			} catch (error) {
+				let code = safeAwsSecretInputFailure(error);
 				try {
 					await reaper?.reap();
 				} catch {
-					error = new AwsSecretInputFailure("WORKER_FAILED");
+					code = "WORKER_FAILED";
 				}
-				const code = safeAwsSecretInputFailure(error);
 				try {
 					await send({
 						type: "failure",

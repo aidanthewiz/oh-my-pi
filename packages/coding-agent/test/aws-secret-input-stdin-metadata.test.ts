@@ -4,6 +4,7 @@ import {
 	measureAwsSecretInputLifecycleDescriptors,
 } from "./fixtures/aws-secret-input-lifecycle-control";
 import {
+	isSupportedFiniteStdinDescriptor,
 	isVerifiedFiniteStdinHandoff,
 	isVerifiedStdinProducerWitness,
 	type StdinPrivateChannelEvidence,
@@ -69,30 +70,27 @@ describe("finite stdin evidence admission", () => {
 		});
 	}
 
-	test("does not accept a null device as proof of an empty pipe handoff", () => {
-		expect(
-			handoff(
-				{
-					verified: false,
-					kind: "unverified",
-					isRegularFile: false,
-					isTerminal: false,
-					isSocket: false,
-					isFifo: false,
-					isCharacterDevice: true,
-					matchesDevNull: true,
-					socketFamily: null,
-					localSocketFamily: null,
-					peerSocketFamily: null,
-					socketType: null,
-					localAddress: null,
-					peerAddress: null,
-					failure: "unsupported-channel",
-				},
-				producer(true),
-				true,
-			),
-		).toBe(false);
+	test("rejects null-device EOF as either an empty or nonempty finite stdin handoff", () => {
+		const descriptor: StdinPrivateChannelEvidence = {
+			verified: false,
+			kind: "unverified",
+			isRegularFile: false,
+			isTerminal: false,
+			isSocket: false,
+			isFifo: false,
+			isCharacterDevice: true,
+			matchesDevNull: true,
+			socketFamily: null,
+			localSocketFamily: null,
+			peerSocketFamily: null,
+			socketType: null,
+			localAddress: null,
+			peerAddress: null,
+			failure: "unsupported-channel",
+		};
+		expect(isSupportedFiniteStdinDescriptor(descriptor)).toBe(false);
+		expect(handoff(descriptor, producer(true), true)).toBe(false);
+		expect(handoff(descriptor, producer(false), false)).toBe(false);
 	});
 
 	for (const patch of [
@@ -117,15 +115,20 @@ describe("finite stdin evidence admission", () => {
 });
 
 describe("kernel descriptor alias evidence", () => {
-	test("compares one socket identity after the kernel proves duplicate descriptors are aliases", () => {
+	test("keeps proved socket aliases distinct from independent and conflicting kernel identities", () => {
 		const descriptors = measureAwsSecretInputLifecycleDescriptors([
 			{ fd: 7, dev: "9", ino: "4321", target: "socket:[4321]", kind: "socket" },
 			{ fd: 19, dev: "9", ino: "4321", target: "socket:[4321]", kind: "socket" },
+			{ fd: 20, dev: "9", ino: "4322", target: "socket:[4322]", kind: "socket" },
+			{ fd: 21, dev: "9", ino: "4323", target: "socket:[4324]", kind: "socket" },
 		]);
 		expect(descriptors).toEqual([
 			{ fd: 7, dev: "9", ino: "4321", target: "socket:[4321]", kind: "socket", measurable: true, aliases: [19] },
+			{ fd: 20, dev: "9", ino: "4322", target: "socket:[4322]", kind: "socket", measurable: true, aliases: [] },
+			{ fd: 21, dev: "9", ino: "4323", target: "socket:[4324]", kind: "socket", measurable: false, aliases: [] },
 		]);
-		expect(awsSecretInputLifecycleSocketIdentitiesAvailable(descriptors)).toBe(true);
+		expect(awsSecretInputLifecycleSocketIdentitiesAvailable(descriptors.slice(0, 2))).toBe(true);
+		expect(awsSecretInputLifecycleSocketIdentitiesAvailable(descriptors)).toBe(false);
 	});
 
 	for (const target of ["", "socket:[9876]", "pipe:[4321]"]) {

@@ -3,7 +3,6 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-	AWS_SECRET_INPUT_CAPABILITY,
 	AWS_SECRET_INPUT_PROTOCOL,
 	AwsSecretInputFailure,
 	normalizeAwsSecretInputRequest,
@@ -26,7 +25,7 @@ function request(): AwsSecretInputRequest {
 		},
 		secretInput: {
 			protocol: AWS_SECRET_INPUT_PROTOCOL,
-			capability: AWS_SECRET_INPUT_CAPABILITY.capability,
+			capability: "sha256:4936396a3a935e4582d42be1d73ef096353d23802dcea2394f7e969ffb42a358",
 			expectedIdentity: {
 				account: "123456789012",
 				arn: "arn:aws:sts::123456789012:assumed-role/SyntheticInput/local-session",

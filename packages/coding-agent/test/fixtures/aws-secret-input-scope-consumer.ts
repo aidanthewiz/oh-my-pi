@@ -1,3 +1,4 @@
+import { fstatSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
 import { WRITABLE_INPUT } from "./aws-secret-input-scope-data";
 import { inspectStdinPrivateChannel, isSupportedFiniteStdinDescriptor } from "./aws-secret-input-stdin-metadata";
@@ -17,6 +18,7 @@ if (import.meta.main) {
 	if (!isSupportedFiniteStdinDescriptor(stdinPrivateChannel)) {
 		throw new Error("Synthetic stdin must have supported finite metadata");
 	}
+	const stdinStat = fstatSync(0, { bigint: true });
 	const inputText = await Bun.stdin.text();
 	const exactInput = inputText === WRITABLE_INPUT;
 	if (!exactInput) throw new Error("Synthetic stdin input differs");
@@ -40,6 +42,8 @@ if (import.meta.main) {
 			inputWasEmpty: inputText.length === 0,
 			eof: true,
 			stdinPrivateChannel,
+			stdinDev: String(stdinStat.dev),
+			stdinIno: String(stdinStat.ino),
 		}),
 	);
 	process.stdout.write(PUBLIC_CONSUMER_STDOUT);

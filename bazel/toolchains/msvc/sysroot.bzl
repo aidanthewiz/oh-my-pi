@@ -16,10 +16,10 @@ download cache is deleted after splatting to keep the repo at ~800 MiB.
 Keep this file stable; wrapper/toolchain iteration lives in cc.bzl precisely
 so it never invalidates this repo.
 
-Reproducibility: --manifest-version pins the VS channel (17 = VS2022), but
-Microsoft advances the channel's payload over time, so the splat is stable
-day-to-day, not bit-reproducible forever — same property the cargo-xwin
-pipeline had.
+Reproducibility: the SDK is pinned to the catalog/MSI format xwin supports.
+--manifest-version pins the VS channel (17 = VS2022), but Microsoft advances
+the channel's CRT and SDK payloads over time, so the splat is not permanently
+bit-reproducible — same property the cargo-xwin pipeline had.
 
 xwin release binaries stop shipping darwin builds after 0.6.5; 0.6.5 is the
 newest version covering linux-musl + darwin hosts, which is why it is pinned.
@@ -27,6 +27,7 @@ newest version covering linux-musl + darwin hosts, which is why it is pinned.
 
 _XWIN_VERSION = "0.6.5"
 _XWIN_MANIFEST_VERSION = "17"
+_XWIN_SDK_VERSION = "10.0.22621"
 
 # host key -> (release triple, sha256), from the published .sha256 assets.
 _XWIN_DISTS = {
@@ -181,12 +182,12 @@ xwin_sysroot_repository = repository_rule(
             values = ["x86_64", "aarch64"],
             doc = "xwin --arch: target CRT/SDK library architecture.",
         ),
-        # The newest SDK's arm64 MSIs reference no cab files, which xwin 0.6.5
-        # rejects ("no cab files were referenced by the MSI", Jake-Shadle/xwin#126);
-        # the arm64 splat pins an older SDK. Empty = xwin's default (latest).
+        # xwin 0.6.5 requires backslash-separated catalog payload names;
+        # SDK 26100 uses forward slashes. Its ARM64 MSIs also reference no
+        # cab files, which this xwin rejects (Jake-Shadle/xwin#126).
         "sdk_version": attr.string(
-            default = "",
-            doc = "xwin --sdk-version override (e.g. 10.0.22621).",
+            default = _XWIN_SDK_VERSION,
+            doc = "Windows SDK version compatible with the pinned xwin release.",
         ),
     },
     # Persistent splat cache location; changing it only changes where the CDN

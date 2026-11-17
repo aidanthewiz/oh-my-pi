@@ -40,6 +40,7 @@ async function runConsumer() {
 		}
 		const stdinPrivateChannel = inspectStdinPrivateChannel();
 		if (!isSupportedFiniteStdinDescriptor(stdinPrivateChannel)) throw new Error(LIFECYCLE_FAILURE);
+		const stdinStat = fs.fstatSync(0, { bigint: true });
 		let noControllingTty = false;
 		try {
 			const tty = fs.openSync("/dev/tty", fs.constants.O_RDWR | fs.constants.O_NOCTTY | fs.constants.O_NONBLOCK);
@@ -86,6 +87,8 @@ async function runConsumer() {
 			envClean: !lifecycleContainsSensitive(process.env),
 			stdinIsTTY: stdinPrivateChannel.isTerminal,
 			stdinPrivateChannel,
+			stdinDev: String(stdinStat.dev),
+			stdinIno: String(stdinStat.ino),
 			stdinIsRegularFile: stdinPrivateChannel.isRegularFile,
 			noControllingTty,
 		};

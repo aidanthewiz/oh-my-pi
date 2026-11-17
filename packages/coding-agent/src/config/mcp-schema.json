@@ -94,7 +94,13 @@
 					"type": "string"
 				},
 				"scope": {
-					"type": "string"
+					"type": "string",
+					"description": "Requested scopes. Overrides protected-resource, challenge, and authorization-URL scopes. Set to an empty string to omit the scope parameter."
+				},
+				"resourceMetadataUrl": {
+					"type": "string",
+					"minLength": 1,
+					"description": "Explicitly trusted RFC 9728 protected-resource metadata URL. Overrides challenge discovery. Must be an absolute HTTP(S) URL without user information."
 				},
 				"redirectUri": {
 					"type": "string"
@@ -113,7 +119,7 @@
 					"description": "OAuth `prompt` parameter sent during authorization (default: omit unless the requested scope contains `offline_access`, which sends \"consent\"; set to \"\" to always omit)."
 				}
 			},
-			"description": "Explicit OAuth client settings for servers that need them during /mcp reauth or initial connect."
+			"description": "OAuth discovery, client, scope, and callback overrides used during /mcp reauth or initial connect."
 		},
 		"serverBase": {
 			"type": "object",

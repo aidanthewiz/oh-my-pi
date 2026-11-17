@@ -318,28 +318,8 @@ export function isLocallyAnonymousStdinChannel(value: unknown): value is StdinPr
 	);
 }
 
-/** A known null device supplies EOF, not an anonymous channel. */
 export function isSupportedFiniteStdinDescriptor(value: unknown): value is StdinPrivateChannelEvidence {
-	if (isLocallyAnonymousStdinChannel(value)) return true;
-	const fields = plainFields(value, EVIDENCE_KEYS);
-	return (
-		fields !== undefined &&
-		fields.verified === false &&
-		fields.kind === "unverified" &&
-		fields.failure === "unsupported-channel" &&
-		fields.isRegularFile === false &&
-		fields.isTerminal === false &&
-		fields.isSocket === false &&
-		fields.isFifo === false &&
-		fields.isCharacterDevice === true &&
-		fields.matchesDevNull === true &&
-		fields.socketFamily === null &&
-		fields.localSocketFamily === null &&
-		fields.peerSocketFamily === null &&
-		fields.socketType === null &&
-		fields.localAddress === null &&
-		fields.peerAddress === null
-	);
+	return isLocallyAnonymousStdinChannel(value);
 }
 
 export interface StdinProducerWitness {
@@ -411,7 +391,7 @@ export function isVerifiedStdinProducerWitness(value: unknown): value is StdinPr
 	);
 }
 
-interface PendingStdinOperation {
+export interface PendingStdinOperation {
 	guardianPid: number;
 	id: number;
 	operation: "write" | "flush";

@@ -716,8 +716,11 @@ export class OwnedInputSupervisor {
 		void this.proc.stdout.pipeTo(new WritableStream({ write() {} })).catch(() => {});
 		void this.proc.stderr.pipeTo(new WritableStream({ write() {} })).catch(() => {});
 		void this.proc.exited.then(
-			code => {
+			async code => {
 				if (this.#complete && this.#released && code === 0 && this.proc.signalCode === null && !this.#failed) {
+					await this.#inputDone;
+					await this.#joinKeeper();
+					if (this.#failed) return;
 					this.#cleanupAcknowledged = true;
 					clearTimeout(this.#stopTimer);
 					this.#control?.destroy();
@@ -866,6 +869,7 @@ export class OwnedInputSupervisor {
 			this.#receiverAnchor = receiver;
 			this.identity.receiverPid = value.receiverPid as number;
 			this.#started.resolve();
+			this.#inputDone ??= Promise.resolve().then(() => this.#writeInput());
 			return;
 		}
 		if (

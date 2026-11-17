@@ -7,7 +7,6 @@ import { compileCodingAgent } from "../scripts/compile-binary";
 import { createAwsSecretInputNativeGuardLauncher } from "./fixtures/aws-secret-input-native-dcg";
 import {
 	isLocallyAnonymousStdinChannel,
-	isSupportedFiniteStdinDescriptor,
 	isVerifiedStdinProducerWitness,
 } from "./fixtures/aws-secret-input-stdin-metadata";
 
@@ -73,16 +72,12 @@ function safeReceipt(value: unknown): boolean {
 	const receipt = value as Record<string, unknown>;
 	const stdinPrivateChannel = receipt.stdinPrivateChannel;
 	const stdinProducerWitness = receipt.stdinProducerWitness;
-	if (
-		!isSupportedFiniteStdinDescriptor(stdinPrivateChannel) ||
-		!isVerifiedStdinProducerWitness(stdinProducerWitness) ||
-		!isLocallyAnonymousStdinChannel(stdinPrivateChannel)
-	)
+	if (!isLocallyAnonymousStdinChannel(stdinPrivateChannel) || !isVerifiedStdinProducerWitness(stdinProducerWitness))
 		return false;
 	if (typeof receipt.workerSocketIdentitiesCompared !== "boolean") return false;
 	if (
 		process.platform === "linux"
-			? typeof receipt.guardianSocketIdentitiesCompared !== "boolean"
+			? receipt.workerSocketIdentitiesCompared !== true || receipt.guardianSocketIdentitiesCompared !== true
 			: receipt.guardianSocketIdentitiesCompared !== null
 	)
 		return false;

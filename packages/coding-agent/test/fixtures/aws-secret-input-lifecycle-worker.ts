@@ -50,6 +50,7 @@ async function runWorker() {
 	const files: Uint8Array[] = [];
 	const responses: Record<string, unknown>[] = [];
 	const inputs: Uint8Array[] = [];
+	const stdinProducerObserver = createStdinProducerWitnessObserver();
 	let cleanSurfaces = true;
 	let unexpectedOutput = false;
 	let retryDisabled = true;
@@ -295,7 +296,6 @@ async function runWorker() {
 			},
 		});
 	const originalSpawn = Bun.spawn;
-	const stdinProducerObserver = createStdinProducerWitnessObserver();
 	let producerCompletion: Promise<void> | undefined;
 
 	let pendingGuardianPid: number | undefined;

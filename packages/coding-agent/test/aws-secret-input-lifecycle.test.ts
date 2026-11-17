@@ -5,7 +5,6 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { Process, ProcessStatus } from "@oh-my-pi/pi-natives";
 import {
-	AWS_SECRET_INPUT_CAPABILITY,
 	AwsSecretInputFailure,
 	type AwsSecretInputFailureCode,
 	type AwsSecretInputRequest,
@@ -164,57 +163,6 @@ async function withBoundary(
 				return operation;
 			},
 		});
-	} catch (error) {
-		const failure = cleanupControl?.events.find(event => event.kind === "consumer-execution-failed");
-		if (failure && Number.isSafeInteger(failure.spawnStage)) {
-			console.error("SYNTHETIC_STDIN_SPAWN_STAGE", failure.spawnStage);
-		}
-		if (
-			failure &&
-			typeof failure.guardianPhase === "number" &&
-			Number.isInteger(failure.guardianPhase) &&
-			failure.guardianPhase >= 0 &&
-			failure.guardianPhase <= 10
-		) {
-			console.error("SYNTHETIC_STDIN_GUARDIAN_PHASE", failure.guardianPhase);
-		}
-		if (
-			failure &&
-			typeof failure.guardianReason === "number" &&
-			Number.isInteger(failure.guardianReason) &&
-			failure.guardianReason >= 0 &&
-			failure.guardianReason <= 40
-		) {
-			console.error("SYNTHETIC_STDIN_GUARDIAN_REASON", failure.guardianReason);
-		}
-		if (
-			failure &&
-			typeof failure.guardianKind === "number" &&
-			Number.isInteger(failure.guardianKind) &&
-			failure.guardianKind >= 0 &&
-			failure.guardianKind <= 4
-		) {
-			console.error("SYNTHETIC_STDIN_GUARDIAN_KIND", failure.guardianKind);
-		}
-		if (
-			failure &&
-			typeof failure.keeperSocketCode === "number" &&
-			Number.isInteger(failure.keeperSocketCode) &&
-			failure.keeperSocketCode >= 0 &&
-			failure.keeperSocketCode <= 8
-		) {
-			console.error("SYNTHETIC_STDIN_KEEPER_SOCKET_CODE", failure.keeperSocketCode);
-		}
-		if (
-			failure &&
-			typeof failure.keeperSocketState === "number" &&
-			Number.isInteger(failure.keeperSocketState) &&
-			failure.keeperSocketState >= 0 &&
-			failure.keeperSocketState <= 31
-		) {
-			console.error("SYNTHETIC_STDIN_KEEPER_SOCKET_STATE", failure.keeperSocketState);
-		}
-		throw error;
 	} finally {
 		controller.abort();
 		try {
@@ -406,7 +354,7 @@ describe.skipIf(process.platform === "win32")("AWS secret input real worker and 
 	test("private capability probe joins its worker without opening credentials or creating a consumer", async () => {
 		await withBoundary("success", "text", async boundary => {
 			const capability = await boundary.client.probeAwsSecretInputWorker(boundary.controller.signal);
-			expect(capability).toEqual(AWS_SECRET_INPUT_CAPABILITY);
+			expect(capability.capability).toBe("sha256:4936396a3a935e4582d42be1d73ef096353d23802dcea2394f7e969ffb42a358");
 			await expectWorkerDone(boundary, NO_PROVIDER_COUNTS);
 			await expectQuiescent(boundary);
 			expect(boundary.directories[0]?.files).toEqual([]);
@@ -458,6 +406,7 @@ describe.skipIf(process.platform === "win32")("AWS secret input real worker and 
 					expect(spawned.receiverPid).toBe(input.pid);
 					expect(input.parentPid).toBe(spawned.pid);
 					const childFds = input.descriptors as AwsSecretInputLifecycleDescriptor[];
+					expect(spawned.privateFdSnapshotAvailable).toBe(true);
 					if (process.platform === "linux") {
 						expect(input.fdSnapshotAvailable, "receiver descriptor snapshot is incomplete").toBe(true);
 						expect(ready.fdSnapshotAvailable, "initial worker descriptor snapshot is incomplete").toBe(true);

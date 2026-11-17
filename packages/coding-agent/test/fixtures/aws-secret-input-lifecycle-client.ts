@@ -3,7 +3,6 @@ import * as path from "node:path";
 import type { Subprocess } from "bun";
 import { Process, ProcessStatus } from "@oh-my-pi/pi-natives";
 import {
-	AWS_SECRET_INPUT_CAPABILITY,
 	AWS_SECRET_INPUT_PROTOCOL,
 	type AwsSecretInputCapability,
 	type AwsSecretInputRequest,
@@ -248,7 +247,7 @@ export function awsSecretInputLifecycleRequest(
 		timeout: timeoutSeconds,
 		secretInput: {
 			protocol: AWS_SECRET_INPUT_PROTOCOL,
-			capability: AWS_SECRET_INPUT_CAPABILITY.capability,
+			capability: "sha256:4936396a3a935e4582d42be1d73ef096353d23802dcea2394f7e969ffb42a358",
 			expectedIdentity: {
 				account: "123456789012",
 				arn: "arn:aws:sts::123456789012:assumed-role/FixtureRole/fixture",

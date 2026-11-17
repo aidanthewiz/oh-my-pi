@@ -7,7 +7,7 @@ import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { isDeepStrictEqual } from "node:util";
-import { isEnoent } from "@oh-my-pi/pi-utils";
+import { getAgentDir, isEnoent } from "@oh-my-pi/pi-utils";
 import { withFileLock } from "@oh-my-pi/pi-utils/file-lock";
 import { invalidate as invalidateFsCache } from "../capability/fs";
 
@@ -19,6 +19,15 @@ function withSchema(config: MCPConfigFile): MCPConfigFile {
 		$schema: config.$schema ?? MCP_CONFIG_SCHEMA_URL,
 		...config,
 	};
+}
+
+function configFileSourceLevel(filePath: string): "user" | "project" {
+	const resolvedPath = path.resolve(filePath);
+	const filename = path.basename(resolvedPath);
+	const isUserFile =
+		path.dirname(resolvedPath) === path.resolve(getAgentDir()) &&
+		(filename === "mcp.json" || filename === ".mcp.json");
+	return isUserFile ? "user" : "project";
 }
 
 /**
@@ -120,7 +129,7 @@ export async function addMCPServer(
 	filePath: string,
 	name: string,
 	config: MCPServerConfig,
-	options?: { assertCurrent?: () => void },
+	options?: { assertCurrent?: () => void; sourceLevel?: "user" | "project" },
 ): Promise<void> {
 	options?.assertCurrent?.();
 	// Validate server name
@@ -130,7 +139,13 @@ export async function addMCPServer(
 	}
 
 	// Validate the config
-	const errors = validateServerConfig(name, config);
+	const errors = validateServerConfig(
+		name,
+		config,
+		config.oauth?.resourceMetadataUrl === undefined
+			? undefined
+			: (options?.sourceLevel ?? configFileSourceLevel(filePath)),
+	);
 	if (errors.length > 0) {
 		throw new Error(`Invalid server config: ${errors.join("; ")}`);
 	}
@@ -168,7 +183,11 @@ export async function updateMCPServer(
 	filePath: string,
 	name: string,
 	config: MCPServerConfig,
-	options?: { expectedConfig?: MCPServerConfig; assertCurrent?: () => void },
+	options?: {
+		expectedConfig?: MCPServerConfig;
+		assertCurrent?: () => void;
+		sourceLevel?: "user" | "project";
+	},
 ): Promise<void> {
 	options?.assertCurrent?.();
 	// Validate server name
@@ -178,7 +197,13 @@ export async function updateMCPServer(
 	}
 
 	// Validate the config
-	const errors = validateServerConfig(name, config);
+	const errors = validateServerConfig(
+		name,
+		config,
+		config.oauth?.resourceMetadataUrl === undefined
+			? undefined
+			: (options?.sourceLevel ?? configFileSourceLevel(filePath)),
+	);
 	if (errors.length > 0) {
 		throw new Error(`Invalid server config: ${errors.join("; ")}`);
 	}
@@ -399,6 +424,8 @@ export interface SetMcpServerEnabledOptions {
 export async function setMcpServerEnabled(options: SetMcpServerEnabledOptions): Promise<void> {
 	const { userPath, projectPath, sourcePath, name, enabled } = options;
 	const candidatePaths = [...new Set([sourcePath, projectPath, userPath].filter(path => path !== undefined))];
+	const resolvedUserPath = path.resolve(userPath);
+	const resolvedProjectPath = path.resolve(projectPath);
 	let updatedInConfig = false;
 
 	for (const filePath of candidatePaths) {
@@ -406,7 +433,14 @@ export async function setMcpServerEnabled(options: SetMcpServerEnabledOptions): 
 		const server = config.mcpServers?.[name];
 		if (server === undefined) continue;
 
-		await updateMCPServer(filePath, name, { ...server, enabled });
+		const resolvedPath = path.resolve(filePath);
+		const sourceLevel =
+			resolvedPath === resolvedUserPath
+				? "user"
+				: resolvedPath === resolvedProjectPath
+					? "project"
+					: configFileSourceLevel(filePath);
+		await updateMCPServer(filePath, name, { ...server, enabled }, { sourceLevel });
 		updatedInConfig = true;
 		break;
 	}

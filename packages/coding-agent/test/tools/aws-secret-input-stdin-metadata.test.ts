@@ -212,7 +212,7 @@ describe.skipIf(process.platform !== "darwin" && process.platform !== "linux")("
 			});
 			expect(isVerifiedStdinPrivateChannelEvidence(empty)).toBe(false);
 			expect(isLocallyAnonymousStdinChannel(empty)).toBe(false);
-			expect(isSupportedFiniteStdinDescriptor(empty)).toBe(true);
+			expect(isSupportedFiniteStdinDescriptor(empty)).toBe(false);
 			const other = inspectStdinPrivateChannel(otherFd);
 			expect(other.isCharacterDevice).toBe(true);
 			expect(other.matchesDevNull).toBe(false);

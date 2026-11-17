@@ -12,6 +12,7 @@
 - Native AWS approvals offer **Allow for the rest of this session** for later commands, profiles, and SSO renewal without saving a configuration grant.
 - Keep job widgets local by default. Remote spec authoring requires managed or runtime consent, current model and account admission, bounded redacted context, and originating-journal accounting.
 - Expose session-bound native MCP calls to extensions. Honor `exposeTools: false` without disabling server startup or discovery.
+- Support explicitly trusted MCP protected-resource metadata through `oauth.resourceMetadataUrl`, including hosted servers whose canonical resource differs from the MCP endpoint.
 - Select the JavaScript debug adapter's executable with `JS_DEBUG_NODE` independently of the target runtime, and reject invalid paths without fallback.
 
 ### Fixed
@@ -19,7 +20,7 @@
 - Expose the full registered AWS JSON input schema through `xd://aws/schema`. Require complete schema and `aws-secret-input/v1` capability comparison before authentication or approval. Preserve native session-disposal and cancellation cleanup. Source delivery does not publish an engine or adopt an installed runtime.
 - Require actual native invocation ownership under `native-tool-host/v2` for AWS secret input. Preserve native Agent dispatch and native Write → `xd://aws` with intrinsic cleanup. Reject JavaScript/Python Eval and naked SDK/direct execution before approval UI, provider work, or receiver execution, even through registered wrappers or nested Write calls. Capability discovery does not authorize unsupported paths. Preserve authorized receiver reads and writes, bounded raw output, and normal retention.
 - Accept copied hashline Write paths and content, inner intent fields, and both active and mounted AWS presentations. Preserve exact normalized input and live native invocation ownership.
-- Deliver private AWS stdin through an actual anonymous pipe or unnamed Unix stream under delivery policy v3. Bound writes, join flush and EOF, and reject file-backed stdin optimizations.
+- Deliver private AWS stdin through an actual anonymous pipe or unnamed Unix stream under delivery policy v3. Bound writes, join flush and EOF, reject file-backed stdin optimizations, and refuse previous or mixed delivery-policy/fingerprint tuples.
 - Apply normalized device authorization before capability probes, including policy revocation during approval. Preserve active and mounted AWS dispatch and exact native invocation ownership.
 - Join owned process cleanup using kernel creation identities and actual reaping. Preserve a pinned Darwin group anchor until acknowledged retirement, and reject unknown or replaced receiver identities.
 - Preserve constructor-registered tool session callbacks so active native scopes stop when the SDK adopts or forks a session.
@@ -27,7 +28,14 @@
 - Settle restored session generations before rollback reconciliation without declaring transition readiness or skipping native cleanup.
 - Handle ordinary synchronous disposer returns without losing subsequent session cleanup. Continue to await native cancellation and asynchronous disposers.
 - Reap known receiver identities independently after guardian loss. Preserve unproved ownership as `WORKER_FAILED` through cancellation so later handoffs stay blocked.
+- Compare Linux descriptor aliases with their exact kernel identities. Keep unknown or conflicting descriptor snapshots unproved.
 - Keep committed-session events and transcript recording connected when cleanup rejects. Retire outgoing messages at transcript commit and propagate cleanup failures without carrying an old aside into the new conversation.
+- Synchronize shell TERM-output qualification with a child release gate and controlled cancellation deadlines instead of wall-clock sleeps.
+- Synchronize session lease race qualification with an observed held lease before racing claims and probes.
+- Separate hosted Chromium readiness from connection deadlines, close timed-out qualification pipes before cleanup, and preserve startup failures.
+- Honor configured MCP `oauth.scope` over metadata, challenge, and authorization-URL scopes during registration and authorization.
+- Preserve MCP metadata environment references across toggles and OAuth write-back; validate their resolved URLs under the original source's environment policy.
+- Require explicit approval for every managed Drata MCP call regardless of read-only annotations or permissive default approval modes.
 - Preserve the exact durable journal and its parent directory in shutdown, fork-return and fatal-recovery commands. Quote paths for POSIX shells and PowerShell, including sessions opened with a different future-session directory.
 - Separate MCP fixture startup from request deadlines. Make connected-browser viewport qualification deterministic and preserve navigation failures during cleanup.
 - Serialize and atomically publish shared ACP handle mappings. Fork unloaded handles from their continued conversation instead of the original transcript.

@@ -50,14 +50,7 @@ interface ManagedMCPConfigFile {
 				clientSecret?: string;
 			};
 			type?: "stdio" | "sse" | "http";
-			oauth?: {
-				clientId?: string;
-				clientSecret?: string;
-				redirectUri?: string;
-				callbackPort?: number;
-				callbackPath?: string;
-				prompt?: string;
-			};
+			oauth?: MCPServer["oauth"];
 		}
 	>;
 }
