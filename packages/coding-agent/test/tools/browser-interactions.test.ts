@@ -1620,8 +1620,8 @@ document.getElementById("menu-item").addEventListener("pointerdown", event => {
 				const held = Promise.withResolvers<void>();
 				const released = Promise.withResolvers<void>();
 				try {
-					await page.setContent(
-						'<button id="target" data-clicks="0" onclick="this.dataset.clicks=String(Number(this.dataset.clicks)+1)">Click</button>',
+					await page.goto(
+						`data:text/html,${encodeURIComponent('<button id="target" data-clicks="0" onclick="this.dataset.clicks=String(Number(this.dataset.clicks)+1)">Click</button>')}`,
 					);
 					const handle = await page.$("#target");
 					if (!handle) throw new Error("Expected the real fixture button");

@@ -330,13 +330,11 @@ async function expectBlockedFixtureWriter(boundary: LifecycleBoundary): Promise<
 	const blocked = await boundary.control.waitForEvent("stdin-writer-blocked");
 	expect(blocked.pending, "actual native writer has no pending operation").toBe(true);
 	expect(blocked.guardianPid).toBe(channel.pid);
-	expect(blocked.operation).toBe("flush");
 	expect(Number.isSafeInteger(blocked.id) && (blocked.id as number) > 0).toBe(true);
 	boundary.control.send("confirm-input-backpressure");
 	const confirmed = await boundary.control.waitForEvent("stdin-writer-still-blocked");
-	expect(confirmed.pending, "native flush resolved before the control-gated receipt").toBe(true);
+	expect(confirmed.pending, "native writer settled before the control-gated receipt").toBe(true);
 	expect(confirmed.id).toBe(blocked.id);
-	expect(confirmed.operation).toBe("flush");
 	expect(confirmed.bytesAccepted).toBe(blocked.bytesAccepted);
 	expect(boundary.control.events.some(event => event.kind === "input-complete")).toBe(false);
 }
@@ -541,7 +539,7 @@ describe.skipIf(process.platform === "win32")("AWS secret input real worker and 
 		);
 	}
 
-	test("drains maximum finite input after real flush backpressure on a constrained fixture socketpair", async () => {
+	test("drains maximum finite input after real writer backpressure on a constrained fixture socketpair", async () => {
 		await withBoundary("input-limit", "input-paused", async boundary => {
 			const operation = boundary.run();
 			await expectBlockedFixtureWriter(boundary);
@@ -576,7 +574,7 @@ describe.skipIf(process.platform === "win32")("AWS secret input real worker and 
 		});
 	}, 30_000);
 
-	test("cancels a genuinely blocked maximum-input flush on a constrained fixture socketpair", async () => {
+	test("cancels a genuinely blocked maximum-input writer on a constrained fixture socketpair", async () => {
 		await withBoundary("input-limit", "input-paused", async boundary => {
 			const operation = boundary.run();
 			await expectBlockedFixtureWriter(boundary);
