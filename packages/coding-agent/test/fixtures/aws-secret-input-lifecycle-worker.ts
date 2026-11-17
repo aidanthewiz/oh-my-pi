@@ -48,6 +48,7 @@ function privateDescriptorSnapshot(pid = process.pid): PrivateDescriptorSnapshot
 	} catch {
 		return { descriptors: [], available: false };
 	}
+	if (entries.length > 256) return { descriptors: [], available: false };
 	for (const name of entries) {
 		const fd = Number(name);
 		if (!Number.isSafeInteger(fd) || fd < 3) continue;
@@ -70,7 +71,15 @@ function privateDescriptorSnapshot(pid = process.pid): PrivateDescriptorSnapshot
 					kind: stat.isSocket() ? "socket" : stat.isFIFO() ? "pipe" : "file",
 				});
 			}
-		} catch {}
+		} catch (error) {
+			if (
+				!error ||
+				typeof error !== "object" ||
+				!("code" in error) ||
+				(error.code !== "EBADF" && error.code !== "ENOENT")
+			)
+				return { descriptors: [], available: false };
+		}
 	}
 	return { descriptors: measureAwsSecretInputLifecycleDescriptors(descriptors), available: true };
 }
@@ -97,6 +106,7 @@ async function runWorker() {
 	const files: Uint8Array[] = [];
 	const responses: Record<string, unknown>[] = [];
 	const inputs: Uint8Array[] = [];
+	const stdinProducerObserver = createStdinProducerWitnessObserver();
 	let cleanSurfaces = true;
 	let unexpectedOutput = false;
 	let retryDisabled = true;
@@ -117,7 +127,8 @@ async function runWorker() {
 	const originalSocketEmit = Socket.prototype.emit;
 	Socket.prototype.write = new Proxy(originalSocketWrite, {
 		apply(target, receiver, args) {
-			observeControl(receiver, args[0], socketWrites);
+			if (!stdinProducerObserver.isPrivateStdinWrite(receiver, args[0]))
+				observeControl(receiver, args[0], socketWrites);
 			return Reflect.apply(target, receiver, args);
 		},
 	});
@@ -149,7 +160,6 @@ async function runWorker() {
 			},
 		});
 	const originalSpawn = Bun.spawn;
-	const stdinProducerObserver = createStdinProducerWitnessObserver();
 	Bun.spawn = new Proxy(originalSpawn, {
 		apply(target, receiver, args) {
 			const command = args[0];
@@ -354,6 +364,7 @@ async function runWorker() {
 						? null
 						: (stdinProducerObserver.witnessFor(identity.pid, identity.receiverPid) ?? null),
 				privateDescriptors: workerDescriptors.descriptors,
+				privateFdSnapshotAvailable: workerDescriptors.available,
 				privateSocketIdentitiesAvailable: awsSecretInputLifecycleSocketIdentitiesAvailable(
 					workerDescriptors.descriptors,
 				),

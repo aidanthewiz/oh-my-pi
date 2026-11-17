@@ -1,10 +1,11 @@
 import { dlopen, FFIType, ptr } from "bun:ffi";
-import { readdirSync } from "node:fs";
+import { closeSync, readdirSync } from "node:fs";
 import { createRequire } from "node:module";
 import { connect, type NetConnectOpts, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { Readable } from "node:stream";
+import { finished } from "node:stream/promises";
 import { Process } from "@oh-my-pi/pi-natives";
 import type { Subprocess } from "bun";
 import { TempDir } from "./temp";
@@ -118,6 +119,43 @@ function hasOwnedInputPrimitives(): boolean {
 
 /** Requires the loaded identity-safe native binding, not an assumed package version. */
 export const PTREE_OWNED_INPUT_SUPPORTED = hasOwnedInputPrimitives();
+
+function createInputChannel(): { reader: number; writer: Socket } {
+	for (const candidate of process.platform === "darwin" ? ["/usr/lib/libSystem.B.dylib"] : ["libc.so.6", "libc.so"]) {
+		let libc;
+		try {
+			libc = dlopen(candidate, {
+				socketpair: { args: [FFIType.i32, FFIType.i32, FFIType.i32, FFIType.ptr], returns: FFIType.i32 },
+				fcntl: { args: [FFIType.i32, FFIType.i32, FFIType.i32], returns: FFIType.i32 },
+			});
+		} catch {
+			continue;
+		}
+		const descriptors = new Int32Array([-1, -1]);
+		try {
+			if (libc.symbols.socketpair(1, 1, 0, ptr(descriptors)) !== 0) throw new Error("PTREE_OWNED_INPUT_UNSUPPORTED");
+			for (const descriptor of descriptors) {
+				const flags = libc.symbols.fcntl(descriptor, 1, 0);
+				if (flags < 0 || libc.symbols.fcntl(descriptor, 2, flags | 1) < 0)
+					throw new Error("PTREE_OWNED_INPUT_UNSUPPORTED");
+			}
+			const writer = connect({
+				fd: descriptors[1],
+				allowHalfOpen: true,
+			} as NetConnectOpts);
+			writer.on("error", () => {});
+			const reader = descriptors[0]!;
+			descriptors.fill(-1);
+			return { reader, writer };
+		} finally {
+			for (const descriptor of descriptors) {
+				if (descriptor >= 0) closeSync(descriptor);
+			}
+			libc.close();
+		}
+	}
+	throw new Error("PTREE_OWNED_INPUT_UNSUPPORTED");
+}
 
 function guardianScript(bindingPath: string, startupDirectory: string): string {
 	return `
@@ -333,7 +371,7 @@ try {
 `;
 }
 
-type GuardianProcess = Subprocess<Uint8Array, "pipe", "pipe">;
+type GuardianProcess = Subprocess<number, "pipe", "pipe">;
 
 export class OwnedInputSupervisor {
 	readonly proc: GuardianProcess;
@@ -362,10 +400,16 @@ export class OwnedInputSupervisor {
 	#receiverSignalCode: NodeJS.Signals | null = null;
 	#stopTimer?: NodeJS.Timeout;
 	#startupDirectory?: TempDir;
+	#input?: Uint8Array;
+	#inputWriter?: Socket;
+	#inputClosed: Promise<void> = Promise.resolve();
+	#inputDone: Promise<void> = Promise.resolve();
+	#inputStarted = false;
 
 	constructor(command: OwnedInputCommand, input: Uint8Array) {
 		if (!PTREE_OWNED_INPUT_SUPPORTED || !nativeBindingPath) throw new Error("PTREE_OWNED_INPUT_UNSUPPORTED");
 		this.#command = command;
+		this.#input = input;
 		this.exited = this.#finished.promise;
 		this.stopped = this.#stopRequested.promise;
 		void this.exited.catch(() => {});
@@ -375,37 +419,47 @@ export class OwnedInputSupervisor {
 			// Bun evaluates cwd preloads before the guardian entrypoint.
 			this.#startupDirectory = TempDir.createSync(join(resolve(tmpdir()), "omp-owned-input-"));
 			const startupDirectory = this.#startupDirectory.path();
-			this.proc = Bun.spawn(
-				[
-					process.execPath,
-					"--cwd",
-					startupDirectory,
-					"--no-env-file",
-					"--no-install",
-					"-e",
-					guardianScript(nativeBindingPath, startupDirectory),
-				],
-				{
-					cwd: startupDirectory,
-					env: {
-						HOME: startupDirectory,
-						USERPROFILE: startupDirectory,
-						XDG_CONFIG_HOME: startupDirectory,
-						XDG_CACHE_HOME: startupDirectory,
-						BUN_INSTALL: startupDirectory,
-						TMPDIR: startupDirectory,
-						BUN_OPTIONS: "",
-						NODE_OPTIONS: "",
-						BUN_BE_BUN: "1",
-						BUN_RUNTIME_TRANSPILER_CACHE_PATH: "0",
-						DO_NOT_TRACK: "1",
+			const channel = createInputChannel();
+			this.#inputWriter = channel.writer;
+			const closed = Promise.withResolvers<void>();
+			channel.writer.once("close", () => closed.resolve());
+			this.#inputClosed = closed.promise;
+			try {
+				this.proc = Bun.spawn(
+					[
+						process.execPath,
+						"--cwd",
+						startupDirectory,
+						"--no-env-file",
+						"--no-install",
+						"-e",
+						guardianScript(nativeBindingPath, startupDirectory),
+					],
+					{
+						cwd: startupDirectory,
+						env: {
+							HOME: startupDirectory,
+							USERPROFILE: startupDirectory,
+							XDG_CONFIG_HOME: startupDirectory,
+							XDG_CACHE_HOME: startupDirectory,
+							BUN_INSTALL: startupDirectory,
+							TMPDIR: startupDirectory,
+							BUN_OPTIONS: "",
+							NODE_OPTIONS: "",
+							BUN_BE_BUN: "1",
+							BUN_RUNTIME_TRANSPILER_CACHE_PATH: "0",
+							DO_NOT_TRACK: "1",
+						},
+						stdio: [channel.reader, "pipe", "pipe", "socket-fd", "socket-fd", "socket-fd"],
+						detached: true,
+						windowsHide: true,
 					},
-					stdio: [input, "pipe", "pipe", "socket-fd", "socket-fd", "socket-fd"],
-					detached: true,
-					windowsHide: true,
-				},
-			);
+				);
+			} finally {
+				closeSync(channel.reader);
+			}
 		} catch {
+			this.#cancelInput();
 			try {
 				this.#removeStartupDirectory();
 			} catch {}
@@ -465,8 +519,11 @@ export class OwnedInputSupervisor {
 		void this.proc.stdout.pipeTo(new WritableStream({ write() {} })).catch(() => {});
 		void this.proc.stderr.pipeTo(new WritableStream({ write() {} })).catch(() => {});
 		void this.proc.exited.then(
-			code => {
+			async code => {
 				if (this.#complete && this.#released && code === 0 && this.proc.signalCode === null && !this.#failed) {
+					await this.#inputDone;
+					await this.#inputClosed;
+					if (this.#failed) return;
 					this.#cleanupAcknowledged = true;
 					clearTimeout(this.#stopTimer);
 					this.#control?.destroy();
@@ -501,6 +558,7 @@ export class OwnedInputSupervisor {
 
 	acknowledgeRegistration(): void {
 		this.#releaseEnabled = true;
+		this.#beginInput();
 		if (this.#complete && !this.#released) {
 			try {
 				this.#send({ type: "release" });
@@ -515,6 +573,7 @@ export class OwnedInputSupervisor {
 		if (this.#cleanupAcknowledged) return this.exited.then(() => true);
 		if (!this.#stopping) {
 			this.#stopping = true;
+			this.#cancelInput();
 			this.#stopRequested.resolve();
 			this.#stopTimer = setTimeout(() => {
 				void this.#fail("PTREE_OWNED_INPUT_CLEANUP_FAILED");
@@ -527,6 +586,55 @@ export class OwnedInputSupervisor {
 			}
 		}
 		return this.exited.then(() => this.#cleanupAcknowledged);
+	}
+
+	#cancelInput(): void {
+		this.#input = undefined;
+		this.#inputWriter?.destroy();
+		this.#inputWriter = undefined;
+	}
+
+	#beginInput(): void {
+		if (this.#inputStarted) return;
+		this.#inputStarted = true;
+		this.#inputDone = this.#writeInput();
+	}
+
+	async #writeInput(): Promise<void> {
+		let input = this.#input;
+		this.#input = undefined;
+		const writer = this.#inputWriter;
+		try {
+			if (!input || !writer) return;
+			for (let offset = 0; offset < input.byteLength; offset += 16_384) {
+				if (this.#stopping || this.#complete || this.#failed) return;
+				const size = Math.min(16_384, input.byteLength - offset);
+				const chunk = Buffer.from(input.buffer, input.byteOffset + offset, size);
+				const written = Promise.withResolvers<void>();
+				writer.write(chunk, error => (error ? written.reject(error) : written.resolve()));
+				await written.promise;
+			}
+			if (this.#stopping || this.#complete || this.#failed) return;
+			const ended = finished(writer, { readable: false, cleanup: true });
+			writer.end();
+			await ended;
+		} catch (error) {
+			const code = error && typeof error === "object" && "code" in error ? error.code : undefined;
+			const cause = writer?.errored;
+			const causeCode = cause && "code" in cause ? cause.code : undefined;
+			const refused =
+				code === "EPIPE" ||
+				code === "ECONNRESET" ||
+				(code === "ECANCELED" && (causeCode === "EPIPE" || causeCode === "ECONNRESET"));
+			if (!this.#stopping && !this.#complete && !this.#failed && !refused) {
+				void this.#fail("PTREE_OWNED_INPUT_OWNERSHIP_LOST");
+			}
+		} finally {
+			input = undefined;
+			writer?.destroy();
+			await this.#inputClosed;
+			this.#inputWriter = undefined;
+		}
 	}
 
 	#send(message: unknown): void {
@@ -573,6 +681,7 @@ export class OwnedInputSupervisor {
 	async #fail(code: string): Promise<void> {
 		if (this.#failed) return;
 		this.#failed = true;
+		this.#cancelInput();
 		this.#stopRequested.resolve();
 		clearTimeout(this.#stopTimer);
 		try {
@@ -580,6 +689,8 @@ export class OwnedInputSupervisor {
 				await this.proc.exited.catch(() => {});
 			}
 		} catch {}
+		await this.#inputDone;
+		await this.#inputClosed;
 		this.#control?.destroy();
 		this.#out?.destroy();
 		this.#err?.destroy();

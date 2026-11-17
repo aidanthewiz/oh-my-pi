@@ -43,3 +43,4 @@ winreg.workspace = true
 [dev-dependencies]
 async-trait.workspace = true
 tempfile = "3"
+tokio = { workspace = true, features = ["test-util"] }

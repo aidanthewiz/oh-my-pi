@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { SourceMeta } from "@oh-my-pi/pi-coding-agent/capability/types";
+import { readMCPConfigFile, setMcpServerEnabled } from "@oh-my-pi/pi-coding-agent/mcp/config-writer";
 import type { MCPServerConfig } from "@oh-my-pi/pi-coding-agent/mcp/types";
 import { MCPCommandController } from "@oh-my-pi/pi-coding-agent/modes/controllers/mcp-command-controller";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
@@ -19,6 +20,18 @@ import { createInteractiveModeContext, createMcpManagerStub } from "./helpers/in
 const originalProjectDir = getProjectDir();
 const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
 const fallbackAgentDir = path.join(getConfigRootDir(), "agent");
+const METADATA_ENV = "OMP_TEST_MCP_METADATA_URL";
+const METADATA_REFERENCE = `\${OMP_TEST_MCP_METADATA_URL}`;
+
+function setMetadataEnvironment(value: string | undefined): void {
+	if (value === undefined) {
+		delete Bun.env[METADATA_ENV];
+		delete process.env[METADATA_ENV];
+	} else {
+		Bun.env[METADATA_ENV] = value;
+		process.env[METADATA_ENV] = value;
+	}
+}
 
 function restoreAgentDir(): void {
 	if (originalAgentDir) {
@@ -68,12 +81,14 @@ async function writeProjectConfig(projectDir: string, servers: Record<string, MC
 describe("/mcp enable and disable", () => {
 	let projectDir = "";
 	let agentDir = "";
+	let originalMetadataUrl: string | undefined;
 
 	beforeAll(() => {
 		initTheme();
 	});
 
 	beforeEach(async () => {
+		originalMetadataUrl = Bun.env[METADATA_ENV];
 		projectDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-mcp-toggle-project-"));
 		agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-mcp-toggle-agent-"));
 		setProjectDir(projectDir);
@@ -82,10 +97,147 @@ describe("/mcp enable and disable", () => {
 
 	afterEach(async () => {
 		vi.restoreAllMocks();
+		setMetadataEnvironment(originalMetadataUrl);
 		setProjectDir(originalProjectDir);
 		restoreAgentDir();
 		await removeWithRetries(projectDir);
 		await removeWithRetries(agentDir);
+	});
+
+	test("disables and dashboard-reenables a user OAuth server without rewriting its metadata placeholder", async () => {
+		setMetadataEnvironment("https://mcp.example.test/.well-known/oauth-protected-resource");
+		const userPath = getMCPConfigPath("user", projectDir);
+		const config: MCPServerConfig = {
+			type: "http",
+			url: "https://mcp.example.test/mcp/",
+			oauth: { resourceMetadataUrl: METADATA_REFERENCE },
+		};
+		await Bun.write(userPath, JSON.stringify({ mcpServers: { oauthserver: config } }));
+		const { controller, mcpManager } = createController();
+
+		await controller.handle("/mcp disable oauthserver");
+
+		expect(mcpManager.disconnectServer).toHaveBeenCalledWith("oauthserver");
+		const disabled = (await readMCPConfigFile(userPath)).mcpServers?.oauthserver;
+		expect(disabled?.enabled).toBe(false);
+		expect(disabled?.oauth?.resourceMetadataUrl).toBe(METADATA_REFERENCE);
+
+		await setMcpServerEnabled({
+			userPath,
+			projectPath: getMCPConfigPath("project", projectDir),
+			name: "oauthserver",
+			enabled: true,
+		});
+
+		const enabled = (await readMCPConfigFile(userPath)).mcpServers?.oauthserver;
+		expect(enabled?.enabled).toBe(true);
+		expect(enabled?.oauth?.resourceMetadataUrl).toBe(METADATA_REFERENCE);
+	});
+
+	test("dashboard toggles retain user-source expansion for an alternate native .mcp.json", async () => {
+		setMetadataEnvironment("https://mcp.example.test/.well-known/oauth-protected-resource");
+		const sourcePath = path.join(agentDir, ".mcp.json");
+		await Bun.write(
+			sourcePath,
+			JSON.stringify({
+				mcpServers: {
+					oauthserver: {
+						type: "http",
+						url: "https://mcp.example.test/mcp/",
+						oauth: { resourceMetadataUrl: METADATA_REFERENCE },
+					},
+				},
+			}),
+		);
+		await setMcpServerEnabled({
+			userPath: getMCPConfigPath("user", projectDir),
+			projectPath: getMCPConfigPath("project", projectDir),
+			sourcePath,
+			name: "oauthserver",
+			enabled: false,
+		});
+
+		const saved = (await readMCPConfigFile(sourcePath)).mcpServers?.oauthserver;
+		expect(saved?.enabled).toBe(false);
+		expect(saved?.oauth?.resourceMetadataUrl).toBe(METADATA_REFERENCE);
+	});
+
+	test.each(["https://user:synthetic@example.test/metadata", "file:///tmp/metadata.json", "not-a-url"])(
+		"rejects an unsafe resolved user metadata URL %s without changing enabled state",
+		async metadataUrl => {
+			setMetadataEnvironment(metadataUrl);
+			const userPath = getMCPConfigPath("user", projectDir);
+			const definition = JSON.stringify({
+				mcpServers: {
+					oauthserver: {
+						type: "http",
+						url: "https://mcp.example.test/mcp/",
+						enabled: true,
+						oauth: { resourceMetadataUrl: METADATA_REFERENCE },
+					},
+				},
+			});
+			await Bun.write(userPath, definition);
+			await expect(
+				setMcpServerEnabled({
+					userPath,
+					projectPath: getMCPConfigPath("project", projectDir),
+					name: "oauthserver",
+					enabled: false,
+				}),
+			).rejects.toThrow("oauth.resourceMetadataUrl");
+			expect(await Bun.file(userPath).text()).toBe(definition);
+		},
+	);
+
+	test.each([
+		{
+			label: "unavailable project variable",
+			expression: METADATA_REFERENCE,
+			ambient: "https://private.example.test/metadata",
+			accepted: false,
+		},
+		{
+			label: "safe project default",
+			expression: `\${OMP_TEST_MCP_METADATA_URL:-https://public.example.test/metadata}`,
+			ambient: "https://user:synthetic@example.test/metadata",
+			accepted: true,
+		},
+		{
+			label: "unsafe project default",
+			expression: `\${OMP_TEST_MCP_METADATA_URL:-https://user:synthetic@example.test/metadata}`,
+			ambient: "https://private.example.test/metadata",
+			accepted: false,
+		},
+	])("validates $label without inheriting restricted process values", async ({ expression, ambient, accepted }) => {
+		setMetadataEnvironment(ambient);
+		const projectPath = getMCPConfigPath("project", projectDir);
+		const definition = JSON.stringify({
+			mcpServers: {
+				oauthserver: {
+					type: "http",
+					url: "https://mcp.example.test/mcp/",
+					enabled: true,
+					oauth: { resourceMetadataUrl: expression },
+				},
+			},
+		});
+		await Bun.write(projectPath, definition);
+		const toggle = setMcpServerEnabled({
+			userPath: getMCPConfigPath("user", projectDir),
+			projectPath,
+			name: "oauthserver",
+			enabled: false,
+		});
+		if (!accepted) {
+			await expect(toggle).rejects.toThrow("oauth.resourceMetadataUrl");
+			expect(await Bun.file(projectPath).text()).toBe(definition);
+			return;
+		}
+		await toggle;
+		const saved = (await readMCPConfigFile(projectPath)).mcpServers?.oauthserver;
+		expect(saved?.enabled).toBe(false);
+		expect(saved?.oauth?.resourceMetadataUrl).toBe(expression);
 	});
 
 	test("disabling one configured server does not reload other MCP servers", async () => {

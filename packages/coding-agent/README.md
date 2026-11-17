@@ -60,7 +60,9 @@ JavaScript/Python Eval and naked SDK/direct `.execute(...)` invocations are unsu
 They fail with `CAPABILITY_INCOMPATIBLE` before approval UI, provider work, or receiver execution.
 Discover and verify the current fingerprint at runtime; do not reuse a fingerprint from another host contract.
 The manifest requires `hostPolicy:"native-tool-host/v2"` and retains `executionPolicy:"tool-cancellation-cleanup/v1"`.
-Scope, lifecycle, and delivery remain `aws-secret-input-sdk-scope/v2`, `tool-session-lifecycle/v2`, and `finite-stdin-owned-process-group/v2`.
+Scope and lifecycle remain `aws-secret-input-sdk-scope/v2` and `tool-session-lifecycle/v2`.
+Require `deliveryPolicy:"finite-stdin-owned-process-group/v3"` and capability `sha256:4936396a3a935e4582d42be1d73ef096353d23802dcea2394f7e969ffb42a358`.
+Reject older or mixed delivery-policy/fingerprint tuples.
 Output remains `raw-bounded-consumer-output/v1`.
 Native schema and description discovery no longer enumerate AWS profiles; schema and capability discovery read no profile or credential files.
 Use an operator-approved, caller-known operational profile, never an inferred ambient, default, or model/relay profile.
@@ -120,7 +122,11 @@ The consumer runs in a detached owned process group without a controlling termin
 It receives no inherited AWS credential environment or private worker control descriptors.
 The guardian starts in a fresh neutral owned directory with a minimal Bun startup environment that blocks project and global preloads.
 Only the receiver uses the approved working directory, environment, and argv.
-Stdin closes after the bounded input.
+Stdin uses an anonymous Unix stream, never a regular file or memfd.
+The owned writer sends bounded chunks after receiver registration, then closes stdin for EOF.
+Completion joins the writer and closes its descriptor, including cancellation and early receiver exit.
+A receiver can close or reset stdin before reading all input; its actual exit status remains authoritative after cleanup.
+Unexplained writer cancellation remains an ownership failure.
 Cancellation, timeout, and session disposal terminate and reap the owned consumer group and worker, close streams, and release owned references.
 An independent owned finite-input guardian handles worker SIGKILL or disconnect and receiver leader exit while foreground descendants or pipes remain.
 The intrinsic `await-cleanup` policy keeps admitted native invocations pending until owned teardown completes or reports an ownership failure.

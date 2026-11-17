@@ -209,6 +209,14 @@ describe.skipIf(process.platform === "win32")("AWS secret input local host admis
 		}
 	});
 
+	const staleDeliveryCapability = {
+		...AWS_SECRET_INPUT_CAPABILITY,
+		capability: "sha256:bac95b8ce6d793c137902275a7fc42ea4970babd0d73788f34e15529750bca12",
+		manifest: {
+			...AWS_SECRET_INPUT_CAPABILITY.manifest,
+			deliveryPolicy: "finite-stdin-owned-process-group/v2",
+		},
+	};
 	for (const [name, workerCapability] of [
 		["protocol", { ...AWS_SECRET_INPUT_CAPABILITY, protocol: "aws-secret-input/v0" }],
 		[
@@ -218,6 +226,15 @@ describe.skipIf(process.platform === "win32")("AWS secret input local host admis
 				capability: "sha256:d22786d4a043200a285344d1ce7316ed342e7a7de68e33af4de6e07a1b7f6469",
 				manifest: { ...AWS_SECRET_INPUT_CAPABILITY.manifest, hostPolicy: "native-tool-host/v1" },
 			},
+		],
+		["stale delivery tuple", staleDeliveryCapability],
+		[
+			"current fingerprint with stale delivery policy",
+			{ ...staleDeliveryCapability, capability: AWS_SECRET_INPUT_CAPABILITY.capability },
+		],
+		[
+			"stale fingerprint with current delivery policy",
+			{ ...staleDeliveryCapability, manifest: AWS_SECRET_INPUT_CAPABILITY.manifest },
 		],
 		[
 			"manifest",

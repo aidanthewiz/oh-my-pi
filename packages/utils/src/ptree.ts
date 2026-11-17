@@ -13,9 +13,9 @@ import { OwnedInputSupervisor, type OwnedInputIdentity } from "./ptree-owned-inp
 
 export { OwnedInputError, PTREE_OWNED_INPUT_SUPPORTED } from "./ptree-owned-input";
 
-export const PTREE_EXEC_INPUT_POLICY = "finite-stdin-owned-process-group/v2";
+export const PTREE_EXEC_INPUT_POLICY = "finite-stdin-owned-process-group/v3";
 
-type InMask = "pipe" | "ignore" | Buffer | Uint8Array | null;
+type InMask = "pipe" | "ignore" | Buffer | Uint8Array | number | null;
 
 /** A Bun subprocess with stdout/stderr always piped (stdin may vary). */
 type PipedSubprocess<In extends InMask = InMask> = Subprocess<In, "pipe", "pipe">;
@@ -836,8 +836,8 @@ export async function exec(cmd: string[], opts?: ExecOptions): Promise<ExecResul
 				onSpawn?.(child);
 			}
 		} catch (error) {
-			guardian?.acknowledgeRegistration();
 			child.kill(new AbortError("exec setup failed", ""), -1);
+			guardian?.acknowledgeRegistration();
 			await child.wait({ allowAbort: true, allowNonZero: true, maxOutputBytes: 0 }).catch(() => {});
 			throw error;
 		}

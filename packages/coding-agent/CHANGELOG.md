@@ -12,6 +12,7 @@
 - Native AWS approvals offer **Allow for the rest of this session** for later commands, profiles, and SSO renewal without saving a configuration grant.
 - Keep job widgets local by default. Remote spec authoring requires managed or runtime consent, current model and account admission, bounded redacted context, and originating-journal accounting.
 - Expose session-bound native MCP calls to extensions. Honor `exposeTools: false` without disabling server startup or discovery.
+- Support explicitly trusted MCP protected-resource metadata through `oauth.resourceMetadataUrl`, including hosted servers whose canonical resource differs from the MCP endpoint.
 - Select the JavaScript debug adapter's executable with `JS_DEBUG_NODE` independently of the target runtime, and reject invalid paths without fallback.
 
 ### Fixed
@@ -24,7 +25,15 @@
 - Settle restored session generations before rollback reconciliation without declaring transition readiness or skipping native cleanup.
 - Handle ordinary synchronous disposer returns without losing subsequent session cleanup. Continue to await native cancellation and asynchronous disposers.
 - Reap known receiver identities independently after guardian loss. Preserve unproved ownership as `WORKER_FAILED` through cancellation so later handoffs stay blocked.
+- Require `finite-stdin-owned-process-group/v3` for anonymous-stream secret input. Reject the previous delivery capability and mixed policy/fingerprint tuples during preflight.
+- Deliver owned secret stdin through an anonymous Unix stream instead of Bun's Linux TypedArray memfd transport. Bound writes, send EOF, and join the writer during early exit or cancellation. Preserve receiver refusal on `EPIPE` or `ECONNRESET`; cancelled write callbacks require a matching socket error. Verify Linux descriptor aliases by their kernel socket identities.
 - Keep committed-session events and transcript recording connected when cleanup rejects. Retire outgoing messages at transcript commit and propagate cleanup failures without carrying an old aside into the new conversation.
+- Synchronize shell TERM-output qualification with a child release gate and controlled cancellation deadlines instead of wall-clock sleeps.
+- Synchronize session lease race qualification with an observed held lease before racing claims and probes.
+- Separate hosted Chromium readiness from connection deadlines, close timed-out qualification pipes before cleanup, and preserve startup failures.
+- Honor configured MCP `oauth.scope` over metadata, challenge, and authorization-URL scopes during registration and authorization.
+- Preserve MCP metadata environment references across toggles and OAuth write-back; validate their resolved URLs under the original source's environment policy.
+- Require explicit approval for every managed Drata MCP call regardless of read-only annotations or permissive default approval modes.
 - Preserve the exact durable journal and its parent directory in shutdown, fork-return and fatal-recovery commands. Quote paths for POSIX shells and PowerShell, including sessions opened with a different future-session directory.
 - Separate MCP fixture startup from request deadlines. Make connected-browser viewport qualification deterministic and preserve navigation failures during cleanup.
 - Serialize and atomically publish shared ACP handle mappings. Fork unloaded handles from their continued conversation instead of the original transcript.

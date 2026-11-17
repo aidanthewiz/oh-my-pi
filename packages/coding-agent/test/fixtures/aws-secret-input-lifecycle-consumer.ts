@@ -20,7 +20,9 @@ import { inspectStdinPrivateChannel, isSupportedFiniteStdinDescriptor } from "./
 function descriptors() {
 	const directory = process.platform === "linux" ? "/proc/self/fd" : "/dev/fd";
 	const result: AwsSecretInputLifecycleDescriptorIdentity[] = [];
-	for (const name of fs.readdirSync(directory)) {
+	const entries = fs.readdirSync(directory);
+	if (entries.length > 256) throw new Error(LIFECYCLE_FAILURE);
+	for (const name of entries) {
 		const fd = Number(name);
 		if (!Number.isSafeInteger(fd) || fd < 3) continue;
 		try {
@@ -36,7 +38,15 @@ function descriptors() {
 				target,
 				kind: stat.isSocket() ? "socket" : stat.isFIFO() ? "pipe" : stat.isFile() ? "file" : "other",
 			});
-		} catch {}
+		} catch (error) {
+			if (
+				!error ||
+				typeof error !== "object" ||
+				!("code" in error) ||
+				(error.code !== "EBADF" && error.code !== "ENOENT")
+			)
+				throw new Error(LIFECYCLE_FAILURE);
+		}
 	}
 	return measureAwsSecretInputLifecycleDescriptors(result);
 }
@@ -62,6 +72,7 @@ async function runConsumer() {
 		}
 		const stdinPrivateChannel = inspectStdinPrivateChannel();
 		if (!isSupportedFiniteStdinDescriptor(stdinPrivateChannel)) throw new Error(LIFECYCLE_FAILURE);
+		const stdinStat = fs.fstatSync(0, { bigint: true });
 		let noControllingTty = false;
 		try {
 			const tty = fs.openSync("/dev/tty", fs.constants.O_RDWR | fs.constants.O_NOCTTY | fs.constants.O_NONBLOCK);
@@ -100,6 +111,8 @@ async function runConsumer() {
 			envClean: !lifecycleContainsSensitive(process.env),
 			stdinIsTTY: stdinPrivateChannel.isTerminal,
 			stdinPrivateChannel,
+			stdinDev: String(stdinStat.dev),
+			stdinIno: String(stdinStat.ino),
 			stdinIsRegularFile: stdinPrivateChannel.isRegularFile,
 			noControllingTty,
 		};

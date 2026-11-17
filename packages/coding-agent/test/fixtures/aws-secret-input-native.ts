@@ -125,9 +125,19 @@ export function requireAwsSecretInputNativeTransport(
 		Bun.deepEquals(input.credentialEnv, []) && input.ipcAvailable === false && input.controlFdInherited === false,
 	);
 	requireNativeProof(Array.isArray(input.descriptors) && typeof input.socketIdentitiesAvailable === "boolean");
+	requireNativeProof(input.descriptors.length <= 256 && input.descriptors.every(isRecord));
 	requireNativeProof(isRecord(spawned) && Array.isArray(spawned.privateDescriptors));
+	requireNativeProof(
+		spawned.privateFdSnapshotAvailable === true &&
+			spawned.privateDescriptors.length <= 256 &&
+			spawned.privateDescriptors.every(isRecord),
+	);
 	requireNativeProof(typeof spawned.privateSocketIdentitiesAvailable === "boolean");
 	requireNativeProof(spawned.guardianDescriptors === null || Array.isArray(spawned.guardianDescriptors));
+	requireNativeProof(
+		spawned.guardianDescriptors === null ||
+			(spawned.guardianDescriptors.length <= 256 && spawned.guardianDescriptors.every(isRecord)),
+	);
 	requireNativeProof(
 		spawned.guardianSocketIdentitiesAvailable === null ||
 			typeof spawned.guardianSocketIdentitiesAvailable === "boolean",
@@ -172,12 +182,8 @@ export function requireAwsSecretInputNativeTransport(
 	requireDisjoint(workerDescriptors, workerSockets);
 	if (spawned.guardianDescriptors !== null) requireDisjoint(spawned.guardianDescriptors, guardianSockets === true);
 	if (process.platform === "linux") {
-		if (workerDescriptors.some(descriptor => descriptor.kind === "socket")) requireNativeProof(workerSockets);
-		if (
-			Array.isArray(spawned.guardianDescriptors) &&
-			spawned.guardianDescriptors.filter(isRecord).some(descriptor => descriptor.kind === "socket")
-		)
-			requireNativeProof(guardianSockets === true);
+		requireNativeProof(workerSockets === true);
+		requireNativeProof(guardianSockets === true);
 	}
 	return {
 		stdinPrivateChannelVerified: true,
@@ -871,17 +877,28 @@ export async function runAwsSecretInputNativeProbe(
 			}
 		});
 		await record("worker-admission-before-approval", async () => {
-			native = install("success", {
-				probeWorker: async () =>
-					({
-						...AWS_SECRET_INPUT_CAPABILITY,
-						protocol: "old-worker",
-					}) as unknown as typeof AWS_SECRET_INPUT_CAPABILITY,
-			});
-			const approvals = choices.length;
-			const invocation = await invoke(awsSecretInputLifecycleRequest(root));
-			requireNativeProof(invocation.failed && invocation.code === "CAPABILITY_INCOMPATIBLE");
-			requireNativeProof(choices.length === approvals && runWorkers === 0);
+			const staleDeliveryCapability = {
+				...AWS_SECRET_INPUT_CAPABILITY,
+				capability: "sha256:bac95b8ce6d793c137902275a7fc42ea4970babd0d73788f34e15529750bca12",
+				manifest: {
+					...AWS_SECRET_INPUT_CAPABILITY.manifest,
+					deliveryPolicy: "finite-stdin-owned-process-group/v2",
+				},
+			};
+			for (const capability of [
+				{ ...AWS_SECRET_INPUT_CAPABILITY, protocol: "old-worker" },
+				staleDeliveryCapability,
+				{ ...staleDeliveryCapability, capability: AWS_SECRET_INPUT_CAPABILITY.capability },
+				{ ...staleDeliveryCapability, manifest: AWS_SECRET_INPUT_CAPABILITY.manifest },
+			]) {
+				native = install("success", {
+					probeWorker: async () => capability as unknown as typeof AWS_SECRET_INPUT_CAPABILITY,
+				});
+				const approvals = choices.length;
+				const invocation = await invoke(awsSecretInputLifecycleRequest(root));
+				requireNativeProof(invocation.failed && invocation.code === "CAPABILITY_INCOMPATIBLE");
+				requireNativeProof(choices.length === approvals && runWorkers === 0);
+			}
 		});
 		await record("capability-mismatch-before-approval", async () => {
 			native = install();

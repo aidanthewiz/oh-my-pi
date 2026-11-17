@@ -1,6 +1,7 @@
 import type * as BunFfi from "bun:ffi";
-import { fstatSync, readlinkSync, statSync } from "node:fs";
+import { fstatSync, readlinkSync, readSync, statSync, writeSync } from "node:fs";
 import { createRequire } from "node:module";
+import { Socket } from "node:net";
 import { isatty } from "node:tty";
 
 export interface StdinPrivateChannelEvidence {
@@ -25,6 +26,7 @@ const SOCKET_SYMBOLS = {
 	getsockname: { args: ["i32", "ptr", "ptr"], returns: "i32" },
 	getpeername: { args: ["i32", "ptr", "ptr"], returns: "i32" },
 	getsockopt: { args: ["i32", "i32", "i32", "ptr", "ptr"], returns: "i32" },
+	fcntl: { args: ["i32", "i32", "i32"], returns: "i32" },
 } as const;
 type SocketLibrary = BunFfi.Library<typeof SOCKET_SYMBOLS>;
 type Ffi = typeof BunFfi;
@@ -342,13 +344,42 @@ export function isSupportedFiniteStdinDescriptor(value: unknown): value is Stdin
 	);
 }
 
+function verifyStdinPeer(writer: number, reader: number): boolean {
+	const metadata = openSocketMetadataLibrary();
+	if (!metadata) return false;
+	const { library } = metadata;
+	const flags = library.symbols.fcntl(reader, 3, 0);
+	const nonblocking = process.platform === "darwin" ? 4 : 0x800;
+	const probe = new Uint8Array([0x4f, 0x4d, 0x50, 0x50]);
+	const received = new Uint8Array(probe.byteLength);
+	let verified = false;
+	try {
+		if (flags >= 0 && library.symbols.fcntl(reader, 4, flags | nonblocking) === 0) {
+			verified =
+				writeSync(writer, probe) === probe.byteLength &&
+				readSync(reader, received, 0, received.byteLength, null) === probe.byteLength &&
+				received.every((byte, index) => byte === probe[index]);
+		}
+	} catch {
+		verified = false;
+	} finally {
+		if (flags < 0 || library.symbols.fcntl(reader, 4, flags) !== 0) verified = false;
+		library.close();
+	}
+	return verified;
+}
+
 export interface StdinProducerWitness {
-	origin: "observed-bun-spawn-stdio0";
+	origin: "observed-anonymous-stdin-descriptor";
 	observerPid: number;
 	guardianPid: number;
 	receiverPid: number;
-	stdio0IsUint8Array: boolean;
-	stdio0IsOwnedInput: boolean;
+	stdinPrivateChannel: StdinPrivateChannelEvidence;
+	stdinDev: string | null;
+	stdinIno: string | null;
+	writerDev: string | null;
+	writerIno: string | null;
+	writerPeerVerified: boolean;
 	inputUnmodified: boolean;
 	inputWasEmpty: boolean;
 }
@@ -358,8 +389,12 @@ const PRODUCER_KEYS = [
 	"observerPid",
 	"guardianPid",
 	"receiverPid",
-	"stdio0IsUint8Array",
-	"stdio0IsOwnedInput",
+	"stdinPrivateChannel",
+	"stdinDev",
+	"stdinIno",
+	"writerDev",
+	"writerIno",
+	"writerPeerVerified",
 	"inputUnmodified",
 	"inputWasEmpty",
 ] as const;
@@ -372,9 +407,18 @@ export function isVerifiedStdinProducerWitness(value: unknown): value is StdinPr
 	const fields = plainFields(value, PRODUCER_KEYS);
 	return (
 		fields !== undefined &&
-		fields.origin === "observed-bun-spawn-stdio0" &&
-		fields.stdio0IsUint8Array === true &&
-		fields.stdio0IsOwnedInput === true &&
+		fields.origin === "observed-anonymous-stdin-descriptor" &&
+		isVerifiedStdinPrivateChannelEvidence(fields.stdinPrivateChannel) &&
+		typeof fields.stdinDev === "string" &&
+		typeof fields.stdinIno === "string" &&
+		(process.platform !== "linux" || (fields.stdinDev !== "0" && fields.stdinIno !== "0")) &&
+		typeof fields.writerDev === "string" &&
+		typeof fields.writerIno === "string" &&
+		fields.writerPeerVerified === true &&
+		(process.platform !== "linux" ||
+			(fields.writerDev !== "0" &&
+				fields.writerIno !== "0" &&
+				(fields.writerDev !== fields.stdinDev || fields.writerIno !== fields.stdinIno))) &&
 		fields.inputUnmodified === true &&
 		typeof fields.inputWasEmpty === "boolean" &&
 		processId(fields.observerPid) &&
@@ -389,6 +433,7 @@ export function isVerifiedStdinProducerWitness(value: unknown): value is StdinPr
 export interface StdinProducerWitnessObserver {
 	begin(input: Uint8Array): void;
 	captureSpawn(options: unknown): (guardianPid: number) => void;
+	isPrivateStdinWrite(socket: object, chunk: unknown): boolean;
 	witnessFor(guardianPid: number, receiverPid: number): StdinProducerWitness | undefined;
 	end(): void;
 }
@@ -396,6 +441,9 @@ export interface StdinProducerWitnessObserver {
 export function createStdinProducerWitnessObserver(): StdinProducerWitnessObserver {
 	let ownedInput: Uint8Array | undefined;
 	let snapshot: Uint8Array | undefined;
+	const originalConnect = Socket.prototype.connect;
+	const candidates = new Map<Socket, number>();
+	let writer: Socket | undefined;
 	const observed = new Map<number, Omit<StdinProducerWitness, "receiverPid">>();
 	return {
 		begin(input) {
@@ -403,37 +451,85 @@ export function createStdinProducerWitnessObserver(): StdinProducerWitnessObserv
 				throw new Error("STDIN_PRODUCER_OBSERVER_INVALID_INPUT");
 			snapshot = Uint8Array.from(input);
 			ownedInput = input;
+			Socket.prototype.connect = new Proxy(originalConnect, {
+				apply(target, receiver, args) {
+					const socket = Reflect.apply(target, receiver, args) as Socket;
+					const options = Array.isArray(args[0]) ? args[0][0] : args[0];
+					const fd = plainFields(options)?.fd;
+					if (typeof fd === "number" && isVerifiedStdinPrivateChannelEvidence(inspectStdinPrivateChannel(fd))) {
+						candidates.set(socket, fd);
+					}
+					return socket;
+				},
+			});
 		},
 		captureSpawn(options) {
 			const fields = plainFields(options);
 			const stdio = fields?.stdio;
 			const supplied = Array.isArray(stdio) ? Object.getOwnPropertyDescriptor(stdio, "0")?.value : fields?.stdin;
-			const stdio0IsUint8Array = supplied instanceof Uint8Array;
-			const stdio0IsOwnedInput = ownedInput !== undefined && supplied === ownedInput;
+			const stdinPrivateChannel = inspectStdinPrivateChannel(typeof supplied === "number" ? supplied : -1);
+			let stdinDev: string | null = null;
+			let stdinIno: string | null = null;
+			try {
+				const stat = fstatSync(supplied, { bigint: true });
+				stdinDev = String(stat.dev);
+				stdinIno = String(stat.ino);
+			} catch {}
+			let writerDev: string | null = null;
+			let writerIno: string | null = null;
+			let writerPeerVerified = false;
+			if (typeof supplied === "number" && candidates.size === 1) {
+				const [socket, fd] = candidates.entries().next().value!;
+				writerPeerVerified = verifyStdinPeer(fd, supplied);
+				if (writerPeerVerified) {
+					writer = socket;
+					const stat = fstatSync(fd, { bigint: true });
+					writerDev = String(stat.dev);
+					writerIno = String(stat.ino);
+				}
+			}
+			if (
+				ownedInput !== undefined &&
+				(!writerPeerVerified || !isVerifiedStdinPrivateChannelEvidence(stdinPrivateChannel))
+			)
+				throw new Error("STDIN_PRODUCER_PEER_UNVERIFIED");
 			let inputUnmodified =
-				stdio0IsUint8Array &&
-				stdio0IsOwnedInput &&
-				snapshot !== undefined &&
-				supplied.byteLength === snapshot.byteLength;
+				ownedInput !== undefined && snapshot !== undefined && ownedInput.byteLength === snapshot.byteLength;
 			if (inputUnmodified) {
-				for (let index = 0; index < supplied.byteLength; index++) {
-					if (supplied[index] !== snapshot![index]) {
+				for (let index = 0; index < ownedInput!.byteLength; index++) {
+					if (ownedInput![index] !== snapshot![index]) {
 						inputUnmodified = false;
 						break;
 					}
 				}
 			}
 			const observation: Omit<StdinProducerWitness, "receiverPid" | "guardianPid"> = {
-				origin: "observed-bun-spawn-stdio0",
+				origin: "observed-anonymous-stdin-descriptor",
 				observerPid: process.pid,
-				stdio0IsUint8Array,
-				stdio0IsOwnedInput,
+				stdinPrivateChannel,
+				stdinDev,
+				stdinIno,
+				writerDev,
+				writerIno,
+				writerPeerVerified,
 				inputUnmodified,
-				inputWasEmpty: stdio0IsUint8Array && supplied.byteLength === 0,
+				inputWasEmpty: ownedInput?.byteLength === 0,
 			};
 			return guardianPid => {
 				if (processId(guardianPid)) observed.set(guardianPid, { ...observation, guardianPid });
 			};
+		},
+		isPrivateStdinWrite(socket, chunk) {
+			return (
+				socket === writer &&
+				ownedInput !== undefined &&
+				chunk instanceof Uint8Array &&
+				chunk.buffer === ownedInput.buffer &&
+				chunk.byteLength > 0 &&
+				chunk.byteLength <= 16_384 &&
+				chunk.byteOffset >= ownedInput.byteOffset &&
+				chunk.byteOffset + chunk.byteLength <= ownedInput.byteOffset + ownedInput.byteLength
+			);
 		},
 		witnessFor(guardianPid, receiverPid) {
 			const observation = observed.get(guardianPid);
@@ -445,8 +541,11 @@ export function createStdinProducerWitnessObserver(): StdinProducerWitnessObserv
 				snapshot?.fill(0);
 			} finally {
 				snapshot = undefined;
+				writer = undefined;
+				candidates.clear();
 				ownedInput = undefined;
 				observed.clear();
+				Socket.prototype.connect = originalConnect;
 			}
 		},
 	};
@@ -470,10 +569,9 @@ export function isVerifiedFiniteStdinHandoff(
 		input.eof !== true ||
 		launch.pid !== producer.guardianPid ||
 		launch.receiverPid !== producer.receiverPid ||
-		launch.workerPid !== producer.observerPid
+		launch.workerPid !== producer.observerPid ||
+		(process.platform === "linux" && (input.stdinDev !== producer.stdinDev || input.stdinIno !== producer.stdinIno))
 	)
 		return false;
-	return producer.inputWasEmpty
-		? isSupportedFiniteStdinDescriptor(descriptor)
-		: isLocallyAnonymousStdinChannel(descriptor);
+	return isLocallyAnonymousStdinChannel(descriptor);
 }

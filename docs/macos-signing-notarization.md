@@ -29,9 +29,11 @@ credentials. Calling the script directly without every credential is an error.
      are removed on exit.
 3. Both Darwin matrix legs verify the final strict signature before publishing.
    When all signing credentials exist, they reject an ad-hoc signature.
-4. The `verify_release` job downloads the published arm64 asset, verifies its
-   strict signature, and repeats both launch checks. When signing credentials
-   exist, it also rejects an ad-hoc published signature.
+4. The `verify_release` job uses the same `xcode-27` ARM64 runner as the Darwin
+   ARM64 build. It downloads the published binary and native addon, verifies
+   their checksums, loads the addon, verifies the binary's strict signature,
+   and repeats both launch checks. When signing credentials exist, it also
+   rejects an ad-hoc published signature.
 
 The signing and notarization calls occur only in the explicit Coreforce release
 workflow. They add no end-user telemetry or background network path.

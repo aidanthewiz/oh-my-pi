@@ -31,7 +31,9 @@ JavaScript/Python Eval and naked SDK/direct `.execute(...)` calls reject with `C
 Canonical registered wrappers and nested Write → `xd://aws` calls do not make those unsupported invocations admissible.
 Discover the current fingerprint at runtime; do not reuse one from another host contract.
 Require manifest `hostPolicy:"native-tool-host/v2"`; retain `executionPolicy:"tool-cancellation-cleanup/v1"` and `outputPolicy:"raw-bounded-consumer-output/v1"`.
-Scope, lifecycle, and delivery remain `aws-secret-input-sdk-scope/v2`, `tool-session-lifecycle/v2`, and `finite-stdin-owned-process-group/v2`.
+Scope and lifecycle remain `aws-secret-input-sdk-scope/v2` and `tool-session-lifecycle/v2`.
+Require `deliveryPolicy:"finite-stdin-owned-process-group/v3"` and capability `sha256:4936396a3a935e4582d42be1d73ef096353d23802dcea2394f7e969ffb42a358`.
+Reject older or mixed delivery-policy/fingerprint tuples.
 Native schema and description discovery no longer enumerate AWS profiles; schema and capability discovery read no profile or credential files.
 Use an operator-approved, caller-known operational profile; never infer ambient, default, or model/relay profiles.
 Ordinary explicit-profile execution and the existing commercial MCP profile metadata route remain unchanged.

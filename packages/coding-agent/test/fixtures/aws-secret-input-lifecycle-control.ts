@@ -11,23 +11,29 @@ export interface AwsSecretInputLifecycleDescriptorIdentity {
 }
 export interface AwsSecretInputLifecycleDescriptor extends AwsSecretInputLifecycleDescriptorIdentity {
 	measurable: boolean;
+	aliases: number[];
 }
 
 export function measureAwsSecretInputLifecycleDescriptors(
 	descriptors: readonly AwsSecretInputLifecycleDescriptorIdentity[],
 ): AwsSecretInputLifecycleDescriptor[] {
-	const sockets = new Map<string, number>();
+	const aliases = new Map<string, number[]>();
 	for (const descriptor of descriptors) {
-		if (descriptor.kind !== "socket") continue;
 		const key = `${descriptor.dev}:${descriptor.ino}`;
-		sockets.set(key, (sockets.get(key) ?? 0) + 1);
+		const group = aliases.get(key) ?? [];
+		group.push(descriptor.fd);
+		aliases.set(key, group);
 	}
 	return descriptors.map(descriptor => ({
 		...descriptor,
+		aliases: aliases.get(`${descriptor.dev}:${descriptor.ino}`)!,
 		measurable:
 			descriptor.dev !== "0" &&
 			descriptor.ino !== "0" &&
-			(descriptor.kind !== "socket" || sockets.get(`${descriptor.dev}:${descriptor.ino}`) === 1),
+			(descriptor.kind !== "socket" ||
+				(process.platform === "linux"
+					? descriptor.target === `socket:[${descriptor.ino}]`
+					: aliases.get(`${descriptor.dev}:${descriptor.ino}`)?.length === 1)),
 	}));
 }
 

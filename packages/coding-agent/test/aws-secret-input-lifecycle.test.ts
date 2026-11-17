@@ -5,7 +5,6 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { Process, ProcessStatus } from "@oh-my-pi/pi-natives";
 import {
-	AWS_SECRET_INPUT_CAPABILITY,
 	AwsSecretInputFailure,
 	type AwsSecretInputFailureCode,
 	type AwsSecretInputRequest,
@@ -27,6 +26,8 @@ import {
 } from "./fixtures/aws-secret-input-lifecycle-client";
 import {
 	createAwsSecretInputLifecycleControl,
+	awsSecretInputLifecycleSocketIdentitiesAvailable,
+	measureAwsSecretInputLifecycleDescriptors,
 	type AwsSecretInputLifecycleControl,
 	type AwsSecretInputLifecycleDescriptor,
 	type AwsSecretInputLifecycleEvent,
@@ -262,11 +263,29 @@ async function expectWorkerDone(
 const COMPLETE_COUNTS = { files: 2, clients: 2, identity: 1, secret: 1, consumer: 1, destroyed: 2 };
 const NO_PROVIDER_COUNTS = { files: 0, clients: 0, identity: 0, secret: 0, consumer: 0, destroyed: 0 };
 
+test.skipIf(process.platform !== "linux")(
+	"compares Linux socket endpoint identities without treating descriptor aliases as unknown",
+	() => {
+		const measured = measureAwsSecretInputLifecycleDescriptors([
+			{ fd: 3, dev: "9", ino: "41", target: "socket:[41]", kind: "socket" },
+			{ fd: 7, dev: "9", ino: "41", target: "socket:[41]", kind: "socket" },
+			{ fd: 8, dev: "9", ino: "42", target: "socket:[42]", kind: "socket" },
+			{ fd: 9, dev: "9", ino: "43", target: "socket:[44]", kind: "socket" },
+		]);
+		expect(measured[0]?.aliases).toEqual([3, 7]);
+		expect(measured[1]?.aliases).toEqual([3, 7]);
+		expect(measured[2]?.aliases).toEqual([8]);
+		expect(awsSecretInputLifecycleSocketIdentitiesAvailable(measured.slice(0, 3))).toBe(true);
+		expect(measured[3]?.measurable).toBe(false);
+		expect(awsSecretInputLifecycleSocketIdentitiesAvailable(measured)).toBe(false);
+	},
+);
+
 describe.skipIf(process.platform === "win32")("AWS secret input real worker and process lifecycle", () => {
 	test("private capability probe joins its worker without opening credentials or creating a consumer", async () => {
 		await withBoundary("success", "text", async boundary => {
 			const capability = await boundary.client.probeAwsSecretInputWorker(boundary.controller.signal);
-			expect(capability).toEqual(AWS_SECRET_INPUT_CAPABILITY);
+			expect(capability.capability).toBe("sha256:4936396a3a935e4582d42be1d73ef096353d23802dcea2394f7e969ffb42a358");
 			await expectWorkerDone(boundary, NO_PROVIDER_COUNTS);
 			await expectQuiescent(boundary);
 			expect(boundary.directories[0]?.files).toEqual([]);
@@ -318,6 +337,7 @@ describe.skipIf(process.platform === "win32")("AWS secret input real worker and 
 					expect(spawned.receiverPid).toBe(input.pid);
 					expect(input.parentPid).toBe(spawned.pid);
 					const childFds = input.descriptors as AwsSecretInputLifecycleDescriptor[];
+					expect(spawned.privateFdSnapshotAvailable).toBe(true);
 					if (process.platform === "linux") {
 						expect(spawned.guardianFdSnapshotAvailable).toBe(true);
 						const guardianFds = spawned.guardianDescriptors as AwsSecretInputLifecycleDescriptor[];

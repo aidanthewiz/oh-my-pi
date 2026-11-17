@@ -6,6 +6,7 @@ import type { ExtensionRunner } from "../extensibility/extensions/runner";
 import { ExtensionToolWrapper } from "../extensibility/extensions/wrapper";
 import type { CustomToolResult } from "../extensibility/custom-tools/types";
 import { throwIfAborted } from "../tools/tool-errors";
+import { mcpToolApproval } from "./approval-policy";
 import type { MCPManager } from "./manager";
 import { buildErrorResult, buildResult, createLegacyMCPToolName, createMCPToolName } from "./tool-bridge";
 import type { ExtensionMCPContext } from "./types";
@@ -41,7 +42,7 @@ export function createExtensionMCPContext(
 				formatApprovalDetails: input =>
 					isRecord(input) ? formatArgsInline(input, 1200, { characterBudget: true }) : "Invalid MCP arguments",
 				parameters: { type: "object", properties: {}, additionalProperties: true },
-				approval: "write",
+				approval: mcpToolApproval(serverName),
 				mcpServerName: serverName,
 				mcpToolName: toolName,
 				async execute(_toolCallId, input, _signal, _onUpdate, context) {

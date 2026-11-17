@@ -172,7 +172,7 @@ export const AWS_SECRET_INPUT_MANIFEST = freeze({
 	executionPolicy: "tool-cancellation-cleanup/v1",
 	hostPolicy: "native-tool-host/v2",
 	lifecyclePolicy: "tool-session-lifecycle/v2",
-	deliveryPolicy: "finite-stdin-owned-process-group/v2",
+	deliveryPolicy: "finite-stdin-owned-process-group/v3",
 	outputPolicy: "raw-bounded-consumer-output/v1",
 	sdk: "@aws-sdk/{client-sts,client-secrets-manager,client-sso}@3.1150.0",
 	authPolicy: "read-only-explicit-static-sso/v1",

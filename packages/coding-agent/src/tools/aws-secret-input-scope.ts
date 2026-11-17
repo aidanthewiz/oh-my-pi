@@ -34,7 +34,7 @@ export type {
 } from "./aws-secret-input-provider";
 
 export const AWS_SECRET_INPUT_SCOPE_ID = "aws-secret-input-sdk-scope/v2";
-export const AWS_SECRET_INPUT_DELIVERY_POLICY_ID = "finite-stdin-owned-process-group/v2";
+export const AWS_SECRET_INPUT_DELIVERY_POLICY_ID = "finite-stdin-owned-process-group/v3";
 export const AWS_SECRET_INPUT_OUTPUT_POLICY_ID = "raw-bounded-consumer-output/v1";
 export const AWS_SECRET_INPUT_SCOPE_CONSUMER_ADMISSION_ID = AWS_SECRET_INPUT_CONSUMER_ADMISSION_ID;
 export type AwsSecretInputConsumerAdmission = () => Promise<void>;
