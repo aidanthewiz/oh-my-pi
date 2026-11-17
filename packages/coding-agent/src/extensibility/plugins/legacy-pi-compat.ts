@@ -3005,19 +3005,25 @@ async function importExtensionWithOptions(
 	}
 	const graphContext = graphContextKey === null ? undefined : extensionGraphContexts.get(graphContextKey);
 	if (graphContext) {
-		let activeImports = graphContext.activeDynamicImports.get(importerPath);
-		if (!activeImports) {
-			activeImports = new Set();
-			graphContext.activeDynamicImports.set(importerPath, activeImports);
-		}
-		if (!activeImports.has(nativeSpecifier)) {
+		const preparation = (graphContext.pending ?? Promise.resolve()).then(async () => {
+			let activeImports = graphContext.activeDynamicImports.get(importerPath);
+			if (activeImports?.has(nativeSpecifier)) return;
+			if (!activeImports) {
+				activeImports = new Set();
+				graphContext.activeDynamicImports.set(importerPath, activeImports);
+			}
 			activeImports.add(nativeSpecifier);
-			graphContext.pending = (graphContext.pending ?? Promise.resolve()).then(async () => {
+			try {
 				const pendingSources = await ensureExtensionGraphHook(graphContext.entryRealPath, graphContext);
 				pendingSources?.clear();
-			});
-		}
-		await graphContext.pending;
+			} catch (error) {
+				activeImports.delete(nativeSpecifier);
+				if (activeImports.size === 0) graphContext.activeDynamicImports.delete(importerPath);
+				throw error;
+			}
+		});
+		graphContext.pending = preparation.catch(() => undefined);
+		await preparation;
 	}
 	return load(moduleSpecifier, normalizedOptions);
 }

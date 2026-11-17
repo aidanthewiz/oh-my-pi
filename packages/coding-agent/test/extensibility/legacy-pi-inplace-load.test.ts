@@ -258,6 +258,69 @@ describe("legacy-pi in-place module loading (issue #1674)", () => {
 		expect(secondLeaf.default === firstLeaf.default).toBe(!reload);
 	});
 
+	it.each([
+		["mjs", true],
+		["mjs", false],
+		["cjs", true],
+		["cjs", false],
+	] as const)(
+		"isolates failed %s activation with reload=%s from concurrent siblings and repaired imports",
+		async (extension, reload) => {
+			const helperSource = (value: string) =>
+				`let uses = 0; ${extension === "mjs" ? "export default" : "module.exports ="} { value: ${JSON.stringify(value)}, next: () => ++uses };`;
+			const dir = await writePackage({
+				"package.json": JSON.stringify({ name: "dynamic-import-recovery", type: "module" }),
+				"entry.mjs": ["bad", "good", "stable"]
+					.map(name => `export const ${name} = options => import("./${name}.${extension}", options);`)
+					.join("\n"),
+				[`bad.${extension}`]: helperSource("bad"),
+				[`good.${extension}`]: helperSource("good"),
+				[`stable.${extension}`]: helperSource("stable"),
+			});
+			interface Helper {
+				default: { value: string; next(): number };
+			}
+			interface Loaded {
+				bad(options: unknown): Promise<Helper>;
+				good(options: unknown): Promise<Helper>;
+				stable(options: unknown): Promise<Helper>;
+			}
+			const loaded = (await loadLegacyPiModule(path.join(dir, "entry.mjs"), { reload })) as Loaded;
+			const warm = await loaded.stable({});
+			expect(warm.default.next()).toBe(1);
+
+			const badPath = path.join(dir, `bad.${extension}`);
+			await fs.writeFile(badPath, extension === "mjs" ? "export const = ;" : "module.exports = ;", "utf8");
+			const [failed, sibling, active] = await Promise.allSettled([
+				loaded.bad({}),
+				loaded.good({ with: {} }),
+				loaded.stable({}),
+			]);
+			assert(failed?.status === "rejected");
+			expect(failed.reason).toBeInstanceOf(Error);
+			expect((failed.reason as Error).message).toContain(
+				"Failed to parse extension source for dependency rewriting:",
+			);
+			expect((failed.reason as Error).message).toContain(`bad.${extension}`);
+			assert(sibling?.status === "fulfilled");
+			expect(sibling.value.default.value).toBe("good");
+			expect(sibling.value.default.next()).toBe(1);
+			assert(active?.status === "fulfilled");
+			expect(active.value).toBe(warm);
+			expect(active.value.default.next()).toBe(2);
+			if (!reload) {
+				expect(await loadLegacyPiModule(path.join(dir, "entry.mjs"), { reload })).toBe(loaded);
+			}
+
+			await fs.writeFile(badPath, helperSource("repaired"), "utf8");
+			const repaired = await loaded.bad({});
+			expect(repaired.default.value).toBe("repaired");
+			expect(repaired.default.next()).toBe(1);
+			expect((await loaded.good({})).default.next()).toBe(2);
+			expect((await loaded.stable({})).default.next()).toBe(3);
+		},
+	);
+
 	it("retains mixed, default, value re-export, and side-effect dependency ownership", async () => {
 		const runtimeSource = (value: string) =>
 			[

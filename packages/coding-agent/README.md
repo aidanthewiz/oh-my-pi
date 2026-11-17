@@ -49,6 +49,7 @@ There is no per-origin prompt quota. Default Deny and cancellation do not provid
 Explicit native loader attributes and options retain Bun's loader behavior.
 Dynamic import options are evaluated once to select native or ordinary dependency loading.
 Ordinary dynamic imports retain dependency remapping, module identity, and reload behavior.
+Failed graph preparation remains local to that import; unrelated imports retain their module identity and state.
 A file can provide ordinary module exports and `with { type: "file" }` assets without the compatibility hooks intercepting those assets.
 Literal native file imports support relative paths, package exports and aliases, file URLs, and dynamic import options.
 
