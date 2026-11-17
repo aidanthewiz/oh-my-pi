@@ -1058,8 +1058,9 @@ test.skipIf(process.platform === "win32")(
 			};
 			f.secret.SecretString = WRITABLE_INPUT;
 			const producerObserver = createStdinProducerWitnessObserver();
-			let producerWitness: StdinProducerWitness | undefined;
+			let producerWitness: Promise<StdinProducerWitness | undefined> | undefined;
 			let spawned: { pid: number; receiverPid: number; workerPid: number } | undefined;
+
 			f.dependencies.executeConsumer = async (argv, options) => {
 				if (!(options?.input instanceof Uint8Array)) throw new Error("Expected finite synthetic stdin bytes");
 				producerObserver.begin(options.input);
@@ -1069,15 +1070,18 @@ test.skipIf(process.platform === "win32")(
 					Bun.spawn = new Proxy(originalSpawn, {
 						apply(target, receiver, args) {
 							const bind = producerObserver.captureSpawn(args[1]);
+
 							const child = Reflect.apply(target, receiver, args);
-							bind(child.pid);
-							return child;
+
+							const observedChild = bind(child);
+
+							return observedChild;
 						},
 					});
 					return await ptree.exec(argv, options);
 				} finally {
 					Bun.spawn = originalSpawn;
-					producerObserver.end();
+					await producerObserver.end();
 				}
 			};
 			let starts = 0;
@@ -1094,7 +1098,7 @@ test.skipIf(process.platform === "win32")(
 				stdinPrivateChannel: unknown;
 			};
 			expect(
-				isVerifiedFiniteStdinHandoff(received.stdinPrivateChannel, producerWitness, received, spawned),
+				isVerifiedFiniteStdinHandoff(received.stdinPrivateChannel, await producerWitness, received, spawned),
 				"finite stdin requires exact input through EOF and the actual producer identity",
 			).toBe(true);
 			expect(JSON.parse(await readFile(statePath, "utf8"))).toEqual({ counter: 9, writes: 1 });

@@ -1,3 +1,5 @@
+import { dlopen, FFIType, ptr } from "bun:ffi";
+import { readFileSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -47,6 +49,136 @@ export interface AwsSecretInputWorkerProcessDependencies {
 	spawn?: (command: string[], options: AwsSecretInputWorkerSpawnOptions) => OwnedWorker;
 	beforeDirectoryRemoval?: (directory: string) => void | Promise<void>;
 }
+
+interface OwnedConsumerCreation {
+	readonly pid: number;
+	readonly creation: string;
+}
+
+interface OwnedConsumerIdentity extends OwnedConsumerCreation {
+	readonly parentPid: number;
+	readonly groupId: number;
+	readonly state: "live" | "zombie";
+}
+
+function ownedConsumerIdentity(pid: number): OwnedConsumerIdentity | null {
+	if (process.platform === "linux") {
+		try {
+			const record = readFileSync(`/proc/${pid}/stat`, "utf8");
+			const close = record.lastIndexOf(")");
+			const fields = record
+				.slice(close + 2)
+				.trim()
+				.split(/\s+/u);
+			const parentPid = Number(fields[1]);
+			const groupId = Number(fields[2]);
+			const creation = fields[19];
+			if (
+				!record.startsWith(`${pid} (`) ||
+				close < 0 ||
+				!fields[0] ||
+				!/^[RSDTtWKPIZXx]$/u.test(fields[0]) ||
+				!Number.isSafeInteger(parentPid) ||
+				parentPid < 0 ||
+				!Number.isSafeInteger(groupId) ||
+				groupId <= 0 ||
+				!creation ||
+				!/^[0-9]+$/u.test(creation)
+			)
+				throw new AwsSecretInputFailure("WORKER_FAILED");
+			return { pid, parentPid, groupId, creation, state: /^[ZXx]$/u.test(fields[0]) ? "zombie" : "live" };
+		} catch (error) {
+			if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") return null;
+			throw new AwsSecretInputFailure("WORKER_FAILED");
+		}
+	}
+	if (process.platform !== "darwin") throw new AwsSecretInputFailure("WORKER_FAILED");
+	const library = dlopen("/usr/lib/libproc.dylib", {
+		proc_pidinfo: { args: [FFIType.i32, FFIType.i32, FFIType.u64, FFIType.ptr, FFIType.i32], returns: FFIType.i32 },
+	});
+	try {
+		const data = new Uint8Array(136);
+		if (library.symbols.proc_pidinfo(pid, 3, 1, ptr(data), data.byteLength) !== data.byteLength) {
+			try {
+				process.kill(pid, 0);
+			} catch (error) {
+				if (error && typeof error === "object" && "code" in error && error.code === "ESRCH") return null;
+			}
+			throw new AwsSecretInputFailure("WORKER_FAILED");
+		}
+		const view = new DataView(data.buffer);
+		const parentPid = view.getUint32(16, true);
+		const groupId = view.getUint32(100, true);
+		const status = view.getUint32(4, true);
+		const seconds = view.getBigUint64(120, true);
+		const microseconds = view.getBigUint64(128, true);
+		if (
+			view.getUint32(12, true) !== pid ||
+			groupId <= 0 ||
+			status < 1 ||
+			status > 5 ||
+			seconds === 0n ||
+			microseconds >= 1_000_000n
+		)
+			throw new AwsSecretInputFailure("WORKER_FAILED");
+		return {
+			pid,
+			parentPid,
+			groupId,
+			creation: `${seconds}:${microseconds}`,
+			state: status === 5 ? "zombie" : "live",
+		};
+	} finally {
+		library.close();
+	}
+}
+
+function captureOwnedReceiver(
+	pid: number,
+	guardianPid: number,
+	groupId: number,
+): { anchor?: Process; identity?: OwnedConsumerIdentity } {
+	const before = ownedConsumerIdentity(pid);
+	if (before === null) {
+		if (ownedConsumerIdentity(pid) !== null) throw new AwsSecretInputFailure("UNSAFE_OUTPUT");
+		return {};
+	}
+	const matches = (identity: OwnedConsumerIdentity): boolean =>
+		identity.pid === pid &&
+		identity.creation === before.creation &&
+		identity.parentPid === guardianPid &&
+		identity.groupId === groupId;
+	if (!matches(before)) throw new AwsSecretInputFailure("UNSAFE_OUTPUT");
+	const anchor = Process.fromPid(pid) ?? undefined;
+	const after = ownedConsumerIdentity(pid);
+	if (after === null) return { identity: before };
+	if (!matches(after)) throw new AwsSecretInputFailure("UNSAFE_OUTPUT");
+	if (anchor?.status() === ProcessStatus.Running && anchor.ppid === guardianPid && anchor.groupId() === groupId)
+		return { anchor, identity: before };
+	const terminal = ownedConsumerIdentity(pid);
+	if (terminal === null) return { identity: before };
+	if (!matches(terminal)) throw new AwsSecretInputFailure("UNSAFE_OUTPUT");
+	if (terminal.state !== "zombie" || (anchor && anchor.status() !== ProcessStatus.Exited))
+		throw new AwsSecretInputFailure("WORKER_FAILED");
+	return { anchor, identity: before };
+}
+
+async function waitForOwnedConsumerReaping(owned: readonly OwnedConsumerCreation[]): Promise<boolean> {
+	const pending = new Map(owned.map(identity => [identity.pid, identity.creation]));
+	const deadline = Date.now() + 5_000;
+	while (pending.size > 0) {
+		for (const [pid, creation] of pending) {
+			try {
+				const current = ownedConsumerIdentity(pid);
+				if (current === null || current.creation !== creation) pending.delete(pid);
+			} catch {}
+		}
+		if (pending.size === 0) return true;
+		if (Date.now() >= deadline) return false;
+		await Bun.sleep(5);
+	}
+	return true;
+}
 async function reapOwnedConsumer(anchor: Process): Promise<boolean> {
 	let reaped = true;
 	try {
@@ -63,7 +195,11 @@ async function reapOwnedConsumer(anchor: Process): Promise<boolean> {
 	return reaped;
 }
 
-async function reapOwnedConsumerScope(guardian: Process, receiver: Process | undefined): Promise<boolean> {
+async function reapOwnedConsumerScope(
+	guardian: Process,
+	receiver: Process | undefined,
+	owned: readonly OwnedConsumerCreation[],
+): Promise<boolean> {
 	let reaped = true;
 	let guardianExited = false;
 	try {
@@ -81,6 +217,7 @@ async function reapOwnedConsumerScope(guardian: Process, receiver: Process | und
 		}
 	}
 	if (receiver && (!guardianExited || !(await reapOwnedConsumer(receiver)))) reaped = false;
+	if (!(await waitForOwnedConsumerReaping(owned))) reaped = false;
 	return reaped;
 }
 
@@ -112,6 +249,7 @@ async function workerOperation(
 	let worker: Process | undefined;
 	let consumer: Process | undefined;
 	let receiver: Process | undefined;
+	const consumerCreations: OwnedConsumerCreation[] = [];
 	let settled = false;
 	let compatible = false;
 	let runDispatched = false;
@@ -312,17 +450,41 @@ async function workerOperation(
 						)
 							throw new AwsSecretInputFailure("UNSAFE_OUTPUT");
 						const anchor = Process.fromPid(message.pid);
-						if (!anchor || anchor.ppid !== child.pid || anchor.groupId() !== message.groupId)
-							throw new AwsSecretInputFailure("UNSAFE_OUTPUT");
-						const receiverAnchor =
-							message.receiverPid === null ? undefined : Process.fromPid(message.receiverPid);
 						if (
-							receiverAnchor &&
-							(receiverAnchor.ppid !== anchor.pid || receiverAnchor.groupId() !== message.groupId)
+							!anchor ||
+							anchor.status() !== ProcessStatus.Running ||
+							anchor.ppid !== child.pid ||
+							anchor.groupId() !== message.groupId
 						)
 							throw new AwsSecretInputFailure("UNSAFE_OUTPUT");
 						consumer = anchor;
-						receiver = receiverAnchor ?? undefined;
+						const guardianIdentity = ownedConsumerIdentity(anchor.pid);
+						if (guardianIdentity === null) throw new AwsSecretInputFailure("WORKER_FAILED");
+						if (
+							guardianIdentity.state !== "live" ||
+							guardianIdentity.parentPid !== child.pid ||
+							guardianIdentity.groupId !== message.groupId
+						)
+							throw new AwsSecretInputFailure("UNSAFE_OUTPUT");
+						consumerCreations.push(guardianIdentity);
+						const captured =
+							message.receiverPid === null
+								? undefined
+								: captureOwnedReceiver(message.receiverPid, anchor.pid, message.groupId);
+						const currentGuardian = ownedConsumerIdentity(anchor.pid);
+						if (
+							currentGuardian === null ||
+							currentGuardian.creation !== guardianIdentity.creation ||
+							currentGuardian.state !== "live" ||
+							currentGuardian.parentPid !== child.pid ||
+							currentGuardian.groupId !== message.groupId ||
+							anchor.status() !== ProcessStatus.Running ||
+							anchor.ppid !== child.pid ||
+							anchor.groupId() !== message.groupId
+						)
+							throw new AwsSecretInputFailure("UNSAFE_OUTPUT");
+						receiver = captured?.anchor;
+						if (captured?.identity) consumerCreations.push(captured.identity);
 						consumerStarted = true;
 						send({ type: "consumer-registered" });
 						return;
@@ -381,7 +543,8 @@ async function workerOperation(
 		if (child && !finished) {
 			const exited = await Promise.race([child.exited.then(() => true), Bun.sleep(5_000).then(() => false)]);
 			if (!exited) {
-				if (consumer && !(await reapOwnedConsumerScope(consumer, receiver))) cleanupFailed = true;
+				if (consumer && !(await reapOwnedConsumerScope(consumer, receiver, consumerCreations)))
+					cleanupFailed = true;
 				try {
 					if (worker) {
 						if (!(await worker.terminate({ group: true, gracefulMs: -1, timeoutMs: 5_000 })))
@@ -392,7 +555,7 @@ async function workerOperation(
 				}
 			}
 		}
-		if (consumer && !(await reapOwnedConsumerScope(consumer, receiver))) cleanupFailed = true;
+		if (consumer && !(await reapOwnedConsumerScope(consumer, receiver, consumerCreations))) cleanupFailed = true;
 		if (child) {
 			try {
 				await child.exited;

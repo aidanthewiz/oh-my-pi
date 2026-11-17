@@ -13,7 +13,7 @@ import { OwnedInputSupervisor, type OwnedInputIdentity } from "./ptree-owned-inp
 
 export { OwnedInputError, PTREE_OWNED_INPUT_SUPPORTED } from "./ptree-owned-input";
 
-export const PTREE_EXEC_INPUT_POLICY = "finite-stdin-owned-process-group/v2";
+export const PTREE_EXEC_INPUT_POLICY = "finite-stdin-owned-process-group/v3";
 
 type InMask = "pipe" | "ignore" | Buffer | Uint8Array | null;
 

@@ -1,10 +1,10 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import {
-	type AwsSecretInputLifecycleDescriptorIdentity,
+	awsSecretInputLifecycleProcessIdentity,
 	awsSecretInputLifecycleSocketIdentitiesAvailable,
 	connectAwsSecretInputLifecycleControl,
-	measureAwsSecretInputLifecycleDescriptors,
+	snapshotAwsSecretInputLifecycleDescriptors,
 } from "./aws-secret-input-lifecycle-control";
 import {
 	type AwsSecretInputLifecycleConsumerMode,
@@ -16,30 +16,6 @@ import {
 	lifecycleExpectedInput,
 } from "./aws-secret-input-lifecycle-values";
 import { inspectStdinPrivateChannel, isSupportedFiniteStdinDescriptor } from "./aws-secret-input-stdin-metadata";
-
-function descriptors() {
-	const directory = process.platform === "linux" ? "/proc/self/fd" : "/dev/fd";
-	const result: AwsSecretInputLifecycleDescriptorIdentity[] = [];
-	for (const name of fs.readdirSync(directory)) {
-		const fd = Number(name);
-		if (!Number.isSafeInteger(fd) || fd < 3) continue;
-		try {
-			const stat = fs.fstatSync(fd, { bigint: true });
-			let target = "";
-			try {
-				target = fs.readlinkSync(path.join(directory, name));
-			} catch {}
-			result.push({
-				fd,
-				dev: String(stat.dev),
-				ino: String(stat.ino),
-				target,
-				kind: stat.isSocket() ? "socket" : stat.isFIFO() ? "pipe" : stat.isFile() ? "file" : "other",
-			});
-		} catch {}
-	}
-	return measureAwsSecretInputLifecycleDescriptors(result);
-}
 
 async function runConsumer() {
 	if (process.argv[2] === "--descendant") {
@@ -54,8 +30,10 @@ async function runConsumer() {
 	const control = port ? await connectAwsSecretInputLifecycleControl(port, "consumer") : undefined;
 	let descendant: Bun.Subprocess<"ignore", "pipe", "inherit"> | undefined;
 	try {
+		const processIdentity = awsSecretInputLifecycleProcessIdentity(process.pid);
+		if (!processIdentity || processIdentity.state !== "live") throw new Error(LIFECYCLE_FAILURE);
 		if (mode === "early-exit") {
-			control?.send({ kind: "consumer-early-exit", pid: process.pid });
+			control?.send({ kind: "consumer-early-exit", pid: process.pid, processIdentity });
 			await Bun.write(Bun.stderr, "public consumer refused input\n");
 			process.exitCode = 23;
 			return;
@@ -73,12 +51,19 @@ async function runConsumer() {
 				"code" in error &&
 				["ENXIO", "ENODEV", "ENOENT"].includes(String(error.code));
 		}
+		if (mode === "input-paused") {
+			if (!control) throw new Error(LIFECYCLE_FAILURE);
+			control.send({ kind: "stdin-read-gated", pid: process.pid, processIdentity });
+			await control.waitForCommand("read-input");
+		}
 		const input = await new Response(Bun.stdin.stream()).bytes();
 		const expected = lifecycleExpectedInput(mode);
 		const exactInput = Buffer.from(input).equals(Buffer.from(expected));
-		const inheritedDescriptors = descriptors();
+		const descriptorSnapshot = snapshotAwsSecretInputLifecycleDescriptors();
+		const inheritedDescriptors = descriptorSnapshot.descriptors;
 		const receipt = {
 			kind: "input-complete",
+			processIdentity,
 			pid: process.pid,
 			parentPid: process.ppid,
 			exactInput,
@@ -95,6 +80,7 @@ async function runConsumer() {
 				descriptor.target.endsWith("aws-secret-input-lifecycle-control-fd"),
 			),
 			descriptors: inheritedDescriptors,
+			fdSnapshotAvailable: descriptorSnapshot.available,
 			socketIdentitiesAvailable: awsSecretInputLifecycleSocketIdentitiesAvailable(inheritedDescriptors),
 			argvClean: !lifecycleContainsSensitive(process.argv),
 			envClean: !lifecycleContainsSensitive(process.env),
@@ -153,6 +139,8 @@ async function runConsumer() {
 				pid: process.pid,
 				parentPid: process.ppid,
 				descendantPid: descendant.pid,
+				processIdentity,
+				descendantIdentity: awsSecretInputLifecycleProcessIdentity(descendant.pid),
 				committed: mode === "commit-hold",
 			});
 			if (mode === "exit-with-descendant") {

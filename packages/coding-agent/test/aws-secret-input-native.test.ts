@@ -1,7 +1,9 @@
 import { expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
+import { createRequire } from "node:module";
 import * as os from "node:os";
 import * as path from "node:path";
+import { compileCodingAgent } from "../scripts/compile-binary";
 import { createAwsSecretInputNativeGuardLauncher } from "./fixtures/aws-secret-input-native-dcg";
 import {
 	isLocallyAnonymousStdinChannel,
@@ -74,7 +76,7 @@ function safeReceipt(value: unknown): boolean {
 	if (
 		!isSupportedFiniteStdinDescriptor(stdinPrivateChannel) ||
 		!isVerifiedStdinProducerWitness(stdinProducerWitness) ||
-		(!stdinProducerWitness.inputWasEmpty && !isLocallyAnonymousStdinChannel(stdinPrivateChannel))
+		!isLocallyAnonymousStdinChannel(stdinPrivateChannel)
 	)
 		return false;
 	if (typeof receipt.workerSocketIdentitiesCompared !== "boolean") return false;
@@ -111,82 +113,114 @@ function safeReceipt(value: unknown): boolean {
 	});
 }
 
-test.skipIf(process.platform === "win32")(
-	"native Write xd://aws preserves admission, immutable approval, guards, and real stdin delivery",
-	async () => {
-		const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "aws-secret-input-native-")));
-		try {
-			const guardPath = path.join(root, "native-dcg");
-			const guard = createAwsSecretInputNativeGuardLauncher(root);
-			await fs.writeFile(guardPath, guard, { mode: 0o755 });
-			const policyPath = path.join(root, "dcg.toml");
-			const policy = '[packs]\nenabled = ["fixture_aws_secret_input"]\n';
-			await fs.writeFile(policyPath, policy);
-			const child = Bun.spawn(
-				[
-					process.execPath,
-					"--no-env-file",
-					"--no-install",
-					path.resolve(import.meta.dir, "fixtures/aws-secret-input-native.ts"),
-					root,
-				],
-				{
-					cwd: root,
-					env: {
-						HOME: root,
-						USERPROFILE: root,
-						TMPDIR: root,
-						TMP: root,
-						TEMP: root,
-						XDG_CONFIG_HOME: root,
-						XDG_CACHE_HOME: root,
-						XDG_DATA_HOME: root,
-						OMP_DOTENV_OVERRIDE: "1",
-						OMP_CF_PRODUCT_VERSION: "fixture",
-						BUN_RUNTIME_TRANSPILER_CACHE_PATH: "0",
-						DO_NOT_TRACK: "1",
-						OMP_DCG_PATH: guardPath,
-						OMP_DCG_VERSION: "fixture",
-						OMP_DCG_BINARY_SHA256: new Bun.CryptoHasher("sha256").update(guard).digest("hex"),
-						OMP_DCG_CONFIG: policyPath,
-						OMP_DCG_CONFIG_SHA256: new Bun.CryptoHasher("sha256").update(policy).digest("hex"),
-						...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}),
-					},
-					stdin: "ignore",
-					stdout: "pipe",
-					stderr: "pipe",
-					signal: AbortSignal.timeout(150_000),
-				},
-			);
+async function compileSyntheticWorker(entry: string, outfile: string): Promise<void> {
+	const transformers = createRequire(import.meta.url)("@huggingface/transformers/package.json") as { version: string };
+	await compileCodingAgent({
+		repoRoot: path.resolve(import.meta.dir, "../../.."),
+		entrypoint: path.resolve(import.meta.dir, "fixtures", entry),
+		outfile,
+		transformersVersion: transformers.version,
+		native: { platform: process.platform, arch: process.arch },
+	});
+}
+
+for (const mode of ["source", "compiled"] as const) {
+	test.skipIf(process.platform === "win32")(
+		`native Write xd://aws preserves admission, immutable approval, guards, and real stdin delivery (${mode} worker)`,
+		async () => {
+			const workspace = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "aws-secret-input-native-")));
+			const root = path.join(workspace, "runtime");
 			try {
-				const [stdout, stderr, exit] = await Promise.all([
-					capture(child.stdout, 32_768),
-					capture(child.stderr, 16_384),
-					child.exited,
-				]);
-				let receipt: unknown;
+				await fs.mkdir(root);
+				let compiledWorker: string | undefined;
+				let compiledMalformedWorker: string | undefined;
+				if (mode === "compiled") {
+					const buildRoot = path.join(workspace, "compiled");
+					await fs.mkdir(buildRoot);
+					compiledWorker = path.join(buildRoot, "worker");
+					compiledMalformedWorker = path.join(buildRoot, "malformed-worker");
+					await compileSyntheticWorker("aws-secret-input-lifecycle-worker.ts", compiledWorker);
+					await compileSyntheticWorker("aws-secret-input-lifecycle-malformed-worker.ts", compiledMalformedWorker);
+				}
+				const guardPath = path.join(root, "native-dcg");
+				const guard = createAwsSecretInputNativeGuardLauncher(root);
+				await fs.writeFile(guardPath, guard, { mode: 0o755 });
+				const policyPath = path.join(root, "dcg.toml");
+				const policy = '[packs]\nenabled = ["fixture_aws_secret_input"]\n';
+				await fs.writeFile(policyPath, policy);
+				const child = Bun.spawn(
+					[
+						process.execPath,
+						"--no-env-file",
+						"--no-install",
+						path.resolve(import.meta.dir, "fixtures/aws-secret-input-native.ts"),
+						root,
+					],
+					{
+						cwd: root,
+						env: {
+							HOME: root,
+							USERPROFILE: root,
+							TMPDIR: root,
+							TMP: root,
+							TEMP: root,
+							XDG_CONFIG_HOME: root,
+							XDG_CACHE_HOME: root,
+							XDG_DATA_HOME: root,
+							OMP_DOTENV_OVERRIDE: "1",
+							OMP_CF_PRODUCT_VERSION: "fixture",
+							BUN_RUNTIME_TRANSPILER_CACHE_PATH: "0",
+							DO_NOT_TRACK: "1",
+							OMP_DCG_PATH: guardPath,
+							OMP_DCG_VERSION: "fixture",
+							OMP_DCG_BINARY_SHA256: new Bun.CryptoHasher("sha256").update(guard).digest("hex"),
+							OMP_DCG_CONFIG: policyPath,
+							OMP_DCG_CONFIG_SHA256: new Bun.CryptoHasher("sha256").update(policy).digest("hex"),
+							PI_TEST_AWS_SECRET_INPUT_WORKER_BINARY: compiledWorker,
+							PI_TEST_AWS_SECRET_INPUT_MALFORMED_WORKER_BINARY: compiledMalformedWorker,
+							...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}),
+						},
+						stdin: "ignore",
+						stdout: "pipe",
+						stderr: "pipe",
+						signal: AbortSignal.timeout(150_000),
+					},
+				);
 				try {
-					receipt = JSON.parse(stdout.text);
-				} catch {}
-				const failure = receipt && typeof receipt === "object" ? (receipt as Record<string, unknown>) : undefined;
-				const failedCase =
-					failure?.schema === "aws-secret-input-native-failure/v1"
-						? ["setup", ...CASES].find(name => name === failure.case)
-						: undefined;
-				expect(
-					exit === 0,
-					`Native secret-input fixture failed; case=${failedCase ?? "startup"}; diagnostics are withheld`,
-				).toBe(true);
-				expect(stdout.overflow || stderr.overflow, "Fixture diagnostics exceeded their public bounds").toBe(false);
-				expect(stderr.text === "", "Fixture stderr is withheld").toBe(true);
-				expect(safeReceipt(receipt), "Native secret-input evidence is incomplete; receipt is withheld").toBe(true);
+					const [stdout, stderr, exit] = await Promise.all([
+						capture(child.stdout, 32_768),
+						capture(child.stderr, 16_384),
+						child.exited,
+					]);
+					let receipt: unknown;
+					try {
+						receipt = JSON.parse(stdout.text);
+					} catch {}
+					const failure =
+						receipt && typeof receipt === "object" ? (receipt as Record<string, unknown>) : undefined;
+					const failedCase =
+						failure?.schema === "aws-secret-input-native-failure/v1"
+							? ["setup", ...CASES].find(name => name === failure.case)
+							: undefined;
+					expect(
+						exit === 0,
+						`Native secret-input fixture failed; case=${failedCase ?? "startup"}; diagnostics are withheld`,
+					).toBe(true);
+					expect(stdout.overflow || stderr.overflow, "Fixture diagnostics exceeded their public bounds").toBe(
+						false,
+					);
+					expect(stderr.text === "", "Fixture stderr is withheld").toBe(true);
+					expect(safeReceipt(receipt), "Native secret-input evidence is incomplete; receipt is withheld").toBe(
+						true,
+					);
+				} finally {
+					if (child.exitCode === null) child.kill("SIGKILL");
+					await child.exited;
+				}
 			} finally {
-				if (child.exitCode === null) child.kill("SIGKILL");
-				await child.exited;
+				await fs.rm(workspace, { recursive: true, force: true });
 			}
-		} finally {
-			await fs.rm(root, { recursive: true, force: true });
-		}
-	},
-	160_000,
-);
+		},
+		mode === "compiled" ? 300_000 : 160_000,
+	);
+}

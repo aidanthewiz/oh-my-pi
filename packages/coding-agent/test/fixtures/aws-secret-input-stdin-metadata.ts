@@ -1,5 +1,5 @@
 import type * as BunFfi from "bun:ffi";
-import { fstatSync, readlinkSync, statSync } from "node:fs";
+import { closeSync, fstatSync, readlinkSync, statSync } from "node:fs";
 import { createRequire } from "node:module";
 import { isatty } from "node:tty";
 
@@ -343,14 +343,20 @@ export function isSupportedFiniteStdinDescriptor(value: unknown): value is Stdin
 }
 
 export interface StdinProducerWitness {
-	origin: "observed-bun-spawn-stdio0";
+	origin: "observed-anonymous-stdin-writes";
 	observerPid: number;
 	guardianPid: number;
 	receiverPid: number;
-	stdio0IsUint8Array: boolean;
-	stdio0IsOwnedInput: boolean;
+	pipeConfigured: boolean;
 	inputUnmodified: boolean;
 	inputWasEmpty: boolean;
+	exactWrites: boolean;
+	bytesAccepted: number;
+	maxChunkBytes: number;
+	flushesCompleted: boolean;
+	eofClosed: boolean;
+	writeFailed: boolean;
+	backpressureObserved: boolean;
 }
 
 const PRODUCER_KEYS = [
@@ -358,10 +364,16 @@ const PRODUCER_KEYS = [
 	"observerPid",
 	"guardianPid",
 	"receiverPid",
-	"stdio0IsUint8Array",
-	"stdio0IsOwnedInput",
+	"pipeConfigured",
 	"inputUnmodified",
 	"inputWasEmpty",
+	"exactWrites",
+	"bytesAccepted",
+	"maxChunkBytes",
+	"flushesCompleted",
+	"eofClosed",
+	"writeFailed",
+	"backpressureObserved",
 ] as const;
 
 function processId(value: unknown): value is number {
@@ -372,11 +384,24 @@ export function isVerifiedStdinProducerWitness(value: unknown): value is StdinPr
 	const fields = plainFields(value, PRODUCER_KEYS);
 	return (
 		fields !== undefined &&
-		fields.origin === "observed-bun-spawn-stdio0" &&
-		fields.stdio0IsUint8Array === true &&
-		fields.stdio0IsOwnedInput === true &&
+		fields.origin === "observed-anonymous-stdin-writes" &&
+		fields.pipeConfigured === true &&
 		fields.inputUnmodified === true &&
+		fields.exactWrites === true &&
+		fields.flushesCompleted === true &&
+		fields.eofClosed === true &&
+		fields.writeFailed === false &&
+		typeof fields.backpressureObserved === "boolean" &&
 		typeof fields.inputWasEmpty === "boolean" &&
+		Number.isSafeInteger(fields.bytesAccepted) &&
+		(fields.bytesAccepted as number) >= 0 &&
+		(fields.inputWasEmpty ? fields.bytesAccepted === 0 : (fields.bytesAccepted as number) > 0) &&
+		Number.isSafeInteger(fields.maxChunkBytes) &&
+		(fields.inputWasEmpty
+			? fields.maxChunkBytes === 0
+			: (fields.maxChunkBytes as number) > 0 &&
+				(fields.maxChunkBytes as number) <= (fields.bytesAccepted as number)) &&
+		(fields.maxChunkBytes as number) <= 4096 &&
 		processId(fields.observerPid) &&
 		processId(fields.guardianPid) &&
 		processId(fields.receiverPid) &&
@@ -386,66 +411,454 @@ export function isVerifiedStdinProducerWitness(value: unknown): value is StdinPr
 	);
 }
 
+interface PendingStdinOperation {
+	guardianPid: number;
+	id: number;
+	operation: "write" | "flush";
+	bytesAccepted: number;
+}
+
+interface StdinObserverOptions {
+	constrainBuffer?: boolean;
+	onPending?(operation: PendingStdinOperation): void;
+	onStressChannel?(evidence: {
+		guardianPid: number;
+		transport: "fixture-socketpair";
+		sendBufferBytes: number;
+		channel: StdinPrivateChannelEvidence;
+	}): void;
+	onStressClosed?(evidence: { guardianPid: number; readerClosed: boolean; writerClosed: boolean }): void;
+}
+
+function descriptorIsClosed(fd: number): boolean {
+	try {
+		fstatSync(fd);
+		return false;
+	} catch (error) {
+		return !!error && typeof error === "object" && "code" in error && error.code === "EBADF";
+	}
+}
+
+function fixtureSocketIdentity(fd: number): string {
+	const stat = fstatSync(fd, { bigint: true });
+	if (!stat.isSocket()) throw new Error("STDIN_STRESS_OWNERSHIP_LOST");
+	if (process.platform === "linux") {
+		if (stat.ino <= 0n || readlinkSync(`/proc/self/fd/${fd}`) !== `socket:[${stat.ino}]`)
+			throw new Error("STDIN_STRESS_METADATA_UNAVAILABLE");
+		return `linux:${stat.dev}:${stat.ino}`;
+	}
+	if (process.platform !== "darwin") throw new Error("STDIN_STRESS_METADATA_UNAVAILABLE");
+	const ffi = loadBuiltin("bun:ffi") as Ffi;
+	const library = ffi.dlopen("/usr/lib/libproc.dylib", {
+		proc_pidfdinfo: { args: ["i32", "i32", "i32", "ptr", "i32"], returns: "i32" },
+	} as const);
+	try {
+		const buffer = new Uint8Array(4096);
+		const written = library.symbols.proc_pidfdinfo(process.pid, fd, 3, ffi.ptr(buffer), buffer.byteLength);
+		if (written < 188 || written > buffer.byteLength) throw new Error("STDIN_STRESS_METADATA_UNAVAILABLE");
+		const view = new DataView(buffer.buffer);
+		// socket_fdinfo starts with 24-byte proc_fileinfo and 136-byte vinfo_stat.
+		const socket = view.getBigUint64(160, true);
+		const pcb = view.getBigUint64(168, true);
+		if (socket === 0n || pcb === 0n || view.getInt32(176, true) !== 1 || view.getInt32(184, true) !== 1)
+			throw new Error("STDIN_STRESS_METADATA_UNAVAILABLE");
+		return `darwin:${socket}:${pcb}`;
+	} finally {
+		library.close();
+	}
+}
+
+function closeFixtureSocket(fd: number, identity: string): void {
+	let current: string;
+	try {
+		current = fixtureSocketIdentity(fd);
+	} catch (error) {
+		if (descriptorIsClosed(fd)) return;
+		throw error;
+	}
+	if (current !== identity) throw new Error("STDIN_STRESS_OWNERSHIP_LOST");
+	closeSync(fd);
+}
+
+function constrainedStdinSocketpair() {
+	const ffi = loadBuiltin("bun:ffi") as Ffi;
+	const symbols = {
+		socketpair: { args: ["i32", "i32", "i32", "ptr"], returns: "i32" },
+		setsockopt: { args: ["i32", "i32", "i32", "ptr", "i32"], returns: "i32" },
+		getsockopt: SOCKET_SYMBOLS.getsockopt,
+		fcntl: { args: ["i32", "i32", "i32"], returns: "i32" },
+	} as const;
+	let library: BunFfi.Library<typeof symbols> | undefined;
+	for (const filename of process.platform === "darwin" ? ["/usr/lib/libSystem.B.dylib"] : ["libc.so.6", "libc.so"]) {
+		try {
+			library = ffi.dlopen(filename, symbols);
+			break;
+		} catch {}
+	}
+	if (!library) throw new Error("STDIN_STRESS_METADATA_UNAVAILABLE");
+	const descriptors = new Int32Array([-1, -1]);
+	let readerOpen = false;
+	let writerOwned = false;
+	try {
+		if (library.symbols.socketpair(1, 1, 0, ffi.ptr(descriptors)) !== 0)
+			throw new Error("STDIN_STRESS_METADATA_UNAVAILABLE");
+		readerOpen = descriptors[0]! >= 0;
+		writerOwned = descriptors[1]! >= 0 && descriptors[0] !== descriptors[1];
+		if (descriptors[0]! <= 2 || descriptors[1]! <= 2 || descriptors[0] === descriptors[1])
+			throw new Error("STDIN_STRESS_METADATA_UNAVAILABLE");
+		for (const fd of descriptors) {
+			const flags = library.symbols.fcntl(fd, 1, 0);
+			if (flags < 0 || library.symbols.fcntl(fd, 2, flags | 1) !== 0)
+				throw new Error("STDIN_STRESS_METADATA_UNAVAILABLE");
+		}
+		const writerFd = descriptors[1]!;
+		const flags = library.symbols.fcntl(writerFd, 3, 0);
+		if (flags < 0 || library.symbols.fcntl(writerFd, 4, flags | (process.platform === "darwin" ? 4 : 2048)) !== 0)
+			throw new Error("STDIN_STRESS_METADATA_UNAVAILABLE");
+		const level = process.platform === "darwin" ? 0xffff : 1;
+		const option = process.platform === "darwin" ? 0x1001 : 7;
+		const capacity = new Int32Array([4096]);
+		const length = new Uint32Array([capacity.byteLength]);
+		if (
+			library.symbols.setsockopt(writerFd, level, option, ffi.ptr(capacity), capacity.byteLength) !== 0 ||
+			library.symbols.getsockopt(writerFd, level, option, ffi.ptr(capacity), ffi.ptr(length)) !== 0 ||
+			length[0] !== capacity.byteLength ||
+			capacity[0]! <= 0 ||
+			capacity[0]! >= 65_536
+		)
+			throw new Error("STDIN_STRESS_METADATA_UNAVAILABLE");
+		const channel = inspectStdinPrivateChannel(writerFd);
+		if (!isVerifiedStdinPrivateChannelEvidence(channel)) throw new Error("STDIN_STRESS_METADATA_UNAVAILABLE");
+		const readerFd = descriptors[0]!;
+		const readerIdentity = fixtureSocketIdentity(readerFd);
+		const writerIdentity = fixtureSocketIdentity(writerFd);
+		const closeReader = () => {
+			if (!readerOpen) return;
+			closeFixtureSocket(readerFd, readerIdentity);
+			readerOpen = false;
+		};
+		const closeWriter = () => {
+			if (!writerOwned) return;
+			closeFixtureSocket(writerFd, writerIdentity);
+			writerOwned = false;
+		};
+		const writer = Bun.file(writerFd).writer({ highWaterMark: 16_384 });
+		let endStarted = false;
+		let endResult: number | Promise<number> | undefined;
+		let endFailed = false;
+		let endFailure: unknown;
+		const endWriter: Bun.FileSink["end"] = error => {
+			if (endStarted) {
+				if (endFailed) throw endFailure;
+				return endResult!;
+			}
+			endStarted = true;
+			try {
+				const result = writer.end(error);
+				if (typeof result === "number") {
+					closeWriter();
+					endResult = result;
+				} else {
+					endResult = result.then(
+						bytes => {
+							closeWriter();
+							return bytes;
+						},
+						error => {
+							closeWriter();
+							throw error;
+						},
+					);
+					void endResult.catch(() => {});
+				}
+				return endResult;
+			} catch (error) {
+				try {
+					closeWriter();
+				} catch (closeError) {
+					error = closeError;
+				}
+				endFailed = true;
+				endFailure = error;
+				throw error;
+			}
+		};
+		return {
+			readerFd,
+			writer,
+			channel,
+			sendBufferBytes: capacity[0]!,
+			closeReader,
+			endWriter,
+			readerClosed: () => !readerOpen,
+			writerClosed: () => !writerOwned,
+		};
+	} catch (error) {
+		if (readerOpen) closeSync(descriptors[0]!);
+		if (writerOwned) closeSync(descriptors[1]!);
+		throw error;
+	} finally {
+		library.close();
+	}
+}
+
 export interface StdinProducerWitnessObserver {
-	begin(input: Uint8Array): void;
-	captureSpawn(options: unknown): (guardianPid: number) => void;
-	witnessFor(guardianPid: number, receiverPid: number): StdinProducerWitness | undefined;
-	end(): void;
+	begin(input: Uint8Array, options?: StdinObserverOptions): void;
+	captureSpawn(options: unknown): <T extends { pid: number; stdin: unknown }>(guardian: T) => T;
+	witnessFor(guardianPid: number, receiverPid: number): Promise<StdinProducerWitness | undefined>;
+	pendingFor(guardianPid: number): PendingStdinOperation | undefined;
+	end(): Promise<void>;
 }
 
 export function createStdinProducerWitnessObserver(): StdinProducerWitnessObserver {
 	let ownedInput: Uint8Array | undefined;
 	let snapshot: Uint8Array | undefined;
-	const observed = new Map<number, Omit<StdinProducerWitness, "receiverPid">>();
+	let configuration: StdinObserverOptions | undefined;
+	let stress: ReturnType<typeof constrainedStdinSocketpair> | undefined;
+	type Observation = Omit<StdinProducerWitness, "receiverPid">;
+	const observed = new Map<
+		number,
+		{
+			promise: Promise<Observation>;
+			finish(): void;
+			pending?: PendingStdinOperation;
+		}
+	>();
 	return {
-		begin(input) {
+		begin(input, options) {
 			if (!(input instanceof Uint8Array) || ownedInput !== undefined)
 				throw new Error("STDIN_PRODUCER_OBSERVER_INVALID_INPUT");
 			snapshot = Uint8Array.from(input);
 			ownedInput = input;
+			configuration = options;
 		},
 		captureSpawn(options) {
 			const fields = plainFields(options);
 			const stdio = fields?.stdio;
-			const supplied = Array.isArray(stdio) ? Object.getOwnPropertyDescriptor(stdio, "0")?.value : fields?.stdin;
-			const stdio0IsUint8Array = supplied instanceof Uint8Array;
-			const stdio0IsOwnedInput = ownedInput !== undefined && supplied === ownedInput;
-			let inputUnmodified =
-				stdio0IsUint8Array &&
-				stdio0IsOwnedInput &&
-				snapshot !== undefined &&
-				supplied.byteLength === snapshot.byteLength;
-			if (inputUnmodified) {
-				for (let index = 0; index < supplied.byteLength; index++) {
-					if (supplied[index] !== snapshot![index]) {
-						inputUnmodified = false;
-						break;
+			let supplied = Array.isArray(stdio) ? Object.getOwnPropertyDescriptor(stdio, "0")?.value : fields?.stdin;
+			const input = ownedInput;
+			const expected = snapshot;
+			if (input && expected && configuration?.constrainBuffer) {
+				if (!Array.isArray(stdio) || supplied !== "pipe" || stress) throw new Error("STDIN_STRESS_INVALID_SPAWN");
+				stress = constrainedStdinSocketpair();
+				stdio[0] = stress.readerFd;
+				supplied = stress.readerFd;
+			}
+			return guardian => {
+				if (!input || !expected || !processId(guardian.pid)) return guardian;
+				const { promise, resolve } = Promise.withResolvers<Observation>();
+				let offset = 0;
+				let pending = 0;
+				let finished = false;
+				let operationId = 0;
+				const observation: Observation = {
+					origin: "observed-anonymous-stdin-writes",
+					observerPid: process.pid,
+					guardianPid: guardian.pid,
+					pipeConfigured: supplied === "pipe",
+					inputUnmodified: true,
+					inputWasEmpty: expected.byteLength === 0,
+					exactWrites: true,
+					bytesAccepted: 0,
+					maxChunkBytes: 0,
+					flushesCompleted: false,
+					eofClosed: false,
+					writeFailed: false,
+					backpressureObserved: false,
+				};
+				const finish = () => {
+					if (finished) return;
+					finished = true;
+					observation.inputUnmodified =
+						input.byteLength === expected.byteLength && input.every((byte, index) => byte === expected[index]);
+					observation.exactWrites &&= offset === expected.byteLength;
+					observation.flushesCompleted = pending === 0;
+					resolve({ ...observation });
+				};
+				const record = { promise, finish, pending: undefined as PendingStdinOperation | undefined };
+				observed.set(guardian.pid, record);
+				const stressChannel = stress;
+				const writer = stressChannel?.writer ?? (guardian.stdin as Bun.FileSink | undefined);
+				if (stressChannel) {
+					try {
+						stressChannel.closeReader();
+						configuration?.onStressChannel?.({
+							guardianPid: guardian.pid,
+							transport: "fixture-socketpair",
+							sendBufferBytes: stressChannel.sendBufferBytes,
+							channel: stressChannel.channel,
+						});
+					} catch {
+						observation.writeFailed = true;
 					}
 				}
-			}
-			const observation: Omit<StdinProducerWitness, "receiverPid" | "guardianPid"> = {
-				origin: "observed-bun-spawn-stdio0",
-				observerPid: process.pid,
-				stdio0IsUint8Array,
-				stdio0IsOwnedInput,
-				inputUnmodified,
-				inputWasEmpty: stdio0IsUint8Array && supplied.byteLength === 0,
-			};
-			return guardianPid => {
-				if (processId(guardianPid)) observed.set(guardianPid, { ...observation, guardianPid });
+				if (!writer || typeof writer !== "object" || typeof writer.write !== "function") {
+					observation.writeFailed = true;
+					finish();
+					return guardian;
+				}
+				const originalWrite = writer.write.bind(writer);
+				const originalFlush = writer.flush.bind(writer);
+				const originalEnd = stressChannel ? stressChannel.endWriter : writer.end.bind(writer);
+				const completed = (
+					value: number | Promise<number>,
+					accept: (bytes: number) => void,
+					operation?: "write" | "flush",
+				) => {
+					if (typeof value === "number") {
+						accept(value);
+						return value;
+					}
+					observation.backpressureObserved = true;
+					pending++;
+					const id = ++operationId;
+					if (operation) {
+						record.pending = {
+							guardianPid: guardian.pid,
+							id,
+							operation,
+							bytesAccepted: observation.bytesAccepted,
+						};
+						try {
+							configuration?.onPending?.({ ...record.pending });
+						} catch {
+							observation.writeFailed = true;
+						}
+					}
+					return value.then(
+						bytes => {
+							pending--;
+							if (record.pending?.id === id) record.pending = undefined;
+							accept(bytes);
+							return bytes;
+						},
+						error => {
+							pending--;
+							if (record.pending?.id === id) record.pending = undefined;
+							observation.writeFailed = true;
+							throw error;
+						},
+					);
+				};
+				const observedWrite: Bun.FileSink["write"] = chunk => {
+					if (!(chunk instanceof Uint8Array) || pending !== 0) observation.exactWrites = false;
+					if (chunk instanceof Uint8Array) {
+						observation.maxChunkBytes = Math.max(observation.maxChunkBytes, chunk.byteLength);
+						for (const byte of chunk) {
+							if (byte !== expected[offset]) observation.exactWrites = false;
+							offset++;
+						}
+					}
+					try {
+						return completed(
+							originalWrite(chunk),
+							bytes => {
+								observation.bytesAccepted += bytes;
+							},
+							"write",
+						);
+					} catch (error) {
+						observation.writeFailed = true;
+						throw error;
+					}
+				};
+				const observedFlush: Bun.FileSink["flush"] = () => {
+					try {
+						return completed(originalFlush(), () => {}, "flush");
+					} catch (error) {
+						observation.writeFailed = true;
+						throw error;
+					}
+				};
+				const closeObserved = () => {
+					if (stressChannel) {
+						try {
+							configuration?.onStressClosed?.({
+								guardianPid: guardian.pid,
+								readerClosed: stressChannel.readerClosed(),
+								writerClosed: stressChannel.writerClosed(),
+							});
+						} catch {
+							observation.writeFailed = true;
+						}
+					}
+					finish();
+				};
+				const observedEnd: Bun.FileSink["end"] = error => {
+					try {
+						const result = completed(originalEnd(error), () => {
+							observation.eofClosed = true;
+						});
+						if (typeof result === "number") {
+							closeObserved();
+							return result;
+						}
+						return result.then(
+							bytes => {
+								closeObserved();
+								return bytes;
+							},
+							error => {
+								closeObserved();
+								throw error;
+							},
+						);
+					} catch (error) {
+						observation.writeFailed = true;
+						closeObserved();
+						throw error;
+					}
+				};
+				const observedWriter = new Proxy(Object.create(null) as Bun.FileSink, {
+					get(_target, property) {
+						if (property === "write") return observedWrite;
+						if (property === "flush") return observedFlush;
+						if (property === "end") return observedEnd;
+						const value = Reflect.get(writer, property, writer);
+						return typeof value === "function" ? value.bind(writer) : value;
+					},
+					getPrototypeOf: () => Object.getPrototypeOf(writer),
+				});
+				return new Proxy(Object.create(null) as typeof guardian, {
+					get(_target, property) {
+						if (property === "stdin") return observedWriter;
+						const value = Reflect.get(guardian, property, guardian);
+						return typeof value === "function" ? value.bind(guardian) : value;
+					},
+					getPrototypeOf: () => Object.getPrototypeOf(guardian),
+				});
 			};
 		},
-		witnessFor(guardianPid, receiverPid) {
+		async witnessFor(guardianPid, receiverPid) {
 			const observation = observed.get(guardianPid);
 			if (!observation || !processId(receiverPid)) return undefined;
-			return { ...observation, receiverPid };
+			return { ...(await observation.promise), receiverPid };
 		},
-		end() {
+		pendingFor(guardianPid) {
+			const pending = observed.get(guardianPid)?.pending;
+			return pending ? { ...pending } : undefined;
+		},
+		async end() {
 			try {
-				snapshot?.fill(0);
+				if (stress) {
+					try {
+						stress.closeReader();
+					} finally {
+						try {
+							await stress.endWriter();
+						} catch (error) {
+							if (!stress.writerClosed()) throw error;
+						}
+					}
+					if (!stress.readerClosed() || !stress.writerClosed()) throw new Error("STDIN_STRESS_OWNERSHIP_LOST");
+				}
 			} finally {
+				for (const observation of observed.values()) observation.finish();
+				snapshot?.fill(0);
 				snapshot = undefined;
 				ownedInput = undefined;
+				configuration = undefined;
+				stress = undefined;
 				observed.clear();
 			}
 		},
@@ -473,7 +886,5 @@ export function isVerifiedFiniteStdinHandoff(
 		launch.workerPid !== producer.observerPid
 	)
 		return false;
-	return producer.inputWasEmpty
-		? isSupportedFiniteStdinDescriptor(descriptor)
-		: isLocallyAnonymousStdinChannel(descriptor);
+	return isLocallyAnonymousStdinChannel(descriptor);
 }

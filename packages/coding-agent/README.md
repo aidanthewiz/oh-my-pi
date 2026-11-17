@@ -55,12 +55,12 @@ The receiving CLI controls its own reads and writes.
 Capability discovery performs no authentication, credential access, or AWS request.
 Discovery checks loaded host and private worker capabilities; it does not authorize an unsupported execution path.
 Execution requires actual invocation ownership under `native-tool-host/v2`, not merely a canonical registered tool wrapper.
-The actual native Agent dispatcher and native Write → `xd://aws` route support secret input with intrinsic `await-cleanup` and session lifecycle ownership.
+The actual native Agent dispatcher and native Write → `xd://aws` route support secret input with intrinsic `await-cleanup` and session lifecycle ownership, whether AWS is active or mounted.
 JavaScript/Python Eval and naked SDK/direct `.execute(...)` invocations are unsupported, even through a canonical registered wrapper or nested Write → `xd://aws`.
 They fail with `CAPABILITY_INCOMPATIBLE` before approval UI, provider work, or receiver execution.
 Discover and verify the current fingerprint at runtime; do not reuse a fingerprint from another host contract.
 The manifest requires `hostPolicy:"native-tool-host/v2"` and retains `executionPolicy:"tool-cancellation-cleanup/v1"`.
-Scope, lifecycle, and delivery remain `aws-secret-input-sdk-scope/v2`, `tool-session-lifecycle/v2`, and `finite-stdin-owned-process-group/v2`.
+Scope and lifecycle remain `aws-secret-input-sdk-scope/v2` and `tool-session-lifecycle/v2`; delivery requires `finite-stdin-owned-process-group/v3`.
 Output remains `raw-bounded-consumer-output/v1`.
 Native schema and description discovery no longer enumerate AWS profiles; schema and capability discovery read no profile or credential files.
 Use an operator-approved, caller-known operational profile, never an inferred ambient, default, or model/relay profile.
@@ -94,7 +94,7 @@ With `secretInput.jsonPointer`, an RFC 6901 pointer selects only a string leaf f
 The native route does not infer fields or combine credentials with application commands.
 The receiver must already support this finite stdin channel and normal non-echoing configuration.
 A receiver that requires another credential channel is unsupported.
-Do not substitute secret argv, environment variables, files, FIFOs, RAM disks, PTY injection, or a shell AWS fallback.
+Do not substitute secret argv, environment variables, files, memfds, named FIFOs, RAM disks, PTY injection, or a shell AWS fallback.
 
 Input is limited to 65,536 bytes.
 `maxStdoutBytes` and `maxStderrBytes` each bound retained output to 1,048,576 bytes: at most 2 MiB combined.
@@ -121,6 +121,8 @@ It receives no inherited AWS credential environment or private worker control de
 The guardian starts in a fresh neutral owned directory with a minimal Bun startup environment that blocks project and global preloads.
 Only the receiver uses the approved working directory, environment, and argv.
 Stdin closes after the bounded input.
+Delivery uses an actual anonymous pipe or unnamed Unix stream, not a runtime's typed-array-to-file optimization.
+The input writer applies backpressure and closes the finite stream after all approved bytes.
 Cancellation, timeout, and session disposal terminate and reap the owned consumer group and worker, close streams, and release owned references.
 An independent owned finite-input guardian handles worker SIGKILL or disconnect and receiver leader exit while foreground descendants or pipes remain.
 The intrinsic `await-cleanup` policy keeps admitted native invocations pending until owned teardown completes or reports an ownership failure.

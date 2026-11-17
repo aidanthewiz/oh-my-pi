@@ -31,7 +31,7 @@ JavaScript/Python Eval and naked SDK/direct `.execute(...)` calls reject with `C
 Canonical registered wrappers and nested Write → `xd://aws` calls do not make those unsupported invocations admissible.
 Discover the current fingerprint at runtime; do not reuse one from another host contract.
 Require manifest `hostPolicy:"native-tool-host/v2"`; retain `executionPolicy:"tool-cancellation-cleanup/v1"` and `outputPolicy:"raw-bounded-consumer-output/v1"`.
-Scope, lifecycle, and delivery remain `aws-secret-input-sdk-scope/v2`, `tool-session-lifecycle/v2`, and `finite-stdin-owned-process-group/v2`.
+Scope and lifecycle remain `aws-secret-input-sdk-scope/v2` and `tool-session-lifecycle/v2`; delivery requires `finite-stdin-owned-process-group/v3`.
 Native schema and description discovery no longer enumerate AWS profiles; schema and capability discovery read no profile or credential files.
 Use an operator-approved, caller-known operational profile; never infer ambient, default, or model/relay profiles.
 Ordinary explicit-profile execution and the existing commercial MCP profile metadata route remain unchanged.
@@ -57,7 +57,7 @@ Report truncation separately for each stream.
 `timeout` is seconds: default 30, maximum 120.
 Do not infer secret fields or combine credentials with application commands.
 The receiver must support finite stdin and non-echoing normal configuration; otherwise report it unsupported.
-Never substitute credential argv, environment, files, FIFOs, RAM disks, unsafe PTY input, or shell AWS calls.
+Never substitute credential argv, environment, files, named FIFOs, RAM disks, unsafe PTY input, or shell AWS calls.
 
 Only explicit existing static profile credentials and existing unexpired SSO tokens are supported.
 Do not assume role chains, credential_process, web identity, endpoints, or ambient credential providers work.

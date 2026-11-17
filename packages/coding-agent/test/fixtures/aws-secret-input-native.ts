@@ -34,7 +34,12 @@ import {
 	type AwsSecretInputLifecycleWorkerScenario,
 } from "./aws-secret-input-lifecycle-client";
 import { createAwsSecretInputLifecycleControl } from "./aws-secret-input-lifecycle-control";
-import { LIFECYCLE_STDERR, LIFECYCLE_STDOUT, lifecycleContainsSensitive } from "./aws-secret-input-lifecycle-values";
+import {
+	LIFECYCLE_SENSITIVE_MARKER,
+	LIFECYCLE_STDERR,
+	LIFECYCLE_STDOUT,
+	lifecycleContainsSensitive,
+} from "./aws-secret-input-lifecycle-values";
 import {
 	AWS_SECRET_INPUT_STARTUP_MARKER,
 	awsSecretInputLifecycleStartupPreloadSource,
@@ -205,9 +210,14 @@ export async function assertAwsSecretInputNativeFiles(root: string): Promise<voi
 			requireNativeProof(!lifecycleContainsSensitive(filename));
 			if (entry.isDirectory()) await visit(filename);
 			else if (entry.isFile()) {
-				const stat = await fs.stat(filename);
-				requireNativeProof(stat.size <= 8_388_608);
-				requireNativeProof(!lifecycleContainsSensitive(await fs.readFile(filename)));
+				const decoder = new TextDecoder();
+				let tail = "";
+				for await (const bytes of Bun.file(filename).stream()) {
+					const text = tail + decoder.decode(bytes, { stream: true });
+					requireNativeProof(!text.includes(LIFECYCLE_SENSITIVE_MARKER));
+					tail = text.slice(Math.max(0, text.length - LIFECYCLE_SENSITIVE_MARKER.length + 1));
+				}
+				requireNativeProof(!(tail + decoder.decode()).includes(LIFECYCLE_SENSITIVE_MARKER));
 			} else if (entry.isSymbolicLink()) {
 				requireNativeProof(!lifecycleContainsSensitive(await fs.readlink(filename)));
 			} else throw new Error(FAILURE);
