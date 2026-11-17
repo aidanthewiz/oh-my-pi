@@ -54,11 +54,30 @@ interface BundledVirtualResolveResult {
 	namespace: typeof BUNDLED_VIRTUAL_NAMESPACE | typeof BUNDLED_HOST_NAMESPACE;
 }
 
-interface ExtensionSpecifierReference {
-	readonly kind: "import" | "native-import" | "require";
+type ExtensionSpecifierReference = {
 	readonly specifier: string;
 	readonly start: number;
 	readonly end: number;
+} & (
+	| { readonly kind: "import" | "native-import" | "require" }
+	| {
+			readonly kind: "dynamic-import";
+			readonly callStart: number;
+			readonly callEnd: number;
+			readonly optionsStart: number;
+			readonly optionsEnd: number;
+	  }
+);
+
+interface ExtensionSourceReplacement {
+	readonly start: number;
+	readonly end: number;
+	readonly replacement: string;
+}
+
+interface ResolvedExtensionSpecifier {
+	readonly specifier: string;
+	readonly graphContextKey: string | null;
 }
 
 function parseExtensionSource(source: string, importerPath: string): ParseResult {
@@ -473,31 +492,21 @@ function hasNativeImportType(attributes: readonly unknown[] | null): boolean {
 	return false;
 }
 
-function usesNativeImportLoader(node: StructuralAstNode): boolean {
-	if (hasNativeImportType(nodeArray(node, "attributes")) || hasNativeImportType(nodeArray(node, "assertions")))
-		return true;
-	const options = asAstNode(
-		node.type === "ImportExpression" ? node.options : node.type === "CallExpression" ? nodeArgument(node, 1) : null,
+function isErasedTypeDeclaration(node: StructuralAstNode): boolean {
+	if (node.importKind === "type" || node.exportKind === "type") return true;
+	if (node.type !== "ImportDeclaration" && node.type !== "ExportNamedDeclaration") return false;
+	const specifiers = nodeArray(node, "specifiers");
+	return (
+		specifiers !== null &&
+		specifiers.length > 0 &&
+		specifiers.every(value => {
+			const specifier = asAstNode(value);
+			return (
+				(specifier?.type === "ImportSpecifier" && specifier.importKind === "type") ||
+				(specifier?.type === "ExportSpecifier" && specifier.exportKind === "type")
+			);
+		})
 	);
-	if (!options) return false;
-	if (options.type !== "ObjectExpression") return true;
-	for (const value of nodeArray(options, "properties") ?? []) {
-		const property = asAstNode(value);
-		if (!property) continue;
-		if (property.type === "SpreadElement" || property.computed === true) return true;
-		const key = asAstNode(property.key);
-		if (
-			!(
-				(property.computed !== true && (isIdentifier(key, "with") || isIdentifier(key, "assert"))) ||
-				(key?.type === "StringLiteral" && (key.value === "with" || key.value === "assert"))
-			)
-		)
-			continue;
-		const attributes = asAstNode(property.value);
-		if (attributes?.type !== "ObjectExpression") return true;
-		if (hasNativeImportType(nodeArray(attributes, "properties"))) return true;
-	}
-	return false;
 }
 
 function collectExtensionSpecifierReferences(
@@ -506,7 +515,11 @@ function collectExtensionSpecifierReferences(
 	ast: ParseResult = parseExtensionSource(source, importerPath),
 ): ExtensionSpecifierReference[] {
 	const references: ExtensionSpecifierReference[] = [];
-	const record = (kind: ExtensionSpecifierReference["kind"], literal: unknown): void => {
+	const record = (
+		kind: Exclude<ExtensionSpecifierReference["kind"], "dynamic-import">,
+		literal: unknown,
+		call?: StructuralAstNode,
+	): void => {
 		const node = asAstNode(literal);
 		if (
 			node?.type === "StringLiteral" &&
@@ -514,13 +527,33 @@ function collectExtensionSpecifierReferences(
 			typeof node.start === "number" &&
 			typeof node.end === "number"
 		) {
-			references.push({ kind, specifier: node.value, start: node.start, end: node.end });
+			const options = call
+				? asAstNode(call.type === "ImportExpression" ? call.options : nodeArgument(call, 1))
+				: null;
+			references.push(
+				options &&
+					typeof options.start === "number" &&
+					typeof options.end === "number" &&
+					typeof call?.start === "number" &&
+					typeof call.end === "number"
+					? {
+							kind: "dynamic-import",
+							specifier: node.value,
+							start: node.start,
+							end: node.end,
+							callStart: call.start,
+							callEnd: call.end,
+							optionsStart: options.start,
+							optionsEnd: options.end,
+						}
+					: { kind, specifier: node.value, start: node.start, end: node.end },
+			);
 		}
 	};
 	const createRequireBindings = new Set<string>();
 	const moduleNamespaceBindings = new Set<string>();
 	for (const { node } of collectScopedAstNodes(ast, candidate => candidate.type === "ImportDeclaration")) {
-		if (node.importKind === "type") continue;
+		if (isErasedTypeDeclaration(node)) continue;
 		const source = asAstNode(node.source);
 		if (source?.type !== "StringLiteral" || (source.value !== "node:module" && source.value !== "module")) continue;
 		for (const value of Array.isArray(node.specifiers) ? node.specifiers : []) {
@@ -542,15 +575,20 @@ function collectExtensionSpecifierReferences(
 		}
 	}
 	for (const { node, scope } of collectScopedAstNodes(ast, isSpecifierReferenceNode)) {
-		if (node.importKind === "type" || node.exportKind === "type") continue;
+		if (isErasedTypeDeclaration(node)) continue;
 		if (
 			node.type === "ImportDeclaration" ||
 			node.type === "ExportNamedDeclaration" ||
 			node.type === "ExportAllDeclaration"
 		) {
-			record(usesNativeImportLoader(node) ? "native-import" : "import", node.source);
+			record(
+				hasNativeImportType(nodeArray(node, "attributes")) || hasNativeImportType(nodeArray(node, "assertions"))
+					? "native-import"
+					: "import",
+				node.source,
+			);
 		} else if (node.type === "ImportExpression") {
-			record(usesNativeImportLoader(node) ? "native-import" : "import", node.source);
+			record("import", node.source, node);
 		} else if (node.type === "TSImportEqualsDeclaration") {
 			const moduleReference = asAstNode(node.moduleReference);
 			if (moduleReference?.type === "TSExternalModuleReference") {
@@ -559,7 +597,7 @@ function collectExtensionSpecifierReferences(
 		} else if (node.type === "CallExpression") {
 			const callee = asAstNode(node.callee);
 			if (callee?.type === "Import") {
-				record(usesNativeImportLoader(node) ? "native-import" : "import", nodeArgument(node, 0));
+				record("import", nodeArgument(node, 0), node);
 			} else if (isIdentifier(callee, "require") && !scopeHasBinding(scope, REQUIRE_BINDING)) {
 				record("require", nodeArgument(node, 0));
 			} else if (isCreateRequireInvocation(callee, createRequireBindings, moduleNamespaceBindings)) {
@@ -580,7 +618,7 @@ function collectExtensionSpecifierReferences(
 	return references;
 }
 
-const EXTENSION_PARSE_CACHE_SCHEMA_VERSION = 5;
+const EXTENSION_PARSE_CACHE_SCHEMA_VERSION = 6;
 const CREATE_EXTENSION_PARSE_CACHE_TABLE =
 	"CREATE TABLE IF NOT EXISTS extension_parse_cache (cache_key TEXT PRIMARY KEY, source_type TEXT NOT NULL, [references] TEXT NOT NULL, commonjs_syntax INTEGER NOT NULL)";
 const EXTENSION_PARSE_CACHE_MAX_BYTES = 8 * 1024 * 1024;
@@ -687,10 +725,18 @@ function parseCachedAnalysis(row: ExtensionParseCacheRow): ExtensionSourceAnalys
 				reference =>
 					reference &&
 					typeof reference === "object" &&
-					(reference.kind === "import" || reference.kind === "native-import" || reference.kind === "require") &&
+					(reference.kind === "import" ||
+						reference.kind === "native-import" ||
+						reference.kind === "dynamic-import" ||
+						reference.kind === "require") &&
 					typeof reference.specifier === "string" &&
 					typeof reference.start === "number" &&
-					typeof reference.end === "number",
+					typeof reference.end === "number" &&
+					(reference.kind !== "dynamic-import" ||
+						(typeof reference.callStart === "number" &&
+							typeof reference.callEnd === "number" &&
+							typeof reference.optionsStart === "number" &&
+							typeof reference.optionsEnd === "number")),
 			)
 		) {
 			return null;
@@ -774,13 +820,32 @@ function getExtensionSourceAnalysis(source: string, importerPath: string): Exten
 	return analysis;
 }
 
-function applySpecifierReplacements(
-	source: string,
-	replacements: ReadonlyArray<ExtensionSpecifierReference & { readonly replacement: string }>,
-): string {
+function createSpecifierReplacements(
+	reference: ExtensionSpecifierReference,
+	target: ResolvedExtensionSpecifier,
+	importerPath: string,
+): ExtensionSourceReplacement[] {
+	if (reference.kind !== "dynamic-import") {
+		return [{ start: reference.start, end: reference.end, replacement: JSON.stringify(target.specifier) }];
+	}
+	return [
+		{
+			start: reference.callStart,
+			end: reference.optionsStart,
+			replacement: `(globalThis[${JSON.stringify(DYNAMIC_IMPORT_GLOBAL)}](${JSON.stringify(target.graphContextKey)}, ${JSON.stringify(importerPath)}, (`,
+		},
+		{
+			start: reference.optionsEnd,
+			end: reference.callEnd,
+			replacement: `), (__specifier, __options) => import(__specifier, __options), ${JSON.stringify(target.specifier)}, ${JSON.stringify(reference.specifier)}))`,
+		},
+	];
+}
+
+function applySpecifierReplacements(source: string, replacements: readonly ExtensionSourceReplacement[]): string {
 	let rewritten = source;
 	for (const reference of [...replacements].sort((left, right) => right.start - left.start)) {
-		rewritten = `${rewritten.slice(0, reference.start)}${JSON.stringify(reference.replacement)}${rewritten.slice(reference.end)}`;
+		rewritten = `${rewritten.slice(0, reference.start)}${reference.replacement}${rewritten.slice(reference.end)}`;
 	}
 	return rewritten;
 }
@@ -1192,14 +1257,15 @@ async function rewriteLegacyExtensionSource(
 	importerPath: string,
 	mtimeTag: string | null = null,
 	resolvedImportMtimeTag: string | null = mtimeTag,
+	graphContext?: ExtensionGraphContext,
 ): Promise<string> {
 	// Compiled mode completes the override map from the build-supplied module
 	// keys on first use; every rewrite path must see the full map.
 	await ensureLegacyPiOverridesReady();
 	const references = getExtensionSourceAnalysis(source, importerPath).references;
-	const replacements: Array<ExtensionSpecifierReference & { replacement: string }> = [];
+	const replacements: ExtensionSourceReplacement[] = [];
 	for (const reference of references) {
-		if (reference.kind !== "import") continue;
+		if (reference.kind !== "import" && reference.kind !== "dynamic-import") continue;
 
 		const specifier = reference.specifier;
 		let replacement: string | null = null;
@@ -1226,8 +1292,14 @@ async function rewriteLegacyExtensionSource(
 		if (!replacement && mtimeTag && /^\.\.?\//.test(specifier) && !specifier.includes("?")) {
 			replacement = `${specifier}?mtime=${mtimeTag}`;
 		}
-		if (replacement && replacement !== specifier) {
-			replacements.push({ ...reference, replacement });
+		if (reference.kind === "dynamic-import" || (replacement && replacement !== specifier)) {
+			replacements.push(
+				...createSpecifierReplacements(
+					reference,
+					{ specifier: replacement ?? specifier, graphContextKey: graphContext?.key ?? null },
+					importerPath,
+				),
+			);
 		}
 	}
 	// Resolve `require()` targets against the original source rather than the
@@ -2085,21 +2157,24 @@ async function collectExtensionSpecifierReplacements(
 	rewriteImports = false,
 	/** The walk that read `source` for `importerPath`; its analysis memo is keyed by path. */
 	sources?: ExtensionGraphSources,
-): Promise<Array<ExtensionSpecifierReference & { replacement: string }>> {
+	graphContext?: ExtensionGraphContext,
+): Promise<ExtensionSourceReplacement[]> {
 	const { references } = sources
 		? await sources.analyze(importerPath)
 		: getExtensionSourceAnalysis(source, importerPath);
-	const resolvedSpecifierTargets = new Map<string, string>();
-	const replacements: Array<ExtensionSpecifierReference & { replacement: string }> = [];
+	const resolvedSpecifierTargets = new Map<string, ResolvedExtensionSpecifier>();
+	const replacements: ExtensionSourceReplacement[] = [];
 	for (const reference of references) {
 		if (reference.kind === "native-import") {
 			const replacement = await resolveNativeImportSpecifier(reference.specifier, importerPath);
 			if (replacement && replacement !== reference.specifier) {
-				resolvedSpecifierTargets.set(`${reference.kind}\0${reference.specifier}`, replacement);
-				replacements.push({ ...reference, replacement });
+				const target = { specifier: replacement, graphContextKey: null };
+				resolvedSpecifierTargets.set(`${reference.kind}\0${reference.specifier}`, target);
+				replacements.push(...createSpecifierReplacements(reference, target, importerPath));
 			}
 			continue;
 		}
+		if (reference.kind === "dynamic-import" && !rewriteImports) continue;
 		let resolved: string | null = null;
 		if (reference.kind === "require") {
 			resolved = await resolveExtensionCommonJsRequire(reference.specifier, importerPath, sources);
@@ -2116,10 +2191,15 @@ async function collectExtensionSpecifierReplacements(
 				resolved = await resolveExtensionBareDependency(reference.specifier, importerPath);
 			}
 		}
-		if (!resolved) continue;
-		const replacement = stripWindowsExtendedLengthPathPrefix(resolved).replaceAll("\\", "/");
-		resolvedSpecifierTargets.set(`${reference.kind}\0${reference.specifier}`, replacement);
-		replacements.push({ ...reference, replacement });
+		if (!resolved && reference.kind !== "dynamic-import") continue;
+		const target: ResolvedExtensionSpecifier = {
+			specifier: resolved
+				? stripWindowsExtendedLengthPathPrefix(resolved).replaceAll("\\", "/")
+				: reference.specifier,
+			graphContextKey: graphContext?.key ?? null,
+		};
+		resolvedSpecifierTargets.set(`${reference.kind}\0${reference.specifier}`, target);
+		replacements.push(...createSpecifierReplacements(reference, target, importerPath));
 	}
 	extensionSynchronousSpecifierTargets.set(importerPath, resolvedSpecifierTargets);
 	return replacements;
@@ -2130,11 +2210,11 @@ function rewriteExtensionSpecifiersFromCache(source: string, importerPath: strin
 	if (!resolvedSpecifierTargets || resolvedSpecifierTargets.size === 0) {
 		return source;
 	}
-	const replacements: Array<ExtensionSpecifierReference & { replacement: string }> = [];
+	const replacements: ExtensionSourceReplacement[] = [];
 	for (const reference of getExtensionSourceAnalysis(source, importerPath).references) {
-		const replacement = resolvedSpecifierTargets.get(`${reference.kind}\0${reference.specifier}`);
-		if (replacement) {
-			replacements.push({ ...reference, replacement });
+		const target = resolvedSpecifierTargets.get(`${reference.kind}\0${reference.specifier}`);
+		if (target) {
+			replacements.push(...createSpecifierReplacements(reference, target, importerPath));
 		}
 	}
 	return applySpecifierReplacements(source, replacements);
@@ -2186,10 +2266,22 @@ function escapeRegExp(value: string): string {
 const extensionGraphHookModules = new Map<string, Set<string>>();
 const extensionGraphCacheBustResolvedImportModules = new Map<string, Set<string>>();
 const commonJsFallbackModulePaths = new Map<string, string>();
-const extensionSynchronousSpecifierTargets = new Map<string, Map<string, string>>();
+const extensionSynchronousSpecifierTargets = new Map<string, Map<string, ResolvedExtensionSpecifier>>();
 const synchronousModuleSources = new Map<string, string>();
 const commonJsGraphModulePaths = new Set<string>();
 const COMMONJS_REQUIRE_GLOBAL = "__ompLegacyPiRequireGraphModule";
+const DYNAMIC_IMPORT_GLOBAL = "__ompLegacyPiImportWithOptions";
+
+interface ExtensionGraphContext {
+	readonly key: string;
+	readonly entryRealPath: string;
+	readonly activeDynamicImports: Map<string, Set<string>>;
+	readonly preparedModules: Map<string, "commonjs" | "sync" | "async">;
+	pending?: Promise<void>;
+}
+
+const extensionGraphContexts = new Map<string, ExtensionGraphContext>();
+const latestExtensionGraphContexts = new Map<string, ExtensionGraphContext>();
 const commonJsModuleDefinitions = new Map<string, { source: string; filename: string; dirname: string }>();
 const commonJsModuleCache = new Map<
 	string,
@@ -2317,6 +2409,9 @@ export function ensureGraphCommonJsRequireRegistered(): void {
 }
 
 ensureGraphCommonJsRequireRegistered();
+if (!Reflect.get(globalThis, DYNAMIC_IMPORT_GLOBAL)) {
+	Reflect.set(globalThis, DYNAMIC_IMPORT_GLOBAL, importExtensionWithOptions);
+}
 
 let legacyPiLoadTag = 0;
 
@@ -2360,7 +2455,10 @@ interface ExtensionModuleGraph {
  * synchronous bridge. Resolved ESM imports inside third-party dependencies
  * omit the reload tag so their importer paths stay query-free.
  */
-async function collectExtensionModules(entryRealPath: string): Promise<ExtensionModuleGraph> {
+async function collectExtensionModules(
+	entryRealPath: string,
+	graphContext?: ExtensionGraphContext,
+): Promise<ExtensionModuleGraph> {
 	const modules = new Map<string, string>();
 	const commonJsPaths = new Set<string>();
 	const synchronousSourcePaths = new Set<string>();
@@ -2406,9 +2504,12 @@ async function collectExtensionModules(entryRealPath: string): Promise<Extension
 			commonJsGraphModulePaths.add(file);
 		}
 		const dir = path.dirname(file);
-		const references = analysis.references;
+		const activeImports = graphContext?.activeDynamicImports.get(file);
+		const references: readonly Pick<ExtensionSpecifierReference, "kind" | "specifier">[] = activeImports
+			? [...analysis.references, ...Array.from(activeImports, specifier => ({ kind: "import" as const, specifier }))]
+			: analysis.references;
 		for (const reference of references) {
-			if (reference.kind === "native-import") continue;
+			if (reference.kind === "native-import" || reference.kind === "dynamic-import") continue;
 			const specifier = reference.specifier;
 			try {
 				let resolved: string | null = null;
@@ -2571,11 +2672,11 @@ async function collectExtensionModules(entryRealPath: string): Promise<Extension
 				modulePath,
 				applySpecifierReplacements(
 					source,
-					await collectExtensionSpecifierReplacements(source, modulePath, true, sources),
+					await collectExtensionSpecifierReplacements(source, modulePath, true, sources, graphContext),
 				),
 			);
 		} else if (synchronousSourcePaths.has(modulePath)) {
-			modules.set(modulePath, await rewriteLegacyExtensionSource(source, modulePath));
+			modules.set(modulePath, await rewriteLegacyExtensionSource(source, modulePath, null, null, graphContext));
 		}
 	}
 	return {
@@ -2684,6 +2785,9 @@ async function installExtensionGraphHook(
 					}
 					const cached = asyncModules.get(sourcePath);
 					const resolvedImportMtimeTag = cacheBustResolvedImportModules.has(sourcePath) ? mtimeTag : null;
+					const graphContext =
+						extensionGraphContexts.get(`${entryRealPath}\0${mtimeTag ?? ""}`) ??
+						latestExtensionGraphContexts.get(entryRealPath);
 					return (async () => {
 						let raw: string;
 						if (cached !== undefined) {
@@ -2694,7 +2798,13 @@ async function installExtensionGraphHook(
 							raw = await Bun.file(sourcePath).text();
 						}
 						return {
-							contents: await rewriteLegacyExtensionSource(raw, sourcePath, mtimeTag, resolvedImportMtimeTag),
+							contents: await rewriteLegacyExtensionSource(
+								raw,
+								sourcePath,
+								mtimeTag,
+								resolvedImportMtimeTag,
+								graphContext,
+							),
 							loader: getLoader(sourcePath),
 						};
 					})();
@@ -2762,13 +2872,16 @@ async function installExtensionGraphHook(
  * Returns a clearable handle to drop cached sources that weren't consumed
  * during the initial load; `undefined` when no new modules were discovered.
  */
-async function ensureExtensionGraphHook(entryRealPath: string): Promise<{ clear(): void } | undefined> {
+async function ensureExtensionGraphHook(
+	entryRealPath: string,
+	graphContext: ExtensionGraphContext,
+): Promise<{ clear(): void } | undefined> {
 	const {
 		modules: currentModules,
 		commonJsPaths,
 		cacheBustResolvedImportModules: discoveredCacheBustModules,
 		synchronousSourcePaths,
-	} = await collectExtensionModules(entryRealPath);
+	} = await collectExtensionModules(entryRealPath, graphContext);
 	let cacheBustResolvedImportModules = extensionGraphCacheBustResolvedImportModules.get(entryRealPath);
 	if (!cacheBustResolvedImportModules) {
 		cacheBustResolvedImportModules = new Set<string>();
@@ -2777,9 +2890,17 @@ async function ensureExtensionGraphHook(entryRealPath: string): Promise<{ clear(
 	for (const modulePath of discoveredCacheBustModules) {
 		cacheBustResolvedImportModules.add(modulePath);
 	}
+	const preparedCommonJsPaths = new Set<string>();
 	for (const [modulePath, source] of currentModules) {
+		const kind = commonJsPaths.has(modulePath)
+			? "commonjs"
+			: synchronousSourcePaths.has(modulePath)
+				? "sync"
+				: "async";
+		if (graphContext.preparedModules.get(modulePath) === kind) continue;
 		if (commonJsPaths.has(modulePath)) {
 			await prepareGraphCommonJsModule(modulePath, source);
+			preparedCommonJsPaths.add(modulePath);
 		}
 		if (synchronousSourcePaths.has(modulePath)) {
 			synchronousModuleSources.set(modulePath, source);
@@ -2788,8 +2909,12 @@ async function ensureExtensionGraphHook(entryRealPath: string): Promise<{ clear(
 			// hooks installed while it was synchronous still serve it from this
 			// map — keep the pre-rewritten bytes fresh instead of serving the
 			// stale snapshot from the walk that flagged it.
-			synchronousModuleSources.set(modulePath, await rewriteLegacyExtensionSource(source, modulePath));
+			synchronousModuleSources.set(
+				modulePath,
+				await rewriteLegacyExtensionSource(source, modulePath, null, null, graphContext),
+			);
 		}
+		graphContext.preparedModules.set(modulePath, kind);
 	}
 	let hookedModules = extensionGraphHookModules.get(entryRealPath);
 	if (!hookedModules) {
@@ -2811,7 +2936,7 @@ async function ensureExtensionGraphHook(entryRealPath: string): Promise<{ clear(
 			}
 		}
 	}
-	if (pendingModules.size === 0 && commonJsPaths.size === 0) {
+	if (pendingModules.size === 0 && preparedCommonJsPaths.size === 0) {
 		return undefined;
 	}
 
@@ -2831,12 +2956,70 @@ async function ensureExtensionGraphHook(entryRealPath: string): Promise<{ clear(
 	return {
 		clear() {
 			asyncModules.clear();
-			for (const modulePath of commonJsPaths) {
+			for (const modulePath of preparedCommonJsPaths) {
 				commonJsModuleDefinitions.delete(modulePath);
 				commonJsModuleCache.delete(modulePath);
 			}
 		},
 	};
+}
+
+/** Runtime Bun hooks expose no attributes, so dynamic options must select dependency ownership before loading. */
+async function importExtensionWithOptions(
+	graphContextKey: string | null,
+	importerPath: string,
+	options: unknown,
+	load: (specifier: string, options: unknown) => Promise<unknown>,
+	moduleSpecifier: string,
+	nativeSpecifier: string,
+): Promise<unknown> {
+	let normalizedOptions: unknown = options;
+	if (options !== undefined) {
+		if ((typeof options !== "object" || options === null) && typeof options !== "function") {
+			return load(moduleSpecifier, options);
+		}
+		const attributes = Reflect.get(options, "with");
+		normalizedOptions = { with: attributes };
+		if (attributes !== undefined) {
+			if ((typeof attributes !== "object" || attributes === null) && typeof attributes !== "function") {
+				return load(moduleSpecifier, normalizedOptions);
+			}
+			// Bun enumerates string keys before reading values, and stops at the first non-string value.
+			const normalized: Record<string, unknown> = Object.create(null);
+			for (const key of Object.keys(attributes)) {
+				const value = Reflect.get(attributes, key);
+				normalized[key] = value;
+				if (typeof value !== "string") return load(moduleSpecifier, { with: normalized });
+			}
+			normalizedOptions = { with: normalized };
+			if (typeof normalized.type === "string") {
+				let resolved: string | null = null;
+				try {
+					resolved = await resolveNativeImportSpecifier(nativeSpecifier, importerPath);
+				} catch {
+					// Bun validates attributes before resolving the original specifier.
+				}
+				return load(resolved ?? nativeSpecifier, normalizedOptions);
+			}
+		}
+	}
+	const graphContext = graphContextKey === null ? undefined : extensionGraphContexts.get(graphContextKey);
+	if (graphContext) {
+		let activeImports = graphContext.activeDynamicImports.get(importerPath);
+		if (!activeImports) {
+			activeImports = new Set();
+			graphContext.activeDynamicImports.set(importerPath, activeImports);
+		}
+		if (!activeImports.has(nativeSpecifier)) {
+			activeImports.add(nativeSpecifier);
+			graphContext.pending = (graphContext.pending ?? Promise.resolve()).then(async () => {
+				const pendingSources = await ensureExtensionGraphHook(graphContext.entryRealPath, graphContext);
+				pendingSources?.clear();
+			});
+		}
+		await graphContext.pending;
+	}
+	return load(moduleSpecifier, normalizedOptions);
 }
 
 /**
@@ -2860,7 +3043,20 @@ export async function loadLegacyPiModule(resolvedPath: string, options: { reload
 	// actually hands the hook.
 	const entryRealPath = await realpathOrSelf(path.resolve(resolvedPath));
 	await ensureLegacyPiOverridesReady();
-	const pendingSources = await ensureExtensionGraphHook(entryRealPath);
+	const mtimeTag = options.reload === false ? null : nextLegacyPiLoadTag();
+	const graphContextKey = `${entryRealPath}\0${mtimeTag ?? ""}`;
+	let graphContext = extensionGraphContexts.get(graphContextKey);
+	if (!graphContext) {
+		graphContext = {
+			key: graphContextKey,
+			entryRealPath,
+			activeDynamicImports: new Map(),
+			preparedModules: new Map(),
+		};
+		extensionGraphContexts.set(graphContextKey, graphContext);
+	}
+	latestExtensionGraphContexts.set(entryRealPath, graphContext);
+	const pendingSources = await ensureExtensionGraphHook(entryRealPath, graphContext);
 	try {
 		// Dynamic import is required: legacy extension entry paths are user/plugin supplied at runtime.
 		// Use the raw filesystem path so Bun keys the `?mtime` suffix as part of
@@ -2869,8 +3065,8 @@ export async function loadLegacyPiModule(resolvedPath: string, options: { reload
 		const entrySpecifier = isBundledVirtualSpecifier(entryRealPath)
 			? toImportSpecifier(entryRealPath)
 			: stripWindowsExtendedLengthPathPrefix(entryRealPath);
-		if (options.reload === false) return await import(entrySpecifier);
-		return await import(`${entrySpecifier}?mtime=${nextLegacyPiLoadTag()}`);
+		if (mtimeTag === null) return await import(entrySpecifier);
+		return await import(`${entrySpecifier}?mtime=${mtimeTag}`);
 	} finally {
 		// Drop whatever the initial import didn't consume: graph modules only
 		// reached by lazy dynamic imports must be read from disk at their actual

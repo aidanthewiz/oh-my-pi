@@ -17,7 +17,8 @@
 ### Fixed
 
 - Route headless task DCG reviews to the live parent TUI without enabling child UI or reusing grants. Revalidate both sessions' authority and the exact invocation through backend dispatch. Preserve typed denial, cancellation, and unavailable errors.
-- Keep erased TypeScript type imports out of legacy extension runtime graphs. Preserve Bun's native loader for attributed imports, including mixed module/file use and package self-exports.
+- Keep erased TypeScript type declarations out of legacy extension runtime graphs, including inline-only named imports and exports.
+- Preserve Bun's native loader for attributed imports, mixed module/file use and package self-exports. Select dynamic import loaders at runtime without losing ordinary dependency remapping, CommonJS identity or reload behavior.
 - Synchronize shell TERM-output qualification with a child release gate and controlled cancellation deadlines instead of wall-clock sleeps.
 - Synchronize session lease race qualification with an observed held lease before racing claims and probes.
 - Separate hosted Chromium readiness from connection deadlines, close timed-out qualification pipes before cleanup, and preserve startup failures.

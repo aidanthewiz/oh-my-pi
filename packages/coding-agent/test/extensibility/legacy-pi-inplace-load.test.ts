@@ -189,6 +189,113 @@ describe("legacy-pi in-place module loading (issue #1674)", () => {
 		expect(Reflect.get(Object(mod), "canvasValue")).toBe("canvas-shim");
 	});
 
+	it.each([
+		["esm", true],
+		["esm", false],
+		["commonjs", true],
+		["commonjs", false],
+	] as const)("loads runtime options through the %s dependency graph with reload=%s", async (kind, reload) => {
+		const extension = kind === "esm" ? "mjs" : "cjs";
+		const leafSource = (value: number) =>
+			[
+				kind === "esm"
+					? 'import { isCompiledBinary } from "@earendil-works/pi-utils";'
+					: 'const { isCompiledBinary } = require("@earendil-works/pi-utils");',
+				`const token = { value: ${value}, uses: 0 };`,
+				`${kind === "esm" ? "export default" : "module.exports ="} { token, hostType: typeof isCompiledBinary, next: () => ++token.uses };`,
+			].join("\n");
+		const dir = await writePackage({
+			"package.json": JSON.stringify({ name: "runtime-options-extension", type: "module" }),
+			"entry.mjs": [
+				`export const load = options => import("./helper.${extension}", options);`,
+				'export const loadLeaf = options => import("owned-leaf", options);',
+				`export const loadNested = async () => import("./helper.${extension}", (await import("./options.mjs")).runtimeOptions);`,
+				`export const loadSpread = attributes => import("./helper.${extension}", { ...{ with: attributes } });`,
+			].join("\n"),
+			"options.mjs": 'export const runtimeOptions = { ["with"]: {} };',
+			[`helper.${extension}`]:
+				kind === "esm" ? 'export { default } from "owned-leaf";' : 'module.exports = require("owned-leaf");',
+			"node_modules/owned-leaf/package.json": JSON.stringify({
+				name: "owned-leaf",
+				type: kind === "esm" ? "module" : "commonjs",
+				exports: `./index.${extension}`,
+			}),
+			[`node_modules/owned-leaf/index.${extension}`]: leafSource(1),
+		});
+		interface Leaf {
+			token: { value: number; uses: number };
+			hostType: string;
+			next(): number;
+		}
+		interface Loaded {
+			load(options: unknown): Promise<{ default: Leaf }>;
+			loadLeaf(options: unknown): Promise<{ default: Leaf }>;
+			loadNested(): Promise<{ default: Leaf }>;
+			loadSpread(attributes: unknown): Promise<{ default: Leaf }>;
+		}
+		const entry = path.join(dir, "entry.mjs");
+		const first = (await loadLegacyPiModule(entry, { reload })) as Loaded;
+		const [firstHelper, firstLeaf] = await Promise.all([first.load({}), first.loadLeaf({ with: {} })]);
+		const nested = await first.loadNested();
+		const spread = await first.loadSpread({});
+		expect(firstHelper.default.hostType).toBe("function");
+		expect(firstHelper.default.token.value).toBe(1);
+		expect(firstHelper.default).toBe(firstLeaf.default);
+		expect(nested.default).toBe(firstLeaf.default);
+		expect(spread.default).toBe(firstLeaf.default);
+		expect(firstHelper.default.next()).toBe(1);
+		expect(firstLeaf.default.next()).toBe(2);
+
+		await fs.writeFile(path.join(dir, `node_modules/owned-leaf/index.${extension}`), leafSource(2), "utf8");
+		const second = (await loadLegacyPiModule(entry, { reload })) as Loaded;
+		const secondHelper = await second.load({});
+		const secondLeaf = await second.loadLeaf({ with: {} });
+		expect(secondHelper.default).toBe(secondLeaf.default);
+		expect(secondHelper.default.hostType).toBe("function");
+		expect(secondHelper.default.token.value).toBe(reload ? 2 : 1);
+		expect(secondHelper.default.next()).toBe(reload ? 1 : 3);
+		expect(second === first).toBe(!reload);
+		expect(secondLeaf.default === firstLeaf.default).toBe(!reload);
+	});
+
+	it("retains mixed, default, value re-export, and side-effect dependency ownership", async () => {
+		const runtimeSource = (value: string) =>
+			[
+				'import { isCompiledBinary } from "@earendil-works/pi-utils";',
+				"export interface Shape { value: string; }",
+				`export const value = ${JSON.stringify(value)} + ":" + typeof isCompiledBinary;`,
+				"export default value;",
+			].join("\n");
+		const dir = await writePackage({
+			"package.json": JSON.stringify({ name: "mixed-type-extension", type: "module" }),
+			"state.ts": "export const events: string[] = [];",
+			"mixed.ts": runtimeSource("mixed"),
+			"default.ts": runtimeSource("default"),
+			"exported.ts": runtimeSource("exported"),
+			"effect.ts": [
+				'import { events } from "./state.ts";',
+				'import { isCompiledBinary } from "@earendil-works/pi-utils";',
+				'events.push("effect:" + typeof isCompiledBinary);',
+			].join("\n"),
+			"entry.ts": [
+				'import mixedDefault, { type Shape, value } from "./mixed.ts";',
+				'import defaultValue, { type Shape as DefaultShape } from "./default.ts";',
+				'export { type Shape as ExportedShape, value as exportedValue } from "./exported.ts";',
+				'import "./effect.ts";',
+				'export { events } from "./state.ts";',
+				"export const values = [mixedDefault, value, defaultValue];",
+			].join("\n"),
+		});
+		const loaded = (await loadLegacyPiModule(path.join(dir, "entry.ts"))) as {
+			values: string[];
+			exportedValue: string;
+			events: string[];
+		};
+		expect(loaded.values).toEqual(["mixed:function", "mixed:function", "default:function"]);
+		expect(loaded.exportedValue).toBe("exported:function");
+		expect(loaded.events).toEqual(["effect:function"]);
+	});
+
 	it("reads a lazy CommonJS helper at import time", async () => {
 		const dir = await writePackage({
 			"package.json": JSON.stringify({ name: "lazy-cjs-ext", version: "1.0.0", type: "module" }),

@@ -45,8 +45,10 @@ There is no per-origin prompt quota. Default Deny and cancellation do not provid
 
 ## Extension module imports
 
-`import type` and `export type` declarations do not add runtime dependencies to the legacy extension graph.
+`import type`, `export type`, and declarations containing only inline type specifiers do not add runtime dependencies to the legacy extension graph.
 Explicit native loader attributes and options retain Bun's loader behavior.
+Dynamic import options are evaluated once to select native or ordinary dependency loading.
+Ordinary dynamic imports retain dependency remapping, module identity, and reload behavior.
 A file can provide ordinary module exports and `with { type: "file" }` assets without the compatibility hooks intercepting those assets.
 Literal native file imports support relative paths, package exports and aliases, file URLs, and dynamic import options.
 
