@@ -410,11 +410,10 @@ export function validateServerConfig(
 ): string[] {
 	const errors: string[] = [];
 
-	const serverType = config.type ?? "stdio";
-
 	// Check for conflicting transport fields
 	const hasCommand = "command" in config && config.command;
 	const hasUrl = "url" in config && (config as { url?: string }).url;
+	const serverType = config.type ?? (hasCommand ? "stdio" : hasUrl ? "http" : "stdio");
 	if (hasCommand && hasUrl) {
 		errors.push(
 			`Server "${name}": both "command" and "url" are set - server should be either stdio (command) OR http/sse (url), not both`,

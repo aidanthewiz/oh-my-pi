@@ -172,7 +172,7 @@ Only the interactive custom-rendering surface advertises this capability.
 
 ### `stdio` transport
 
-Direct runtime configs and the config writer default to `stdio` when `type` is omitted. Discovery infers `http` for a URL-only entry and `stdio` for a command entry; use an explicit `type` for portable, schema-valid configuration.
+Discovery and configuration writes infer `http` for a URL-only entry and `stdio` for a command entry. Use an explicit `type` for direct runtime configurations and schema validation.
 
 Required:
 
@@ -254,6 +254,38 @@ Example:
 ```
 
 `sse` is still supported for compatibility, but the MCP spec now prefers Streamable HTTP (`type: "http"`) for new servers.
+
+## Authenticate selected hosted servers
+
+Use the native terminal command without starting an agent session:
+
+```sh
+coreforge engine mcp auth
+coreforge engine mcp auth server-name --check
+coreforge engine mcp reauth server-name
+```
+
+`auth` verifies enabled HTTP/SSE servers under the current profile and discovery
+policy. Optional server names restrict the selection. Healthy grants are reused;
+normal refresh remains available. Missing or rejected authorization requests
+browser consent only in an interactive terminal.
+
+`--check` and unattended invocations never prompt or open a browser.
+`reauth` deliberately starts a fresh browser authorization using the same flow
+as `/mcp reauth`; the identity provider controls its consent and SSO behavior.
+Neither command enables a disabled server or grants project trust.
+Coreforge's `coreforge mcp auth` wrapper also checks selected CLI-backed integrations.
+Native hosted authentication does not sign in stdio servers.
+
+Results distinguish verified connections from saved grants whose connection
+could not be verified. Exit codes are `0` for ready, `1` for unresolved readiness,
+`2` for invalid arguments or selection, and `130` for cancellation.
+Saving a grant does not reconnect another running session.
+
+Interactive startup shows a persistent sign-in notice without opening a browser.
+Run `/mcp` and select Authenticate or Not now, even without cached tool definitions.
+Not now preserves configuration and credentials and defers sign-in for the session.
+Tenant permissions, administrator setup, and static API keys remain separate prerequisites.
 
 ## Auth fields
 

@@ -20,9 +20,10 @@ import { getActiveProfile } from "@oh-my-pi/pi-utils/dirs";
 import type { OAuthController } from "@oh-my-pi/pi-ai/oauth/types";
 import { expandEnvVarsDeepForConfigLevel } from "../discovery/helpers";
 import type { SourceMeta } from "../capability/types";
+import { COREFORGE_MCP_PROVIDER_ID } from "../discovery/coreforge";
 import { connectToServer, disconnectServer } from "./client";
 import { readMCPConfigFile, updateMCPServer } from "./config-writer";
-import { resolveMCPChildCredentialPolicy } from "./config";
+import { loadAllMCPConfigs, resolveMCPChildCredentialPolicy } from "./config";
 import { MCPManager } from "./manager";
 import {
 	analyzeAuthError,
@@ -203,6 +204,8 @@ export interface FoundMcpServer {
  * user config under the same namespaced name; the native provider
  * (priority 100) shadows the discovered entry after the next reload.
  *
+ * Selected Coreforge project entries reuse the loader's exact-byte trust exception without writing the project definition.
+ *
  * `preferManager` flips the first step — but only for ACP-isolated managers:
  * ACP declares servers at `session/new` (source `provider: "acp"`), and
  * isolation means the manager entry is the server actually active while a
@@ -238,15 +241,44 @@ export async function findMcpServerForAuth(
 	const userPath = getMCPConfigPath("user", cwd);
 	const projectPath = getMCPConfigPath("project", cwd);
 
-	// `mcp.enableProjectConfig: false` opts the project out of project-scoped
-	// config at startup; the lookup must not resurrect an opted-out entry here
-	// (a reauth would write a credential binding for a server that never loads).
+	// Project files stay excluded unless the loader verifies the selected Coreforge source below.
 	const enableProjectConfig = options?.enableProjectConfig ?? true;
 	const [userConfig, projectConfig] = await Promise.all([
 		readMCPConfigFile(userPath),
 		enableProjectConfig ? readMCPConfigFile(projectPath) : Promise.resolve(null),
 	]);
 	if ((getActiveProfile() ?? "default") !== profileIdentity) throw new MCPOAuthCancelledError();
+
+	const runtimeSource = mcpManager?.getSource(name);
+	if (runtimeSource?.provider === COREFORGE_MCP_PROVIDER_ID && runtimeSource.level === "project") {
+		const selected = await loadAllMCPConfigs(cwd, {
+			enableProjectConfig,
+			discoveryProviders: [COREFORGE_MCP_PROVIDER_ID],
+			filterExa: false,
+		});
+		if ((getActiveProfile() ?? "default") !== profileIdentity) throw new MCPOAuthCancelledError();
+		const selectedSource = selected.sources[name];
+		const selectedConfig = selected.configs[name];
+		if (
+			!selectedSource ||
+			!selectedConfig ||
+			selectedSource.provider !== runtimeSource.provider ||
+			selectedSource.path !== runtimeSource.path ||
+			selectedSource.level !== runtimeSource.level ||
+			selectedSource.contentSha256 !== runtimeSource.contentSha256 ||
+			!matchingManagerServerConfig(mcpManager, name, selectedConfig)
+		)
+			return null;
+		return {
+			filePath: userPath,
+			scope: "user",
+			profileIdentity,
+			sourceLevel: runtimeSource.level,
+			source: runtimeSource,
+			config: selectedConfig,
+			discovered: true,
+		};
+	}
 
 	// Project wins over user on a name collision: runtime discovery enumerates
 	// project paths first and deduplicates first-wins, so the project entry is
@@ -874,6 +906,10 @@ export function persistMcpOAuthResult(
 
 export interface McpReauthOptions extends McpOAuthFlowPresentation {
 	authStorage: AuthStorage;
+	/** Effective selection from the existing config loader, including user enable/disable overrides. */
+	effectiveEnabled?: boolean;
+	/** Effective transport inferred by discovery without changing the raw source definition. */
+	effectiveTransport?: MCPServerConfig["type"];
 	/** Host cancellation; wired before the anonymous probe so the whole reauth is abortable. */
 	signal?: AbortSignal;
 	isCurrent?: () => boolean;
@@ -949,14 +985,17 @@ export async function reauthorizeMcpServer(
 		if (credentialPool.generation !== credentialGeneration) throw new MCPOAuthCancelledError();
 	};
 	assertCurrent();
-	if (found.config.enabled === false) {
+	if ((opts.effectiveEnabled ?? found.config.enabled) === false) {
 		throw new McpReauthRefusalError(`Server "${name}" is disabled. Run /mcp enable ${name} first.`);
 	}
 
 	const currentAuth = found.config.auth;
 	const baseConfig = stripMcpOAuthAuth(found.config);
 	const configLevel = (found.sourceLevel ?? found.scope) === "project" ? "project" : "user";
-	const runtimeBaseConfig = expandEnvVarsDeepForConfigLevel(baseConfig, configLevel);
+	const expandedBaseConfig = expandEnvVarsDeepForConfigLevel(baseConfig, configLevel);
+	const runtimeBaseConfig = opts.effectiveTransport
+		? ({ ...expandedBaseConfig, type: opts.effectiveTransport } as MCPServerConfig)
+		: expandedBaseConfig;
 	// Resolve endpoints first: this fails fast for stdio transports and
 	// probes http/sse with { oauth: false }, so nothing destructive has
 	// happened yet if the server turns out not to need (or support) OAuth.

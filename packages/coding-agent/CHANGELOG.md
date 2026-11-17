@@ -8,6 +8,7 @@
 
 ### Added
 
+- Authenticate selected hosted MCP servers from a sessionless terminal command with `mcp auth [server ...]`, passive `--check`, and deliberate `mcp reauth <server>`.
 - Native AWS approvals offer **Allow for the rest of this session** for later commands, profiles, and SSO renewal without saving a configuration grant.
 - Keep job widgets local by default. Remote spec authoring requires managed or runtime consent, current model and account admission, bounded redacted context, and originating-journal accounting.
 - Expose session-bound native MCP calls to extensions. Honor `exposeTools: false` without disabling server startup or discovery.
@@ -16,6 +17,9 @@
 
 ### Fixed
 
+- Preserve actionable MCP authentication readiness across asynchronous startup and late subscriptions. Offer Authenticate / Not now without cached tools, startup browsers, or editor focus changes.
+- Respect effective opt-in overlays during hosted OAuth while preserving raw managed definitions, profile bindings, and credential persistence.
+- Preserve inferred HTTP transport, raw environment placeholders, and exact project trust during OAuth recovery. Stop automatic reconnection retries for permission-only HTTP 403 failures.
 - Synchronize shell TERM-output qualification with a child release gate and controlled cancellation deadlines instead of wall-clock sleeps.
 - Synchronize session lease race qualification with an observed held lease before racing claims and probes.
 - Separate hosted Chromium readiness from connection deadlines, close timed-out qualification pipes before cleanup, and preserve startup failures.

@@ -116,11 +116,13 @@ import { hasNativeJudge } from "../judgment";
 import { LSP_STARTUP_EVENT_CHANNEL, type LspStartupEvent } from "../lsp/startup-events";
 import type { MCPAuthQueueEvent, MCPManager } from "../mcp";
 import {
+	formatMCPAuthRequiredMessage,
 	formatMCPConnectionStatusMessage,
 	isMcpConnectionStatusEvent,
 	MCP_CONNECTION_STATUS_EVENT_CHANNEL,
 	type McpConnectionFailure,
 	type McpConnectionStatusEvent,
+	type McpConnectionStatusSnapshot,
 } from "../mcp/startup-events";
 import { humanizePlanTitle, type PlanApprovalDetails, resolvePlanTitle } from "../plan-mode/approved-plan";
 import {
@@ -2042,7 +2044,8 @@ export class InteractiveMode implements InteractiveModeContext {
 	#mcpStatusOrder: string[] = [];
 	#mcpPendingServers = new Set<string>();
 	#mcpConnectedServers = new Set<string>();
-	#mcpFailedServers = new Map<string, { error: string; sourcePath?: string }>();
+	#mcpFailedServers = new Map<string, McpConnectionFailure>();
+	readonly #mcpAuthNotice = new AnchoredLiveContainer();
 	#mcpAuthActiveServer?: string;
 	#mcpAuthQueue: string[] = [];
 	#mcpAuthCompletedCount = 0;
@@ -2128,6 +2131,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			);
 			this.#eventBusUnsubscribers.push(
 				eventBus.on(MCP_CONNECTION_STATUS_EVENT_CHANNEL, data => {
+					if (this.mcpManager) return;
 					if (!isMcpConnectionStatusEvent(data)) {
 						logger.warn("Ignoring malformed mcp:connection-status event", {
 							data,
@@ -2313,6 +2317,12 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.collabController = new CollabController(this);
 		this.session.setPromptDropped?.(prompt => this.#restoreDroppedPrompt(prompt));
 		this.#observerRegistry = new SessionObserverRegistry();
+		if (mcpManager) {
+			const updateMcpReadiness = () =>
+				this.#handleMcpConnectionStatusSnapshot(mcpManager.getConnectionStatusSnapshot());
+			this.#eventBusUnsubscribers.push(mcpManager.addConnectionStatusListener(updateMcpReadiness));
+			updateMcpReadiness();
+		}
 	}
 
 	#handleJudgmentBatchProgress(progress: JudgmentBatchProgress): void {
@@ -2342,15 +2352,24 @@ export class InteractiveMode implements InteractiveModeContext {
 		if (requestRender) this.ui.requestRender();
 	}
 
+	#handleMcpConnectionStatusSnapshot(snapshot: McpConnectionStatusSnapshot): void {
+		this.#mcpStatusOrder = [
+			...snapshot.pendingServers,
+			...snapshot.connectedServers,
+			...snapshot.failedServers.map(failure => failure.serverName),
+		];
+		this.#mcpPendingServers = new Set(snapshot.pendingServers);
+		this.#mcpConnectedServers = new Set(snapshot.connectedServers);
+		this.#mcpFailedServers = new Map(snapshot.failedServers.map(failure => [failure.serverName, failure]));
+		this.#renderMcpConnectionStatus();
+	}
+
 	#handleMcpConnectionStatusEvent(event: McpConnectionStatusEvent): void {
 		if (cfgStartupQuiet.get(this.settings)) return;
 		if (event.type === "connecting") {
-			this.#mcpStatusOrder = [];
-			this.#mcpPendingServers.clear();
-			this.#mcpConnectedServers.clear();
-			this.#mcpFailedServers.clear();
 			for (const serverName of event.serverNames) {
 				this.#trackMcpStatusServer(serverName);
+				if (this.#mcpConnectedServers.has(serverName) || this.#mcpFailedServers.has(serverName)) continue;
 				this.#mcpPendingServers.add(serverName);
 			}
 		} else if (event.type === "reconnecting") {
@@ -2367,21 +2386,34 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.#mcpPendingServers.delete(event.serverName);
 			this.#mcpConnectedServers.delete(event.serverName);
 			this.#mcpFailedServers.delete(event.serverName);
-			return;
 		} else {
 			this.#trackMcpStatusServer(event.serverName);
 			this.#mcpPendingServers.delete(event.serverName);
 			this.#mcpConnectedServers.delete(event.serverName);
-			this.#mcpFailedServers.set(event.serverName, {
-				error: event.error,
-				sourcePath: event.sourcePath,
-			});
+			this.#mcpFailedServers.set(event.serverName, event);
 		}
+		this.#renderMcpConnectionStatus();
+	}
 
+	#renderMcpConnectionStatus(): void {
+		this.#mcpAuthNotice.disposeChildren();
+		if (cfgStartupQuiet.get(this.settings)) return;
+		const failedServers = this.#orderedMcpStatusFailures();
+		const needsSignIn = failedServers
+			.filter(failure => failure.authRequired && !failure.authDeferred)
+			.map(failure => failure.serverName);
+		if (needsSignIn.length > 0) {
+			this.#mcpAuthNotice.addChild(
+				new Text(formatMCPAuthRequiredMessage(needsSignIn), 1, 0).setStyleFn(message =>
+					theme.fg("warning", message),
+				),
+			);
+		}
+		this.ui.requestRender();
 		const message = formatMCPConnectionStatusMessage({
 			pendingServers: this.#orderedMcpStatusServers(this.#mcpPendingServers),
 			connectedServers: this.#orderedMcpStatusServers(this.#mcpConnectedServers),
-			failedServers: this.#orderedMcpStatusFailures(),
+			failedServers,
 		});
 		// Progress of every server connecting or failing: a toast per change
 		// is noise on a native terminal (Tern), so it stays in the ANSI transcript.
@@ -2401,7 +2433,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	#orderedMcpStatusFailures(): McpConnectionFailure[] {
 		return this.#mcpStatusOrder.flatMap(serverName => {
 			const failure = this.#mcpFailedServers.get(serverName);
-			return failure === undefined ? [] : [{ serverName, ...failure }];
+			return failure === undefined ? [] : [failure];
 		});
 	}
 
@@ -2582,6 +2614,7 @@ export class InteractiveMode implements InteractiveModeContext {
 				// Judge batches and automatic downloads stay editor-anchored and update
 				// independently of transcript output, directly above the working/throughput/title row.
 				this.progressHudContainer,
+				this.#mcpAuthNotice,
 				// Working loader / transient status sits below the sticky todo + subagent
 				// HUDs, just above the editor's hook-widget top margin — so it reads next to
 				// the prompt while keeping the one-line gap above the editor (the band
@@ -2619,6 +2652,7 @@ export class InteractiveMode implements InteractiveModeContext {
 					this.subagentContainer,
 					this.modelCycleContainer,
 					this.progressHudContainer,
+					this.#mcpAuthNotice,
 				],
 				// Natively the HUD pills lead the dock, queued messages sit between
 				// the working row and the composer, and the attachment chips live
@@ -2632,6 +2666,7 @@ export class InteractiveMode implements InteractiveModeContext {
 					this.modelCycleContainer,
 					this.deferredCommandContainer,
 					this.progressHudContainer,
+					this.#mcpAuthNotice,
 					this.statusContainer,
 					this.pendingMessagesContainer,
 					this.hookWidgetContainerAbove,

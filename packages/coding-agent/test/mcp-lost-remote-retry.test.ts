@@ -17,7 +17,7 @@
  * - a reconnect that never replaced the live connection (a declined auth
  *   challenge) does not schedule one that would.
  */
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -154,6 +154,93 @@ describe("MCP lost remote server retry schedule", () => {
 		await Bun.sleep(QUIET_MS);
 		expect(flaky.authRefusals).toBe(1);
 		expect(manager.getConnectionStatus("flaky")).not.toBe("connected");
+	});
+
+	it("stops retries on a formerly healthy server's permission denial and permits manual repair", async () => {
+		workDir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-mcp-permission-denied-"));
+		let forbidden = false;
+		let denials = 0;
+		const initializes = new Map<string, number>();
+		const server = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			async fetch(request) {
+				if (request.method === "DELETE") return new Response(null, { status: 202 });
+				if (request.method !== "POST") return new Response(null, { status: 405 });
+				const pathname = new URL(request.url).pathname;
+				if (pathname === "/restricted" && forbidden) {
+					denials += 1;
+					return new Response("tenant permission denied", {
+						status: 403,
+						headers: { "WWW-Authenticate": 'Bearer realm="tenant-permission"' },
+					});
+				}
+				const body = (await request.json()) as { id?: number; method?: string };
+				if (body.id === undefined) return new Response(null, { status: 202 });
+				let result: unknown;
+				if (body.method === "initialize") {
+					initializes.set(pathname, (initializes.get(pathname) ?? 0) + 1);
+					result = {
+						protocolVersion: "2025-03-26",
+						capabilities: { tools: {} },
+						serverInfo: { name: pathname, version: "1" },
+					};
+				} else if (body.method === "tools/list") {
+					result = { tools: [{ name: "ping", inputSchema: { type: "object", properties: {} } }] };
+				} else {
+					result = { content: [{ type: "text", text: `available ${pathname}` }] };
+				}
+				return Response.json({ jsonrpc: "2.0", id: body.id, result });
+			},
+		});
+		manager = new MCPManager(workDir, null, undefined, FAST);
+		const authorize = vi.fn(async () => undefined);
+		manager.setAuthHandler(authorize);
+		try {
+			await manager.connectServers(
+				{
+					restricted: { type: "http", url: `${server.url}restricted`, oauth: { clientId: "test-client" } },
+					healthy: { type: "http", url: `${server.url}healthy` },
+				},
+				{},
+				undefined,
+				0,
+			);
+			expect(manager.getConnectionStatus("restricted")).toBe("connected");
+			const healthyConnection = manager.getConnection("healthy");
+			forbidden = true;
+
+			expect(await manager.reconnectServer("restricted")).toBeNull();
+			// Fake timers cannot drive real fetch I/O; wait beyond every retry deadline to prove the schedule stopped.
+			await Bun.sleep(QUIET_MS);
+
+			expect(denials).toBe(1);
+			expect(manager.getConnectionStatus("restricted")).toBe("disconnected");
+			expect(manager.getConnectionStatusSnapshot().failedServers).toEqual([
+				expect.objectContaining({ serverName: "restricted", error: expect.stringContaining("HTTP 403") }),
+			]);
+			expect(manager.getConnectionStatusSnapshot().failedServers[0]?.authRequired).not.toBe(true);
+			expect(manager.getPendingAuthServers()).toEqual([]);
+			expect(authorize).not.toHaveBeenCalled();
+			expect(manager.getConnection("healthy")).toBe(healthyConnection);
+			expect((await manager.callTool("healthy", "ping")).content).toEqual([
+				{ type: "text", text: "available /healthy" },
+			]);
+
+			forbidden = false;
+			await Bun.sleep(QUIET_MS);
+			expect(manager.getConnectionStatus("restricted")).toBe("disconnected");
+			expect(initializes.get("/restricted")).toBe(1);
+			expect(await manager.reconnectServer("restricted", { manual: true })).not.toBeNull();
+			expect((await manager.callTool("restricted", "ping")).content).toEqual([
+				{ type: "text", text: "available /restricted" },
+			]);
+			expect(initializes.get("/healthy")).toBe(1);
+			expect(authorize).not.toHaveBeenCalled();
+		} finally {
+			await manager.disconnectAll();
+			server.stop(true);
+		}
 	});
 
 	it("does not schedule a server that never connected", async () => {

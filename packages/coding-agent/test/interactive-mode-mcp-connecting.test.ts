@@ -3,6 +3,9 @@ import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { MCPManager } from "@oh-my-pi/pi-coding-agent/mcp/manager";
+import * as mcpClient from "@oh-my-pi/pi-coding-agent/mcp/client";
+import * as oauthFlow from "@oh-my-pi/pi-coding-agent/mcp/oauth-flow";
 import {
 	MCP_CONNECTION_STATUS_EVENT_CHANNEL,
 	type McpConnectionStatusEvent,
@@ -24,6 +27,7 @@ describe("InteractiveMode MCP connection status", () => {
 	let session: AgentSession;
 	let tempDir: TempDir;
 	let harness: TspHarness | undefined;
+	let manager: MCPManager | undefined;
 
 	const transcript = (): string => Bun.stripANSI(mode.chatContainer.render(160).join("\n"));
 	const emit = (event: McpConnectionStatusEvent): void => {
@@ -67,6 +71,8 @@ describe("InteractiveMode MCP connection status", () => {
 	afterEach(async () => {
 		harness?.stop();
 		harness = undefined;
+		await manager?.disconnectAll();
+		manager = undefined;
 		mode?.stop();
 		vi.restoreAllMocks();
 		await session?.dispose();
@@ -133,6 +139,69 @@ describe("InteractiveMode MCP connection status", () => {
 		expect(transcript()).toContain("retained-error-control");
 		expect(transcript()).toContain("retry");
 		expect(transcript()).not.toContain("retired-error-control");
+	});
+
+	it("keeps sign-in recovery visible on native surfaces without replacing input or opening a selector", async () => {
+		await mode.init();
+		harness = await TspHarness.start(tui => tui.setFrameProvider(mode.composer));
+		mode.editor.setText("unfinished-draft-control");
+		const focus = mode.ui.getFocused();
+		const selector = vi.spyOn(mode, "showHookSelector");
+		emit({
+			type: "failed",
+			serverName: "sign-in-control",
+			error: `HTTP 401: ${"long diagnostic ".repeat(40)}hidden-diagnostic-tail`,
+			authRequired: true,
+		});
+		mode.showStatus("unrelated-status-control");
+		await harness.render();
+		const notice = harness.find(node => node.k === "text" && JSON.stringify(node.p).includes("sign-in-control"));
+		expect(JSON.stringify(notice?.p)).toContain("/mcp");
+		expect(JSON.stringify(notice?.p)).not.toContain("hidden-diagnostic-tail");
+		expect(selector).not.toHaveBeenCalled();
+		expect(mode.editor.getText()).toBe("unfinished-draft-control");
+		expect(mode.ui.getFocused()).toBe(focus);
+
+		emit({ type: "connecting", serverNames: ["sign-in-control", "healthy-sibling-control"] });
+		emit({ type: "connected", serverName: "healthy-sibling-control" });
+		await harness.render();
+		expect(
+			harness.find(node => node.k === "text" && JSON.stringify(node.p).includes("sign-in-control")),
+		).toBeDefined();
+		emit({ type: "connected", serverName: "sign-in-control" });
+		await harness.render();
+		expect(
+			harness.find(node => node.k === "text" && JSON.stringify(node.p).includes("sign-in-control")),
+		).toBeUndefined();
+	});
+
+	it("hydrates cold failures before subscription and defers sign-in without disabling the integration", async () => {
+		vi.spyOn(mcpClient, "connectToServer").mockRejectedValue(
+			new Error('HTTP 401: authentication required [WWW-Authenticate: Bearer realm="hosted"]'),
+		);
+		const login = vi
+			.spyOn(oauthFlow.MCPOAuthFlow.prototype, "login")
+			.mockRejectedValue(new Error("Unexpected login"));
+		manager = new MCPManager(tempDir.path());
+		await manager.connectServers({ hosted: { type: "http", url: "https://hosted.test/mcp" } }, {}, undefined, 0);
+		await manager.waitForStartup(0);
+		expect(manager.getTools()).toEqual([]);
+		mode.stop();
+		mode = new InteractiveMode(session, "test", undefined, () => {}, [], manager, eventBus);
+		vi.spyOn(mode.statusLine, "watchBranch").mockImplementation(() => {});
+		await mode.init();
+		harness = await TspHarness.start(tui => tui.setFrameProvider(mode.composer));
+		await harness.render();
+		expect(harness.find(node => node.k === "text" && JSON.stringify(node.p).includes("hosted"))).toBeDefined();
+		const selector = vi.spyOn(mode, "showHookSelector").mockResolvedValue("Not now");
+		await mode.handleMCPCommand("/mcp");
+		await harness.render();
+		expect(selector).toHaveBeenCalledTimes(1);
+		expect(harness.find(node => node.k === "text" && JSON.stringify(node.p).includes("hosted"))).toBeUndefined();
+		expect(manager.getServerConfig("hosted")?.enabled).not.toBe(false);
+		expect(manager.getPendingAuthServers()).toEqual(["hosted"]);
+		await expect(manager.waitForConnection("hosted")).rejects.toThrow("MCP server not connected");
+		expect(login).not.toHaveBeenCalled();
 	});
 
 	it("preserves the last valid status when a malformed event follows", () => {

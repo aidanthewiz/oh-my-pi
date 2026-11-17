@@ -13,6 +13,8 @@ export type McpConnectionFailure = {
 	serverName: string;
 	error: string;
 	sourcePath?: string;
+	authRequired?: boolean;
+	authDeferred?: boolean;
 };
 
 export type McpConnectionStatusEvent =
@@ -55,12 +57,18 @@ function sanitizeMcpStatusError(error: string): string {
 export function formatMCPConnectingMessage(serverNames: readonly string[]): string {
 	return `Connecting to MCP servers: ${formatServerList(serverNames)}…`;
 }
+export function formatMCPAuthRequiredMessage(serverNames: readonly string[]): string {
+	return serverNames.length === 0
+		? ""
+		: `MCP sign-in required: ${formatServerList(serverNames)}. Run /mcp to authenticate or choose Not now.`;
+}
 
-function formatFailedServer({ serverName, error, sourcePath }: McpConnectionFailure): string {
+function formatFailedServer({ serverName, error, sourcePath, authRequired }: McpConnectionFailure): string {
 	const source = sourcePath
 		? ` [config: ${sanitizeMcpStatusText(shortenPath(sourcePath), TRUNCATE_LENGTHS.CONTENT)}]`
 		: "";
-	return `${sanitizeMcpServerName(serverName)}${source}: ${sanitizeMcpStatusError(error)}`;
+	const remedy = authRequired ? "Sign-in required. Run /mcp to authenticate. " : "";
+	return `${sanitizeMcpServerName(serverName)}${source}: ${remedy}${sanitizeMcpStatusError(error)}`;
 }
 
 export function formatMCPConnectionStatusMessage(snapshot: McpConnectionStatusSnapshot): string {
@@ -115,7 +123,9 @@ export function isMcpConnectionStatusEvent(data: unknown): data is McpConnection
 			return (
 				typeof data.serverName === "string" &&
 				typeof data.error === "string" &&
-				(data.sourcePath === undefined || typeof data.sourcePath === "string")
+				(data.sourcePath === undefined || typeof data.sourcePath === "string") &&
+				(data.authRequired === undefined || typeof data.authRequired === "boolean") &&
+				(data.authDeferred === undefined || typeof data.authDeferred === "boolean")
 			);
 		default:
 			return false;
