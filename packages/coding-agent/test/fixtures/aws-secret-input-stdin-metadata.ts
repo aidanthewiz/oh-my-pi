@@ -553,14 +553,15 @@ function constrainedStdinSocketpair() {
 				}
 				return endResult;
 			} catch (error) {
+				let failure = error;
 				try {
 					closeWriter();
 				} catch (closeError) {
-					error = closeError;
+					failure = closeError;
 				}
 				endFailed = true;
-				endFailure = error;
-				throw error;
+				endFailure = failure;
+				throw failure;
 			}
 		};
 		return {
@@ -821,15 +822,20 @@ export function createStdinProducerWitnessObserver(): StdinProducerWitnessObserv
 		async end() {
 			try {
 				if (stress) {
+					let readerFailed = false;
+					let readerFailure: unknown;
 					try {
 						stress.closeReader();
-					} finally {
-						try {
-							await stress.endWriter();
-						} catch (error) {
-							if (!stress.writerClosed()) throw error;
-						}
+					} catch (error) {
+						readerFailed = true;
+						readerFailure = error;
 					}
+					try {
+						await stress.endWriter();
+					} catch (error) {
+						if (!stress.writerClosed()) throw error;
+					}
+					if (readerFailed) throw readerFailure;
 					if (!stress.readerClosed() || !stress.writerClosed()) throw new Error("STDIN_STRESS_OWNERSHIP_LOST");
 				}
 			} finally {

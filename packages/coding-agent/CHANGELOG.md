@@ -9,6 +9,7 @@
 ### Added
 
 - Add generic `xd://aws` secret delivery through finite stdin to an exact-approved local process on Darwin and Linux. Pin the AWS identity and secret version, verify live host/worker capabilities, preserve AWS and receiver guards, and return bounded raw consumer output. The native route supports existing static profiles and unexpired SSO without automatic sign-in or retry; cancellation reports uncertain writes and reaps owned processes.
+- Emit observation-only deferred tool results for final Bash job outcomes, including eval calls and completion after an agent abort. Retain the original conversation, input and MCP identity without starting model continuations.
 - Native AWS approvals offer **Allow for the rest of this session** for later commands, profiles, and SSO renewal without saving a configuration grant.
 - Keep job widgets local by default. Remote spec authoring requires managed or runtime consent, current model and account admission, bounded redacted context, and originating-journal accounting.
 - Expose session-bound native MCP calls to extensions. Honor `exposeTools: false` without disabling server startup or discovery.
