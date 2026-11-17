@@ -60,6 +60,7 @@ interface OAuthDiscoveryHints {
 	oauth: OAuthEndpoints | null;
 	authServerUrl?: string;
 	resourceMetadataUrl?: string;
+	wwwAuthenticate?: string;
 	scopes?: string;
 }
 
@@ -79,9 +80,17 @@ export function preserveOAuthDiscoveryHints(error: Error, source: Error): void {
 			previous?.resourceMetadataUrl ??
 			source.message.match(/resource_metadata\s*=\s*"([^"]+)"/i)?.[1] ??
 			error.message.match(/resource_metadata\s*=\s*"([^"]+)"/i)?.[1],
+		wwwAuthenticate: extractOAuthChallengeHeader(source) ?? extractOAuthChallengeHeader(error),
 		scopes: extractOAuthChallengeScopes(source) ?? extractOAuthChallengeScopes(error),
 	};
 	oauthDiscoveryHints.set(error, hints);
+}
+
+export function extractOAuthChallengeHeader(error: Error): string | undefined {
+	return (
+		oauthDiscoveryHints.get(error)?.wwwAuthenticate ??
+		error.message.match(/\[WWW-Authenticate:\s*([\s\S]*?)(?:;\s*Mcp-Auth-Server:|\]\s*$)/i)?.[1]?.trim()
+	);
 }
 
 export function extractMcpAuthServerUrl(error: Error, serverUrl?: string): string | undefined {

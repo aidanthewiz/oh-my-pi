@@ -371,7 +371,7 @@ export function stripMcpOAuthAuth(config: MCPServerConfig): MCPServerConfig {
  */
 export function clearMcpClientAuthSurface(config: MCPServerConfig): MCPServerConfig {
 	const next = stripMcpOAuthAuth(config);
-	if (next.type !== "http" && next.type !== "sse") return next;
+	if (next.type === "stdio" || !("url" in next) || !next.headers) return next;
 	const headers: Record<string, string> = { ...next.headers };
 	for (const header of Object.keys(headers)) {
 		if (header.toLowerCase() === "authorization") delete headers[header];

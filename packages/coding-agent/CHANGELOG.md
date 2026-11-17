@@ -17,9 +17,9 @@
 
 ### Fixed
 
-- Preserve actionable MCP authentication readiness across asynchronous startup and late subscriptions. Offer Authenticate / Not now without cached tools, startup browsers, or editor focus changes.
+- Preserve actionable MCP authentication readiness across asynchronous startup, late subscriptions, and truncated HTTP diagnostics. Offer Authenticate / Not now without cached tools, startup browsers, or editor focus changes.
 - Respect effective opt-in overlays during hosted OAuth while preserving raw managed definitions, profile bindings, and credential persistence.
-- Preserve inferred HTTP transport, raw environment placeholders, and exact project trust during OAuth recovery. Stop automatic reconnection retries for permission-only HTTP 403 failures.
+- Preserve inferred HTTP transport, raw environment placeholders, and exact project trust during OAuth recovery. Replace stale Authorization headers in URL-only user definitions without adding unrelated fields. Stop automatic reconnection retries for permission-only HTTP 403 failures.
 - Synchronize shell TERM-output qualification with a child release gate and controlled cancellation deadlines instead of wall-clock sleeps.
 - Synchronize session lease race qualification with an observed held lease before racing claims and probes.
 - Separate hosted Chromium readiness from connection deadlines, close timed-out qualification pipes before cleanup, and preserve startup failures.

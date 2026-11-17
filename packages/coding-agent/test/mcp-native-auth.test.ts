@@ -397,6 +397,36 @@ describe.skipIf(process.platform === "win32")("native MCP auth command", () => {
 		30_000,
 	);
 
+	test.each(["auth", "reauth"] as const)(
+		"%s replaces stale URL-only client headers without persisting inferred transport",
+		async action => {
+			fixture = oauthServer();
+			const raw = {
+				url: `\${MCP_NATIVE_AUTH_URL}`,
+				headers: { aUtHoRiZaTiOn: "synthetic-expired-client", "X-Route": "tenant-a" },
+				oauth: fixture.config.oauth,
+			};
+			await configure({ mcpServers: { synthetic: raw } });
+			const result = await run([action, "synthetic"], {
+				tty: true,
+				freshManager: true,
+				env: { MCP_NATIVE_AUTH_URL: fixture.url },
+			});
+			expect(result.exitCode, result.stderr + result.stdout).toBe(0);
+			expect(result.stdout).toContain('FRESH_CONNECTION=[{"type":"text","text":"native-grant-1"}]');
+			const saved = JSON.parse(await fs.readFile(path.join(agentDir, "mcp.json"), "utf8")).mcpServers.synthetic;
+			expect(saved.url).toBe(raw.url);
+			expect(Object.hasOwn(saved, "type")).toBe(false);
+			expect(saved.headers).toEqual({ "X-Route": "tenant-a" });
+			expect(saved.auth).toMatchObject({
+				type: "oauth",
+				credentialId: mcpOAuthCredentialId(fixture.url, "default"),
+			});
+			expect(fixture.handshakes).toContain("Bearer native-grant-1");
+		},
+		30_000,
+	);
+
 	test.each(["expiring", "rejected"] as const)(
 		"refreshes a %s grant without opening a browser",
 		async condition => {

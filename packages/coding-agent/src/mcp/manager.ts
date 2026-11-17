@@ -43,7 +43,7 @@ import {
 	refreshStoredManagedMcpOAuthCredential,
 } from "./oauth-credentials";
 import type { MCPStoredOAuthCredential } from "./oauth-flow";
-import { extractMcpAuthServerUrl, extractOAuthEndpoints } from "./oauth-discovery";
+import { extractMcpAuthServerUrl, extractOAuthChallengeHeader, extractOAuthEndpoints } from "./oauth-discovery";
 import type { MCPProjectTrustHandler } from "./project-trust";
 import type { McpConnectionFailure, McpConnectionStatusEvent, McpConnectionStatusSnapshot } from "./startup-events";
 import { resolveMCPStartupTimeoutMs } from "./timeout";
@@ -97,11 +97,9 @@ function getInitialAuthChallenge(error: unknown, config: MCPServerConfig): MCPAu
 	const message = error instanceof Error ? error.message : String(error);
 	const status = message.match(/^HTTP (401|403):/i)?.[1];
 	if (!status) return undefined;
-	const wwwAuthenticate = message
-		.match(/\[WWW-Authenticate:\s*([\s\S]*?)(?:;\s*Mcp-Auth-Server:|\]\s*$)/i)?.[1]
-		?.trim();
-	const bearerChallenge = wwwAuthenticate !== undefined && /\bBearer\b/i.test(wwwAuthenticate);
 	const authError = error instanceof Error ? error : new Error(message);
+	const wwwAuthenticate = extractOAuthChallengeHeader(authError);
+	const bearerChallenge = wwwAuthenticate !== undefined && /\bBearer\b/i.test(wwwAuthenticate);
 	const oauthHint = extractOAuthEndpoints(authError) || extractMcpAuthServerUrl(authError, config.url);
 	const configuredOAuth = config.oauth !== undefined || config.auth?.type === "oauth";
 	if (

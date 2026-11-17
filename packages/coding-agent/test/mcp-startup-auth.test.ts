@@ -33,6 +33,7 @@ function installMcpFetch(
 		failTools?: boolean;
 		authStatus?: number;
 		authMethod?: "initialize" | "tools/list";
+		authBody?: string;
 		tools?: MCPToolDefinition[];
 	},
 ) {
@@ -59,7 +60,7 @@ function installMcpFetch(
 			) {
 				failedInitializations.add(url);
 				const wwwAuthenticate = authHeaders.get(url);
-				return new Response(JSON.stringify({ error: "invalid_token" }), {
+				return new Response(options?.authBody ?? JSON.stringify({ error: "invalid_token" }), {
 					status: options?.authStatus ?? 401,
 					headers: {
 						"Content-Type": "application/json",
@@ -167,7 +168,11 @@ describe("MCP startup OAuth", () => {
 					[SENTRY_URL, 'Bearer resource_metadata="https://auth.test/.well-known/oauth-protected-resource"'],
 				]),
 				true,
-				{ authMethod, tools: [{ name: "lookup", inputSchema: { type: "object", properties: {} } }] },
+				{
+					authMethod,
+					authBody: JSON.stringify({ error: "invalid_token", details: "x".repeat(2_048) }),
+					tools: [{ name: "lookup", inputSchema: { type: "object", properties: {} } }],
+				},
 			);
 			const handler = vi.fn(async () => ({ ...config, headers: { Authorization: "Bearer fresh-token" } }));
 			manager.setAuthHandler(handler);
@@ -240,6 +245,7 @@ describe("MCP startup OAuth", () => {
 		const config: MCPHttpServerConfig = row.configured ? httpConfig(SENTRY_URL) : { type: "http", url: SENTRY_URL };
 		installMcpFetch(new Set([SENTRY_URL]), row.challenge ? new Map([[SENTRY_URL, row.challenge]]) : new Map(), true, {
 			authStatus: row.status,
+			authBody: JSON.stringify({ error: "invalid_token", details: "x".repeat(2_048) }),
 		});
 		const handler = vi.fn(async () => config);
 		manager.setAuthHandler(handler);
