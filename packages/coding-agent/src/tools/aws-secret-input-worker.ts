@@ -1,3 +1,5 @@
+import { dlopen, FFIType, toArrayBuffer } from "bun:ffi";
+import { Process } from "@oh-my-pi/pi-natives";
 import stsPackage from "@aws-sdk/client-sts/package.json" with { type: "json" };
 import secretPackage from "@aws-sdk/client-secrets-manager/package.json" with { type: "json" };
 import ssoPackage from "@aws-sdk/client-sso/package.json" with { type: "json" };
@@ -47,6 +49,67 @@ function loadedCapability() {
 		throw new AwsSecretInputFailure("CAPABILITY_INCOMPATIBLE");
 	return AWS_SECRET_INPUT_CAPABILITY;
 }
+
+interface PrivateWorkerReaper {
+	reap(): Promise<void>;
+	close(): void;
+}
+
+function privateWorkerReaper(): PrivateWorkerReaper | undefined {
+	if (process.platform !== "linux") return undefined;
+	if (!process.connected || typeof process.send !== "function")
+		throw new AwsSecretInputFailure("CAPABILITY_INCOMPATIBLE");
+	const symbols = {
+		prctl: { args: [FFIType.i32, FFIType.u64, FFIType.u64, FFIType.u64, FFIType.u64], returns: FFIType.i32 },
+		waitpid: { args: [FFIType.i32, FFIType.ptr, FFIType.i32], returns: FFIType.i32 },
+		__errno_location: { args: [], returns: FFIType.ptr },
+	} as const;
+	const musl = process.arch === "arm64" ? "aarch64" : process.arch === "x64" ? "x86_64" : undefined;
+	for (const name of ["libc.so.6", "libc.so", ...(musl ? [`/lib/ld-musl-${musl}.so.1`] : [])]) {
+		const library = (() => {
+			try {
+				return dlopen(name, symbols);
+			} catch {
+				return undefined;
+			}
+		})();
+		if (!library) continue;
+		if (library.symbols.prctl(36, 1, 0, 0, 0) !== 0) {
+			library.close();
+			continue;
+		}
+		const root = Process.fromPid(process.pid);
+		if (!root) {
+			library.close();
+			throw new AwsSecretInputFailure("CAPABILITY_INCOMPATIBLE");
+		}
+		return {
+			async reap(): Promise<void> {
+				const deadline = Date.now() + 5_000;
+				for (;;) {
+					for (const child of root.children()) child.killTree(9);
+					let pid;
+					do {
+						pid = library.symbols.waitpid(-1, null, 1);
+					} while (pid > 0);
+					if (pid < 0) {
+						const address = library.symbols.__errno_location();
+						if (!address) throw new AwsSecretInputFailure("WORKER_FAILED");
+						const errno = new Int32Array(toArrayBuffer(address, 0, 4))[0];
+						if (errno === 10 && root.children().length === 0) return;
+						if (errno !== 4 && errno !== 10) throw new AwsSecretInputFailure("WORKER_FAILED");
+					}
+					if (Date.now() >= deadline) throw new AwsSecretInputFailure("WORKER_FAILED");
+					await Bun.sleep(5);
+				}
+			},
+			close() {
+				library.close();
+			},
+		};
+	}
+	throw new AwsSecretInputFailure("CAPABILITY_INCOMPATIBLE");
+}
 export async function startAwsSecretInputWorker(dependencies: AwsSecretInputScopeDependencies = {}): Promise<void> {
 	const controller = new AbortController();
 	const pending = new Map<
@@ -58,6 +121,7 @@ export async function startAwsSecretInputWorker(dependencies: AwsSecretInputScop
 	let started = false;
 	let completed = false;
 	let registration: { resolve: () => void; reject: (error: AwsSecretInputFailure) => void } | undefined;
+	let reaper: PrivateWorkerReaper | undefined;
 	const send = async (message: AwsSecretInputWorkerOutbound): Promise<void> => {
 		if (!process.send || !process.connected) throw new AwsSecretInputFailure("CANCELLED");
 		const { promise, resolve, reject } = Promise.withResolvers<void>();
@@ -206,9 +270,15 @@ export async function startAwsSecretInputWorker(dependencies: AwsSecretInputScop
 					},
 				);
 				assertAwsSecretInputResult(result, false);
+				await reaper?.reap();
 				await send({ type: "result", value: result });
 			} catch (error) {
-				const code = safeAwsSecretInputFailure(error);
+				let code = safeAwsSecretInputFailure(error);
+				try {
+					await reaper?.reap();
+				} catch {
+					code = "WORKER_FAILED";
+				}
 				try {
 					await send({
 						type: "failure",
@@ -227,6 +297,7 @@ export async function startAwsSecretInputWorker(dependencies: AwsSecretInputScop
 	process.on("uncaughtException", cancel);
 	process.on("unhandledRejection", cancel);
 	try {
+		reaper = privateWorkerReaper();
 		await send({
 			type: "capabilities",
 			value: loadedCapability(),
@@ -245,6 +316,7 @@ export async function startAwsSecretInputWorker(dependencies: AwsSecretInputScop
 	process.off("SIGINT", cancel);
 	process.off("uncaughtException", cancel);
 	process.off("unhandledRejection", cancel);
+	reaper?.close();
 	if (process.connected) process.disconnect?.();
 }
 if (import.meta.main)

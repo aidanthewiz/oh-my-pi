@@ -2187,13 +2187,15 @@ export class ExtensionRunner {
 	 * Emit `tool_result` to every subscribed extension. Returns the full
 	 * `content`/`details`/`isError` triple only when a handler modified the
 	 * result; joined `additionalContext` rides along whenever any handler set it.
+	 * Deferred completions are isolated notifications; patches and context are ignored.
 	 */
 	async emitToolResult(
 		event: ToolResultEvent,
 		agent?: ExtensionAgentIdentity,
 	): Promise<ToolResultEventResult | undefined> {
 		const ctx = this.createContext(undefined, undefined, agent);
-		const currentEvent: ToolResultEvent = { ...event };
+		const deferred = event.completion === "deferred";
+		const currentEvent: ToolResultEvent = deferred ? structuredClone(event) : { ...event };
 		let modified = false;
 		const contexts: string[] = [];
 
@@ -2205,12 +2207,12 @@ export class ExtensionRunner {
 			for (const handler of handlers) {
 				const handlerResult = (await this.#runHandlerWithTimeout(
 					handler,
-					currentEvent,
+					deferred ? structuredClone(currentEvent) : currentEvent,
 					ctx,
 					ext,
 					extensionHandlerTimeoutMs,
 				)) as ToolResultEventResult | undefined;
-				if (!handlerResult) continue;
+				if (deferred || !handlerResult) continue;
 
 				if (handlerResult.content !== undefined) {
 					currentEvent.content = handlerResult.content;

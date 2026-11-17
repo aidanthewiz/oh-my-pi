@@ -9,6 +9,7 @@
 ### Added
 
 - Add generic `xd://aws` secret delivery through finite stdin to an exact-approved local process on Darwin and Linux. Pin the AWS identity and secret version, verify live host/worker capabilities, preserve AWS and receiver guards, and return bounded raw consumer output. The native route supports existing static profiles and unexpired SSO without automatic sign-in or retry; cancellation reports uncertain writes and reaps owned processes.
+- Emit observation-only deferred tool results for final Bash job outcomes, including eval calls and completion after an agent abort. Retain the original conversation, input and MCP identity without starting model continuations.
 - Native AWS approvals offer **Allow for the rest of this session** for later commands, profiles, and SSO renewal without saving a configuration grant.
 - Keep job widgets local by default. Remote spec authoring requires managed or runtime consent, current model and account admission, bounded redacted context, and originating-journal accounting.
 - Expose session-bound native MCP calls to extensions. Honor `exposeTools: false` without disabling server startup or discovery.
@@ -20,13 +21,18 @@
 - Expose the full registered AWS JSON input schema through `xd://aws/schema`. Require complete schema and `aws-secret-input/v1` capability comparison before authentication or approval. Preserve native session-disposal and cancellation cleanup. Source delivery does not publish an engine or adopt an installed runtime.
 - Require actual native invocation ownership under `native-tool-host/v2` for AWS secret input. Preserve native Agent dispatch and native Write → `xd://aws` with intrinsic cleanup. Reject JavaScript/Python Eval and naked SDK/direct execution before approval UI, provider work, or receiver execution, even through registered wrappers or nested Write calls. Capability discovery does not authorize unsupported paths. Preserve authorized receiver reads and writes, bounded raw output, and normal retention.
 - Accept copied hashline Write paths and content, inner intent fields, and both active and mounted AWS presentations. Preserve exact normalized input and live native invocation ownership.
+- Deliver private AWS stdin through an actual anonymous pipe or unnamed Unix stream under delivery policy v3. Bound writes, join flush and EOF, reject file-backed stdin optimizations, and refuse previous or mixed delivery-policy/fingerprint tuples.
+- Read socket-backed stdin directly in native preload qualification. Preserve exact-byte comparison and real non-Bun receivers on Linux.
+- Enable native WebMCP on current Chrome while preserving legacy testing flags.
+- Keep Python zoom qualification JSON within bounded output columns when temporary paths are long.
+- Apply normalized device authorization before capability probes, including policy revocation during approval. Preserve active and mounted AWS dispatch and exact native invocation ownership.
+- Join owned process cleanup using kernel creation identities and actual reaping. Preserve a pinned Darwin group anchor until acknowledged retirement, and reject unknown or replaced receiver identities.
 - Preserve constructor-registered tool session callbacks so active native scopes stop when the SDK adopts or forks a session.
 - Acquire session cleanup ownership before forwarding constructor callbacks. Failed startup keeps pooled credential restrictions until cleanup settles and preserves unrelated live roots.
 - Settle restored session generations before rollback reconciliation without declaring transition readiness or skipping native cleanup.
 - Handle ordinary synchronous disposer returns without losing subsequent session cleanup. Continue to await native cancellation and asynchronous disposers.
 - Reap known receiver identities independently after guardian loss. Preserve unproved ownership as `WORKER_FAILED` through cancellation so later handoffs stay blocked.
-- Require `finite-stdin-owned-process-group/v3` for anonymous-stream secret input. Reject the previous delivery capability and mixed policy/fingerprint tuples during preflight.
-- Deliver owned secret stdin through an anonymous Unix stream instead of Bun's Linux TypedArray memfd transport. Bound writes, send EOF, and join the writer during early exit or cancellation. Preserve receiver refusal on `EPIPE` or `ECONNRESET`; cancelled write callbacks require a matching socket error. Verify Linux descriptor aliases by their kernel socket identities.
+- Compare Linux descriptor aliases with their exact kernel identities. Keep unknown or conflicting descriptor snapshots unproved.
 - Keep committed-session events and transcript recording connected when cleanup rejects. Retire outgoing messages at transcript commit and propagate cleanup failures without carrying an old aside into the new conversation.
 - Synchronize shell TERM-output qualification with a child release gate and controlled cancellation deadlines instead of wall-clock sleeps.
 - Synchronize session lease race qualification with an observed held lease before racing claims and probes.

@@ -1,3 +1,6 @@
+import { dlopen, FFIType, ptr } from "bun:ffi";
+import * as fs from "node:fs";
+import * as path from "node:path";
 import * as net from "node:net";
 import { LIFECYCLE_FAILURE, lifecycleContainsSensitive } from "./aws-secret-input-lifecycle-values";
 import type { StdinPrivateChannelEvidence, StdinProducerWitness } from "./aws-secret-input-stdin-metadata";
@@ -17,24 +20,108 @@ export interface AwsSecretInputLifecycleDescriptor extends AwsSecretInputLifecyc
 export function measureAwsSecretInputLifecycleDescriptors(
 	descriptors: readonly AwsSecretInputLifecycleDescriptorIdentity[],
 ): AwsSecretInputLifecycleDescriptor[] {
-	const aliases = new Map<string, number[]>();
+	const identities = new Map<string, AwsSecretInputLifecycleDescriptorIdentity[]>();
 	for (const descriptor of descriptors) {
 		const key = `${descriptor.dev}:${descriptor.ino}`;
-		const group = aliases.get(key) ?? [];
-		group.push(descriptor.fd);
-		aliases.set(key, group);
+		identities.set(key, [...(identities.get(key) ?? []), descriptor]);
 	}
-	return descriptors.map(descriptor => ({
-		...descriptor,
-		aliases: aliases.get(`${descriptor.dev}:${descriptor.ino}`)!,
-		measurable:
-			descriptor.dev !== "0" &&
-			descriptor.ino !== "0" &&
-			(descriptor.kind !== "socket" ||
-				(process.platform === "linux"
-					? descriptor.target === `socket:[${descriptor.ino}]`
-					: aliases.get(`${descriptor.dev}:${descriptor.ino}`)?.length === 1)),
-	}));
+	const result: AwsSecretInputLifecycleDescriptor[] = [];
+	for (const group of identities.values()) {
+		const first = group[0]!;
+		const kernelTarget = /^(socket|pipe):\[([1-9][0-9]*)\]$/u.exec(first.target);
+		const kernelIdentity =
+			kernelTarget !== null &&
+			kernelTarget[1] === first.kind &&
+			kernelTarget[2] === first.ino &&
+			group.every(descriptor => descriptor.kind === first.kind && descriptor.target === first.target);
+		const measurable =
+			first.dev !== "0" &&
+			first.ino !== "0" &&
+			(first.kind === "socket" || first.kind === "pipe" ? kernelIdentity : group.length === 1);
+		if (measurable && kernelIdentity) {
+			result.push({ ...first, measurable: true, aliases: group.slice(1).map(descriptor => descriptor.fd) });
+		} else {
+			for (const descriptor of group) result.push({ ...descriptor, measurable, aliases: [] });
+		}
+	}
+	return result;
+}
+
+export function snapshotAwsSecretInputLifecycleDescriptors(pid = process.pid): {
+	descriptors: AwsSecretInputLifecycleDescriptor[];
+	available: boolean;
+} {
+	if (pid !== process.pid && process.platform !== "linux") return { descriptors: [], available: false };
+	const directory = process.platform === "linux" ? `/proc/${pid}/fd` : "/dev/fd";
+	const descriptors: AwsSecretInputLifecycleDescriptorIdentity[] = [];
+	const unavailable = new Set<number>();
+	let available = true;
+	const controlPath = path.join(process.cwd(), "aws-secret-input-lifecycle-control-fd");
+	let controlStat: fs.BigIntStats | undefined;
+	try {
+		controlStat = fs.statSync(controlPath, { bigint: true });
+	} catch {}
+	try {
+		const entries = fs.readdirSync(directory);
+		for (const name of entries) {
+			const fd = Number(name);
+			if (!Number.isSafeInteger(fd) || fd < 3) continue;
+			try {
+				const filename = path.join(directory, name);
+				const stat =
+					pid === process.pid ? fs.fstatSync(fd, { bigint: true }) : fs.statSync(filename, { bigint: true });
+				let target = "";
+				try {
+					target = fs.readlinkSync(filename);
+				} catch {
+					if (process.platform === "linux") throw new Error("LIFECYCLE_DESCRIPTOR_TARGET_UNAVAILABLE");
+				}
+				if (process.platform === "linux" && fs.readlinkSync(filename) !== target) available = false;
+				if (controlStat?.dev === stat.dev && controlStat.ino === stat.ino) target = controlPath;
+				descriptors.push({
+					fd,
+					dev: String(stat.dev),
+					ino: String(stat.ino),
+					target,
+					kind: stat.isSocket() ? "socket" : stat.isFIFO() ? "pipe" : stat.isFile() ? "file" : "other",
+				});
+			} catch (error) {
+				if (
+					error &&
+					typeof error === "object" &&
+					"code" in error &&
+					(error.code === "ENOENT" || error.code === "EBADF")
+				)
+					unavailable.add(fd);
+				else available = false;
+			}
+		}
+		// The directory iterator closes its own descriptor before this snapshot can inspect it.
+		for (const fd of unavailable) {
+			try {
+				if (pid === process.pid) fs.fstatSync(fd);
+				else fs.statSync(path.join(directory, String(fd)));
+				available = false;
+			} catch (error) {
+				if (
+					!error ||
+					typeof error !== "object" ||
+					!("code" in error) ||
+					!["ENOENT", "EBADF"].includes(String(error.code))
+				)
+					available = false;
+			}
+		}
+	} catch {
+		available = false;
+	}
+	const measured = measureAwsSecretInputLifecycleDescriptors(descriptors);
+	if (
+		process.platform === "linux" &&
+		measured.some(fd => (fd.kind === "socket" || fd.kind === "pipe") && !fd.measurable)
+	)
+		available = false;
+	return { descriptors: measured, available };
 }
 
 export function awsSecretInputLifecycleSocketIdentitiesAvailable(
@@ -245,5 +332,90 @@ export async function connectAwsSecretInputLifecycleControl(
 			socket.end();
 			await promise;
 		},
+	};
+}
+
+export interface AwsSecretInputLifecycleProcessIdentity {
+	pid: number;
+	parentPid: number;
+	groupId: number;
+	creation: string;
+	state: "live" | "stopped" | "zombie";
+}
+
+export function awsSecretInputLifecycleProcessIdentity(pid: number): AwsSecretInputLifecycleProcessIdentity | null {
+	if (!Number.isSafeInteger(pid) || pid <= 1) throw new Error(LIFECYCLE_FAILURE);
+	try {
+		if (process.platform === "linux") {
+			const record = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+			const fields = record
+				.slice(record.lastIndexOf(")") + 2)
+				.trim()
+				.split(/\s+/u);
+			if (
+				!/^[0-9]+$/u.test(fields[19] ?? "") ||
+				!/^[0-9]+$/u.test(fields[1] ?? "") ||
+				!/^[0-9]+$/u.test(fields[2] ?? "") ||
+				!/^[RSDTtWKPIZXx]$/u.test(fields[0] ?? "")
+			)
+				throw new Error(LIFECYCLE_FAILURE);
+			return {
+				pid,
+				parentPid: Number(fields[1]),
+				groupId: Number(fields[2]),
+				creation: fields[19]!,
+				state:
+					fields[0] === "Z" || fields[0] === "X" || fields[0] === "x"
+						? "zombie"
+						: fields[0] === "T" || fields[0] === "t"
+							? "stopped"
+							: "live",
+			};
+		}
+		if (process.platform === "darwin") {
+			const library = dlopen("/usr/lib/libproc.dylib", {
+				proc_pidinfo: {
+					args: [FFIType.i32, FFIType.i32, FFIType.u64, FFIType.ptr, FFIType.i32],
+					returns: FFIType.i32,
+				},
+			});
+			try {
+				const data = new Uint8Array(136);
+				if (library.symbols.proc_pidinfo(pid, 3, 1, ptr(data), data.byteLength) !== data.byteLength) {
+					try {
+						process.kill(pid, 0);
+					} catch (error) {
+						if (error && typeof error === "object" && "code" in error && error.code === "ESRCH") return null;
+						throw error;
+					}
+					throw new Error(LIFECYCLE_FAILURE);
+				}
+				const view = new DataView(data.buffer);
+				if (view.getUint32(12, true) !== pid || ![1, 2, 3, 4, 5].includes(view.getUint32(4, true)))
+					throw new Error(LIFECYCLE_FAILURE);
+				return {
+					pid,
+					parentPid: view.getUint32(16, true),
+					groupId: view.getUint32(100, true),
+					creation: `${view.getBigUint64(120, true)}:${view.getBigUint64(128, true)}`,
+					state: view.getUint32(4, true) === 5 ? "zombie" : view.getUint32(4, true) === 4 ? "stopped" : "live",
+				};
+			} finally {
+				library.close();
+			}
+		}
+		throw new Error(LIFECYCLE_FAILURE);
+	} catch (error) {
+		if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") return null;
+		throw error;
+	}
+}
+
+export function awsSecretInputLifecycleProcessDisposition(identity: AwsSecretInputLifecycleProcessIdentity) {
+	const current = awsSecretInputLifecycleProcessIdentity(identity.pid);
+	return {
+		pid: identity.pid,
+		creation: identity.creation,
+		state: current === null ? "reaped" : current.creation !== identity.creation ? "reused" : current.state,
 	};
 }

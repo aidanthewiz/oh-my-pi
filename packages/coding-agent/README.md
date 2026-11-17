@@ -55,7 +55,7 @@ The receiving CLI controls its own reads and writes.
 Capability discovery performs no authentication, credential access, or AWS request.
 Discovery checks loaded host and private worker capabilities; it does not authorize an unsupported execution path.
 Execution requires actual invocation ownership under `native-tool-host/v2`, not merely a canonical registered tool wrapper.
-The actual native Agent dispatcher and native Write → `xd://aws` route support secret input with intrinsic `await-cleanup` and session lifecycle ownership.
+The actual native Agent dispatcher and native Write → `xd://aws` route support secret input with intrinsic `await-cleanup` and session lifecycle ownership, whether AWS is active or mounted.
 JavaScript/Python Eval and naked SDK/direct `.execute(...)` invocations are unsupported, even through a canonical registered wrapper or nested Write → `xd://aws`.
 They fail with `CAPABILITY_INCOMPATIBLE` before approval UI, provider work, or receiver execution.
 Discover and verify the current fingerprint at runtime; do not reuse a fingerprint from another host contract.
@@ -96,7 +96,7 @@ With `secretInput.jsonPointer`, an RFC 6901 pointer selects only a string leaf f
 The native route does not infer fields or combine credentials with application commands.
 The receiver must already support this finite stdin channel and normal non-echoing configuration.
 A receiver that requires another credential channel is unsupported.
-Do not substitute secret argv, environment variables, files, FIFOs, RAM disks, PTY injection, or a shell AWS fallback.
+Do not substitute secret argv, environment variables, files, memfds, named FIFOs, RAM disks, PTY injection, or a shell AWS fallback.
 
 Input is limited to 65,536 bytes.
 `maxStdoutBytes` and `maxStderrBytes` each bound retained output to 1,048,576 bytes: at most 2 MiB combined.
@@ -122,11 +122,10 @@ The consumer runs in a detached owned process group without a controlling termin
 It receives no inherited AWS credential environment or private worker control descriptors.
 The guardian starts in a fresh neutral owned directory with a minimal Bun startup environment that blocks project and global preloads.
 Only the receiver uses the approved working directory, environment, and argv.
-Stdin uses an anonymous Unix stream, never a regular file or memfd.
-The owned writer sends bounded chunks after receiver registration, then closes stdin for EOF.
-Completion joins the writer and closes its descriptor, including cancellation and early receiver exit.
-A receiver can close or reset stdin before reading all input; its actual exit status remains authoritative after cleanup.
-Unexplained writer cancellation remains an ownership failure.
+Stdin closes after the bounded input.
+Delivery uses an actual anonymous pipe or unnamed Unix stream, never a regular file or memfd backing.
+The input writer applies backpressure and closes the finite stream after all approved bytes.
+Input completion remains joined through cancellation, early receiver exit, and unexpected writer failure.
 Cancellation, timeout, and session disposal terminate and reap the owned consumer group and worker, close streams, and release owned references.
 An independent owned finite-input guardian handles worker SIGKILL or disconnect and receiver leader exit while foreground descendants or pipes remain.
 The intrinsic `await-cleanup` policy keeps admitted native invocations pending until owned teardown completes or reports an ownership failure.

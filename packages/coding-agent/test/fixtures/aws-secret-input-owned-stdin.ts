@@ -1,5 +1,4 @@
 import { fstatSync } from "node:fs";
-import { Socket } from "node:net";
 import { Process, ProcessStatus } from "@oh-my-pi/pi-natives";
 import { exec, OwnedInputError, type ChildProcess } from "@oh-my-pi/pi-utils/ptree";
 import { lifecycleExpectedInput } from "./aws-secret-input-lifecycle-values";
@@ -8,6 +7,8 @@ import {
 	inspectStdinPrivateChannel,
 	isLocallyAnonymousStdinChannel,
 	isVerifiedFiniteStdinHandoff,
+	type PendingStdinOperation,
+	type StdinPrivateChannelEvidence,
 } from "./aws-secret-input-stdin-metadata";
 
 const MODES = ["text", "newline", "binary", "input-limit", "empty"] as const;
@@ -68,42 +69,135 @@ async function parent(): Promise<void> {
 		"blocked",
 		"cancel-registration",
 		"reject-registration",
-		"unproved-cancel",
+		"unexpected-producer-failure",
 	] as const) {
 		activeMode = mode;
 		phase = "delivery";
 		const input = MODES.includes(mode as (typeof MODES)[number])
 			? lifecycleExpectedInput(mode as (typeof MODES)[number])
 			: new Uint8Array(2_097_152).fill(0xa5);
+		const stress = mode === "blocked" || mode === "unexpected-producer-failure";
 		const observer = createStdinProducerWitnessObserver();
-		observer.begin(input);
+		let stressChannel:
+			| {
+					guardianPid: number;
+					transport: "fixture-socketpair";
+					sendBufferBytes: number;
+					channel: StdinPrivateChannelEvidence;
+			  }
+			| undefined;
+		let stressClosed: { guardianPid: number; readerClosed: boolean; writerClosed: boolean } | undefined;
+		observer.begin(
+			input,
+			stress
+				? {
+						constrainBuffer: true,
+						onStressChannel(evidence) {
+							stressChannel = evidence;
+						},
+						onStressClosed(evidence) {
+							stressClosed = evidence;
+						},
+					}
+				: undefined,
+		);
 		const originalSpawn = Bun.spawn;
-		const originalWrite = Socket.prototype.write;
-		let sender: Socket | undefined;
+		const nativeOperations: Promise<number>[] = [];
+		let outstandingOperations = 0;
+		let endStarted = false;
+		let endSettled = false;
+		let operationAfterEnd = false;
+		let cancelPending: (() => void) | undefined;
+		let cancellationInjected = false;
+		let operationRejected = false;
+		let pendingAtCancellation: PendingStdinOperation | undefined;
 		let guardian: Process | undefined;
 		let consumer: Process | undefined;
+		let ownedChildren: Process[] = [];
 		let identity: ChildProcess["ownedInputIdentity"];
 		let waiting = "";
 		let aborting: Promise<void> | undefined;
 		const controller = new AbortController();
 		let registrationCleanup: (() => boolean) | undefined;
 		try {
-			Socket.prototype.write = new Proxy(originalWrite, {
-				apply(target, socket, args) {
-					if (socket instanceof Socket && observer.isPrivateStdinWrite(socket, args[0])) sender = socket;
-					return Reflect.apply(target, socket, args);
-				},
-			});
 			Bun.spawn = new Proxy(originalSpawn, {
 				apply(target, owner, args) {
 					const bind = observer.captureSpawn(args[1]);
-					const child = Reflect.apply(target, owner, args);
-					bind(child.pid);
-					return child;
+					const child = bind(Reflect.apply(target, owner, args));
+					const writer = child.stdin as Bun.FileSink;
+					requireProof(writer && typeof writer.write === "function" && typeof writer.end === "function");
+					const observeOperation = (
+						operation: "write" | "flush" | "end",
+						run: () => number | Promise<number>,
+					): number | Promise<number> => {
+						if (operation === "end") endStarted = true;
+						else if (endStarted) operationAfterEnd = true;
+						let result: number | Promise<number>;
+						try {
+							result = run();
+						} catch (error) {
+							if (operation === "end") endSettled = true;
+							throw error;
+						}
+						if (typeof result === "number") {
+							if (operation === "end") endSettled = true;
+							return result;
+						}
+						outstandingOperations++;
+						let settled = false;
+						const native = result.then(
+							bytes => {
+								settled = true;
+								outstandingOperations--;
+								if (operation === "end") endSettled = true;
+								return bytes;
+							},
+							error => {
+								settled = true;
+								outstandingOperations--;
+								if (operation === "end") endSettled = true;
+								throw error;
+							},
+						);
+						nativeOperations.push(native);
+						void native.catch(() => {});
+						if (mode !== "unexpected-producer-failure" || operation === "end") return native;
+						const cancellation = Promise.withResolvers<number>();
+						cancelPending = () => {
+							requireProof(!settled && observer.pendingFor(child.pid) !== undefined);
+							cancellationInjected = true;
+							cancellation.reject(
+								Object.assign(new Error("synthetic writer cancellation"), { code: "ECANCELED" }),
+							);
+						};
+						return Promise.race([native, cancellation.promise]);
+					};
+					const observedWriter = new Proxy(Object.create(null) as Bun.FileSink, {
+						get(_target, property) {
+							if (property === "write")
+								return (chunk: Parameters<Bun.FileSink["write"]>[0]) =>
+									observeOperation("write", () => writer.write(chunk));
+							if (property === "flush") return () => observeOperation("flush", () => writer.flush());
+							if (property === "end")
+								return (error: Parameters<Bun.FileSink["end"]>[0]) =>
+									observeOperation("end", () => writer.end(error));
+							const value = Reflect.get(writer, property, writer);
+							return typeof value === "function" ? value.bind(writer) : value;
+						},
+						getPrototypeOf: () => Object.getPrototypeOf(writer),
+					});
+					return new Proxy(Object.create(null) as typeof child, {
+						get(_target, property) {
+							if (property === "stdin") return observedWriter;
+							const value = Reflect.get(child, property, child);
+							return typeof value === "function" ? value.bind(child) : value;
+						},
+						getPrototypeOf: () => Object.getPrototypeOf(child),
+					});
 				},
 			});
 			const receiverMode =
-				mode === "cancel-registration" || mode === "reject-registration" || mode === "unproved-cancel"
+				mode === "cancel-registration" || mode === "reject-registration" || mode === "unexpected-producer-failure"
 					? "blocked"
 					: mode;
 			const command = compiled
@@ -143,76 +237,128 @@ async function parent(): Promise<void> {
 							consumer.ppid === identity.pid &&
 							consumer.groupId() === identity.pid,
 					);
+					ownedChildren = guardian.children();
+					requireProof(ownedChildren.every(child => child.groupId() === identity!.pid));
 					if (mode === "cancel-registration") controller.abort();
-					if (mode === "reject-registration" || mode === "unproved-cancel")
+					if (mode === "reject-registration" || mode === "unexpected-producer-failure")
 						registrationCleanup = () => child.ownedInputCleanedUp === true;
 					if (mode === "reject-registration") return Promise.reject(registrationFailure);
 				},
 				onStdout(chunk) {
-					if (mode !== "blocked" && mode !== "unproved-cancel") return;
+					if (!stress) return;
 					waiting += chunk;
 					if (!waiting.includes("blocked-ready\n") || aborting) return;
 					aborting = (async () => {
 						const deadline = Date.now() + 3_000;
-						while (!sender || sender.writableLength === 0) {
+						for (;;) {
+							const pending = identity ? observer.pendingFor(identity.pid) : undefined;
+							if (pending && (mode !== "unexpected-producer-failure" || cancelPending)) {
+								pendingAtCancellation = pending;
+								break;
+							}
 							requireProof(Date.now() < deadline);
 							await Bun.sleep(1);
 						}
-						if (mode === "unproved-cancel")
-							sender.destroy(Object.assign(new Error("synthetic writer cancellation"), { code: "ECANCELED" }));
+						if (mode === "unexpected-producer-failure") cancelPending!();
 						else controller.abort();
 					})();
 					void aborting.catch(() => controller.abort());
 				},
 			}).catch(error => {
-				if (mode === "unproved-cancel")
-					requireProof(error instanceof OwnedInputError && error.message === "PTREE_OWNED_INPUT_OWNERSHIP_LOST");
-				else if (mode === "reject-registration") requireProof(error === registrationFailure);
+				if (mode === "unexpected-producer-failure") {
+					requireProof(cancellationInjected && error instanceof OwnedInputError);
+					operationRejected = true;
+				} else if (mode === "reject-registration") requireProof(error === registrationFailure);
 				else throw error;
 				return undefined;
 			});
+			requireProof(identity && identity.receiverPid !== null);
+			const producerSettledAtExecReturn =
+				endStarted &&
+				endSettled &&
+				outstandingOperations === 0 &&
+				!operationAfterEnd &&
+				observer.pendingFor(identity.pid) === undefined;
+			if (mode !== "unexpected-producer-failure") requireProof(producerSettledAtExecReturn);
 			await aborting;
 			phase = "cleanup";
-			requireProof(identity && identity.receiverPid !== null);
-			requireProof(guardian?.status() === ProcessStatus.Exited && consumer?.status() === ProcessStatus.Exited);
-			if (mode === "unproved-cancel") {
-				const senderError = sender?.errored;
+			await Promise.allSettled(nativeOperations);
+			requireProof(
+				guardian?.status() === ProcessStatus.Exited &&
+					consumer?.status() === ProcessStatus.Exited &&
+					ownedChildren.every(child => child.status() === ProcessStatus.Exited),
+			);
+			requireProof(
+				endStarted &&
+					endSettled &&
+					outstandingOperations === 0 &&
+					!operationAfterEnd &&
+					observer.pendingFor(identity.pid) === undefined,
+			);
+			const witness = await observer.witnessFor(identity.pid, identity.receiverPid);
+			requireProof(
+				witness &&
+					witness.inputUnmodified &&
+					witness.flushesCompleted &&
+					witness.maxChunkBytes <= 4096 &&
+					witness.pipeConfigured === !stress,
+			);
+			const evidence = {
+				mode,
+				transport: stress ? "fixture-socketpair" : "production-pipe",
+				ownedProcessesTerminal: true,
+				producerSettledAfterFixtureJoin: true,
+				producerSettledAtExecReturn,
+				writerEofClosed: witness.eofClosed,
+				stdinProducerWitness: witness,
+				...(stress
+					? { pendingAtCancellation, nativePendingSettledAfterFixtureJoin: true, stressChannel, stressClosed }
+					: {}),
+			};
+			if (stress) {
+				requireProof(
+					pendingAtCancellation?.guardianPid === identity.pid &&
+						(pendingAtCancellation.operation === "write" || pendingAtCancellation.operation === "flush") &&
+						pendingAtCancellation.bytesAccepted > 0 &&
+						pendingAtCancellation.bytesAccepted < input.byteLength &&
+						witness.backpressureObserved &&
+						stressChannel?.guardianPid === identity.pid &&
+						stressChannel.transport === "fixture-socketpair" &&
+						stressChannel.sendBufferBytes > 0 &&
+						stressChannel.sendBufferBytes < 65_536 &&
+						isLocallyAnonymousStdinChannel(stressChannel.channel) &&
+						stressClosed?.guardianPid === identity.pid &&
+						stressClosed.readerClosed &&
+						stressClosed.writerClosed,
+				);
+			}
+			if (mode === "unexpected-producer-failure") {
 				requireProof(
 					result === undefined &&
+						operationRejected &&
+						cancellationInjected &&
 						!controller.signal.aborted &&
-						senderError &&
-						"code" in senderError &&
-						senderError.code === "ECANCELED" &&
-						sender?.destroyed &&
-						sender.closed &&
-						sender.writableLength === 0 &&
 						registrationCleanup?.() === false,
 				);
-				cases.push({ mode, reaped: true, writerClosed: true });
+				cases.push({ ...evidence, operationRejected: true, cleanupAcknowledged: false });
 				continue;
 			}
 			if (mode === "reject-registration") {
-				requireProof(
-					result === undefined && !controller.signal.aborted && sender === undefined && registrationCleanup?.(),
-				);
-				cases.push({ mode, reaped: true, writerClosed: true });
+				requireProof(result === undefined && !controller.signal.aborted && registrationCleanup?.());
+				cases.push(evidence);
 				continue;
 			}
 			requireProof(result && result.ownedInputCleanedUp === true);
 			if (mode === "blocked" || mode === "cancel-registration") {
 				requireProof(controller.signal.aborted && result.exitError?.aborted === true);
-				if (mode === "blocked") requireProof(sender?.destroyed && sender.closed && sender.writableLength === 0);
-				else requireProof(sender === undefined);
-				cases.push({ mode, reaped: true, writerClosed: true });
+				cases.push(evidence);
 			} else if (mode === "refuse") {
 				requireProof(result.exitCode === 23 && result.stderr === "public receiver refused remaining input\n");
-				requireProof(sender?.destroyed && sender.closed && sender.writableLength === 0);
-				cases.push({ mode, reaped: true, writerClosed: true });
+				cases.push(evidence);
 			} else {
 				phase = "receiver-evidence";
-				requireProof(result.exitCode === 0 && result.stderr === "" && identity);
+				requireProof(result.exitCode === 0 && result.stderr === "");
 				const received = JSON.parse(result.stdout);
-				const witness = observer.witnessFor(identity.pid, identity.receiverPid!);
 				requireProof(
 					received.compiled === compiled &&
 						received.parentPid === identity.pid &&
@@ -221,15 +367,17 @@ async function parent(): Promise<void> {
 							workerPid: process.pid,
 						}),
 				);
-				if (input.byteLength > 0) requireProof(sender?.destroyed && sender.closed && sender.writableLength === 0);
-				cases.push({ mode, reaped: true, writerClosed: true, received });
+				cases.push({ ...evidence, received });
 			}
 		} finally {
 			controller.abort();
 			Bun.spawn = originalSpawn;
-			Socket.prototype.write = originalWrite;
-			observer.end();
-			input.fill(0);
+			try {
+				await observer.end();
+				await Promise.allSettled(nativeOperations);
+			} finally {
+				input.fill(0);
+			}
 		}
 	}
 	await Bun.write(Bun.stdout, JSON.stringify({ compiled, cases }));

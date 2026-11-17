@@ -1,17 +1,17 @@
 import * as fs from "node:fs";
 import { Socket } from "node:net";
 import * as path from "node:path";
+import { Process, ProcessStatus } from "@oh-my-pi/pi-natives";
 import { ptree } from "@oh-my-pi/pi-utils";
 import { AwsSecretInputFailure } from "../../src/tools/aws-secret-input-contract";
 import type { AwsSecretInputClientConfig } from "../../src/tools/aws-secret-input-provider";
 import type { AwsSecretInputScopeDependencies } from "../../src/tools/aws-secret-input-scope";
 import { startAwsSecretInputWorker } from "../../src/tools/aws-secret-input-worker";
 import {
-	type AwsSecretInputLifecycleDescriptor,
-	type AwsSecretInputLifecycleDescriptorIdentity,
+	awsSecretInputLifecycleProcessIdentity,
 	awsSecretInputLifecycleSocketIdentitiesAvailable,
 	connectAwsSecretInputLifecycleControl,
-	measureAwsSecretInputLifecycleDescriptors,
+	snapshotAwsSecretInputLifecycleDescriptors,
 } from "./aws-secret-input-lifecycle-control";
 import {
 	AWS_SECRET_INPUT_STARTUP_MARKER,
@@ -28,62 +28,6 @@ import {
 	lifecycleContainsSensitive,
 } from "./aws-secret-input-lifecycle-values";
 
-interface PrivateDescriptorSnapshot {
-	descriptors: AwsSecretInputLifecycleDescriptor[];
-	available: boolean;
-}
-
-function privateDescriptorSnapshot(pid = process.pid): PrivateDescriptorSnapshot {
-	if (pid !== process.pid && process.platform !== "linux") return { descriptors: [], available: false };
-	const directory = process.platform === "linux" ? `/proc/${pid}/fd` : "/dev/fd";
-	const descriptors: AwsSecretInputLifecycleDescriptorIdentity[] = [];
-	const controlPath = path.join(process.cwd(), "aws-secret-input-lifecycle-control-fd");
-	let controlStat: fs.BigIntStats | undefined;
-	try {
-		controlStat = fs.statSync(controlPath, { bigint: true });
-	} catch {}
-	let entries: string[];
-	try {
-		entries = fs.readdirSync(directory);
-	} catch {
-		return { descriptors: [], available: false };
-	}
-	if (entries.length > 256) return { descriptors: [], available: false };
-	for (const name of entries) {
-		const fd = Number(name);
-		if (!Number.isSafeInteger(fd) || fd < 3) continue;
-		try {
-			const stat =
-				pid === process.pid
-					? fs.fstatSync(fd, { bigint: true })
-					: fs.statSync(path.join(directory, name), { bigint: true });
-			let target = "";
-			try {
-				target = fs.readlinkSync(path.join(directory, name));
-			} catch {}
-			if (controlStat?.dev === stat.dev && controlStat.ino === stat.ino) target = controlPath;
-			if (stat.isSocket() || stat.isFIFO() || target.endsWith("aws-secret-input-lifecycle-control-fd")) {
-				descriptors.push({
-					fd,
-					dev: String(stat.dev),
-					ino: String(stat.ino),
-					target,
-					kind: stat.isSocket() ? "socket" : stat.isFIFO() ? "pipe" : "file",
-				});
-			}
-		} catch (error) {
-			if (
-				!error ||
-				typeof error !== "object" ||
-				!("code" in error) ||
-				(error.code !== "EBADF" && error.code !== "ENOENT")
-			)
-				return { descriptors: [], available: false };
-		}
-	}
-	return { descriptors: measureAwsSecretInputLifecycleDescriptors(descriptors), available: true };
-}
-
 function privateDiagnostic(denied = false): Error {
 	return Object.assign(
 		new Error(LIFECYCLE_DIAGNOSTIC, {
@@ -98,7 +42,7 @@ function privateDiagnostic(denied = false): Error {
 
 async function runWorker() {
 	const scenario = process.argv[2] ?? "success";
-	const descriptorSnapshot = privateDescriptorSnapshot();
+	const descriptorSnapshot = snapshotAwsSecretInputLifecycleDescriptors();
 	const port = Number(process.argv[3]);
 	const control = port ? await connectAwsSecretInputLifecycleControl(port, "worker") : undefined;
 	const counts = { files: 0, clients: 0, identity: 0, secret: 0, consumer: 0, destroyed: 0 };
@@ -116,6 +60,83 @@ async function runWorker() {
 	};
 	const socketWrites = new WeakMap<object, string>();
 	const socketReads = new WeakMap<object, string>();
+	const guardians = new Map<number, Process>();
+	const guardianChildren = new Map<number, ReturnType<typeof Bun.spawn>>();
+	let stoppedRegistration: { anchor: Process; child: ReturnType<typeof Bun.spawn>; creation: string } | undefined;
+	let registrationGate: Promise<void> | undefined;
+	const registrationCancelled = Promise.withResolvers<never>();
+	void registrationCancelled.promise.catch(() => {});
+	const resumeRegistrationGuardian = (): void => {
+		const stopped = stoppedRegistration;
+		if (!stopped) return;
+		const current = awsSecretInputLifecycleProcessIdentity(stopped.anchor.pid);
+		if (current === null || current.creation !== stopped.creation || current.state === "zombie") {
+			stoppedRegistration = undefined;
+			return;
+		}
+		if (
+			current.parentPid !== process.pid ||
+			current.groupId !== stopped.anchor.pid ||
+			stopped.anchor.status() !== ProcessStatus.Running ||
+			stopped.anchor.ppid !== process.pid ||
+			stopped.anchor.groupId() !== stopped.anchor.pid
+		)
+			throw new Error(LIFECYCLE_FAILURE);
+		stopped.child.kill("SIGCONT");
+		stoppedRegistration = undefined;
+	};
+	const registrationMessage = (message: unknown): void => {
+		if (!message || typeof message !== "object" || !("type" in message)) return;
+		if (message.type !== "consumer-registered" && message.type !== "stop") return;
+		if (message.type === "stop") registrationCancelled.reject(new Error(LIFECYCLE_FAILURE));
+		try {
+			resumeRegistrationGuardian();
+		} catch {
+			if (process.connected) process.disconnect?.();
+		}
+	};
+	process.on("message", registrationMessage);
+	const keeperFrames = new WeakMap<object, string>();
+	const observeKeeper = (socket: object, chunk: unknown): void => {
+		if (process.platform !== "darwin" || (typeof chunk !== "string" && !(chunk instanceof Uint8Array))) return;
+		try {
+			const pending =
+				(keeperFrames.get(socket) ?? "") +
+				(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+			if (pending.length > 4096) {
+				keeperFrames.delete(socket);
+				return;
+			}
+			const lines = pending.split("\n");
+			keeperFrames.set(socket, lines.pop()!);
+			for (const line of lines) {
+				const value = JSON.parse(line) as { type?: unknown; keeperPid?: unknown };
+				if (value.type !== "ready" || !Number.isSafeInteger(value.keeperPid) || (value.keeperPid as number) <= 1)
+					continue;
+				const keeper = Process.fromPid(value.keeperPid as number);
+				const guardian = keeper?.ppid ? guardians.get(keeper.ppid) : undefined;
+				if (
+					!guardian ||
+					guardian.status() !== ProcessStatus.Running ||
+					guardian.ppid !== process.pid ||
+					guardian.groupId() !== guardian.pid ||
+					keeper?.status() !== ProcessStatus.Running ||
+					keeper.groupId() !== guardian.pid
+				)
+					continue;
+				const identity = awsSecretInputLifecycleProcessIdentity(keeper.pid);
+				control?.send({
+					kind: "keeper-ready",
+					pid: process.pid,
+					guardianPid: guardian.pid,
+					keeperIdentity:
+						identity?.state === "live" && identity.parentPid === guardian.pid && identity.groupId === guardian.pid
+							? identity
+							: null,
+				});
+			}
+		} catch {}
+	};
 	const observeControl = (socket: object, chunk: unknown, tails: WeakMap<object, string>): void => {
 		const text =
 			typeof chunk === "string" ? chunk : chunk instanceof Uint8Array ? Buffer.from(chunk).toString("utf8") : "";
@@ -127,14 +148,16 @@ async function runWorker() {
 	const originalSocketEmit = Socket.prototype.emit;
 	Socket.prototype.write = new Proxy(originalSocketWrite, {
 		apply(target, receiver, args) {
-			if (!stdinProducerObserver.isPrivateStdinWrite(receiver, args[0]))
-				observeControl(receiver, args[0], socketWrites);
+			observeControl(receiver, args[0], socketWrites);
 			return Reflect.apply(target, receiver, args);
 		},
 	});
 	Socket.prototype.emit = new Proxy(originalSocketEmit, {
 		apply(target, receiver, args) {
-			if (args[0] === "data") observeControl(receiver, args[1], socketReads);
+			if (args[0] === "data") {
+				observeControl(receiver, args[1], socketReads);
+				observeKeeper(receiver, args[1]);
+			}
 			return Reflect.apply(target, receiver, args);
 		},
 	});
@@ -146,6 +169,119 @@ async function runWorker() {
 				if (scenario === "pause-capabilities" && args[0]?.type === "capabilities" && control) {
 					control.send({ kind: "worker-capabilities-blocked", pid: process.pid });
 					void control.waitForCommand("release-capabilities").then(() => Reflect.apply(target, receiver, args));
+					return true;
+				}
+				if (scenario === "zombie-registration" && args[0]?.type === "consumer-start" && control) {
+					if (process.platform !== "linux" || registrationGate) throw new Error(LIFECYCLE_FAILURE);
+					const message = args[0];
+					const guardian = guardians.get(message.pid);
+					const child = guardianChildren.get(message.pid);
+					const original = awsSecretInputLifecycleProcessIdentity(message.pid);
+					const receiverIdentity = awsSecretInputLifecycleProcessIdentity(message.receiverPid);
+					if (
+						!guardian ||
+						!child ||
+						!original ||
+						original.state !== "live" ||
+						original.parentPid !== process.pid ||
+						original.groupId !== guardian.pid ||
+						guardian.status() !== ProcessStatus.Running ||
+						guardian.ppid !== process.pid ||
+						guardian.groupId() !== guardian.pid ||
+						!receiverIdentity ||
+						receiverIdentity.parentPid !== guardian.pid ||
+						receiverIdentity.groupId !== guardian.pid
+					)
+						throw new Error(LIFECYCLE_FAILURE);
+					stoppedRegistration = { anchor: guardian, child, creation: original.creation };
+					child.kill("SIGSTOP");
+					registrationGate = (async () => {
+						const deadline = Date.now() + 5_000;
+						while (true) {
+							const current = awsSecretInputLifecycleProcessIdentity(guardian.pid);
+							if (
+								!current ||
+								current.creation !== original.creation ||
+								current.parentPid !== process.pid ||
+								current.groupId !== guardian.pid
+							)
+								throw new Error(LIFECYCLE_FAILURE);
+							if (current.state === "stopped") break;
+							if (Date.now() >= deadline) throw new Error(LIFECYCLE_FAILURE);
+							await Promise.race([Bun.sleep(5), registrationCancelled.promise]);
+						}
+						control.send({
+							kind: "consumer-registration-held",
+							pid: process.pid,
+							guardianPid: guardian.pid,
+							receiverPid: receiverIdentity.pid,
+							guardianIdentity: original,
+						});
+						let zombie = receiverIdentity;
+						while (true) {
+							const current = awsSecretInputLifecycleProcessIdentity(receiverIdentity.pid);
+							if (
+								!current ||
+								current.creation !== receiverIdentity.creation ||
+								current.parentPid !== guardian.pid ||
+								current.groupId !== guardian.pid
+							)
+								throw new Error(LIFECYCLE_FAILURE);
+							if (current.state === "zombie") {
+								zombie = current;
+								break;
+							}
+							if (Date.now() >= deadline) throw new Error(LIFECYCLE_FAILURE);
+							await Promise.race([Bun.sleep(5), registrationCancelled.promise]);
+						}
+						control.send({
+							kind: "receiver-registration-zombie",
+							pid: process.pid,
+							guardianPid: guardian.pid,
+							receiverPid: zombie.pid,
+							zombieIdentity: zombie,
+						});
+						const limit = Promise.withResolvers<never>();
+						const timer = setTimeout(() => limit.reject(new Error(LIFECYCLE_FAILURE)), 5_000);
+						let wrongParent: boolean;
+						try {
+							wrongParent = await Promise.race([
+								control.waitForCommand("release-zombie-registration").then(() => false),
+								control.waitForCommand("forward-zombie-wrong-parent").then(() => true),
+								registrationCancelled.promise,
+								limit.promise,
+							]);
+						} finally {
+							clearTimeout(timer);
+						}
+						const current = awsSecretInputLifecycleProcessIdentity(zombie.pid);
+						const owner = awsSecretInputLifecycleProcessIdentity(guardian.pid);
+						if (
+							!current ||
+							current.creation !== zombie.creation ||
+							current.state !== "zombie" ||
+							current.parentPid !== guardian.pid ||
+							current.groupId !== guardian.pid ||
+							!owner ||
+							owner.creation !== original.creation ||
+							owner.state !== "stopped" ||
+							owner.parentPid !== process.pid ||
+							owner.groupId !== guardian.pid
+						)
+							throw new Error(LIFECYCLE_FAILURE);
+						if (wrongParent) args[0] = { ...message, receiverPid: process.pid };
+						Reflect.apply(target, receiver, args);
+					})().catch(() => {
+						try {
+							resumeRegistrationGuardian();
+						} catch {}
+						try {
+							control.send({ kind: "zombie-registration-failed", pid: process.pid });
+						} catch {}
+						try {
+							if (process.connected) process.disconnect?.();
+						} catch {}
+					});
 					return true;
 				}
 				if (scenario === "malformed-result-after-consumer" && args[0]?.type === "result") {
@@ -160,6 +296,9 @@ async function runWorker() {
 			},
 		});
 	const originalSpawn = Bun.spawn;
+	let producerCompletion: Promise<void> | undefined;
+
+	let pendingGuardianPid: number | undefined;
 	Bun.spawn = new Proxy(originalSpawn, {
 		apply(target, receiver, args) {
 			const command = args[0];
@@ -169,9 +308,19 @@ async function runWorker() {
 				observe({ env: options.env, cwd: options.cwd });
 			}
 			const bind = stdinProducerObserver.captureSpawn(args[1]);
+
 			const child = Reflect.apply(target, receiver, args);
-			bind(child.pid);
-			return child;
+			try {
+				const guardian = Process.fromPid(child.pid);
+				if (guardian?.ppid === process.pid && guardian.groupId() === child.pid) {
+					guardians.set(child.pid, guardian);
+					guardianChildren.set(child.pid, child);
+				}
+			} catch {}
+
+			const observedChild = bind(child);
+
+			return observedChild;
 		},
 	});
 	for (const stream of [process.stdout, process.stderr]) {
@@ -198,14 +347,29 @@ async function runWorker() {
 	control?.send({
 		kind: "worker-ready",
 		pid: process.pid,
+		processIdentity: awsSecretInputLifecycleProcessIdentity(process.pid),
 		ipcAvailable: typeof process.send === "function" && process.connected === true,
 		controlFdPresent: descriptorSnapshot.descriptors.some(descriptor =>
 			descriptor.target.endsWith("aws-secret-input-lifecycle-control-fd"),
 		),
 		descriptors: descriptorSnapshot.descriptors,
+		fdSnapshotAvailable: descriptorSnapshot.available,
 		socketIdentitiesAvailable: awsSecretInputLifecycleSocketIdentitiesAvailable(descriptorSnapshot.descriptors),
 	});
 	if (control) {
+		for (const [command, kind] of [
+			["check-input-backpressure", "stdin-writer-blocked"],
+			["confirm-input-backpressure", "stdin-writer-still-blocked"],
+		] as const) {
+			void control
+				.waitForCommand(command)
+				.then(() => {
+					const pending =
+						pendingGuardianPid === undefined ? undefined : stdinProducerObserver.pendingFor(pendingGuardianPid);
+					control.send({ kind, pid: process.pid, pending: pending !== undefined, ...pending });
+				})
+				.catch(() => {});
+		}
 		void control.waitForCommand("worker-uncaught").then(() => {
 			queueMicrotask(() => {
 				throw privateDiagnostic();
@@ -299,7 +463,24 @@ async function runWorker() {
 			observe({ argv, cwd: options?.cwd, env: options?.env });
 			if (!(options?.input instanceof Uint8Array)) throw new Error(LIFECYCLE_FAILURE);
 			inputs.push(options.input);
-			stdinProducerObserver.begin(options.input);
+			stdinProducerObserver.begin(
+				options.input,
+				argv.includes("input-paused")
+					? {
+							constrainBuffer: true,
+							onPending(pending) {
+								pendingGuardianPid = pending.guardianPid;
+								control?.send({ kind: "stdin-write-pending", pid: process.pid, ...pending });
+							},
+							onStressChannel(evidence) {
+								control?.send({ kind: "stdin-stress-channel", pid: process.pid, ...evidence });
+							},
+							onStressClosed(evidence) {
+								control?.send({ kind: "stdin-stress-closed", pid: process.pid, ...evidence });
+							},
+						}
+					: undefined,
+			);
 			let globalMarkerPath: string | undefined;
 			try {
 				if (scenario === "global-bun-preload") {
@@ -338,7 +519,19 @@ async function runWorker() {
 				realConsumer = true;
 				return await ptree.exec(argv, options);
 			} finally {
-				stdinProducerObserver.end();
+				try {
+					if (producerCompletion) {
+						const deadline = Promise.withResolvers<never>();
+						const timer = setTimeout(() => deadline.reject(new Error(LIFECYCLE_FAILURE)), 5_000);
+						try {
+							await Promise.race([producerCompletion, deadline.promise]);
+						} finally {
+							clearTimeout(timer);
+						}
+					}
+				} finally {
+					await stdinProducerObserver.end();
+				}
 				if (globalMarkerPath) {
 					control?.send({
 						kind: "global-preload-probe",
@@ -348,21 +541,25 @@ async function runWorker() {
 				}
 			}
 		},
-		onConsumerSpawn(child) {
+		async onConsumerSpawn(child) {
 			const identity = child.ownedInputIdentity;
 			if (!identity) throw new Error(LIFECYCLE_FAILURE);
-			const workerDescriptors = privateDescriptorSnapshot();
-			const guardianDescriptors = privateDescriptorSnapshot(identity.pid);
-			control?.send({
-				kind: "consumer-spawned",
+			if (scenario === "zombie-registration") {
+				const deadline = Date.now() + 5_000;
+				while (awsSecretInputLifecycleProcessIdentity(identity.pid)?.state !== "live") {
+					if (Date.now() >= deadline) throw new Error(LIFECYCLE_FAILURE);
+					await Bun.sleep(5);
+				}
+			}
+			const workerDescriptors = snapshotAwsSecretInputLifecycleDescriptors();
+			const guardianDescriptors = snapshotAwsSecretInputLifecycleDescriptors(identity.pid);
+			const spawned = {
 				pid: identity.pid,
 				groupId: identity.groupId,
 				receiverPid: identity.receiverPid,
 				workerPid: process.pid,
-				stdinProducerWitness:
-					identity.receiverPid === null
-						? null
-						: (stdinProducerObserver.witnessFor(identity.pid, identity.receiverPid) ?? null),
+				guardianIdentity: awsSecretInputLifecycleProcessIdentity(identity.pid),
+				stdinProducerWitness: null,
 				privateDescriptors: workerDescriptors.descriptors,
 				privateFdSnapshotAvailable: workerDescriptors.available,
 				privateSocketIdentitiesAvailable: awsSecretInputLifecycleSocketIdentitiesAvailable(
@@ -373,7 +570,14 @@ async function runWorker() {
 				guardianSocketIdentitiesAvailable: guardianDescriptors.available
 					? awsSecretInputLifecycleSocketIdentitiesAvailable(guardianDescriptors.descriptors)
 					: null,
-			});
+			};
+			control?.send({ ...spawned, kind: "consumer-channel-ready" });
+			if (identity.receiverPid !== null) {
+				producerCompletion = stdinProducerObserver.witnessFor(identity.pid, identity.receiverPid).then(witness => {
+					control?.send({ ...spawned, kind: "consumer-spawned", stdinProducerWitness: witness ?? null });
+				});
+				void producerCompletion.catch(() => {});
+			}
 		},
 	};
 	try {
@@ -406,6 +610,12 @@ async function runWorker() {
 		if (originalSend) process.send = originalSend;
 		Socket.prototype.write = originalSocketWrite;
 		Socket.prototype.emit = originalSocketEmit;
+		registrationCancelled.reject(new Error(LIFECYCLE_FAILURE));
+		try {
+			resumeRegistrationGuardian();
+		} catch {}
+		await registrationGate;
+		process.off("message", registrationMessage);
 		await control?.close();
 	}
 }

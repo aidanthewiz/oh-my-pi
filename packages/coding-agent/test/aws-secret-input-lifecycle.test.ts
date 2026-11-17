@@ -25,10 +25,11 @@ import {
 	type AwsSecretInputLifecycleWorkerScenario,
 } from "./fixtures/aws-secret-input-lifecycle-client";
 import {
+	awsSecretInputLifecycleProcessDisposition,
+	awsSecretInputLifecycleProcessIdentity,
 	createAwsSecretInputLifecycleControl,
-	awsSecretInputLifecycleSocketIdentitiesAvailable,
-	measureAwsSecretInputLifecycleDescriptors,
 	type AwsSecretInputLifecycleControl,
+	type AwsSecretInputLifecycleProcessIdentity,
 	type AwsSecretInputLifecycleDescriptor,
 	type AwsSecretInputLifecycleEvent,
 } from "./fixtures/aws-secret-input-lifecycle-control";
@@ -40,7 +41,11 @@ import {
 	LIFECYCLE_STDOUT,
 	lifecycleContainsSensitive,
 } from "./fixtures/aws-secret-input-lifecycle-values";
-import { isVerifiedFiniteStdinHandoff } from "./fixtures/aws-secret-input-stdin-metadata";
+import {
+	isLocallyAnonymousStdinChannel,
+	isVerifiedFiniteStdinHandoff,
+	isVerifiedStdinPrivateChannelEvidence,
+} from "./fixtures/aws-secret-input-stdin-metadata";
 
 interface DirectoryObservation {
 	directory: string;
@@ -198,6 +203,49 @@ async function expectQuiescent(boundary: LifecycleBoundary, cleanIpc = true): Pr
 	expect(awsSecretInputLifecycleProcessExists(worker.pid)).toBe(false);
 	await boundary.control.waitForEvent("worker-control-closed");
 	const pids = new Set<number>();
+	const identities = new Map<number, AwsSecretInputLifecycleProcessIdentity>();
+	for (const event of boundary.control.events) {
+		for (const value of [
+			event.processIdentity,
+			event.guardianIdentity,
+			event.descendantIdentity,
+			event.keeperIdentity,
+		]) {
+			if (!value || typeof value !== "object") continue;
+			const identity = value as AwsSecretInputLifecycleProcessIdentity;
+			expect(identity.state, "ownership identity was not captured while the process was live").toBe("live");
+			expect(Number.isSafeInteger(identity.pid) && identity.pid > 1).toBe(true);
+			expect(/^[0-9]+(?::[0-9]+)?$/u.test(identity.creation)).toBe(true);
+			const original = identities.get(identity.pid);
+			expect(
+				!original || original.creation === identity.creation,
+				"owned numeric PID was reused during invocation",
+			).toBe(true);
+			identities.set(identity.pid, identity);
+		}
+		if (event.kind === "keeper-ready") {
+			expect(process.platform).toBe("darwin");
+			expect(event.keeperIdentity, "Darwin keeper has no native creation identity").not.toBeNull();
+			const keeper = event.keeperIdentity as AwsSecretInputLifecycleProcessIdentity;
+			expect(keeper.parentPid).toBe(event.guardianPid as number);
+			expect(keeper.groupId).toBe(event.guardianPid as number);
+		}
+		if (process.platform === "darwin" && event.kind === "consumer-channel-ready" && event.receiverPid !== null) {
+			expect(
+				boundary.control.events.some(
+					candidate => candidate.kind === "keeper-ready" && candidate.guardianPid === event.pid,
+				),
+				"Darwin receiver launched without independent keeper creation evidence",
+			).toBe(true);
+		}
+	}
+	for (const identity of identities.values()) {
+		const disposition = awsSecretInputLifecycleProcessDisposition(identity);
+		expect(
+			["reaped", "reused"].includes(disposition.state),
+			`owned process has not been reaped at outer completion: ${JSON.stringify(disposition)}`,
+		).toBe(true);
+	}
 	const receiverStarts = new Set(
 		boundary.control.events
 			.filter(event => event.kind === "input-complete" || event.kind === "consumer-early-exit")
@@ -210,10 +258,17 @@ async function expectQuiescent(boundary: LifecycleBoundary, cleanIpc = true): Pr
 		if (typeof event.descendantPid === "number") pids.add(event.descendantPid);
 		if (typeof event.receiverPid === "number") pids.add(event.receiverPid);
 	}
-	for (const pid of pids)
-		expect(awsSecretInputLifecycleProcessExists(pid), "owned consumer or descendant remained after completion").toBe(
-			false,
-		);
+	for (const pid of pids) {
+		const identity = identities.get(pid);
+		if (identity) {
+			const disposition = awsSecretInputLifecycleProcessDisposition(identity);
+			expect(["reaped", "reused"].includes(disposition.state), JSON.stringify(disposition)).toBe(true);
+		} else {
+			expect(awsSecretInputLifecycleProcessExists(pid), "unidentified owned PID remained after completion").toBe(
+				false,
+			);
+		}
+	}
 	if (boundary.control.events.some(event => event.source === "consumer"))
 		await boundary.control.waitForEvent("consumer-control-closed");
 	expect(boundary.control.clean).toBe(true);
@@ -260,26 +315,40 @@ async function expectWorkerDone(
 	return done;
 }
 
+async function expectBlockedFixtureWriter(boundary: LifecycleBoundary): Promise<void> {
+	const channel = await boundary.control.waitForEvent("consumer-channel-ready");
+	const gated = await boundary.control.waitForEvent("stdin-read-gated");
+	const stress = await boundary.control.waitForEvent("stdin-stress-channel");
+	expect(channel.receiverPid).toBe(gated.pid);
+	expect(stress.guardianPid).toBe(channel.pid);
+	expect(stress.transport).toBe("fixture-socketpair");
+	expect(stress.sendBufferBytes as number).toBeGreaterThan(0);
+	expect(stress.sendBufferBytes as number).toBeLessThan(65_536);
+	expect(isVerifiedStdinPrivateChannelEvidence(stress.channel)).toBe(true);
+	await boundary.control.waitForEvent("stdin-write-pending");
+	boundary.control.send("check-input-backpressure");
+	const blocked = await boundary.control.waitForEvent("stdin-writer-blocked");
+	expect(blocked.pending, "actual native writer has no pending operation").toBe(true);
+	expect(blocked.guardianPid).toBe(channel.pid);
+	expect(blocked.operation).toBe("flush");
+	expect(Number.isSafeInteger(blocked.id) && (blocked.id as number) > 0).toBe(true);
+	boundary.control.send("confirm-input-backpressure");
+	const confirmed = await boundary.control.waitForEvent("stdin-writer-still-blocked");
+	expect(confirmed.pending, "native flush resolved before the control-gated receipt").toBe(true);
+	expect(confirmed.id).toBe(blocked.id);
+	expect(confirmed.operation).toBe("flush");
+	expect(confirmed.bytesAccepted).toBe(blocked.bytesAccepted);
+	expect(boundary.control.events.some(event => event.kind === "input-complete")).toBe(false);
+}
+
+async function expectFixtureStdinClosed(boundary: LifecycleBoundary): Promise<void> {
+	const closed = await boundary.control.waitForEvent("stdin-stress-closed");
+	expect(closed.readerClosed, "fixture retained its parent read end").toBe(true);
+	expect(closed.writerClosed, "fixture retained its FileSink descriptor after EOF").toBe(true);
+}
+
 const COMPLETE_COUNTS = { files: 2, clients: 2, identity: 1, secret: 1, consumer: 1, destroyed: 2 };
 const NO_PROVIDER_COUNTS = { files: 0, clients: 0, identity: 0, secret: 0, consumer: 0, destroyed: 0 };
-
-test.skipIf(process.platform !== "linux")(
-	"compares Linux socket endpoint identities without treating descriptor aliases as unknown",
-	() => {
-		const measured = measureAwsSecretInputLifecycleDescriptors([
-			{ fd: 3, dev: "9", ino: "41", target: "socket:[41]", kind: "socket" },
-			{ fd: 7, dev: "9", ino: "41", target: "socket:[41]", kind: "socket" },
-			{ fd: 8, dev: "9", ino: "42", target: "socket:[42]", kind: "socket" },
-			{ fd: 9, dev: "9", ino: "43", target: "socket:[44]", kind: "socket" },
-		]);
-		expect(measured[0]?.aliases).toEqual([3, 7]);
-		expect(measured[1]?.aliases).toEqual([3, 7]);
-		expect(measured[2]?.aliases).toEqual([8]);
-		expect(awsSecretInputLifecycleSocketIdentitiesAvailable(measured.slice(0, 3))).toBe(true);
-		expect(measured[3]?.measurable).toBe(false);
-		expect(awsSecretInputLifecycleSocketIdentitiesAvailable(measured)).toBe(false);
-	},
-);
 
 describe.skipIf(process.platform === "win32")("AWS secret input real worker and process lifecycle", () => {
 	test("private capability probe joins its worker without opening credentials or creating a consumer", async () => {
@@ -339,6 +408,27 @@ describe.skipIf(process.platform === "win32")("AWS secret input real worker and 
 					const childFds = input.descriptors as AwsSecretInputLifecycleDescriptor[];
 					expect(spawned.privateFdSnapshotAvailable).toBe(true);
 					if (process.platform === "linux") {
+						expect(input.fdSnapshotAvailable, "receiver descriptor snapshot is incomplete").toBe(true);
+						expect(ready.fdSnapshotAvailable, "initial worker descriptor snapshot is incomplete").toBe(true);
+						expect(spawned.privateFdSnapshotAvailable, "active worker descriptor snapshot is incomplete").toBe(
+							true,
+						);
+						expect(spawned.privateSocketIdentitiesAvailable, "active worker socket identity is unavailable").toBe(
+							true,
+						);
+						expect(input.socketIdentitiesAvailable, "receiver socket identity is unavailable").toBe(true);
+						const privateFds = spawned.privateDescriptors as AwsSecretInputLifecycleDescriptor[];
+						expect(
+							childFds.some(
+								childFd =>
+									childFd.measurable &&
+									privateFds.some(
+										privateFd =>
+											privateFd.measurable && childFd.dev === privateFd.dev && childFd.ino === privateFd.ino,
+									),
+							),
+							"worker IPC, control, or input-writer descriptor reached the receiver",
+						).toBe(false);
 						expect(spawned.guardianFdSnapshotAvailable).toBe(true);
 						const guardianFds = spawned.guardianDescriptors as AwsSecretInputLifecycleDescriptor[];
 						if (guardianFds.some(fd => fd.kind === "socket")) {
@@ -399,6 +489,114 @@ describe.skipIf(process.platform === "win32")("AWS secret input real worker and 
 			);
 		}, 30_000);
 	}
+
+	for (const wrongParent of [false, true]) {
+		test.skipIf(process.platform !== "linux")(
+			`held zombie receiver registration ${wrongParent ? "rejects an unrelated live PID" : "preserves exact owned lineage and output"}`,
+			async () => {
+				await withBoundary("zombie-registration", "exit-with-descendant", async boundary => {
+					const operation = boundary.run();
+					const held = await boundary.control.waitForEvent("consumer-registration-held");
+					const ready = await boundary.control.waitForEvent("consumer-ready");
+					const input = await boundary.control.waitForEvent("input-complete");
+					const live = input.processIdentity as AwsSecretInputLifecycleProcessIdentity;
+					const guardian = held.guardianIdentity as AwsSecretInputLifecycleProcessIdentity;
+					expect(live.state).toBe("live");
+					expect(live.pid).toBe(held.receiverPid as number);
+					expect(live.parentPid).toBe(guardian.pid);
+					expect(live.groupId).toBe(guardian.pid);
+					expect(input.exactInput).toBe(true);
+					expect(input.eof).toBe(true);
+					expect(ready.pid).toBe(live.pid);
+					expect(awsSecretInputLifecycleProcessIdentity(guardian.pid)).toEqual({
+						...guardian,
+						state: "stopped",
+					});
+					boundary.control.send("exit-consumer");
+					const observed = await boundary.control.waitForEvent("receiver-registration-zombie");
+					const zombie = observed.zombieIdentity as AwsSecretInputLifecycleProcessIdentity;
+					expect(zombie).toEqual({ ...live, state: "zombie" });
+					expect(awsSecretInputLifecycleProcessIdentity(live.pid)).toEqual(zombie);
+					expect(boundary.control.events.some(event => event.kind === "consumer-channel-ready")).toBe(false);
+					boundary.control.send(wrongParent ? "forward-zombie-wrong-parent" : "release-zombie-registration");
+					if (wrongParent) expectFixedFailure(await captureFailure(operation), "UNSAFE_OUTPUT");
+					else {
+						const result = await operation;
+						expect(result.stdout).toBe(LIFECYCLE_STDOUT);
+						expect(result.stderr).toBe(LIFECYCLE_STDERR);
+						expect(result.exitCode).toBe(0);
+						expect(result.completion).toBe("exited");
+						expect(result.teardown).toEqual({
+							consumerReaped: true,
+							workerReaped: true,
+							referencesReleased: true,
+						});
+					}
+					expect(boundary.control.events.some(event => event.kind === "zombie-registration-failed")).toBe(false);
+					await expectWorkerDone(boundary, COMPLETE_COUNTS);
+					await expectQuiescent(boundary);
+				});
+			},
+			30_000,
+		);
+	}
+
+	test("drains maximum finite input after real flush backpressure on a constrained fixture socketpair", async () => {
+		await withBoundary("input-limit", "input-paused", async boundary => {
+			const operation = boundary.run();
+			await expectBlockedFixtureWriter(boundary);
+			boundary.control.send("read-input");
+			const result = await operation;
+			expect(result.exitCode).toBe(7);
+			expect(result.stdout).toBe(LIFECYCLE_STDOUT);
+			expect(result.stderr).toBe(LIFECYCLE_STDERR);
+			const input = await boundary.control.waitForEvent("input-complete");
+			const spawned = await boundary.control.waitForEvent("consumer-spawned");
+			expect(input.exactInput).toBe(true);
+			expect(input.eof).toBe(true);
+			expect(isLocallyAnonymousStdinChannel(input.stdinPrivateChannel)).toBe(true);
+			expect(
+				isVerifiedFiniteStdinHandoff(input.stdinPrivateChannel, spawned.stdinProducerWitness, input, spawned),
+				"a fixture-supplied FD must not certify production Bun pipe construction",
+			).toBe(false);
+			expect(spawned.stdinProducerWitness).toMatchObject({
+				pipeConfigured: false,
+				inputUnmodified: true,
+				exactWrites: true,
+				bytesAccepted: 65_536,
+				maxChunkBytes: 4096,
+				flushesCompleted: true,
+				eofClosed: true,
+				writeFailed: false,
+				backpressureObserved: true,
+			});
+			await expectFixtureStdinClosed(boundary);
+			await expectWorkerDone(boundary, COMPLETE_COUNTS);
+			await expectQuiescent(boundary);
+		});
+	}, 30_000);
+
+	test("cancels a genuinely blocked maximum-input flush on a constrained fixture socketpair", async () => {
+		await withBoundary("input-limit", "input-paused", async boundary => {
+			const operation = boundary.run();
+			await expectBlockedFixtureWriter(boundary);
+			boundary.controller.abort();
+			const result = await operation;
+			expect(result.cancelled).toBe(true);
+			expect(result.completion).toBe("uncertain");
+			expect(result.stdout).toBe("");
+			expect(result.stderr).toBe("");
+			expect(result.exitCode === null || result.exitCode !== 0).toBe(true);
+			expect(result.teardown).toEqual({ consumerReaped: true, workerReaped: true, referencesReleased: true });
+			expect(boundary.control.events.some(event => event.kind === "input-complete")).toBe(false);
+			await expectFixtureStdinClosed(boundary);
+			const spawned = await boundary.control.waitForEvent("consumer-spawned");
+			expect(spawned.stdinProducerWitness?.inputUnmodified).toBe(true);
+			expect(spawned.stdinProducerWitness?.flushesCompleted).toBe(true);
+			await expectWorkerDone(boundary, COMPLETE_COUNTS);
+			await expectQuiescent(boundary);
+		});
+	}, 30_000);
 
 	for (const mode of ["boundary", "overflow"] as const) {
 		test(`drains both real output streams at ${mode} without inventing success or hiding truncation`, async () => {
@@ -587,11 +785,26 @@ describe.skipIf(process.platform === "win32")("AWS secret input real worker and 
 		test(`unexpected worker ${fault}${cancellation} cannot orphan a ready receiver or its descendant`, async () => {
 			await withBoundary("success", "hold", async boundary => {
 				const operation = boundary.run();
-				await waitForAwsSecretInputLifecycleConsumerReady(boundary.control, boundary.workers);
+				const ready = await waitForAwsSecretInputLifecycleConsumerReady(boundary.control, boundary.workers);
+				const guardian = Process.fromPid(ready.parentPid as number);
+				const receiver = Process.fromPid(ready.pid!);
+				const descendant = Process.fromPid(ready.descendantPid!);
+				for (const owned of [guardian, receiver, descendant]) {
+					expect(owned?.status()).toBe(ProcessStatus.Running);
+					const identity = awsSecretInputLifecycleProcessIdentity(owned!.pid);
+					expect(identity?.state).toBe("live");
+				}
 				if (fault === "disconnect") boundary.workers[0]!.disconnect();
 				else boundary.workers[0]!.kill("SIGKILL");
 				if (abortAfterWorkerLoss) boundary.controller.abort();
 				expectFixedFailure(await captureFailure(operation), "WORKER_FAILED");
+				for (const owned of [guardian, receiver, descendant]) {
+					expect(
+						await owned!.waitForExit({ timeoutMs: 0 }),
+						"operation returned with a live pinned owned process",
+					).toBe(true);
+					expect(owned!.status()).toBe(ProcessStatus.Exited);
+				}
 				if (fault === "disconnect") await expectWorkerDone(boundary, COMPLETE_COUNTS);
 				await expectQuiescent(boundary);
 			});
@@ -650,6 +863,51 @@ describe.skipIf(process.platform === "win32")("AWS secret input real worker and 
 			});
 		}, 60_000);
 	}
+
+	test("guardian-only SIGKILL after a controlled receiver exit reaps its still-live owned descendant", async () => {
+		await withBoundary("success", "exit-with-descendant", async boundary => {
+			const operation = boundary.run();
+			const ready = await waitForAwsSecretInputLifecycleConsumerReady(boundary.control, boundary.workers);
+			const guardian = Process.fromPid(ready.parentPid as number);
+			const receiver = Process.fromPid(ready.pid!);
+			const descendant = Process.fromPid(ready.descendantPid!);
+			expect(guardian?.ppid).toBe(boundary.workers[0]!.pid);
+			expect(guardian?.groupId()).toBe(guardian!.pid);
+			const original = awsSecretInputLifecycleProcessIdentity(guardian!.pid);
+			expect(original?.state).toBe("live");
+			expect(receiver?.status()).toBe(ProcessStatus.Running);
+			expect(descendant?.status()).toBe(ProcessStatus.Running);
+			if (process.platform === "darwin") {
+				const keeper = await boundary.control.waitForEvent("keeper-ready");
+				expect((keeper.keeperIdentity as AwsSecretInputLifecycleProcessIdentity).state).toBe("live");
+			}
+			expect(guardian!.status()).toBe(ProcessStatus.Running);
+			expect(awsSecretInputLifecycleProcessIdentity(guardian!.pid)?.creation).toBe(original!.creation);
+			process.kill(guardian!.pid, "SIGSTOP");
+			const stoppedDeadline = Date.now() + 5_000;
+			// Kernel stop notifications cannot be advanced with fake JavaScript timers.
+			for (;;) {
+				const current = awsSecretInputLifecycleProcessIdentity(guardian!.pid);
+				expect(current?.creation).toBe(original!.creation);
+				if (current?.state === "stopped") break;
+				if (Date.now() >= stoppedDeadline) throw new Error("LIFECYCLE_GUARDIAN_STOP_TIMEOUT");
+				await Bun.sleep(5);
+			}
+			boundary.control.send("exit-consumer");
+			expect(await receiver!.waitForExit({ timeoutMs: 5_000 })).toBe(true);
+			expect(receiver!.status()).toBe(ProcessStatus.Exited);
+			expect(descendant!.status(), "controlled exit lost its live-descendant positive control").toBe(
+				ProcessStatus.Running,
+			);
+			const stopped = awsSecretInputLifecycleProcessIdentity(guardian!.pid);
+			expect(stopped?.creation).toBe(original!.creation);
+			expect(stopped?.state).toBe("stopped");
+			process.kill(guardian!.pid, "SIGKILL");
+			expectFixedFailure(await captureFailure(operation), "WORKER_FAILED");
+			expect(descendant!.status()).toBe(ProcessStatus.Exited);
+			await expectQuiescent(boundary);
+		});
+	}, 40_000);
 
 	test("worker failure still sweeps its owned group after the actual receiver has exited", async () => {
 		await withBoundary("pause-result", "hold", async boundary => {

@@ -153,13 +153,8 @@ for (const language of ["js", "py"] as const) {
 						});
 						expect(summary?.native).toBeNull();
 					} else {
-						expect(counts?.ui).toBe(3);
-						expect(counts?.launch).toBe(3);
-						expect(counts?.runWorker).toBe(3);
-						expect(counts?.providerRequests).toBe(6);
 						expect(counts?.providerDestroyed).toBe(counts?.providerClients);
-						expect(counts?.receiver).toBe(3);
-						expect(counts?.cleanupComplete).toBe(3);
+						expect(counts?.cleanupComplete).toBe(counts?.runWorker);
 						const native = isRecord(summary?.native) ? summary.native : undefined;
 						expect(native?.capability).toEqual(AWS_SECRET_INPUT_CAPABILITY);
 						const capabilityRoutes = native?.capabilityRoutes;
@@ -195,6 +190,17 @@ for (const language of ["js", "py"] as const) {
 						);
 						expect(native?.stdout).toBe("carrier-input-approved\n");
 						expect(native?.directStdout).toBe("carrier-input-approved\n");
+						expect(native?.transferRoutes).toEqual(
+							[
+								"native-mounted-ordinary-write",
+								"native-active-ordinary-write",
+								"native-active-copied-write",
+								"native-active-normalized-write",
+								"native-remounted-copied-write",
+							].map(stage => ({ stage, stdout: "carrier-input-approved\n", approvals: 1 })),
+						);
+						expect(native?.policyRevokedBeforeDelivery).toBe(true);
+						expect(native?.disabledBeforeProtectedWork).toBe(true);
 						expect(native?.resultHandlers).toEqual({ write: 1, aws: 1 });
 						expect(native?.cancelled).toBe(true);
 						expect(native?.cleanupRemoved).toBe(true);

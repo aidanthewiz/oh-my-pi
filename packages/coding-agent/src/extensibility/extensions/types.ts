@@ -1548,6 +1548,12 @@ export type ToolCallEvent =
 interface ToolResultEventBase extends McpToolEventIdentity {
 	type: "tool_result";
 	toolCallId: string;
+	/** Session that started the execution, even if the active session has changed. */
+	sessionId?: string;
+	/** Working directory of the session that started the execution. */
+	cwd?: string;
+	/** Actual completion of returned background work. Notification-only; result patches are ignored. */
+	completion?: "deferred";
 	input: Record<string, unknown>;
 	content: (TextContent | ImageContent)[];
 	isError: boolean;
@@ -1588,7 +1594,7 @@ export interface CustomToolResultEvent extends ToolResultEventBase {
 	details: unknown;
 }
 
-/** Fired after a tool executes. Can modify result. */
+/** Fired after a tool executes. Can modify returned results; deferred completions are notification-only. */
 export type ToolResultEvent =
 	| BashToolResultEvent
 	| ReadToolResultEvent

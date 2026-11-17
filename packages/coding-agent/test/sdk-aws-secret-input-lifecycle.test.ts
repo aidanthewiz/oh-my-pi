@@ -155,7 +155,7 @@ for (const scenario of ["fork", "dispose"] as const) {
 					expect(
 						isSupportedFiniteStdinDescriptor(stdinPrivateChannel) &&
 							isVerifiedStdinProducerWitness(stdinProducerWitness) &&
-							(stdinProducerWitness.inputWasEmpty || isLocallyAnonymousStdinChannel(stdinPrivateChannel)) &&
+							isLocallyAnonymousStdinChannel(stdinPrivateChannel) &&
 							summary?.stdinInputMode ===
 								(stdinProducerWitness.inputWasEmpty ? "empty-eof" : "anonymous-channel") &&
 							summary?.stdinPeerMetadataObserved ===

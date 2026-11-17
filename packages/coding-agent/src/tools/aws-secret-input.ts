@@ -171,6 +171,8 @@ export class AwsSecretInput {
 	async prepareApprovalTier(args: unknown, signal?: AbortSignal): Promise<void> {
 		try {
 			const request = this.#normalize(args);
+			if ("action" in request) this.#policy("aws", request, "read");
+			else this.#policies(request);
 			await this.#probe(request, signal);
 		} catch (error) {
 			throw new ToolError(safeAwsSecretInputFailure(error));
@@ -327,6 +329,8 @@ export class AwsSecretInput {
 		this.denyRuntimeApproval(toolCallId);
 		try {
 			const request = this.#normalize(args);
+			if ("action" in request) this.#policy("aws", request, "read", context);
+			else this.#policies(request, context);
 			const generation = this.#generation;
 			const sessionId = this.#sessionId();
 			await this.#probe(request, signal);
@@ -540,6 +544,7 @@ export class AwsSecretInput {
 			await this.#barrier;
 			this.#requireHost(request);
 			if ("action" in request) {
+				this.#policy("aws", request, "read", context);
 				await this.#probe(request, signal);
 				return toolResult<AwsSecretInputDetails>({ response: AWS_SECRET_INPUT_CAPABILITY })
 					.text(JSON.stringify(AWS_SECRET_INPUT_CAPABILITY))

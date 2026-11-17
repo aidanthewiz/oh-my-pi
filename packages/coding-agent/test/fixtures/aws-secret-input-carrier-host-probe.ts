@@ -23,6 +23,8 @@ import {
 	normalizeAwsSecretInputRequest,
 } from "../../src/tools/aws-secret-input-contract";
 import { runAwsSecretInputScope } from "../../src/tools/aws-secret-input-scope";
+import { probeAwsSecretInputWorker } from "../../src/tools/aws-secret-input-worker-client";
+import { cfgToolsApproval } from "../../src/tools/settings";
 import { createInMemoryAuthStorage } from "../helpers/agent-session-setup";
 
 const emit = process.stdout.write.bind(process.stdout);
@@ -190,6 +192,7 @@ async function run(root: string, language: "js" | "py") {
 	let unsubscribe: (() => void) | undefined;
 	let restoreUI: (() => void) | undefined;
 	let resultHook: CarrierResultHook | undefined;
+	let approvalAction: (() => Promise<void>) | undefined;
 	let sequence = 0;
 	const synthetic = createMockModel({ provider: model.provider, id: model.id, handler: { content: ["complete"] } });
 	const originalFactory = BUILTIN_TOOLS.aws;
@@ -208,10 +211,10 @@ async function run(root: string, language: "js" | "py") {
 			events.push("launch");
 			return launch;
 		},
-		probeWorker: async () => {
+		probeWorker: async signal => {
 			counts.probeWorker++;
 			events.push("probeWorker");
-			return AWS_SECRET_INPUT_CAPABILITY;
+			return probeAwsSecretInputWorker(signal);
 		},
 		runWorker: async (approved, files, authorize, signal, admitConsumer) => {
 			counts.runWorker++;
@@ -371,6 +374,9 @@ async function run(root: string, language: "js" | "py") {
 				counts.ui++;
 				events.push("ui");
 				proof(Bun.deepEquals(options, ["Deny", "Approve once"]));
+				const action = approvalAction;
+				approvalAction = undefined;
+				await action?.();
 				return "Approve once";
 			},
 		};
@@ -398,6 +404,7 @@ async function run(root: string, language: "js" | "py") {
 				owner.getToolContext?.() as AgentToolContext | undefined,
 			);
 		const reject = async (name: string, invoke: () => Promise<unknown>) => {
+			const previousStage = stage;
 			stage = name;
 			const before = { ...counts };
 			let outcome: unknown;
@@ -409,6 +416,7 @@ async function run(root: string, language: "js" | "py") {
 			proof(incompatible(outcome));
 			proof(Bun.deepEquals(counts, before));
 			denied.push(name);
+			stage = previousStage;
 		};
 		const dispatch = (name: string, args: Record<string, unknown>) => {
 			const id = `dispatch-${++sequence}`;
@@ -451,6 +459,29 @@ async function run(root: string, language: "js" | "py") {
 					cleanupComplete: counts.cleanupComplete - before.cleanupComplete,
 				},
 			});
+		};
+		const transferRoutes: { stage: string; stdout: string; approvals: number }[] = [];
+		const transfer = async (name: string, args: Record<string, unknown>) => {
+			stage = name;
+			const before = { ...counts };
+			const turn = dispatch("write", args);
+			await turn.pending;
+			const result = results.get(turn.id);
+			proof(result && result.isError !== true);
+			const value = response(result);
+			proof(value?.ok === true && isRecord(value.result));
+			proof(
+				value.result.stdout === APPROVED_OUTPUT &&
+					value.result.exitCode === 0 &&
+					value.result.cancelled === false &&
+					counts.ui - before.ui === 1 &&
+					counts.launch - before.launch === 1 &&
+					counts.runWorker - before.runWorker === 1 &&
+					counts.providerRequests - before.providerRequests === 2 &&
+					counts.receiver - before.receiver === 1 &&
+					counts.cleanupComplete - before.cleanupComplete === 1,
+			);
+			transferRoutes.push({ stage: name, stdout: value.result.stdout, approvals: counts.ui - before.ui });
 		};
 		for (const [kind, args] of [
 			["transfer", request],
@@ -600,6 +631,7 @@ async function run(root: string, language: "js" | "py") {
 		proof(stale);
 		stale.release();
 		await stale.settled;
+		await transfer("native-mounted-ordinary-write", writeArgs(request));
 
 		stage = "native-held-cleanup";
 		hold = {
@@ -700,14 +732,87 @@ async function run(root: string, language: "js" | "py") {
 		proof(directOrder.indexOf("provider-sts") < directOrder.indexOf("provider-secretsmanager"));
 		proof(directOrder.indexOf("provider-secretsmanager") < directOrder.indexOf("receiver"));
 		proof(directOrder.indexOf("receiver") < directOrder.indexOf("cleanup-complete"));
-		proof(counts.ui === 3 && counts.runWorker === 3 && counts.launch === 3);
-		proof(
-			counts.providerFiles === 6 &&
-				counts.providerRequests === 6 &&
-				counts.providerClients === 6 &&
-				counts.providerDestroyed === 6,
-		);
-		proof(counts.receiver === 3 && counts.cleanupComplete === 3);
+		await transfer("native-active-ordinary-write", writeArgs(request));
+		await transfer("native-active-copied-write", writeArgs(request, COPIED_AWS_PATH));
+		await transfer("native-active-normalized-write", {
+			path: COPIED_AWS_PATH,
+			content: JSON.stringify({ ...request, i: "Delivering synthetic private input" }, null, 2)
+				.split("\n")
+				.map((line, index) => `${index + 1}:${line}`)
+				.join("\n"),
+		});
+
+		const nativeSettings = owner.getToolContext?.()?.settings ?? owner.settings;
+		cfgToolsApproval.override(nativeSettings, { aws: "deny", bash: "allow" });
+		try {
+			for (const mounted of [false, true]) {
+				await live.setActiveToolPresentation(
+					mounted ? ["edit", "eval", "read", "write"] : ["aws", "edit", "eval", "read", "write"],
+					mounted ? ["aws"] : [],
+				);
+				for (const args of [capabilityRequest, request]) {
+					const innerIntent = JSON.stringify({ ...args, i: "Delivering synthetic private input" }, null, 2);
+					for (const content of [
+						JSON.stringify(args),
+						innerIntent,
+						innerIntent
+							.split("\n")
+							.map((line, index) => `${index + 1}:${line}`)
+							.join("\n"),
+					]) {
+						const form = content === innerIntent ? "intent" : content.startsWith("1:") ? "hashline" : "plain";
+						const policyCase = `native-policy-denied-${mounted ? "mounted" : "active"}-${args === capabilityRequest ? "capability" : "protected"}-${form}`;
+						stage = `${policyCase}-result`;
+						const before = { ...counts };
+						const turn = dispatch("write", { path: COPIED_AWS_PATH, content });
+						await turn.pending;
+						proof(results.get(turn.id)?.isError === true);
+						stage = `${policyCase}-effects`;
+						proof(Bun.deepEquals(counts, before));
+					}
+				}
+			}
+		} finally {
+			cfgToolsApproval.override(nativeSettings, { aws: "allow", bash: "allow" });
+			await live.setActiveToolPresentation(["aws", "edit", "eval", "read", "write"], []);
+		}
+
+		stage = "native-policy-revocation";
+		const beforeRevocation = { ...counts };
+		let probesAtRevocation: number | undefined;
+		approvalAction = async () => {
+			probesAtRevocation = counts.probeWorker;
+			cfgToolsApproval.override(nativeSettings, { aws: "deny", bash: "allow" });
+		};
+		try {
+			const turn = dispatch("write", writeArgs(request, COPIED_AWS_PATH));
+			await turn.pending;
+			const result = results.get(turn.id);
+			proof(result?.isError === true);
+			proof(
+				Bun.deepEquals(counts, {
+					...beforeRevocation,
+					ui: beforeRevocation.ui + 1,
+					probeWorker: probesAtRevocation,
+				}),
+			);
+		} finally {
+			approvalAction = undefined;
+			cfgToolsApproval.override(nativeSettings, { aws: "allow", bash: "allow" });
+		}
+
+		await live.setActiveToolPresentation(["edit", "eval", "read", "write"], []);
+		for (const args of [capabilityRequest, request]) {
+			stage = "native-disabled-write";
+			const before = { ...counts };
+			const turn = dispatch("write", writeArgs(args, COPIED_AWS_PATH));
+			await turn.pending;
+			const result = results.get(turn.id);
+			proof(result?.isError === true);
+			proof(Bun.deepEquals(counts, before));
+		}
+		await live.setActiveToolPresentation(["aws", "edit", "eval", "read", "write"], ["aws"]);
+		await transfer("native-remounted-copied-write", writeArgs(request, COPIED_AWS_PATH));
 		return {
 			schema: "aws-secret-input-carrier-host/v1",
 			language,
@@ -716,6 +821,9 @@ async function run(root: string, language: "js" | "py") {
 			native: {
 				capability: discoveredCapability,
 				capabilityRoutes,
+				transferRoutes,
+				policyRevokedBeforeDelivery: true,
+				disabledBeforeProtectedWork: true,
 				stdout: approvedResponse.result.stdout,
 				directStdout: directResponse.result.stdout,
 				resultHandlers: { write: writeResultHook.completed, aws: directResultHook.completed },

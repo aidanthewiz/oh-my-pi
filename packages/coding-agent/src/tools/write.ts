@@ -53,7 +53,14 @@ import writeDeviceOnlyRefusal from "../prompts/tools/write-device-only-refusal.m
 import type { ToolSession } from "../sdk";
 
 import { routeWriteThroughBridge, shouldRouteWriteThroughBridge } from "./acp-bridge";
-import { formatApprovalArguments, truncateForPrompt } from "./approval";
+import {
+	denyError,
+	formatApprovalArguments,
+	resolveApproval,
+	resolveApprovalFromContext,
+	resolveToolDecision,
+	truncateForPrompt,
+} from "./approval";
 import { approvalTargetIdentities, approvalTargetKey } from "./approval-targets";
 import { assertEditableFile } from "./auto-generated-guard";
 
@@ -578,13 +585,14 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 	readonly approval = (args: unknown): ToolApprovalDecision => {
 		const { path: rawPath, content } = args as Partial<WriteParams>;
 		if (typeof rawPath !== "string") return "write";
-		// Unwrap a hashline `[path#TAG]` wrapper first (parity with execute) so a
-		// wrapped `[scheme://h/x#ABCD]` gets the same tier as the bare URL.
-		return InternalUrlRouter.instance().writeTier(
-			unwrapHashlineHeaderPath(rawPath),
-			typeof content === "string" ? content : undefined,
-			this.session,
-		);
+		const router = InternalUrlRouter.instance();
+		const { path } = recoverConflictUriPrefix(router.peelWriteSelector(unwrapHashlineHeaderPath(rawPath), "write"));
+		const target = router.writeTarget(path);
+		const cleanContent =
+			typeof content !== "string" || target?.spec.write?.payload === "verbatim"
+				? content
+				: stripWriteContent(this.session, content).text;
+		return router.writeTier(path, cleanContent, this.session);
 	};
 	readonly cancellationBehavior = (args: unknown): "await-cleanup" | undefined => {
 		if (!isRecord(args) || typeof args.path !== "string") return undefined;
@@ -606,7 +614,12 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 			return undefined;
 		}
 	};
-	async prepareRuntimeApproval(toolCallId: string, args: unknown, signal?: AbortSignal): Promise<undefined> {
+	async prepareRuntimeApproval(
+		toolCallId: string,
+		args: unknown,
+		signal?: AbortSignal,
+		context?: AgentToolContext,
+	): Promise<undefined> {
 		const input = args as Partial<WriteParams>;
 		if (typeof input.path !== "string" || typeof input.content !== "string") return undefined;
 		const router = InternalUrlRouter.instance();
@@ -621,7 +634,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 		const prepare = (
 			inst as { prepareApprovalTier?: (args: unknown, signal?: AbortSignal) => Promise<void> } | undefined
 		)?.prepareApprovalTier;
-		if (!inst || !prepare) return undefined;
+		if (!name || !inst || !prepare) return undefined;
 		const content =
 			target?.spec.write?.payload === "verbatim"
 				? input.content
@@ -632,6 +645,17 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 		} catch {
 			return undefined;
 		}
+		const { approvalMode, userPolicies } = resolveApprovalFromContext({
+			autoApprove: context?.autoApprove,
+			settings: this.session.settings,
+		});
+		const approval = resolveApproval(
+			{ name: this.name, approval: { ...resolveToolDecision(inst, parsed), policyKey: name } },
+			parsed,
+			approvalMode,
+			userPolicies,
+		);
+		if (approval.policy === "deny") throw denyError(approval, this.name);
 		// Resolve async device tiers before the outer synchronous xd:// approval gate.
 		await prepare.call(inst, parsed, signal);
 		return undefined;

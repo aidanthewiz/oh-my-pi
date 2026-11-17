@@ -1,5 +1,5 @@
 import type { AgentToolDocTopic, ToolApprovalDecision } from "@oh-my-pi/pi-agent-core";
-import { isRecord, stableStringifyJson } from "@oh-my-pi/pi-utils";
+import { stableStringifyJson } from "@oh-my-pi/pi-utils";
 import { REPORT_ISSUE_DEVICE_NAME } from "@oh-my-pi/pi-tui/tools/report-tool-issue";
 import { isResolutionDeviceName } from "@oh-my-pi/pi-tui/tools/resolve";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
@@ -10,6 +10,7 @@ import { dispatchReportIssueDevice, reportIssueDeviceUsage } from "../tools/repo
 import { dispatchResolutionDevice, resolutionDeviceUsage } from "../tools/resolve";
 import {
 	dispatchXdevTool,
+	parseDeviceArgs,
 	resolveXdevCancellationBehavior,
 	resolveXdevTool,
 	xdevDocs,
@@ -46,13 +47,13 @@ function deviceWriteTier(
 		if (name && isResolutionDeviceName(name)) return "read";
 		const inst = name && session?.xdev ? resolveXdevTool(session.xdev, name) : undefined;
 		if (!name || !inst) return "exec";
-		if (typeof content !== "string") return "exec";
-		const parsed: unknown = JSON.parse(content);
-		if (!isRecord(parsed)) return "exec";
-		// The policyKey makes the outer gate consult `tools.approval.<device>` for
-		// this dispatch before falling back to `tools.approval.write`, so users can
-		// scope allow/deny/prompt to a single device (issue #7923).
-		return { ...resolveToolDecision(inst, parsed), policyKey: name };
+		if (typeof content !== "string") return { tier: "exec", policyKey: name };
+		try {
+			const parsed = parseDeviceArgs(inst, content, "approval-policy", () => "");
+			return { ...resolveToolDecision(inst, parsed), policyKey: name };
+		} catch {
+			return { tier: "exec", policyKey: name };
+		}
 	} catch {
 		return "exec";
 	}

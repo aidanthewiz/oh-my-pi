@@ -20,6 +20,7 @@ export const LIFECYCLE_STDOUT = "public stdout\0é🙂\n";
 export const LIFECYCLE_STDERR = "public stderr\0漢字\n";
 export const LIFECYCLE_OUTPUT_LIMIT = 1_048_576;
 export const LIFECYCLE_FAILURE = "AWS_SECRET_INPUT_LIFECYCLE_FIXTURE_FAILED";
+export const LIFECYCLE_SENSITIVE_MARKER = "aws_secret_input_fixture_";
 
 export type AwsSecretInputLifecycleConsumerMode =
 	| "text"
@@ -28,6 +29,7 @@ export type AwsSecretInputLifecycleConsumerMode =
 	| "newline"
 	| "binary"
 	| "input-limit"
+	| "input-paused"
 	| "empty"
 	| "hold"
 	| "commit-hold"
@@ -39,7 +41,7 @@ export type AwsSecretInputLifecycleConsumerMode =
 
 export function lifecycleExpectedInput(mode: AwsSecretInputLifecycleConsumerMode): Uint8Array {
 	if (mode === "binary") return new Uint8Array(LIFECYCLE_SECRET_BINARY);
-	if (mode === "input-limit") return new Uint8Array(LIFECYCLE_SECRET_LIMIT_INPUT);
+	if (mode === "input-limit" || mode === "input-paused") return new Uint8Array(LIFECYCLE_SECRET_LIMIT_INPUT);
 	if (mode === "empty") return new Uint8Array();
 	return new TextEncoder().encode(LIFECYCLE_SECRET_TEXT + (mode === "newline" ? "\n" : ""));
 }
@@ -47,7 +49,7 @@ export function lifecycleExpectedInput(mode: AwsSecretInputLifecycleConsumerMode
 export function lifecycleContainsSensitive(value: unknown): boolean {
 	const seen = new WeakSet<object>();
 	const visit = (item: unknown): boolean => {
-		if (typeof item === "string") return item.includes("aws_secret_input_fixture_");
+		if (typeof item === "string") return item.includes(LIFECYCLE_SENSITIVE_MARKER);
 		if (!item || typeof item !== "object" || seen.has(item)) return false;
 		seen.add(item);
 		if (item instanceof Uint8Array) return visit(Buffer.from(item).toString("utf8"));

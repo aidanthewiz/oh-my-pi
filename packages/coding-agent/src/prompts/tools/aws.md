@@ -59,7 +59,7 @@ Report truncation separately for each stream.
 `timeout` is seconds: default 30, maximum 120.
 Do not infer secret fields or combine credentials with application commands.
 The receiver must support finite stdin and non-echoing normal configuration; otherwise report it unsupported.
-Never substitute credential argv, environment, files, FIFOs, RAM disks, unsafe PTY input, or shell AWS calls.
+Never substitute credential argv, environment, files, named FIFOs, RAM disks, unsafe PTY input, or shell AWS calls.
 
 Only explicit existing static profile credentials and existing unexpired SSO tokens are supported.
 Do not assume role chains, credential_process, web identity, endpoints, or ambient credential providers work.

@@ -53,6 +53,7 @@ function ownedWorkerState(worker: AwsSecretInputLifecycleWorker): OwnedWorkerSta
 }
 export type AwsSecretInputLifecycleWorkerScenario =
 	| "success"
+	| "zombie-registration"
 	| "pause-capabilities"
 	| "global-bun-preload"
 	| "pause-result"
@@ -114,6 +115,17 @@ export function createAwsSecretInputLifecycleWorkerClient(
 			].includes(scenario)
 				? "aws-secret-input-lifecycle-malformed-worker.ts"
 				: "aws-secret-input-lifecycle-worker.ts";
+			const standardBinary = process.env.PI_TEST_AWS_SECRET_INPUT_WORKER_BINARY;
+			const malformedBinary = process.env.PI_TEST_AWS_SECRET_INPUT_MALFORMED_WORKER_BINARY;
+			if (
+				(standardBinary !== undefined || malformedBinary !== undefined) &&
+				(!standardBinary ||
+					!malformedBinary ||
+					!path.isAbsolute(standardBinary) ||
+					!path.isAbsolute(malformedBinary))
+			)
+				throw new Error(LIFECYCLE_FAILURE);
+			const binary = entry === "aws-secret-input-lifecycle-malformed-worker.ts" ? malformedBinary : standardBinary;
 			let controlFd: number | undefined;
 			try {
 				if (options.withControlDescriptor) {
@@ -126,14 +138,16 @@ export function createAwsSecretInputLifecycleWorkerClient(
 				}
 				const { stdin, stdout, stderr, ...processOptions } = spawnOptions;
 				const child = Bun.spawn(
-					[
-						process.execPath,
-						"--no-env-file",
-						"--no-install",
-						path.join(import.meta.dir, entry),
-						scenario,
-						String(options.controlPort ?? 0),
-					],
+					binary
+						? [binary, scenario, String(options.controlPort ?? 0)]
+						: [
+								process.execPath,
+								"--no-env-file",
+								"--no-install",
+								path.join(import.meta.dir, entry),
+								scenario,
+								String(options.controlPort ?? 0),
+							],
 					{
 						...processOptions,
 						...(controlFd === undefined
