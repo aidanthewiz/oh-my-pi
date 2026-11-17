@@ -85,6 +85,102 @@ afterEach(async () => {
 	await Promise.all(tempDirs.splice(0).map(dir => fs.rm(dir, { recursive: true, force: true })));
 });
 
+describe("JavaScript adapter runtime selection", () => {
+	let cwd: string;
+	let serverPath: string;
+	let originalEnv: Record<string, string | undefined>;
+	const nodeName = process.platform === "win32" ? "node.exe" : "node";
+
+	beforeEach(async () => {
+		cwd = await makeTempDir("omp-dap-js-runtime-");
+		serverPath = path.join(cwd, "dapDebugServer.js");
+		await fs.writeFile(serverPath, "");
+		await fs.writeFile(path.join(cwd, "package.json"), "{}");
+		const binDir = path.join(cwd, "bin");
+		await fs.mkdir(binDir);
+		originalEnv = {
+			JS_DEBUG_DAP_SERVER: process.env.JS_DEBUG_DAP_SERVER,
+			JS_DEBUG_NODE: process.env.JS_DEBUG_NODE,
+			PATH: process.env.PATH,
+		};
+		process.env.JS_DEBUG_DAP_SERVER = serverPath;
+		delete process.env.JS_DEBUG_NODE;
+		process.env.PATH = binDir;
+	});
+
+	afterEach(() => {
+		for (const [name, value] of Object.entries(originalEnv)) {
+			if (value === undefined) delete process.env[name];
+			else process.env[name] = value;
+		}
+	});
+
+	it("uses the explicit adapter runtime instead of project-local or PATH Node", async () => {
+		const managedNode = path.join(cwd, "managed", nodeName);
+		await writeExecutable(managedNode);
+		await writeExecutable(path.join(cwd, "node_modules", ".bin", nodeName));
+		await writeExecutable(path.join(cwd, "bin", nodeName));
+		process.env.JS_DEBUG_NODE = managedNode;
+
+		const adapter = requireSelectedAdapter(selectLaunchAdapter("app.js", cwd));
+		expect(adapter.resolvedCommand).toBe(managedNode);
+		expect(adapter.connectMode).toBe("tcp");
+	});
+
+	it("resolves an explicit relative runtime from the debug cwd, not PATH", async () => {
+		const managedNode = path.join(cwd, "managed", nodeName);
+		await writeExecutable(managedNode);
+		await writeExecutable(path.join(cwd, "bin", nodeName));
+		process.env.JS_DEBUG_NODE = path.join("managed", nodeName);
+
+		expect(resolveAdapter("js-debug-adapter", cwd)?.resolvedCommand).toBe(managedNode);
+	});
+
+	it("reports an unavailable adapter rather than replacing a missing explicit runtime", async () => {
+		await writeExecutable(path.join(cwd, "node_modules", ".bin", nodeName));
+		await writeExecutable(path.join(cwd, "bin", nodeName));
+		process.env.JS_DEBUG_NODE = path.join(cwd, "missing", nodeName);
+
+		expect(resolveAdapter("js-debug-adapter", cwd)).toBeNull();
+		expect(selectLaunchAdapter("app.js", cwd)).toEqual({
+			kind: "unavailable",
+			adapterName: "js-debug-adapter",
+			command: "js-debug-adapter",
+		});
+	});
+
+	it("rejects an explicitly empty runtime instead of using the host runtime", () => {
+		process.env.JS_DEBUG_NODE = "";
+
+		expect(resolveAdapter("js-debug-adapter", cwd)).toBeNull();
+	});
+
+	it("preserves project-local, PATH, and host fallback when no runtime is configured", async () => {
+		const projectNode = path.join(cwd, "node_modules", ".bin", nodeName);
+		const pathNode = path.join(cwd, "bin", nodeName);
+		await writeExecutable(projectNode);
+		await writeExecutable(pathNode);
+
+		expect(resolveAdapter("js-debug-adapter", cwd)?.resolvedCommand).toBe(projectNode);
+		await fs.rm(projectNode);
+		expect(resolveAdapter("js-debug-adapter", cwd)?.resolvedCommand).toBe(pathNode);
+		await fs.rm(pathNode);
+		expect(resolveAdapter("js-debug-adapter", cwd)?.resolvedCommand).toBe(process.execPath);
+	});
+
+	it("leaves a custom JavaScript adapter command independent of the runtime override", async () => {
+		const customAdapter = path.join(cwd, "custom", nodeName);
+		await writeExecutable(customAdapter);
+		await fs.writeFile(
+			path.join(cwd, "dap.json"),
+			JSON.stringify({ adapters: { "js-debug-adapter": { command: customAdapter } } }),
+		);
+		process.env.JS_DEBUG_NODE = path.join(cwd, "missing", nodeName);
+
+		expect(resolveAdapter("js-debug-adapter", cwd)?.resolvedCommand).toBe(customAdapter);
+	});
+});
+
 describe("DAP adapter configuration", () => {
 	it("loads a custom adapter from dap.json and selects it by file extension", async () => {
 		const cwd = await makeTempDir("omp-dap-config-json-");

@@ -35,9 +35,10 @@ import {
 	recoverTrustedAwsAuthentication,
 	resolveTrustedAwsProfile,
 } from "../tools/aws";
-import { formatApprovalArguments } from "../tools/approval";
+import { formatApprovalArguments, type ToolApproval } from "../tools/approval";
 import { ToolAbortError, throwIfAborted } from "../tools/tool-errors";
 import { schemaDeclaresIntentField } from "../utils/tool-schema";
+import { mcpToolApproval } from "./approval-policy";
 import { callTool, isAuthenticatedAwsTool, listTools } from "./client";
 import { formatMCPToolFailure, getMCPToolDiagnostic, MCPTransportError } from "./errors";
 import { describeMCPCall, describeMCPResult, renderMCPCall, renderMCPResult } from "@oh-my-pi/pi-tui/tools/mcp";
@@ -1216,7 +1217,7 @@ export class MCPTool implements CustomTool<TSchema, MCPToolDetails> {
 	readonly mcpServerName: string;
 	/** Server-declared read-only behavior for prewalk; approval stays conservative. */
 	readonly mcpReadOnlyHint: boolean | undefined;
-	readonly approval = "write" as const;
+	readonly approval: ToolApproval;
 	/** Render completed MCP calls with the result header replacing the pending call header. */
 	readonly mergeCallAndResult = true;
 	/**
@@ -1245,6 +1246,7 @@ export class MCPTool implements CustomTool<TSchema, MCPToolDetails> {
 		this.parameters = normalizeSchemaForMCP(tool.inputSchema) as TSchema;
 		this.mcpToolName = tool.name;
 		this.mcpServerName = connection.name;
+		this.approval = mcpToolApproval(connection.name);
 		this.mcpReadOnlyHint = tool.annotations?.readOnlyHint;
 	}
 
@@ -1320,7 +1322,7 @@ export class DeferredMCPTool implements CustomTool<TSchema, MCPToolDetails> {
 	readonly mcpServerName: string;
 	/** See {@link MCPTool.mcpReadOnlyHint}. */
 	readonly mcpReadOnlyHint: boolean | undefined;
-	readonly approval = "write" as const;
+	readonly approval: ToolApproval;
 	/** Render completed MCP calls with the result header replacing the pending call header. */
 	readonly mergeCallAndResult = true;
 	/** See {@link MCPTool.strict}: MCP servers own validation, so stay non-strict. */
@@ -1360,6 +1362,7 @@ export class DeferredMCPTool implements CustomTool<TSchema, MCPToolDetails> {
 		this.parameters = normalizeSchemaForMCP(this.tool.inputSchema) as TSchema;
 		this.mcpToolName = tool.name;
 		this.mcpServerName = serverName;
+		this.approval = mcpToolApproval(serverName);
 		this.mcpReadOnlyHint = tool.annotations?.readOnlyHint;
 		this.#fallbackProvider = source?.provider;
 		this.#fallbackProviderName = source?.providerName;

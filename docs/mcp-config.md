@@ -119,7 +119,7 @@ Shared fields for every transport:
 - `requestIdFormat?: "number" | "string"` — outgoing JSON-RPC request-id encoding; defaults to per-transport integers. `"string"` uses collision-resistant snowflake IDs. This OMP-specific field is read only from OMP-native files, root `mcp.json` / `.mcp.json`, and OMP extension packages; configs translated from other tools ignore it.
 - `instructions?: boolean` — include server-provided instructions in the system prompt (default: `true`). Set `false` to omit that server's instructions without disabling its tools. Native, standalone, managed, and OMP plugin configurations support it; imported tool configs ignore it.
 - `auth?: { ... }` — stored-credential metadata; managed credential injection is implemented for OAuth
-- `oauth?: { ... }` — explicit OAuth client and callback settings used during auth/reauth
+- `oauth?: { ... }` — explicit OAuth discovery, client, scope, and callback settings used during auth/reauth
 
 Disable instructions when a server's guidance conflicts with your tool policy or adds unwanted context to every request, including subagent requests. If no connected server contributes instructions, the MCP Server Instructions section is omitted entirely. `instructions` does not distinguish connections: when two entries under different names describe the same endpoint, only the higher-priority entry is kept, together with its own `instructions` value, so set the option on the entry that wins (see `/mcp list`). A changed value applies to an already-connected server after `/mcp reload`.
 
@@ -302,9 +302,11 @@ profile for untrusted checkouts.
 
 ```json
 {
+	"clientName": "Coreforge",
 	"clientId": "...",
 	"clientSecret": "...",
 	"scope": "optional space-separated scopes",
+	"resourceMetadataUrl": "https://mcp.example.com/.well-known/oauth-protected-resource",
 	"redirectUri": "...",
 	"callbackPort": 3334,
 	"callbackPath": "/oauth/callback",
@@ -312,11 +314,27 @@ profile for untrusted checkouts.
 }
 ```
 
-Use `oauth` when the MCP server requires explicit OAuth client, scope, or callback settings. The callback listener defaults to port `3000` and path `/callback`; an HTTP loopback `redirectUri` supplies its own port/path unless explicitly overridden. An HTTPS loopback redirect requires a distinct `callbackPort` for the local HTTP listener behind your TLS terminator.
+Use `oauth` when the MCP server requires explicit OAuth discovery, client, scope, or callback settings. The callback listener defaults to port `3000` and path `/callback`; an HTTP loopback `redirectUri` supplies its own port/path unless explicitly overridden. Set `callbackPort: 0` for an OS-assigned port and fresh dynamic client registration. An HTTPS loopback redirect requires a distinct `callbackPort` for the local HTTP listener behind your TLS terminator.
 
-During `/mcp reauth`, scopes advertised by the protected resource or its authentication challenge take precedence; `oauth.scope` supplies the fallback. Authorization-server `scopes_supported` is a catalogue of available scopes, not a request to grant all of them. OMP does not copy that catalogue into the login request. If the resource advertises no scopes, set `oauth.scope` to the scopes allowed for your registered client (for example, `"openid"` for an OpenID Connect login), or leave it unset to use the authorization server's defaults.
+`oauth.scope` overrides scopes from protected-resource metadata, authentication challenges, and the authorization URL. OMP uses that exact scope set for dynamic client registration and authorization. Set it to `""` to omit the scope parameter. Without this override, resource and challenge scopes remain the defaults. Authorization-server `scopes_supported` is a catalogue, not a request to grant every scope; OMP does not copy that catalogue into the login request.
 
 Scopes from resource-server-hosted `/oauth/metadata` and `/.mcp/auth` documents are also preserved, including nested `oauth`, `authorization`, and `auth` blocks. Their `scopes_supported` arrays are not treated as resource requirements when those paths are probed on an explicitly identified authorization server.
+
+`oauth.resourceMetadataUrl` explicitly trusts an RFC 9728 protected-resource metadata location for this MCP endpoint. OMP uses it instead of challenge-provided or inferred metadata, including when a challenge embeds OAuth endpoints. It must be an absolute HTTP(S) URL without user information. The document must provide `authorization_servers`; unavailable or invalid metadata does not fall back to challenge issuers. Advertised authorization servers and issuer matching still govern discovery. Without this option, origin-root metadata for a different resource remains rejected.
+
+Configuration writes validate the source-expanded metadata URL but preserve its original `${VAR}` or `${VAR:-default}` expression. This includes enable/disable operations and OAuth credential write-back. User definitions use normal environment expansion. Project definitions retain the restricted environment allowlist; an excluded variable uses its configured default, not its process value. Unsafe resolved URLs still block the write.
+
+For regional services, change both `url` and `oauth.resourceMetadataUrl` to the region's official URLs. Do not mix regions. Drata's root metadata names the origin as `resource`, while its MCP endpoint uses `/mcp/`; configure its official metadata URL explicitly with native HTTP transport. Set `clientName: "Coreforge"`, `callbackPort: 0`, and a read-only scope set such as `"openid offline_access read:controls read:framework read:policy read:evidence"`. Credentials remain bound to the active profile and MCP endpoint URL, not the metadata URL or canonical resource.
+
+Drata's regional URL pairs are:
+
+| Region | MCP `url` | `oauth.resourceMetadataUrl` |
+| --- | --- | --- |
+| US (default) | `https://mcp.drata.com/mcp/` | `https://mcp.drata.com/.well-known/oauth-protected-resource` |
+| EU | `https://mcp-euc1.drata.com/mcp/` | `https://mcp-euc1.drata.com/.well-known/oauth-protected-resource` |
+| APAC | `https://mcp-apse2.drata.com/mcp/` | `https://mcp-apse2.drata.com/.well-known/oauth-protected-resource` |
+
+The managed Drata server `coreforge-drata-mcp` requires explicit approval for every tool call, including calls annotated read-only. Permissive default approval modes do not bypass this requirement. Server annotations do not authorize mutations.
 
 `prompt` controls the OAuth `prompt` authorization parameter. By default OMP omits it, except that a requested `offline_access` scope defaults to `"consent"` so the provider can issue refresh access. Set it explicitly to a provider-supported value such as `"consent"` or `"select_account"`, or to `""` to force omission.
 
@@ -521,6 +539,7 @@ From `validateServerConfig()` in `packages/coding-agent/src/mcp/config.ts`:
 - `http` and `sse` require `url`
 - a server cannot set both `command` and `url`
 - unknown `type` values are rejected
+- `oauth.resourceMetadataUrl`, when set, must be an absolute HTTP(S) URL without user information
 
 These rules apply to direct configs passed to the validator/writer. Discovery first converts canonical entries: it infers `http` for a URL-only entry and `stdio` for a command entry, and keeps the fields for the selected transport. Do not rely on discovery to reject conflicting raw fields or an unknown type; write explicit, schema-valid transport definitions.
 

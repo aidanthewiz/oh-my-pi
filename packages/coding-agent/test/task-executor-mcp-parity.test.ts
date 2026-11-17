@@ -1,16 +1,22 @@
 import { describe, expect, it, vi } from "bun:test";
+import type { TSchema } from "@oh-my-pi/pi-ai";
+import type { MCPToolDetails } from "@oh-my-pi/pi-tui/tools/mcp";
 import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { ModelRegistry } from "../src/config/model-registry";
+import { Settings } from "../src/config/settings";
 import type { CustomToolContext } from "../src/extensibility/custom-tools/types";
-import type { ExtensionRunner } from "../src/extensibility/extensions/runner";
-import type { RegisteredTool } from "../src/extensibility/extensions/types";
-import { wrapRegisteredTool } from "../src/extensibility/extensions/wrapper";
+import { ExtensionRuntime, extensionToolSourceInfo } from "../src/extensibility/extensions/loader";
+import { ExtensionRunner } from "../src/extensibility/extensions/runner";
+import type { ExtensionUIContext, RegisteredTool } from "../src/extensibility/extensions/types";
+import { ExtensionToolWrapper, wrapRegisteredTool } from "../src/extensibility/extensions/wrapper";
 import { MCPManager } from "../src/mcp/manager";
-import { MCPTool } from "../src/mcp/tool-bridge";
+import { DeferredMCPTool, MCPTool } from "../src/mcp/tool-bridge";
 import type { MCPServerConnection, MCPToolDefinition } from "../src/mcp/types";
 import { customToolToDefinition } from "../src/sdk";
+import { SessionManager } from "../src/session/session-manager";
 import { buildSystemPrompt, projectSystemPromptToolMetadata } from "../src/system-prompt";
 import { createMCPProxyTools } from "../src/task/executor";
 import { createMockConnection, createMockTransport } from "./mcp-test-utils";
@@ -167,5 +173,193 @@ describe("Task MCP proxy parity", () => {
 
 		expect(freshCalls).toHaveLength(1);
 		expect(staleCalls).toHaveLength(0);
+	});
+});
+
+const DRATA_SERVER = "coreforge-drata-mcp";
+const DRATA_MUTATION: MCPToolDefinition = {
+	...STRICT_TOOL,
+	name: "update_control_17",
+	annotations: { readOnlyHint: true },
+};
+
+function createApprovalFixture(kind: "active" | "cached") {
+	const calls: CapturedRequest[] = [];
+	const connection = { ...createCapturedConnection(calls), name: DRATA_SERVER };
+	let connections = 0;
+	const source =
+		kind === "active"
+			? new MCPTool(connection, DRATA_MUTATION)
+			: new DeferredMCPTool(DRATA_SERVER, DRATA_MUTATION, async () => {
+					connections++;
+					return connection;
+				});
+	const manager = new MCPManager(process.cwd());
+	const getTools = vi.spyOn(manager, "getTools").mockReturnValue([source]);
+	return { manager, source, calls, getTools, connections: () => connections };
+}
+
+function createChildMCPTool(
+	manager: MCPManager,
+	settings = Settings.isolated(),
+	select?: ExtensionUIContext["select"],
+) {
+	const runner = new ExtensionRunner(
+		[],
+		new ExtensionRuntime(),
+		process.cwd(),
+		SessionManager.inMemory(process.cwd()),
+		{} as ModelRegistry,
+		undefined,
+		settings,
+	);
+	if (select) {
+		vi.spyOn(runner, "hasUI").mockReturnValue(true);
+		vi.spyOn(runner, "getUIContext").mockReturnValue({ ...runner.getUIContext(), select });
+	}
+	const [proxy] = createMCPProxyTools(manager);
+	if (!proxy) throw new Error("Expected an MCP child proxy");
+	const definition = customToolToDefinition(proxy);
+	const registered = wrapRegisteredTool(
+		{
+			definition,
+			extensionPath: "<sdk>",
+			owner: null,
+			sourceInfo: extensionToolSourceInfo(definition, "<sdk>"),
+		},
+		runner,
+	);
+	return new ExtensionToolWrapper(registered, runner);
+}
+
+describe("child MCP native approval", () => {
+	it.each(["active", "cached"] as const)(
+		"requires new consent for every read-only-annotated Drata mutation from an %s source under default yolo",
+		async kind => {
+			const f = createApprovalFixture(kind);
+			const prompted = Promise.withResolvers<void>();
+			const choice = Promise.withResolvers<string>();
+			let prompts = 0;
+			const child = createChildMCPTool(
+				f.manager,
+				Settings.isolated({ "tools.approval": { [f.source.name]: "allow" } }),
+				async () => {
+					prompts++;
+					if (prompts > 1) return "Deny";
+					prompted.resolve();
+					return choice.promise;
+				},
+			);
+			const pending = child.execute("child-consent", { body: "synthetic control" });
+			try {
+				const outcome = await Promise.race([
+					prompted.promise.then(() => "prompted"),
+					pending.then(() => "dispatched"),
+				]);
+				expect(outcome).toBe("prompted");
+				expect(f.calls).toEqual([]);
+				expect(f.connections()).toBe(0);
+				choice.resolve("Approve");
+				const result = await pending;
+				expect(result.details).toMatchObject({ serverName: DRATA_SERVER, mcpToolName: DRATA_MUTATION.name });
+				await expect(child.execute("child-next-consent", { body: "another control" })).rejects.toThrow(
+					"denied by user",
+				);
+				expect(prompts).toBe(2);
+				expect(f.calls).toEqual([
+					{
+						method: "tools/call",
+						params: { name: DRATA_MUTATION.name, arguments: { body: "synthetic control" } },
+					},
+				]);
+			} finally {
+				choice.resolve("Deny");
+				await pending.catch(() => {});
+			}
+		},
+	);
+
+	it.each(["active", "cached"] as const)("honors an exact deny before connecting an %s source", async kind => {
+		const f = createApprovalFixture(kind);
+		let prompts = 0;
+		const child = createChildMCPTool(
+			f.manager,
+			Settings.isolated({ "tools.approval": { [f.source.name]: "deny" } }),
+			async () => {
+				prompts++;
+				return "Approve";
+			},
+		);
+		await expect(child.execute("child-denied", { body: "blocked control" })).rejects.toThrow(
+			"blocked by user policy",
+		);
+		expect(prompts).toBe(0);
+		expect(f.connections()).toBe(0);
+		expect(f.calls).toEqual([]);
+	});
+
+	it("rebinds approval to the current raw namespace rather than a stale policy or colliding display name", async () => {
+		const f = createApprovalFixture("cached");
+		const stale: CustomTool<TSchema, MCPToolDetails> = {
+			...f.source,
+			approval: "write",
+			execute: f.source.execute.bind(f.source),
+		};
+		f.getTools.mockReturnValue([stale]);
+		let prompts = 0;
+		const child = createChildMCPTool(f.manager, Settings.isolated(), async () => {
+			prompts++;
+			return "Deny";
+		});
+		const decoyCalls: CapturedRequest[] = [];
+		const decoy = new MCPTool(
+			{ ...createCapturedConnection(decoyCalls), name: "coreforge_drata_mcp" },
+			DRATA_MUTATION,
+		);
+		f.getTools.mockReturnValue([decoy, f.source]);
+		await expect(child.execute("child-rebound", { body: "blocked control" })).rejects.toThrow("denied by user");
+		expect(prompts).toBe(1);
+		expect(f.connections()).toBe(0);
+		expect(f.calls).toEqual([]);
+		expect(decoyCalls).toEqual([]);
+	});
+
+	it("preserves a legacy deny when the raw tool name contains digits", async () => {
+		const f = createApprovalFixture("active");
+		if (!f.source.legacyName) throw new Error("Expected a legacy tool policy key");
+		const child = createChildMCPTool(
+			f.manager,
+			Settings.isolated({ "tools.approval": { [f.source.legacyName]: "deny" } }),
+		);
+		await expect(child.execute("child-legacy-denied", { body: "blocked control" })).rejects.toThrow(
+			"blocked by user policy",
+		);
+		expect(f.calls).toEqual([]);
+	});
+
+	it("preserves another server's dynamic approval receiver and input-dependent deny", async () => {
+		const calls: CapturedRequest[] = [];
+		const base = new MCPTool(createCapturedConnection(calls), STRICT_TOOL);
+		const source: CustomTool<TSchema, MCPToolDetails> = {
+			...base,
+			approval(this: CustomTool<TSchema, MCPToolDetails>, args) {
+				return this === source &&
+					typeof args === "object" &&
+					args !== null &&
+					"body" in args &&
+					args.body === "public"
+					? "read"
+					: { tier: "write", policy: "deny" };
+			},
+			execute: base.execute.bind(base),
+		};
+		const manager = new MCPManager(process.cwd());
+		vi.spyOn(manager, "getTools").mockReturnValue([source]);
+		const child = createChildMCPTool(manager, Settings.isolated({ "tools.approvalMode": "always-ask" }));
+		await child.execute("child-public", { body: "public" });
+		await expect(child.execute("child-private", { body: "private" })).rejects.toThrow("blocked by tool policy");
+		expect(calls).toEqual([
+			{ method: "tools/call", params: { name: STRICT_TOOL.name, arguments: { body: "public" } } },
+		]);
 	});
 });
