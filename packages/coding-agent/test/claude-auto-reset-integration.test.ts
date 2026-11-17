@@ -842,7 +842,7 @@ describe("Claude saved-reset trigger integration", () => {
 		expect([...coordinator.lastAttemptAtByAccount.keys()]).toEqual([`anthropic|${ORG_ID}|${CREDENTIAL_ID}`]);
 	});
 
-	it.each(["yes", "no"] as const)(
+	it.each(["unset", "yes", "no"] as const)(
 		"honors explicit headless auto-redeem consent for an imminent reset (%s)",
 		async autoRedeem => {
 			const status = claudeStatus(false);
@@ -885,8 +885,6 @@ describe("Claude saved-reset trigger integration", () => {
 	);
 
 	it("does not spend headlessly before independent Claude consent", async () => {
-		// Codex being disabled does not enable Claude, and short of a reset about to expire an unset headless
-		// session cannot spend silently.
 		const status = claudeStatus(false);
 		const { session, coordinator, targets } = buildSession({
 			report: withInventory(claudeReport(0.5), status),

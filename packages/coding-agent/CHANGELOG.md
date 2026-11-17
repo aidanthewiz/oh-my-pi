@@ -4,7 +4,7 @@
 
 ### Changed
 
-- Headless sessions with saved-reset `autoRedeem: unset` can spend an eligible saved credit during its final five minutes. Set the provider's `autoRedeem` to `no` to disable automatic spending.
+- Sync upstream v18.20.2 while retaining Coreforce model, account, approval, and resource-ownership policies.
 
 ### Added
 
@@ -16,6 +16,8 @@
 
 ### Fixed
 
+- Require explicit saved-reset consent or `autoRedeem: yes` before spending credits, including imminent expirations in headless sessions.
+- Derive directory depth from the traversal stack to keep symlink-aware walker frames compact without extra allocations.
 - Keep injected pending filesystem operations pending for their first poll, even when their latency timer is already ready.
 - Label differential job-control drive failures with their actual shell arm while preserving the original error.
 - Await native tab-worker closure and thread teardown before replacing a worker or releasing its browser resources.

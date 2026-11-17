@@ -117,6 +117,7 @@ describe("Codex saved-reset consent without a prompt UI", () => {
 	function buildSession(options: {
 		accounts: CodexAccount[];
 		streamErrorFirst?: boolean;
+		autoRedeem?: "unset" | "yes" | "no";
 		/** Builds the session the way ACP does for a client with or without form elicitation. */
 		acpForm?: boolean;
 	}): {
@@ -155,8 +156,8 @@ describe("Codex saved-reset consent without a prompt UI", () => {
 			"retry.baseDelayMs": 5,
 			"retry.maxDelayMs": 100,
 			"retry.maxRetries": 1,
-			"codexResets.autoRedeem5h": "unset",
-			"codexResets.autoRedeemWeekly": "unset",
+			"codexResets.autoRedeem5h": options.autoRedeem ?? "unset",
+			"codexResets.autoRedeemWeekly": options.autoRedeem ?? "unset",
 			"claudeResets.autoRedeem5h": "no",
 			"claudeResets.autoRedeemWeekly": "no",
 			"claudeResets.autoRedeemFable": "no",
@@ -204,7 +205,7 @@ describe("Codex saved-reset consent without a prompt UI", () => {
 		return elicitations;
 	}
 
-	it("restores a blocked turn with a reset expiring within five minutes and continues", async () => {
+	it("restores an explicitly authorized blocked turn with an imminent reset and continues", async () => {
 		const account = {
 			accountId: "acct-a",
 			credentialId: 1,
@@ -212,15 +213,13 @@ describe("Codex saved-reset consent without a prompt UI", () => {
 			limitReached: true,
 			creditExpiresInMs: 4 * MINUTE,
 		};
-		const { session, targets } = buildSession({ accounts: [account], streamErrorFirst: true });
+		const { session, targets } = buildSession({ accounts: [account], streamErrorFirst: true, autoRedeem: "yes" });
 		mockSchedulerWaitWithClock();
 
 		await session.prompt("trigger a codex usage limit");
 		await session.waitForIdle();
 
-		expect(targets).toEqual([
-			{ provider: "openai-codex", credentialId: 1, accountId: "acct-a", email: EMAIL, creditId: "credit-1" },
-		]);
+		expect(targets).toEqual([{ provider: "openai-codex", credentialId: 1, accountId: "acct-a", email: EMAIL }]);
 		expect(session.agent.state.messages.at(-1)).toMatchObject({
 			role: "assistant",
 			stopReason: "stop",
@@ -245,7 +244,7 @@ describe("Codex saved-reset consent without a prompt UI", () => {
 		expect(session.agent.state.messages.at(-1)).toMatchObject({ role: "assistant", stopReason: "error" });
 	});
 
-	it("spends only the reset about to expire from a mixed salvage batch", async () => {
+	it("does not spend an unconsented mixed salvage batch, including its imminent reset", async () => {
 		const expiring = {
 			accountId: "acct-a",
 			credentialId: 1,
@@ -265,9 +264,7 @@ describe("Codex saved-reset consent without a prompt UI", () => {
 		await session.fetchUsageReports();
 		await coordinator.sweepPromise;
 
-		expect(targets).toEqual([
-			{ provider: "openai-codex", credentialId: 1, accountId: "acct-a", email: EMAIL, creditId: "credit-1" },
-		]);
+		expect(targets).toEqual([]);
 	});
 
 	it.each(["pool", "opt-out", "dispose"] as const)(
@@ -280,7 +277,7 @@ describe("Codex saved-reset consent without a prompt UI", () => {
 				limitReached: false,
 				creditExpiresInMs: 4 * MINUTE,
 			};
-			const { session, coordinator, targets } = buildSession({ accounts: [account] });
+			const { session, coordinator, targets } = buildSession({ accounts: [account], autoRedeem: "yes" });
 			let permitted = true;
 			vi.spyOn(authStorage.sessions, "permits").mockImplementation(() => permitted);
 			const entered = Promise.withResolvers<void>();
@@ -307,7 +304,7 @@ describe("Codex saved-reset consent without a prompt UI", () => {
 		},
 	);
 
-	it("spends a reset about to expire for an ACP client without form elicitation", async () => {
+	it("honors explicit redemption consent for an ACP client without form elicitation", async () => {
 		const account = {
 			accountId: "acct-a",
 			credentialId: 1,
@@ -318,6 +315,7 @@ describe("Codex saved-reset consent without a prompt UI", () => {
 		const { session, targets } = buildSession({
 			accounts: [account],
 			streamErrorFirst: true,
+			autoRedeem: "yes",
 			acpForm: false,
 		});
 		const elicitations = await attachAcpClient(session, false);
@@ -327,9 +325,7 @@ describe("Codex saved-reset consent without a prompt UI", () => {
 		await session.waitForIdle();
 
 		expect(elicitations).toEqual([]);
-		expect(targets).toEqual([
-			{ provider: "openai-codex", credentialId: 1, accountId: "acct-a", email: EMAIL, creditId: "credit-1" },
-		]);
+		expect(targets).toEqual([{ provider: "openai-codex", credentialId: 1, accountId: "acct-a", email: EMAIL }]);
 		expect(session.agent.state.messages.at(-1)).toMatchObject({ role: "assistant", stopReason: "stop" });
 	});
 

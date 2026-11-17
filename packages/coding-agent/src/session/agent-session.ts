@@ -388,7 +388,6 @@ import {
 	planCodexResetRedemptions,
 	REDEEM_RETRY_DEFER_MS,
 	resetPlanSettings,
-	IMMINENT_RESET_EXPIRY_MS,
 	resetWindowMode,
 	resetWindowsEnabled,
 	SWEEP_MIN_INTERVAL_MS,
@@ -16299,35 +16298,15 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		const keyList = keys.map(key => key.id).join(", ");
 		const runner = this.#extensionRunner;
 		if (!runner?.hasUI() || !this.#interactivePrompts) {
-			const approved = actions
-				.filter(
-					action =>
-						action.expiresInMs !== undefined &&
-						action.expiresInMs > 0 &&
-						action.expiresInMs <= IMMINENT_RESET_EXPIRY_MS,
-				)
-				.map(action =>
-					!("program" in action) && action.creditId
-						? { ...action, target: { ...action.target, creditId: action.creditId } }
-						: action,
-				);
-			const waiting = actions.find(action => !approved.some(spend => spend.attemptKey === action.attemptKey));
-			if (waiting && !coordinator.notifiedKeys.has(waiting.attemptKey)) {
-				coordinator.notifiedKeys.add(waiting.attemptKey);
+			if (!coordinator.notifiedKeys.has(actions[0].attemptKey)) {
+				coordinator.notifiedKeys.add(actions[0].attemptKey);
 				this.emitNotice(
 					"warning",
 					`Saved ${providerLabel} resets are eligible to spend, but auto-redeem is unset and no prompt UI is available. Run \`/usage reset\` or set ${keyList}.`,
 					source,
 				);
 			}
-			for (const action of approved) {
-				this.emitNotice(
-					"info",
-					`Spending a saved ${providerLabel} reset for ${action.label} before it expires in ${formatDuration(action.expiresInMs ?? 0)}; auto-redeem is unset and no prompt UI is available. Set ${keyList} to no to let resets expire instead.`,
-					source,
-				);
-			}
-			return approved;
+			return [];
 		}
 
 		const lines = actions.map(action => {
