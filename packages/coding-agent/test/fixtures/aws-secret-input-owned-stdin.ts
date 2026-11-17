@@ -272,10 +272,17 @@ async function parent(): Promise<void> {
 				else throw error;
 				return undefined;
 			});
+			requireProof(identity && identity.receiverPid !== null);
+			const producerSettledAtExecReturn =
+				endStarted &&
+				endSettled &&
+				outstandingOperations === 0 &&
+				!operationAfterEnd &&
+				observer.pendingFor(identity.pid) === undefined;
+			if (mode !== "unexpected-producer-failure") requireProof(producerSettledAtExecReturn);
 			await aborting;
 			phase = "cleanup";
 			await Promise.allSettled(nativeOperations);
-			requireProof(identity && identity.receiverPid !== null);
 			requireProof(
 				guardian?.status() === ProcessStatus.Exited &&
 					consumer?.status() === ProcessStatus.Exited &&
@@ -299,11 +306,14 @@ async function parent(): Promise<void> {
 			const evidence = {
 				mode,
 				transport: stress ? "fixture-socketpair" : "production-pipe",
-				reaped: true,
-				producerSettled: true,
+				ownedProcessesTerminal: true,
+				producerSettledAfterFixtureJoin: true,
+				producerSettledAtExecReturn,
 				writerEofClosed: witness.eofClosed,
 				stdinProducerWitness: witness,
-				...(stress ? { pendingAtCancellation, nativePendingJoined: true, stressChannel, stressClosed } : {}),
+				...(stress
+					? { pendingAtCancellation, nativePendingSettledAfterFixtureJoin: true, stressChannel, stressClosed }
+					: {}),
 			};
 			if (stress) {
 				requireProof(

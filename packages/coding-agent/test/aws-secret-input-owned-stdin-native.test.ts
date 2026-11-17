@@ -123,11 +123,9 @@ test.skipIf(process.platform === "win32")(
 				for (const item of receipt.cases) {
 					expect(isRecord(item)).toBe(true);
 					if (!isRecord(item)) throw new Error("MISSING_OWNED_STDIN_CASE");
-					expect({ mode: item.mode, reaped: item.reaped, producerSettled: item.producerSettled }).toEqual({
-						mode: item.mode,
-						reaped: true,
-						producerSettled: true,
-					});
+					expect(item.ownedProcessesTerminal).toBe(true);
+					expect(item.producerSettledAfterFixtureJoin).toBe(true);
+					if (item.mode !== "unexpected-producer-failure") expect(item.producerSettledAtExecReturn).toBe(true);
 					expect(typeof item.writerEofClosed).toBe("boolean");
 					const stress = item.mode === "blocked" || item.mode === "unexpected-producer-failure";
 					expect(item.transport).toBe(stress ? "fixture-socketpair" : "production-pipe");
@@ -142,7 +140,7 @@ test.skipIf(process.platform === "win32")(
 					expect(Number.isSafeInteger(witness.maxChunkBytes) && Number(witness.maxChunkBytes) <= 4096).toBe(true);
 					if (stress) {
 						expect(witness.backpressureObserved).toBe(true);
-						expect(item.nativePendingJoined).toBe(true);
+						expect(item.nativePendingSettledAfterFixtureJoin).toBe(true);
 						expect(isRecord(item.pendingAtCancellation) && isRecord(item.stressChannel)).toBe(true);
 						if (!isRecord(item.pendingAtCancellation) || !isRecord(item.stressChannel))
 							throw new Error("MISSING_PENDING_STDIN_EVIDENCE");
