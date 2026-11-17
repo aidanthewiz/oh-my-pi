@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Expose an optional tool-context callback for terminal results produced after a tool returns.
+
 ### Fixed
 
 - Validate tool arguments without imposing unrelated renderer theme types on the tool metadata.
