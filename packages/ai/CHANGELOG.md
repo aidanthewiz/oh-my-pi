@@ -16,6 +16,7 @@
 
 - Do not replay a Kiro request after a truncated successful HTTP response; missing stream data does not prove that the request was not billed.
 - Require Kiro's per-tool completion marker before accepting a tool call. Reject incomplete responses without replaying them, preserving received text, usage and confirmed calls.
+- Let Antigravity dispose and log out after startup fails before credential ownership. Preserve cleanup fences when owned resources may remain.
 - Price billed usage retained by failed OpenAI Responses streams before reporting their terminal error.
 - Bind Factory transport qualification to explicit synthetic organization and discovered fallback authority without relaxing production admission.
 - Cancel parked Cursor runs before accepting tool results after credentials, endpoint, provider, transport, or tenant headers change. This fixes an inherited upstream relay defect from #17382.

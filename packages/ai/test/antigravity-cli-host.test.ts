@@ -1,10 +1,12 @@
 import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import { mkdir, mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import * as fs from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { type } from "@oh-my-pi/omptype";
 import { AuthStorage, SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai/auth-storage";
+import { OAuthError } from "@oh-my-pi/pi-ai/error";
 import * as agyBinary from "@oh-my-pi/pi-ai/providers/antigravity-cli/binary";
 import { conversationStorePath } from "@oh-my-pi/pi-ai/providers/antigravity-cli/conversation-store";
 import { agyCredentialKey, stageAgyCredentials } from "@oh-my-pi/pi-ai/providers/antigravity-cli/credentials";
@@ -23,6 +25,7 @@ import { StepWriter } from "@oh-my-pi/pi-ai/providers/antigravity-cli/step-write
 import type { AssistantMessage, Context, Message, Tool, ToolResultMessage } from "@oh-my-pi/pi-ai/types";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import * as fileLocks from "@oh-my-pi/pi-utils";
 import type { ContentBlock, PromptRequest, PromptResponse, SessionConfigOption } from "@oh-my-pi/pi-utils/acp";
 
 const model = buildModel({
@@ -858,7 +861,102 @@ function tokenPath(directory: string): string {
 	return path.join(directory, "antigravity-cli", "antigravity-oauth-token");
 }
 
+async function logoutFixture() {
+	const root = await mkdtemp(path.join(tmpdir(), "agy-startup-logout-"));
+	cleanup.push(() => rm(root, { recursive: true, force: true }));
+	vi.spyOn(agyBinary, "agyGeminiDir").mockReturnValue(root);
+	const store = await SqliteAuthCredentialStore.open(path.join(root, "agent.db"));
+	const storage = new AuthStorage(store);
+	cleanup.push(() => storage.close());
+	await storage.credentials.set("antigravity-cli", {
+		type: "oauth",
+		access: "synthetic-access",
+		refresh: "synthetic-refresh",
+		expires: JSON.parse(apiKey).expiresAt as number,
+		email: "host@example.test",
+	});
+	const row = storage.credentials.list("antigravity-cli")[0];
+	if (!row) throw new Error("Missing target account");
+	const dir = path.join(root, agyCredentialKey(apiKey));
+	await mkdir(dir, { recursive: true });
+	return { store, storage, row, dir };
+}
+
 describe("AgyHost credential lifetime", () => {
+	it.each(["EEXIST", "EACCES", "ELOCKED"] as const)(
+		"retires a pre-owner %s failure, then permits startup and exact-account logout",
+		async code => {
+			const account = await logoutFixture();
+			const state = await fixture({}, account.dir);
+			const directory = path.dirname(tokenPath(state.dir));
+			let restore = () => {};
+			if (code === "EEXIST") {
+				await fs.writeFile(directory, "not a directory");
+			} else {
+				const failure = Object.assign(new Error(`synthetic pre-owner failure: ${code}`), { code });
+				const mock =
+					code === "EACCES"
+						? vi.spyOn(fs, "mkdir").mockRejectedValueOnce(failure)
+						: vi.spyOn(fileLocks, "acquireFileLock").mockRejectedValueOnce(failure);
+				restore = () => mock.mockRestore();
+			}
+			try {
+				await expect(step(state.host, [user("failed startup")]).done).rejects.toMatchObject({ code });
+				expect(state.instances).toEqual([]);
+			} finally {
+				restore();
+				if (code === "EEXIST") await rm(directory);
+			}
+			await state.host.dispose();
+			const run = step(state.host, [user("recovered startup")]);
+			const child = await state.started.next();
+			await child.prompts.next();
+			expect(JSON.parse(await readFile(tokenPath(state.dir), "utf8")).token.refresh_token).toBe("synthetic-refresh");
+			expect(await account.storage.credentials.removeById("antigravity-cli", account.row.id)).toBe(true);
+			await expect(run.done).rejects.toThrow("session closed");
+			expect(child.closed).toBe(true);
+			expect(account.store.listAuthCredentials("antigravity-cli")).toEqual([]);
+			await expect(stat(tokenPath(state.dir))).rejects.toMatchObject({ code: "ENOENT" });
+		},
+	);
+
+	it("keeps an OAuth-shaped cleanup failure fenced from disposal and exact-account logout", async () => {
+		const account = await logoutFixture();
+		let starts = 0;
+		const host = new AgyHost(account.dir, {
+			startTransport: async () => {
+				starts++;
+				throw new Error("transport must not start");
+			},
+		});
+		const remove = fs.rm;
+		const stagingFailure = new Error("synthetic staged-file verification failure");
+		const cleanupFailure = new OAuthError("synthetic owner cleanup failure", {
+			kind: "validation",
+			provider: "antigravity-cli",
+		});
+		const readMock = vi.spyOn(fs, "readFile").mockRejectedValueOnce(stagingFailure);
+		const removeMock = vi.spyOn(fs, "rm").mockImplementation(async (...args) => {
+			if (String(args[0]).includes(".credential-owner-")) throw cleanupFailure;
+			return remove(...args);
+		});
+		try {
+			await expect(step(host, [user("uncertain cleanup")]).done).rejects.toBe(cleanupFailure);
+		} finally {
+			readMock.mockRestore();
+			removeMock.mockRestore();
+		}
+		expect(starts).toBe(0);
+		const retained = await readFile(tokenPath(account.dir), "utf8");
+		expect(JSON.parse(retained).token.refresh_token).toBe("synthetic-refresh");
+		await expect(host.dispose()).rejects.toBe(cleanupFailure);
+		await expect(account.storage.credentials.removeById("antigravity-cli", account.row.id)).rejects.toBe(
+			cleanupFailure,
+		);
+		expect(account.store.listAuthCredentials("antigravity-cli").map(row => row.id)).toEqual([account.row.id]);
+		expect(await readFile(tokenPath(account.dir), "utf8")).toBe(retained);
+	});
+
 	it("keeps a rotated grant until the last overlapping host exits", async () => {
 		const first = await fixture();
 		const initial = step(first.host, [user("first")]);

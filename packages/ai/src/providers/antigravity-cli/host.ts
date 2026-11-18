@@ -15,7 +15,6 @@ import {
 	type SessionConfigOption,
 	type SessionNotification,
 } from "@oh-my-pi/pi-utils/acp";
-import { OAuthError } from "../../error";
 import type { OAuthCredentials } from "../../registry/oauth/types";
 import type {
 	AntigravityCliCheckpoint,
@@ -41,7 +40,7 @@ import {
 	agyCredentialKey,
 	agyCredentialVersion,
 	removeAgyCredentials,
-	stageAgyCredentials,
+	stageAgyCredentialsWithOwnership,
 } from "./credentials";
 import { type McpCallHandler, McpBridge, type McpToolDefinition, type McpToolOutput } from "./mcp-bridge";
 import { inputBlocks, type Ledger, lateToolResultPrompt, planTurn, replayPrompt, transcriptDigest } from "./reconcile";
@@ -441,10 +440,12 @@ export class AgyHost implements ProviderSessionState {
 		const starting = (async () => {
 			step.controller.signal.throwIfAborted();
 			startupDrained = false;
-			const releaseCredentials = await stageAgyCredentials(apiKey, this.#geminiDir).catch(error => {
-				if (error instanceof OAuthError) startupDrained = true;
-				throw error;
-			});
+			const staged = await stageAgyCredentialsWithOwnership(apiKey, this.#geminiDir);
+			if ("error" in staged) {
+				startupDrained = staged.drained;
+				throw staged.error;
+			}
+			const releaseCredentials = staged.release;
 			this.#credentialOwners.add(releaseCredentials);
 			try {
 				step.controller.signal.throwIfAborted();

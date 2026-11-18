@@ -163,6 +163,29 @@ export function agyCredentialEnv(): Record<string, string> {
  * Broker refresh sentinels are never sent to Google.
  */
 export async function stageAgyCredentials(apiKey: string, geminiDir: string): Promise<() => Promise<void>> {
+	const staged = await stageAgyCredentialsWithOwnership(apiKey, geminiDir);
+	if ("error" in staged) throw staged.error;
+	return staged.release;
+}
+
+/** Internal startup result: error types do not establish whether resources were released. */
+export async function stageAgyCredentialsWithOwnership(
+	apiKey: string,
+	geminiDir: string,
+): Promise<{ release: () => Promise<void> } | { error: unknown; drained: boolean }> {
+	const state = { drained: true };
+	try {
+		return { release: await stageCredentials(apiKey, geminiDir, state) };
+	} catch (error) {
+		return { error, drained: state.drained };
+	}
+}
+
+async function stageCredentials(
+	apiKey: string,
+	geminiDir: string,
+	state: { drained: boolean },
+): Promise<() => Promise<void>> {
 	const credentials = parseAgyApiKey(apiKey);
 	agyCredentialKey(apiKey);
 	if (credentials.expires <= Date.now()) throw invalid("Antigravity CLI credentials must be refreshed before use");
@@ -177,7 +200,10 @@ export async function stageAgyCredentials(apiKey: string, geminiDir: string): Pr
 	const owner = path.join(directory, `${OWNER_PREFIX}${randomUUID()}`);
 	const temporary = `${file}.${randomUUID()}.tmp`;
 	await fs.mkdir(directory, { recursive: true, mode: 0o700 });
-	return withFileLock(credentialLock(geminiDir), async () => {
+	const lock = await acquireFileLock(credentialLock(geminiDir));
+	state.drained = false;
+	let ownerReleased = true;
+	try {
 		try {
 			await fs.stat(path.join(geminiDir, ".credentials-removed"));
 			throw invalid("Antigravity CLI account was removed; sign in again before use");
@@ -186,10 +212,12 @@ export async function stageAgyCredentials(apiKey: string, geminiDir: string): Pr
 		}
 		await fs.chmod(geminiDir, 0o700);
 		await fs.chmod(directory, 0o700);
+		ownerReleased = false;
 		await fs.writeFile(owner, "", { mode: 0o600, flag: "wx" });
 		const lease = tryAcquireFileLock(owner);
 		if (!lease) {
 			await fs.rm(owner, { force: true });
+			ownerReleased = true;
 			throw invalid("Could not retain the isolated Antigravity CLI account credentials");
 		}
 		let released: Promise<void> | undefined;
@@ -219,14 +247,18 @@ export async function stageAgyCredentials(apiKey: string, geminiDir: string): Pr
 				throw new Error();
 			}
 			return release;
-		} catch {
+		} catch (error) {
 			lease.release();
 			await fs.rm(temporary, { force: true });
 			await removeCredentialOwner(owner);
 			await removeUnownedCredentials(geminiDir);
-			throw invalid("Could not stage the isolated Antigravity CLI account credentials");
+			ownerReleased = true;
+			throw error;
 		}
-	});
+	} finally {
+		lock.release();
+		state.drained = ownerReleased;
+	}
 }
 
 /** Logout completes only after this exact account has no active transport owner. */

@@ -159,6 +159,26 @@ describe("Antigravity CLI credential ownership", () => {
 		expect((await exportAgyCredentials(otherAccount)).access).toBe("second-access");
 	});
 
+	it("preserves a staging error after complete cleanup and permits the next native lease", async () => {
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "agy-staging-recovery-"));
+		directories.push(directory);
+		const failure = Object.assign(new Error("synthetic staged-file read failure"), { code: "EACCES" });
+		const read = vi.spyOn(fs, "readFile").mockRejectedValueOnce(failure);
+		try {
+			await expect(stageAgyCredentials(apiKey, directory)).rejects.toBe(failure);
+		} finally {
+			read.mockRestore();
+		}
+		expect(await fs.readdir(path.join(directory, "antigravity-cli"))).toEqual([]);
+		const release = await stageAgyCredentials(apiKey, directory);
+		credentialReleases.push(release);
+		expect((await exportAgyCredentials(directory)).refresh).toBe(grant.refresh);
+		await release();
+		await expect(fs.stat(path.join(directory, "antigravity-cli", "antigravity-oauth-token"))).rejects.toMatchObject({
+			code: "ENOENT",
+		});
+	});
+
 	it("renders broker credentials with the local structured policy before staging", async () => {
 		const result = await getOAuthApiKey("antigravity-cli", {
 			"antigravity-cli": { ...grant, refresh: "__remote__" },
