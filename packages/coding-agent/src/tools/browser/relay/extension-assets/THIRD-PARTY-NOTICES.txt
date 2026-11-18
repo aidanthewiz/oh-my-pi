@@ -32482,13 +32482,13 @@ SOFTWARE.
 -------------------------------------------------------------------------------
 License: MIT License (MIT)
 Used by:
-- pi-ast 18.22.1 (https://github.com/can1357/oh-my-pi)
-- pi-builtins 18.22.1 (https://github.com/can1357/oh-my-pi)
-- pi-iso 18.22.1 (https://github.com/can1357/oh-my-pi)
-- pi-natives 18.22.1 (https://github.com/can1357/oh-my-pi)
-- pi-shell 18.22.1 (https://github.com/can1357/oh-my-pi)
-- pi-voice 18.22.1 (https://github.com/can1357/oh-my-pi)
-- pi-walker 18.22.1 (https://github.com/can1357/oh-my-pi)
+- pi-ast 18.22.2 (https://github.com/can1357/oh-my-pi)
+- pi-builtins 18.22.2 (https://github.com/can1357/oh-my-pi)
+- pi-iso 18.22.2 (https://github.com/can1357/oh-my-pi)
+- pi-natives 18.22.2 (https://github.com/can1357/oh-my-pi)
+- pi-shell 18.22.2 (https://github.com/can1357/oh-my-pi)
+- pi-voice 18.22.2 (https://github.com/can1357/oh-my-pi)
+- pi-walker 18.22.2 (https://github.com/can1357/oh-my-pi)
 
 Full license text:
 
@@ -32615,11 +32615,11 @@ Used by:
 - objc2-foundation 0.3.2 (https://github.com/madsmtm/objc2)
 - objc2-metal 0.3.2 (https://github.com/madsmtm/objc2)
 - objc2-quartz-core 0.3.2 (https://github.com/madsmtm/objc2)
-- pi-diff 18.22.1 (https://github.com/can1357/oh-my-pi)
-- pi-edit 18.22.1 (https://github.com/can1357/oh-my-pi)
-- pi-predict 18.22.1 (https://github.com/can1357/oh-my-pi)
-- pi-vcs 18.22.1 (https://github.com/can1357/oh-my-pi)
-- pi-vfs 18.22.1 (https://github.com/can1357/oh-my-pi)
+- pi-diff 18.22.2 (https://github.com/can1357/oh-my-pi)
+- pi-edit 18.22.2 (https://github.com/can1357/oh-my-pi)
+- pi-predict 18.22.2 (https://github.com/can1357/oh-my-pi)
+- pi-vcs 18.22.2 (https://github.com/can1357/oh-my-pi)
+- pi-vfs 18.22.2 (https://github.com/can1357/oh-my-pi)
 - pulp-wasm-simd-flag 0.1.1 (https://github.com/sarah-quinones/pulp/)
 - rcgen 0.13.2 (https://github.com/rustls/rcgen)
 - sptr 0.3.2 (https://github.com/Gankra/sptr)

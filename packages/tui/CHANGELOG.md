@@ -33,6 +33,20 @@
 - Scrub provider and operational AWS credentials from tmux capability queries while preserving terminal session identity.
 - Keep tool-image links bound to captured blob copies instead of reopening mutable read paths. Refresh native image links when hyperlink policy or file identity changes.
 - Preserve the focused worker's live loader when an older completion arrives. Fence teardown across view changes and asynchronous model switches.
+## [18.22.2] - 2026-11-18
+
+### Added
+
+- `ui.loop-blocked` log records can name what held the event loop (`cause`, `causeShare`, `top`) when explicitly enabled with `PI_LOOP_SAMPLER=1` or `true`; stack sampling remains off by default.
+
+### Changed
+
+- On Windows, terminal output is written off the JS thread, so input and rendering stay responsive while the console drains a large repaint
+
+### Fixed
+
+- On Windows, omp no longer freezes when the terminal stops reading its output (a hung Windows Terminal, a paused ssh client); it keeps running and catches up once the terminal reads again
+
 ## [18.22.1] - 2026-11-17
 
 ### Added

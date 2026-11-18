@@ -14,6 +14,7 @@
 
 ### Fixed
 
+- Do not replay a Kiro request after a truncated successful HTTP response; missing stream data does not prove that the request was not billed.
 - Price billed usage retained by failed OpenAI Responses streams before reporting their terminal error.
 - Bind Factory transport qualification to explicit synthetic organization and discovered fallback authority without relaxing production admission.
 - Cancel parked Cursor runs before accepting tool results after credentials, endpoint, provider, transport, or tenant headers change. This fixes an inherited upstream relay defect from #17382.
@@ -55,6 +56,24 @@
 - Preserved lease-owned account restrictions alongside durable credential admission, and kept branded callback errors inert during OAuth completion.
 - Kept official fallback-credit payloads off Factory routes and isolated Droid capture credentials without overriding account entitlements.
 - Preserve effective-endpoint fallback replay restrictions while collapsing incompatible Anthropic reasoning chains. Keep quoted prose during doubled-pipe DSML cleanup.
+## [18.22.2] - 2026-11-18
+
+### Added
+
+- Added the native Kiro provider: sign in with AWS IAM Identity Center, AWS Builder ID, Google, GitHub, or a Kiro API key (`KIRO_API_KEY`), stream responses with reasoning, tool calls, and images, and report Kiro credits in `/usage` ([#18955](https://github.com/can1357/oh-my-pi/pull/18955) by [@Xytronix](https://github.com/Xytronix), based on [#14215](https://github.com/can1357/oh-my-pi/pull/14215) by [@ajdiyassin](https://github.com/ajdiyassin))
+- Added a `definitive` option to `OAuthError`; `isDefinitiveOAuthFailure` now takes the error object and disables a credential marked definitive without matching its message ([#18955](https://github.com/can1357/oh-my-pi/pull/18955) by [@Xytronix](https://github.com/Xytronix))
+- `buildAnthropicSearchHeaders` takes `extraBetas`, request-specific betas sent beside the web search beta ([#18125](https://github.com/can1357/oh-my-pi/pull/18125) by [@will-bogusz](https://github.com/will-bogusz))
+- Added `omitDemotedReasoning` to `StreamOptions`: an Anthropic request leaves out other models' reasoning that it would otherwise replay as text, and a refused request reports how many such blocks it carried in `demotedReasoningBlocks` ([#10407](https://github.com/can1357/oh-my-pi/issues/10407)) ([#17610](https://github.com/can1357/oh-my-pi/pull/17610) by [@will-bogusz](https://github.com/will-bogusz))
+
+### Fixed
+
+- Fixed shutting down or cancelling an omp session making every other session sharing the agent directory see its OAuth accounts as depleted for 5 minutes; still-valid tokens are also served during shutdown ([#19607](https://github.com/can1357/oh-my-pi/issues/19607))
+- OAuth accounts refreshed through an auth broker keep their stored routing metadata (such as an API endpoint) in the key built for the request, instead of losing it after the first refresh ([#18955](https://github.com/can1357/oh-my-pi/pull/18955) by [@Xytronix](https://github.com/Xytronix), based on [#14215](https://github.com/can1357/oh-my-pi/pull/14215) by [@ajdiyassin](https://github.com/ajdiyassin))
+- Fenced (```thinking) reasoning with very long unbroken lines no longer slows down as it streams ([#19493](https://github.com/can1357/oh-my-pi/pull/19493) by [@H4vC](https://github.com/H4vC))
+- Fixed Anthropic requests that replay a signed server-compaction block still asking for a message thread, which the API refuses (`thread_unsupported_request`), so every such request first paid a rejected round trip before resending without the thread ([#19473](https://github.com/can1357/oh-my-pi/pull/19473) by [@alphastorm](https://github.com/alphastorm))
+- Anthropic requests whose connection drops before any response now say how long after the request started it dropped and whether the request body was still uploading or had all been written to the socket, with its size, instead of a bare "Connection error." ([#18624](https://github.com/can1357/oh-my-pi/pull/18624) by [@will-bogusz](https://github.com/will-bogusz))
+- Fixed Anthropic requests dropping the reasoning of earlier non-Claude turns signed in under another credential, or kept through a compaction; it is now replayed like other models' reasoning ([#7241](https://github.com/can1357/oh-my-pi/issues/7241)) ([#17610](https://github.com/can1357/oh-my-pi/pull/17610) by [@will-bogusz](https://github.com/will-bogusz))
+
 ## [18.22.1] - 2026-11-17
 
 ### Added
@@ -2616,3 +2635,4 @@ Older entries are archived in [packages/ai/CHANGELOG.md@7dc0d0325754](https://gi
 Older entries are archived in [packages/ai/CHANGELOG.md@b81a844b520a](https://github.com/can1357/oh-my-pi/blob/b81a844b520af43d1d190a99fcdc8928e242b315/packages/ai/CHANGELOG.md).
 Older entries are archived in [packages/ai/CHANGELOG.md@80ad1d6b2eb3](https://github.com/can1357/oh-my-pi/blob/80ad1d6b2eb3dd916d863841dcae79f4f96c5612/packages/ai/CHANGELOG.md).
 Older entries are archived in [packages/ai/CHANGELOG.md@6d3c42d33f26](https://github.com/can1357/oh-my-pi/blob/6d3c42d33f261e22588fbb7a96bff5af83a2e90e/packages/ai/CHANGELOG.md).
+Older entries are archived in [packages/ai/CHANGELOG.md@f6e1fbe1c735](https://github.com/can1357/oh-my-pi/blob/f6e1fbe1c735f06b8084102619f59e44e6f61d0f/packages/ai/CHANGELOG.md).

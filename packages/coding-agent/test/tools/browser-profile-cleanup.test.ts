@@ -158,10 +158,11 @@ describe("headless Chromium profile cleanup (issue #7058)", () => {
 		}
 	});
 
-	it("waits for a disconnected owned browser to close before removing its profile", async () => {
+	it("kills a disconnected owned-profile browser before removing its profile", async () => {
 		const dir = await makeProfileDir();
-		const closeStarted = Promise.withResolvers<void>();
-		const finishClose = Promise.withResolvers<void>();
+		// A real live process is required to exercise native termination, not a fake timer.
+		const chromium = Bun.spawn([process.execPath, "--no-env-file", "-e", "await Bun.sleep(60_000)"]);
+		let closeCalls = 0;
 		const handle = {
 			key: "headless:1",
 			kind: { kind: "headless", headless: true },
@@ -169,24 +170,24 @@ describe("headless Chromium profile cleanup (issue #7058)", () => {
 			userDataDir: dir,
 			browser: {
 				connected: false,
-				process: () => ({ pid: 4242 }),
-				close: async () => {
-					closeStarted.resolve();
-					await finishClose.promise;
+				process: () => ({ pid: chromium.pid }),
+				close: () => {
+					closeCalls++;
+					return Promise.withResolvers<void>().promise;
 				},
 			},
 			stealth: { browserSession: null, override: null },
 		} as unknown as BrowserHandle;
 
-		const released = releaseBrowser(handle, { kill: false });
 		try {
-			await closeStarted.promise;
-			expect(fs.existsSync(dir)).toBe(true);
+			await releaseBrowser(handle, { kill: false });
+			await chromium.exited;
+			expect(closeCalls).toBe(0);
+			expect(fs.existsSync(dir)).toBe(false);
 		} finally {
-			finishClose.resolve();
-			await released;
+			if (chromium.exitCode === null) chromium.kill("SIGKILL");
+			await chromium.exited;
 		}
-		expect(fs.existsSync(dir)).toBe(false);
 	});
 });
 

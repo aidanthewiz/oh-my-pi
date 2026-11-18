@@ -62,6 +62,13 @@
 - Drain owned Git process pipes through cancellation while preserving the existing TERM, grace, and reap policy.
 - Close unrelated inherited descriptors before child FIFO opens so blocked jobs cannot retain another pipeline's writer. Preserve explicitly inherited descriptors.
 - Preserve pipeline tap closure and byte-order checks on the current runtime, including Windows query failures that are not EOF.
+## [18.22.2] - 2026-11-18
+
+### Added
+
+- `TtyWriter` now works on Windows consoles: it writes off the JS thread in 16 KiB `WriteFile` chunks, restores the UTF-8 console code pages that child processes change, and `stop()` cancels a blocked write
+- Added `isolateThreadStartsFromConsole()`, which keeps a Windows console whose terminal stopped reading from blocking new threads in the process
+
 ## [18.22.1] - 2026-11-17
 
 ### Added

@@ -36,7 +36,9 @@ test.skipIf(!CHROMIUM_AVAILABLE)(
 				if (userDataDir) await removeUserDataDir(userDataDir);
 			},
 		};
-		await using _browserCleanup = { [Symbol.asyncDispose]: () => closeLaunchedBrowser(browser) };
+		await using _browserCleanup = {
+			[Symbol.asyncDispose]: () => closeLaunchedBrowser({ browser, userDataDir }),
+		};
 		const context = await browser.createBrowserContext();
 		await using _contextCleanup = { [Symbol.asyncDispose]: () => context.close() };
 		const checkout = await context.newPage();
