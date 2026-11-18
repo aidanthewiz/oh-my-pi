@@ -497,6 +497,7 @@ describe("ModelRegistry runtime discovery", () => {
 		expect(authStorage.credentials.getOAuth("anthropic")?.access).toBe("sk-ant-oat-expired-anthropic");
 	});
 	test("Antigravity startup hydrates only the current credential's model cache", async () => {
+		vi.spyOn(compatAuth, "providerDisabledReason").mockReturnValue(undefined);
 		const modelA = "gemini-2.5-account-a";
 		const modelB = "gemini-2.5-account-b";
 		const useAccount = (access: string) =>
@@ -532,6 +533,7 @@ describe("ModelRegistry runtime discovery", () => {
 	});
 
 	test("Antigravity cache follows the account union and explicit credential authority", async () => {
+		vi.spyOn(compatAuth, "providerDisabledReason").mockReturnValue(undefined);
 		const credential = (account: string, access = account): OAuthCredentials & { type: "oauth" } => ({
 			type: "oauth",
 			access,
@@ -1072,6 +1074,7 @@ describe("ModelRegistry runtime discovery", () => {
 	});
 
 	test("Antigravity discovery retains the project identity of a token override matching a stored account", async () => {
+		vi.spyOn(compatAuth, "providerDisabledReason").mockReturnValue(undefined);
 		await authStorage.credentials.set("google-antigravity", [
 			{
 				type: "oauth",
@@ -1109,6 +1112,7 @@ describe("ModelRegistry runtime discovery", () => {
 	});
 
 	test("Antigravity discovery does not append a stale preflight token after its stored account refreshes", async () => {
+		vi.spyOn(compatAuth, "providerDisabledReason").mockReturnValue(undefined);
 		const { refreshCalls } = await useAuthStorageWithRefreshTracker();
 		await authStorage.credentials.set("google-antigravity", {
 			type: "oauth",
@@ -1125,8 +1129,11 @@ describe("ModelRegistry runtime discovery", () => {
 					"expired-antigravity",
 				);
 				return (
-					accounts?.map(account => ({ accessToken: account.accessToken, accountKey: oauthAccountKey(account) })) ??
-					null
+					accounts?.map(account => ({
+						accessToken: account.accessToken,
+						accountKey: oauthAccountKey(account),
+						projectId: account.projectId,
+					})) ?? null
 				);
 			},
 			endpoint: "https://antigravity.test",

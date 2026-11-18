@@ -1,15 +1,18 @@
-import { afterEach, describe, expect, test, vi } from "bun:test";
-import type { AuthStorage } from "@oh-my-pi/pi-ai";
+import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
+import { Agent } from "@oh-my-pi/pi-agent-core";
+import { AuthStorage } from "@oh-my-pi/pi-ai";
+import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { OPENAI_HEADERS } from "@oh-my-pi/pi-catalog/wire/codex";
+import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { LiveSessionController, type LiveSessionControllerOptions } from "@oh-my-pi/pi-coding-agent/live/controller";
+import { LiveSessionController } from "@oh-my-pi/pi-coding-agent/live/controller";
 import { buildLiveSessionUpdate } from "@oh-my-pi/pi-coding-agent/live/protocol";
-import * as liveTransport from "@oh-my-pi/pi-coding-agent/live/transport";
+import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import {
 	buildLiveSidebandUrl,
 	type LiveEndpoint,
 	LiveTransport,
-	type LiveTransportOptions,
 	liveEndpointCallsUrl,
 	liveEndpointHeaders,
 	liveEndpointSidebandUrl,
@@ -20,14 +23,9 @@ import {
 /** Headers only Codex calls carry besides {@link OPENAI_HEADERS}; a custom endpoint must never see any. */
 const CODEX_ONLY_HEADERS = ["x-oai-attestation", "openai-alpha", "x-session-id"];
 
-/** Auth storage that fails the test if a custom-endpoint call asks for a Codex login. */
-const noCodexLogin = {
-	oauth: {
-		access: () => {
-			throw new Error("a custom live endpoint must not use Codex OAuth");
-		},
-	},
-} as unknown as AuthStorage;
+let authStorage: AuthStorage;
+const sessions: AgentSession[] = [];
+const controllers: LiveSessionController[] = [];
 
 const callbacks = { onEvent: () => {}, onOutputLevel: () => {} };
 
@@ -38,6 +36,7 @@ function realtimeServer() {
 	const upgrades: Request[] = [];
 	const messages: string[] = [];
 	const message = Promise.withResolvers<string>();
+	const sessionClosed = Promise.withResolvers<void>();
 	const server = Bun.serve({
 		hostname: "127.0.0.1",
 		port: 0,
@@ -58,15 +57,27 @@ function realtimeServer() {
 			message(_socket, data) {
 				messages.push(String(data));
 				message.resolve(String(data));
+				if (JSON.parse(String(data)).type === "session.close") sessionClosed.resolve();
 			},
 		},
 	});
-	return { server, calls, offers, upgrades, messages, firstMessage: message.promise };
+	return {
+		server,
+		calls,
+		offers,
+		upgrades,
+		messages,
+		firstMessage: message.promise,
+		sessionClosed: sessionClosed.promise,
+	};
 }
 
 function endpointTransport(endpoint: LiveEndpoint): LiveTransport {
+	vi.spyOn(authStorage.oauth, "access").mockImplementation(() => {
+		throw new Error("a custom live endpoint must not use Codex OAuth");
+	});
 	return new LiveTransport({
-		authStorage: noCodexLogin,
+		authStorage,
 		endpoint,
 		sessionId: "s1",
 		instructions: "Be brief.",
@@ -83,7 +94,14 @@ function expectNoCodexHeaders(request: Request): void {
 	}
 }
 
-afterEach(() => {
+beforeEach(async () => {
+	authStorage = await AuthStorage.create(":memory:");
+});
+
+afterEach(async () => {
+	for (const controller of controllers.splice(0)) await controller.stop();
+	for (const session of sessions.splice(0)) await session.dispose();
+	await authStorage.close();
 	vi.restoreAllMocks();
 });
 
@@ -213,14 +231,10 @@ describe("live transport on a custom endpoint", () => {
 describe("live transport without an endpoint", () => {
 	test("still signals Codex with the openai-codex login", async () => {
 		const providers: string[] = [];
-		const authStorage = {
-			oauth: {
-				access: async (provider: string) => {
-					providers.push(provider);
-					return undefined;
-				},
-			},
-		} as unknown as AuthStorage;
+		vi.spyOn(authStorage.oauth, "access").mockImplementation(async provider => {
+			providers.push(provider);
+			return undefined;
+		});
 		const transport = new LiveTransport({
 			authStorage,
 			sessionId: "s1",
@@ -235,50 +249,68 @@ describe("live transport without an endpoint", () => {
 });
 
 describe("live session offline mode", () => {
-	function controllerFor(settings: Settings): { controller: LiveSessionController; endpoints: unknown[] } {
-		const endpoints: unknown[] = [];
-		// bun's spyOn types a class export's implementation as `never`; a plain constructible function suffices.
-		const transportSpy = vi.spyOn(liveTransport, "LiveTransport") as unknown as {
-			mockImplementation(implementation: (options: LiveTransportOptions) => object): void;
-		};
-		transportSpy.mockImplementation(function (options: LiveTransportOptions) {
-			endpoints.push(options.endpoint);
-			return {
-				connect: async () => {},
-				setMuted: async () => {},
-				send: async () => {},
-				close: async () => {},
-				sdpAnswer: "v=0 answer",
-			};
+	async function controllerFor(settings: Settings): Promise<LiveSessionController> {
+		const mock = createMockModel({
+			handler: () => {
+				throw new Error("unexpected delegated turn");
+			},
 		});
-		const session = {
-			modelRegistry: { authStorage: noCodexLogin },
-			model: { provider: "anthropic" },
+		const session = new AgentSession({
+			agent: new Agent({
+				initialState: { model: mock.model, systemPrompt: ["Test"], tools: [] },
+				streamFn: mock.stream,
+				getApiKey: () => "test-key",
+			}),
+			sessionManager: SessionManager.inMemory(),
+			modelRegistry: new ModelRegistry(authStorage, undefined, { ignoreLocalModelConfig: true }),
 			settings,
-			sessionId: "s1",
-			subscribe: () => () => {},
-			sendCustomMessage: async () => {},
-		} as unknown as LiveSessionControllerOptions["session"];
+		});
+		sessions.push(session);
 		const controller = new LiveSessionController({
 			session,
 			extractAssistantText: () => "",
 			sdpOffer: "v=0 offer",
 			callbacks: { onPhase: () => {}, onLevels: () => {}, onTranscript: () => {}, onTerminal: () => {} },
 		});
-		return { controller, endpoints };
+		controllers.push(controller);
+		return controller;
 	}
 
-	test("allows an explicitly configured live endpoint", async () => {
-		const settings = Settings.isolated({ "models.offline": true, "live.endpoint": "http://127.0.0.1:8080/v1" });
-		const { controller, endpoints } = controllerFor(settings);
-		await controller.start();
-		expect(endpoints).toEqual([{ baseUrl: "http://127.0.0.1:8080/v1" }]);
-		await controller.stop();
+	test("allows an explicitly configured live endpoint and closes its offline session", async () => {
+		const local = realtimeServer();
+		const access = vi.spyOn(authStorage.oauth, "access");
+		const controller = await controllerFor(
+			Settings.isolated({
+				"models.offline": true,
+				"live.endpoint": `http://127.0.0.1:${local.server.port}/v1`,
+			}),
+		);
+		try {
+			await controller.start();
+			expect(JSON.parse(await local.firstMessage).type).toBe("session.update");
+			expect(controller.sdpAnswer).toBe("v=0 answer");
+			await Promise.all([controller.stop(), local.sessionClosed]);
+			expect(local.offers).toEqual(["v=0 offer"]);
+			expect(access).not.toHaveBeenCalled();
+		} finally {
+			await controller.stop();
+			local.server.stop(true);
+		}
 	});
 
 	test("still requires the openai-codex provider without one", async () => {
-		const { controller, endpoints } = controllerFor(Settings.isolated({ "models.offline": true }));
+		const controller = await controllerFor(Settings.isolated({ "models.offline": true }));
 		await expect(controller.start()).rejects.toThrow("openai-codex session provider or live.endpoint");
-		expect(endpoints).toEqual([]);
+	});
+
+	test("keeps the live model policy on an explicitly configured endpoint", async () => {
+		const controller = await controllerFor(
+			Settings.isolated({
+				"models.offline": true,
+				"live.endpoint": "http://127.0.0.1:8080/v1",
+				disabledProviders: ["openai-codex"],
+			}),
+		);
+		await expect(controller.start()).rejects.toThrow("excluded by model policy");
 	});
 });

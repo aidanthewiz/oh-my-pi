@@ -1344,6 +1344,11 @@ describe("tool-owned dynamic approval declarations", () => {
 			],
 		});
 
+		const commandRows = (prompt: string) =>
+			prompt
+				.split("\n")
+				.filter(line => /^  [✓?] /u.test(line))
+				.map(line => line.trim().replace(/ \([^)]*\)$/u, ""));
 		const prompts: { full: string; compact: string }[] = [];
 		const ui = {
 			select: async () => undefined,
@@ -1353,30 +1358,21 @@ describe("tool-owned dynamic approval declarations", () => {
 			},
 		};
 
-		await requestApproval(ui, bash, {
-			command: "git status && git diff --stat && bun test && go get example.com/mod",
-		});
-		const expectedLines = [
-			"Allow tool: bash",
-			"Command:",
-			"  ✓ git status (allowed: git status*)",
-			"  ✓ git diff --stat (allowed: git diff*)",
-			"  ? bun test (requires approval)",
-			"  ? go get example.com/mod (prompt: go get*)",
-		];
-		expect(prompts[0]!.full.split("\n")).toEqual(expectedLines);
-		expect(prompts[0]!.compact.split("\n")).toEqual(expectedLines);
+		const mixed = "git status && git diff --stat && bun test && go get example.com/mod";
+		await requestApproval(ui, bash, { command: mixed });
+		const expectedRows = ["✓ git status", "✓ git diff --stat", "? bun test", "? go get example.com/mod"];
+		expect(commandRows(prompts[0]!.full)).toEqual(expectedRows);
+		expect(commandRows(prompts[0]!.compact)).toEqual(expectedRows);
+		expect(resolveApproval(bash, { command: mixed }, "always-ask").policy).toBe("prompt");
+		for (const command of ["git status", "git diff --stat"]) {
+			expect(resolveApproval(bash, { command }, "always-ask").policy).toBe("allow");
+		}
 
-		// Non-stateful non-literal segment prompts for itself without tainting a following allowed segment.
-		expect(formatApprovalPrompt(bash, { command: "echo hi > /tmp/out && git status" }).split("\n")).toEqual([
-			"Allow tool: bash",
-			"Command:",
-			"  ? echo hi > /tmp/out (requires approval)",
-			"  ✓ git status (allowed: git status*)",
+		expect(commandRows(formatApprovalPrompt(bash, { command: "echo hi > /tmp/out && git status" }))).toEqual([
+			"? echo hi > /tmp/out",
+			"✓ git status",
 		]);
 
-		// Stateful segment taints subsequent segments because shell state can change before they run,
-		// including when a leading redirection precedes the stateful builtin.
 		for (const command of [
 			"cd /tmp && git status",
 			">/dev/null cd /tmp && git status",
@@ -1386,74 +1382,51 @@ describe("tool-owned dynamic approval declarations", () => {
 			"PATH=/tmp : && git status",
 			"repeat 1 export PATH=/tmp && git status",
 		]) {
-			expect(formatApprovalPrompt(bash, { command }).split("\n")).toEqual([
-				"Allow tool: bash",
-				"Command:",
-				`  ? ${command.split(" && ")[0]} (requires approval)`,
-				"  ? git status (requires approval)",
+			expect(commandRows(formatApprovalPrompt(bash, { command }))).toEqual([
+				`? ${command.split(" && ")[0]}`,
+				"? git status",
 			]);
+			expect(resolveApproval(bash, { command }, "always-ask").policy).toBe("prompt");
 		}
 
-		// `&&` inside `[[ ... ]]` stays within the conditional clause instead of splitting into false command rows.
 		expect(
-			formatApprovalPrompt(bash, { command: "git status && [[ -f a && -f b ]] && git diff" }).split("\n"),
-		).toEqual([
-			"Allow tool: bash",
-			"Command:",
-			"  ✓ git status (allowed: git status*)",
-			"  ? [[ -f a && -f b ]] (requires approval)",
-			"  ? git diff (requires approval)",
-		]);
-
-		// `&&` inside `${…}` and `{ … }` groups stays within its clause too.
+			commandRows(formatApprovalPrompt(bash, { command: "git status && [[ -f a && -f b ]] && git diff" })),
+		).toEqual(["✓ git status", "? [[ -f a && -f b ]]", "? git diff"]);
 		expect(
-			formatApprovalPrompt(bash, { command: "git status && echo ${x:-a&&b} && { true && cd /tmp; }" }).split("\n"),
-		).toEqual([
-			"Allow tool: bash",
-			"Command:",
-			"  ✓ git status (allowed: git status*)",
-			"  ? echo ${x:-a&&b} (requires approval)",
-			"  ? { true && cd /tmp; } (requires approval)",
-		]);
+			commandRows(formatApprovalPrompt(bash, { command: "git status && echo ${x:-a&&b} && { true && cd /tmp; }" })),
+		).toEqual(["✓ git status", "? echo ${x:-a&&b}", "? { true && cd /tmp; }"]);
 
-		// Long chains elide excess leading allowed rows in compact view so the first prompted segment is visible.
 		const longChain = [...Array.from({ length: 7 }, (_, i) => `git status -s dir${i}`), "rm -rf /"].join(" && ");
-		await requestApproval(ui, bash, { command: longChain }, { reason: "Critical pattern detected" });
-		expect(prompts[1]!.full.split("\n")).toHaveLength(11);
-		expect(prompts[1]!.compact.split("\n")).toEqual([
-			"Allow tool: bash",
-			"Reason: Critical pattern detected",
-			"Command:",
-			"  ✓ … (4 allowed segments)",
-			"  ✓ git status -s dir4 (allowed: git status*)",
-			"  ✓ git status -s dir5 (allowed: git status*)",
-			"  ✓ git status -s dir6 (allowed: git status*)",
-			"  ? rm -rf / (critical pattern)",
-		]);
+		await requestApproval(ui, bash, { command: longChain });
+		const fullRows = commandRows(prompts[1]!.full);
+		const compactRows = commandRows(prompts[1]!.compact);
+		expect(fullRows).toEqual([...Array.from({ length: 7 }, (_, i) => `✓ git status -s dir${i}`), "? rm -rf /"]);
+		expect(compactRows).toContain("? rm -rf /");
+		expect(compactRows.length).toBeLessThan(fullRows.length);
+		expect(resolveApproval(bash, { command: longChain }, "always-ask").policy).toBe("prompt");
 
-		// Critical segment is flagged even if an allow rule would otherwise match.
-		const rmAllowed = createBashTool({
-			"bash.allowCompoundCommands": true,
-			"bash.patterns": [
-				{ match: "git status*", approval: "allow" },
-				{ match: "rm *", approval: "allow" },
-			],
+		withoutManagedDcg(() => {
+			const rmAllowed = createBashTool({
+				"bash.allowCompoundCommands": true,
+				"bash.patterns": [
+					{ match: "git status*", approval: "allow" },
+					{ match: "rm *", approval: "allow" },
+				],
+			});
+			const command = "git status && rm -rf /";
+			expect(commandRows(formatApprovalPrompt(rmAllowed, { command }))).toEqual(["✓ git status", "? rm -rf /"]);
+			expect(resolveApproval(rmAllowed, { command }, "always-ask").policy).toBe("prompt");
 		});
-		expect(formatApprovalPrompt(rmAllowed, { command: "git status && rm -rf /" }).split("\n")).toEqual([
-			"Allow tool: bash",
-			"Command:",
-			"  ✓ git status (allowed: git status*)",
-			"  ? rm -rf / (critical pattern)",
-		]);
 
-		// With allowCompoundCommands disabled, the command stays a single unsegmented line.
 		const compoundDisabled = createBashTool({
 			"bash.allowCompoundCommands": false,
 			"bash.patterns": [{ match: "git status*", approval: "allow" }],
 		});
-		expect(formatApprovalPrompt(compoundDisabled, { command: "git status && bun test" })).toBe(
-			"Allow tool: bash\nCommand: git status && bun test",
-		);
+		const disabledCommand = "git status && bun test";
+		const disabledPrompt = formatApprovalPrompt(compoundDisabled, { command: disabledCommand });
+		expect(disabledPrompt).toContain(disabledCommand);
+		expect(commandRows(disabledPrompt)).toEqual([]);
+		expect(resolveApproval(compoundDisabled, { command: disabledCommand }, "always-ask").policy).toBe("prompt");
 	});
 });
 

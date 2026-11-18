@@ -1,5 +1,5 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it, spyOn, vi } from "bun:test";
-import { agentLoop, type AgentToolContext } from "@oh-my-pi/pi-agent-core";
+import { Agent, agentLoop, type AgentToolContext } from "@oh-my-pi/pi-agent-core";
 import type { AgentLoopConfig } from "@oh-my-pi/pi-agent-core/types";
 import * as ai from "@oh-my-pi/pi-ai";
 import type { Api, AssistantMessage, Message, Model } from "@oh-my-pi/pi-ai";
@@ -12,6 +12,8 @@ import type {
 	ExtensionUIDialogOptions,
 	ExtensionUISelectItem,
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
+import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { AskTool, recoverAskHtml } from "@oh-my-pi/pi-coding-agent/tools/ask";
 import { ToolAbortError } from "@oh-my-pi/pi-coding-agent/tools/tool-errors";
@@ -715,14 +717,14 @@ describe("AskTool option note images", () => {
 		);
 
 		expect(result.content).toEqual([
-			{
-				type: "text",
-				text: `User answers:\n${JSON.stringify({ store: "redis" }, null, 2)}\nOption notes:\n- Session store: Redis [store="redis"] — see [Image #1, 1x1]\n- Lifetime (days): 7 [ttl="7"] — and [Image #2, 2x2]`,
-			},
+			expect.objectContaining({ type: "text" }),
 			{ type: "text", text: expect.stringContaining("/tmp/shot.png") },
-			image,
+			tagged,
 			second,
 		]);
+		expect(text(result)).toContain('store="redis"');
+		expect(text(result)).toContain("see [Image #1, 1x1]");
+		expect(text(result)).toContain("and [Image #2, 2x2]");
 		expect(result.details?.notes).toEqual([
 			{ name: "store", question: "Session store", option: "Redis", value: "redis", text: "see [Image #1, 1x1]" },
 			{ name: "ttl", question: "Lifetime (days)", option: "7", value: "7", text: "and [Image #2, 2x2]" },
@@ -744,47 +746,69 @@ describe("AskTool option note images", () => {
 		});
 		const textModel: Model<Api> = { ...visionModel, id: "gpt-4.1-mini", input: ["text"] };
 		let tempDir: TempDir;
+		let ownedSessions: AgentSession[];
 
 		beforeEach(async () => {
 			tempDir = await TempDir.create("@omp-ask-describe-");
-			vi.spyOn(ai, "completeSimple").mockImplementation(
-				(async () =>
-					({
-						role: "assistant",
-						api: visionModel.api,
-						provider: visionModel.provider,
-						model: visionModel.id,
-						usage: {
-							input: 1,
-							output: 1,
-							cacheRead: 0,
-							cacheWrite: 0,
-							totalTokens: 2,
-							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-						},
-						stopReason: "stop",
-						timestamp: Date.now(),
-						content: [{ type: "text", text: "A red banner reading ZEBRA 42." }],
-					}) satisfies AssistantMessage) as unknown as typeof ai.completeSimple,
-			);
+			ownedSessions = [];
+			vi.spyOn(ai, "completeSimple").mockImplementation((async (model, _context, options) => {
+				if (typeof options?.apiKey === "function")
+					await options.apiKey({ lastChance: false, error: undefined, signal: options.signal });
+				await options?.onPayload?.({}, model, options.signal);
+				options?.signal?.throwIfAborted();
+				return {
+					role: "assistant",
+					api: visionModel.api,
+					provider: visionModel.provider,
+					model: visionModel.id,
+					usage: {
+						input: 1,
+						output: 1,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 2,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					stopReason: "stop",
+					timestamp: Date.now(),
+					content: [{ type: "text", text: "A red banner reading ZEBRA 42." }],
+				} satisfies AssistantMessage;
+			}) as typeof ai.completeSimple);
 		});
 
 		afterEach(async () => {
+			for (const session of ownedSessions) await session.dispose();
 			await tempDir.remove();
 		});
 
 		function run(model: Model<Api>, getApiKey: () => Promise<string | undefined> = async () => "test-key") {
+			const settings = Settings.isolated({ modelRoles: { vision: "openai/gpt-4o" }, "ask.notify": "off" });
+			const registry = {
+				getAvailable: () => [visionModel],
+				getApiKey,
+				resolver: () => getApiKey,
+			} as unknown as NonNullable<ToolSession["modelRegistry"]>;
+			const owner = new AgentSession({
+				agent: new Agent({ initialState: { model, tools: [] }, getApiKey }),
+				sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
+				settings,
+				modelRegistry: registry,
+			});
+			ownedSessions.push(owner);
+			owner.setSideRequestOwnerCapture(
+				() => () => true,
+				() => () => false,
+			);
 			return new AskTool(
 				createSession({
-					settings: Settings.isolated({ "ask.notify": "off" }),
-					getActiveModel: () => model,
+					settings,
+					getActiveModel: () => owner.model,
 					getArtifactsDir: () => tempDir.path(),
-					getSessionId: () => "session",
-					modelRegistry: {
-						getAvailable: () => [visionModel],
-						getApiKey,
-						resolver: () => async () => "test-key",
-					} as unknown as ToolSession["modelRegistry"],
+					getSessionId: () => owner.sessionId,
+					isDisposed: () => owner.isDisposed,
+					captureOwnerCurrent: () => () => true,
+					describeAttachedImages: (images, signal, current) =>
+						owner.describeAttachedImages(images, signal, current),
 				}),
 			).execute(
 				"call-describe",

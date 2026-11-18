@@ -12,8 +12,10 @@ Never both; never a bare payload outside `data`.
 
 Omit `type` for the usual single terminal result.
 Pass `type: ["section"]` with `data` to submit an incremental, non-terminal section that accumulates.
-A data-less `type: "result"` finalizes previously submitted sections; it is invalid when none were submitted.
+A data-less `type: "result"` finalizes previously submitted sections.
 {{#if hasOutputSchema}}
 The terminal `data` MUST be the full object matching the output schema.
+{{else}}
+Without a schema or prior sections, a data-less terminal call submits report prose from the current or preceding assistant message.
 {{/if}}
 {{/if}}

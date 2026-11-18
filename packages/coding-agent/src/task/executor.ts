@@ -3582,7 +3582,7 @@ export function buildWakeRelayBody(args: {
 	// Computed once, above the completed/failed split: a turn that yielded an
 	// artifact before failing must be reported, never contradicted.
 	const summary =
-		args.yielded && args.result?.outputPath
+		args.yielded && args.result
 			? formatTaskResultSummary(args.result, { totalDurationMs: args.result.durationMs })
 			: undefined;
 

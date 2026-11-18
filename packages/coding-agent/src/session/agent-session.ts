@@ -305,6 +305,7 @@ import { generateSessionTitle } from "../utils/title-generator";
 import { buildNamedToolChoice, isToolChoiceActive } from "../utils/tool-choice";
 import type { VibeModeState } from "../vibe/state";
 import type {
+	AgentLifecycleOutcome,
 	AgentLifecycleState,
 	AgentSessionEvent,
 	AgentSessionEventListener,
@@ -4290,7 +4291,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 					? undefined
 					: event.messages.findLast((message): message is AssistantMessage => message.role === "assistant")
 							?.stopReason;
-			const outcome = stopReason === "error" || stopReason === "aborted" ? stopReason : "success";
+			const outcome = event.outcome ?? (stopReason === "error" || stopReason === "aborted" ? stopReason : "success");
 			event = { ...event, runId, ...(event.type !== "agent_start" ? { outcome } : {}) };
 			if (event.type === "agent_start") {
 				this.#notifyEventListeners(this.#lifecycleListeners, { type: "agent_start", runId });
@@ -4304,15 +4305,6 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 						...(event.type === "agent_pause" && event.awaiting ? { awaitingAsyncWork: true } : {}),
 					};
 				}
-				this.#notifyEventListeners(this.#lifecycleListeners, {
-					type: "agent_end",
-					runId,
-					messages: event.messages,
-					outcome,
-					isTerminal: !paused,
-					yielded: event.type === "agent_pause" ? event.yielded : true,
-					...(event.type === "agent_pause" && event.awaiting ? { awaitingAsyncWork: true } : {}),
-				});
 			}
 		}
 		if (event.type === "tool_execution_update") {
@@ -4389,6 +4381,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	#inFlightEventHandlers = new Set<Promise<void>>();
 	#agentRunId = "";
 	readonly #lifecycleRunIds = new WeakMap<AgentEvent, string>();
+	readonly #lifecycleOutcomes = new WeakMap<AgentEndEvent, AgentLifecycleOutcome>();
 
 	/**
 	 * In-flight `agent_end` maintenance dispatches — the only event handlers that
@@ -4420,6 +4413,15 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		}
 		if (event.type === "agent_start" || event.type === "agent_end") {
 			this.#lifecycleRunIds.set(event, this.#agentRunId);
+		}
+		if (event.type === "agent_end") {
+			const stopReason = event.messages.findLast(
+				(message): message is AssistantMessage => message.role === "assistant",
+			)?.stopReason;
+			this.#lifecycleOutcomes.set(
+				event,
+				stopReason === "error" || stopReason === "aborted" ? stopReason : "success",
+			);
 		}
 		const processing = this.#dispatchAgentEvent(event);
 		this.#inFlightEventHandlers.add(processing);
@@ -6283,6 +6285,28 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 */
 	#endLoop(event: AgentEndEvent, activeMessages: AgentMessage[], loopEpoch: number, options?: LoopEndOptions): void {
 		this.#settledAgentEnd = event;
+		const runId = this.#lifecycleRunIds.get(event) ?? this.#agentRunId;
+		const outcome = this.#lifecycleOutcomes.get(event) ?? "success";
+		const current = loopEpoch === this.#runEpoch;
+		const awaiting = current && !options?.continuing && this.#wakeSources() !== undefined;
+		const continuing = options?.continuing === true || awaiting;
+		if (current && this.#lifecycleState?.runId === runId) {
+			this.#lifecycleState = {
+				runId,
+				phase: continuing ? "continuing" : "idle",
+				outcome,
+				...(awaiting ? { awaitingAsyncWork: true } : {}),
+			};
+		}
+		this.#notifyEventListeners(this.#lifecycleListeners, {
+			type: "agent_end",
+			runId,
+			messages: event.messages,
+			outcome,
+			isTerminal: !continuing,
+			yielded: !options?.continuing,
+			...(awaiting ? { awaitingAsyncWork: true } : {}),
+		});
 		// Maintenance awaits before routing, and a wake, steer or scheduled continuation can
 		// start the next loop meanwhile. Its `agent_start` already told subscribers the run
 		// goes on, so this end folds into the run instead of being announced after it;
@@ -6299,6 +6323,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		const end: LoopEnd = { event, activeMessages, yielded: !options?.continuing, paused: false };
 		this.#loopEnd = end;
 		if (options?.continuing) this.#pauseLoop(end);
+		else if (awaiting) this.#pauseLoop(end, true);
 		this.#scheduleRunCheck();
 	}
 
@@ -6316,6 +6341,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		void this.#emitSessionEvent({
 			type: "agent_pause",
 			runId: this.#lifecycleRunIds.get(end.event) ?? this.#agentRunId,
+			outcome: this.#lifecycleOutcomes.get(end.event),
 			messages: end.event.messages,
 			yielded: end.yielded,
 			awaiting,
@@ -6392,13 +6418,19 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		}
 		const end = this.#loopEnd;
 		this.#closeRun();
-		void this.#emitSessionEvent(end.event).catch(error =>
-			logger.warn("agent_end session event emission failed", { error: String(error) }),
-		);
+		void this.#emitSessionEvent({
+			...end.event,
+			outcome: this.#lifecycleOutcomes.get(end.event),
+		}).catch(error => logger.warn("agent_end session event emission failed", { error: String(error) }));
 		// A subscriber may queue input from `agent_end` itself (a collab guest's steer racing
 		// the settle): nothing polls the queue any more, so it starts the next run.
 		this.#drainStrandedQueuedMessages();
-		void this.#notifyExtensionsLoopEnd(this.#lifecycleRunIds.get(end.event) ?? this.#agentRunId, end.activeMessages);
+		if (!end.paused) {
+			void this.#notifyExtensionsLoopEnd(
+				this.#lifecycleRunIds.get(end.event) ?? this.#agentRunId,
+				end.activeMessages,
+			);
+		}
 	}
 
 	/** Close the open run; without a following `agent_end`, a transition or dispose abandons it. */

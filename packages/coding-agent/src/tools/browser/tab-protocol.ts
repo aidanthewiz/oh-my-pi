@@ -77,6 +77,9 @@ export function ownsPage(payload: WorkerInitPayload): boolean {
 	return payload.mode === "headless" || payload.page.kind !== "borrowed";
 }
 
+/** The relay refused the debugger attach over another extension's frame. */
+export class RelayAttachRefusedError extends ToolError {}
+
 /** Globals every page has and omp's Bun runtime lacks: run code that cannot find one was written for the page. */
 const PAGE_ONLY_GLOBAL_RE =
 	/^(document|window|location|history|localStorage|sessionStorage|customElements|getComputedStyle|CSS|HTML\w*Element|Element|Node) is not defined$/;
@@ -225,6 +228,8 @@ export interface RunErrorPayload {
 	navigationTimeout?: boolean;
 	/** The page's renderer crashed; the worker runs nothing more and must be recycled. */
 	rendererCrashed?: boolean;
+	/** The relay's target metadata confirmed a foreign-frame refusal of the debugger attach. */
+	relayAttachRefused?: boolean;
 	/**
 	 * Chrome ended the debugger attachment the page is driven through (omp browser relay) `during` this run, after
 	 * its code started, or `before` it, so nothing ran; the worker runs nothing more. `reason` is Chrome's

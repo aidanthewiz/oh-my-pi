@@ -17,7 +17,7 @@ function makeSession(fetch?: FetchImpl): ToolSession {
 		getArtifactsDir: () => artifactsDir,
 		getSessionSpawns: () => null,
 		allocateOutputArtifact: async toolType => ({ id: "test", path: path.join(artifactsDir, `test.${toolType}.log`) }),
-		settings: Settings.isolated({ "fetch.enabled": true }),
+		settings: Settings.isolated({ "fetch.enabled": true, "providers.webKeyless": true }),
 		fetch,
 	};
 }

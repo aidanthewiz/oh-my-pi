@@ -23,7 +23,8 @@ import { buildParams } from "@oh-my-pi/pi-ai/providers/openai-responses";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { writeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
-import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import { fingerprintStaticModels } from "@oh-my-pi/pi-catalog/model-manager";
+import { getBundledModel, getBundledModels } from "@oh-my-pi/pi-catalog/models";
 import { resolveModelCacheProviderId } from "@oh-my-pi/pi-catalog/provider-models";
 import type { ModelSpec } from "@oh-my-pi/pi-catalog/types";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
@@ -8130,9 +8131,8 @@ describe("AgentSession retry fallback", () => {
 				throw new Error(`Unexpected URL: ${url}`);
 			};
 			const registry = new ModelRegistry(auth, path.join(dir.path(), "models.yml"), { fetch: fetchMock });
+			await registry.hydrateCredentialScopedModelCaches();
 			expect(registry.find("openai-codex", discoveredId)).toBeUndefined();
-			expect(registry.getProviderDiscoveryState("openai-codex")?.status).toBe("idle");
-			expect(registry.isProviderDiscoveryPending("openai-codex")).toBe(true);
 
 			const resolvedSelector = `openai-codex/${discoveredId}:xhigh`;
 			const unresolvedSelector = "openai-codex/no-such-codex-model";
@@ -8145,6 +8145,7 @@ describe("AgentSession retry fallback", () => {
 			});
 
 			registry.refreshInBackground("online-if-uncached");
+			expect(registry.isProviderDiscoveryPending("openai-codex")).toBe(true);
 			session.validateRetryFallbackChains();
 			expect(session.configWarnings).not.toContain(resolvedWarning);
 			expect(session.configWarnings).not.toContain(unresolvedWarning);
@@ -8176,7 +8177,19 @@ describe("AgentSession retry fallback", () => {
 				throw new Error("Expected bundled openai-codex gpt-6.1-sol model to exist");
 			}
 			const cacheDbPath = path.join(dir.path(), "models.db");
-			writeModelCache(resolveModelCacheProviderId("openai-codex"), Date.now(), [baseCodex], true, "", cacheDbPath);
+			const cacheProviderId = resolveModelCacheProviderId("openai-codex", {
+				apiKey: JSON.stringify(["token:codex-startup-token"]),
+			});
+			const bundledCodex = getBundledModels("openai-codex");
+			writeModelCache(
+				cacheProviderId,
+				Date.now(),
+				[baseCodex],
+				true,
+				fingerprintStaticModels(bundledCodex, { authoritative: true }),
+				cacheDbPath,
+				bundledCodex,
+			);
 			auth.keys.setRuntime("openai-codex", "codex-startup-token");
 
 			const discoveredId = "codex-lazy-discovery-model";
@@ -8262,15 +8275,18 @@ describe("AgentSession retry fallback", () => {
 				name: "Codex Cached Later",
 			});
 			const cacheDbPath = path.join(dir.path(), "models.db");
-			const cacheProviderId = resolveModelCacheProviderId("openai-codex");
+			const cacheProviderId = resolveModelCacheProviderId("openai-codex", {
+				apiKey: JSON.stringify(["token:codex-startup-token"]),
+			});
+			const bundledCodex = getBundledModels("openai-codex");
+			const fingerprint = fingerprintStaticModels(bundledCodex, { authoritative: true });
 			auth.keys.setRuntime("openai-codex", "codex-startup-token");
 
-			// Fresh authoritative row with zero cached models must still defer while refreshInBackground is active,
-			// and warn immediately for embedders without a background refresh.
-			writeModelCache(cacheProviderId, Date.now(), [], true, "", cacheDbPath);
+			// Empty endpoint snapshots cannot suppress the next refresh.
+			writeModelCache(cacheProviderId, Date.now(), [], false, fingerprint, cacheDbPath, bundledCodex);
 			const emptyCacheRegistry = new ModelRegistry(auth, path.join(dir.path(), "empty-models.yml"));
+			await emptyCacheRegistry.hydrateCredentialScopedModelCaches();
 			expect(emptyCacheRegistry.find("openai-codex", discoveredCodex.id)).toBeUndefined();
-			expect(emptyCacheRegistry.getProviderDiscoveryState("openai-codex")?.status).toBe("unavailable");
 			expect(emptyCacheRegistry.isProviderDiscoveryPending("openai-codex")).toBe(false);
 
 			const selector = `openai-codex/${discoveredCodex.id}:xhigh`;
@@ -8282,14 +8298,24 @@ describe("AgentSession retry fallback", () => {
 				await embedderSession.dispose();
 			}
 
-			writeModelCache(cacheProviderId, Date.now(), [baseCodex], true, "", cacheDbPath);
+			writeModelCache(cacheProviderId, Date.now(), [baseCodex], true, fingerprint, cacheDbPath, bundledCodex);
 			const registry = new ModelRegistry(auth, path.join(dir.path(), "models.yml"));
+			await registry.hydrateCredentialScopedModelCaches();
 			expect(registry.find("openai-codex", discoveredCodex.id)).toBeUndefined();
 			expect(registry.getProviderDiscoveryState("openai-codex")?.status).toBe("cached");
 
 			session = createChainSession(registry, [selector]);
-			writeModelCache(cacheProviderId, Date.now(), [baseCodex, discoveredCodex], true, "", cacheDbPath);
+			writeModelCache(
+				cacheProviderId,
+				Date.now(),
+				[baseCodex, discoveredCodex],
+				true,
+				fingerprint,
+				cacheDbPath,
+				bundledCodex,
+			);
 			registry.refreshInBackground("offline");
+			expect(registry.isProviderDiscoveryPending("openai-codex")).toBe(true);
 			session.validateRetryFallbackChains();
 			expect(session.configWarnings).not.toContain(warning);
 

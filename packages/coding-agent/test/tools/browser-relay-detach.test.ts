@@ -579,7 +579,7 @@ describe("relay tabs Chrome detaches omp from", () => {
 			await ext.chromeDetach("target_closed");
 			expect(await stalled).toBeInstanceOf(ToolError);
 			expect((await invoke(readMark)).value).toBe("kept");
-			expect(await page?.evaluate("window.detachRuns")).toBe(1);
+			expect(await page?.mainFrame().mainRealm().evaluate("window.detachRuns")).toBe(1);
 		},
 		60_000,
 	);
@@ -764,7 +764,7 @@ describe("relay tabs Chrome detaches omp from", () => {
 				await reapplying;
 				await ext.chromeDetach("target_closed");
 				expect(await next).toBeInstanceOf(ToolError);
-				expect(await page?.evaluate("window.budgetRuns ?? 0")).toBe(0);
+				expect(await page?.mainFrame().mainRealm().evaluate("window.budgetRuns ?? 0")).toBe(0);
 			} finally {
 				restoreReadyListener?.();
 				spawning.mockRestore();
@@ -795,7 +795,7 @@ describe("relay tabs Chrome detaches omp from", () => {
 					timeout: 10,
 				}),
 			).rejects.toBeInstanceOf(ToolError);
-			expect(await page?.evaluate("window.failedStartupRan")).toBeUndefined();
+			expect(await page?.mainFrame().mainRealm().evaluate("window.failedStartupRan")).toBeUndefined();
 		},
 		60_000,
 	);
@@ -814,7 +814,7 @@ describe("relay tabs Chrome detaches omp from", () => {
 			await detached;
 			expect(ext.attachRequests).toBe(attaches);
 			expect(page?.isClosed()).toBe(false);
-			expect(await page?.evaluate("window.mark")).toBe("kept");
+			expect(await page?.mainFrame().mainRealm().evaluate("window.mark")).toBe("kept");
 		},
 		60_000,
 	);
@@ -830,7 +830,7 @@ describe("relay tabs Chrome detaches omp from", () => {
 			expect(getTab(name)).toBeUndefined();
 			await detached;
 			expect(page?.isClosed()).toBe(false);
-			expect(await page?.evaluate("window.mark")).toBe("kept");
+			expect(await page?.mainFrame().mainRealm().evaluate("window.mark")).toBe("kept");
 		},
 		60_000,
 	);
@@ -942,14 +942,16 @@ describe("relay tabs Chrome detaches omp from", () => {
 		"releases the tab without re-adopting it when the user cancels Chrome's debugging bar",
 		async () => {
 			const ext = await openRelayTab();
+			const attaches = ext.attachRequests;
 			const evaluating = ext.hanging();
 			const stalled = invoke({ action: "run", ...HANG }).catch((error: unknown) => error);
 			await evaluating;
 			await ext.chromeDetach("canceled_by_user");
 			expect(await stalled).toBeInstanceOf(ToolError);
 			expect(getTab(name)).toBeUndefined();
-			expect(await page?.evaluate("window.mark")).toBe("kept");
+			expect(await page?.mainFrame().mainRealm().evaluate("window.mark")).toBe("kept");
 			await expect(invoke(readMark)).rejects.toBeInstanceOf(ToolError);
+			expect(ext.attachRequests).toBe(attaches);
 		},
 		60_000,
 	);

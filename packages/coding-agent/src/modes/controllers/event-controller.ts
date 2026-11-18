@@ -1265,6 +1265,7 @@ export class EventController {
 	}
 
 	async #handleAgentStart(_event: Extract<AgentSessionEvent, { type: "agent_start" }>): Promise<void> {
+		this.#runEpoch++;
 		// A loop started before the interrupt landed; that abort ends this loop
 		// as a plain user interrupt.
 		this.#stoppedWaiting = false;

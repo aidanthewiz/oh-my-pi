@@ -51,8 +51,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/collab/replication-shrink";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
-import type { AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
-import { toWireEvent, type WireSessionEvent } from "@oh-my-pi/pi-coding-agent/session/loop-end-wire";
+import type { AgentSessionLifecycleEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { runtimeIdentityHistory } from "@oh-my-pi/pi-coding-agent/session/runtime-identity";
@@ -229,7 +228,7 @@ function makeHostHarness(sessionManager: HostReplicationSource): HostHarness {
 			model: undefined,
 			thinkingLevel: undefined,
 			lifecycleState: null,
-			subscribe: () => () => {},
+			subscribeLifecycle: () => () => {},
 			emitNotice: () => {},
 			promptCustomMessage: () => Promise.resolve(),
 			abort: () => Promise.resolve(),
@@ -305,7 +304,7 @@ function boundEntry(entry: ReplicatedEntry): ReplicatedEntry {
 }
 
 /** The bounded event, after checking its JSON is exactly what the frame would carry. */
-function boundEvent(event: WireSessionEvent): WireSessionEvent {
+function boundEvent(event: AgentSessionLifecycleEvent): AgentSessionLifecycleEvent {
 	const { value, json } = serializeReplicatedEvent(event);
 	expect(json).toBe(JSON.stringify(value));
 	return value;
@@ -674,32 +673,29 @@ describe("serializeReplicatedEntry (#11433)", () => {
 });
 
 describe("serializeReplicatedEvent (#11433)", () => {
-	it.each(["agent_pause", "agent_end"] as const)(
-		"retains %s ownership when an oversized message snapshot cannot be replicated",
-		type => {
+	it.each([false, true])(
+		"retains loop ownership with isTerminal=%s when an oversized message snapshot cannot be replicated",
+		isTerminal => {
 			const giantKey = "k".repeat(2 * MAX_REPLICATED_PAYLOAD_BYTES);
-			const event: AgentSessionEvent =
-				type === "agent_pause"
-					? {
-							type,
-							runId: "continuing-loop",
-							yielded: true,
-							awaiting: true,
-							messages: [{ role: "user", content: "", timestamp: 0 }],
-						}
-					: { type, runId: "continuing-loop", messages: [{ role: "user", content: "", timestamp: 0 }] };
-			const wire = toWireEvent(event);
-			if (wire.type !== "agent_end") throw new Error("Missing wire loop boundary");
-			Object.assign(wire.messages[0], { [giantKey]: 1 });
-			Object.assign(wire, { [giantKey]: true });
-			const shrunk = boundEvent(wire);
+			const event: AgentSessionLifecycleEvent = {
+				type: "agent_end",
+				runId: "continuing-loop",
+				isTerminal,
+				yielded: true,
+				...(isTerminal ? {} : { awaitingAsyncWork: true as const }),
+				outcome: "success",
+				messages: [{ role: "user", content: "", timestamp: 0 }],
+			};
+			Object.assign(event.messages[0], { [giantKey]: 1 });
+			Object.assign(event, { [giantKey]: true });
+			const shrunk = boundEvent(event);
 			expectBounded(shrunk);
 			expect(shrunk.type).toBe("agent_end");
 			if (shrunk.type !== "agent_end") throw new Error("Missing loop boundary");
-			expect(shrunk).toMatchObject({ runId: "continuing-loop" });
-			expect(shrunk.isTerminal).toBe(type === "agent_end");
+			expect(shrunk).toMatchObject({ runId: "continuing-loop", outcome: "success" });
+			expect(shrunk.isTerminal).toBe(isTerminal);
 			expect(shrunk.yielded).toBe(true);
-			expect(shrunk.awaitingAsyncWork).toBe(type === "agent_pause" ? true : undefined);
+			expect(shrunk.awaitingAsyncWork).toBe(isTerminal ? undefined : true);
 			expect(shrunk.messages).toEqual([]);
 		},
 	);
@@ -710,7 +706,7 @@ describe("serializeReplicatedEvent (#11433)", () => {
 			toolCallId: "call-1",
 			toolName: "read",
 			result: { text: "x".repeat(8 * 1024 * 1024) },
-		} as unknown as WireSessionEvent;
+		} as unknown as AgentSessionLifecycleEvent;
 
 		const shrunk = boundEvent(event);
 		expect(shrunk).not.toBe(event);
@@ -728,7 +724,7 @@ describe("serializeReplicatedEvent (#11433)", () => {
 			toolCallId: "call-2",
 			toolName: "read",
 			result: { [giantKey]: 1 },
-		} as unknown as WireSessionEvent;
+		} as unknown as AgentSessionLifecycleEvent;
 
 		const shrunk = boundEvent(event);
 		expect(shrunk.type).toBe("notice");

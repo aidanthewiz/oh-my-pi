@@ -2661,7 +2661,7 @@ mod custody {
 	}
 
 	#[tokio::test(flavor = "multi_thread")]
-	async fn cancellation_owns_retained_children_without_current_run_attribution() {
+	async fn cancellation_preserves_retained_children_without_current_run_attribution() {
 		let _guard = shell_test_lock().lock().await;
 		for launch_before_successor in [true, false] {
 			let root = tempfile::tempdir().expect("private delayed job");
@@ -2727,11 +2727,15 @@ mod custody {
 				.expect("run joined")
 				.expect("shell result");
 			assert!(result.cancelled);
+			assert!(!root.path().join("previous-cleaned").exists());
+			assert_eq!(shell.live_background_job_count().await, 1);
+			assert!(shell.pids().is_empty());
+			drop(shell);
+			marker(&root.path().join("previous-cleaned")).await;
 			assert_eq!(
 				fs::read_to_string(root.path().join("previous-cleaned")).expect("retained TERM trap"),
 				"cleaned",
 			);
-			assert!(shell.pids().is_empty());
 		}
 	}
 

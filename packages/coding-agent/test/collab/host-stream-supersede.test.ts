@@ -15,7 +15,6 @@ import { CollabHost } from "@oh-my-pi/pi-coding-agent/collab/host";
 import { COLLAB_PROTO, type CollabFrame, parseCollabLink } from "@oh-my-pi/pi-coding-agent/collab/protocol";
 import { CollabSocket } from "@oh-my-pi/pi-coding-agent/collab/relay-client";
 import type {
-	AgentSessionEvent,
 	AgentSessionLifecycleEvent,
 	AgentSessionLifecycleListener,
 } from "@oh-my-pi/pi-coding-agent/session/agent-session-events";
@@ -66,7 +65,7 @@ function streamedUpdate(text: string, delta: string): AgentSessionLifecycleEvent
 	};
 }
 
-function textOf(event: AgentSessionEvent): string {
+function textOf(event: AgentSessionLifecycleEvent): string {
 	if (event.type !== "message_update" || event.message.role !== "assistant") return "";
 	const block = event.message.content[0];
 	return block?.type === "text" ? block.text : "";
@@ -103,11 +102,11 @@ it("supersedes queued updates of a streaming message instead of ending the room"
 
 	const guest = new CollabSocket({ wsUrl: parsed.wsUrl, role: "guest", key });
 	cleanups.push(() => guest.close());
-	const events: AgentSessionEvent[] = [];
+	const events: AgentSessionLifecycleEvent[] = [];
 	const welcomed = Promise.withResolvers<void>();
 	guest.onFrame = (frame: CollabFrame) => {
 		if (frame.t === "welcome") welcomed.resolve();
-		if (frame.t === "event") events.push(frame.event as AgentSessionEvent);
+		if (frame.t === "event") events.push(frame.event);
 	};
 	guest.onOpen = () => guest.send({ t: "hello", proto: COLLAB_PROTO, name: "watcher" });
 	guest.connect();

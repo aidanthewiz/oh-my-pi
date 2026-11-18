@@ -517,7 +517,7 @@ await withArtifactPublicationLock(async () => {
 	it("terminalizes the ref when an autonomous wake turn's yield is accepted", async () => {
 		const harness = createHarness();
 		registerRunning(harness.session);
-		attachIrcWakeTurnMonitor(harness.session, { id: AGENT_ID, agent: baseAgent });
+		attachIrcWakeTurnMonitor(harness.session, { id: AGENT_ID, agent: baseAgent, outputSchema: {} });
 		const observer = harness.wakeObserver();
 		expect(observer).toBeDefined();
 
@@ -557,7 +557,7 @@ await withArtifactPublicationLock(async () => {
 			session: harness.session,
 			status: "idle",
 		});
-		attachIrcWakeTurnMonitor(harness.session, { id: AGENT_ID, agent: baseAgent });
+		attachIrcWakeTurnMonitor(harness.session, { id: AGENT_ID, agent: baseAgent, outputSchema: {} });
 		const observer = harness.wakeObserver();
 		if (!observer) throw new Error("wake-turn observer was not registered");
 
@@ -1165,9 +1165,8 @@ await withArtifactPublicationLock(async () => {
 			await finish?.(undefined);
 
 			const result = await waiting;
-			expect(result.details?.jobs).toMatchObject([
-				{ id: AGENT_ID, status: "completed", resultText: "mask path fixed too" },
-			]);
+			expect(result.details?.jobs).toMatchObject([{ id: AGENT_ID, status: "completed" }]);
+			expect(result.details?.jobs?.[0]?.resultText).toContain("mask path fixed too");
 			await manager.drainDeliveries({ timeoutMs: 1000 });
 			expect(inbox).toEqual([]);
 			expect(asyncReplies).toEqual([]);

@@ -12,6 +12,7 @@ import {
 	parseSqlitePathCandidates,
 	parseSqliteSelector,
 	renderTable,
+	queryRows,
 	renderTableList,
 } from "@oh-my-pi/pi-coding-agent/tools/sqlite-reader";
 import { WriteTool } from "@oh-my-pi/pi-coding-agent/tools/write";
@@ -536,10 +537,18 @@ describe("SQLite tool support", () => {
 		expect(await read(`q=${sql}&limit=1&offset=1`)).toBe(unpagedRow);
 	});
 
-	it("rejects table names that do not exist instead of interpolating them", async () => {
-		await expect(
-			readTool.execute("sqlite-injection-table", { path: `${sqlitePath}:users;DROP TABLE users;` }),
-		).rejects.toThrow(/not found/i);
+	it("rejects a missing table selector", async () => {
+		await expect(readTool.execute("sqlite-missing-table", { path: `${sqlitePath}:missing_table` })).rejects.toThrow();
+	});
+
+	it("rejects SQL text as a table identifier without altering the database", () => {
+		const db = new Database(sqlitePath);
+		try {
+			expect(() => queryRows(db, "users;DROP TABLE users;", { limit: 20, offset: 0 })).toThrow();
+			expect(listTables(db).find(table => table.name === "users")?.count.rows).toBe(6);
+		} finally {
+			db.close();
+		}
 	});
 
 	it("truncates wide rows to the configured table width", () => {

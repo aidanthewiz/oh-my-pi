@@ -545,31 +545,29 @@ describe("bridge tool resolution beyond the model-facing registry", () => {
 		expect(result.content.map(c => (c.type === "text" ? c.text : "")).join("")).toContain("blocked by user policy");
 	});
 
-	it("wraps the per-call grep the real bridge factory builds", async () => {
-		// The reviewed bypass was in the factory the session hands the bridge,
-		// not in the bridge: a raw `new GrepTool(...)` there skips the approval
-		// gate every registry tool goes through. Exercise the shared factory
-		// both callsites use, so a regression in it fails here.
-		await Bun.write(path.join(cwd, "hit.txt"), "needle\n");
+	it("honors per-call grep limits through the approval wrapper", async () => {
+		await Bun.write(path.join(cwd, "hit.txt"), "before\nneedle first\nneedle second\nafter\n");
 		const intercepted: string[] = [];
 		const factory = createBridgeGrepFactory(createTestSession(cwd), passthroughRunner(intercepted));
-		const built = factory({ context: 0, totalMatchLimit: 5 });
-		expect(built).toBeInstanceOf(ExtensionToolWrapper);
-
 		const handlers = new CursorExecHandlers({
 			cwd,
 			tools: new Map<string, Tool>(),
 			createGrepTool: factory,
+			getToolContext: yoloToolContext,
 		});
 		const result = await handlers.piGrep({
 			toolCallId: "g1",
-			args: { pattern: "needle", path: cwd, limit: 5 },
+			args: { pattern: "needle", path: cwd, context: 0, limit: 1 },
 		} as never);
 
-		// The wrapper ran (its extension hook fired) and the frame's cap still
-		// reached the underlying tool.
+		expect(result.isError).toBe(false);
 		expect(intercepted).toEqual(["grep"]);
 		expect((result.details as { matchCount?: number } | undefined)?.matchCount).toBe(1);
+		const output = result.content.map(block => (block.type === "text" ? block.text : "")).join("\n");
+		expect(output).toContain("needle first");
+		expect(output).not.toContain("needle second");
+		expect(output).not.toContain("before");
+		expect(output).not.toContain("after");
 	});
 
 	it("denies a pi_write frame the user's policy blocks when the tool came from the caller's map", async () => {
@@ -838,6 +836,7 @@ describe("Cursor MCP exec ordering", () => {
 				handlers,
 				result => {
 					toolResults.push(result);
+					return result;
 				},
 				{ sawTokenDelta: false },
 				[],
@@ -2606,6 +2605,7 @@ describe("CursorExecHandlers Pi frame translation", () => {
 			handlers,
 			result => {
 				results.push(result);
+				return result;
 			},
 			{ sawTokenDelta: false },
 			[],

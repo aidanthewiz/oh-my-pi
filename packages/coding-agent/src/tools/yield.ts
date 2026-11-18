@@ -4,7 +4,8 @@
  * Subagents can call this tool incrementally or terminally depending on `type`.
  */
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
-import type { TSchema } from "@oh-my-pi/pi-ai/types";
+import type { AssistantMessage, TSchema } from "@oh-my-pi/pi-ai/types";
+import { isCursorExecResolved } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import {
 	dereferenceJsonSchema,
 	isValidJsonSchema,
@@ -15,6 +16,7 @@ import {
 import { isRecord, prompt } from "@oh-my-pi/pi-utils";
 import yieldDescription from "../prompts/tools/yield.md" with { type: "text" };
 import yieldDataErrorConflictMessage from "../prompts/tools/yield-data-error-conflict.md" with { type: "text" };
+import submitReminderTemplate from "../prompts/system/subagent-yield-reminder.md" with { type: "text" };
 import { subprocessToolRegistry } from "../task/subprocess-tool-registry";
 import type { WorkPoolYieldItem } from "../task/workpool-yield";
 import type { ToolSession } from ".";
@@ -87,7 +89,7 @@ const yieldTypeSchema: Record<string, unknown> = {
 		},
 	],
 	description:
-		"Optional result type. A non-empty string array labels an incremental section; a string is terminal and, without data, finalizes the submitted sections.",
+		"Optional result type. A non-empty string array labels an incremental section; a string is terminal and, without data, finalizes submitted sections or submits the current report when no output schema is declared.",
 };
 
 function isYieldType(value: unknown): value is string | string[] {
@@ -311,6 +313,44 @@ const MAX_SCHEMA_RETRIES = 3;
  */
 const MAX_EMPTY_RESULT_RETRIES = 3;
 
+function isYieldReportReminder(content: string): boolean {
+	if (
+		content === prompt.render(submitReminderTemplate, { budgetStop: true, structured: false }) ||
+		content === prompt.render(submitReminderTemplate, { budgetStop: true, structured: true })
+	) {
+		return true;
+	}
+	const match = /Reminder (\d+) of (\d+)\./u.exec(content);
+	return (
+		match !== null &&
+		content ===
+			prompt.render(submitReminderTemplate, {
+				budgetStop: false,
+				retryCount: Number(match[1]),
+				maxRetries: Number(match[2]),
+			})
+	);
+}
+
+function reportTurnText(message: AssistantMessage, toolCallId?: string): string | undefined {
+	if (message.stopReason === "error" || message.stopReason === "aborted") return undefined;
+	const text: string[] = [];
+	let hasCall = toolCallId === undefined;
+	for (const block of message.content) {
+		if (block.type === "text") text.push(block.text);
+		else if (block.type === "toolCall") {
+			if (block.name === "yield") {
+				if (block.id === toolCallId) hasCall = true;
+			} else {
+				if (!isCursorExecResolved(block)) return undefined;
+				text.length = 0;
+			}
+		}
+	}
+	const report = text.join("\n");
+	return hasCall && report.trim() ? report : undefined;
+}
+
 export class YieldTool implements AgentTool<TSchema, YieldDetails> {
 	readonly name = "yield";
 	readonly approval = "read" as const;
@@ -464,6 +504,37 @@ export class YieldTool implements AgentTool<TSchema, YieldDetails> {
 		return items;
 	}
 
+	#reportText(toolCallId: string): string | undefined {
+		const messages = this.#session.getContextMessages?.() ?? [];
+		const current = messages.at(-1);
+		if (
+			current?.role !== "assistant" ||
+			current.stopReason === "error" ||
+			current.stopReason === "aborted" ||
+			!current.content.some(
+				block => block.type === "toolCall" && block.name === "yield" && block.id === toolCallId,
+			) ||
+			current.content.some(
+				block => block.type === "toolCall" && block.name !== "yield" && !isCursorExecResolved(block),
+			)
+		) {
+			return undefined;
+		}
+		const report = reportTurnText(current, toolCallId);
+		if (report !== undefined) return report;
+		if (current.content.some(block => block.type === "toolCall" && block.name !== "yield")) return undefined;
+		let index = messages.length - 2;
+		let crossedReminder = false;
+		for (; index >= 0; index--) {
+			const message = messages[index];
+			if (message.role !== "developer") break;
+			if (typeof message.content !== "string" || !isYieldReportReminder(message.content)) return undefined;
+			crossedReminder = true;
+		}
+		const previous = messages[index];
+		return crossedReminder && previous?.role === "assistant" ? reportTurnText(previous) : undefined;
+	}
+
 	async execute(
 		_toolCallId: string,
 		params: unknown,
@@ -507,15 +578,21 @@ export class YieldTool implements AgentTool<TSchema, YieldDetails> {
 		if (errorMessage !== undefined && data !== undefined) {
 			throw new Error(renderDataErrorConflictMessage(errorMessage, yieldType));
 		}
-		// A data-less yield carries a result only as a terminal `type` closing
-		// sections already submitted; anything else is empty and would fail the
-		// run post-mortem, so reject it here while the child can still resubmit.
+		// Submitted sections take precedence over the schema-less report fallback.
 		const finalizesSections =
 			errorMessage === undefined &&
 			data === undefined &&
 			yieldType !== undefined &&
 			!isIncremental &&
 			this.#hasIncrementalSections;
+		if (errorMessage === undefined && data === undefined && typeof yieldType === "string" && !finalizesSections) {
+			if (this.#validate) {
+				throw new Error(
+					"A data-less terminal yield requires explicit structured output matching the declared schema.",
+				);
+			}
+			data = this.#reportText(_toolCallId);
+		}
 		if (errorMessage === undefined && data === undefined && !finalizesSections) {
 			this.#emptyResultFailures++;
 			if (this.#emptyResultFailures > MAX_EMPTY_RESULT_RETRIES) {
@@ -536,7 +613,7 @@ export class YieldTool implements AgentTool<TSchema, YieldDetails> {
 			const reason = isIncremental
 				? `Section ${formatYieldLabels(yieldType as string[])} carries no \`data\`.`
 				: yieldType !== undefined
-					? "A data-less `type` only finalizes previously submitted sections, and none were submitted."
+					? "No report prose is available for this terminal type, and no sections were submitted."
 					: "yield must contain either `data` or `error`.";
 			throw new Error(`${reason} ${YIELD_FORMAT_HINT} Empty result retries remaining before abort: ${remaining}.`);
 		}

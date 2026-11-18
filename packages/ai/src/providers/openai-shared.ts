@@ -4147,7 +4147,7 @@ export async function processResponsesStream<TApi extends Api>(
 				);
 			}
 			if (response?.status === "failed" || response?.status === "cancelled") {
-				throwOpenAIResponsesEventError(event, output, model.provider);
+				throwOpenAIResponsesEventError(event, output, model, options?.requestServiceTier);
 			}
 			if (response?.status === "incomplete" && response.incomplete_details?.reason === "content_filter") {
 				// A content-filtered turn is a failure, not a token-cap truncation —
@@ -4181,7 +4181,7 @@ export async function processResponsesStream<TApi extends Api>(
 			// reaches the SDK stream), actively releasing the connection.
 			break;
 		} else if (event.type === "error" || event.type === "response.failed") {
-			throwOpenAIResponsesEventError(event, output, model.provider);
+			throwOpenAIResponsesEventError(event, output, model, options?.requestServiceTier);
 		}
 	}
 }
@@ -4696,8 +4696,10 @@ export function isOpenAIResponsesRefusedEncryptedReasoningError(error: unknown):
 export function throwOpenAIResponsesEventError(
 	event: ResponseStreamEvent,
 	output: AssistantMessage,
-	provider: string,
+	model: Model<Api>,
+	requestServiceTier?: ServiceTier,
 ): never {
+	const provider = model.provider;
 	const envelope = event as unknown as Record<string, unknown>;
 	if (event.type === "error") {
 		const error = isRecord(envelope.error) ? envelope.error : envelope;
@@ -4709,7 +4711,17 @@ export function throwOpenAIResponsesEventError(
 		);
 	}
 	const response = isRecord(envelope.response) ? envelope.response : undefined;
-	if (event.type === "response.failed") populateResponsesUsageFromResponse(output, event.response?.usage);
+	if (event.type === "response.failed") {
+		populateResponsesUsageFromResponse(output, event.response?.usage);
+		calculateCost(model, output.usage, output.timestamp);
+		applyProviderReportedCost(model, output.usage, event.response?.usage);
+		output.serviceTier = applyOpenAIResponsesServiceTierCost(
+			model,
+			output.usage,
+			(event.response as { service_tier?: unknown } | undefined)?.service_tier,
+			requestServiceTier,
+		);
+	}
 	const statusDetails = isRecord(response?.status_details) ? response.status_details : undefined;
 	const error = isRecord(response?.error)
 		? response.error

@@ -385,8 +385,12 @@ it("lets the agent answer its own child's question while its run waits on that c
 		},
 	});
 	try {
-		expect((await childAsked.sent).outcome).toBe("woken");
+		await childAsked.sent;
 		await answering.promise;
+		const question = child.mock.calls[1]?.context;
+		if (!question) throw new Error("Child question did not reach a model request");
+		expect(latestInput(question)).toContain(CHILD_ID);
+		expect(latestInput(question)).toContain(PEER_BODY);
 		job.resolve();
 		expect((await child.run).output).toBe(REPORT);
 	} finally {

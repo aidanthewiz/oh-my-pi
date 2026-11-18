@@ -151,6 +151,7 @@ describe("EventController — run waiting only on background jobs", () => {
 			await controller.handleEvent(yieldedPause());
 			const stopping = controller.stopAwaitingAsyncWork();
 			await entered.promise;
+			end();
 			controller.resetTranscriptAnchors();
 			release.resolve();
 			await stopping;

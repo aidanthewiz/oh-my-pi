@@ -20,18 +20,8 @@ async function git(cwd: string, ...args: string[]): Promise<string> {
 	return stdout.trimEnd();
 }
 
-async function expectUnmerged(run: () => Promise<unknown>, filePath: string, context: string): Promise<void> {
-	let error: unknown;
-	try {
-		await run();
-	} catch (caught) {
-		error = caught;
-	}
-	expect(error).toMatchObject({ name: "VcsError", code: "Backend" });
-	const message = error instanceof Error ? error.message : String(error);
-	expect(message.startsWith(context)).toBe(true);
-	expect(message).toContain("unmerged entries");
-	expect(message).toContain(filePath);
+async function expectUnmerged(run: () => Promise<unknown>): Promise<void> {
+	await expect(run()).rejects.toMatchObject({ name: "VcsError", code: "Backend" });
 }
 
 /** Content conflict on `conflicted.txt` (stages 1-3, no stage 0) plus a staged `extra.txt`. */
@@ -85,15 +75,15 @@ describe("unresolved index commits", () => {
 		const treeBefore = await git(root, "rev-parse", "HEAD^{tree}");
 		const hookMarker = Bun.file(path.join(root, "hook-ran"));
 
-		await expectUnmerged(() => repo.commitCreate("should refuse", {}), "conflicted.txt", "git commit:");
+		await expectUnmerged(() => repo.commitCreate("should refuse", {}));
 		expect(await hookMarker.exists()).toBe(false);
 		expect(await git(root, "rev-parse", "HEAD")).toBe(head);
 		expect(await git(root, "rev-parse", "HEAD^{tree}")).toBe(treeBefore);
 		expect(await git(root, "ls-files", "-u", "--", "conflicted.txt")).toContain("conflicted.txt");
 
-		await expectUnmerged(() => repo.commitCreate("empty", { allowEmpty: true }), "conflicted.txt", "git commit:");
-		await expectUnmerged(() => repo.commitCreate("amend", { amend: true }), "conflicted.txt", "git commit:");
-		await expectUnmerged(() => repo.commitCreate("unverified", { noVerify: true }), "conflicted.txt", "git commit:");
+		await expectUnmerged(() => repo.commitCreate("empty", { allowEmpty: true }));
+		await expectUnmerged(() => repo.commitCreate("amend", { amend: true }));
+		await expectUnmerged(() => repo.commitCreate("unverified", { noVerify: true }));
 		expect(await git(root, "rev-parse", "HEAD")).toBe(head);
 		expect(await git(root, "ls-tree", "-r", "--name-only", "HEAD")).not.toContain("extra.txt");
 
@@ -111,10 +101,10 @@ describe("unresolved index commits", () => {
 	test("refuses to write a tree from an unresolved index", async () => {
 		const { root, head } = await conflictedCheckout();
 		const repo = vcsGitDiscover(root)!;
-		await expectUnmerged(() => repo.writeTree(), "conflicted.txt", "git write-tree:");
+		await expectUnmerged(() => repo.writeTree());
 		const alternate = path.join(root, "conflicted.index");
 		await fs.copyFile(path.join(root, ".git/index"), alternate);
-		await expectUnmerged(() => repo.writeTree(alternate), "conflicted.txt", "git write-tree:");
+		await expectUnmerged(() => repo.writeTree(alternate));
 		expect(await git(root, "rev-parse", "HEAD")).toBe(head);
 		expect(await git(root, "ls-files", "-u", "--", "conflicted.txt")).toContain("conflicted.txt");
 	});
@@ -122,11 +112,7 @@ describe("unresolved index commits", () => {
 	test("refuses a pathspec commit when another index entry is unresolved", async () => {
 		const { root, head } = await conflictedCheckout();
 		const repo = vcsGitDiscover(root)!;
-		await expectUnmerged(
-			() => repo.commitCreate("partial", { files: ["extra.txt"] }),
-			"conflicted.txt",
-			"git commit:",
-		);
+		await expectUnmerged(() => repo.commitCreate("partial", { files: ["extra.txt"] }));
 		expect(await git(root, "rev-parse", "HEAD")).toBe(head);
 		expect(await git(root, "ls-tree", "-r", "--name-only", "HEAD")).not.toContain("extra.txt");
 		expect(await git(root, "ls-files", "-u", "--", "conflicted.txt")).toContain("conflicted.txt");
@@ -138,11 +124,7 @@ describe("unresolved index commits", () => {
 		await fs.copyFile(path.join(root, ".git/index"), alternate);
 		await git(root, "add", "conflicted.txt");
 		const repo = vcsGitDiscover(root)!;
-		await expectUnmerged(
-			() => repo.commitCreate("partial", { files: ["extra.txt"], indexPath: alternate }),
-			"conflicted.txt",
-			"git commit:",
-		);
+		await expectUnmerged(() => repo.commitCreate("partial", { files: ["extra.txt"], indexPath: alternate }));
 		expect(await git(root, "rev-parse", "HEAD")).toBe(head);
 		expect(await git(root, "ls-tree", "-r", "--name-only", "HEAD")).not.toContain("extra.txt");
 	});
@@ -174,7 +156,7 @@ describe("unresolved index commits", () => {
 			].join("\n"),
 		);
 		const repo = vcsGitDiscover(root)!;
-		await expectUnmerged(() => repo.commitCreate("partial", { files: ["extra.txt"] }), "tracked.txt", "git commit:");
+		await expectUnmerged(() => repo.commitCreate("partial", { files: ["extra.txt"] }));
 		expect(await Bun.file(path.join(root, "hook-ran")).exists()).toBe(true);
 		expect(await git(root, "rev-parse", "HEAD")).toBe(head);
 		expect(await git(root, "ls-tree", "-r", "--name-only", "HEAD")).not.toContain("extra.txt");

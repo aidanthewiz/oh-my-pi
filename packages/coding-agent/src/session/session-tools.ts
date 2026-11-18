@@ -857,7 +857,7 @@ export class SessionTools {
 	#derivePromptSurface(activeToolNames?: readonly string[]): PromptSurface {
 		const candidate: PromptSurface = {
 			skillHintVisible: cfgSkillful.get(this.#host.settings) === true && this.#promptSkills.length > 0,
-			evalPreludes: this.#host.evalPreludes(),
+			evalPreludes: this.#host.evalPreludes().map(definition => ({ ...definition })),
 			sessionAgents: this.#host.sessionAgents(),
 			evalToolNames: this.getEvalBridgeToolNames(),
 			perCallModelAdvertisement: getPerCallModelAdvertisement(
@@ -868,7 +868,7 @@ export class SessionTools {
 			activeToolNames: activeToolNames === undefined ? undefined : new Set(activeToolNames),
 		};
 		return this.#promptSurfaceScope.run(candidate, () => {
-			candidate.evalPreludes = this.#host.evalPreludes();
+			candidate.evalPreludes = this.#host.evalPreludes().map(definition => ({ ...definition }));
 			candidate.sessionAgents = this.#host.sessionAgents();
 			candidate.evalToolNames = this.getEvalBridgeToolNames();
 			return candidate;

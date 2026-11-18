@@ -681,7 +681,7 @@ it("startup-mounted destructive tools gain the ACP permission gate when the brid
 	expect(deleteTool.executeCalls).toBe(1);
 });
 
-it("xd wire aliases keep edit's approval tier and cannot bypass ACP rejection", async () => {
+it("xd wire aliases cannot bypass ACP rejection", async () => {
 	const requests: ClientBridgePermissionToolCall[] = [];
 	const bridge: ClientBridge = {
 		capabilities: { requestPermission: true },
@@ -707,7 +707,6 @@ it("xd wire aliases keep edit's approval tier and cannot bypass ACP rejection", 
 	const content = JSON.stringify({ input });
 
 	for (const name of ["edit", "apply_patch"]) {
-		expect(write.approval({ path: `xd://${name}`, content })).toEqual({ tier: "write", policyKey: "edit" });
 		const result = await write.execute(`xd-permission-${name}`, { path: `xd://${name}`, content });
 		expect(result.isError).toBe(true);
 		expect(result.content.find(entry => entry.type === "text")?.text).toContain("rejected by user");

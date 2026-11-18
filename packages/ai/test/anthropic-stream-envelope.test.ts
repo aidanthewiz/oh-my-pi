@@ -2371,14 +2371,23 @@ describe("anthropic stream envelope handling", () => {
 
 	it("keeps the refused request's demoted reasoning count through a fallback-credit redemption", async () => {
 		const sent: string[] = [];
-		const refused = await streamAnthropic(model, crossModelReasoningContext(), {
-			client: refusingClient(sent, { category: "cyber", explanation: null, fallback_credit_token: "fct_carried" }),
-		}).result();
+		let attempt = 0;
+		vi.spyOn(AnthropicMessages.prototype, "create").mockImplementation(params => {
+			sent.push(JSON.stringify(params));
+			return createMockRequest(
+				refusalEvents(
+					attempt++ === 0
+						? { category: "cyber", explanation: null, fallback_credit_token: "fct_carried" }
+						: { category: "reasoning_extraction", explanation: null },
+				),
+			) as never;
+		});
+		const refused = await streamAnthropic(model, crossModelReasoningContext(), { apiKey: "sk-ant-test" }).result();
 		expect(refused.fallbackCreditHandle?.demotedReasoningBlocks).toBe(2);
 
 		// The fallback model replays the frozen body, which carries the same reasoning.
 		const redeemed = await streamAnthropic({ ...model, id: "claude-opus-4-8" }, crossModelReasoningContext(), {
-			client: refusingClient(sent),
+			apiKey: "sk-ant-test",
 			fallbackCreditRedemption: refused.fallbackCreditHandle,
 		}).result();
 

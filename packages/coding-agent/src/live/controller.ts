@@ -20,6 +20,7 @@ import {
 } from "./protocol";
 import { OUTPUT_ACTIVE_LEVEL, OutputActivity } from "./output-activity";
 import { type LiveEndpoint, LiveTransport, resolveLiveEndpoint } from "./transport";
+import { cfgLiveEndpoint } from "./settings";
 import type { LivePhase } from "@oh-my-pi/pi-tui/apps/live-visualizer";
 import { DEFAULT_LIVE_VOICE } from "./voices";
 
@@ -321,7 +322,7 @@ export class LiveSessionController {
 		this.#stopped = true;
 		if (
 			this.#phase === "connecting" ||
-			(cfgOffline.get(this.#session.settings) && this.#session.model?.provider !== "openai-codex")
+			(!this.#endpoint && cfgOffline.get(this.#session.settings) && this.#session.model?.provider !== "openai-codex")
 		) {
 			this.#transportAbort.abort();
 		}
@@ -347,7 +348,9 @@ export class LiveSessionController {
 			try {
 				if (
 					!this.#transportAbort.signal.aborted &&
-					(!cfgOffline.get(this.#session.settings) || this.#session.model?.provider === "openai-codex")
+					(this.#endpoint ||
+						!cfgOffline.get(this.#session.settings) ||
+						this.#session.model?.provider === "openai-codex")
 				) {
 					await transport.send(buildSessionClose());
 				}
@@ -435,7 +438,7 @@ export class LiveSessionController {
 
 	/** Offline mode reaches only the session's provider, unless `live.endpoint` names the voice server. */
 	#assertProviderAllowed(): void {
-		if (this.#endpoint || !cfgOffline.get(this.#session.settings)) return;
+		if (cfgLiveEndpoint.get(this.#session.settings)?.trim() || !cfgOffline.get(this.#session.settings)) return;
 		if (this.#session.model?.provider !== "openai-codex") {
 			throw new Error("Live audio requires the openai-codex session provider or live.endpoint in offline mode.");
 		}

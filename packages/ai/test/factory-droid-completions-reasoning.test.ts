@@ -50,14 +50,17 @@ describe("Factory Droid completions reasoning matrix", () => {
 
 	it("names the tool on Kimi K3.1 Pro's tool-result message, as Kimi K3 does", async () => {
 		const captured: CapturedRequest[] = [];
-		await streamFactoryDroid(
-			factoryModel("kimi-k3.1-pro", ["fireworks"]),
+		const model = factoryModel("kimi-k3.1-pro", ["fireworks"]);
+		model.factoryDroidOrgId = "org-1";
+		const result = await streamFactoryDroid(
+			model,
 			{
 				messages: [{ role: "user", content: "read it", timestamp: 1 }, ...toolTurn("n", "kimi-k3.1-pro")],
 				tools: [{ name: "Read", description: "Read file", parameters: type({ path: "string" }) }],
 			},
-			{ apiKey: "workos-token", fetch: captureFetch(captured, completionsChunks("OK", "kimi-k3.1-pro")) },
+			{ apiKey: WORKOS_TOKEN, fetch: captureFetch(captured, completionsChunks("OK", "kimi-k3.1-pro")) },
 		).result();
+		expect(result.stopReason).toBe("stop");
 		const messages = captured[0].body.messages as Array<{ role: string; name?: string }>;
 		expect(messages.find(message => message.role === "tool")?.name).toBe("Read");
 	});

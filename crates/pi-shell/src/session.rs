@@ -915,12 +915,15 @@ impl Driver {
 		self.settle().await;
 		if applied > 0 {
 			let deadline = tokio::time::Instant::now() + KILL_WAIT;
-			while !self
-				.host
-				.spawner()
-				.leftovers()
-				.is_ok_and(|processes| processes.is_empty())
-				&& tokio::time::Instant::now() < deadline
+			while !self.host.spawner().leftovers().is_ok_and(|processes| {
+				let children = self.children.0.lock();
+				processes.iter().all(|process| {
+					children
+						.pids
+						.iter()
+						.any(|&(owner, pid)| owner != run && pid == process.group)
+				})
+			}) && tokio::time::Instant::now() < deadline
 			{
 				self.poll_tools();
 				tokio::time::sleep(Duration::from_millis(10)).await;

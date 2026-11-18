@@ -580,7 +580,17 @@ describe("FileSessionStorage.deleteSessionWithArtifacts", () => {
 		async () => {
 			const sessionPath = await createSessionFile("unreadable");
 			const historyDbPath = path.join(tempDir, "history.db");
-			new Database(historyDbPath).close();
+			const artifactsDir = sessionPath.slice(0, -".jsonl".length);
+			await fsp.mkdir(artifactsDir);
+			await Bun.write(path.join(artifactsDir, "subagent.jsonl"), "{}\n");
+			const history = new Database(historyDbPath);
+			try {
+				history.run("CREATE TABLE history (prompt TEXT NOT NULL, session_id TEXT)");
+				history.run("INSERT INTO history VALUES ('keep unresolved rows', 'session-id')");
+				history.run("INSERT INTO history VALUES ('keep unrelated rows', 'other-session')");
+			} finally {
+				history.close();
+			}
 			await fsp.chmod(sessionPath, 0o000);
 
 			await storage.deleteSessionWithArtifacts(sessionPath, {
@@ -589,6 +599,16 @@ describe("FileSessionStorage.deleteSessionWithArtifacts", () => {
 			});
 
 			expect(fs.existsSync(sessionPath)).toBe(false);
+			expect(fs.existsSync(artifactsDir)).toBe(false);
+			const check = new Database(historyDbPath);
+			try {
+				expect(check.query("SELECT session_id FROM history ORDER BY session_id").all()).toEqual([
+					{ session_id: "other-session" },
+					{ session_id: "session-id" },
+				]);
+			} finally {
+				check.close();
+			}
 		},
 	);
 

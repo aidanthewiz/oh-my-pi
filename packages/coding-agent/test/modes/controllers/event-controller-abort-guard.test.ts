@@ -6,7 +6,7 @@ import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import { resetSettingsForTest, Settings, settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { EventController } from "@oh-my-pi/pi-coding-agent/modes/controllers/event-controller";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
-import type { AgentSessionEvent, AgentSessionLifecycleEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import type { AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import * as titleGenerator from "@oh-my-pi/pi-coding-agent/utils/title-generator";
 import { TERMINAL } from "@oh-my-pi/pi-tui";
 import { createInteractiveModeContext } from "../../helpers/interactive-mode-context";
@@ -208,8 +208,11 @@ describe("EventController — error toast gated while auto-retry is pending", ()
 				session: {
 					lifecycleState: {
 						runId: "current",
-						phase: boundary === "continuing" ? "continuing" : "idle",
+						phase: boundary === "streaming" ? "running" : boundary === "continuing" ? "continuing" : "idle",
 						outcome: "error",
+					},
+					get isRunActive() {
+						return streaming || boundary === "continuing";
 					},
 					get isStreaming() {
 						return streaming;
@@ -226,11 +229,13 @@ describe("EventController — error toast gated while auto-retry is pending", ()
 					delayMs: 0,
 					errorMessage: "overloaded",
 				});
-				const end: Extract<AgentSessionLifecycleEvent, { type: "agent_end" }> = {
-					...makeAgentEndEvent([makeAssistantMessage("error")]),
+				const end: AgentSessionEvent = {
+					type: boundary === "continuing" ? "agent_pause" : "agent_end",
+					messages: [makeAssistantMessage("error")],
 					runId: boundary === "stale-owner" ? "older" : "current",
-					isTerminal: boundary !== "continuing",
 					outcome: "error",
+					yielded: false,
+					awaiting: false,
 				};
 				await controller.handleEvent(end);
 				expect(spy).not.toHaveBeenCalled();
@@ -263,11 +268,10 @@ describe("EventController — error toast gated while auto-retry is pending", ()
 			});
 			const loader = ctx.retryLoader;
 			if (!loader) throw new Error("Retry loader was not created");
-			const end: Extract<AgentSessionLifecycleEvent, { type: "agent_end" }> = {
+			const end: Extract<AgentSessionEvent, { type: "agent_end" }> = {
 				type: "agent_end",
 				runId: "current",
 				messages: [],
-				isTerminal: true,
 				outcome: "error",
 			};
 			await controller.handleEvent(end);

@@ -1652,8 +1652,8 @@ export class CommandController {
 	/**
 	 * `/fork` inside a Tern pane: ask Tern to run `omp --fork` of this session in a new pane beside
 	 * this one, which keeps the original session. False means fork in place instead: outside Tern,
-	 * an unsaved session, a Tern without `fork`, or Tern refusing it. Once the request is out, an
-	 * unconfirmed one is reported rather than retried in place, since Tern may still open the pane.
+	 * an unsaved session, a Tern without `fork`, or an idle-session refusal. A declined or
+	 * unconfirmed request never replaces a running session with an in-place fork.
 	 */
 	async #forkIntoTernPane(): Promise<boolean> {
 		const tern = resolveTernPane();
@@ -1682,6 +1682,10 @@ export class CommandController {
 			} catch (error) {
 				if (error instanceof TernError && !TERN_FORK_UNCONFIRMED[error.kind]) {
 					const details = { kind: error.kind, error: error.message };
+					if (this.ctx.session.isStreaming) {
+						this.ctx.showError(`Tern declined the fork: ${error.message}`);
+						return true;
+					}
 					if (error.kind === "failed") logger.warn("Tern could not open the fork pane; forking in place", details);
 					else logger.debug("Tern refused the fork; forking in place", details);
 					return false;

@@ -210,9 +210,7 @@ describe("YieldTool", () => {
 		expect(result.details).toEqual({ data: undefined, status: "aborted", error: "blocked" });
 	});
 
-	it("rejects a data-less terminal type with no submitted sections as retryable", async () => {
-		// `{type:"result"}` with nothing to finalize used to terminate the child and
-		// fail the run post-mortem with a null-data warning it could no longer fix.
+	it("requires explicit terminal data for a declared output schema", async () => {
 		const tool = new YieldTool(
 			createSession({
 				outputSchema: {
@@ -222,9 +220,7 @@ describe("YieldTool", () => {
 				},
 			}),
 		);
-		await expect(tool.execute("call-empty-finalize", { type: "result" } as never)).rejects.toThrow(
-			/only finalizes previously submitted sections, and none were submitted/,
-		);
+		await expect(tool.execute("call-empty-finalize", { type: "result" } as never)).rejects.toBeInstanceOf(Error);
 	});
 
 	it("rejects an incremental section without data", async () => {
@@ -988,7 +984,7 @@ describe("YieldTool", () => {
 		const untyped = new YieldTool(createSession());
 		await expect(
 			untyped.execute("call-null-data", { type: "summary", data: null, error: null } as never),
-		).rejects.toThrow(/none were submitted/);
+		).rejects.toBeInstanceOf(Error);
 	});
 
 	it("omits nested strict-mode null optionals while retaining explicit nullable values", async () => {

@@ -792,7 +792,7 @@ export async function splitDelimitedPathEntry(
 			isReadableUrlPath(part) || /^(?:ftp|wss?):\/\//i.test(part) || InternalUrlRouter.instance().canResolve(part));
 	const isBoundary = (part: string) => isUrl(part) || (options.exclusionParts === true && isExclusionPart(part));
 	if (isInternalUrlPath(normalizedEntry)) {
-		const parts = await tryDelimitedPathSplit(
+		const rawParts = await tryDelimitedPathSplit(
 			normalizedEntry,
 			cwd,
 			splitter,
@@ -802,10 +802,23 @@ export async function splitDelimitedPathEntry(
 			false,
 			options.queryOwner,
 		);
-		if (!parts || parts.length <= 1) return null;
-		if (parts.every(isBoundary)) return parts;
+		if (!rawParts || rawParts.length <= 1) return null;
+		const parts = await splitMixedUrlPathList(normalizedEntry, cwd, isBoundary, options.queryOwner);
+		if (parts?.every(isBoundary)) return parts;
 		if (!options.mixedLocalPaths) return null;
-		return (await internalUrlEntryResolves(normalizedEntry, options.mixedLocalPaths)) ? null : parts;
+		if (await internalUrlEntryResolves(normalizedEntry, options.mixedLocalPaths)) return null;
+		if (parts) return parts;
+		// Opaque URI fragments belong to the preceding resource, not a new target.
+		if (
+			rawParts.some(
+				part =>
+					extractUriScheme(part) !== undefined &&
+					splitUrlScheme(repairCollapsedScheme(InternalUrlRouter.instance().normalize(part))) === undefined,
+			)
+		) {
+			return null;
+		}
+		return rawParts;
 	}
 	const urlParts = await splitMixedUrlPathList(normalizedEntry, cwd, isBoundary, options.queryOwner);
 	if (urlParts) return urlParts;

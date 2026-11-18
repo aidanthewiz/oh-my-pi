@@ -258,7 +258,7 @@ describe("AgentSession.branchFromBtw", () => {
 			});
 		const activeSession = await createSession({
 			sdk: true,
-			model: getBundledModel("deepseek", "deepseek-v4-flash")!,
+			model: { ...getBundledModel("anthropic", "claude-sonnet-4-5")!, input: ["text"] },
 		});
 		activeSession.sessionManager.appendMessage({ role: "user", content: "seed", timestamp: 1 });
 		await activeSession.sessionManager.flush();
@@ -296,7 +296,7 @@ describe("AgentSession.branchFromBtw", () => {
 		});
 		const activeSession = await createSession({
 			sdk: true,
-			model: getBundledModel("deepseek", "deepseek-v4-flash")!,
+			model: { ...getBundledModel("anthropic", "claude-sonnet-4-5")!, input: ["text"] },
 		});
 		activeSession.sessionManager.appendMessage({ role: "user", content: "seed", timestamp: 1 });
 		await activeSession.sessionManager.flush();

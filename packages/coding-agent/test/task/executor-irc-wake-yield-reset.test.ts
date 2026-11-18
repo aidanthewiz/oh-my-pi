@@ -55,6 +55,6 @@ describe("IRC wake turn yield reset", () => {
 		// Starting the wake turn must clear the submitted-sections state.
 		observer([{ role: "user", content: "wake up" }]);
 
-		await expect(yieldTool.execute("wake-empty", { type: "result" } as never)).rejects.toThrow(/none were submitted/);
+		await expect(yieldTool.execute("wake-empty", { type: "result" } as never)).rejects.toThrow();
 	});
 });

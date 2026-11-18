@@ -18,6 +18,7 @@ import { fingerprintStaticModels } from "@oh-my-pi/pi-catalog/model-manager";
 import * as catalogModels from "@oh-my-pi/pi-catalog/models";
 import { calculateUsageCost, getBundledModels } from "@oh-my-pi/pi-catalog/models";
 import { modelKind } from "@oh-my-pi/pi-catalog/types";
+import * as compatAuth from "@oh-my-pi/pi-catalog/compat/auth";
 import { finalizeCustomModel } from "@oh-my-pi/pi-coding-agent/config/custom-models";
 import { applyModelPatch, mergeDiscoveredModel } from "@oh-my-pi/pi-coding-agent/config/model-patch";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
@@ -4040,6 +4041,7 @@ describe("ModelRegistry", () => {
 		});
 
 		test("does not offer bundled Antigravity chat ids absent from a fresh account roster after restart", async () => {
+			spies.push(spyOn(compatAuth, "providerDisabledReason").mockReturnValue(undefined));
 			const oauthToken = "antigravity-roster-token";
 			await authStorage.credentials.set("google-antigravity", {
 				type: "oauth",
@@ -4073,6 +4075,7 @@ describe("ModelRegistry", () => {
 		});
 
 		test("does not reuse an Antigravity roster after the same account changes projects", async () => {
+			spies.push(spyOn(compatAuth, "providerDisabledReason").mockReturnValue(undefined));
 			const credential = {
 				type: "oauth" as const,
 				access: "antigravity-project-token",

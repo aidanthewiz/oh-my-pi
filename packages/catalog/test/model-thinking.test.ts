@@ -41,7 +41,7 @@ function createModel<TApi extends Api>(overrides: {
 }
 
 describe("model thinking derivation", () => {
-	it("offers unknown Meta models an opt-in ladder without exporting a capability to another host", () => {
+	it("offers unknown Meta models an opt-in ladder without promoting inferred capability into an authored spec", () => {
 		const model = createModel({
 			id: "unclassified-preview",
 			api: "openai-responses",
@@ -49,18 +49,13 @@ describe("model thinking derivation", () => {
 			baseUrl: "https://api.meta.ai/v1",
 			reasoning: false,
 		});
-		expect(model.thinking).toEqual({
+		expect(model.thinking).toMatchObject({
 			mode: "effort",
-			efforts: [Effort.Minimal, Effort.Low, Effort.Medium, Effort.High, Effort.XHigh],
 			unverified: true,
 		});
-		const rerouted = buildModel({
-			...toModelSpec(model),
-			provider: "private-gateway",
-			baseUrl: "https://private.example/v1",
-		});
-		expect(rerouted.reasoning).toBe(false);
-		expect(rerouted.thinking).toBeUndefined();
+		const reference = toModelSpec(model);
+		expect(reference.reasoning).toBeUndefined();
+		expect(reference.thinking).toBeUndefined();
 	});
 
 	it("does not infer an unverified ladder for a known neutral model or an unadmitted host", () => {

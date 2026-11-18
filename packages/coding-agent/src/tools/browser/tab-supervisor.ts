@@ -51,12 +51,13 @@ import {
 	type WebKitBrowserHandle,
 } from "./registry";
 import { isLoopbackRelayUrl } from "./relay/daemon";
-import { FOREIGN_FRAME_REFUSAL, type HiddenFrame } from "./relay/protocol";
+import type { HiddenFrame } from "./relay/protocol";
 import {
 	type AttachPage,
 	isMissingPageGlobal,
 	ownsPage,
 	type ReadyInfo,
+	RelayAttachRefusedError,
 	type RunErrorPayload,
 	type RunResultOk,
 	type ScreenshotLimits,
@@ -1586,24 +1587,22 @@ async function recoverWorkerTab(
 		if (reattached) tab.heldOut = undefined;
 		return reattached;
 	} catch (recycleError) {
-		const messages = [recycleError, recycleError instanceof Error ? recycleError.cause : undefined].map(error =>
-			error instanceof Error ? error.message : String(error),
-		);
-		// A foreign extension can prevent re-adoption without closing the user's page.
+		const message = recycleError instanceof Error ? recycleError.message : String(recycleError);
+		const cause = recycleError instanceof Error ? recycleError.cause : undefined;
 		if (
 			tab.kindTag === "relay" &&
 			!opts.signal?.aborted &&
-			messages.some(message => FOREIGN_FRAME_REFUSAL.test(message)) &&
+			(recycleError instanceof RelayAttachRefusedError || cause instanceof RelayAttachRefusedError) &&
 			tabs.get(name) === tab &&
 			tab.state === "alive"
 		) {
 			logger.warn("Chrome refused to reattach a relay tab over another extension's frame; keeping it", {
-				error: messages[0],
+				error: message,
 			});
 			tab.heldOut = true;
 			throw new TabHeldOutError();
 		}
-		logger.warn("Failed to recycle browser tab worker; killing tab", { error: messages[0] });
+		logger.warn("Failed to recycle browser tab worker; killing tab", { error: message });
 		return await killTab(opts.failedReason ?? reason);
 	}
 }
@@ -2840,17 +2839,19 @@ function errorFromPayload(payload: RunErrorPayload): Error {
 		if (payload.stack) error.stack = payload.stack;
 		return error;
 	}
-	const error = payload.rendererCrashed
-		? new RendererCrashedError(payload.message)
-		: payload.recoverTab
-			? new RecoverableWorkerError(payload.message)
-			: payload.isAbort
-				? new ToolAbortError()
-				: payload.navigationTimeout
-					? new NavigationTimeoutError(payload.message)
-					: payload.isToolError
-						? new ToolError(payload.message)
-						: new Error(payload.message);
+	const error = payload.relayAttachRefused
+		? new RelayAttachRefusedError(payload.message)
+		: payload.rendererCrashed
+			? new RendererCrashedError(payload.message)
+			: payload.recoverTab
+				? new RecoverableWorkerError(payload.message)
+				: payload.isAbort
+					? new ToolAbortError()
+					: payload.navigationTimeout
+						? new NavigationTimeoutError(payload.message)
+						: payload.isToolError
+							? new ToolError(payload.message)
+							: new Error(payload.message);
 	error.name = payload.name;
 	if (payload.stack) error.stack = payload.stack;
 	if (payload.missingPageGlobal) addPageGlobalHint(error);

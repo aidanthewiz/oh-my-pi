@@ -214,6 +214,9 @@ function closeFixture(send: (method: string, emit: (targetId: string) => void) =
 			}),
 		on: (_event: string, handler: (event: { targetId: string }) => void) => handlers.add(handler),
 		off: (_event: string, handler: (event: { targetId: string }) => void) => handlers.delete(handler),
+		createSession: async () => {
+			throw new Error("closes must not attach to targets");
+		},
 	};
 	return {
 		browser: {

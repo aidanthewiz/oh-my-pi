@@ -558,14 +558,13 @@ describe("/fork inside Tern", () => {
 		expect(ctx.showWarning).not.toHaveBeenCalled();
 	});
 
-	it("aborts the running turn and forks in place when Tern declines the fork", async () => {
+	it.each([false, true])("preserves the current turn when Tern declines a fork (streaming=%s)", async streaming => {
 		const tern = await startTern(() => ({ error: { kind: "not_agent", message: "no session file" } }));
-		const { controller, ctx, session } = createContext({ streaming: true });
+		const { controller, ctx, session } = createContext({ streaming });
 		await controller.handleForkCommand();
 		expect(tern.forks).toHaveLength(1);
-		expect(session.abort).toHaveBeenCalledTimes(1);
-		expect(session.fork).toHaveBeenCalledTimes(1);
-		expect(session.abort.mock.invocationCallOrder[0]).toBeLessThan(session.fork.mock.invocationCallOrder[0]);
-		expect(ctx.showWarning).not.toHaveBeenCalled();
+		expect(session.abort).not.toHaveBeenCalled();
+		expect(session.fork).toHaveBeenCalledTimes(streaming ? 0 : 1);
+		expect(ctx.showError).toHaveBeenCalledTimes(streaming ? 1 : 0);
 	});
 });

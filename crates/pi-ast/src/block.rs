@@ -1354,7 +1354,7 @@ mod tests {
 				continue;
 			}
 			if used + len > budget {
-				break;
+				continue;
 			}
 			used += len;
 			picked.push(path.clone());

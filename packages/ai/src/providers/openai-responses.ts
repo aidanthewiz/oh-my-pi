@@ -1237,7 +1237,7 @@ const streamOpenAIResponsesOnce = (
 					}
 				} catch (error) {
 					if (error instanceof OpenAIResponsesRequestRejection) {
-						throwOpenAIResponsesEventError(error.event, output, model.provider);
+						throwOpenAIResponsesEventError(error.event, output, accountingModel, options?.serviceTier);
 					}
 					throw error;
 				}

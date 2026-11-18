@@ -19,7 +19,11 @@ import { peekFileEnds } from "@oh-my-pi/pi-utils/peek-file";
 import { isPidAlive } from "@oh-my-pi/pi-utils/pid";
 import { Snowflake } from "@oh-my-pi/pi-utils/snowflake";
 import { toError } from "@oh-my-pi/pi-utils/type-guards";
-import { SESSION_HEADER_READ_LIMIT, sessionHeaderIdFromPrefix } from "./session-header-id";
+import {
+	readSessionHeaderIdSync as readSessionHeaderIdForPurgeSync,
+	SESSION_HEADER_READ_LIMIT,
+	sessionHeaderIdFromPrefix,
+} from "./session-header-id";
 import {
 	overlayTitleSlotContent,
 	type SessionTitleUpdate,
@@ -1494,7 +1498,7 @@ export class FileSessionStorage implements SessionStorage {
 		// is already absent still purges (callers treat ENOENT as success) and
 		// then rethrows, so artifact cleanup does not run for a file this call
 		// did not remove.
-		const sessionId = readSessionHeaderIdSync(sessionPath);
+		const sessionId = readSessionHeaderIdForPurgeSync(sessionPath);
 		let alreadyGone: unknown;
 		try {
 			await this.unlink(sessionPath);

@@ -280,7 +280,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 		const runtimeSignals = getRuntimeSignals();
 		expect(runtimeSignals).toContain("compaction:start:threshold");
 		expect(runtimeSignals.some(signal => signal.startsWith("compaction:end:"))).toBe(true);
-		expect(agentEndTerminalStates).toEqual([false]);
+		expect(agentEndTerminalStates).toEqual([false, true]);
 	});
 
 	it("marks manual compaction active before abort teardown can yield", async () => {

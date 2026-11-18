@@ -11,6 +11,7 @@ import { ExtensionRunner } from "../src/extensibility/extensions/runner";
 import { AgentSession } from "../src/session/agent-session";
 import type { AgentSessionEvent, AgentSessionLifecycleEvent } from "../src/session/agent-session-events";
 import { AuthStorage } from "../src/session/auth-storage";
+import { USER_INTERRUPT_LABEL } from "../src/session/messages";
 import { SessionManager } from "../src/session/session-manager";
 import { EventBus } from "../src/utils/event-bus";
 
@@ -172,6 +173,8 @@ test.each([
 			expect(ends).toContain(starts[1]);
 			if (asyncPause) {
 				jobs.acknowledgeDeliveries(["newer-owner-job"]);
+				releaseJob.resolve("suppressed newer-owner result");
+				await jobs.waitForOwnerJobs("DelayedOwner");
 				await session.waitForRunEnd();
 			}
 			expect(session.isStreaming).toBe(false);
@@ -214,7 +217,7 @@ const outcomeCases: Array<{ label: string; response: MockResponse; outcome: Agen
 	},
 	{
 		label: "aborted",
-		response: { content: ["partial"], stopReason: "aborted", errorMessage: "Interrupted by user" },
+		response: { content: ["partial"], stopReason: "aborted", errorMessage: USER_INTERRUPT_LABEL },
 		outcome: "aborted",
 	},
 ];
@@ -227,15 +230,24 @@ test.each(outcomeCases)(
 		const releaseJob = Promise.withResolvers<string>();
 		const providerEntered = Promise.withResolvers<void>();
 		const releaseProvider = Promise.withResolvers<void>();
+		const firstProviderEntered = Promise.withResolvers<void>();
+		const releaseFirstProvider = Promise.withResolvers<void>();
 		let session: AgentSession | undefined;
 		let nextPrompt: Promise<boolean> | undefined;
+		let aborting: Promise<void> | undefined;
 		try {
 			const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 			if (!model) throw new Error("Missing bundled test model");
 			authStorage.keys.setRuntime(model.provider, "synthetic-key");
 			const mock = createMockModel({
 				responses: [
-					response,
+					async () => {
+						if (outcome === "aborted") {
+							firstProviderEntered.resolve();
+							await releaseFirstProvider.promise;
+						}
+						return response;
+					},
 					async () => {
 						providerEntered.resolve();
 						await releaseProvider.promise;
@@ -265,18 +277,27 @@ test.each(outcomeCases)(
 			});
 			const physicalEnds: Array<Extract<AgentSessionLifecycleEvent, { type: "agent_end" }>> = [];
 			const publicEnds: Array<Extract<AgentSessionEvent, { type: "agent_end" }>> = [];
+			const publicPauses: Array<Extract<AgentSessionEvent, { type: "agent_pause" }>> = [];
 			session.subscribeLifecycle(event => {
 				if (event.type === "agent_end") physicalEnds.push(event);
 			});
 			session.subscribe(event => {
 				if (event.type === "agent_end") publicEnds.push(event);
+				if (event.type === "agent_pause") publicPauses.push(event);
 			});
 			jobs.register("bash", "held synthetic job", () => releaseJob.promise, {
 				id: "outcome-job",
 				ownerId: "OutcomeOwner",
 			});
 
-			await session.prompt("Settle while the background job remains held.");
+			const prompting = session.prompt("Settle while the background job remains held.");
+			if (outcome === "aborted") {
+				await firstProviderEntered.promise;
+				aborting = session.abort({ reason: USER_INTERRUPT_LABEL });
+				releaseFirstProvider.resolve();
+			}
+			await prompting;
+			await aborting;
 			const owner = session.lifecycleState;
 			if (!owner) throw new Error("Settled loop lost its owner");
 			expect(owner.outcome).toBe(outcome);
@@ -285,7 +306,13 @@ test.each(outcomeCases)(
 			expect(physicalEnds[0]?.runId).toBe(owner.runId);
 			expect(physicalEnds[0]?.outcome).toBe(outcome);
 			expect(physicalEnds[0]?.awaitingAsyncWork).toBe(outcome === "aborted" ? undefined : true);
-			expect(publicEnds[0]?.outcome).toBe(outcome);
+			if (outcome === "aborted") {
+				expect(publicEnds[0]?.outcome).toBe(outcome);
+				expect(publicPauses).toEqual([]);
+			} else {
+				expect(publicEnds).toEqual([]);
+				expect(publicPauses).toMatchObject([{ runId: owner.runId, outcome, awaiting: true }]);
+			}
 			if (outcome === "error") {
 				expect(agent.state.messages.some(message => message.role === "assistant")).toBe(false);
 				expect(
@@ -294,6 +321,8 @@ test.each(outcomeCases)(
 			}
 
 			jobs.acknowledgeDeliveries(["outcome-job"]);
+			releaseJob.resolve("suppressed synthetic result");
+			await jobs.waitForOwnerJobs("OutcomeOwner");
 			await session.waitForRunEnd();
 			expect(session.lifecycleState?.runId).toBe(owner.runId);
 			expect(session.lifecycleState?.phase).toBe("idle");
@@ -321,6 +350,8 @@ test.each(outcomeCases)(
 			await session.newSession();
 			expect(session.lifecycleState).toBeNull();
 		} finally {
+			releaseFirstProvider.resolve();
+			await aborting;
 			releaseProvider.resolve();
 			releaseJob.resolve("suppressed synthetic result");
 			try {

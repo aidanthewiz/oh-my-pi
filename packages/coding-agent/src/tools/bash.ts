@@ -937,16 +937,15 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				}
 			}
 		}
+		const patterns = isDestructiveCommandGuardConfigured() ? CRITICAL_BASH_PATTERNS : ALL_CRITICAL_BASH_PATTERNS;
 		const segmentCritical = segments.map(segment => {
 			const literalCommand = segment.literal?.argv.join(" ");
-			return CRITICAL_BASH_PATTERNS.some(
+			return patterns.some(
 				pattern => pattern.test(segment.text) || (literalCommand !== undefined && pattern.test(literalCommand)),
 			);
 		});
 		const wholeChainOnlyCritical =
-			command !== "" &&
-			CRITICAL_BASH_PATTERNS.some(pattern => pattern.test(command)) &&
-			!segmentCritical.some(Boolean);
+			command !== "" && patterns.some(pattern => pattern.test(command)) && !segmentCritical.some(Boolean);
 		if (wholeChainOnlyCritical) return null;
 
 		let chainUntainted = true;

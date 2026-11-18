@@ -29,6 +29,7 @@ import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import type { AgentSessionLifecycleListener } from "@oh-my-pi/pi-coding-agent/session/agent-session-events";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { FakeWebSocket, installInMemoryRelay, uninstallInMemoryRelay } from "./helpers/in-memory-relay";
@@ -47,7 +48,7 @@ interface HostContextState {
 	showStatus: string[];
 	/** Guest prompts the host forwarded into the session. */
 	prompts: string[];
-	subscribed: ((event: { type: string; [k: string]: unknown }) => void) | null;
+	subscribed: AgentSessionLifecycleListener | null;
 	/** Invoked on every `getSessionId()` read, i.e. each time the host checks the session it mirrors. */
 	onSessionIdRead: (() => void) | undefined;
 	/** Resolves when the host clears its status-line segment, i.e. tore down. */
@@ -107,7 +108,7 @@ function makeHostContext(): { ctx: InteractiveModeContext; state: HostContextSta
 			get lifecycleState() {
 				return state.lifecycle;
 			},
-			subscribe: (cb: HostContextState["subscribed"]) => {
+			subscribeLifecycle: (cb: AgentSessionLifecycleListener) => {
 				state.subscribed = cb;
 				return () => {};
 			},
@@ -212,7 +213,7 @@ describe("collab host registry lifecycle (#6099)", () => {
 				if (scenario === "older-completion") {
 					state.lifecycle = { runId: "second", phase: "running" };
 					state.subscribed!({ type: "agent_start", runId: "second" });
-					state.subscribed!({ type: "agent_end", runId: "first", messages: [] });
+					state.subscribed!({ type: "agent_end", runId: "first", messages: [], isTerminal: true, yielded: true });
 					await flush(100);
 					state.usedTokens = 128;
 					await flush(2_200);
@@ -220,16 +221,16 @@ describe("collab host registry lifecycle (#6099)", () => {
 					expect(latest?.lifecycle).toEqual({ runId: "second", phase: "running" });
 					state.isStreaming = false;
 					state.lifecycle = { runId: "second", phase: "idle" };
-					state.subscribed!({ type: "agent_end", runId: "second", messages: [] });
+					state.subscribed!({ type: "agent_end", runId: "second", messages: [], isTerminal: true, yielded: true });
 					await flush(100);
 				} else {
 					state.lifecycle = { runId: "first", phase: "continuing" };
 					state.subscribed!({
-						type: "agent_pause",
+						type: "agent_end",
 						runId: "first",
 						messages: [],
 						yielded: false,
-						awaiting: false,
+						isTerminal: false,
 					});
 					await flush(100);
 					state.isStreaming = false;
@@ -997,7 +998,7 @@ describe("collab host registry lifecycle (#6099)", () => {
 		// transport, or its tail — not the frames under test — is what stalls.
 		await replicated.promise;
 		const emit = (content: string) =>
-			state.subscribed?.({ type: "message_start", message: { role: "user", content } });
+			state.subscribed?.({ type: "message_start", message: { role: "user", content, timestamp: 0 } });
 		return { host, transport, hostWire, goodbye, received, emit };
 	}
 

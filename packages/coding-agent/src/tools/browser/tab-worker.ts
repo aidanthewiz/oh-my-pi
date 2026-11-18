@@ -260,6 +260,7 @@ import {
 	isMissingPageGlobal,
 	ownsPage,
 	type ReadyInfo,
+	RelayAttachRefusedError,
 	type RunErrorPayload,
 	type RunOutcome,
 	type ScreenshotResult,
@@ -1531,6 +1532,7 @@ function errorPayload(error: unknown): RunErrorPayload {
 			recoverTab,
 			navigationTimeout,
 			rendererCrashed,
+			relayAttachRefused: error instanceof RelayAttachRefusedError || undefined,
 			debuggerDetached,
 		};
 	}
@@ -2354,7 +2356,7 @@ export class WorkerCore {
 		const targetInfo = await this.#browserHasTarget(this.#browser, targetId);
 		const refusal = isRecord(targetInfo) && typeof targetInfo.refusal === "string" ? targetInfo.refusal : undefined;
 		if (refusal && FOREIGN_FRAME_REFUSAL.test(refusal)) {
-			throw new ToolError(`Chrome refused to attach to target ${targetId}: ${refusal}`);
+			throw new RelayAttachRefusedError(`Chrome refused to attach to target ${targetId}: ${refusal}`);
 		}
 		// Puppeteer lists a page only once its URL is non-empty, and a crashed page revived by this attach reloads
 		// with an empty URL for a moment. Wait for it while Chromium still has the target; fail at once when not.
