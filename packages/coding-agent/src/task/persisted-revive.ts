@@ -29,6 +29,7 @@ import type { CostGateApi } from "../session/cost-gate";
 import { installRetryFallbackRole } from "../session/retry-fallback-chains";
 import type { AuthStorage } from "../session/auth-storage";
 import { revivePersistedPlaced } from "../thread/executor-routing";
+import type { SubagentRuntimeApprovalHandler } from "../tools/subagent-runtime-approval";
 import { subagentWorkerPool } from "../thread/subagent-worker";
 import {
 	extractSessionInit,
@@ -111,6 +112,7 @@ export interface PersistedReviveSpec {
 	readonly eventBus: EventBus | undefined;
 	readonly subagentEventBus: EventBus | undefined;
 	readonly isOwnerCurrent?: () => boolean;
+	readonly parentRuntimeApproval?: SubagentRuntimeApprovalHandler;
 	readonly isOwnerLifetimeCurrent?: () => boolean;
 	readonly captureOwnerCurrent?: () => () => boolean;
 	readonly hasUI: boolean;
@@ -255,6 +257,9 @@ export function createPersistedSubagentReviverFactory(
 				eventBus: ctx.eventBus,
 				subagentEventBus: ctx.subagentEventBus,
 				isOwnerCurrent: isReviveCurrent,
+				parentRuntimeApproval: restoredSeance
+					? undefined
+					: ctx.session.extensionRunner?.getSubagentRuntimeApproval(),
 				isOwnerLifetimeCurrent: isRootCurrent,
 				captureOwnerCurrent: ctx.captureOwnerCurrent,
 				hasUI: ctx.session.extensionRunner?.hasUI() === true,
@@ -536,6 +541,7 @@ export async function revivePersistedSubagent(spec: PersistedReviveSpec, expecte
 			// createAgentSession default to wildcard ("*").
 			spawns: init.spawns ?? "",
 			hasUI: false,
+			parentRuntimeApproval: spec.parentRuntimeApproval,
 			enableLsp: restrictToolNames ? false : spec.enableLsp,
 			...(restrictToolNames
 				? {

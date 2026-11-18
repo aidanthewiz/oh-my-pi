@@ -148,6 +148,14 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser WebMCP helpers", () => {
 				expect(middle.parentFrame()).toBe(page.mainFrame());
 				expect(middle.client).not.toBe(page.mainFrame().client);
 				expect(leaf.client).toBe(middle.client);
+				const nativeRegistration = `(() => {
+  const context = document.modelContext ?? navigator.modelContext;
+  return typeof ModelContext !== "undefined" && context instanceof ModelContext
+    && /\\[native code\\]/.test(Function.prototype.toString.call(context.registerTool));
+})()`;
+				expect(await Promise.all([middle.evaluate(nativeRegistration), leaf.evaluate(nativeRegistration)])).toEqual(
+					[true, true],
+				);
 				await Promise.all([
 					middle.waitForFunction(() => document.title === "registered"),
 					leaf.waitForFunction(() => document.title === "registered"),
@@ -203,6 +211,14 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser WebMCP helpers", () => {
 					["unregistered", "nested_constant", leafId],
 					["unregistered", "middle_constant", middleId],
 				]);
+
+				await page.goto(`http://127.0.0.1:${leafServer.port}/tool`, { waitUntil: "load" });
+				expect((await controller.list()).tools.map(tool => tool.name)).toEqual(["nested_constant"]);
+				expect(await controller.invoke("nested_constant", {})).toEqual({
+					ok: true,
+					result: { value: 42, calls: 1 },
+					untrusted: true,
+				});
 			} finally {
 				try {
 					await controller.dispose();

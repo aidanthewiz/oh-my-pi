@@ -62,6 +62,8 @@ export interface BashExecutorOptions {
 	env?: Record<string, string>;
 	/** Command and environment already transformed and reviewed by the calling tool. */
 	preflight?: { command: string; env: Record<string, string> | undefined };
+	/** Revalidates per-call authority immediately before dispatch. */
+	validate?: () => void;
 	/** Run through the configured user shell instead of the embedded shell parsing directly. */
 	useUserShell?: boolean;
 	/** Run supported user shells (zsh/fish) on a headless PTY; requires `useUserShell`. */
@@ -822,6 +824,7 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 	if (usePty && ptyRequest) {
 		const requestedMs = options?.timeout;
 		try {
+			options?.validate?.();
 			return await executeUserShellPty({
 				shell,
 				args,
@@ -936,6 +939,7 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 	};
 
 	try {
+		options?.validate?.();
 		const runPromise = executionShell.run(
 			{
 				command: finalCommand,

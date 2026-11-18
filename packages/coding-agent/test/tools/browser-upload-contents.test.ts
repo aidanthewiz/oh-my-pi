@@ -519,6 +519,9 @@ return "done";`);
 			expect(JSON.stringify(recycled.content)).toContain("reattached to a new worker");
 			const read = await run(`return await tab.evaluate(() => document.querySelector("#direct").files[0].text());`);
 			expect(valueOf(read)).toBe("outlives its worker");
+			const staged = (await fs.readdir(staging, { recursive: true })).filter(file => file.endsWith("recycled.txt"));
+			expect(staged).toHaveLength(1);
+			expect(await fs.readFile(path.join(staging, staged[0]!), "utf8")).toBe("outlives its worker");
 		} finally {
 			await prelude.invoke({ action: "close", name }, context);
 		}

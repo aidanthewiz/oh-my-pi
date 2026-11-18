@@ -795,8 +795,9 @@ async function wrappedExecute(
 			};
 		}
 	} catch (e) {
-		// Re-throw with formatted message so agent-loop sets isError flag
-		throw new Error(renderError(e));
+		const message = renderError(e);
+		if (e instanceof Error && message === e.message) throw e;
+		throw new Error(message);
 	}
 	// The Spotlight experiment shapes what the agent's own calls return; calls a tool or script makes stay whole.
 	const shape = context?.spotlightShape;

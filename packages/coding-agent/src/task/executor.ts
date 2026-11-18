@@ -541,6 +541,8 @@ export interface ExecutorOptions {
 	taskDepth?: number;
 	/** Whether the parent session has the interactive TUI surface. */
 	parentHasUI?: boolean;
+	/** Owning root's live, per-call runtime approval capability. */
+	parentRuntimeApproval?: CreateAgentSessionOptions["parentRuntimeApproval"];
 	/**
 	 * Override the `task.maxRuntimeMs` wall-clock cap for this run. When provided
 	 * it wins over the settings value; `0` disables the per-subagent wall-clock
@@ -5478,6 +5480,7 @@ async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<Sing
 					preloadedPreparedExtensions: options.preloadedPreparedExtensions,
 					preloadedCustomToolPaths: restrictToolNames ? [] : options.preloadedCustomToolPaths,
 					hasUI: false,
+					parentRuntimeApproval: options.parentRuntimeApproval,
 					prewalk,
 					spawns: spawnsEnv,
 					taskDepth: childDepth,

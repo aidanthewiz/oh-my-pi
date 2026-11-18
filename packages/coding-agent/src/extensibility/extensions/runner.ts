@@ -42,6 +42,11 @@ import type { AsyncJobSnapshot, SendUserMessageOptions } from "../../session/age
 import { MAIN_AGENT_ID } from "../../registry/agent-registry";
 import type { SessionManager } from "../../session/session-manager";
 import { addFileDeleteFallback, addFileWriteFallback } from "../../tools/file-write-fallback";
+import type {
+	SubagentRuntimeApprovalHandler,
+	SubagentRuntimeApprovalRequest,
+	SubagentRuntimeApprovalResult,
+} from "../../tools/subagent-runtime-approval";
 import type { BranchHandler, NavigateTreeHandler, NewSessionHandler } from "../session-handler-types";
 import { accumulateToolCallResult, buildAggregatedToolCallResult } from "../shared-events";
 import { ManagedTimers } from "./managed-timers";
@@ -618,6 +623,7 @@ export const UNAVAILABLE_ANNOTATIONS: ExtensionAnnotationsAPI = Object.freeze({
 
 export class ExtensionRunner {
 	#uiContext: ExtensionUIContext;
+	#uiContextLifetime = new AbortController();
 	#mcp: ExtensionMCPContext = {
 		callTool: async () => {
 			throw new Error("MCP is unavailable for this session");
@@ -625,6 +631,8 @@ export class ExtensionRunner {
 	};
 	#mode: ExtensionMode = "print";
 	#toolApprovalPreviewWaiter?: (toolCallId: string) => Promise<void>;
+	#parentRuntimeApproval?: SubagentRuntimeApprovalHandler;
+	#subagentRuntimeApproval?: () => SubagentRuntimeApprovalHandler | undefined;
 	/** Grant keys (see `sessionApprovalScope`) approved "for this session", each prefixed by the session it covers. */
 	#sessionApprovals = new Set<string>();
 	#trackUserWait?: UserWaitTracker;
@@ -946,6 +954,8 @@ export class ExtensionRunner {
 		uiContext?: ExtensionUIContext,
 		mode: ExtensionMode = "print",
 	): void {
+		this.#uiContextLifetime.abort();
+		this.#uiContextLifetime = new AbortController();
 		// Copy actions into the shared runtime (all extension APIs reference this)
 		this.runtime.sendMessage = actions.sendMessage;
 		this.runtime.sendUserMessage = actions.sendUserMessage;
@@ -1163,8 +1173,34 @@ export class ExtensionRunner {
 		this.#sessionApprovals.add(`${this.sessionId}\0${key}`);
 	}
 
+	setRuntimeApprovalBridge(
+		parent: SubagentRuntimeApprovalHandler | undefined,
+		children: () => SubagentRuntimeApprovalHandler | undefined,
+	): void {
+		this.#parentRuntimeApproval = parent;
+		this.#subagentRuntimeApproval = children;
+	}
+
+	getSubagentRuntimeApproval(): SubagentRuntimeApprovalHandler | undefined {
+		return this.#subagentRuntimeApproval?.();
+	}
+
+	async requestParentRuntimeApproval(
+		request: SubagentRuntimeApprovalRequest,
+		signal?: AbortSignal,
+	): Promise<SubagentRuntimeApprovalResult | undefined> {
+		const handler = this.#parentRuntimeApproval;
+		if (!handler) return undefined;
+		const dialog = () => untilAborted(signal, () => handler(request, signal));
+		return this.#trackUserWait ? this.#trackUserWait(dialog) : dialog();
+	}
+
 	getUIContext(): ExtensionUIContext {
 		return this.#uiContext;
+	}
+
+	getUIContextSignal(): AbortSignal {
+		return this.#uiContextLifetime.signal;
 	}
 
 	hasUI(): boolean {

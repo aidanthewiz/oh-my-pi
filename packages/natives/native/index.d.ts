@@ -3059,7 +3059,7 @@ export declare function macOSAutocorrectWord(text: string, start: number, length
  * Find every misspelled word using the active macOS dictionaries.
  *
  * Returns an empty list when Apple's spelling service is unavailable.
- * On macOS, the check runs on the dedicated spelling thread.
+ * On macOS, the dedicated spelling thread submits a native background check.
  */
 export declare function macOSCheckSpelling(text: string): Promise<Array<SpellingRange>>
 

@@ -5,9 +5,10 @@
 //! `AppleSpell` exposes UTF-16 ranges through [`NSSpellChecker`]. JavaScript
 //! strings use the same indexing unit, so ranges cross N-API without remapping.
 //! Other platforms expose the same API as an unavailable, no-op backend.
-//! All `AppKit` work runs serially on the one process-wide spelling thread in
-//! `pi_predict::apple::appkit` (shared with the `apple` word-completion
-//! engine) so the singleton keeps a stable thread identity.
+//! Requests originate on the process-wide spelling thread in
+//! `pi_predict::apple::appkit`, shared with word completion.
+//! Background checks collect immutable results in `AppKit`'s completion
+//! context.
 
 use napi_derive::napi;
 
@@ -37,8 +38,10 @@ mod platform {
 			.map_err(|error| Error::new(Status::GenericFailure, format!("{error:#}")))
 	}
 
-	pub fn check(text: &str) -> anyhow::Result<Vec<SpellingRange>> {
-		Ok(appkit::check(text)?
+	pub async fn check(text: String) -> Result<Vec<SpellingRange>> {
+		Ok(appkit::check(text)
+			.await
+			.map_err(|error| Error::new(Status::GenericFailure, format!("{error:#}")))?
 			.into_iter()
 			.map(|range| SpellingRange { start: range.start, length: range.length })
 			.collect())
@@ -55,7 +58,7 @@ pub fn macos_spell_checker_available() -> bool {
 /// Find every misspelled word using the active macOS dictionaries.
 ///
 /// Returns an empty list when Apple's spelling service is unavailable.
-/// On macOS, the check runs on the dedicated spelling thread.
+/// On macOS, the dedicated spelling thread submits a native background check.
 #[napi(js_name = "macOSCheckSpelling")]
 #[cfg_attr(
 	not(target_os = "macos"),
@@ -64,7 +67,7 @@ pub fn macos_spell_checker_available() -> bool {
 pub async fn macos_check_spelling(text: String) -> napi::Result<Vec<SpellingRange>> {
 	#[cfg(target_os = "macos")]
 	{
-		platform::run(move || platform::check(&text)).await
+		platform::check(text).await
 	}
 	#[cfg(not(target_os = "macos"))]
 	{

@@ -31,6 +31,7 @@ export interface ServiceStart {
 	ready?: ServiceReady;
 	/** Overlay on the configured shell env; wins over it. */
 	env?: Record<string, string>;
+	validate?: () => void;
 }
 
 const serviceStateKey = Symbol("ownedServices");
@@ -131,6 +132,7 @@ async function request(
 	session: ToolSession,
 	operation: DaemonOperation,
 	signal?: AbortSignal,
+	validate?: () => void,
 ): Promise<DaemonRpcResult> {
 	throwIfAborted(signal);
 	if (session.isDisposed?.()) throw new ToolAbortError("Service session is no longer active");
@@ -149,7 +151,7 @@ async function request(
 		assertActive();
 		subscribe(session, state, client, owner);
 		assertActive();
-		const result = await client.request(operation, requestSignal);
+		const result = await client.request(operation, requestSignal, validate);
 		assertActive();
 		if (result.op === "list") {
 			state.owned.clear();
@@ -313,6 +315,7 @@ export async function startService(
 			awaitReady: readyInterrupt === undefined,
 		},
 		signal,
+		params.validate,
 	);
 	if (result.op !== "start") throw new Error("Unexpected daemon start response");
 	const launched = result.daemon;

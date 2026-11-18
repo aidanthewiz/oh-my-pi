@@ -8,6 +8,7 @@
 
 ### Fixed
 
+- Use native background requests for macOS spelling checks. Preserve per-request UTF-16 ranges and omit whole-string orthography results.
 - Pin the Windows cross-build SDK to the catalog and MSI format supported by xwin 0.6.5. Preserve Linux/macOS build hosts and the ARM64 SDK selection.
 - Drain PTY regression output on descriptor readiness instead of timed sleeps, retaining the original three-second limit and backpressure assertions.
 
