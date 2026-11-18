@@ -59,7 +59,7 @@ jobs:
     steps:
       - name: Checkout protected helper only
         id: checkout
-        continue-on-error: true
+        continue-on-error: ${{ inputs.canary-id == '' }}
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: Coreforce-CAD/oh-my-pi
@@ -69,7 +69,7 @@ jobs:
       - name: Guard execution source and configuration before OIDC
         if: steps.checkout.outcome == 'success'
         id: guard
-        continue-on-error: true
+        continue-on-error: ${{ inputs.canary-id == '' }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 scripts/ci_cache_guard.py authorize-read
@@ -77,13 +77,13 @@ jobs:
       - name: Record allowlisted actual OIDC claims
         if: steps.guard.outputs.enabled == 'true'
         id: oidc
-        continue-on-error: true
+        continue-on-error: ${{ inputs.canary-id == '' }}
         run: python3 scripts/ci_cache_guard.py oidc --broker read
 
       - name: Assume cache read role
         if: steps.oidc.outcome == 'success'
         id: credentials
-        continue-on-error: true
+        continue-on-error: ${{ inputs.canary-id == '' }}
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: ${{ vars.CI_CACHE_READ_ROLE }}
@@ -96,13 +96,13 @@ jobs:
       - name: Verify and record actual STS caller
         if: steps.credentials.outcome == 'success'
         id: identity
-        continue-on-error: true
+        continue-on-error: ${{ inputs.canary-id == '' }}
         run: python3 scripts/ci_cache_guard.py identity --broker read
 
       - name: Fetch inert snapshot
         if: steps.identity.outcome == 'success'
         id: fetch
-        continue-on-error: true
+        continue-on-error: ${{ inputs.canary-id == '' }}
         env:
           CACHE_SLOT: ${{ matrix.slot }}
           CI_CACHE_PREFIX: ${{ steps.guard.outputs.prefix }}
@@ -150,7 +150,7 @@ jobs:
       - name: Transfer inert restore data
         if: always() && steps.guard.outcome == 'success' && steps.guard.outputs.enabled == 'true'
         id: upload
-        continue-on-error: true
+        continue-on-error: ${{ inputs.canary-id == '' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ steps.guard.outputs.artifact }}

@@ -243,7 +243,7 @@ def deny(operation, code="AccessDenied"):
     sys.exit(255)
 
 if operation == "list-objects-v2":
-    if control.get("deny_list"):
+    if control.get("deny_list") or control.get("deny_list_prefix") == argument("--prefix"):
         deny("ListObjectsV2")
     if "list_raw" in control:
         print(control["list_raw"])
@@ -667,6 +667,25 @@ else:
         with self.assertRaisesRegex(cache.CacheError, "AccessDenied"):
             store.put(object_key, source, immutable=True)
         self.assertEqual((remote / store.key(object_key)).read_bytes(), b"original")
+
+    def test_s3_cli_prune_failure_after_publication_leaves_snapshot_readable(self):
+        store, _, control = self.s3_fixture()
+        snapshot, manifest = self.snapshot()
+        result = subprocess.run([sys.executable, str(HELPER), "publish", "--snapshot", str(snapshot)], capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        cache.atomic_json(control, {"deny_list_prefix": store.prefix + "/"})
+        result = subprocess.run([sys.executable, str(HELPER), "prune", "--apply"], capture_output=True, text=True, timeout=20)
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        fetched = self.root / "after-failed-prune"
+        result = subprocess.run([sys.executable, str(HELPER), "fetch", "--slot", self.identity["slot"], "--output", str(fetched)], capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        disk, repo = self.roots()
+        result = subprocess.run([sys.executable, str(HELPER), "restore", "--identity", str(self.identity_path), "--snapshot", str(fetched), "--disk", str(disk), "--repo", str(repo)], capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((disk / DISK_NAME).read_bytes(), b"compiled action output")
+        self.assertEqual((repo / REPO_NAME).read_bytes(), b"repository download")
+        self.assertEqual((repo / ID_NAME).read_bytes(), b"")
+        self.assertEqual(cache.read_json(fetched / "manifest.json"), manifest)
 
     def test_prune_preserves_current_latest_historical_shared_and_grace_objects(self):
         generations = []

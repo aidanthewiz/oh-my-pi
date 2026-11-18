@@ -71,6 +71,9 @@ Staging these values does not enable the backend. Never store static AWS keys, t
 
 5. Require the entire run to succeed before enablement.
 
+Canary broker failures are fatal, including pruning after a usable snapshot is published.
+Production cache failures remain optional and cannot change the original build or release result.
+
 The non-releasing exemption admits only explicit cache documentation/workflows and direct cache-helper/test namespaces. The release workflow additionally requires identical non-cache semantics after removing owned cache jobs/steps, exact cache status conditions, and the marked cache-publication region. Native commands, signing, matrices, permissions, admission, and tag allocation remain significant.
 
 The baseline is the latest published roll in the current package family, not an unpublished tag or the merge's first parent. Pending runtime, mixed, unknown, renamed/deleted artifact input, and empty diffs retain the normal release decision. A missing published baseline cannot suppress publication. Git, metadata, and parse errors abort preparation.

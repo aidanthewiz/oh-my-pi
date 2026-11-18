@@ -35,7 +35,7 @@ jobs:
       (inputs.canary-id != '' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/coreforge'))
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-    continue-on-error: true
+    continue-on-error: ${{ inputs.canary-id == '' }}
     concurrency:
       group: cf-durable-cache-publish
       cancel-in-progress: false
