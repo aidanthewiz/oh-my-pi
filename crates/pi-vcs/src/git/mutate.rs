@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
 	GitRepo,
-	cli::{RunOptions, run_checked},
+	cli::{RunOptions, run, run_checked},
 	filter::WorktreeFilter,
 	normalize_path,
 	open::{
@@ -803,46 +803,87 @@ impl GitRepo {
 			index_path: options.index_path.clone(),
 			..RunOptions::default()
 		};
+		let state = read_cli_commit_state(self, &process).await?;
+		let operation_in_progress =
+			state.merge_head.is_some() || state.cherry_pick.is_some() || state.revert.is_some();
+		if operation_in_progress && (options.amend || !options.files.is_empty()) {
+			return Err(Error::backend(
+				"git commit",
+				"cannot amend or partially commit during a merge, cherry-pick, or revert",
+			));
+		}
+		if options.amend && old_head.is_none() {
+			return Err(Error::backend("git commit", "cannot amend an unborn HEAD"));
+		}
+		let base = if let Some(head) = &old_head {
+			run_checked(
+				self.root(),
+				&[
+					"-c".into(),
+					"safe.directory=*".into(),
+					"rev-parse".into(),
+					format!("{head}^{{tree}}"),
+				],
+				&process,
+			)
+			.await?
+			.stdout
+			.trim()
+			.to_owned()
+		} else {
+			process.stdin = Some(Vec::new());
+			let output = run_checked(
+				self.root(),
+				&[
+					"-c".into(),
+					"safe.directory=*".into(),
+					"hash-object".into(),
+					"-w".into(),
+					"-t".into(),
+					"tree".into(),
+					"--stdin".into(),
+				],
+				&process,
+			)
+			.await?;
+			process.stdin = None;
+			output.stdout.trim().to_owned()
+		};
+		let object_hash = gix::hash::ObjectId::from_hex(base.as_bytes())
+			.map_err(|err| Error::backend("git commit read base tree", err))?
+			.kind();
 		let mut private_index = None;
-		if let Some(index_path) = &options.index_path {
-			if !index_path.is_file() {
-				return Err(Error::backend(
-					"git commit",
-					format!("index file not found: {}", index_path.display()),
-				));
-			}
-			if !options.files.is_empty() {
-				let file = gix::tempfile::new(
-					&self.info().git_dir,
-					gix::tempfile::ContainingDirectory::Exists,
-					gix::tempfile::AutoRemove::Tempfile,
-				)?
-				.take()
-				.ok_or_else(|| Error::backend("git commit", "private index file was removed"))?;
-				let path = file.into_temp_path();
+		let mut path_index = None;
+		if let Some(index_path) = &options.index_path
+			&& !index_path.is_file()
+		{
+			return Err(Error::backend(
+				"git commit",
+				format!("index file not found: {}", index_path.display()),
+			));
+		}
+		if !options.files.is_empty() {
+			let file = gix::tempfile::new(
+				&self.info().git_dir,
+				gix::tempfile::ContainingDirectory::Exists,
+				gix::tempfile::AutoRemove::Tempfile,
+			)?
+			.take()
+			.ok_or_else(|| Error::backend("git commit", "private index file was removed"))?;
+			let path = file.into_temp_path();
+			process.index_path = Some(path.to_path_buf());
+			if let Some(index_path) = &options.index_path {
+				reject_unmerged_index(&read_cli_commit_index(index_path, object_hash)?, "git commit")?;
 				fs::copy(index_path, &path)?;
-				process.index_path = Some(path.to_path_buf());
-				private_index = Some(path);
-				let base = if let Some(head) = &old_head {
-					head.clone()
-				} else {
-					process.stdin = Some(Vec::new());
-					let output = run_checked(
-						self.root(),
-						&[
-							"hash-object".into(),
-							"-w".into(),
-							"-t".into(),
-							"tree".into(),
-							"--stdin".into(),
-						],
-						&process,
-					)
-					.await?;
-					process.stdin = None;
-					output.stdout.trim().to_owned()
-				};
-				let mut args = vec!["reset".into(), "-q".into(), base, "--".into(), ".".into()];
+				let mut args = vec![
+					"-c".into(),
+					"safe.directory=*".into(),
+					"reset".into(),
+					"-q".into(),
+					base.clone(),
+					"--".into(),
+					".".into(),
+				];
 				args.extend(
 					options
 						.files
@@ -850,43 +891,365 @@ impl GitRepo {
 						.map(|path| format!(":(top,exclude,literal){}", normalize_stage_path(path))),
 				);
 				run_checked(self.root(), &args, &process).await?;
-			}
-		}
-		let mut args = vec![
-			"-c".into(),
-			"safe.directory=*".into(),
-			"commit".into(),
-			"--file=-".into(),
-			"--cleanup=whitespace".into(),
-		];
-		if options.allow_empty {
-			args.push("--allow-empty".into());
-		}
-		if options.amend {
-			args.push("--amend".into());
-		}
-		if options.no_verify {
-			args.push("--no-verify".into());
-		}
-		if let Some(author) = &options.author {
-			args.push(format!("--author={} <{}>", author.name, author.email));
-			if let Some(date) = &author.date {
-				args.push(format!("--date={date}"));
-			}
-		}
-		if !options.files.is_empty() && private_index.is_none() {
-			args.extend(["--only".into(), "--".into()]);
-			args.extend(
-				options
+			} else {
+				run_checked(
+					self.root(),
+					&["-c".into(), "safe.directory=*".into(), "read-tree".into(), base.clone()],
+					&process,
+				)
+				.await?;
+				let mut partial = read_cli_commit_index(&path, object_hash)?;
+				let shared_path = self.info().git_dir.join("index");
+				let original = read_cli_commit_index(
+					if shared_path.is_file() {
+						&shared_path
+					} else {
+						&path
+					},
+					object_hash,
+				)?;
+				reject_unmerged_index(&original, "git commit")?;
+				mark_skipped_like(&mut partial, &original);
+				let requested: Vec<_> = options
 					.files
 					.iter()
-					.map(|path| literal_pathspec(&normalize_stage_path(path))),
-			);
+					.map(|path| normalize_stage_path(path))
+					.collect();
+				let mut selected = BTreeSet::new();
+				for source in [&partial, &original] {
+					for entry in source.entries() {
+						let path = entry.path(source).to_str_lossy();
+						if requested
+							.iter()
+							.any(|wanted| stage_path_matches(&path, wanted))
+							&& !selected.contains(path.as_ref())
+						{
+							let skipped = original
+								.entry_by_path(entry.path(source))
+								.unwrap_or(entry)
+								.flags
+								.contains(gix::index::entry::Flags::SKIP_WORKTREE);
+							if skipped
+								&& fs::symlink_metadata(self.root().join(path.as_ref()))
+									.is_err_and(|err| err.kind() == std::io::ErrorKind::NotFound)
+							{
+								continue;
+							}
+							selected.insert(path.into_owned());
+						}
+					}
+				}
+				if selected.is_empty() {
+					return Err(Error::backend(
+						"git commit",
+						"pathspec did not match any tracked files",
+					));
+				}
+				// Keep staged additions tracked so Git also handles their worktree
+				// deletion.
+				let additions: Vec<_> = original
+					.entries()
+					.iter()
+					.filter(|entry| {
+						let path = entry.path(&original);
+						selected.contains(path.to_str_lossy().as_ref())
+							&& partial.entry_by_path(path).is_none()
+					})
+					.collect();
+				for entry in additions {
+					partial.dangerously_push_entry(
+						entry.stat,
+						entry.id,
+						gix::index::entry::Flags::empty(),
+						entry.mode,
+						entry.path(&original),
+					);
+				}
+				partial.sort_entries();
+				for (entry, path) in partial.entries_mut_with_paths() {
+					if selected.contains(path.to_str_lossy().as_ref()) {
+						entry.flags.remove(gix::index::entry::Flags::SKIP_WORKTREE);
+					}
+				}
+				partial
+					.write(INDEX_WRITE)
+					.map_err(|err| Error::backend("git commit", err))?;
+				let selected: Vec<_> = selected.into_iter().collect();
+				let mut args = vec![
+					"-c".into(),
+					"safe.directory=*".into(),
+					"add".into(),
+					"-A".into(),
+					"-f".into(),
+					"--".into(),
+				];
+				args.extend(selected.iter().map(|path| literal_pathspec(path)));
+				run_checked(self.root(), &args, &process).await?;
+				path_index = Some((original, selected));
+			}
+			private_index = Some(path);
 		}
-		process.stdin = Some(message.as_bytes().to_vec());
-		let result = run_checked(self.root(), &args, &process).await;
-		// Git owns hook execution, signing, index locking and the reference CAS.
-		// Preserve the public error when a hook moved HEAD before publication.
+		if !options.no_verify {
+			run_commit_hook(self, "pre-commit", &[], &process).await?;
+		}
+		let tree = run_checked(
+			self.root(),
+			&["-c".into(), "safe.directory=*".into(), "write-tree".into()],
+			&process,
+		)
+		.await?
+		.stdout
+		.trim()
+		.to_owned();
+		let committed_index = if path_index.is_some() {
+			Some(read_cli_commit_index(
+				private_index
+					.as_deref()
+					.expect("path commits own a private index"),
+				object_hash,
+			)?)
+		} else {
+			None
+		};
+		let mut parents = Vec::new();
+		let inherited_author = if options.amend {
+			let head = old_head.as_ref().expect("amend requires a born HEAD");
+			parents.extend(
+				run_checked(
+					self.root(),
+					&[
+						"-c".into(),
+						"safe.directory=*".into(),
+						"show".into(),
+						"-s".into(),
+						"--no-show-signature".into(),
+						"--format=%P".into(),
+						head.clone(),
+					],
+					&process,
+				)
+				.await?
+				.stdout
+				.split_whitespace()
+				.map(str::to_owned),
+			);
+			Some(head)
+		} else {
+			parents.extend(old_head.iter().cloned());
+			if let Some(merge_head) = &state.merge_head {
+				if old_head.is_none() {
+					return Err(Error::backend("git commit", "cannot merge into an unborn HEAD"));
+				}
+				for line in merge_head
+					.split(|byte| *byte == b'\n')
+					.filter(|line| !line.is_empty())
+				{
+					let parent = gix::hash::ObjectId::from_hex(line.trim_ascii())
+						.map_err(|err| Error::backend("git commit read merge parent", err))?;
+					parents.push(parent.to_hex().to_string());
+				}
+				if parents.len() == 1 {
+					return Err(Error::backend("git commit", "MERGE_HEAD has no merge parents"));
+				}
+				None
+			} else {
+				state.cherry_pick.as_ref()
+			}
+		};
+		if !options.allow_empty && state.merge_head.is_none() {
+			let comparison_tree = if let Some(parent) = parents.first() {
+				run_checked(
+					self.root(),
+					&[
+						"-c".into(),
+						"safe.directory=*".into(),
+						"rev-parse".into(),
+						format!("{parent}^{{tree}}"),
+					],
+					&process,
+				)
+				.await?
+				.stdout
+				.trim()
+				.to_owned()
+			} else {
+				gix::hash::ObjectId::empty_tree(object_hash)
+					.to_hex()
+					.to_string()
+			};
+			if tree == comparison_tree {
+				return Err(Error::backend("git commit", "nothing to commit, working tree clean"));
+			}
+		}
+		let mut commit_env = process
+			.env
+			.clone()
+			.unwrap_or_else(|| std::env::vars().collect());
+		if let Some(commit) = inherited_author {
+			let output = run_checked(
+				self.root(),
+				&[
+					"-c".into(),
+					"safe.directory=*".into(),
+					"show".into(),
+					"-s".into(),
+					"--no-show-signature".into(),
+					"--format=%an%x00%ae%x00%aI".into(),
+					commit.clone(),
+				],
+				&process,
+			)
+			.await?;
+			let mut author = output.stdout.trim_end().split('\0');
+			for key in ["GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_AUTHOR_DATE"] {
+				let value = author
+					.next()
+					.ok_or_else(|| Error::backend("git commit", "invalid inherited author"))?;
+				commit_env.insert(key.into(), value.into());
+			}
+		}
+		if let Some(author) = &options.author {
+			commit_env.insert("GIT_AUTHOR_NAME".into(), author.name.clone());
+			commit_env.insert("GIT_AUTHOR_EMAIL".into(), author.email.clone());
+			commit_env.insert("GIT_AUTHOR_DATE".into(), format!("@{}", commit_author_time(author)?));
+		}
+		let mut message_file = gix::tempfile::new(
+			&self.info().git_dir,
+			gix::tempfile::ContainingDirectory::Exists,
+			gix::tempfile::AutoRemove::Tempfile,
+		)?
+		.take()
+		.ok_or_else(|| Error::backend("git commit", "commit message file was removed"))?;
+		message_file.write_all(message.as_bytes())?;
+		let message_path = message_file.into_temp_path();
+		let _ = fs::write(self.info().git_dir.join("COMMIT_EDITMSG"), message);
+		run_commit_hook(
+			self,
+			"prepare-commit-msg",
+			&[message_path.as_os_str(), OsStr::new("message")],
+			&process,
+		)
+		.await?;
+		if !options.no_verify {
+			run_commit_hook(self, "commit-msg", &[message_path.as_os_str()], &process).await?;
+		}
+		process.stdin = Some(fs::read(&message_path)?);
+		let message = run_checked(self.root(), &["stripspace".into()], &process)
+			.await?
+			.stdout;
+		process.stdin = None;
+		if message.is_empty() {
+			return Err(Error::backend("git commit", "empty commit message"));
+		}
+		let sign_args =
+			["-c", "safe.directory=*", "config", "--type=bool", "--get", "commit.gpgSign"]
+				.map(str::to_owned);
+		let signing = run(self.root(), &sign_args, &process).await?;
+		let sign = if signing.exit_code == 1 {
+			false
+		} else {
+			signing.into_checked(&sign_args)?.stdout.trim() == "true"
+		};
+		let mut args = vec!["-c".into(), "safe.directory=*".into(), "commit-tree".into(), tree];
+		if sign {
+			args.push("-S".into());
+		}
+		for parent in parents {
+			args.extend(["-p".into(), parent]);
+		}
+		let id = run_checked(self.root(), &args, &RunOptions {
+			stdin: Some(message.as_bytes().to_vec()),
+			cancel: process.cancel.clone(),
+			env: Some(commit_env),
+			..RunOptions::default()
+		})
+		.await?
+		.stdout
+		.trim()
+		.to_owned();
+		if read_cli_commit_state(self, &process).await? != state {
+			return Err(Error::backend(
+				"git commit",
+				"operation state changed before commit publication",
+			));
+		}
+		let index_update = if let Some((original, mut files)) = path_index {
+			let shared_path = self.info().git_dir.join("index");
+			let mut lock = gix::lock::File::acquire_to_update_resource(
+				&shared_path,
+				gix::lock::acquire::Fail::Immediately,
+				None,
+			)
+			.map_err(|err| Error::backend("git commit lock index", err))?;
+			let mut shared = if shared_path.is_file() {
+				read_cli_commit_index(&shared_path, object_hash)?
+			} else {
+				original.clone()
+			};
+			files.retain(|path| {
+				let path = path.as_bytes().as_bstr();
+				let before = original
+					.entry_by_path(path)
+					.map(|entry| (entry.id, entry.mode, entry.flags));
+				let now = shared
+					.entry_by_path(path)
+					.map(|entry| (entry.id, entry.mode, entry.flags));
+				before == now
+			});
+			if files.is_empty() {
+				None
+			} else {
+				copy_index_paths(
+					&mut shared,
+					committed_index
+						.as_ref()
+						.expect("path commits capture their committed index"),
+					&files,
+				);
+				let racy_from = shared.timestamp();
+				for entry in shared.entries_mut() {
+					if entry.stat.is_racy(racy_from, Default::default()) {
+						entry.stat = gix::index::entry::Stat::default();
+					}
+				}
+				let mut out = BufWriter::new(&mut lock);
+				shared
+					.write_to(&mut out, INDEX_WRITE)
+					.map_err(|err| Error::backend("git commit write index", err))?;
+				out.flush()?;
+				drop(out);
+				Some(lock)
+			}
+		} else {
+			None
+		};
+		let old_value = old_head.clone().unwrap_or_else(|| "0".repeat(id.len()));
+		let action = if options.amend {
+			"commit (amend)"
+		} else if old_head.is_none() {
+			"commit (initial)"
+		} else if state.merge_head.is_some() {
+			"commit (merge)"
+		} else {
+			"commit"
+		};
+		// Only this transaction may publish: its old value is the caller's
+		// captured HEAD.
+		let result = run_checked(
+			self.root(),
+			&[
+				"-c".into(),
+				"safe.directory=*".into(),
+				"update-ref".into(),
+				"-m".into(),
+				format!("{action}: {}", message.lines().next().unwrap_or_default()),
+				"HEAD".into(),
+				id.clone(),
+				old_value,
+			],
+			&process,
+		)
+		.await;
 		if result.is_err() {
 			let actual = self.head_sha()?;
 			if actual != old_head {
@@ -897,9 +1260,24 @@ impl GitRepo {
 			}
 		}
 		result?;
-		self
-			.head_sha()?
-			.ok_or_else(|| Error::backend("git commit", "HEAD is unborn after commit"))
+		if let Some(lock) = index_update {
+			lock
+				.commit()
+				.map_err(|err| Error::backend("git commit publish index", err))?;
+		}
+		let cancel = process.cancel.take();
+		let cleanup = finish_cli_commit_state(self, &state, &id, &process).await;
+		process.cancel = cancel;
+		let autostash_error = cleanup?;
+		let _ = run_commit_hook(self, "post-commit", &[], &process).await;
+		if options.amend {
+			process.stdin = Some(format!("{} {id}\n", old_head.as_deref().unwrap()).into_bytes());
+			let _ = run_commit_hook(self, "post-rewrite", &[OsStr::new("amend")], &process).await;
+		}
+		if let Some(error) = autostash_error {
+			return Err(error);
+		}
+		Ok(id)
 	}
 
 	/// Write a commit object for `tree` on top of `parents` without touching
@@ -1629,6 +2007,162 @@ impl GitRepo {
 	}
 }
 
+fn read_cli_commit_index(path: &Path, object_hash: gix::hash::Kind) -> Result<gix::index::File> {
+	gix::index::File::at(path, object_hash, false, gix::index::decode::Options::default())
+		.map_err(|err| Error::backend("git commit read index", err))
+}
+
+#[derive(PartialEq, Eq)]
+struct CliCommitState {
+	merge_head:     Option<Vec<u8>>,
+	cherry_pick:    Option<String>,
+	revert:         Option<String>,
+	autostash:      Option<String>,
+	sequencer_todo: Option<Vec<u8>>,
+}
+
+async fn read_cli_commit_state(
+	repository: &GitRepo,
+	process: &RunOptions,
+) -> Result<CliCommitState> {
+	async fn read_ref(
+		repository: &GitRepo,
+		name: &str,
+		process: &RunOptions,
+	) -> Result<Option<String>> {
+		let args = [
+			"-c".into(),
+			"safe.directory=*".into(),
+			"rev-parse".into(),
+			"--verify".into(),
+			"--quiet".into(),
+			name.into(),
+		];
+		let output = run(repository.root(), &args, process).await?;
+		if output.exit_code == 1 {
+			return Ok(None);
+		}
+		let output = output.into_checked(&args)?;
+		let id = gix::hash::ObjectId::from_hex(output.stdout.trim().as_bytes())
+			.map_err(|err| Error::backend("git commit read operation head", err))?;
+		Ok(Some(id.to_hex().to_string()))
+	}
+	let git_dir = &repository.info().git_dir;
+	let merge_head = read_optional_file(&git_dir.join("MERGE_HEAD"))?;
+	let cherry_pick = read_ref(repository, "CHERRY_PICK_HEAD", process).await?;
+	let revert = read_ref(repository, "REVERT_HEAD", process).await?;
+	let autostash = read_ref(repository, "MERGE_AUTOSTASH", process).await?;
+	let sequencer_todo = if cherry_pick.is_some() || revert.is_some() {
+		read_optional_file(&git_dir.join("sequencer/todo"))?
+	} else {
+		None
+	};
+	Ok(CliCommitState { merge_head, cherry_pick, revert, autostash, sequencer_todo })
+}
+
+async fn finish_cli_commit_state(
+	repository: &GitRepo,
+	state: &CliCommitState,
+	id: &str,
+	process: &RunOptions,
+) -> Result<Option<Error>> {
+	if state.merge_head.is_none() && state.cherry_pick.is_none() && state.revert.is_none() {
+		return Ok(None);
+	}
+	if read_cli_commit_state(repository, process).await? != *state {
+		return Err(Error::backend("git commit", "operation state changed before commit cleanup"));
+	}
+	let mut autostash_error = None;
+	if let Some(stash) = &state.autostash {
+		let result = run_checked(
+			repository.root(),
+			&["-c".into(), "safe.directory=*".into(), "stash".into(), "apply".into(), stash.clone()],
+			process,
+		)
+		.await;
+		if let Err(error) = result {
+			run_checked(
+				repository.root(),
+				&[
+					"-c".into(),
+					"safe.directory=*".into(),
+					"stash".into(),
+					"store".into(),
+					"-m".into(),
+					"autostash".into(),
+					stash.clone(),
+				],
+				process,
+			)
+			.await?;
+			autostash_error = Some(Error::backend(
+				"git commit restore autostash",
+				format!(
+					"commit {id} created, but autostash {stash} could not be restored; recovery is \
+					 retained in the stash: {error}"
+				),
+			));
+		}
+		run_checked(
+			repository.root(),
+			&[
+				"-c".into(),
+				"safe.directory=*".into(),
+				"update-ref".into(),
+				"--no-deref".into(),
+				"-d".into(),
+				"MERGE_AUTOSTASH".into(),
+				stash.clone(),
+			],
+			process,
+		)
+		.await?;
+		let current = read_cli_commit_state(repository, process).await?;
+		if current.merge_head != state.merge_head
+			|| current.cherry_pick != state.cherry_pick
+			|| current.revert != state.revert
+			|| current.sequencer_todo != state.sequencer_todo
+			|| current.autostash.is_some()
+		{
+			return Err(Error::backend("git commit", "operation state changed before commit cleanup"));
+		}
+	}
+	for (name, value) in [("CHERRY_PICK_HEAD", &state.cherry_pick), ("REVERT_HEAD", &state.revert)] {
+		if let Some(value) = value {
+			run_checked(
+				repository.root(),
+				&[
+					"-c".into(),
+					"safe.directory=*".into(),
+					"update-ref".into(),
+					"--no-deref".into(),
+					"-d".into(),
+					name.into(),
+					value.clone(),
+				],
+				process,
+			)
+			.await?;
+		}
+	}
+	if let Some(todo) = &state.sequencer_todo
+		&& todo
+			.iter()
+			.position(|byte| *byte == b'\n')
+			.is_none_or(|newline| newline + 1 == todo.len())
+	{
+		fs::remove_dir_all(repository.info().git_dir.join("sequencer"))
+			.map_err(|err| Error::backend("git commit clear sequencer", err))?;
+	}
+	run_checked(
+		repository.root(),
+		&["-c".into(), "safe.directory=*".into(), "merge".into(), "--quit".into()],
+		process,
+	)
+	.await?;
+	Ok(autostash_error)
+}
+
 /// Commit hooks use the same bounded, cancellation-drained child runner as
 /// signing and authenticated transfers.
 async fn run_commit_hook(
@@ -1637,20 +2171,53 @@ async fn run_commit_hook(
 	args: &[&OsStr],
 	options: &RunOptions,
 ) -> Result<bool> {
-	if repository.hook_path(name)?.is_none() && !hook_configured(repository, name)? {
+	if !repository.is_reftable()
+		&& repository.hook_path(name)?.is_none()
+		&& !hook_configured(repository, name)?
+	{
 		return Ok(false);
 	}
+	// `git hook run` delivers hook stdin only through `--to-stdin`.
+	let input_file = options
+		.stdin
+		.as_ref()
+		.map(|input| -> Result<_> {
+			let mut file = gix::tempfile::new(
+				&repository.info().git_dir,
+				gix::tempfile::ContainingDirectory::Exists,
+				gix::tempfile::AutoRemove::Tempfile,
+			)?
+			.take()
+			.ok_or_else(|| Error::backend("git hook", "hook input file was removed"))?;
+			file.write_all(input)?;
+			Ok(file.into_temp_path())
+		})
+		.transpose()?;
 	let mut argv = vec![
 		"-c".to_owned(),
 		"safe.directory=*".to_owned(),
 		"hook".to_owned(),
 		"run".to_owned(),
 		"--ignore-missing".to_owned(),
-		name.to_owned(),
-		"--".to_owned(),
 	];
+	if let Some(path) = &input_file {
+		argv.push(format!("--to-stdin={}", path.display()));
+	}
+	argv.extend([name.to_owned(), "--".to_owned()]);
 	argv.extend(args.iter().map(|arg| arg.to_string_lossy().into_owned()));
-	run_checked(repository.root(), &argv, options).await?;
+	if input_file.is_some() {
+		run_checked(repository.root(), &argv, &RunOptions {
+			read_only:  options.read_only,
+			timeout:    options.timeout,
+			stdin:      None,
+			cancel:     options.cancel.clone(),
+			env:        options.env.clone(),
+			index_path: options.index_path.clone(),
+		})
+		.await?;
+	} else {
+		run_checked(repository.root(), &argv, options).await?;
+	}
 	Ok(true)
 }
 
@@ -1866,15 +2433,18 @@ pub fn detach_git_dir(
 
 /// Author signature for an explicit [`CommitAuthor`]; a missing date means now.
 fn signature_for(author: &CommitAuthor) -> Result<gix::actor::Signature> {
-	let time = match &author.date {
+	Ok(gix::actor::Signature {
+		name:  author.name.clone().into(),
+		email: author.email.clone().into(),
+		time:  commit_author_time(author)?,
+	})
+}
+
+fn commit_author_time(author: &CommitAuthor) -> Result<gix::date::Time> {
+	Ok(match &author.date {
 		Some(date) => gix::date::parse(date.strip_prefix('@').unwrap_or(date), None)
 			.map_err(|err| Error::backend("git commit", err))?,
 		None => gix::date::Time::now_local_or_utc(),
-	};
-	Ok(gix::actor::Signature {
-		name: author.name.clone().into(),
-		email: author.email.clone().into(),
-		time,
 	})
 }
 
@@ -3242,6 +3812,235 @@ mod tests {
 		assert_eq!(repo.head_sha().unwrap(), before_signing);
 	}
 
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn reftable_commit_keeps_hook_messages_private() {
+		let Some((temp, repo)) = fixture_with_ref_format(true) else {
+			return;
+		};
+		let hooks = temp.path().join(".git/hooks");
+		write_hook(
+			&hooks.join("prepare-commit-msg"),
+			"printf '%s' \"$1\" > .git/owned-message-path\nprintf 'another writer\\n' > \
+			 .git/COMMIT_EDITMSG\nprintf '\\nprepared body  \\n' >> \"$1\"",
+			true,
+		);
+		write_hook(&hooks.join("commit-msg"), "printf '\\nvalidated body\\n' >> \"$1\"", true);
+		let id = repo
+			.commit_create(
+				"owned subject  \n",
+				&CommitOptions { allow_empty: true, ..Default::default() },
+				None,
+			)
+			.await
+			.unwrap();
+		assert_eq!(
+			git(temp.path(), &["show", "-s", "--format=%B", &id]),
+			"owned subject\n\nprepared body\n\nvalidated body"
+		);
+		let message_path = fs::read_to_string(temp.path().join(".git/owned-message-path")).unwrap();
+		assert!(!Path::new(&message_path).exists());
+	}
+
+	#[cfg(unix)]
+	#[derive(Clone, Copy)]
+	enum CommitRaceHead {
+		Born,
+		Unborn,
+		Amend,
+	}
+
+	#[cfg(unix)]
+	async fn assert_reftable_commit_cas(head: CommitRaceHead, explicit: bool, alternate: bool) {
+		let unborn = matches!(head, CommitRaceHead::Unborn);
+		let amend = matches!(head, CommitRaceHead::Amend);
+		let Some((temp, repo)) = fixture_with_ref_format(true) else {
+			return;
+		};
+		let alt = alternate_index(&temp);
+		let original_alt = fs::read(&alt).unwrap();
+		if unborn {
+			git(temp.path(), &["checkout", "-q", "--orphan", "unborn"]);
+		}
+		let captured = repo.head_sha().unwrap();
+		fs::write(temp.path().join("a"), "untouched worktree\n").unwrap();
+		fs::write(temp.path().join("b"), "concurrent staged content\n").unwrap();
+		git(temp.path(), &["add", "b"]);
+		let real_git = Command::new("sh")
+			.args(["-c", "command -v git"])
+			.output()
+			.unwrap();
+		assert!(real_git.status.success());
+		let real_git = String::from_utf8(real_git.stdout)
+			.unwrap()
+			.trim()
+			.to_owned();
+		let wrapper_dir = temp.path().join(".git/race-bin");
+		fs::create_dir(&wrapper_dir).unwrap();
+		write_hook(
+			&wrapper_dir.join("git"),
+			"set -eu\nfor arg in \"$@\"; do\ncase \"$arg\" in\ncommit|commit-tree)\nif test ! -f \
+			 .git/race-head; then\n(\nunset GIT_INDEX_FILE\n\"$REAL_GIT\" -c \
+			 core.hooksPath=/dev/null -c commit.gpgSign=false commit -qm 'concurrent \
+			 winner'\n\"$REAL_GIT\" rev-parse HEAD > .git/race-head\n\"$REAL_GIT\" rev-parse \
+			 'HEAD^{tree}' > .git/race-tree\ncp .git/index \
+			 .git/race-index\n)\nfi\nbreak\n;;\nesac\ndone\nexec \"$REAL_GIT\" \"$@\"",
+			true,
+		);
+		let mut env: BTreeMap<_, _> = std::env::vars().collect();
+		let path = std::env::join_paths(
+			std::iter::once(wrapper_dir)
+				.chain(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())),
+		)
+		.unwrap();
+		env.insert("PATH".into(), path.to_string_lossy().into_owned());
+		env.insert("REAL_GIT".into(), real_git);
+		let error = repo
+			.commit_create(
+				"stale must not publish",
+				&CommitOptions {
+					files: vec!["a".into()],
+					index_path: alternate.then_some(alt.clone()),
+					expected_head: explicit.then_some(captured.clone()),
+					env: Some(env),
+					amend,
+					..Default::default()
+				},
+				None,
+			)
+			.await
+			.unwrap_err();
+		let winner = fs::read_to_string(temp.path().join(".git/race-head")).unwrap();
+		let winner = winner.trim();
+		assert!(matches!(
+			error,
+			Error::HeadMoved { expected, actual }
+				if expected == captured.unwrap_or_else(|| "unborn HEAD".into())
+					&& actual.as_deref() == Some(winner)
+		));
+		assert_eq!(git(temp.path(), &["rev-parse", "HEAD"]), winner);
+		assert_eq!(
+			git(temp.path(), &["rev-parse", "HEAD^{tree}"]),
+			fs::read_to_string(temp.path().join(".git/race-tree"))
+				.unwrap()
+				.trim()
+		);
+		assert_eq!(git(temp.path(), &["show", "HEAD:a"]), "one");
+		assert_eq!(git(temp.path(), &["show", "HEAD:b"]), "concurrent staged content");
+		assert_eq!(git(temp.path(), &["show", ":b"]), "concurrent staged content");
+		assert_eq!(
+			fs::read(temp.path().join(".git/index")).unwrap(),
+			fs::read(temp.path().join(".git/race-index")).unwrap()
+		);
+		assert_eq!(fs::read(alt).unwrap(), original_alt);
+		assert_eq!(fs::read(temp.path().join("a")).unwrap(), b"untouched worktree\n");
+		assert_eq!(git(temp.path(), &["log", "-1", "--format=%s"]), "concurrent winner");
+		assert_eq!(
+			git(temp.path(), &["rev-list", "--count", "HEAD"]),
+			if unborn { "1" } else { "2" }
+		);
+		assert!(
+			!git(temp.path(), &["reflog", "--all", "--format=%gs"]).contains("stale must not publish")
+		);
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn reftable_commit_cas_rejects_concurrent_born_head() {
+		for (explicit, alternate) in [(false, false), (true, true)] {
+			assert_reftable_commit_cas(CommitRaceHead::Born, explicit, alternate).await;
+		}
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn reftable_commit_cas_rejects_concurrent_unborn_head() {
+		for alternate in [false, true] {
+			assert_reftable_commit_cas(CommitRaceHead::Unborn, true, alternate).await;
+		}
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn reftable_commit_cas_rejects_concurrent_amend() {
+		assert_reftable_commit_cas(CommitRaceHead::Amend, true, true).await;
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn reftable_amend_preserves_root_author_and_runs_post_rewrite() {
+		let Some((temp, repo)) = fixture_with_ref_format(true) else {
+			return;
+		};
+		git(temp.path(), &[
+			"commit",
+			"--amend",
+			"--no-edit",
+			"--date=@86400 +0130",
+			"--author=Root Author <root@example.com>",
+		]);
+		let old_head = repo.head_sha().unwrap().unwrap();
+		write_hook(
+			&temp.path().join(".git/hooks/post-rewrite"),
+			"printf '%s\\n' \"$1\" > .git/rewrite-kind\ncat > .git/rewrite-ids",
+			true,
+		);
+		let id = repo
+			.commit_create("amended root", &CommitOptions { amend: true, ..Default::default() }, None)
+			.await
+			.unwrap();
+		assert_eq!(git(temp.path(), &["show", "-s", "--format=%P", &id]), "");
+		assert_eq!(
+			git(temp.path(), &["show", "-s", "--format=%an <%ae> %aI", &id]),
+			"Root Author <root@example.com> 1970-01-02T01:30:00+01:30"
+		);
+		assert_eq!(fs::read_to_string(temp.path().join(".git/rewrite-kind")).unwrap(), "amend\n");
+		assert_eq!(
+			fs::read_to_string(temp.path().join(".git/rewrite-ids")).unwrap(),
+			format!("{old_head} {id}\n")
+		);
+	}
+
+	#[tokio::test]
+	async fn reftable_amend_author_override_without_date_uses_current_time() {
+		let Some((temp, repo)) = fixture_with_ref_format(true) else {
+			return;
+		};
+		git(temp.path(), &["commit", "--amend", "--no-edit", "--date=@86400 +0130"]);
+		let before = std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.unwrap()
+			.as_secs();
+		let id = repo
+			.commit_create(
+				"override author",
+				&CommitOptions {
+					amend: true,
+					author: Some(CommitAuthor {
+						name:  "New Author".into(),
+						email: "new@example.com".into(),
+						date:  None,
+					}),
+					..Default::default()
+				},
+				None,
+			)
+			.await
+			.unwrap();
+		let after = std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.unwrap()
+			.as_secs();
+		assert_eq!(
+			git(temp.path(), &["show", "-s", "--format=%an <%ae>", &id]),
+			"New Author <new@example.com>"
+		);
+		let timestamp: u64 = git(temp.path(), &["show", "-s", "--format=%at", &id])
+			.parse()
+			.unwrap();
+		assert!((before..=after).contains(&timestamp));
+	}
+
 	/// Build `<git_dir>/alt-index` from HEAD plus a changed `a`, leaving the
 	/// repository's own index untouched.
 	fn alternate_index(temp: &TempDir) -> PathBuf {
@@ -3270,7 +4069,18 @@ mod tests {
 
 	#[tokio::test]
 	async fn commit_finishes_resolved_cherry_picks_with_the_original_author() {
-		let (temp, repo) = fixture();
+		assert_resolved_cherry_pick(false).await;
+	}
+
+	#[tokio::test]
+	async fn reftable_commit_finishes_resolved_cherry_picks_with_the_original_author() {
+		assert_resolved_cherry_pick(true).await;
+	}
+
+	async fn assert_resolved_cherry_pick(reftable: bool) {
+		let Some((temp, repo)) = fixture_with_ref_format(reftable) else {
+			return;
+		};
 		git(temp.path(), &["switch", "-c", "side"]);
 		fs::write(temp.path().join("a"), "picked\n").unwrap();
 		git(temp.path(), &["add", "a"]);
@@ -3297,7 +4107,7 @@ mod tests {
 		assert_eq!(git(temp.path(), &["rev-parse", "CHERRY_PICK_HEAD"]), picked);
 		assert_eq!(git(temp.path(), &["diff", "--name-only", "--diff-filter=U"]), "a");
 		fs::write(temp.path().join("a"), "resolved\n").unwrap();
-		repo.stage_files(&["a".into()]).unwrap();
+		git(temp.path(), &["add", "a"]);
 
 		let id = repo
 			.commit_create("resolved cherry-pick\n", &CommitOptions::default(), None)
@@ -3311,6 +4121,7 @@ mod tests {
 			),
 			(author, false),
 		);
+		assert!(repo.resolve_ref("CHERRY_PICK_HEAD").unwrap().is_none());
 		assert_eq!(git(temp.path(), &["show", "-s", "--format=%P", &id]), parent);
 		assert_eq!(git(temp.path(), &["show", "HEAD:a"]), "resolved");
 		assert!(!temp.path().join(".git/MERGE_MSG").exists());
@@ -3319,7 +4130,18 @@ mod tests {
 
 	#[tokio::test]
 	async fn commit_finishes_resolved_reverts_with_the_current_author() {
-		let (temp, repo) = fixture();
+		assert_resolved_revert(false).await;
+	}
+
+	#[tokio::test]
+	async fn reftable_commit_finishes_resolved_reverts_with_the_current_author() {
+		assert_resolved_revert(true).await;
+	}
+
+	async fn assert_resolved_revert(reftable: bool) {
+		let Some((temp, repo)) = fixture_with_ref_format(reftable) else {
+			return;
+		};
 		fs::write(temp.path().join("a"), "picked\n").unwrap();
 		git(temp.path(), &["add", "a"]);
 		git(temp.path(), &["commit", "-qm", "picked", "--author=Picked Author <picked@example.com>"]);
@@ -3338,7 +4160,7 @@ mod tests {
 		assert_eq!(git(temp.path(), &["rev-parse", "REVERT_HEAD"]), picked);
 		assert_eq!(git(temp.path(), &["diff", "--name-only", "--diff-filter=U"]), "a");
 		fs::write(temp.path().join("a"), "resolved revert\n").unwrap();
-		repo.stage_files(&["a".into()]).unwrap();
+		git(temp.path(), &["add", "a"]);
 
 		let id = repo
 			.commit_create("resolved revert\n", &CommitOptions::default(), None)
@@ -3352,6 +4174,7 @@ mod tests {
 			),
 			(author, false),
 		);
+		assert!(repo.resolve_ref("REVERT_HEAD").unwrap().is_none());
 		assert_eq!(git(temp.path(), &["show", "-s", "--format=%P", &id]), parent);
 		assert_eq!(git(temp.path(), &["show", "HEAD:a"]), "resolved revert");
 		assert!(!temp.path().join(".git/MERGE_MSG").exists());
@@ -3360,8 +4183,19 @@ mod tests {
 
 	#[tokio::test]
 	async fn commit_preserves_pending_picks_and_finishes_the_last_sequenced_pick() {
+		assert_pending_picks(false).await;
+	}
+
+	#[tokio::test]
+	async fn reftable_commit_preserves_pending_picks_and_finishes_the_last_sequenced_pick() {
+		assert_pending_picks(true).await;
+	}
+
+	async fn assert_pending_picks(reftable: bool) {
 		for conflict_first in [false, true] {
-			let (temp, repo) = fixture();
+			let Some((temp, repo)) = fixture_with_ref_format(reftable) else {
+				return;
+			};
 			git(temp.path(), &["switch", "-c", "side"]);
 			let mut picks = Vec::new();
 			for file in if conflict_first {
@@ -3388,7 +4222,7 @@ mod tests {
 			assert_eq!(git(temp.path(), &["diff", "--name-only", "--diff-filter=U"]), "a");
 			assert!(temp.path().join(".git/sequencer/todo").exists());
 			fs::write(temp.path().join("a"), "resolved\n").unwrap();
-			repo.stage_files(&["a".into()]).unwrap();
+			git(temp.path(), &["add", "a"]);
 
 			repo
 				.commit_create("resolved sequence\n", &CommitOptions::default(), None)
@@ -3396,6 +4230,7 @@ mod tests {
 				.unwrap();
 
 			assert!(!temp.path().join(".git/CHERRY_PICK_HEAD").exists());
+			assert!(repo.resolve_ref("CHERRY_PICK_HEAD").unwrap().is_none());
 			assert_eq!(temp.path().join(".git/sequencer").exists(), conflict_first);
 			if conflict_first {
 				assert_eq!(git(temp.path(), &["show", "HEAD:b"]), "two");
@@ -3410,8 +4245,19 @@ mod tests {
 
 	#[tokio::test]
 	async fn commit_finishes_resolved_merges_including_unchanged_trees() {
+		assert_resolved_merges(false).await;
+	}
+
+	#[tokio::test]
+	async fn reftable_commit_finishes_resolved_merges_including_unchanged_trees() {
+		assert_resolved_merges(true).await;
+	}
+
+	async fn assert_resolved_merges(reftable: bool) {
 		for unchanged_tree in [false, true] {
-			let (temp, repo) = fixture();
+			let Some((temp, repo)) = fixture_with_ref_format(reftable) else {
+				return;
+			};
 			git(temp.path(), &["switch", "-c", "side"]);
 			fs::write(temp.path().join("side"), "side\n").unwrap();
 			git(temp.path(), &["add", "."]);
@@ -3447,8 +4293,19 @@ mod tests {
 
 	#[tokio::test]
 	async fn commit_restores_merge_autostash_and_preserves_conflict_recovery() {
+		assert_merge_autostash(false).await;
+	}
+
+	#[tokio::test]
+	async fn reftable_commit_restores_merge_autostash_and_preserves_conflict_recovery() {
+		assert_merge_autostash(true).await;
+	}
+
+	async fn assert_merge_autostash(reftable: bool) {
 		for conflict in [false, true] {
-			let (temp, repo) = fixture();
+			let Some((temp, repo)) = fixture_with_ref_format(reftable) else {
+				return;
+			};
 			git(temp.path(), &["switch", "-c", "side"]);
 			fs::write(temp.path().join("side"), "side\n").unwrap();
 			if conflict {
@@ -3495,8 +4352,19 @@ mod tests {
 
 	#[tokio::test]
 	async fn prepare_commit_msg_edits_and_refusals_apply_with_no_verify() {
+		assert_prepare_commit_msg(false).await;
+	}
+
+	#[tokio::test]
+	async fn reftable_prepare_commit_msg_edits_and_refusals_apply_with_no_verify() {
+		assert_prepare_commit_msg(true).await;
+	}
+
+	async fn assert_prepare_commit_msg(reftable: bool) {
 		for no_verify in [false, true] {
-			let (temp, repo) = fixture();
+			let Some((temp, repo)) = fixture_with_ref_format(reftable) else {
+				return;
+			};
 			let hooks = temp.path().join(".git/hooks");
 			write_hook(
 				&hooks.join("prepare-commit-msg"),
@@ -3732,7 +4600,20 @@ mod tests {
 	#[cfg(unix)]
 	#[tokio::test]
 	async fn path_only_commit_preserves_entries_staged_during_awaited_hooks() {
-		let (temp, repo) = fixture();
+		assert_staged_during_commit_hook(false).await;
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn reftable_path_only_commit_preserves_entries_staged_during_awaited_hooks() {
+		assert_staged_during_commit_hook(true).await;
+	}
+
+	#[cfg(unix)]
+	async fn assert_staged_during_commit_hook(reftable: bool) {
+		let Some((temp, repo)) = fixture_with_ref_format(reftable) else {
+			return;
+		};
 		fs::write(temp.path().join("a"), "selected before hook\n").unwrap();
 		fs::write(temp.path().join("b"), "staged before hook\n").unwrap();
 		git(temp.path(), &["add", "b"]);
@@ -3763,7 +4644,20 @@ mod tests {
 	#[cfg(unix)]
 	#[tokio::test]
 	async fn path_only_commit_hooks_edit_the_selected_private_index() {
-		let (temp, repo) = fixture();
+		assert_private_index_commit_hook(false).await;
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn reftable_path_only_commit_hooks_edit_the_selected_private_index() {
+		assert_private_index_commit_hook(true).await;
+	}
+
+	#[cfg(unix)]
+	async fn assert_private_index_commit_hook(reftable: bool) {
+		let Some((temp, repo)) = fixture_with_ref_format(reftable) else {
+			return;
+		};
 		fs::write(temp.path().join("a"), "selected\n").unwrap();
 		fs::write(temp.path().join("b"), "unrelated staged\n").unwrap();
 		git(temp.path(), &["add", "b"]);
@@ -3913,7 +4807,20 @@ mod tests {
 	#[cfg(unix)]
 	#[tokio::test]
 	async fn commit_runs_config_defined_hooks_like_git_commit() {
-		let (temp, repo) = fixture();
+		assert_config_defined_commit_hooks(false).await;
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn reftable_commit_runs_config_defined_hooks_like_git_commit() {
+		assert_config_defined_commit_hooks(true).await;
+	}
+
+	#[cfg(unix)]
+	async fn assert_config_defined_commit_hooks(reftable: bool) {
+		let Some((temp, repo)) = fixture_with_ref_format(reftable) else {
+			return;
+		};
 		let options = CommitOptions { allow_empty: true, ..Default::default() };
 		git(temp.path(), &["config", "hook.trailer.event", "commit-msg"]);
 		git(temp.path(), &["config", "hook.trailer.command", "printf '\\nHook: ran\\n' >> \"$1\""]);
@@ -3975,7 +4882,20 @@ mod tests {
 	#[cfg(unix)]
 	#[tokio::test]
 	async fn commit_respects_configured_signing_and_refuses_failed_signatures() {
-		let (temp, _) = fixture();
+		assert_configured_commit_signing(false).await;
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn reftable_commit_respects_configured_signing_and_refuses_failed_signatures() {
+		assert_configured_commit_signing(true).await;
+	}
+
+	#[cfg(unix)]
+	async fn assert_configured_commit_signing(reftable: bool) {
+		let Some((temp, _)) = fixture_with_ref_format(reftable) else {
+			return;
+		};
 		// A pre-1973 author date: git rejects a bare `<seconds> <offset>` under
 		// nine digits, so the amend below proves the raw date reaches the
 		// signed commit intact.
@@ -4003,7 +4923,7 @@ mod tests {
 		};
 
 		fs::write(temp.path().join("a"), "amended\n").unwrap();
-		repo.stage_files(&["a".into()]).unwrap();
+		git(temp.path(), &["add", "a"]);
 		let amended = repo
 			.commit_create("signed amend", &CommitOptions { amend: true, ..Default::default() }, None)
 			.await
@@ -4015,7 +4935,7 @@ mod tests {
 
 		let message = "subject ünïcode\n\nbody line\n";
 		fs::write(temp.path().join("b"), "signed\n").unwrap();
-		repo.stage_files(&["b".into()]).unwrap();
+		git(temp.path(), &["add", "b"]);
 		let signed = repo
 			.commit_create(
 				message,
@@ -4040,7 +4960,7 @@ mod tests {
 
 		git(temp.path(), &["config", "user.signingkey", "/no-such-signing-key"]);
 		fs::write(temp.path().join("a"), "must not commit\n").unwrap();
-		repo.stage_files(&["a".into()]).unwrap();
+		git(temp.path(), &["add", "a"]);
 		let staged = git(temp.path(), &["write-tree"]);
 		let error = repo
 			.commit_create("failed signer", &CommitOptions::default(), None)
@@ -4128,7 +5048,7 @@ mod tests {
 			date:  Some("2020-01-02T03:04:05Z".into()),
 		};
 		let sha = repo
-			.commit_tree(&tree, &[head.clone()], "task\n\nbody", Some(&author))
+			.commit_tree(&tree, std::slice::from_ref(&head), "task\n\nbody", Some(&author))
 			.unwrap();
 		assert_eq!(git(root, &["show", &format!("{sha}:a")]), "staged");
 		assert_eq!(git(root, &["show", "-s", "--format=%P", &sha]), head);
