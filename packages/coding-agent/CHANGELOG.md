@@ -27,14 +27,10 @@
 - Keep Python zoom qualification JSON within bounded output columns when temporary paths are long.
 - Qualify private stdin backpressure through the same unsettled native operation, independent of platform-specific write and flush phases.
 - Complete fixture navigation, join cancelled browser click work before page teardown, and await CDP rejections without nested event loops.
-- Remove the unsupported rsync cross-run byte-total invariant; preserve exact live counters, transfer contents, and protocol coverage.
+- Remove unsupported rsync cross-run wire-byte equality; preserve same-transfer counters, exact copied trees, and logical transfer-size checks.
 - Scan every owned qualification-file byte without decoding binary assets. Preserve cross-chunk leak checks and fixed, nonsecret failure phases.
 - Separate synthetic tmux executable readiness from bounded protocol queries. Preserve runtime query deadlines and credential-filtering checks.
 - Isolate home-dotenv cache qualification from managed-launch markers and filtered-child sentinels without changing production dotenv authority.
-- Isolate home-dotenv cache qualification from managed-launch markers without changing production dotenv authority.
-- Verify pending native input and stable backpressure without pinning the platform's write or flush stage.
-- Complete navigation before browser click-cancellation qualification. Retain real click and watch-retirement checks.
-- Remove an obsolete rsync cross-run wire-byte invariant. Preserve same-transfer accounting, exact copied trees, and logical transfer-size comparisons.
 - Apply normalized device authorization before capability probes, including policy revocation during approval. Preserve active and mounted AWS dispatch and exact native invocation ownership.
 - Join owned process cleanup using kernel creation identities and actual reaping. Preserve a pinned Darwin group anchor until acknowledged retirement, and reject unknown or replaced receiver identities.
 - Preserve constructor-registered tool session callbacks so active native scopes stop when the SDK adopts or forks a session.
