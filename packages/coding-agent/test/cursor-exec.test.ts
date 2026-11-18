@@ -61,14 +61,24 @@ function createTestSession(cwd: string, overrides: Partial<ToolSession> = {}): T
 	};
 }
 
-function passthroughRunner(): ExtensionRunner {
+/**
+ * An `ExtensionRunner` that intercepts nothing but records that it ran.
+ *
+ * The bridge's per-call tools must carry the same wrapper as registry tools;
+ * seeing a name arrive here proves the wrapper is present, since an unwrapped
+ * tool never announces.
+ */
+function passthroughRunner(seen: string[] = []): ExtensionRunner {
 	return {
 		hasHandlers: () => true,
 		consumeToolCallEmitted: () => false,
 		runScoped<T>(fn: () => T): T {
 			return fn();
 		},
-		emitToolCall: async () => undefined,
+		emitToolCall: async (event: { toolName: string }) => {
+			seen.push(event.toolName);
+			return undefined;
+		},
 		emitToolResult: async () => undefined,
 	} as unknown as ExtensionRunner;
 }
@@ -532,23 +542,30 @@ describe("bridge tool resolution beyond the model-facing registry", () => {
 		expect(result.content.map(c => (c.type === "text" ? c.text : "")).join("")).toContain("blocked by user policy");
 	});
 
-	it("executes permitted scoped grep with the caller's context", async () => {
+	it("wraps the per-call grep the real bridge factory builds", async () => {
+		// The reviewed bypass was in the factory the session hands the bridge,
+		// not in the bridge: a raw `new GrepTool(...)` there skips the approval
+		// gate every registry tool goes through. Exercise the shared factory
+		// both callsites use, so a regression in it fails here.
 		await Bun.write(path.join(cwd, "hit.txt"), "needle\n");
-		const session = createTestSession(cwd);
-		const factory = createBridgeGrepFactory(session, passthroughRunner());
+		const intercepted: string[] = [];
+		const factory = createBridgeGrepFactory(createTestSession(cwd), passthroughRunner(intercepted));
+		const built = factory({ context: 0, totalMatchLimit: 5 });
+		expect(built).toBeInstanceOf(ExtensionToolWrapper);
 
 		const handlers = new CursorExecHandlers({
 			cwd,
 			tools: new Map<string, Tool>(),
 			createGrepTool: factory,
-			getToolContext: () => ({ settings: session.settings }) as AgentToolContext,
 		});
 		const result = await handlers.piGrep({
 			toolCallId: "g1",
 			args: { pattern: "needle", path: cwd, limit: 5 },
 		} as never);
 
-		expect(result.isError, JSON.stringify(result.content)).toBe(false);
+		// The wrapper ran (its extension hook fired) and the frame's cap still
+		// reached the underlying tool.
+		expect(intercepted).toEqual(["grep"]);
 		expect((result.details as { matchCount?: number } | undefined)?.matchCount).toBe(1);
 	});
 
