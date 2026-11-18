@@ -918,11 +918,11 @@ impl GitRepo {
 				let mut selected = BTreeSet::new();
 				for source in [&partial, &original] {
 					for entry in source.entries() {
-						let path = entry.path(source).to_str_lossy();
+						let path = entry.path(source);
 						if requested
 							.iter()
-							.any(|wanted| stage_path_matches(&path, wanted))
-							&& !selected.contains(path.as_ref())
+							.any(|wanted| wanted.is_empty() || path_matches_bytes(path, wanted.as_bytes()))
+							&& !selected.contains(path)
 						{
 							let skipped = original
 								.entry_by_path(entry.path(source))
@@ -930,12 +930,17 @@ impl GitRepo {
 								.flags
 								.contains(gix::index::entry::Flags::SKIP_WORKTREE);
 							if skipped
-								&& fs::symlink_metadata(self.root().join(path.as_ref()))
-									.is_err_and(|err| err.kind() == std::io::ErrorKind::NotFound)
+								&& fs::symlink_metadata(
+									self.root().join(
+										gix::path::try_from_byte_slice(path)
+											.map_err(|err| Error::backend("git commit", err))?,
+									),
+								)
+								.is_err_and(|err| err.kind() == std::io::ErrorKind::NotFound)
 							{
 								continue;
 							}
-							selected.insert(path.into_owned());
+							selected.insert(path.to_owned());
 						}
 					}
 				}
@@ -952,8 +957,7 @@ impl GitRepo {
 					.iter()
 					.filter(|entry| {
 						let path = entry.path(&original);
-						selected.contains(path.to_str_lossy().as_ref())
-							&& partial.entry_by_path(path).is_none()
+						selected.contains(path) && partial.entry_by_path(path).is_none()
 					})
 					.collect();
 				for entry in additions {
@@ -967,7 +971,7 @@ impl GitRepo {
 				}
 				partial.sort_entries();
 				for (entry, path) in partial.entries_mut_with_paths() {
-					if selected.contains(path.to_str_lossy().as_ref()) {
+					if selected.contains(path) {
 						entry.flags.remove(gix::index::entry::Flags::SKIP_WORKTREE);
 					}
 				}
@@ -975,16 +979,30 @@ impl GitRepo {
 					.write(INDEX_WRITE)
 					.map_err(|err| Error::backend("git commit", err))?;
 				let selected: Vec<_> = selected.into_iter().collect();
-				let mut args = vec![
+				let prefix = b":(top,literal)";
+				let mut input = Vec::with_capacity(
+					selected
+						.iter()
+						.map(|path| prefix.len() + path.len() + 1)
+						.sum(),
+				);
+				for path in &selected {
+					input.extend_from_slice(prefix);
+					input.extend_from_slice(path);
+					input.push(0);
+				}
+				let args = [
 					"-c".into(),
 					"safe.directory=*".into(),
 					"add".into(),
 					"-A".into(),
 					"-f".into(),
-					"--".into(),
+					"--pathspec-from-file=-".into(),
+					"--pathspec-file-nul".into(),
 				];
-				args.extend(selected.iter().map(|path| literal_pathspec(path)));
+				process.stdin = Some(input);
 				run_checked(self.root(), &args, &process).await?;
+				process.stdin = None;
 				path_index = Some((original, selected));
 			}
 			private_index = Some(path);
@@ -1187,7 +1205,7 @@ impl GitRepo {
 				original.clone()
 			};
 			files.retain(|path| {
-				let path = path.as_bytes().as_bstr();
+				let path = path.as_bstr();
 				let before = original
 					.entry_by_path(path)
 					.map(|entry| (entry.id, entry.mode, entry.flags));
@@ -2726,19 +2744,23 @@ fn stage_one(
 	Ok(Staged::Entry(StagedEntry { path: rela_path.to_owned(), stat, id, mode }))
 }
 
-fn copy_index_paths(dest: &mut gix::index::File, source: &gix::index::File, files: &[String]) {
+fn copy_index_paths<P: AsRef<[u8]>>(
+	dest: &mut gix::index::File,
+	source: &gix::index::File,
+	files: &[P],
+) {
 	let all = files.is_empty();
 	dest.remove_entries(|_, path, _| {
 		all || files
 			.iter()
-			.any(|wanted| path_matches(&path.to_str_lossy(), wanted))
+			.any(|wanted| path_matches_bytes(path, wanted.as_ref()))
 	});
 	for entry in source.entries() {
 		let path = entry.path(source);
 		if all
 			|| files
 				.iter()
-				.any(|wanted| path_matches(&path.to_str_lossy(), wanted))
+				.any(|wanted| path_matches_bytes(path, wanted.as_ref()))
 		{
 			dest.dangerously_push_entry(entry.stat, entry.id, entry.flags, entry.mode, path);
 		}
@@ -3031,11 +3053,17 @@ fn restore_index_paths(
 }
 
 fn path_matches(path: &str, wanted: &str) -> bool {
-	let wanted = wanted.trim_end_matches('/');
+	path_matches_bytes(path.as_bytes(), wanted.as_bytes())
+}
+
+fn path_matches_bytes(path: &[u8], mut wanted: &[u8]) -> bool {
+	while let Some(stripped) = wanted.strip_suffix(b"/") {
+		wanted = stripped;
+	}
 	path == wanted
 		|| path
 			.strip_prefix(wanted)
-			.is_some_and(|r| r.starts_with('/'))
+			.is_some_and(|r| r.starts_with(b"/"))
 }
 
 fn set_config_file(path: &Path, key: &str, value: &str) -> Result<()> {
@@ -3518,6 +3546,13 @@ mod tests {
 	use crate::types::{CommitAuthor, StatusOptions};
 
 	fn git(dir: &Path, args: &[&str]) -> String {
+		String::from_utf8(git_bytes(dir, args))
+			.unwrap()
+			.trim_end()
+			.to_owned()
+	}
+
+	fn git_bytes<S: AsRef<OsStr> + std::fmt::Debug>(dir: &Path, args: &[S]) -> Vec<u8> {
 		let output = Command::new("git")
 			.arg("-C")
 			.arg(dir)
@@ -3525,10 +3560,7 @@ mod tests {
 			.output()
 			.unwrap();
 		assert!(output.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&output.stderr));
-		String::from_utf8(output.stdout)
-			.unwrap()
-			.trim_end()
-			.to_owned()
+		output.stdout
 	}
 
 	fn fixture() -> (TempDir, GitRepo) {
@@ -3767,6 +3799,300 @@ mod tests {
 		assert_eq!(git(temp.path(), &["show", "HEAD:b"]), "two");
 		assert_eq!(fs::read(temp.path().join(".git/index")).unwrap(), before);
 		assert_eq!(fs::read(temp.path().join("a")).unwrap(), b"working copy\n");
+	}
+
+	#[tokio::test]
+	async fn reftable_path_only_commit_exceeds_windows_command_line_limit() {
+		let Some((temp, repo)) = fixture_with_ref_format(true) else {
+			return;
+		};
+		let paths: Vec<_> = (0..512)
+			.map(|i| {
+				format!(
+					"selected/ordinary-file-{i:04}-with-a-name-long-enough-for-command-line-limits.txt"
+				)
+			})
+			.collect();
+		assert!(
+			paths
+				.iter()
+				.map(|path| path.encode_utf16().count() + 1)
+				.sum::<usize>()
+				> 32_767
+		);
+		fs::create_dir(temp.path().join("selected")).unwrap();
+		for path in &paths {
+			fs::write(temp.path().join(path), b"base selected\n").unwrap();
+		}
+		git(temp.path(), &["add", "selected"]);
+		git(temp.path(), &["commit", "-qm", "selected base"]);
+		for path in &paths {
+			fs::write(temp.path().join(path), b"selected working copy\n").unwrap();
+		}
+		fs::write(temp.path().join("b"), b"unrelated staged\n").unwrap();
+		git(temp.path(), &["add", "b"]);
+		let staged_b = git(temp.path(), &["rev-parse", ":b"]);
+
+		let id = repo
+			.commit_create(
+				"large selected directory",
+				&CommitOptions { files: vec!["selected".into()], ..Default::default() },
+				None,
+			)
+			.await
+			.unwrap();
+
+		assert_eq!(git(temp.path(), &["rev-parse", "HEAD"]), id);
+		let blob = git(temp.path(), &["hash-object", &paths[0]]);
+		assert_eq!(git_bytes(temp.path(), &["cat-file", "blob", &blob]), b"selected working copy\n");
+		let mut expected_tree = Vec::new();
+		let mut expected_index = Vec::new();
+		for path in &paths {
+			expected_tree.extend_from_slice(format!("100644 blob {blob}\t{path}\0").as_bytes());
+			expected_index.extend_from_slice(format!("100644 {blob} 0\t{path}\0").as_bytes());
+		}
+		assert_eq!(
+			git_bytes(temp.path(), &["ls-tree", "-r", "-z", "HEAD", "--", "selected"]),
+			expected_tree
+		);
+		assert_eq!(
+			git_bytes(temp.path(), &["ls-files", "--stage", "-z", "--", "selected"]),
+			expected_index
+		);
+		assert_eq!(git(temp.path(), &["show", "HEAD:b"]), "two");
+		assert_eq!(git(temp.path(), &["rev-parse", ":b"]), staged_b);
+		assert_eq!(git(temp.path(), &["show", ":b"]), "unrelated staged");
+		assert_eq!(git_bytes(temp.path(), &["diff", "--cached", "--name-only", "-z"]), b"b\0");
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn reftable_path_only_commit_deletes_non_utf8_index_paths() {
+		let Some((temp, repo)) = fixture_with_ref_format(true) else {
+			return;
+		};
+		let raw = b"selected/absent-\xff";
+		let mut index =
+			read_cli_commit_index(&temp.path().join(".git/index"), gix::hash::Kind::Sha1).unwrap();
+		let source = index.entry_by_path(b"a".as_bstr()).unwrap();
+		let (id, mode) = (source.id, source.mode);
+		index.dangerously_push_entry(
+			Default::default(),
+			id,
+			gix::index::entry::Flags::empty(),
+			mode,
+			raw.as_bstr(),
+		);
+		index.sort_entries();
+		index.write(INDEX_WRITE).unwrap();
+		git(temp.path(), &["commit", "-qm", "raw index base"]);
+		assert_eq!(
+			git_bytes(temp.path(), &["ls-tree", "-r", "-z", "--name-only", "HEAD", "--", "selected"]),
+			[raw.as_slice(), b"\0"].concat(),
+		);
+		fs::write(temp.path().join("b"), "unrelated staged\n").unwrap();
+		git(temp.path(), &["add", "b"]);
+		let staged_b = git(temp.path(), &["rev-parse", ":b"]);
+		repo
+			.commit_create(
+				"delete missing raw path",
+				&CommitOptions { files: vec!["selected".into()], ..Default::default() },
+				None,
+			)
+			.await
+			.unwrap();
+		assert_eq!(
+			git_bytes(temp.path(), &["ls-tree", "-r", "-z", "--name-only", "HEAD", "--", "selected"]),
+			Vec::<u8>::new(),
+		);
+		assert_eq!(git_bytes(temp.path(), &["ls-files", "-z", "--", "selected"]), Vec::<u8>::new());
+		assert_eq!(git(temp.path(), &["show", "HEAD:b"]), "two");
+		assert_eq!(git(temp.path(), &["rev-parse", ":b"]), staged_b);
+		assert_eq!(git(temp.path(), &["show", ":b"]), "unrelated staged");
+	}
+
+	#[cfg(target_os = "linux")]
+	#[tokio::test]
+	async fn reftable_path_only_commit_preserves_non_utf8_index_paths() {
+		let Some((temp, repo)) = fixture_with_ref_format(true) else {
+			return;
+		};
+		let updated = b"selected/byte-\xff".as_slice();
+		let deleted = b"selected/byte-\xfe".as_slice();
+		let added = b"selected/byte-\xfd".as_slice();
+		let removed_addition = b"selected/byte-\xfc".as_slice();
+		let absent_skipped = b"selected/byte-\xfb".as_slice();
+		let present_skipped = b"selected/byte-\xfa".as_slice();
+		let untracked = b"selected/byte-\xf9".as_slice();
+		fs::create_dir(temp.path().join("selected")).unwrap();
+		for path in [updated, deleted, absent_skipped, present_skipped] {
+			fs::write(temp.path().join(gix::path::from_byte_slice(path)), b"base selected\n").unwrap();
+		}
+		git(temp.path(), &["add", "selected"]);
+		git(temp.path(), &["commit", "-qm", "byte paths base"]);
+		fs::write(temp.path().join(gix::path::from_byte_slice(updated)), b"stale staged\n").unwrap();
+		fs::remove_file(temp.path().join(gix::path::from_byte_slice(deleted))).unwrap();
+		for path in [added, removed_addition] {
+			fs::write(temp.path().join(gix::path::from_byte_slice(path)), b"staged addition\n")
+				.unwrap();
+		}
+		git(temp.path(), &["add", "-A", "--", "selected"]);
+		git_bytes(temp.path(), &[
+			OsStr::new("update-index"),
+			OsStr::new("--skip-worktree"),
+			OsStr::new("--"),
+			gix::path::from_byte_slice(absent_skipped).as_os_str(),
+			gix::path::from_byte_slice(present_skipped).as_os_str(),
+		]);
+		fs::remove_file(temp.path().join(gix::path::from_byte_slice(absent_skipped))).unwrap();
+		fs::remove_file(
+			temp
+				.path()
+				.join(gix::path::from_byte_slice(removed_addition)),
+		)
+		.unwrap();
+		let changed = [
+			(updated, b"working copy\0\xff\n".as_slice()),
+			(added, b"fresh addition\0\xfd\n".as_slice()),
+			(present_skipped, b"present skipped working copy\n".as_slice()),
+		];
+		for (path, content) in changed {
+			fs::write(temp.path().join(gix::path::from_byte_slice(path)), content).unwrap();
+		}
+		fs::write(temp.path().join(gix::path::from_byte_slice(untracked)), b"not selected\n")
+			.unwrap();
+		fs::write(temp.path().join("b"), b"unrelated staged\n").unwrap();
+		git(temp.path(), &["add", "b"]);
+		let staged_b = git(temp.path(), &["rev-parse", ":b"]);
+
+		repo
+			.commit_create(
+				"selected raw byte paths",
+				&CommitOptions { files: vec!["./selected/".into()], ..Default::default() },
+				None,
+			)
+			.await
+			.unwrap();
+
+		for (path, content) in changed
+			.into_iter()
+			.chain([(absent_skipped, b"base selected\n".as_slice())])
+		{
+			for prefix in [b"HEAD:".as_slice(), b":".as_slice()] {
+				let spec = [prefix, path].concat();
+				assert_eq!(
+					git_bytes(temp.path(), &[
+						OsStr::new("show"),
+						gix::path::from_byte_slice(&spec).as_os_str(),
+					]),
+					content,
+					"path {path:?}"
+				);
+			}
+		}
+		let mut paths = [updated, added, absent_skipped, present_skipped];
+		paths.sort_unstable();
+		let expected: Vec<_> = paths
+			.iter()
+			.flat_map(|path| path.iter().copied().chain(std::iter::once(0)))
+			.collect();
+		assert_eq!(
+			git_bytes(temp.path(), &["ls-tree", "-r", "-z", "--name-only", "HEAD", "--", "selected"]),
+			expected
+		);
+		assert_eq!(git_bytes(temp.path(), &["ls-files", "-z", "--", "selected"]), expected);
+		for (path, status) in
+			[(absent_skipped, b"S ".as_slice()), (present_skipped, b"H ".as_slice())]
+		{
+			assert_eq!(
+				git_bytes(temp.path(), &[
+					OsStr::new("ls-files"),
+					OsStr::new("-t"),
+					OsStr::new("-z"),
+					OsStr::new("--"),
+					gix::path::from_byte_slice(path).as_os_str(),
+				]),
+				[status, path, b"\0"].concat()
+			);
+		}
+		assert_eq!(git(temp.path(), &["show", "HEAD:b"]), "two");
+		assert_eq!(git(temp.path(), &["rev-parse", ":b"]), staged_b);
+		assert_eq!(git(temp.path(), &["show", ":b"]), "unrelated staged");
+		assert_eq!(git_bytes(temp.path(), &["diff", "--cached", "--name-only", "-z"]), b"b\0");
+	}
+
+	#[tokio::test]
+	async fn reftable_path_only_commit_preserves_literal_and_newline_paths() {
+		let Some((temp, repo)) = fixture_with_ref_format(true) else {
+			return;
+		};
+		let selected = [
+			"[selected]/[abc].txt",
+			#[cfg(unix)]
+			":(glob)**/line\nbreak.txt",
+			#[cfg(unix)]
+			":(glob)**/wild*?.txt",
+			#[cfg(unix)]
+			":(glob)**/slash\\name.txt",
+			#[cfg(unix)]
+			":leading",
+		];
+		for path in selected {
+			let full = temp.path().join(path);
+			fs::create_dir_all(full.parent().unwrap()).unwrap();
+			fs::write(full, b"base selected\n").unwrap();
+		}
+		fs::write(temp.path().join("[selected]/a.txt"), b"base neighbor\n").unwrap();
+		git(temp.path(), &["add", "-A"]);
+		git(temp.path(), &["commit", "-qm", "literal paths base"]);
+		for path in selected {
+			fs::write(temp.path().join(path), b"literal working copy\n").unwrap();
+		}
+		fs::write(temp.path().join("[selected]/a.txt"), b"unrelated bracket match\n").unwrap();
+		fs::write(temp.path().join("b"), b"unrelated staged\n").unwrap();
+		git(temp.path(), &["add", "-A"]);
+
+		repo
+			.commit_create(
+				"selected literal paths",
+				&CommitOptions {
+					files: vec![
+						"[selected]/[abc].txt".into(),
+						#[cfg(unix)]
+						"./:(glob)**/".into(),
+						#[cfg(unix)]
+						":leading".into(),
+					],
+					..Default::default()
+				},
+				None,
+			)
+			.await
+			.unwrap();
+
+		for path in selected {
+			for prefix in ["HEAD:", ":"] {
+				let spec = format!("{prefix}{path}");
+				assert_eq!(git_bytes(temp.path(), &["show", &spec]), b"literal working copy\n");
+			}
+		}
+		let mut paths = selected.to_vec();
+		paths.extend(["a", "b", "[selected]/a.txt"]);
+		paths.sort_unstable();
+		let expected: Vec<_> = paths
+			.iter()
+			.flat_map(|path| path.bytes().chain(std::iter::once(0)))
+			.collect();
+		assert_eq!(git_bytes(temp.path(), &["ls-tree", "-r", "-z", "--name-only", "HEAD"]), expected);
+		assert_eq!(git_bytes(temp.path(), &["ls-files", "-z"]), expected);
+		assert_eq!(git(temp.path(), &["show", "HEAD:[selected]/a.txt"]), "base neighbor");
+		assert_eq!(git(temp.path(), &["show", ":[selected]/a.txt"]), "unrelated bracket match");
+		assert_eq!(git(temp.path(), &["show", "HEAD:b"]), "two");
+		assert_eq!(git(temp.path(), &["show", ":b"]), "unrelated staged");
+		assert_eq!(
+			git_bytes(temp.path(), &["diff", "--cached", "--name-only", "-z"]),
+			b"[selected]/a.txt\0b\0"
+		);
 	}
 
 	#[cfg(unix)]
