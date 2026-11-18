@@ -17,6 +17,7 @@
 
 ### Fixed
 
+- Wait for owned jobs, delivered result turns, and persistence in restore qualification before publishing raster inputs.
 - Guard unborn HEADs and commit selected working copies without changing unrelated staged entries. Keep hook messages private per commit.
 - Preserve resolved merge parents and finish merge state, including merges whose trees do not change.
 - Restore automatic merge stashes. Preserve conflicted edits in a recovery stash and report the already-created commit when restoration fails.

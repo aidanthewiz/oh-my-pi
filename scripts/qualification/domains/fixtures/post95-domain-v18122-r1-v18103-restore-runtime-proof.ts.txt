@@ -261,7 +261,15 @@ try {
   };
   const publications = () => session.messages.filter(message => message.role === "custom" && message.customType === "async-result" && JSON.stringify(message).includes(childId ?? "NO_CHILD"));
   const jobs = () => manager.getAllJobs().filter(job => job.agentId === childId).map(job => ({ id: job.id, status: job.status, ownerId: job.ownerId }));
-  const settle = async () => { await bounded(session.settleAsyncWork(), `${label} async settlement`); await session.settleInFlightMessagePersistence(); await persisted.flush(); };
+  const settle = async () => {
+   await bounded((async () => {
+    await manager.waitForAll();
+    assert.equal(await manager.drainDeliveries(), true);
+    await session.waitForRunEnd();
+   })(), `${label} async settlement`);
+   await session.settleInFlightMessagePersistence();
+   await persisted.flush();
+  };
   return { token, session, persisted, rootFile, userId, manager, lifecycle, entered, release, releaseOther, coldEntered, coldRelease, childFile, childId, crashBytes, writes, publications, jobs, settle,
    async close() { await close(); cleanupRuntime = undefined; } };
  }

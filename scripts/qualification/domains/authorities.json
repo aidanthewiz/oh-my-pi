@@ -31,7 +31,7 @@
     "final-sol-ultrafast-runtime-proof.ts": { "file": "post95-domain-v18122-r1-final-sol-ultrafast-runtime-proof.ts.txt", "sha256": "a4afaf9b2bf0831f062f92abd9a9d2e5641b26e848fb0ddff5d1a1c2ff22dc67" },
     "v18102-provider-beta-corrected-runtime-proof.ts": { "file": "post95-domain-v18122-r1-v18102-provider-beta-corrected-runtime-proof.ts.txt", "sha256": "15e03a5e32440a15bb92a4d3f6df27cf456f0e32de0e7625676763cd07322b74" },
     "v18103-accounting-runtime-proof.ts": { "file": "post95-domain-v18122-r1-v18103-accounting-runtime-proof.ts.txt", "sha256": "1af85f62ea3ee9d64d0cdd1e6c376a0531c777170ce10e0448a3f0a7917cf222" },
-    "v18103-restore-runtime-proof.ts": { "file": "post95-domain-v18122-r1-v18103-restore-runtime-proof.ts.txt", "sha256": "7abaf205f52148f95e4f1749a2cad4527a2b49e58c664acb37aeaaab0ac2fc74" },
+    "v18103-restore-runtime-proof.ts": { "file": "post95-domain-v18122-r1-v18103-restore-runtime-proof.ts.txt", "sha256": "335268ea23200b24d4fde7f873ce44249ebc8d5ce51c362ff447bd84c8d2ab11" },
     "v18104-approval-runtime-proof.ts": { "file": "post95-domain-v18122-r1-v18104-approval-runtime-proof.ts.txt", "sha256": "60aeb28c96add67328a8d0bf95de0c5948eb025386cac5ee9c4ff63280b62f60" }
   },
   "adaptations": [
@@ -45,6 +45,7 @@
     "Resolve the accounting omptype package through its engine source entrypoint.",
     "Import the Responses replay policy from openai-responses-state, matching the current Agent owner.",
     "Replace machine-home inequalities with filesystem-root and isolated-HOME assertions.",
+    "Wait for the root manager's actual jobs, delivery drain, and result-driven run within the existing restore settlement deadline before both persistence awaits.",
     "Compile through the canonical parent compiler and execute with parent-enforced checkout-read denial.",
     "Copy actual ANSI, protocol, and image artifacts to output; expose title observations as six ANSI captures per mode."
   ],
