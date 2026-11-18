@@ -7,7 +7,8 @@
 //! Other platforms expose the same API as an unavailable, no-op backend.
 //! Requests originate on the process-wide spelling thread in
 //! `pi_predict::apple::appkit`, shared with word completion.
-//! Background checks collect immutable results in `AppKit`'s completion context.
+//! Background checks collect immutable results in `AppKit`'s completion
+//! context.
 
 use napi_derive::napi;
 
