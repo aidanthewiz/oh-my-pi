@@ -56,6 +56,14 @@ const FAILURE = "AWS_SECRET_INPUT_NATIVE_BOUNDARY_FAILED";
 const emit = process.stdout.write.bind(process.stdout);
 let activeCase = "setup";
 
+function reportNativePhase(
+	phase: "case" | "result" | "files" | "done" | "cleanup" | "cleanup-files" | "inspection" | "inspection-done",
+): void {
+	if (import.meta.main && process.connected && process.send) {
+		process.send({ type: "native-phase", case: activeCase, phase });
+	}
+}
+
 export function requireNativeProof(value: unknown): asserts value {
 	if (!value) throw new Error(FAILURE);
 }
@@ -209,27 +217,46 @@ export function requireAwsSecretInputNativeTransport(
 	};
 }
 
+export async function assertAwsSecretInputNativeFileBytes(chunks: AsyncIterable<Uint8Array>): Promise<void> {
+	const marker = Buffer.from(LIFECYCLE_SENSITIVE_MARKER);
+	const boundary = Buffer.alloc(2 * (marker.length - 1));
+	let tailLength = 0;
+	try {
+		for await (const bytes of chunks) {
+			const chunk = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+			requireNativeProof(chunk.indexOf(marker) === -1);
+			const prefixLength = Math.min(marker.length - 1, chunk.length);
+			chunk.copy(boundary, tailLength, 0, prefixLength);
+			const boundaryLength = tailLength + prefixLength;
+			requireNativeProof(boundary.subarray(0, boundaryLength).indexOf(marker) === -1);
+			const retainedLength = Math.min(marker.length - 1, tailLength + chunk.length);
+			if (chunk.length >= retainedLength) {
+				chunk.copy(boundary, 0, chunk.length - retainedLength);
+			} else {
+				boundary.copyWithin(0, boundaryLength - retainedLength, boundaryLength);
+			}
+			tailLength = retainedLength;
+		}
+	} finally {
+		boundary.fill(0);
+	}
+}
+
 export async function assertAwsSecretInputNativeFiles(root: string): Promise<void> {
+	reportNativePhase("inspection");
 	const visit = async (directory: string): Promise<void> => {
 		for (const entry of await fs.readdir(directory, { withFileTypes: true })) {
 			const filename = path.join(directory, entry.name);
 			requireNativeProof(!lifecycleContainsSensitive(filename));
 			if (entry.isDirectory()) await visit(filename);
-			else if (entry.isFile()) {
-				const decoder = new TextDecoder();
-				let tail = "";
-				for await (const bytes of Bun.file(filename).stream()) {
-					const text = tail + decoder.decode(bytes, { stream: true });
-					requireNativeProof(!text.includes(LIFECYCLE_SENSITIVE_MARKER));
-					tail = text.slice(Math.max(0, text.length - LIFECYCLE_SENSITIVE_MARKER.length + 1));
-				}
-				requireNativeProof(!(tail + decoder.decode()).includes(LIFECYCLE_SENSITIVE_MARKER));
-			} else if (entry.isSymbolicLink()) {
+			else if (entry.isFile()) await assertAwsSecretInputNativeFileBytes(Bun.file(filename).stream());
+			else if (entry.isSymbolicLink()) {
 				requireNativeProof(!lifecycleContainsSensitive(await fs.readlink(filename)));
 			} else throw new Error(FAILURE);
 		}
 	};
 	await visit(root);
+	reportNativePhase("inspection-done");
 }
 
 export function observeAwsSecretInputNativeSurfaces() {
@@ -701,6 +728,7 @@ export async function runAwsSecretInputNativeProbe(
 	};
 	const record = async (name: string, run: () => Promise<void>, expectsLoopbackReceipt = true) => {
 		activeCase = name;
+		reportNativePhase("case");
 		choice = "approve";
 		session.settings = Settings.isolated({
 			"tools.approvalMode": "yolo",
@@ -709,6 +737,7 @@ export async function runAwsSecretInputNativeProbe(
 		});
 		activeContext = context();
 		await run();
+		reportNativePhase("result");
 		requireNativeProof(observation.clean && artifactAllocations === 0);
 		requireNativeProof(workers.every(worker => worker.exited && worker.code === 0));
 		for (const worker of workers) {
@@ -763,6 +792,7 @@ export async function runAwsSecretInputNativeProbe(
 			verifiedWorkers.add(worker);
 		}
 		requireNativeProof(control.clean);
+		reportNativePhase("files");
 		await assertAwsSecretInputNativeFiles(root);
 		for (const directory of ownedDirectories) {
 			let missing = false;
@@ -774,6 +804,7 @@ export async function runAwsSecretInputNativeProbe(
 			requireNativeProof(missing);
 		}
 		cases.push({ name, passed: true });
+		reportNativePhase("done");
 	};
 	try {
 		BUILTIN_TOOLS.aws = () => install();
@@ -1528,6 +1559,7 @@ export async function runAwsSecretInputNativeProbe(
 		};
 	} finally {
 		try {
+			reportNativePhase("cleanup");
 			Object.assign(BUILTIN_TOOLS, originalFactories);
 			disposed = true;
 			for (const callback of Array.from(beginDispose)) await callback();
@@ -1535,6 +1567,7 @@ export async function runAwsSecretInputNativeProbe(
 			control.send("release-consumer");
 			await cleanupAwsSecretInputLifecycleProcesses(workers.map(worker => worker.child));
 			await control.close();
+			reportNativePhase("cleanup-files");
 			await assertAwsSecretInputNativeFiles(root);
 			requireNativeProof(observation.clean);
 		} finally {
@@ -1549,5 +1582,7 @@ if (import.meta.main) {
 	} catch {
 		emit(`${JSON.stringify({ schema: "aws-secret-input-native-failure/v1", case: activeCase, passed: false })}\n`);
 		process.exitCode = 42;
+	} finally {
+		if (process.connected) process.disconnect?.();
 	}
 }

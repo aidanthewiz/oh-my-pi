@@ -1616,7 +1616,6 @@ document.getElementById("menu-item").addEventListener("pointerdown", event => {
 		try {
 			for (const fault of ["transport", "cancel", "acquire"] as const) {
 				const page = await browserHandle.browser.newPage();
-				const frame = page.mainFrame();
 				const controller = new AbortController();
 				const held = Promise.withResolvers<void>();
 				const released = Promise.withResolvers<void>();
@@ -1630,9 +1629,10 @@ document.getElementById("menu-item").addEventListener("pointerdown", event => {
 				let heldWork: Promise<unknown> | undefined;
 				let watchAcquired = false;
 				try {
-					await page.setContent(
-						'<button id="target" data-clicks="0" onclick="this.dataset.clicks=String(Number(this.dataset.clicks)+1)">Click</button>',
+					await page.goto(
+						`data:text/html,${encodeURIComponent('<button id="target" data-clicks="0" onclick="this.dataset.clicks=String(Number(this.dataset.clicks)+1)">Click</button>')}`,
 					);
+					const frame = page.mainFrame();
 					const handle = await page.$("#target");
 					if (!handle) throw new Error("Expected the real fixture button");
 					await page.evaluate(`(() => {
