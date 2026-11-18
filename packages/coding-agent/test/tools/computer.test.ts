@@ -1101,7 +1101,7 @@ describe("computer prelude", () => {
 					"await computer.click(60, 30)",
 					"await win.click(60, 30)",
 					`run_zoom = await computer.run('const zoom = await desktop.zoom({ x: 8, y: 4, width: 16, height: 8 }, { silent: true }); await desktop.click(60, 30); return zoom;')`,
-					"print(json.dumps([desktop_zoom, window_zoom, run_zoom]))",
+					"print(json.dumps([desktop_zoom, window_zoom, run_zoom], indent=2))",
 				].join("\n"),
 				{
 					cwd: process.cwd(),

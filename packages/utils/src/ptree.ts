@@ -9,8 +9,13 @@
 
 import { Process, type ProcessTerminateOptions } from "@oh-my-pi/pi-natives";
 import type { Spawn, Subprocess } from "bun";
+import { OwnedInputSupervisor, type OwnedInputIdentity } from "./ptree-owned-input";
 
-type InMask = "pipe" | "ignore" | Buffer | Uint8Array | null;
+export { OwnedInputError, PTREE_OWNED_INPUT_SUPPORTED } from "./ptree-owned-input";
+
+export const PTREE_EXEC_INPUT_POLICY = "finite-stdin-owned-process-group/v3";
+
+type InMask = "pipe" | "ignore" | Buffer | Uint8Array | number | null;
 
 /** A Bun subprocess with stdout/stderr always piped (stdin may vary). */
 type PipedSubprocess<In extends InMask = InMask> = Subprocess<In, "pipe", "pipe">;
@@ -163,8 +168,13 @@ export interface WaitOptions {
 export interface ExecResult {
 	stdout: string;
 	stdoutTruncated?: boolean;
+	stderrTruncated?: boolean;
 	stderr: string;
 	exitCode: number | null;
+	/** Actual receiver signal, independent of the owned guardian's exit status. */
+	signalCode?: NodeJS.Signals | null;
+	/** Present only after the owned guardian acknowledges cleanup and is reaped. */
+	ownedInputCleanedUp?: boolean;
 	ok: boolean;
 	exitError?: Exception;
 }
@@ -183,6 +193,7 @@ export class ChildProcess<In extends InMask = InMask> {
 	#nothrow = false;
 	#stderrTail = "";
 	#stdoutTruncated = false;
+	#stderrTruncated = false;
 	#stderrChunks?: Uint8Array[];
 	#exitReason?: Exception;
 	#exitReasonPending?: Exception;
@@ -206,15 +217,19 @@ export class ChildProcess<In extends InMask = InMask> {
 	// Windows has no process groups. Retaining the root's native handle pins
 	// its PID after exit so killTree() can still enumerate its original children.
 	#windowsRootProcess?: Process;
+	#ownedInput?: OwnedInputSupervisor;
 	constructor(
 		readonly proc: PipedSubprocess<In>,
 		readonly exposeStderr: boolean,
 		retainFullStderr = exposeStderr,
 		terminateGroup = false,
 		hardKillTree = false,
+		maxStderrBytes?: number,
+		ownedInput?: OwnedInputSupervisor,
 	) {
 		this.#terminateGroup = terminateGroup;
 		this.#hardKillTree = hardKillTree;
+		this.#ownedInput = ownedInput;
 		this.#windowsRootProcess = process.platform === "win32" ? (Process.fromPid(proc.pid) ?? undefined) : undefined;
 		if (retainFullStderr) this.#stderrChunks = [];
 		// Eagerly drain stderr into a truncated tail, retaining raw chunks only for explicit full capture.
@@ -223,7 +238,7 @@ export class ChildProcess<In extends InMask = InMask> {
 			if (this.#stderrTail.length > NonZeroExitError.MAX_TRACE)
 				this.#stderrTail = this.#stderrTail.slice(-NonZeroExitError.MAX_TRACE);
 		};
-		let stderrStream = proc.stderr;
+		let stderrStream = ownedInput?.stderr ?? proc.stderr;
 		if (exposeStderr) {
 			const [teeStream, drainStream] = stderrStream.tee();
 			this.#stderrStream = teeStream;
@@ -233,6 +248,7 @@ export class ChildProcess<In extends InMask = InMask> {
 		const { promise, resolve, reject } = Promise.withResolvers<number>();
 		this.#exited = promise;
 
+		let stderrBytes = 0;
 		this.#stderrDone = (async () => {
 			const reader = stderrStream.getReader();
 			this.#pipeReaders.add(reader);
@@ -244,7 +260,13 @@ export class ChildProcess<In extends InMask = InMask> {
 					}
 					const r = await reader.read();
 					if (r.done) break;
-					this.#stderrChunks?.push(r.value);
+					const remaining =
+						maxStderrBytes === undefined ? r.value.byteLength : Math.max(0, maxStderrBytes - stderrBytes);
+					if (remaining < r.value.byteLength) this.#stderrTruncated = true;
+					if (remaining > 0) {
+						this.#stderrChunks?.push(remaining < r.value.byteLength ? r.value.subarray(0, remaining) : r.value);
+						stderrBytes += Math.min(remaining, r.value.byteLength);
+					}
 					this.#stderrTail += dec.decode(r.value, { stream: true });
 					trim();
 				}
@@ -255,38 +277,37 @@ export class ChildProcess<In extends InMask = InMask> {
 			trim();
 		})();
 
-		proc.exited
-			.catch(() => null)
-			.then(async exitCode => {
-				if (this.#exitReasonPending) {
-					this.#exitReason = this.#exitReasonPending;
-					reject(this.#exitReasonPending);
-					return;
-				}
-				if (exitCode === 0) {
-					resolve(0);
-					return;
-				}
+		(ownedInput ? ownedInput.exited : proc.exited.catch(() => null)).then(async exitCode => {
+			if (this.#exitReasonPending) {
+				this.#exitReason = this.#exitReasonPending;
+				reject(this.#exitReasonPending);
+				return;
+			}
+			if (exitCode === 0) {
+				resolve(0);
+				return;
+			}
 
-				await this.#stderrDone;
-				if (this.#exitReasonPending) {
-					this.#exitReason = this.#exitReasonPending;
-					reject(this.#exitReasonPending);
-					return;
-				}
+			await this.#stderrDone;
+			if (this.#exitReasonPending) {
+				this.#exitReason = this.#exitReasonPending;
+				reject(this.#exitReasonPending);
+				return;
+			}
 
-				if (exitCode !== null) {
-					this.#exitReason = new NonZeroExitError(exitCode, this.#stderrTail);
-					resolve(exitCode);
-					return;
-				}
+			if (exitCode !== null) {
+				this.#exitReason = new NonZeroExitError(exitCode, this.#stderrTail);
+				resolve(exitCode);
+				return;
+			}
 
-				const ex = this.proc.killed
+			const ex =
+				!this.#ownedInput && this.proc.killed
 					? new AbortError(new Error("process killed"), this.#stderrTail)
 					: new NonZeroExitError(-1, this.#stderrTail);
-				this.#exitReason = ex;
-				reject(ex);
-			});
+			this.#exitReason = ex;
+			reject(ex);
+		}, reject);
 	}
 
 	// ── Properties ───────────────────────────────────────────────────────
@@ -298,7 +319,17 @@ export class ChildProcess<In extends InMask = InMask> {
 		return this.#exited;
 	}
 	get exitCode() {
-		return this.proc.exitCode;
+		return this.#ownedInput ? this.#ownedInput.exitCode : this.proc.exitCode;
+	}
+	/** Stable detached guardian identity; the receiver does not lead its group. */
+	get ownedInputIdentity(): Readonly<OwnedInputIdentity> | undefined {
+		return this.#ownedInput?.identity;
+	}
+	get ownedInputCleanedUp(): boolean | undefined {
+		return this.#ownedInput?.cleanupAcknowledged;
+	}
+	get signalCode(): NodeJS.Signals | null {
+		return this.#ownedInput ? this.#ownedInput.signalCode : this.proc.signalCode;
 	}
 	get exitReason() {
 		return this.#exitReason;
@@ -312,7 +343,7 @@ export class ChildProcess<In extends InMask = InMask> {
 
 	/** Raw stdout stream. Must be consumed to prevent pipe deadlock. */
 	get stdout() {
-		return this.proc.stdout;
+		return this.#ownedInput?.stdout ?? this.proc.stdout;
 	}
 
 	/** Optional stderr stream (only when requested in spawn options). */
@@ -344,6 +375,10 @@ export class ChildProcess<In extends InMask = InMask> {
 			// The normalized exit promise may already have resolved from a dead
 			// group leader; wait() still needs to report the later deadline.
 			if (this.proc.exitCode !== null) this.#exitReason = reason;
+		}
+		if (this.#ownedInput) {
+			this.#terminating = this.#ownedInput.stop(gracefulMs).catch(() => false);
+			return;
 		}
 		// An AbortSignal can race a timeout after its hard subreaper sweep has
 		// started. Do not replace that sweep with a normal root termination: the
@@ -458,7 +493,7 @@ export class ChildProcess<In extends InMask = InMask> {
 	}
 
 	async text(): Promise<string> {
-		const p = this.#readStream(this.proc.stdout);
+		const p = this.#readStream(this.stdout);
 		if (this.#nothrow) return p;
 		const [text] = await Promise.all([p, this.exitedCleanly]);
 		await this.#throwIfAborted();
@@ -508,7 +543,7 @@ export class ChildProcess<In extends InMask = InMask> {
 	}
 
 	async #readBytes(): Promise<Uint8Array<ArrayBuffer>> {
-		const reader = this.proc.stdout.getReader();
+		const reader = this.stdout.getReader();
 		this.#openPipeReaders++;
 		this.#pipeReaders.add(reader);
 		const chunks: Uint8Array[] = [];
@@ -579,7 +614,7 @@ export class ChildProcess<In extends InMask = InMask> {
 			throw new Error('Full stderr capture must be requested when spawning the process (pass stderr: "full")');
 		}
 
-		const stdoutP = this.#readStream(this.proc.stdout, maxOutputBytes, onStdout);
+		const stdoutP = this.#readStream(this.stdout, maxOutputBytes, onStdout);
 		const stderrP =
 			stderrMode === "full" && stderrChunks
 				? this.#stderrDone.then(() => new TextDecoder().decode(Buffer.concat(stderrChunks)))
@@ -605,14 +640,27 @@ export class ChildProcess<In extends InMask = InMask> {
 		// would leave timed-out descendants alive past the caller's budget.
 		if (exitError?.aborted && this.#terminating) await this.#terminating;
 
-		const exitCode = this.exitCode ?? (exitError && !exitError.aborted ? exitError.exitCode : null);
-		const ok = exitCode === 0;
+		const exitCode = this.#ownedInput
+			? this.exitCode
+			: (this.exitCode ?? (exitError && !exitError.aborted ? exitError.exitCode : null));
+		const ok = exitCode === 0 && (!this.#ownedInput || !exitError);
 
 		if (exitError) {
 			if ((exitError.aborted && !allowAbort) || (!exitError.aborted && !allowNonZero)) throw exitError;
 		}
 
-		return { stdout, stderr, exitCode, ok, exitError, ...(this.#stdoutTruncated ? { stdoutTruncated: true } : {}) };
+		return {
+			stdout,
+			stderr,
+			exitCode,
+			ok,
+			exitError,
+			...(this.#stdoutTruncated ? { stdoutTruncated: true } : {}),
+			...(this.#stderrTruncated ? { stderrTruncated: true } : {}),
+			...(this.#ownedInput
+				? { signalCode: this.signalCode, ownedInputCleanedUp: this.#ownedInput.cleanupAcknowledged }
+				: {}),
+		};
 	}
 
 	// ── Signal / timeout ─────────────────────────────────────────────────
@@ -684,6 +732,7 @@ function spawnInternal<In extends InMask = InMask>(
 	cmd: string[],
 	opts: ChildSpawnOptions<In> | undefined,
 	retainFullStderr: boolean,
+	maxStderrBytes?: number,
 ): ChildProcess<In> {
 	const { timeout = -1, signal, stderr, detached, subreaper = false, ...rest } = opts ?? {};
 	const useSubreaper = subreaper && process.platform === "linux";
@@ -704,7 +753,14 @@ function spawnInternal<In extends InMask = InMask>(
 				}
 			: rest.env,
 	});
-	const cp = new ChildProcess(child, stderr === "full", retainFullStderr, detached === true, useSubreaper);
+	const cp = new ChildProcess(
+		child,
+		stderr === "full",
+		retainFullStderr,
+		detached === true,
+		useSubreaper,
+		maxStderrBytes,
+	);
 	if (signal) cp.attachSignal(signal);
 	if (timeout > 0) cp.attachTimeout(timeout);
 	return cp;
@@ -718,6 +774,12 @@ export function spawn<In extends InMask = InMask>(cmd: string[], opts?: ChildSpa
 /** Options for exec. */
 export interface ExecOptions extends Omit<ChildSpawnOptions, "stderr" | "stdin">, WaitOptions {
 	input?: string | Buffer | Uint8Array;
+	/** Independently supervise finite input in a detached owned group. Requires explicit `env` and `input`. */
+	ownedInput?: boolean;
+	/** Retain at most this many stderr bytes while continuing to drain the pipe. */
+	maxStderrBytes?: number;
+	/** Observe the owned child before waiting. Owned execution awaits registration before releasing its guardian. */
+	onSpawn?: (child: ChildProcess) => void | Promise<void>;
 	/** Keep a private stdin pipe open until completion. A finite `input` payload takes precedence. */
 	keepStdinOpen?: boolean;
 }
@@ -727,17 +789,58 @@ export async function exec(cmd: string[], opts?: ExecOptions): Promise<ExecResul
 	const {
 		input,
 		keepStdinOpen = false,
+		ownedInput = false,
 		stderr,
 		allowAbort,
 		allowNonZero,
 		maxOutputBytes,
+		maxStderrBytes,
+		onSpawn,
 		onStdout,
 		...spawnOpts
 	} = opts ?? {};
 	const stdin = (typeof input === "string" ? Buffer.from(input) : input) ?? (keepStdinOpen ? "pipe" : undefined);
 	const resolved: ChildSpawnOptions = stdin === undefined ? spawnOpts : { ...spawnOpts, stdin };
-	using child = spawnInternal(cmd, resolved, stderr === "full");
+	let guardian: OwnedInputSupervisor | undefined;
+	if (ownedInput) {
+		if (stdin === undefined || stdin === "pipe" || spawnOpts.detached !== true || !spawnOpts.env) {
+			throw new Error("PTREE_OWNED_INPUT_UNSUPPORTED");
+		}
+		guardian = new OwnedInputSupervisor(
+			{
+				argv: [...cmd],
+				cwd: spawnOpts.cwd ?? process.cwd(),
+				env: { ...spawnOpts.env },
+				uid: spawnOpts.uid,
+				gid: spawnOpts.gid,
+				argv0: spawnOpts.argv0,
+			},
+			stdin,
+		);
+	}
+	using child = guardian
+		? new ChildProcess<InMask>(guardian.proc, false, stderr === "full", false, false, maxStderrBytes, guardian)
+		: spawnInternal<InMask>(cmd, resolved, stderr === "full", maxStderrBytes);
+	if (guardian) {
+		if (spawnOpts.signal) child.attachSignal(spawnOpts.signal);
+		if (spawnOpts.timeout && spawnOpts.timeout > 0) child.attachTimeout(spawnOpts.timeout);
+	}
 	try {
+		try {
+			if (guardian) await guardian.start();
+			if (guardian) {
+				const registration = onSpawn?.(child);
+				if (registration) await Promise.race([registration, guardian.stopped]);
+				guardian.acknowledgeRegistration();
+			} else {
+				onSpawn?.(child);
+			}
+		} catch (error) {
+			child.kill(new AbortError("exec setup failed", ""), -1);
+			guardian?.acknowledgeRegistration();
+			await child.wait({ allowAbort: true, allowNonZero: true, maxOutputBytes: 0 }).catch(() => {});
+			throw error;
+		}
 		return await child.wait({ stderr, allowAbort, allowNonZero, maxOutputBytes, onStdout });
 	} finally {
 		if (stdin === "pipe" && typeof child.stdin === "object") child.stdin.end();

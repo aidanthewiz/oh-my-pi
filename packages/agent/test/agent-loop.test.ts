@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "bun:test";
+import { setImmediate as waitForImmediate } from "node:timers/promises";
 import { type } from "@oh-my-pi/omptype";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import {
@@ -6916,6 +6917,110 @@ describe("agentLoop passive additionalContext", () => {
 		}
 		expect(aborted.message.errorMessage).toBe("Stopped by user");
 	});
+
+	for (const phase of ["execution", "postflight"] as const) {
+		it(`preserves a cleanup-owned result when cancellation arrives during ${phase}`, async () => {
+			const toolSchema = type({});
+			const controller = new AbortController();
+			const started = Promise.withResolvers<void>();
+			const releaseCleanup = Promise.withResolvers<void>();
+			const postflightStarted = Promise.withResolvers<void>();
+			const releasePostflight = Promise.withResolvers<void>();
+			let resourceOpen = false;
+			const tool: AgentTool<typeof toolSchema, { closed: boolean }> = {
+				name: "resource",
+				label: "Resource",
+				description: "Closes its resource before settling.",
+				parameters: toolSchema,
+				cancellationBehavior: "await-cleanup",
+				async execute() {
+					resourceOpen = true;
+					started.resolve();
+					await releaseCleanup.promise;
+					resourceOpen = false;
+					return {
+						content: [{ type: "text", text: "Resource closed safely." }],
+						details: { closed: true },
+						isError: true,
+					};
+				},
+			};
+			const context: AgentContext = { systemPrompt: [""], messages: [], tools: [tool] };
+			const mock = createMockModel({
+				responses: [
+					{ content: [{ type: "toolCall", id: "resource-call", name: "resource", arguments: {} }] },
+					{ content: ["done"] },
+				],
+			});
+			const config: AgentLoopConfig = {
+				model: mock.model,
+				convertToLlm: identityConverter,
+				afterToolCall: async (_context, signal) => {
+					postflightStarted.resolve();
+					await releasePostflight.promise;
+					if (signal?.aborted) throw signal.reason;
+					return undefined;
+				},
+			};
+			const events: AgentEvent[] = [];
+			const stream = agentLoop([createUserMessage("start")], context, config, controller.signal, mock.stream);
+			const consuming = (async () => {
+				for await (const event of stream) events.push(event);
+			})();
+			try {
+				await Promise.race([
+					started.promise,
+					consuming.then(() => {
+						throw new Error("Cleanup-owned execution finished before starting.");
+					}),
+				]);
+				if (phase === "postflight") {
+					releaseCleanup.resolve();
+					await Promise.race([
+						postflightStarted.promise,
+						consuming.then(() => {
+							throw new Error("Cleanup-owned execution finished before postflight.");
+						}),
+					]);
+				}
+				controller.abort(new Error("PRIVATE-CANCELLATION-CAUSE"));
+				if (phase === "execution") {
+					await waitForImmediate();
+					expect(resourceOpen).toBe(true);
+					expect(events.some(event => event.type === "tool_execution_end")).toBe(false);
+				}
+				releaseCleanup.resolve();
+				releasePostflight.resolve();
+				await consuming;
+				const toolEnd = events.find(
+					(event): event is Extract<AgentEvent, { type: "tool_execution_end" }> =>
+						event.type === "tool_execution_end",
+				);
+				expect(resourceOpen).toBe(false);
+				expect(toolEnd).toMatchObject({
+					result: {
+						content: [{ type: "text", text: "Resource closed safely." }],
+						details: { closed: true },
+					},
+					isError: true,
+				});
+				expect(JSON.stringify(toolEnd)).not.toContain("PRIVATE-CANCELLATION-CAUSE");
+				const persisted = events.find(event => event.type === "message_end" && event.message.role === "toolResult");
+				expect(persisted).toMatchObject({
+					message: {
+						content: [{ type: "text", text: "Resource closed safely." }],
+						details: { closed: true },
+						isError: true,
+					},
+				});
+			} finally {
+				controller.abort();
+				releaseCleanup.resolve();
+				releasePostflight.resolve();
+				await consuming;
+			}
+		});
+	}
 
 	it("surfaces afterToolCall errors as a tool error result", async () => {
 		const toolSchema = type({ value: "string" });
