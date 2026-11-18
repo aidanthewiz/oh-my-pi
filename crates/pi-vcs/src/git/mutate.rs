@@ -219,15 +219,43 @@ impl GitRepo {
 			match fs::read(path) {
 				Ok(bytes) => Ok(Some(bytes)),
 				Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-				Err(error) => Err(Error::backend("git commit read merge state", error)),
+				Err(error) => Err(Error::backend("git commit read operation state", error)),
 			}
 		};
 		let read_merge_head = || read_state(&merge_head_path);
 		let merge_head = read_merge_head()?;
-		if merge_head.is_some() && (options.amend || !options.files.is_empty()) {
+		let cherry_pick_head_path = self.info().git_dir.join("CHERRY_PICK_HEAD");
+		let revert_head_path = self.info().git_dir.join("REVERT_HEAD");
+		let sequencer_path = self.info().git_dir.join("sequencer");
+		let read_pick_state = || -> Result<_> {
+			let cherry_pick = read_state(&cherry_pick_head_path)?;
+			let revert = read_state(&revert_head_path)?;
+			let todo = if cherry_pick.is_some() || revert.is_some() {
+				read_state(&sequencer_path.join("todo"))?
+			} else {
+				None
+			};
+			Ok((cherry_pick, revert, todo))
+		};
+		let pick_state = read_pick_state()?;
+		let (cherry_pick_head, revert_head, sequencer_todo) = &pick_state;
+		let parse_pick_head = |head: &Option<Vec<u8>>| -> Result<_> {
+			head
+				.as_deref()
+				.map(|bytes| {
+					gix::hash::ObjectId::from_hex(bytes.trim_ascii())
+						.map_err(|err| Error::backend("git commit read operation head", err))
+				})
+				.transpose()
+		};
+		let cherry_pick_id = parse_pick_head(cherry_pick_head)?;
+		let revert_id = parse_pick_head(revert_head)?;
+		let operation_in_progress =
+			merge_head.is_some() || cherry_pick_id.is_some() || revert_id.is_some();
+		if operation_in_progress && (options.amend || !options.files.is_empty()) {
 			return Err(Error::backend(
 				"git commit",
-				"cannot amend or partially commit during a merge",
+				"cannot amend or partially commit during a merge, cherry-pick, or revert",
 			));
 		}
 		let autostash_path = merge_head
@@ -442,7 +470,22 @@ impl GitRepo {
 						return Err(Error::backend("git commit", "MERGE_HEAD has no merge parents"));
 					}
 				}
-				(parents, None)
+				let inherited_author = if merge_head.is_none() {
+					cherry_pick_id
+						.map(|id| -> Result<_> {
+							repo
+								.find_commit(id)
+								.map_err(|err| Error::backend("git commit read picked commit", err))?
+								.author()
+								.map_err(|err| Error::backend("git commit read picked author", err))?
+								.to_owned()
+								.map_err(|err| Error::backend("git commit read picked author", err))
+						})
+						.transpose()?
+				} else {
+					None
+				};
+				(parents, inherited_author)
 			};
 			if !options.allow_empty && merge_head.is_none() {
 				if let Some(parent) = parents.first() {
@@ -523,10 +566,13 @@ impl GitRepo {
 		};
 		let id = {
 			let repo = self.gix_fresh()?;
-			if read_merge_head()? != merge_head || read_autostash()? != merge_autostash {
+			if read_merge_head()? != merge_head
+				|| read_pick_state()? != pick_state
+				|| read_autostash()? != merge_autostash
+			{
 				return Err(Error::backend(
 					"git commit",
-					"merge state changed before commit publication",
+					"operation state changed before commit publication",
 				));
 			}
 			let index_update = if let Some((_, _, files, original)) = &mut path_index {
@@ -614,9 +660,15 @@ impl GitRepo {
 			id
 		};
 		let mut autostash_error = None;
-		if merge_head.is_some() {
-			if read_merge_head()? != merge_head || read_autostash()? != merge_autostash {
-				return Err(Error::backend("git commit", "merge state changed before commit cleanup"));
+		if operation_in_progress {
+			if read_merge_head()? != merge_head
+				|| read_pick_state()? != pick_state
+				|| read_autostash()? != merge_autostash
+			{
+				return Err(Error::backend(
+					"git commit",
+					"operation state changed before commit cleanup",
+				));
 			}
 			let cancel = process.cancel.take();
 			let cleanup = async {
@@ -668,6 +720,37 @@ impl GitRepo {
 						"git commit",
 						"merge state changed before commit cleanup",
 					));
+				}
+				if cherry_pick_id.is_some() || revert_id.is_some() {
+					let repo = self.gix_fresh()?;
+					for (name, id) in [("CHERRY_PICK_HEAD", cherry_pick_id), ("REVERT_HEAD", revert_id)]
+					{
+						let Some(id) = id else { continue };
+						repo
+							.edit_reference(gix::refs::transaction::RefEdit {
+								change: gix::refs::transaction::Change::Delete {
+									expected: gix::refs::transaction::PreviousValue::MustExistAndMatch(
+										id.into(),
+									),
+									log:      gix::refs::transaction::RefLog::AndReference,
+								},
+								name:   name
+									.try_into()
+									.map_err(|err| Error::backend("git commit clear pick state", err))?,
+								deref:  false,
+							})
+							.map_err(|err| Error::backend("git commit clear pick state", err))?;
+					}
+					// The first todo entry is the resolved pick; keep later picks.
+					if let Some(todo) = sequencer_todo
+						&& todo
+							.iter()
+							.position(|byte| *byte == b'\n')
+							.is_none_or(|newline| newline + 1 == todo.len())
+					{
+						fs::remove_dir_all(&sequencer_path)
+							.map_err(|err| Error::backend("git commit clear sequencer", err))?;
+					}
 				}
 				run_checked(
 					self.root(),
@@ -2914,6 +2997,146 @@ mod tests {
 		run(&["read-tree", "HEAD"]);
 		run(&["update-index", "--cacheinfo", &format!("100644,{blob},a")]);
 		alt
+	}
+
+	#[tokio::test]
+	async fn commit_finishes_resolved_cherry_picks_with_the_original_author() {
+		let (temp, repo) = fixture();
+		git(temp.path(), &["switch", "-c", "side"]);
+		fs::write(temp.path().join("a"), "picked\n").unwrap();
+		git(temp.path(), &["add", "a"]);
+		git(temp.path(), &[
+			"commit",
+			"-qm",
+			"picked",
+			"--author=Picked Author <picked@example.com>",
+			"--date=2020-01-02T03:04:05+02:00",
+		]);
+		let picked = git(temp.path(), &["rev-parse", "HEAD"]);
+		let author = git(temp.path(), &["show", "-s", "--format=%an%n%ae%n%aI", "HEAD"]);
+		git(temp.path(), &["switch", "main"]);
+		fs::write(temp.path().join("a"), "main\n").unwrap();
+		git(temp.path(), &["commit", "-qam", "main"]);
+		let parent = git(temp.path(), &["rev-parse", "HEAD"]);
+		let conflict = Command::new("git")
+			.arg("-C")
+			.arg(temp.path())
+			.args(["cherry-pick", &picked])
+			.output()
+			.unwrap();
+		assert!(!conflict.status.success());
+		assert_eq!(git(temp.path(), &["rev-parse", "CHERRY_PICK_HEAD"]), picked);
+		assert_eq!(git(temp.path(), &["diff", "--name-only", "--diff-filter=U"]), "a");
+		fs::write(temp.path().join("a"), "resolved\n").unwrap();
+		repo.stage_files(&["a".into()]).unwrap();
+
+		let id = repo
+			.commit_create("resolved cherry-pick\n", &CommitOptions::default(), None)
+			.await
+			.unwrap();
+
+		assert_eq!(
+			(
+				git(temp.path(), &["show", "-s", "--format=%an%n%ae%n%aI", &id]),
+				temp.path().join(".git/CHERRY_PICK_HEAD").exists(),
+			),
+			(author, false),
+		);
+		assert_eq!(git(temp.path(), &["show", "-s", "--format=%P", &id]), parent);
+		assert_eq!(git(temp.path(), &["show", "HEAD:a"]), "resolved");
+		assert!(!temp.path().join(".git/MERGE_MSG").exists());
+		assert_eq!(git(temp.path(), &["status", "--porcelain"]), "");
+	}
+
+	#[tokio::test]
+	async fn commit_finishes_resolved_reverts_with_the_current_author() {
+		let (temp, repo) = fixture();
+		fs::write(temp.path().join("a"), "picked\n").unwrap();
+		git(temp.path(), &["add", "a"]);
+		git(temp.path(), &["commit", "-qm", "picked", "--author=Picked Author <picked@example.com>"]);
+		let picked = git(temp.path(), &["rev-parse", "HEAD"]);
+		fs::write(temp.path().join("a"), "current\n").unwrap();
+		git(temp.path(), &["commit", "-qam", "current"]);
+		let parent = git(temp.path(), &["rev-parse", "HEAD"]);
+		let author = git(temp.path(), &["show", "-s", "--format=%an%n%ae", "HEAD"]);
+		let conflict = Command::new("git")
+			.arg("-C")
+			.arg(temp.path())
+			.args(["revert", "--no-edit", &picked])
+			.output()
+			.unwrap();
+		assert!(!conflict.status.success());
+		assert_eq!(git(temp.path(), &["rev-parse", "REVERT_HEAD"]), picked);
+		assert_eq!(git(temp.path(), &["diff", "--name-only", "--diff-filter=U"]), "a");
+		fs::write(temp.path().join("a"), "resolved revert\n").unwrap();
+		repo.stage_files(&["a".into()]).unwrap();
+
+		let id = repo
+			.commit_create("resolved revert\n", &CommitOptions::default(), None)
+			.await
+			.unwrap();
+
+		assert_eq!(
+			(
+				git(temp.path(), &["show", "-s", "--format=%an%n%ae", &id]),
+				temp.path().join(".git/REVERT_HEAD").exists(),
+			),
+			(author, false),
+		);
+		assert_eq!(git(temp.path(), &["show", "-s", "--format=%P", &id]), parent);
+		assert_eq!(git(temp.path(), &["show", "HEAD:a"]), "resolved revert");
+		assert!(!temp.path().join(".git/MERGE_MSG").exists());
+		assert_eq!(git(temp.path(), &["status", "--porcelain"]), "");
+	}
+
+	#[tokio::test]
+	async fn commit_preserves_pending_picks_and_finishes_the_last_sequenced_pick() {
+		for conflict_first in [false, true] {
+			let (temp, repo) = fixture();
+			git(temp.path(), &["switch", "-c", "side"]);
+			let mut picks = Vec::new();
+			for file in if conflict_first {
+				["a", "b"]
+			} else {
+				["b", "a"]
+			} {
+				fs::write(temp.path().join(file), "picked\n").unwrap();
+				git(temp.path(), &["add", file]);
+				git(temp.path(), &["commit", "-qm", file]);
+				picks.push(git(temp.path(), &["rev-parse", "HEAD"]));
+			}
+			git(temp.path(), &["switch", "main"]);
+			fs::write(temp.path().join("a"), "main\n").unwrap();
+			git(temp.path(), &["commit", "-qam", "main"]);
+			let conflict = Command::new("git")
+				.arg("-C")
+				.arg(temp.path())
+				.arg("cherry-pick")
+				.args(&picks)
+				.output()
+				.unwrap();
+			assert!(!conflict.status.success());
+			assert_eq!(git(temp.path(), &["diff", "--name-only", "--diff-filter=U"]), "a");
+			assert!(temp.path().join(".git/sequencer/todo").exists());
+			fs::write(temp.path().join("a"), "resolved\n").unwrap();
+			repo.stage_files(&["a".into()]).unwrap();
+
+			repo
+				.commit_create("resolved sequence\n", &CommitOptions::default(), None)
+				.await
+				.unwrap();
+
+			assert!(!temp.path().join(".git/CHERRY_PICK_HEAD").exists());
+			assert_eq!(temp.path().join(".git/sequencer").exists(), conflict_first);
+			if conflict_first {
+				assert_eq!(git(temp.path(), &["show", "HEAD:b"]), "two");
+				git(temp.path(), &["cherry-pick", "--continue"]);
+			}
+			assert_eq!(git(temp.path(), &["show", "HEAD:a"]), "resolved");
+			assert_eq!(git(temp.path(), &["show", "HEAD:b"]), "picked");
+			assert!(!temp.path().join(".git/sequencer").exists());
+			assert_eq!(git(temp.path(), &["status", "--porcelain"]), "");
+		}
 	}
 
 	#[tokio::test]
