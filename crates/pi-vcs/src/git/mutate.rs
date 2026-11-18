@@ -215,13 +215,14 @@ impl GitRepo {
 			return Err(Error::Canceled);
 		}
 		let merge_head_path = self.info().git_dir.join("MERGE_HEAD");
-		let read_merge_head = || -> Result<Option<Vec<u8>>> {
-			match fs::read(&merge_head_path) {
+		let read_state = |path: &Path| -> Result<Option<Vec<u8>>> {
+			match fs::read(path) {
 				Ok(bytes) => Ok(Some(bytes)),
 				Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-				Err(error) => Err(Error::backend("git commit read MERGE_HEAD", error)),
+				Err(error) => Err(Error::backend("git commit read merge state", error)),
 			}
 		};
+		let read_merge_head = || read_state(&merge_head_path);
 		let merge_head = read_merge_head()?;
 		if merge_head.is_some() && (options.amend || !options.files.is_empty()) {
 			return Err(Error::backend(
@@ -229,6 +230,21 @@ impl GitRepo {
 				"cannot amend or partially commit during a merge",
 			));
 		}
+		let autostash_path = merge_head
+			.as_ref()
+			.map(|_| self.info().git_dir.join("MERGE_AUTOSTASH"));
+		let read_autostash = || match &autostash_path {
+			Some(path) => read_state(path),
+			None => Ok(None),
+		};
+		let merge_autostash = read_autostash()?;
+		let autostash_id = merge_autostash
+			.as_deref()
+			.map(|bytes| {
+				gix::hash::ObjectId::from_hex(bytes.trim_ascii())
+					.map_err(|err| Error::backend("git commit read MERGE_AUTOSTASH", err))
+			})
+			.transpose()?;
 		let sign = {
 			let repo = self.gix_fresh()?;
 			// A malformed value must never silently disable configured signing.
@@ -507,7 +523,7 @@ impl GitRepo {
 		};
 		let id = {
 			let repo = self.gix_fresh()?;
-			if read_merge_head()? != merge_head {
+			if read_merge_head()? != merge_head || read_autostash()? != merge_autostash {
 				return Err(Error::backend(
 					"git commit",
 					"merge state changed before commit publication",
@@ -597,21 +613,78 @@ impl GitRepo {
 			}
 			id
 		};
+		let mut autostash_error = None;
 		if merge_head.is_some() {
-			if read_merge_head()? != merge_head {
+			if read_merge_head()? != merge_head || read_autostash()? != merge_autostash {
 				return Err(Error::backend("git commit", "merge state changed before commit cleanup"));
 			}
 			let cancel = process.cancel.take();
-			let cleanup = run_checked(
-				self.root(),
-				&["-c".into(), "safe.directory=*".into(), "merge".into(), "--quit".into()],
-				&process,
-			)
+			let cleanup = async {
+				if let Some(stash) = autostash_id {
+					let mut args = Vec::with_capacity(7);
+					args.extend([
+						"-c".into(),
+						"safe.directory=*".into(),
+						"stash".into(),
+						"apply".into(),
+						stash.to_hex().to_string(),
+					]);
+					let applied = run_checked(self.root(), &args, &process).await;
+					let stash = args.pop().expect("autostash is the last argument");
+					let stash = if let Err(error) = applied {
+						let message = format!(
+							"commit {} created, but autostash {stash} could not be restored; recovery is \
+							 retained in the stash: {error}",
+							id.to_hex()
+						);
+						args.truncate(2);
+						args.extend([
+							"stash".into(),
+							"store".into(),
+							"-m".into(),
+							"autostash".into(),
+							stash,
+						]);
+						run_checked(self.root(), &args, &process).await?;
+						autostash_error = Some(Error::backend("git commit restore autostash", message));
+						args.pop().expect("autostash is the last argument")
+					} else {
+						stash
+					};
+					args.truncate(2);
+					args.extend([
+						"update-ref".into(),
+						"--no-deref".into(),
+						"-d".into(),
+						"MERGE_AUTOSTASH".into(),
+						stash,
+					]);
+					run_checked(self.root(), &args, &process).await?;
+				}
+				if autostash_id.is_some()
+					&& (read_merge_head()? != merge_head || read_autostash()?.is_some())
+				{
+					return Err(Error::backend(
+						"git commit",
+						"merge state changed before commit cleanup",
+					));
+				}
+				run_checked(
+					self.root(),
+					&["-c".into(), "safe.directory=*".into(), "merge".into(), "--quit".into()],
+					&process,
+				)
+				.await
+				.map(|_| ())
+			}
 			.await;
 			process.cancel = cancel;
 			cleanup?;
 		}
 		let _ = run_commit_hook(self, "post-commit", &[], &process).await;
+		if let Some(error) = autostash_error {
+			return Err(error);
+		}
 		Ok(id.to_hex().to_string())
 	}
 
@@ -2877,6 +2950,54 @@ mod tests {
 			assert!(!temp.path().join(".git/MERGE_HEAD").exists());
 			assert!(!temp.path().join(".git/MERGE_MSG").exists());
 			assert_eq!(git(temp.path(), &["status", "--porcelain"]), "");
+		}
+	}
+
+	#[tokio::test]
+	async fn commit_restores_merge_autostash_and_preserves_conflict_recovery() {
+		for conflict in [false, true] {
+			let (temp, repo) = fixture();
+			git(temp.path(), &["switch", "-c", "side"]);
+			fs::write(temp.path().join("side"), "side\n").unwrap();
+			if conflict {
+				fs::write(temp.path().join("a"), "side edit\n").unwrap();
+			}
+			git(temp.path(), &["add", "."]);
+			git(temp.path(), &["commit", "-qm", "side"]);
+			let side = git(temp.path(), &["rev-parse", "HEAD"]);
+			git(temp.path(), &["switch", "main"]);
+			let main = git(temp.path(), &["rev-parse", "HEAD"]);
+			fs::write(temp.path().join("a"), "local edit\n").unwrap();
+			git(temp.path(), &["merge", "--no-ff", "--no-commit", "--autostash", "side"]);
+			let stash = git(temp.path(), &["rev-parse", "MERGE_AUTOSTASH"]);
+
+			let result = repo
+				.commit_create("autostashed merge\n", &CommitOptions::default(), None)
+				.await;
+
+			let id = git(temp.path(), &["rev-parse", "HEAD"]);
+			assert_eq!(
+				git(temp.path(), &["show", "-s", "--format=%P", &id]),
+				format!("{main} {side}")
+			);
+			if conflict {
+				let error = result.unwrap_err().to_string();
+				assert!(error.contains(&id), "{error}");
+				assert!(error.contains(&stash), "{error}");
+				assert_eq!(git(temp.path(), &["stash", "list", "--format=%H"]), stash);
+				assert_eq!(git(temp.path(), &["show", &format!("{stash}:a")]), "local edit");
+				assert_eq!(git(temp.path(), &["diff", "--name-only", "--diff-filter=U"]), "a");
+				let worktree = fs::read_to_string(temp.path().join("a")).unwrap();
+				assert!(worktree.contains("local edit\n"));
+				assert!(worktree.contains("side edit\n"));
+			} else {
+				assert_eq!(result.unwrap(), id);
+				assert_eq!(fs::read_to_string(temp.path().join("a")).unwrap(), "local edit\n");
+				assert_eq!(git(temp.path(), &["stash", "list", "--format=%H"]), "");
+				assert_eq!(git(temp.path(), &["diff", "--cached", "--name-only"]), "");
+			}
+			assert!(!temp.path().join(".git/MERGE_HEAD").exists());
+			assert!(!temp.path().join(".git/MERGE_AUTOSTASH").exists());
 		}
 	}
 

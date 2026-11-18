@@ -168,6 +168,47 @@ describe("commitCreate message isolation", () => {
 		expect(await git(root, "status", "--porcelain")).toBe("");
 	});
 
+	test.each([false, true])("restores merge autostash and retains conflict recovery (conflict=%s)", async conflict => {
+		const root = await repository();
+		await git(root, "switch", "-c", "side");
+		await Bun.write(path.join(root, "branch.txt"), "side\n");
+		if (conflict) await Bun.write(path.join(root, "tracked.txt"), "side edit\n");
+		await git(root, "add", ".");
+		await git(root, "commit", "-m", "side");
+		const side = await git(root, "rev-parse", "HEAD");
+		await git(root, "switch", "main");
+		const main = await git(root, "rev-parse", "HEAD");
+		await Bun.write(path.join(root, "tracked.txt"), "local edit\n");
+		await git(root, "merge", "--no-ff", "--no-commit", "--autostash", "side");
+		const stash = await git(root, "rev-parse", "MERGE_AUTOSTASH");
+		const repo = vcsGitDiscover(root)!;
+
+		const outcome = await repo.commitCreate("autostashed merge\n", {}).then(
+			id => ({ id, error: null }),
+			error => ({ id: null, error: String(error) }),
+		);
+
+		const id = await git(root, "rev-parse", "HEAD");
+		expect(await git(root, "show", "-s", "--format=%P", id)).toBe(`${main} ${side}`);
+		if (conflict) {
+			expect(outcome.error).toContain(id);
+			expect(outcome.error).toContain(stash);
+			expect(await git(root, "stash", "list", "--format=%H")).toBe(stash);
+			expect(await git(root, "show", `${stash}:tracked.txt`)).toBe("local edit");
+			expect(await git(root, "diff", "--name-only", "--diff-filter=U")).toBe("tracked.txt");
+			const worktree = await Bun.file(path.join(root, "tracked.txt")).text();
+			expect(worktree).toContain("local edit\n");
+			expect(worktree).toContain("side edit\n");
+		} else {
+			expect(outcome.id).toBe(id);
+			expect(await Bun.file(path.join(root, "tracked.txt")).text()).toBe("local edit\n");
+			expect(await git(root, "stash", "list", "--format=%H")).toBe("");
+			expect(await git(root, "diff", "--cached", "--name-only")).toBe("");
+		}
+		expect(await Bun.file(path.join(root, ".git", "MERGE_HEAD")).exists()).toBe(false);
+		expect(await Bun.file(path.join(root, ".git", "MERGE_AUTOSTASH")).exists()).toBe(false);
+	});
+
 	test.each([false, true])("honors prepare-commit-msg edits and refusal (noVerify=%s)", async noVerify => {
 		const root = await repository();
 		await installHook(

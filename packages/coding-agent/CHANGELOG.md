@@ -19,6 +19,7 @@
 
 - Guard unborn HEADs and commit selected working copies without changing unrelated staged entries. Keep hook messages private per commit.
 - Preserve resolved merge parents and finish merge state, including merges whose trees do not change.
+- Restore automatic merge stashes. Preserve conflicted edits in a recovery stash and report the already-created commit when restoration fails.
 - Run `prepare-commit-msg` before validation even with `noVerify`, retaining per-call message ownership.
 - Serialize task patch application and ownership snapshots in one repository transaction.
 - Remove staged Antigravity grants only after their transports exit. Fence logout against delayed staging, preserve concurrent accounts, and allow explicit broker-backed reauthentication.
