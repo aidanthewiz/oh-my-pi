@@ -6,7 +6,7 @@
  * tools the model already has:
  *
  *   read  xd://          → mounted tool listing (discovery)
- *   read  xd://<tool>    → tool docs + JSON parameter schema
+ *   read  xd://<tool>    → tool docs + TypeScript parameter summary
  *   write xd://<tool>    → execute: `content` is the JSON args object
  *
  * Direct and device dispatch share one canonical tool map. The mounted-name
@@ -34,6 +34,7 @@ import {
 	type AgentToolResult,
 	type AgentToolUpdateCallback,
 	type ToolLoadMode,
+	resolveToolCancellationBehavior,
 	validateAgentToolArguments,
 } from "@oh-my-pi/pi-agent-core";
 import { type Tool as AiTool, jsonSchemaToTypeScript, toolWireSchema } from "@oh-my-pi/pi-ai";
@@ -121,7 +122,7 @@ function renderDocs(inst: Tool, heading = "#", descriptionCap?: number): string 
 		"",
 		description,
 		"",
-		`${heading}# Schema`,
+		`${heading}# Schema summary (TypeScript, not full JSON Schema)`,
 		"```ts",
 		`type Args = ${schema};`,
 		"```",
@@ -142,7 +143,7 @@ function renderDocs(inst: Tool, heading = "#", descriptionCap?: number): string 
  * Content is a model-written payload, so lenience strips forged
  * `__parseError`/`__rawJson` sentinels (see `validateAgentToolArguments`).
  */
-function parseDeviceArgs(
+export function parseDeviceArgs(
 	device: Tool,
 	content: string,
 	toolCallId: string,
@@ -258,6 +259,22 @@ export function resolveXdevTool(state: XdevState, name: string): Tool | undefine
 	return state.tools.get(name);
 }
 
+/** Resolve cancellation from the enabled canonical tool and its validated execution input. */
+export function resolveXdevCancellationBehavior(
+	state: XdevState,
+	name: string,
+	content: string,
+): "await-cleanup" | undefined {
+	const tool = resolveXdevTool(state, name);
+	if (!tool || tool.cancellationBehavior === undefined || HELP_CONTENT_RE.test(content)) return undefined;
+	try {
+		const args = parseDeviceArgs(tool, content, "cancellation-policy", () => "");
+		return resolveToolCancellationBehavior(tool, args);
+	} catch {
+		return undefined;
+	}
+}
+
 /**
  * Resolve a mounted tool by name. Presentation-only: `xd://` docs and renderer
  * lookup ask for names they already hold in canonical form.
@@ -312,11 +329,11 @@ export function xdevListing(state: XdevState): string {
 		`${XD_URL_PREFIX} ${state.mountedNames.size} mounted tool devices.`,
 		...rows,
 		"",
-		`Read ${XD_URL_PREFIX}<tool> for docs + JSON schema; write the JSON args object to ${XD_URL_PREFIX}<tool> to execute. Active top-level tools accept the same dispatch.`,
+		`Read ${XD_URL_PREFIX}<tool> for docs + a TypeScript parameter summary; write the JSON args object to ${XD_URL_PREFIX}<tool> to execute. Active top-level tools accept the same dispatch.`,
 	].join("\n");
 }
 
-/** Docs + schema for any enabled tool. */
+/** Docs + TypeScript parameter summary for any enabled tool. */
 export function xdevDocs(state: XdevState, name: string): string {
 	return renderDocs(resolveRequiredXdevTool(state, name));
 }
@@ -485,6 +502,7 @@ export async function dispatchXdevTool(
 					},
 				}
 			: undefined;
+		if (signal?.aborted) throw new ToolAbortError("Tool execution was aborted");
 		const result = await executable.execute(toolCallId, validated as never, signal, innerOnUpdate, executionContext);
 		return { result, xdev: { ...xdev, inner: result.details } };
 	} catch (error) {

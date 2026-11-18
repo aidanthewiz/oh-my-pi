@@ -2,6 +2,7 @@
  * Agent loop that works with AgentMessage throughout.
  * Transforms to Message[] only at the LLM call boundary.
  */
+import { AsyncLocalStorage } from "node:async_hooks";
 import {
 	type AssistantMessage,
 	type AssistantMessageEvent,
@@ -76,6 +77,7 @@ import {
 	startInvokeAgentSpan,
 } from "./telemetry";
 import { validateAgentToolArguments } from "./tool-arguments";
+import { resolveToolCancellationBehavior } from "./tool-cancellation";
 import {
 	createAdditionalContextMessage,
 	isNonBlankContext,
@@ -109,6 +111,53 @@ import {
 	isSoftToolRequirement,
 	SPECULATIVE_STREAM_SESSION,
 } from "./types";
+
+interface ToolExecutionCarrier {
+	readonly tool: AgentTool;
+	readonly args: unknown;
+	readonly parent: ToolExecutionCarrier | undefined;
+	active: boolean;
+}
+
+const toolExecutionCarrier = new AsyncLocalStorage<ToolExecutionCarrier | null>();
+
+function withCleanupOwnedToolCall<T>(
+	tool: AgentTool,
+	args: unknown,
+	cleanupOwned: boolean,
+	run: () => T | Promise<T>,
+): Promise<T> {
+	const parent = toolExecutionCarrier.getStore();
+	if (!cleanupOwned || parent === null) return Promise.resolve(toolExecutionCarrier.run(null, run));
+	const carrier: ToolExecutionCarrier = {
+		tool,
+		args,
+		parent,
+		active: true,
+	};
+	return toolExecutionCarrier.run(carrier, async () => {
+		try {
+			return await run();
+		} finally {
+			carrier.active = false;
+		}
+	});
+}
+
+/** Return arguments only while this exact native invocation owns its entire cleanup chain. */
+export function getCleanupOwnedToolCallArgs(tool: AgentTool): unknown | undefined {
+	const carrier = toolExecutionCarrier.getStore();
+	if (!carrier || carrier.tool !== tool) return undefined;
+	for (let current: ToolExecutionCarrier | undefined = carrier; current !== undefined; current = current.parent) {
+		if (!current.active) return undefined;
+	}
+	return carrier.args;
+}
+
+/** An unsupported outer carrier cannot gain ownership through a nested native dispatch. */
+export function withoutCleanupOwnedToolCall<T>(run: () => T): T {
+	return toolExecutionCarrier.run(null, run);
+}
 
 async function waitForProcessPause(config: AgentLoopConfig, signal?: AbortSignal): Promise<void> {
 	try {
@@ -3134,9 +3183,8 @@ async function prepareToolCallDispatch(
 		if (!beforeToolCall || !tool) continue;
 		let beforeResult: BeforeToolCallResult | undefined;
 		try {
-			beforeResult = await beforeToolCall(
-				{ assistantMessage, toolCall, tool, args: effectiveArgs, context },
-				signal,
+			beforeResult = await withoutCleanupOwnedToolCall(() =>
+				beforeToolCall({ assistantMessage, toolCall, tool, args: effectiveArgs, context }, signal),
 			);
 		} catch (e) {
 			// Contract: a throwing hook surfaces as a tool-error result without
@@ -3579,6 +3627,7 @@ async function executeToolCalls(
 		let caughtError: unknown;
 		let deliveredReplies: string[] | undefined;
 		let completedToolExecution = false;
+		let awaitCancellationCleanup = false;
 		let executionStarted = false;
 		const abortBeforeToolExecution = (): boolean => {
 			if (!isToolAborted(record)) return false;
@@ -3603,6 +3652,7 @@ async function executeToolCalls(
 					record.executionArgs ??
 					(transformToolCallArguments ? transformToolCallArguments(effectiveArgs, toolCall.name) : effectiveArgs);
 				record.args = executionArgs;
+				awaitCancellationCleanup = resolveToolCancellationBehavior(tool, executionArgs) === "await-cleanup";
 				// A transform or awaited claim can cancel the external run after
 				// a queued wake already fixed the combined signal's reason.
 				if (abortBeforeToolExecution()) return;
@@ -3653,37 +3703,39 @@ async function executeToolCalls(
 						// nothing may await or call host code after this final check.
 						if (abortBeforeToolExecution()) return;
 						executionStarted = true;
-						rawResult = await tool.execute(
-							toolCall.id,
-							executionArgs,
-							record.signal,
-							partialResult => {
-								const event: Extract<AgentEvent, { type: "tool_execution_update" }> = {
-									type: "tool_execution_update",
-									toolCallId: toolCall.id,
-									toolName: toolCall.name,
-									args: executionArgs,
-									partialResult: coerceToolResult(partialResult).result,
-								};
-								if (stream.done) {
-									if (!config.onDetachedToolUpdate) return;
-									config.onDetachedToolUpdate(event);
-								} else stream.push(event);
-								const replies = (event.partialResult.details as { replies?: unknown } | undefined)?.replies;
-								if (Array.isArray(replies)) {
-									let changed = deliveredReplies?.length !== replies.length;
-									let valid = true;
-									for (let i = 0; i < replies.length; i++) {
-										if (typeof replies[i] !== "string") {
-											valid = false;
-											break;
+						rawResult = await withCleanupOwnedToolCall(tool, executionArgs, awaitCancellationCleanup, () =>
+							tool.execute(
+								toolCall.id,
+								executionArgs,
+								record.signal,
+								partialResult => {
+									const event: Extract<AgentEvent, { type: "tool_execution_update" }> = {
+										type: "tool_execution_update",
+										toolCallId: toolCall.id,
+										toolName: toolCall.name,
+										args: executionArgs,
+										partialResult: coerceToolResult(partialResult).result,
+									};
+									if (stream.done) {
+										if (!config.onDetachedToolUpdate) return;
+										config.onDetachedToolUpdate(event);
+									} else stream.push(event);
+									const replies = (event.partialResult.details as { replies?: unknown } | undefined)?.replies;
+									if (Array.isArray(replies)) {
+										let changed = deliveredReplies?.length !== replies.length;
+										let valid = true;
+										for (let i = 0; i < replies.length; i++) {
+											if (typeof replies[i] !== "string") {
+												valid = false;
+												break;
+											}
+											changed ||= replies[i] !== deliveredReplies?.[i];
 										}
-										changed ||= replies[i] !== deliveredReplies?.[i];
+										if (valid && changed) deliveredReplies = [...replies];
 									}
-									if (valid && changed) deliveredReplies = [...replies];
-								}
-							},
-							toolContext,
+								},
+								toolContext,
+							),
 						);
 					} finally {
 						await streamSession?.discard("outer tool completed without committing stream speculation");
@@ -3702,19 +3754,27 @@ async function executeToolCalls(
 				isError = true;
 			}
 
-			if (afterToolCall && (!record.signal.aborted || completedToolExecution)) {
+			const retainsCleanupResult = completedToolExecution && awaitCancellationCleanup;
+			if (
+				afterToolCall &&
+				(!record.signal.aborted || completedToolExecution) &&
+				!(retainsCleanupResult && record.signal.aborted)
+			) {
 				try {
-					const after = await afterToolCall(
-						{
-							assistantMessage,
-							toolCall,
-							args: record.args,
-							result,
-							isError,
-							context: currentContext,
-						},
-						record.signal,
+					const after = await withoutCleanupOwnedToolCall(() =>
+						afterToolCall(
+							{
+								assistantMessage,
+								toolCall,
+								args: record.args,
+								result,
+								isError,
+								context: currentContext,
+							},
+							record.signal,
+						),
 					);
+					if (retainsCleanupResult && record.signal.aborted) return;
 					if (after) {
 						// Re-normalize the post-hook result: `afterToolCall` is untyped user/extension
 						// code and may return malformed `content` (non-array / invalid blocks), which
@@ -3734,6 +3794,7 @@ async function executeToolCalls(
 						}
 					}
 				} catch (e) {
+					if (retainsCleanupResult && record.signal.aborted) return;
 					caughtError = e;
 					result = {
 						content: [{ type: "text", text: e instanceof Error ? e.message : String(e) }],

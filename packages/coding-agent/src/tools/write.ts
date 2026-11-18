@@ -53,7 +53,14 @@ import writeDeviceOnlyRefusal from "../prompts/tools/write-device-only-refusal.m
 import type { ToolSession } from "../sdk";
 
 import { routeWriteThroughBridge, shouldRouteWriteThroughBridge } from "./acp-bridge";
-import { formatApprovalArguments, truncateForPrompt } from "./approval";
+import {
+	denyError,
+	formatApprovalArguments,
+	resolveApproval,
+	resolveApprovalFromContext,
+	resolveToolDecision,
+	truncateForPrompt,
+} from "./approval";
 import { approvalTargetIdentities, approvalTargetKey } from "./approval-targets";
 import { assertEditableFile } from "./auto-generated-guard";
 
@@ -84,9 +91,10 @@ import {
 	updateRowByRowId,
 } from "./sqlite-reader";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
+import { ToolAbortError } from "./tool-errors";
 import { toolResult } from "./tool-result";
 import { maybeWriteSnapshotHeader, stripWriteContent } from "./write-content";
-import { resolveXdevTool } from "./xdev";
+import { parseDeviceArgs, resolveXdevTool } from "./xdev";
 import { REPORT_ISSUE_DEVICE_NAME } from "@oh-my-pi/pi-tui/tools/report-tool-issue";
 import { isResolutionDeviceName } from "@oh-my-pi/pi-tui/tools/resolve";
 import { dispatchReportIssueDevice } from "./report-tool-issue";
@@ -577,33 +585,79 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 	readonly approval = (args: unknown): ToolApprovalDecision => {
 		const { path: rawPath, content } = args as Partial<WriteParams>;
 		if (typeof rawPath !== "string") return "write";
-		// Unwrap a hashline `[path#TAG]` wrapper first (parity with execute) so a
-		// wrapped `[scheme://h/x#ABCD]` gets the same tier as the bare URL.
-		return InternalUrlRouter.instance().writeTier(
-			unwrapHashlineHeaderPath(rawPath),
-			typeof content === "string" ? content : undefined,
-			this.session,
-		);
+		const router = InternalUrlRouter.instance();
+		const { path } = recoverConflictUriPrefix(router.peelWriteSelector(unwrapHashlineHeaderPath(rawPath), "write"));
+		const target = router.writeTarget(path);
+		const cleanContent =
+			typeof content !== "string" || target?.spec.write?.payload === "verbatim"
+				? content
+				: stripWriteContent(this.session, content).text;
+		return router.writeTier(path, cleanContent, this.session);
 	};
-	async prepareRuntimeApproval(_toolCallId: string, args: unknown, signal?: AbortSignal): Promise<undefined> {
+	readonly cancellationBehavior = (args: unknown): "await-cleanup" | undefined => {
+		if (!isRecord(args) || typeof args.path !== "string") return undefined;
+		try {
+			const router = InternalUrlRouter.instance();
+			const { path } = recoverConflictUriPrefix(
+				router.peelWriteSelector(unwrapHashlineHeaderPath(args.path), "write"),
+			);
+			const target = router.writeTarget(path);
+			const policy = target?.spec.write;
+			if (!target || !policy?.cancellationBehavior) return undefined;
+			const content = typeof args.content === "string" ? args.content : undefined;
+			const cleanContent =
+				content === undefined || policy.payload === "verbatim"
+					? content
+					: stripWriteContent(this.session, content).text;
+			return policy.cancellationBehavior(target.url, cleanContent, this.session);
+		} catch {
+			return undefined;
+		}
+	};
+	async prepareRuntimeApproval(
+		toolCallId: string,
+		args: unknown,
+		signal?: AbortSignal,
+		context?: AgentToolContext,
+	): Promise<undefined> {
 		const input = args as Partial<WriteParams>;
 		if (typeof input.path !== "string" || typeof input.content !== "string") return undefined;
-		const url = InternalUrlRouter.instance().writeTarget(unwrapHashlineHeaderPath(input.path))?.url;
+		const router = InternalUrlRouter.instance();
+		const { path } = recoverConflictUriPrefix(
+			router.peelWriteSelector(unwrapHashlineHeaderPath(input.path), "write"),
+		);
+		const target = router.writeTarget(path);
+		const url = target?.url;
 		if (url?.protocol !== "xd:") return undefined;
 		const name = parseXdUrl(url.rawHref ?? url.href)?.name;
 		const inst = name && this.session.xdev ? resolveXdevTool(this.session.xdev, name) : undefined;
 		const prepare = (
 			inst as { prepareApprovalTier?: (args: unknown, signal?: AbortSignal) => Promise<void> } | undefined
 		)?.prepareApprovalTier;
-		if (!prepare) return undefined;
-		let parsed: unknown;
+		if (!name || !inst || !prepare) return undefined;
+		const content =
+			target?.spec.write?.payload === "verbatim"
+				? input.content
+				: stripWriteContent(this.session, input.content).text;
+		let parsed: Record<string, unknown>;
 		try {
-			parsed = JSON.parse(input.content);
+			parsed = parseDeviceArgs(inst, content, toolCallId, () => "");
 		} catch {
 			return undefined;
 		}
+		const { approvalMode, userPolicies } = resolveApprovalFromContext({
+			autoApprove: context?.autoApprove,
+			settings: this.session.settings,
+		});
+		const approval = resolveApproval(
+			{ name: this.name, approval: { ...resolveToolDecision(inst, parsed), policyKey: name } },
+			parsed,
+			approvalMode,
+			userPolicies,
+		);
+		if (approval.policy === "deny") throw denyError(approval, this.name);
 		// Resolve async device tiers before the outer synchronous xd:// approval gate.
-		if (isRecord(parsed)) await prepare.call(inst, parsed, signal);
+		await prepare.call(inst, parsed, signal);
 		return undefined;
 	}
 
@@ -1051,14 +1105,12 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 				}),
 			);
 		}
-		return untilAborted(signal, async () => {
-			// Text payloads get hashline display prefixes ([PATH#HASH] + LINE:) stripped if the model
-			// copied them from read output. Verbatim payloads (messages, process stdin, setting
-			// values, conflict directives) reach their handler exactly as the model wrote them.
-			const verbatim = policy?.payload === "verbatim";
-			const { text: cleanContent, stripped } = verbatim
-				? { text: content, stripped: false }
-				: stripWriteContent(this.session, content);
+		// Text payloads strip copied display prefixes; device policy sees the execution payload.
+		const verbatim = policy?.payload === "verbatim";
+		const { text: cleanContent, stripped } = verbatim
+			? { text: content, stripped: false }
+			: stripWriteContent(this.session, content);
+		const writeOperation = async (): Promise<AgentToolResult<WriteToolDetails>> => {
 			// One UTF-8 scan per call, shared by the progress and result lines.
 			const cleanBytes = Buffer.byteLength(cleanContent, "utf8");
 			assertWriteTargetAddressable(path, router);
@@ -1281,6 +1333,11 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 						.get(),
 				},
 			};
-		});
+		};
+		if (target && policy?.cancellationBehavior?.(target.url, cleanContent, this.session) === "await-cleanup") {
+			if (signal?.aborted) throw new ToolAbortError("Tool execution was aborted");
+			return writeOperation();
+		}
+		return untilAborted(signal, writeOperation);
 	}
 }

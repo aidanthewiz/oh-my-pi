@@ -6,6 +6,7 @@ import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { resolveApproval, sessionApprovalScope } from "@oh-my-pi/pi-coding-agent/tools/approval";
 import { WriteTool } from "@oh-my-pi/pi-coding-agent/tools/write";
 import { resolveXdevTool, type XdevState } from "@oh-my-pi/pi-coding-agent/tools/xdev";
+import { Settings } from "../src/config/settings";
 
 const serverName = "coreforge-drata-mcp";
 const definition: MCPToolDefinition = {
@@ -63,7 +64,7 @@ describe("managed Drata approval", () => {
 			isActive: () => false,
 			resolve: name => resolveXdevTool(state, name),
 		};
-		const write = new WriteTool({ cwd: ".", xdev: state } as ToolSession);
+		const write = new WriteTool({ cwd: ".", settings: Settings.isolated({}), xdev: state } as ToolSession);
 		const args = { path: `xd://${tool.name}`, content: JSON.stringify({ id: 42 }) };
 		expect(resolveApproval(write, args, "yolo").policy).toBe("prompt");
 		expect(resolveApproval(write, args, "yolo", { [tool.name]: "deny" }).policy).toBe("deny");

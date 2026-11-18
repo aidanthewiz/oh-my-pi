@@ -1,5 +1,5 @@
-import type { ToolApprovalDecision } from "@oh-my-pi/pi-agent-core";
-import { isRecord } from "@oh-my-pi/pi-utils";
+import type { AgentToolDocTopic, ToolApprovalDecision } from "@oh-my-pi/pi-agent-core";
+import { stableStringifyJson } from "@oh-my-pi/pi-utils";
 import { REPORT_ISSUE_DEVICE_NAME } from "@oh-my-pi/pi-tui/tools/report-tool-issue";
 import { isResolutionDeviceName } from "@oh-my-pi/pi-tui/tools/resolve";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
@@ -8,7 +8,14 @@ import type { ToolSession } from "../tools";
 import { resolveToolDecision } from "../tools/approval";
 import { dispatchReportIssueDevice, reportIssueDeviceUsage } from "../tools/report-tool-issue";
 import { dispatchResolutionDevice, resolutionDeviceUsage } from "../tools/resolve";
-import { dispatchXdevTool, resolveXdevTool, xdevDocs, xdevListing } from "../tools/xdev";
+import {
+	dispatchXdevTool,
+	parseDeviceArgs,
+	resolveXdevCancellationBehavior,
+	resolveXdevTool,
+	xdevDocs,
+	xdevListing,
+} from "../tools/xdev";
 import type {
 	InternalResource,
 	InternalUrl,
@@ -40,16 +47,26 @@ function deviceWriteTier(
 		if (name && isResolutionDeviceName(name)) return "read";
 		const inst = name && session?.xdev ? resolveXdevTool(session.xdev, name) : undefined;
 		if (!name || !inst) return "exec";
-		if (typeof content !== "string") return "exec";
-		const parsed: unknown = JSON.parse(content);
-		if (!isRecord(parsed)) return "exec";
-		// The policyKey makes the outer gate consult `tools.approval.<device>` for
-		// this dispatch before falling back to `tools.approval.write`, so users can
-		// scope allow/deny/prompt to a single device (issue #7923).
-		return { ...resolveToolDecision(inst, parsed), policyKey: name };
+		if (typeof content !== "string") return { tier: "exec", policyKey: name };
+		try {
+			const parsed = parseDeviceArgs(inst, content, "approval-policy", () => "");
+			return { ...resolveToolDecision(inst, parsed), policyKey: name };
+		} catch {
+			return { tier: "exec", policyKey: name };
+		}
 	} catch {
 		return "exec";
 	}
+}
+
+function deviceWriteCancellationBehavior(
+	url: InternalUrl,
+	content: string | undefined,
+	session: ToolSession | undefined,
+): "await-cleanup" | undefined {
+	const name = parseXdUrl(url.rawHref ?? url.href)?.name;
+	if (!name || !session?.xdev || typeof content !== "string") return undefined;
+	return resolveXdevCancellationBehavior(session.xdev, name, content);
 }
 
 /** Routes session-bound virtual tool devices through `xd://` URLs. */
@@ -60,7 +77,13 @@ export class XdProtocolHandler implements ProtocolHandler {
 		selectors: "none",
 		immutable: true,
 		compactTranscript: true,
-		write: { via: "handler", payload: "text", scope: "device", tier: deviceWriteTier },
+		write: {
+			via: "handler",
+			payload: "text",
+			scope: "device",
+			tier: deviceWriteTier,
+			cancellationBehavior: deviceWriteCancellationBehavior,
+		},
 	};
 
 	async resolve(url: InternalUrl, context?: ResolveContext): Promise<InternalResource> {
@@ -69,8 +92,25 @@ export class XdProtocolHandler implements ProtocolHandler {
 		const topic = parseXdTopicUrl(url.href);
 		const device = topic ? null : parseXdUrl(url.href);
 		let content: string;
-		if (topic) content = this.#topic(session, topic.name, topic.topic);
-		else if (device) content = this.#usage(session, device.name);
+		if (topic) {
+			const doc = this.#topic(session, topic.name, topic.topic);
+			if (typeof doc !== "string") {
+				try {
+					if (doc.format !== "json") throw new TypeError();
+					content = stableStringifyJson(doc.value);
+				} catch {
+					throw new ToolError("Cannot serialize xd:// JSON topic.");
+				}
+				return {
+					url: url.href,
+					content,
+					contentType: "application/json",
+					shape: "value",
+					size: Buffer.byteLength(content),
+				};
+			}
+			content = doc;
+		} else if (device) content = this.#usage(session, device.name);
 		else throw new ToolError(`Invalid xd:// URL: ${url.href}. Use xd://, xd://<tool>, or xd://<tool>/<topic>.`);
 		return { url: url.href, content, contentType: "text/plain", size: Buffer.byteLength(content) };
 	}
@@ -124,7 +164,7 @@ export class XdProtocolHandler implements ProtocolHandler {
 	}
 
 	/** `read xd://<tool>/<topic>`: one named doc topic of a tool. */
-	#topic(session: ToolSession, name: string, topic: string): string {
+	#topic(session: ToolSession, name: string, topic: string): AgentToolDocTopic {
 		const topics = session.getToolByName?.(name)?.docTopics?.();
 		if (!topics) throw new ToolError(`Tool '${name}' has no doc topics.`);
 		const doc = topics[topic];

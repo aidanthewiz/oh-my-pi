@@ -7,6 +7,7 @@
  * current execution and forwards to the same `callSessionTool` implementation
  * the JavaScript bridge uses.
  */
+import { withoutCleanupOwnedToolCall } from "@oh-my-pi/pi-agent-core/agent-loop";
 import { logger, postmortem } from "@oh-my-pi/pi-utils";
 import type { ToolSession } from "../../tools";
 import type { RuntimeCallIdentity } from "../js/shared/runtime";
@@ -124,13 +125,15 @@ async function callSessionToolPromptOnAbort(
 		}
 		if (claimed) return bridgeValueFromToolResult(name, args, claimed, entry.emitStatus);
 	}
-	const call = callSessionTool(name, args, {
-		session: entry.toolSession,
-		signal: entry.signal,
-		emitStatus: entry.emitStatus,
-		onReply: entry.onReply,
-		identity,
-	});
+	const call = withoutCleanupOwnedToolCall(() =>
+		callSessionTool(name, args, {
+			session: entry.toolSession,
+			signal: entry.signal,
+			emitStatus: entry.emitStatus,
+			onReply: entry.onReply,
+			identity,
+		}),
+	);
 	const signal = entry.shieldedSignal ?? entry.signal;
 	if (!signal) return await call;
 	if (signal.aborted) {

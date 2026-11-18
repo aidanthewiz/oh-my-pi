@@ -1148,6 +1148,9 @@ export interface AgentToolArgStreamInit {
 	emit(update: unknown): void;
 }
 
+/** On-demand tool documentation: markdown text or an opt-in, unpaged JSON value. */
+export type AgentToolDocTopic = string | { readonly format: "json"; readonly value: unknown };
+
 // AgentTool extends Tool but adds the execute function
 export interface AgentTool<
 	TParameters extends TSchema = TSchema,
@@ -1175,11 +1178,11 @@ export interface AgentTool<
 	 */
 	readonly delegationGuidance?: string;
 	/**
-	 * On-demand documentation topics (`topic → markdown`), readable as
-	 * `xd://<tool>/<topic>`. Lets a tool keep large sub-surfaces out of its
-	 * description and advertise only a one-line pointer per topic.
+	 * On-demand documentation topics, readable as `xd://<tool>/<topic>`.
+	 * Strings are markdown documents; JSON topics return their complete value.
+	 * Advertise large sub-surfaces with a one-line pointer in the description.
 	 */
-	docTopics?(): Readonly<Record<string, string>>;
+	docTopics?(): Readonly<Record<string, AgentToolDocTopic>>;
 	/**
 	 * Concurrency mode for tool scheduling when multiple calls are in one turn.
 	 * - "shared": can run alongside other shared tools (default)
@@ -1214,6 +1217,14 @@ export interface AgentTool<
 	 * still prevents execution. Omitted tools keep the usual pre-start skip.
 	 */
 	handlesToolInterrupt?: boolean;
+	/**
+	 * Intrinsic execution policy, never model arguments or remote tool annotations.
+	 * `await-cleanup` keeps an executing call pending through bounded cancellation
+	 * teardown and preserves its safe result. Omission retains ordinary abort races.
+	 * A function resolves the policy for the arguments this call executes.
+	 * Pre-start cancellation and permission denial still prevent execution.
+	 */
+	readonly cancellationBehavior?: "await-cleanup" | ((args: unknown) => "await-cleanup" | undefined);
 	/**
 	 * Controls how the INTENT_FIELD (`i`) is handled for this tool.
 	 * - `"require"` (default): `i` is injected and required in the parameter schema.
