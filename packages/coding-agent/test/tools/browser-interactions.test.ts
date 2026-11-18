@@ -1616,9 +1616,19 @@ document.getElementById("menu-item").addEventListener("pointerdown", event => {
 		try {
 			for (const fault of ["transport", "cancel", "acquire"] as const) {
 				const page = await browserHandle.browser.newPage();
+				const frame = page.mainFrame();
 				const controller = new AbortController();
 				const held = Promise.withResolvers<void>();
 				const released = Promise.withResolvers<void>();
+				const failure = new Error(
+					fault === "transport"
+						? "Synthetic watch transport failure"
+						: fault === "cancel"
+							? "Synthetic verification cancellation"
+							: "Synthetic acquisition cancellation",
+				);
+				let heldWork: Promise<unknown> | undefined;
+				let watchAcquired = false;
 				try {
 					await page.setContent(
 						'<button id="target" data-clicks="0" onclick="this.dataset.clicks=String(Number(this.dataset.clicks)+1)">Click</button>',
@@ -1643,44 +1653,71 @@ document.getElementById("menu-item").addEventListener("pointerdown", event => {
 					const original = handle.evaluateHandle.bind(handle);
 					handle.evaluateHandle = (async (...args: Parameters<typeof handle.evaluateHandle>) => {
 						const watch = await original(...args);
+						watchAcquired = true;
 						const evaluate = watch.evaluate.bind(watch);
 						const dispose = watch.dispose.bind(watch);
 						let first = true;
-						watch.evaluate = (async (...evaluationArgs: Parameters<typeof watch.evaluate>) => {
+						watch.evaluate = ((...evaluationArgs: Parameters<typeof watch.evaluate>) => {
 							if (first) {
 								first = false;
-								if (fault === "transport") throw new Error("Synthetic watch transport failure");
+								if (fault === "transport") return Promise.reject(failure);
 								if (fault === "cancel") {
-									controller.abort(new Error("Synthetic verification cancellation"));
-									await held.promise;
+									controller.abort(failure);
+									const verification = held.promise.then(() => {
+										throw failure;
+									});
+									heldWork = verification;
+									return verification;
 								}
 							}
-							return await evaluate(...evaluationArgs);
+							return evaluate(...evaluationArgs);
 						}) as typeof watch.evaluate;
 						watch.dispose = async () => {
 							await dispose();
 							released.resolve();
 						};
 						if (fault === "acquire") {
-							queueMicrotask(() => controller.abort(new Error("Synthetic acquisition cancellation")));
-							await held.promise;
+							queueMicrotask(() => controller.abort(failure));
+							const acquisition = held.promise.then(() => watch);
+							heldWork = acquisition;
+							return await acquisition;
 						}
 						return watch;
 					}) as typeof handle.evaluateHandle;
-					await expect(clickElement(handle, "fixture click", controller.signal)).rejects.toBeInstanceOf(Error);
-					if (fault === "acquire") {
-						expect(await page.evaluate("activeClickWatches()")).toBe(6);
-						held.resolve();
+					const error = await rejectionOf(clickElement(handle, "fixture click", controller.signal));
+					if (!(error instanceof Error)) throw new Error(`Expected ${fault} click rejection`, { cause: error });
+					if (fault === "transport") {
+						expect(error, fault).toBe(failure);
+					} else {
+						expect(error.name, fault).toBe("AbortError");
+						expect(error.cause, fault).toBe(failure);
+					}
+					if (fault === "acquire") expect(await page.evaluate("activeClickWatches()"), fault).toBe(6);
+					held.resolve();
+					if (heldWork) {
+						if (fault === "cancel") expect(await rejectionOf(heldWork), fault).toBe(failure);
+						else await heldWork;
 					}
 					await released.promise;
-					expect(await page.$eval("#target", element => element.getAttribute("data-clicks"))).toBe(
+					expect(
+						{
+							connected: browserHandle.browser.connected,
+							closed: page.isClosed(),
+							sameFrame: page.mainFrame() === frame,
+							detached: frame.detached,
+						},
+						`${fault}: fixture ownership before effect observation`,
+					).toEqual({ connected: true, closed: false, sameFrame: true, detached: false });
+					expect(await page.$eval("#target", element => element.getAttribute("data-clicks")), fault).toBe(
 						fault === "acquire" ? "0" : "1",
 					);
-					expect(await page.evaluate("activeClickWatches()")).toBe(0);
+					expect(await page.evaluate("activeClickWatches()"), fault).toBe(0);
 					await handle.dispose();
 				} finally {
 					held.resolve();
 					controller.abort();
+					if (heldWork) await Promise.allSettled([heldWork]);
+					if (watchAcquired) await released.promise;
 					await page.close().catch(() => undefined);
 				}
 			}
