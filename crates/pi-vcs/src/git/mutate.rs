@@ -214,6 +214,21 @@ impl GitRepo {
 		if cancel.as_ref().is_some_and(CancellationToken::is_cancelled) {
 			return Err(Error::Canceled);
 		}
+		let merge_head_path = self.info().git_dir.join("MERGE_HEAD");
+		let read_merge_head = || -> Result<Option<Vec<u8>>> {
+			match fs::read(&merge_head_path) {
+				Ok(bytes) => Ok(Some(bytes)),
+				Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+				Err(error) => Err(Error::backend("git commit read MERGE_HEAD", error)),
+			}
+		};
+		let merge_head = read_merge_head()?;
+		if merge_head.is_some() && (options.amend || !options.files.is_empty()) {
+			return Err(Error::backend(
+				"git commit",
+				"cannot amend or partially commit during a merge",
+			));
+		}
 		let sign = {
 			let repo = self.gix_fresh()?;
 			// A malformed value must never silently disable configured signing.
@@ -316,7 +331,7 @@ impl GitRepo {
 			.index_path
 			.as_deref()
 			.or_else(|| path_index.as_ref().map(|(path, ..)| path.as_ref()));
-		let process = RunOptions {
+		let mut process = RunOptions {
 			cancel,
 			env: options.env.clone(),
 			index_path: index_path.map(Path::to_path_buf),
@@ -388,9 +403,32 @@ impl GitRepo {
 					.map_err(|err| Error::backend("git commit", err))?;
 				(parents, Some(author))
 			} else {
-				(old_commit.into_iter().collect(), None)
+				let mut parents = Vec::with_capacity(
+					usize::from(old_commit.is_some()) + usize::from(merge_head.is_some()),
+				);
+				parents.extend(old_commit);
+				if let Some(merge_head) = &merge_head {
+					if old_commit.is_none() {
+						return Err(Error::backend("git commit", "cannot merge into an unborn HEAD"));
+					}
+					for line in merge_head
+						.split(|byte| *byte == b'\n')
+						.filter(|line| !line.is_empty())
+					{
+						let parent = gix::hash::ObjectId::from_hex(line.trim_ascii())
+							.map_err(|error| Error::backend("git commit read merge parent", error))?;
+						repo
+							.find_commit(parent)
+							.map_err(|error| Error::backend("git commit resolve merge parent", error))?;
+						parents.push(parent);
+					}
+					if parents.len() == 1 {
+						return Err(Error::backend("git commit", "MERGE_HEAD has no merge parents"));
+					}
+				}
+				(parents, None)
 			};
-			if !options.allow_empty {
+			if !options.allow_empty && merge_head.is_none() {
 				if let Some(parent) = parents.first() {
 					if commit_tree(&repo, parent)? == tree {
 						return Err(Error::backend(
@@ -438,6 +476,16 @@ impl GitRepo {
 		// Only the private file is authoritative; hooks may read this
 		// compatibility copy.
 		let _ = fs::write(self.info().git_dir.join("COMMIT_EDITMSG"), message);
+		if run_commit_hook(
+			self,
+			"prepare-commit-msg",
+			&[message_path.as_os_str(), OsStr::new("message")],
+			&process,
+		)
+		.await?
+		{
+			let _ = fs::copy(&message_path, self.info().git_dir.join("COMMIT_EDITMSG"));
+		}
 		if !options.no_verify {
 			run_commit_hook(self, "commit-msg", &[message_path.as_os_str()], &process).await?;
 		}
@@ -459,6 +507,12 @@ impl GitRepo {
 		};
 		let id = {
 			let repo = self.gix_fresh()?;
+			if read_merge_head()? != merge_head {
+				return Err(Error::backend(
+					"git commit",
+					"merge state changed before commit publication",
+				));
+			}
 			let index_update = if let Some((_, _, files, original)) = &mut path_index {
 				// Read after locking so entries staged during hooks are preserved.
 				let mut lock = gix::lock::File::acquire_to_update_resource(
@@ -543,6 +597,20 @@ impl GitRepo {
 			}
 			id
 		};
+		if merge_head.is_some() {
+			if read_merge_head()? != merge_head {
+				return Err(Error::backend("git commit", "merge state changed before commit cleanup"));
+			}
+			let cancel = process.cancel.take();
+			let cleanup = run_checked(
+				self.root(),
+				&["-c".into(), "safe.directory=*".into(), "merge".into(), "--quit".into()],
+				&process,
+			)
+			.await;
+			process.cancel = cancel;
+			cleanup?;
+		}
 		let _ = run_commit_hook(self, "post-commit", &[], &process).await;
 		Ok(id.to_hex().to_string())
 	}
@@ -1281,9 +1349,9 @@ async fn run_commit_hook(
 	name: &str,
 	args: &[&OsStr],
 	options: &RunOptions,
-) -> Result<()> {
+) -> Result<bool> {
 	if repository.hook_path(name)?.is_none() && !hook_configured(repository, name)? {
-		return Ok(());
+		return Ok(false);
 	}
 	let mut argv = vec![
 		"-c".to_owned(),
@@ -1296,7 +1364,7 @@ async fn run_commit_hook(
 	];
 	argv.extend(args.iter().map(|arg| arg.to_string_lossy().into_owned()));
 	run_checked(repository.root(), &argv, options).await?;
-	Ok(())
+	Ok(true)
 }
 
 /// Whether any `hook.<id>.event` names the hook `name`. Git (2.54+) runs such
@@ -2773,6 +2841,83 @@ mod tests {
 		run(&["read-tree", "HEAD"]);
 		run(&["update-index", "--cacheinfo", &format!("100644,{blob},a")]);
 		alt
+	}
+
+	#[tokio::test]
+	async fn commit_finishes_resolved_merges_including_unchanged_trees() {
+		for unchanged_tree in [false, true] {
+			let (temp, repo) = fixture();
+			git(temp.path(), &["switch", "-c", "side"]);
+			fs::write(temp.path().join("side"), "side\n").unwrap();
+			git(temp.path(), &["add", "."]);
+			git(temp.path(), &["commit", "-qm", "side"]);
+			let side = git(temp.path(), &["rev-parse", "HEAD"]);
+			git(temp.path(), &["switch", "main"]);
+			let (file, content) = if unchanged_tree {
+				("side", "side\n")
+			} else {
+				("main", "main\n")
+			};
+			fs::write(temp.path().join(file), content).unwrap();
+			git(temp.path(), &["add", "."]);
+			git(temp.path(), &["commit", "-qm", "main"]);
+			let main = git(temp.path(), &["rev-parse", "HEAD"]);
+			git(temp.path(), &["merge", "--no-ff", "--no-commit", "side"]);
+
+			let id = repo
+				.commit_create("resolved merge\n", &CommitOptions::default(), None)
+				.await
+				.unwrap();
+
+			assert_eq!(git(temp.path(), &["rev-parse", "HEAD"]), id);
+			assert_eq!(
+				git(temp.path(), &["show", "-s", "--format=%P", &id]),
+				format!("{main} {side}")
+			);
+			assert!(!temp.path().join(".git/MERGE_HEAD").exists());
+			assert!(!temp.path().join(".git/MERGE_MSG").exists());
+			assert_eq!(git(temp.path(), &["status", "--porcelain"]), "");
+		}
+	}
+
+	#[tokio::test]
+	async fn prepare_commit_msg_edits_and_refusals_apply_with_no_verify() {
+		for no_verify in [false, true] {
+			let (temp, repo) = fixture();
+			let hooks = temp.path().join(".git/hooks");
+			write_hook(
+				&hooks.join("prepare-commit-msg"),
+				"printf '%s\\n' \"$2\" > .git/prepare-source\nprintf '\\nPrepared: yes\\n' >> \"$1\"",
+				true,
+			);
+			write_hook(
+				&hooks.join("commit-msg"),
+				"grep -q '^Prepared: yes$' \"$1\" || exit 1\nprintf '\\nValidated: yes\\n' >> \"$1\"",
+				true,
+			);
+			let options = CommitOptions { allow_empty: true, no_verify, ..Default::default() };
+
+			let id = repo
+				.commit_create("explicit message\n", &options, None)
+				.await
+				.unwrap();
+
+			let committed = git(temp.path(), &["log", "-1", "--format=%B"]);
+			assert!(committed.contains("Prepared: yes"));
+			assert_eq!(committed.contains("Validated: yes"), !no_verify);
+			assert_eq!(
+				fs::read_to_string(temp.path().join(".git/prepare-source")).unwrap(),
+				"message\n"
+			);
+			write_hook(&hooks.join("prepare-commit-msg"), "exit 17", true);
+			assert!(
+				repo
+					.commit_create("must not land\n", &options, None)
+					.await
+					.is_err()
+			);
+			assert_eq!(git(temp.path(), &["rev-parse", "HEAD"]), id);
+		}
 	}
 
 	#[tokio::test]

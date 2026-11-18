@@ -44,10 +44,10 @@ async function repository(): Promise<string> {
 	return root;
 }
 
-async function installHook(root: string, script: string): Promise<void> {
+async function installHook(root: string, script: string, name = "commit-msg"): Promise<void> {
 	const hooks = path.join(root, ".git", "hooks");
 	await fs.mkdir(hooks, { recursive: true });
-	const hook = path.join(hooks, "commit-msg");
+	const hook = path.join(hooks, name);
 	await Bun.write(hook, script);
 	await fs.chmod(hook, 0o755);
 }
@@ -142,5 +142,63 @@ describe("commitCreate message isolation", () => {
 		expect(await Bun.file(seen).exists()).toBe(false);
 		// Hooks that ignore `$1` and read COMMIT_EDITMSG see this call's message.
 		expect(await Bun.file(shared).text()).toBe("will not land\n");
+	});
+
+	test.each([false, true])("finishes a resolved merge (unchanged tree=%s)", async unchangedTree => {
+		const root = await repository();
+		await git(root, "switch", "-c", "side");
+		await Bun.write(path.join(root, "branch.txt"), "side\n");
+		await git(root, "add", ".");
+		await git(root, "commit", "-m", "side");
+		const side = await git(root, "rev-parse", "HEAD");
+		await git(root, "switch", "main");
+		await Bun.write(path.join(root, unchangedTree ? "branch.txt" : "main.txt"), unchangedTree ? "side\n" : "main\n");
+		await git(root, "add", ".");
+		await git(root, "commit", "-m", "main");
+		const main = await git(root, "rev-parse", "HEAD");
+		await git(root, "merge", "--no-ff", "--no-commit", "side");
+		const repo = vcsGitDiscover(root)!;
+
+		const id = await repo.commitCreate("resolved merge\n", {});
+
+		expect(await git(root, "rev-parse", "HEAD")).toBe(id);
+		expect(await git(root, "show", "-s", "--format=%P", id)).toBe(`${main} ${side}`);
+		expect(await Bun.file(path.join(root, ".git", "MERGE_HEAD")).exists()).toBe(false);
+		expect(await Bun.file(path.join(root, ".git", "MERGE_MSG")).exists()).toBe(false);
+		expect(await git(root, "status", "--porcelain")).toBe("");
+	});
+
+	test.each([false, true])("honors prepare-commit-msg edits and refusal (noVerify=%s)", async noVerify => {
+		const root = await repository();
+		await installHook(
+			root,
+			[
+				"#!/bin/sh",
+				"printf '%s\\n' \"$2\" > .git/prepare-source",
+				"printf '\\nPrepared: yes\\n' >> \"$1\"",
+				"",
+			].join("\n"),
+			"prepare-commit-msg",
+		);
+		await installHook(
+			root,
+			[
+				"#!/bin/sh",
+				'grep -q "^Prepared: yes$" "$1" || { echo "prepare hook did not run" >&2; exit 1; }',
+				"printf '\\nValidated: yes\\n' >> \"$1\"",
+				"",
+			].join("\n"),
+		);
+		const repo = vcsGitDiscover(root)!;
+
+		const id = await repo.commitCreate("prepared message\n", { allowEmpty: true, noVerify });
+
+		const committed = await git(root, "log", "-1", "--format=%B");
+		expect(committed).toContain("Prepared: yes");
+		expect(committed.includes("Validated: yes")).toBe(!noVerify);
+		expect(await Bun.file(path.join(root, ".git", "prepare-source")).text()).toBe("message\n");
+		await installHook(root, "#!/bin/sh\nexit 17\n", "prepare-commit-msg");
+		await expect(repo.commitCreate("must not land\n", { allowEmpty: true, noVerify })).rejects.toThrow();
+		expect(await git(root, "rev-parse", "HEAD")).toBe(id);
 	});
 });
