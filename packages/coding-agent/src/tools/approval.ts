@@ -62,6 +62,8 @@ export interface RuntimeToolApprovalRequest {
 	tuiStyle?: "destructive";
 	/** Only explicitly eligible runtime requests may grant session access. */
 	allowSessionApproval?: boolean;
+	/** Only exact, per-call runtime requests may reach the owning parent's TUI. */
+	allowParentApproval?: boolean;
 }
 
 export interface RuntimeApprovalCapableTool {
@@ -75,7 +77,7 @@ export interface RuntimeApprovalCapableTool {
 		signal?: AbortSignal,
 		context?: AgentToolContext,
 	): Promise<RuntimeToolApprovalRequest | undefined>;
-	approveRuntimeApproval?(toolCallId: string, args: unknown): void;
+	approveRuntimeApproval?(toolCallId: string, args: unknown, validate?: () => void): void;
 	denyRuntimeApproval?(toolCallId: string, args: unknown): void;
 }
 

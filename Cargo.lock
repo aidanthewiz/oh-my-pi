@@ -7248,6 +7248,7 @@ name = "pi-predict"
 version = "18.15.0"
 dependencies = [
  "anyhow",
+ "block2",
  "candle-core",
  "candle-nn",
  "flume",

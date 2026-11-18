@@ -29,6 +29,7 @@ import {
 	resolveApprovalFromContext,
 	sessionApprovalScope,
 } from "../../tools/approval";
+import { ParentRuntimeApprovalError, type SubagentRuntimeApprovalResult } from "../../tools/subagent-runtime-approval";
 import { getApprovalGrants } from "../../tools/approval-cache";
 import { defaultLoadModeForToolName } from "../../tools/essential-tools";
 import { withFileMutationSession } from "../../tools/file-write-fallback";
@@ -483,6 +484,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				let approveSession = false;
 				let approveModeSession = false;
 				let targetGrant: { grant: "folder" | "target"; always: boolean } | undefined;
+				let validateParentApproval: (() => void) | undefined;
 				if (required) {
 					const scheduledCall = context?.toolCall?.toolCalls[context.toolCall.index];
 					if (
@@ -516,7 +518,37 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 							});
 						}
 					};
-					if (!this.runner.hasUI()) {
+					let parentDecision: SubagentRuntimeApprovalResult | undefined;
+					if (
+						!this.runner.hasUI() &&
+						runtimeApproval?.allowParentApproval === true &&
+						sessionApproval === undefined &&
+						safetySnapshot.length === 0 &&
+						resolved.policy === "allow"
+					) {
+						try {
+							const agent = this.#agent ?? this.runner.createContext?.().agent;
+							if (agent?.kind === "sub") {
+								parentDecision = await this.runner.requestParentRuntimeApproval?.(
+									{
+										agentId: agent.id,
+										sessionId: approvalSessionId,
+										cwd: this.runner.cwd,
+										toolName: this.tool.name,
+										toolCallId,
+										args: inputSnapshot,
+										approval: runtimeApproval,
+										policyReason: resolved.reason,
+									},
+									signal,
+								);
+							}
+						} catch (error) {
+							await emitResolved(false, error instanceof Error ? error.message : "parent approval aborted");
+							throw error;
+						}
+					}
+					if (!this.runner.hasUI() && parentDecision === undefined) {
 						await emitResolved(false, "no interactive UI available");
 						if (runtimeApproval) {
 							throw new Error(
@@ -543,59 +575,75 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 								`  3. Use an interactive UI to approve the tool call`,
 						);
 					}
-					const ui = this.runner.getUIContext();
-					if (approvalContext?.settings && cfgApprovalNotify.get(approvalContext.settings) === "on") {
-						TERMINAL.sendNotification({
-							title: context?.sessionManager?.getSessionName() || "Coreforge",
-							body: "Tool approval required",
-							type: "approval",
-							urgency: "normal",
-							actions: "focus",
-						});
-					}
-					let approved = false;
-					try {
-						if (runtimeApproval) {
-							const safetySuffix = safetySnapshot.length
-								? `\n\nProvider safety checks:\n${safetyCheckLines(safetySnapshot).join("\n")}`
-								: "";
-							const choice = await ui.select(
-								`Approve ${this.tool.name}?\nReason: ${runtimeApproval.reason}\n${runtimeApproval.prompt}${safetySuffix}`,
-								sessionApproval ? ["Deny", "Approve once", sessionApproval.label] : ["Deny", "Approve once"],
-								{ tuiStyle: runtimeApproval.tuiStyle },
-							);
-							approveSession = sessionApproval !== undefined && choice === sessionApproval.label;
-							approved = choice === "Approve once" || approveSession;
-						} else if (sessionApproval || safetySnapshot.length) {
-							const base = formatApprovalPrompt(this.tool, resolvedArgs, reason);
-							const choice = await ui.select(
-								safetySnapshot.length
-									? `${base}\nProvider safety checks:\n${safetyCheckLines(safetySnapshot).join("\n")}`
-									: base,
-								sessionApproval ? ["Approve", "Deny", sessionApproval.label] : ["Deny", "Approve"],
-							);
-							approveSession = sessionApproval !== undefined && choice === sessionApproval.label;
-							approved = choice === "Approve" || approveSession;
-						} else {
-							const answer = await requestApproval(ui, this.tool, resolvedArgs, {
-								reason,
-								sessionSubject: sessionScope?.subject,
-								grants: cacheTargets,
-								targets,
-								allowPersistentGrants,
-							});
-							approveModeSession = answer === "session" && sessionScope !== undefined;
-							targetGrant = typeof answer === "object" ? answer : undefined;
-							approved = answer === "once" || approveModeSession || targetGrant !== undefined;
-						}
+					if (parentDecision !== undefined) {
 						signal?.throwIfAborted();
 						if (this.runner.sessionId !== approvalSessionId) throw new Error("Approval session changed");
-					} catch (error) {
-						await emitResolved(false, error instanceof Error ? error.message : "approval aborted");
-						throw error;
+						if (parentDecision.decision === "approved") {
+							validateParentApproval = parentDecision.validate;
+							validateParentApproval();
+						}
+						const refusal =
+							parentDecision.decision === "approved"
+								? undefined
+								: new ParentRuntimeApprovalError(this.tool.name, parentDecision);
+						await emitResolved(refusal === undefined, refusal?.message);
+						if (refusal) throw refusal;
+						validateParentApproval?.();
+					} else {
+						const ui = this.runner.getUIContext();
+						if (approvalContext?.settings && cfgApprovalNotify.get(approvalContext.settings) === "on") {
+							TERMINAL.sendNotification({
+								title: context?.sessionManager?.getSessionName() || "Coreforge",
+								body: "Tool approval required",
+								type: "approval",
+								urgency: "normal",
+								actions: "focus",
+							});
+						}
+						let approved = false;
+						try {
+							if (runtimeApproval) {
+								const safetySuffix = safetySnapshot.length
+									? `\n\nProvider safety checks:\n${safetyCheckLines(safetySnapshot).join("\n")}`
+									: "";
+								const choice = await ui.select(
+									`Approve ${this.tool.name}?\nReason: ${runtimeApproval.reason}\n${runtimeApproval.prompt}${safetySuffix}`,
+									sessionApproval ? ["Deny", "Approve once", sessionApproval.label] : ["Deny", "Approve once"],
+									{ tuiStyle: runtimeApproval.tuiStyle },
+								);
+								approveSession = sessionApproval !== undefined && choice === sessionApproval.label;
+								approved = choice === "Approve once" || approveSession;
+							} else if (sessionApproval || safetySnapshot.length) {
+								const base = formatApprovalPrompt(this.tool, resolvedArgs, reason);
+								const choice = await ui.select(
+									safetySnapshot.length
+										? `${base}\nProvider safety checks:\n${safetyCheckLines(safetySnapshot).join("\n")}`
+										: base,
+									sessionApproval ? ["Approve", "Deny", sessionApproval.label] : ["Deny", "Approve"],
+								);
+								approveSession = sessionApproval !== undefined && choice === sessionApproval.label;
+								approved = choice === "Approve" || approveSession;
+							} else {
+								const answer = await requestApproval(ui, this.tool, resolvedArgs, {
+									reason,
+									sessionSubject: sessionScope?.subject,
+									grants: cacheTargets,
+									targets,
+									allowPersistentGrants,
+								});
+								approveModeSession = answer === "session" && sessionScope !== undefined;
+								targetGrant = typeof answer === "object" ? answer : undefined;
+								approved = answer === "once" || approveModeSession || targetGrant !== undefined;
+							}
+							signal?.throwIfAborted();
+							if (this.runner.sessionId !== approvalSessionId) throw new Error("Approval session changed");
+						} catch (error) {
+							await emitResolved(false, error instanceof Error ? error.message : "approval aborted");
+							throw error;
+						}
+						await emitResolved(approved, approved ? undefined : "denied by user");
+						if (!approved) throw new Error(`Tool call denied by user: ${this.tool.name}`);
 					}
-					await emitResolved(approved, approved ? undefined : "denied by user");
-					if (!approved) throw new Error(`Tool call denied by user: ${this.tool.name}`);
 				}
 				const finalTargets = await captureApprovalTargets(
 					this.tool,
@@ -603,6 +651,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 					this.runner.cwd,
 				);
 				signal?.throwIfAborted();
+				validateParentApproval?.();
 				if (
 					(approvalMode === "always-ask-cached" || resolved.source === "restriction") &&
 					targets.failed &&
@@ -611,33 +660,56 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 					throw new Error(`Tool "${this.tool.name}" approval target identity is unavailable; execution refused.`);
 				}
 				if (this.runner.sessionId !== approvalSessionId) throw new Error("Approval session changed");
-				const finalPolicy = resolveApprovalFromContext(approvalContext);
-				if (
-					!Bun.deepEquals(inputSnapshot, effectiveParams) ||
-					!Bun.deepEquals(resolvedArgs, approvalArgs(effectiveParams, context)) ||
-					!Bun.deepEquals(targets, finalTargets) ||
-					!sameApprovalAuthority(authority, captureAuthority()) ||
-					!Bun.deepEquals(safetySnapshot, computerSafetyChecks(context)) ||
-					!Bun.deepEquals({ approvalMode, userPolicies }, finalPolicy) ||
-					!Bun.deepEquals(
-						resolved,
-						resolveApproval(
-							this.tool,
-							approvalArgs(effectiveParams, context),
-							finalPolicy.approvalMode,
-							finalPolicy.userPolicies,
-							approvalGrants,
-							approvalRestrictions(approvalContext?.settings, this.runner.cwd),
-							finalTargets,
-							context,
-						),
-					)
-				) {
+				const isApprovalCurrent = (): boolean => {
+					const currentPolicy = resolveApprovalFromContext(approvalContext);
+					return (
+						this.runner.sessionId === approvalSessionId &&
+						Bun.deepEquals(inputSnapshot, effectiveParams) &&
+						Bun.deepEquals(resolvedArgs, approvalArgs(effectiveParams, context)) &&
+						sameApprovalAuthority(authority, captureAuthority()) &&
+						Bun.deepEquals(safetySnapshot, computerSafetyChecks(context)) &&
+						Bun.deepEquals({ approvalMode, userPolicies }, currentPolicy) &&
+						Bun.deepEquals(
+							resolved,
+							resolveApproval(
+								this.tool,
+								approvalArgs(effectiveParams, context),
+								currentPolicy.approvalMode,
+								currentPolicy.userPolicies,
+								approvalGrants,
+								approvalRestrictions(approvalContext?.settings, this.runner.cwd),
+								finalTargets,
+								context,
+							),
+						)
+					);
+				};
+				if (!Bun.deepEquals(targets, finalTargets) || !isApprovalCurrent()) {
 					runtimeApprovalTool.denyRuntimeApproval?.(toolCallId, effectiveParams);
+					if (validateParentApproval)
+						throw new ParentRuntimeApprovalError(this.tool.name, {
+							decision: "unavailable",
+							reason: "state-changed",
+							detail: "The tool input or approval authority changed after parent approval.",
+						});
 					recheckPreflight = true;
 					continue;
 				}
-				if (runtimeApproval && required) runtimeApprovalTool.approveRuntimeApproval!(toolCallId, effectiveParams);
+				if (validateParentApproval) {
+					const validateRootApproval = validateParentApproval;
+					validateParentApproval = () => {
+						signal?.throwIfAborted();
+						validateRootApproval();
+						if (!isApprovalCurrent())
+							throw new ParentRuntimeApprovalError(this.tool.name, {
+								decision: "unavailable",
+								reason: "state-changed",
+								detail: "The tool input or approval authority changed after parent approval.",
+							});
+					};
+				}
+				if (runtimeApproval && required)
+					runtimeApprovalTool.approveRuntimeApproval!(toolCallId, effectiveParams, validateParentApproval);
 				if (safetySnapshot.length) {
 					if (!context) throw new Error("Provider safety approval context is unavailable");
 					context.providerSafetyApproved = true;

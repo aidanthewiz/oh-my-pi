@@ -497,9 +497,13 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser uploadFile into a browser omp laun
 			result.details && typeof result.details === "object" && "value" in result.details
 				? result.details.value
 				: undefined;
-		const before = await stagingFolders();
+		let uploadDir: string | undefined;
 		await prelude.invoke({ action: "open", name, url }, context);
 		try {
+			const tab = getTab(name);
+			if (tab?.backend !== "worker") throw new Error("expected a worker tab");
+			uploadDir = tab.uploadDir;
+			ownedStaging.add(uploadDir);
 			const file = path.join(tempDir, "recycled.txt");
 			await Bun.write(file, "outlives its worker");
 			expect(valueOf(await run(collectErrors(`() => tab.uploadFile("#direct", "recycled.txt"),`)))).toEqual([]);
@@ -513,11 +517,17 @@ return "done";`);
 			expect(JSON.stringify(recycled.content)).toContain("reattached to a new worker");
 			const read = await run(`return await tab.evaluate(() => document.querySelector("#direct").files[0].text());`);
 			expect(valueOf(read)).toBe("outlives its worker");
+			const staged = (await fs.readdir(uploadDir, { recursive: true })).filter(file =>
+				file.endsWith("recycled.txt"),
+			);
+			expect(staged).toHaveLength(1);
+			expect(await fs.readFile(path.join(uploadDir, staged[0]!), "utf8")).toBe("outlives its worker");
 		} finally {
 			await prelude.invoke({ action: "close", name }, context);
 		}
 		// omp closed the page it launched, the last reader of the copies.
-		expect([...(await stagingFolders())].filter(folder => !before.has(folder))).toEqual([]);
+		if (!uploadDir) throw new Error("expected upload staging");
+		await expect(fs.stat(uploadDir)).rejects.toMatchObject({ code: "ENOENT" });
 	}, 60_000);
 });
 
