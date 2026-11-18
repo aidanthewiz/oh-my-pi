@@ -736,7 +736,7 @@ class SessionState:
     message_count: int = 0
     queued_message_count: int = 0
     has_pending_async_work: bool = False
-    """Background jobs or deliveries can still inject a follow-up and wake the session."""
+    """Background jobs, their deliveries, child agents or queued peer messages can still wake the session."""
     is_settled: bool = False
     """Idle with nothing queued or pending; same predicate as `session_settled`."""
     queued_messages: QueuedMessagesState = field(
@@ -790,6 +790,16 @@ class BashResult:
     images: tuple[ImageContent, ...] | None = None
     trace: JsonObject | None = None
     """The embedded shell's final `ShellTrace` of the run; only when the caller asked for one."""
+    fork: ShellForkOutcome | None = None
+    """Set when the command overlapped another one on the session's persistent shell and ran in a fork of it."""
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
+class ShellForkOutcome:
+    carried: bool
+    """What the command set carried back into the session's shell; `false`: it stayed in the fork."""
+    jobs: bool
+    """It left background jobs running in the fork, where later commands' `jobs`, `wait` and `%N` miss them."""
 
 
 @dataclass(slots=True, frozen=True, kw_only=True)
@@ -1070,6 +1080,8 @@ class PromptAck:
 @dataclass(slots=True, frozen=True, kw_only=True)
 class AgentStartEvent:
     type: Literal["agent_start"] = "agent_start"
+    run_id: str | None = None
+    outcome: AgentLifecycleOutcome | None = None
     resumed_tool_call_ids: tuple[str, ...] | None = None
     """Calls of an unpaired assistant tail a continued run executes before its first model request."""
 
@@ -1079,10 +1091,11 @@ class AgentEndEvent:
     type: Literal["agent_end"] = "agent_end"
     messages: tuple[AgentMessage, ...]
     """Messages of the run; an oversized frame drops a prefix already delivered by `message_end` (see `messageCount`)."""
-    message_count: int | None = None
-    """Original message count when the frame was compacted."""
+    run_id: str | None = None
     outcome: AgentLifecycleOutcome | None = None
     """This loop's outcome, independent of persisted transcript messages."""
+    message_count: int | None = None
+    """Original message count when the frame was compacted."""
     is_terminal: bool | None = None
     """False when a continuation or async delivery remains."""
     yielded: bool | None = None
@@ -1096,6 +1109,8 @@ class AgentEndEvent:
 @dataclass(slots=True, frozen=True, kw_only=True)
 class TurnStartEvent:
     type: Literal["turn_start"] = "turn_start"
+    run_id: str | None = None
+    outcome: AgentLifecycleOutcome | None = None
 
 
 @dataclass(slots=True, frozen=True, kw_only=True)
@@ -1103,12 +1118,16 @@ class TurnEndEvent:
     type: Literal["turn_end"] = "turn_end"
     message: AgentMessage
     tool_results: tuple[ToolResultMessage, ...]
+    run_id: str | None = None
+    outcome: AgentLifecycleOutcome | None = None
 
 
 @dataclass(slots=True, frozen=True, kw_only=True)
 class MessageStartEvent:
     type: Literal["message_start"] = "message_start"
     message: AgentMessage
+    run_id: str | None = None
+    outcome: AgentLifecycleOutcome | None = None
     message_id: str | None = None
     """Shared by the start, updates, and end of one message; unique per process."""
 
@@ -1118,6 +1137,8 @@ class MessageUpdateEvent:
     type: Literal["message_update"] = "message_update"
     message: AgentMessage
     assistant_message_event: AssistantMessageEvent
+    run_id: str | None = None
+    outcome: AgentLifecycleOutcome | None = None
     message_id: str | None = None
     """Shared by the start, updates, and end of one message; unique per process."""
 
@@ -1126,6 +1147,8 @@ class MessageUpdateEvent:
 class MessageEndEvent:
     type: Literal["message_end"] = "message_end"
     message: AgentMessage
+    run_id: str | None = None
+    outcome: AgentLifecycleOutcome | None = None
     message_id: str | None = None
     """Shared by the start, updates, and end of one message; unique per process."""
 
@@ -1135,6 +1158,8 @@ class ToolExecutionStartEvent:
     type: Literal["tool_execution_start"] = "tool_execution_start"
     tool_call_id: str
     tool_name: str
+    run_id: str | None = None
+    outcome: AgentLifecycleOutcome | None = None
     args: JsonValue | None = None
     intent: str | None = None
 
@@ -1144,6 +1169,8 @@ class ToolExecutionUpdateEvent:
     type: Literal["tool_execution_update"] = "tool_execution_update"
     tool_call_id: str
     tool_name: str
+    run_id: str | None = None
+    outcome: AgentLifecycleOutcome | None = None
     args: JsonValue | None = None
     partial_result: JsonValue | None = None
 
@@ -1153,6 +1180,8 @@ class ToolStreamUpdateEvent:
     type: Literal["tool_stream_update"] = "tool_stream_update"
     tool_call_id: str
     tool_name: str
+    run_id: str | None = None
+    outcome: AgentLifecycleOutcome | None = None
     update: JsonValue | None = None
 
 
@@ -1161,6 +1190,8 @@ class ToolExecutionEndEvent:
     type: Literal["tool_execution_end"] = "tool_execution_end"
     tool_call_id: str
     tool_name: str
+    run_id: str | None = None
+    outcome: AgentLifecycleOutcome | None = None
     result: JsonValue | None = None
     is_error: bool | None = None
 
@@ -2486,6 +2517,15 @@ def parse_bash_result(value: object, path: str = "BashResult") -> BashResult:
         working_dir=optional(payload, "workingDir", decode_str, path),
         images=optional(payload, "images", array(parse_image_content), path),
         trace=optional(payload, "trace", decode_json_object, path),
+        fork=optional(payload, "fork", parse_shell_fork_outcome, path),
+    )
+
+
+def parse_shell_fork_outcome(value: object, path: str = "ShellForkOutcome") -> ShellForkOutcome:
+    payload = expect_object(value, path)
+    return ShellForkOutcome(
+        carried=required(payload, "carried", decode_bool, path),
+        jobs=required(payload, "jobs", decode_bool, path),
     )
 
 
@@ -2808,6 +2848,8 @@ def parse_agent_start_event(value: object, path: str = "AgentStartEvent") -> Age
     payload = expect_object(value, path)
     required(payload, "type", cast('Decoder[Literal["agent_start"]]', literal(frozenset({"agent_start"}))), path)
     return AgentStartEvent(
+        run_id=optional(payload, "runId", decode_str, path),
+        outcome=optional(payload, "outcome", _decode_agent_lifecycle_outcome, path),
         resumed_tool_call_ids=optional(payload, "resumedToolCallIds", array(decode_str), path),
     )
 
@@ -2817,8 +2859,9 @@ def parse_agent_end_event(value: object, path: str = "AgentEndEvent") -> AgentEn
     required(payload, "type", cast('Decoder[Literal["agent_end"]]', literal(frozenset({"agent_end"}))), path)
     return AgentEndEvent(
         messages=required(payload, "messages", array(parse_agent_message), path),
-        message_count=optional(payload, "messageCount", decode_int, path),
+        run_id=optional(payload, "runId", decode_str, path),
         outcome=optional(payload, "outcome", _decode_agent_lifecycle_outcome, path),
+        message_count=optional(payload, "messageCount", decode_int, path),
         is_terminal=optional(payload, "isTerminal", decode_bool, path),
         yielded=optional(payload, "yielded", decode_bool, path),
         awaiting_async_work=optional(payload, "awaitingAsyncWork", decode_bool, path),
@@ -2830,7 +2873,10 @@ def parse_agent_end_event(value: object, path: str = "AgentEndEvent") -> AgentEn
 def parse_turn_start_event(value: object, path: str = "TurnStartEvent") -> TurnStartEvent:
     payload = expect_object(value, path)
     required(payload, "type", cast('Decoder[Literal["turn_start"]]', literal(frozenset({"turn_start"}))), path)
-    return TurnStartEvent()
+    return TurnStartEvent(
+        run_id=optional(payload, "runId", decode_str, path),
+        outcome=optional(payload, "outcome", _decode_agent_lifecycle_outcome, path),
+    )
 
 
 def parse_turn_end_event(value: object, path: str = "TurnEndEvent") -> TurnEndEvent:
@@ -2839,6 +2885,8 @@ def parse_turn_end_event(value: object, path: str = "TurnEndEvent") -> TurnEndEv
     return TurnEndEvent(
         message=required(payload, "message", parse_agent_message, path),
         tool_results=required(payload, "toolResults", array(parse_tool_result_message), path),
+        run_id=optional(payload, "runId", decode_str, path),
+        outcome=optional(payload, "outcome", _decode_agent_lifecycle_outcome, path),
     )
 
 
@@ -2847,6 +2895,8 @@ def parse_message_start_event(value: object, path: str = "MessageStartEvent") ->
     required(payload, "type", cast('Decoder[Literal["message_start"]]', literal(frozenset({"message_start"}))), path)
     return MessageStartEvent(
         message=required(payload, "message", parse_agent_message, path),
+        run_id=optional(payload, "runId", decode_str, path),
+        outcome=optional(payload, "outcome", _decode_agent_lifecycle_outcome, path),
         message_id=optional(payload, "messageId", decode_str, path),
     )
 
@@ -2857,6 +2907,8 @@ def parse_message_update_event(value: object, path: str = "MessageUpdateEvent") 
     return MessageUpdateEvent(
         message=required(payload, "message", parse_agent_message, path),
         assistant_message_event=required(payload, "assistantMessageEvent", parse_assistant_message_event, path),
+        run_id=optional(payload, "runId", decode_str, path),
+        outcome=optional(payload, "outcome", _decode_agent_lifecycle_outcome, path),
         message_id=optional(payload, "messageId", decode_str, path),
     )
 
@@ -2866,6 +2918,8 @@ def parse_message_end_event(value: object, path: str = "MessageEndEvent") -> Mes
     required(payload, "type", cast('Decoder[Literal["message_end"]]', literal(frozenset({"message_end"}))), path)
     return MessageEndEvent(
         message=required(payload, "message", parse_agent_message, path),
+        run_id=optional(payload, "runId", decode_str, path),
+        outcome=optional(payload, "outcome", _decode_agent_lifecycle_outcome, path),
         message_id=optional(payload, "messageId", decode_str, path),
     )
 
@@ -2881,6 +2935,8 @@ def parse_tool_execution_start_event(value: object, path: str = "ToolExecutionSt
     return ToolExecutionStartEvent(
         tool_call_id=required(payload, "toolCallId", decode_str, path),
         tool_name=required(payload, "toolName", decode_str, path),
+        run_id=optional(payload, "runId", decode_str, path),
+        outcome=optional(payload, "outcome", _decode_agent_lifecycle_outcome, path),
         args=optional(payload, "args", decode_json, path),
         intent=optional(payload, "intent", decode_str, path),
     )
@@ -2899,6 +2955,8 @@ def parse_tool_execution_update_event(
     return ToolExecutionUpdateEvent(
         tool_call_id=required(payload, "toolCallId", decode_str, path),
         tool_name=required(payload, "toolName", decode_str, path),
+        run_id=optional(payload, "runId", decode_str, path),
+        outcome=optional(payload, "outcome", _decode_agent_lifecycle_outcome, path),
         args=optional(payload, "args", decode_json, path),
         partial_result=optional(payload, "partialResult", decode_json, path),
     )
@@ -2915,6 +2973,8 @@ def parse_tool_stream_update_event(value: object, path: str = "ToolStreamUpdateE
     return ToolStreamUpdateEvent(
         tool_call_id=required(payload, "toolCallId", decode_str, path),
         tool_name=required(payload, "toolName", decode_str, path),
+        run_id=optional(payload, "runId", decode_str, path),
+        outcome=optional(payload, "outcome", _decode_agent_lifecycle_outcome, path),
         update=optional(payload, "update", decode_json, path),
     )
 
@@ -2930,6 +2990,8 @@ def parse_tool_execution_end_event(value: object, path: str = "ToolExecutionEndE
     return ToolExecutionEndEvent(
         tool_call_id=required(payload, "toolCallId", decode_str, path),
         tool_name=required(payload, "toolName", decode_str, path),
+        run_id=optional(payload, "runId", decode_str, path),
+        outcome=optional(payload, "outcome", _decode_agent_lifecycle_outcome, path),
         result=optional(payload, "result", decode_json, path),
         is_error=optional(payload, "isError", decode_bool, path),
     )
@@ -3641,7 +3703,12 @@ def parse_select_ui_request(value: object, path: str = "SelectUiRequest") -> Sel
         options=required(payload, "options", array(decode_str), path),
         option_details=optional(payload, "optionDetails", array(parse_select_option_detail), path),
         initial_index=optional(payload, "initialIndex", decode_int, path),
-        selection_marker=optional(payload, "selectionMarker", cast('Decoder[Literal["radio", "checkbox"]]', literal(frozenset({"radio", "checkbox"}))), path),
+        selection_marker=optional(
+            payload,
+            "selectionMarker",
+            cast('Decoder[Literal["radio", "checkbox"]]', literal(frozenset({"radio", "checkbox"}))),
+            path,
+        ),
         checked_indices=optional(payload, "checkedIndices", array(decode_int), path),
         markable_count=optional(payload, "markableCount", decode_int, path),
         timeout=optional(payload, "timeout", decode_int, path),
@@ -3844,7 +3911,12 @@ def parse_extension_ui_request(value: object, path: str = "ExtensionUiRequest") 
         options=optional(payload, "options", array(decode_str), path),
         option_details=optional(payload, "optionDetails", array(parse_select_option_detail), path),
         initial_index=optional(payload, "initialIndex", decode_int, path),
-        selection_marker=optional(payload, "selectionMarker", cast('Decoder[Literal["radio", "checkbox"]]', literal(frozenset({"radio", "checkbox"}))), path),
+        selection_marker=optional(
+            payload,
+            "selectionMarker",
+            cast('Decoder[Literal["radio", "checkbox"]]', literal(frozenset({"radio", "checkbox"}))),
+            path,
+        ),
         checked_indices=optional(payload, "checkedIndices", array(decode_int), path),
         markable_count=optional(payload, "markableCount", decode_int, path),
         timeout=optional(payload, "timeout", decode_int, path),
@@ -5040,6 +5112,7 @@ __all__ = [
     "SetStatusUiRequest",
     "SetTitleUiRequest",
     "SetWidgetUiRequest",
+    "ShellForkOutcome",
     "SlashCommandInput",
     "SlashCommandSource",
     "SlashSubcommand",
@@ -5229,6 +5302,7 @@ __all__ = [
     "parse_set_status_ui_request",
     "parse_set_title_ui_request",
     "parse_set_widget_ui_request",
+    "parse_shell_fork_outcome",
     "parse_slash_command_input",
     "parse_slash_subcommand",
     "parse_subagent_event",

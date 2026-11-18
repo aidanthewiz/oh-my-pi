@@ -18,7 +18,6 @@ import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { parseModelPattern } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { getBundledAgent } from "@oh-my-pi/pi-coding-agent/task/agents";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import type { AgentCompactionThresholdOverride } from "@oh-my-pi/pi-coding-agent/config/compaction-threshold";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -36,6 +35,7 @@ import type { AgentSession, AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 
 import { TaskTool } from "@oh-my-pi/pi-coding-agent/task";
+import { getBundledAgent } from "@oh-my-pi/pi-coding-agent/task/agents";
 import * as discoveryModule from "@oh-my-pi/pi-coding-agent/task/discovery";
 import { createEvalCustomTools } from "@oh-my-pi/pi-coding-agent/task/eval-tools";
 import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
@@ -71,7 +71,6 @@ function session(
 		cwd?: string;
 		settings?: Settings;
 		planMode?: boolean;
-		parentSpawns?: string;
 		outputSchema?: unknown;
 		maxDepth?: number;
 		isolationEnabled?: boolean;
@@ -80,6 +79,7 @@ function session(
 		agentServiceTierOverrides?: Record<string, string>;
 		agentCompactionThresholdOverrides?: Record<string, AgentCompactionThresholdOverride>;
 		sessionAgents?: readonly AgentDefinition[];
+		parentSpawns?: string;
 	} = {},
 ): ToolSession {
 	return {
@@ -432,7 +432,6 @@ describe("structured subagent primitive", () => {
 			await fs.rm(tempDir, { recursive: true, force: true });
 		}
 	});
-
 	it("gives task and eval invocations identical blocked-agent preflight errors", async () => {
 		const previous = Bun.env.PI_BLOCKED_AGENT;
 		Bun.env.PI_BLOCKED_AGENT = "worker";
@@ -1080,7 +1079,6 @@ describe("structured subagent primitive", () => {
 			}
 		}
 	});
-
 	it("does not return unavailable structured metadata without an effective schema", async () => {
 		const unstructuredAgent = { ...AGENT, output: undefined };
 		mockDiscovery(unstructuredAgent);
@@ -1857,39 +1855,6 @@ describe("per-call model preflight", () => {
 			request({ session: shadowedSession, agent: "m1", perCallModel: "mock/target:low" }),
 		);
 		expect(policy.modelOverride).toEqual(["mock/target:low"]);
-	});
-
-	describe("an agent shadowing the seance name", () => {
-		const shadow: AgentDefinition = { ...AGENT, name: "seance", source: "project", model: ["mock/agent-own"] };
-
-		it.each([
-			["the per-call gate", "off", "mock/target", "task.perCallModel: off"],
-			["exact-selector validation", "on", ["mock/target"], /invalid `model`/],
-		] as const)("holds its model to %s", async (_name, mode, seanceModel, error) => {
-			mockDiscovery(shadow);
-			await expect(
-				resolveEffectiveSubagentPolicy(
-					request({
-						session: perCallSession({ "task.perCallModel": mode, modelRoles: { review: "mock/target" } }),
-						agent: "seance",
-						seanceModel: typeof seanceModel === "string" ? seanceModel : [...seanceModel],
-					}),
-				),
-			).rejects.toThrow(error);
-		});
-
-		it("routes an approved model as a per-call worker", async () => {
-			mockDiscovery(shadow);
-			const policy = await resolveEffectiveSubagentPolicy(
-				request({
-					session: perCallSession({ "task.perCallModel": "on", modelRoles: { review: "mock/target" } }),
-					agent: "seance",
-					seanceModel: "mock/target",
-				}),
-			);
-			expect(policy.modelOverride).toEqual(["mock/target"]);
-			expect(policy.perCallModelGrants?.agentName).toBe("seance");
-		});
 	});
 });
 

@@ -27,7 +27,7 @@ import { resolveTernKind } from "./browser/tern/kind";
 import { isTernUnavailable } from "./browser/tern/wire";
 import { ownsTerminal } from "./browser/terminal-owner";
 import { WebKitUnavailableError } from "./browser/webkit/host";
-import { ABKIT_VERSION, installWebKitEngine, webKitEngineToInstall } from "./browser/webkit/install";
+import { installWebKitEngine, webKitEngineToInstall } from "./browser/webkit/install";
 import { resolveWebKitKind, VIEWER_PLATFORMS } from "./browser/webkit/kind";
 import type { AriaSnapshotOptions } from "./browser/aria/aria-snapshot";
 import type { ScreenshotResult } from "./browser/tab-protocol";
@@ -180,7 +180,8 @@ interface BrowserPreludeDetails {
  * over the `browser.tern` setting to adopt a block; `headed` does not opt out),
  * a cmux surface, then omp's own browser ({@link ownBrowserKind}). `app: "auto"`
  * is that chain without the relay. Tern and cmux are automatic only while no
- * other omp owns the terminal. `app: "tern"` and `app: "webkit"` are explicit:
+ * other omp owns the terminal, and none of the user's own surfaces (relay, Tern,
+ * cmux) is automatic for a subagent. `app: "tern"` and `app: "webkit"` are explicit:
  * they throw when Tern or omp's WebKit host is unavailable.
  */
 export function resolveBrowserKind(
@@ -233,8 +234,9 @@ export function resolveBrowserKind(
 	// Relay before cdpUrl among settings: enabling the opt-out-by-default relay
 	// is a deliberate mode selection, while cdpUrl is a standing fallback
 	// endpoint. A configured endpoint is a default, not an override: an
-	// explicit app wins.
-	if (app !== "auto") {
+	// explicit app wins. A `/tan` clone (task depth 0) keeps its parent's defaults.
+	const subagent = (session.taskDepth ?? 0) > 0;
+	if (app !== "auto" && !subagent) {
 		const relayKind = resolveRelayKind(
 			{
 				settingEnabled: cfgBrowserRelay.get(session.settings),
@@ -250,22 +252,21 @@ export function resolveBrowserKind(
 	}
 	// Tern and cmux show the tab beside the omp drawn in that terminal. An omp started from that
 	// session's commands (`omp -p` from its bash tool, a script an eval cell runs) inherited the
-	// pane env, and its tabs would float over the other session's work.
+	// pane env, and its tabs would float over the other session's work. A subagent has no pane of
+	// its own either: its tabs would pile up over the parent's, so it skips both even when
+	// PI_BROWSER_TERN=1 or PI_BROWSER_CMUX=1 forces them for the parent.
 	const ownsPane = ownsTerminal(env);
-	// `target` inside Tern names a browser block to adopt: an explicit request, like `app: "tern"`.
-	const ternKind = resolveTernKind(
-		{ settingEnabled: params.target !== undefined || (ownsPane && cfgBrowserTern.get(session.settings)) },
-		env,
-	);
-	if (ternKind) return ternKind;
-	const cmuxKind = resolveCmuxKind(
-		{
-			settingEnabled: ownsPane && cfgBrowserCmux.get(session.settings),
-		},
-		env,
-	);
-	if (cmuxKind) {
-		return cmuxKind;
+	if (!subagent || params.target !== undefined) {
+		// `target` inside Tern names a browser block to adopt: an explicit request, like `app: "tern"`.
+		const ternKind = resolveTernKind(
+			{ settingEnabled: params.target !== undefined || (ownsPane && cfgBrowserTern.get(session.settings)) },
+			env,
+		);
+		if (ternKind) return ternKind;
+	}
+	if (!subagent) {
+		const cmuxKind = resolveCmuxKind({ settingEnabled: ownsPane && cfgBrowserCmux.get(session.settings) }, env);
+		if (cmuxKind) return cmuxKind;
 	}
 	return ownBrowserKind(params, session, env);
 }
@@ -318,10 +319,11 @@ export function createBrowserPrelude(session: ToolSession): EvalPreludeDefinitio
 	return createBrowserPreludeDefinition(session, {
 		invoke: (parameters: unknown, context: EvalPreludeContext) => invokeBrowser(session, parameters, context),
 		status: describeBrowserCall,
-		relayFallback:
-			resolveBrowserKind({ action: "open" }, session).kind === "relay"
+		get relayFallback() {
+			return resolveBrowserKind({ action: "open" }, session).kind === "relay"
 				? resolveBrowserKind({ action: "open", app: "auto" }, session)
-				: undefined,
+				: undefined;
+		},
 	});
 }
 
@@ -552,7 +554,7 @@ async function installWebKitForOpen(
 	});
 	if (pending === null) return undefined;
 	const { engineDir } = pending;
-	if (pending.outdated) {
+	if (pending.installed) {
 		if (failedWebKitUpdates.has(engineDir)) return undefined;
 		if (!explicit && resolveBrowserKind(params, session).kind !== "webkit") return undefined;
 		try {
@@ -562,7 +564,6 @@ async function installWebKitForOpen(
 			failedWebKitUpdates.add(engineDir);
 			logger.warn(`Could not update ${CF_BRAND}'s WebKit engine; running the installed one`, {
 				engineDir,
-				version: ABKIT_VERSION,
 				error: error instanceof Error ? error.message : String(error),
 			});
 		}

@@ -63,6 +63,7 @@ import type { WorkPoolYieldItem } from "../task/workpool-yield";
 import type { EventBus } from "../utils/event-bus";
 import { WebSearchTool } from "../web/search";
 import type { WorkspaceTree } from "../workspace-tree";
+import { DSM_REFERENCES, type DsmReferenceOwner } from "../disasm/reference-owner";
 import { AskTool } from "./ask";
 import { AstEditTool } from "./ast-edit";
 import { AstGrepTool } from "./ast-grep";
@@ -73,13 +74,11 @@ import { type CheckpointState, CheckpointTool, type CompletedRewindState, Rewind
 import { ContextNotesTool, NewContextTool } from "./context-notes";
 import { DebugTool } from "./debug";
 import { DiagramTool } from "./diagram";
-import { cfgIdaAvailable } from "../ida/install";
 import { EvalTool } from "./eval";
 import { resolveEvalBackends } from "./eval-backends";
 import { GithubTool } from "./gh";
 import { GlobTool } from "./glob";
 import { GrepTool } from "./grep";
-import { IdaTool } from "./ida";
 import { isIrcEnabled } from "../irc/messaging";
 import { FindTool, isFindEnabled } from "./jfind";
 import { LearnTool } from "./learn";
@@ -152,7 +151,6 @@ export * from "./computer/supervisor";
 export * from "./context-notes";
 export * from "./debug";
 export * from "./diagram";
-export * from "./ida";
 export * from "./essential-tools";
 export * from "./eval";
 export * from "./eval-backends";
@@ -251,6 +249,8 @@ export interface FileChangeReport {
 export interface ToolSession {
 	/** Current working directory */
 	cwd: string;
+	/** Agent-owned database references, released independently from other sessions. */
+	[DSM_REFERENCES]?: DsmReferenceOwner;
 	/** Cost gate of the session tree, forwarded to subagents. */
 	costGate?: CostGateApi;
 	/** Additional workspace directories beyond cwd (multi-root), forwarded to subagents. */
@@ -397,14 +397,14 @@ export interface ToolSession {
 	 * required yield tool). Suppresses automatic tool-set expansion.
 	 */
 	restrictToolNames?: boolean;
-	/** Seance forks: the consulted session's artifacts dir, read in place by history://, artifact://, agent://. */
-	readonly seanceSourceArtifactsDir?: string;
 	/** Task recursion depth (0 = top-level, 1 = first child, etc.) */
 	taskDepth?: number;
 	/** Get this agent's eval executor session ID; keys its retained JS/Python/Ruby/Julia state. */
 	getEvalSessionId?: () => string | null;
 	/** Get session file */
 	getSessionFile: () => string | null;
+	/** Read-only artifact root of the source consulted by this historical session. */
+	seanceSourceArtifactsDir?: string;
 	/**
 	 * Owning journal; full SDK managers also supply registered identity and the
 	 * cost ledger (`appendModelUsage`) without changing advisor-local IDs.
@@ -566,14 +566,6 @@ export interface ToolSession {
 	commitTodoPhases?: (phases: TodoPhase[]) => void;
 	/** Active workpool items whose incremental yields complete the current turn. */
 	getWorkPoolYieldItems?: () => readonly WorkPoolYieldItem[];
-	/**
-	 * Trimmed text of the most recent assistant message, or `undefined` when the
-	 * turn carries no text (e.g. thinking-only). The yield tool uses it to reject
-	 * a data-less `useLastTurn` finalize that would assemble to an empty result.
-	 */
-	getLastAssistantText?: () => string | undefined;
-	/** Resolve a terminal yield's current or immediately preceding report, bound to its call ID. */
-	getYieldReportText?: (toolCallId: string) => string | undefined;
 	/** The `i` intent the model wrote on a tool call of the current turn, by call ID. */
 	getToolCallIntent?: (toolCallId: string) => string | undefined;
 	/**
@@ -587,6 +579,8 @@ export interface ToolSession {
 	 * the lines still in it (whatever a compaction, prune, clear or branch move took out does not count).
 	 */
 	getContextMessages?: () => readonly Message[];
+	/** Records a call into an eval prelude, so the session can send that prelude's first-call guide. */
+	noteEvalPreludeCall?: (name: string) => void;
 	/** The Spotlight experiment's handle on this session; present only while `spotlight.experiment.enabled`. */
 	spotlight?: SpotlightSession;
 	/** Replace the active workpool item contract and refresh its provider-facing prompt. */
@@ -673,7 +667,6 @@ export const BUILTIN_TOOLS: Record<BuiltinToolName, ToolFactory> = {
 	ask: AskTool.createIf,
 	debug: DebugTool.createIf,
 	diagram: s => new DiagramTool(s),
-	ida: IdaTool.createIf,
 	eval: s => new EvalTool(s),
 	github: GithubTool.createIf,
 	glob: s => new GlobTool(s, { rootPathAlias: true }),
@@ -860,7 +853,6 @@ export async function resolveBuiltinToolPlan(session: ToolSession, toolNames?: s
 		if (name === "bash") return editDisabled || cfgBashEnabled.get(session.settings);
 		if (name === "eval") return allowEval;
 		if (name === "debug") return cfgDebugEnabled.get(session.settings);
-		if (name === "ida") return cfgIdaAvailable.get(session.settings);
 		if (name === "todo")
 			return (!includeYield || session.prewalkArmed === true) && cfgTodoEnabled.get(session.settings);
 		if (name === "glob") return cfgGlobEnabled.get(session.settings);

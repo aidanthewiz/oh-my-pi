@@ -36,6 +36,7 @@ async function stubRoleProvider(id: SearchProviderId, behaviour: (params: Search
 		label: id,
 		isAvailable: () => true,
 		isExplicitlyAvailable: () => true,
+		isKeyless: () => false,
 		search: behaviour,
 	};
 	const getProvider = vi.spyOn(provider, "getSearchProvider").mockImplementation(async requested => {
@@ -92,6 +93,7 @@ describe("web search directive pipeline", () => {
 			label: grounding,
 			isAvailable: () => true,
 			isExplicitlyAvailable: () => true,
+			isKeyless: () => false,
 			search: async () => ({ provider: "xai", sources: [{ title: "Post", url: "https://x.com/jack/status/20" }] }),
 		}));
 
@@ -165,6 +167,7 @@ describe("web search directive pipeline", () => {
 				label: "Hacker News",
 				isAvailable: () => true,
 				isExplicitlyAvailable: () => true,
+				isKeyless: () => false,
 				search: async () => ({
 					provider: "hackernews",
 					sources: [{ title: "Thread", url: "https://news.ycombinator.com/item?id=1" }],
@@ -187,6 +190,7 @@ describe("web search directive pipeline", () => {
 			label: "exa",
 			isAvailable: () => false,
 			isExplicitlyAvailable: () => true,
+			isKeyless: () => false,
 			search: async params => ({
 				provider: "exa",
 				sources: [{ title: params.model.id, url: "https://exa.example" }],

@@ -5,18 +5,20 @@ import { TaskTool, taskSchema } from "@oh-my-pi/pi-coding-agent/task";
 import { loadBundledAgents, parseAgent } from "@oh-my-pi/pi-coding-agent/task/agents";
 import * as discoveryModule from "@oh-my-pi/pi-coding-agent/task/discovery";
 import { getTaskSchema } from "@oh-my-pi/pi-coding-agent/task/types";
-import { isBundledSeance, seanceTaskSchemaFields } from "@oh-my-pi/pi-coding-agent/task/seance";
+import { isBundledSeance } from "@oh-my-pi/pi-coding-agent/task/seance";
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { isRecord } from "@oh-my-pi/pi-utils";
 
 let taskSchemaSessionIndex = 0;
+const bundledSeance = loadBundledAgents().find(agent => isBundledSeance(agent))!;
 
 function createSession(
 	options: {
 		parentSpawns?: string;
 		disabledAgents?: string[];
 		planMode?: boolean;
+		settings?: Record<string, unknown>;
 	} = {},
 ): ToolSession {
 	return {
@@ -26,14 +28,14 @@ function createSession(
 			"task.isolation.enabled": false,
 			"task.batch": false,
 			"task.disabledAgents": options.disabledAgents ?? [],
+			...options.settings,
 		}),
 		getSessionFile: () => null,
 		getSessionSpawns: () => options.parentSpawns ?? "*",
-		getPlanModeState: () => (options.planMode ? { enabled: true } : undefined),
+		getPlanModeState: () => ({ enabled: options.planMode ?? false }),
 	} as unknown as ToolSession;
 }
 
-const bundledSeance = loadBundledAgents().find(agent => agent.name === "seance")!;
 // Contract: the single-spawn schema (`task.batch: false`; the exported
 // `taskSchema` instance) carries no batch fields while accepting a caller
 // `outputSchema` and its validation mode. The batch shape (`tasks[]` + shared
@@ -44,7 +46,7 @@ describe("task schema (single-spawn)", () => {
 	it.each([false, true])("advertises only the source task.steps selects (batch=%s)", batchEnabled => {
 		// Enabled first: the disabled schema must not reuse the enabled one from the cache.
 		for (const steps of [true, false]) {
-			const schema = getTaskSchema({ batchEnabled, isolationEnabled: false, structured: false, steps });
+			const schema = getTaskSchema({ batchEnabled, isolationEnabled: false, steps });
 			const item = steps
 				? { steps: ["Add the parser.", "Wire it in."], solutionSpace: "one defined change" }
 				: { task: "Add the parser.", solutionSpace: "one defined change" };
@@ -103,57 +105,13 @@ describe("task schema (single-spawn)", () => {
 	});
 });
 
-describe("task schema seance fields", () => {
-	it("accepts source and model selectors in every flat/batch isolation mode", () => {
-		for (const batchEnabled of [false, true]) {
-			for (const isolationEnabled of [false, true]) {
-				const schema = getTaskSchema({
-					batchEnabled,
-					isolationEnabled,
-					evalToolsEnabled: false,
-					seanceFields: seanceTaskSchemaFields,
-				});
-				const modelSelector = batchEnabled
-					? ["anthropic/claude-sonnet-4-6", "anthropic/claude-sonnet-4-5"]
-					: "anthropic/claude-sonnet-4-5";
-				const item = {
-					agent: "seance",
-					task: "Read historical context.",
-					solutionSpace: "focused read-only inspection",
-					sourceSession: "/sessions/source.jsonl",
-					model: modelSelector,
-					...(isolationEnabled ? { isolated: false } : {}),
-				};
-				const parsed = schema(batchEnabled ? { context: "shared context", tasks: [item] } : { ...item });
-				expect(parsed instanceof type.errors).toBe(false);
-				if (parsed instanceof type.errors) continue;
-				if (!parsed || typeof parsed !== "object") {
-					expect(parsed).toBeTruthy();
-					continue;
-				}
-				let parsedItem: unknown = parsed;
-				if (batchEnabled) {
-					if (!("tasks" in parsed) || !Array.isArray(parsed.tasks)) {
-						expect(parsed).toHaveProperty("tasks");
-						continue;
-					}
-					parsedItem = parsed.tasks[0];
-				}
-				expect(parsedItem).toMatchObject({
-					sourceSession: "/sessions/source.jsonl",
-					model: modelSelector,
-				});
-			}
-		}
-	});
-	it("omits seance fields when they are not enabled", () => {
+describe("task schema per-call model field", () => {
+	it("advertises model only as one string when per-call model is enabled", () => {
 		for (const batchEnabled of [false, true]) {
 			for (const isolationEnabled of [false, true]) {
 				const schema = getTaskSchema({ batchEnabled, isolationEnabled });
 				const wireSchema = JSON.stringify(schema.toJsonSchema());
-				expect(wireSchema).not.toContain('"sourceSession"');
 				expect(wireSchema).not.toContain('"model"');
-				// Per-call model alone advertises one string, never the seance selector list.
 				const perCall = JSON.stringify(
 					getTaskSchema({ batchEnabled, isolationEnabled, perCallModel: true }).toJsonSchema(),
 				);
@@ -213,6 +171,15 @@ Custom prompt.`,
 		expect(ordinarySchema).toContain('"sourceSession"');
 		expect(ordinarySchema).toContain('"model"');
 	});
+	it.each([
+		["off", false],
+		["eval", false],
+		["on", true],
+	] as const)("advertises model only when task.perCallModel allows task calls (%s)", async (mode, advertised) => {
+		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({ agents: [], projectAgentsDir: null });
+		const tool = await TaskTool.create(createSession({ settings: { "task.perCallModel": mode } }));
+		expect(JSON.stringify(tool.parameters.toJsonSchema()).includes('"model"')).toBe(advertised);
+	});
 	afterEach(() => vi.restoreAllMocks());
 });
 
@@ -255,7 +222,6 @@ describe("task spawn validation", () => {
 		const schema = getTaskSchema({
 			isolationEnabled: false,
 			batchEnabled: false,
-			seanceFields: seanceTaskSchemaFields,
 		});
 		const params = {
 			agent: "scout",
@@ -266,6 +232,6 @@ describe("task spawn validation", () => {
 		expect(schema(params) instanceof type.errors).toBe(false);
 		const scout = loadBundledAgents().find(agent => agent.name === "scout");
 		if (!scout) throw new Error("Expected the bundled scout agent");
-		expect(await executeText(params, [bundledSeance, scout])).toContain("task.perCallModel: off");
+		expect(await executeText(params, [scout])).toContain("task.perCallModel: off");
 	});
 });

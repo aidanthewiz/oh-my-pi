@@ -32,13 +32,7 @@ import {
 	untilAborted,
 } from "@oh-my-pi/pi-utils";
 import { peekFile } from "@oh-my-pi/pi-utils/peek-file";
-import {
-	cfgIdaAvailable,
-	EXECUTABLE_SNIFF_BYTES,
-	isExecutableFile,
-	isExecutableHeader,
-	isIdaDatabasePath,
-} from "../ida";
+import { cfgDisasmBackend, DISASM_BACKENDS, isExecutableFile } from "../disasm";
 import { normalizeToLF } from "../edit/normalize";
 import { getEditStore, recordFullySeenRows } from "../edit/store";
 import { extractUriScheme, InternalUrlRouter, type SchemeSpec, sessionResolveContext } from "../internal-urls";
@@ -1102,8 +1096,8 @@ function repeatReadNotice(
 
 /**
  * Whether `path` takes a trailing `:A-B` line selector: filesystem paths, web
- * URLs and `lines` schemes do; selector-free devices (`xd://`), opaque MCP
- * resources and unregistered schemes would read the tail as part of the URL.
+ * URLs and `lines` schemes do; selector-free schemes (`out://`, `attachment://`),
+ * opaque MCP resources and unregistered schemes would read the tail as part of the URL.
  */
 function acceptsLineSelector(path: string): boolean {
 	const router = InternalUrlRouter.instance();
@@ -1387,7 +1381,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 	get description(): string {
 		return prompt.render(readDescription, {
 			IS_HL_MODE: resolveFileDisplayMode(this.session).hashLines,
-			BINARY_VIEWS: cfgIdaAvailable.get(this.session.settings),
+			BINARY_VIEWS: cfgDisasmBackend.get(this.session.settings) !== undefined,
 		});
 	}
 	/**
@@ -1396,7 +1390,9 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 	 */
 	docTopics(): Record<string, string> {
 		return {
-			sources: prompt.render(readSourcesDoc, { BINARY_VIEWS: cfgIdaAvailable.get(this.session.settings) }),
+			sources: prompt.render(readSourcesDoc, {
+				BINARY_VIEWS: cfgDisasmBackend.get(this.session.settings) !== undefined,
+			}),
 			urls: InternalUrlRouter.instance()
 				.reference()
 				.map(line => `- ${line}`)
@@ -2511,7 +2507,13 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			(localTarget.sel === undefined || parseVideoSelector(localTarget.sel) !== null)
 				? { kind: "none" as const }
 				: parseSel(localTarget.sel);
-		if (!rawPathIsLiteral && question === undefined && !isVideoPath(localTarget.path) && !isRawSelector(parsed)) {
+		if (
+			!rawPathIsLiteral &&
+			question === undefined &&
+			lexicalAbsolutePath === undefined &&
+			!isVideoPath(localTarget.path) &&
+			!isRawSelector(parsed)
+		) {
 			const binaryView = await resolveBinaryViewPath(this.session, localTarget.path);
 			if (binaryView) return readBinary(this.session, binaryView, parsed, signal);
 		}
@@ -2639,6 +2641,19 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			return toolResult<ReadToolDetails>({ resolvedPath: absolutePath })
 				.text(formatLocatedFileNotice(located.url, absolutePath, fileSize, true))
 				.done();
+		}
+
+		// Metadata inspection precedes whole-file snapshots and never starts analysis.
+		// Raw/image and speculative reads retain their existing safety/fallback routes.
+		if (
+			question === undefined &&
+			!isRawSelector(parsed) &&
+			parsed.kind !== "image" &&
+			lexicalAbsolutePath === undefined &&
+			(DISASM_BACKENDS.ida.isDatabasePath(absolutePath) || (await isExecutableFile(absolutePath)))
+		) {
+			const backend = cfgDisasmBackend.get(this.session.settings);
+			return readBinary(this.session, { backend, absolutePath, view: "" }, parsed, signal);
 		}
 
 		const ext = path.extname(renderAbsolutePath).toLowerCase();
@@ -2793,20 +2808,6 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				(wholeFileBytes
 					? isProbablyBinaryHeader(wholeFileBytes.subarray(0, BINARY_SNIFF_BYTES))
 					: await isProbablyBinary(absolutePath));
-			// Executables and IDBs open in IDA instead of being refused. Speculative
-			// reads (lexicalAbsolutePath set) never launch IDA; they fall back to an
-			// ordinary execution that does.
-			if (
-				looksBinary &&
-				lexicalAbsolutePath === undefined &&
-				cfgIdaAvailable.get(this.session.settings) &&
-				(isIdaDatabasePath(absolutePath) ||
-					(wholeFileBytes
-						? isExecutableHeader(wholeFileBytes.subarray(0, EXECUTABLE_SNIFF_BYTES))
-						: await isExecutableFile(absolutePath)))
-			) {
-				return readBinary(this.session, { absolutePath, view: "" }, parsed, signal);
-			}
 			if (looksBinary) {
 				return toolResult<ReadToolDetails>({ resolvedPath: renderAbsolutePath, suffixResolution })
 					.text(

@@ -188,7 +188,7 @@ export type {
 } from "@oh-my-pi/pi-tui/overlays/ask-dialog";
 
 import type { HtmlFormData, OptionNote } from "@oh-my-pi/pi-tui/html-form/data";
-import type { FormMedia } from "@oh-my-pi/pi-tui/html-form/media";
+import type { Media } from "@oh-my-pi/pi-tui/media";
 export type { HtmlFormData, HtmlFormValue, OptionNote } from "@oh-my-pi/pi-tui/html-form/data";
 
 /** A submitted {@link ExtensionUIContext.formDialog}: form values and optional notes on selected options. */
@@ -234,7 +234,7 @@ export interface ExtensionUIDialogOptions {
 	/** Invoked when the UI times out while waiting for a selection/input */
 	onTimeout?: () => void;
 	/** In-process loader for image bytes admitted by the host's read policy. */
-	loadMedia?: (src: string, signal: AbortSignal) => Promise<FormMedia>;
+	loadMedia?: (src: string, signal: AbortSignal) => Promise<Media>;
 	/** Invoked when the UI-managed timeout countdown starts */
 	onTimeoutStart?: () => void;
 	/** Invoked when user input resets a UI-managed timeout countdown */
@@ -271,7 +271,7 @@ export interface ExtensionUIDialogOptions {
 	 *  trailing options (e.g. "Other"/"Done" actions) keep the plain cursor.
 	 *  Defaults to all options when `selectionMarker` is set. */
 	markableCount?: number;
-	/** Allow image pastes in rich ask-dialog custom-answer and note prompts. */
+	/** Allow image pastes in rich ask-dialog custom-answer and note prompts, and in `formDialog` option notes. */
 	acceptImages?: boolean;
 }
 
@@ -839,7 +839,8 @@ export interface ExtensionContext {
 	/**
 	 * Answer the open interactive plan review as if the operator picked `choice` in it.
 	 * `refine` needs non-empty `input.feedback`, which is sent as the next planning prompt.
-	 * `save` writes the plan under its default file name without the path prompt.
+	 * `save` writes the plan under its default file name without the path prompt; the review
+	 * stays open and still takes an answer (no `plan_review_resolved`).
 	 * Approvals execute the plan as it is when picked (in-overlay edits, else the plan
 	 * file), which may differ from the `planContent` that `plan_review_requested` reported.
 	 * `input.role` selects an approval's execution tier, matched against `plan_review_requested`'s
@@ -1448,7 +1449,10 @@ interface McpToolEventIdentity {
 
 /** Stable ids for the interactive plan review's choices; labels may change (keep's label carries a token count). */
 export type PlanReviewChoice = "execute" | "compact" | "keep" | "refine" | "save";
-/** A choice as displayed in the interactive plan review, delivered in display order by `plan_review_requested`. */
+/**
+ * A choice of the interactive plan review, delivered in order by `plan_review_requested`. The overlay
+ * shows `refine` only while the plan has comments; it is always answerable with feedback.
+ */
 export interface PlanReviewOption {
 	id: PlanReviewChoice;
 	label: string;
@@ -2318,8 +2322,8 @@ export interface ProviderModelConfig {
 	 * Must be a kind the api serves, as in `models.yml`.
 	 */
 	kind?: Model["kind"];
-	/** Whether the model supports extended thinking at all. */
-	reasoning: boolean;
+	/** Reviewed thinking capability; omitted when request-time discovery should determine support. */
+	reasoning?: boolean;
 	/** Optional canonical thinking capability metadata for per-model effort support. */
 	thinking?: Model["thinking"];
 	/** Supported input types. */

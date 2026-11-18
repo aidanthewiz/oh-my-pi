@@ -5,6 +5,7 @@
 ### Changed
 
 - `AuthStorage.close()` now returns `Promise<void>`. Await it before exiting or removing its database.
+- Keep Codex wire versions pinned unless explicitly overridden. Require separate SDK opt-in for thinking probes, and prohibit them inside admitted requests.
 
 ### Added
 
@@ -24,6 +25,8 @@
 - Drain complete OAuth account recovery and rate-limit mutations before broker shutdown or credential-store replacement. Persist rotated tokens in their originating store generation, and reject new local or delegated token exchanges after shutdown begins.
 - Preserve prototype-named caller fields and strict tool-schema behavior while retaining supported extra root arguments. Refuse empty Factory schema conjunctions instead of widening them.
 - Preserve Anthropic fallback-credit redemption through `streamSimple()` so retries keep the token, frozen request body, and continuation.
+- Protect active Antigravity login directories with native leases, and wait for actual child exit before credential-directory removal.
+- Attribute usage without resolving unrelated command-backed credential rows.
 - Keep stock Anthropic AWS environment routing and credentials consistent when `firstPartyProvider` is disabled.
 - Redact credential headers and URL secrets from opt-in request logs. Write private files; explicitly recorded bodies remain raw.
 - Keep request compression resends inside inference routes, retain cancellation, and replace headers that describe uncompressed bytes.
@@ -52,6 +55,60 @@
 - Preserved lease-owned account restrictions alongside durable credential admission, and kept branded callback errors inert during OAuth completion.
 - Kept official fallback-credit payloads off Factory routes and isolated Droid capture credentials without overriding account entitlements.
 - Preserve effective-endpoint fallback replay restrictions while collapsing incompatible Anthropic reasoning chains. Keep quoted prose during doubled-pipe DSML cleanup.
+## [18.22.1] - 2026-11-17
+
+### Added
+
+- Added support for request-specific Anthropic beta headers through the `extraBetas` option in `buildAnthropicSearchHeaders`.
+- Added `omitDemotedReasoning` to `StreamOptions`, allowing Anthropic requests to omit other models' reasoning that would otherwise be replayed as text; refused requests report the omitted block count in `demotedReasoningBlocks`.
+- Usage reports can now include the credential ID used by API-key or OAuth credentials, and `AuthStorage.sessions.sticky` provides a read-only lookup for the credential serving a session.
+- Added `riskAcknowledgement` to `OAuthPrompt`, allowing hosts to display login-warning acceptance text even when they decline input before the authorization URL is shown.
+- `remoteCompaction: { api: "anthropic-messages", enabled: true }` opts an Anthropic model at a gateway `baseUrl` outside the known deployments into on-demand compaction; `enabled` alone keeps such a gateway excluded, and a reroute away from the configured endpoint still has to reach a known deployment. `isBuiltinApi()` tells a built-in request adapter from an extension's custom api ([#19580](https://github.com/can1357/oh-my-pi/pull/19580) by [@ryanskidmore](https://github.com/ryanskidmore))
+
+### Changed
+
+- OpenAI Codex requests now track the latest compatible `@openai/codex` client version automatically, with an optional `PI_AI_CODEX_CLIENT_VERSION` override, so newly available Codex models can be used without updating omp.
+- Updated OpenAI Codex request formatting and ChatGPT token-refresh reporting to match Codex CLI 0.169.
+- Updated Claude Code and Gemini CLI client version identifiers to 2.1.326 and 0.68.0, respectively.
+
+### Fixed
+
+- Fixed OpenAI Decisions usage accounting for gateways that report `prompt_tokens` and `completion_tokens` instead of `input_tokens` and `output_tokens`.
+- Improved streaming performance for fenced thinking content containing very long unbroken lines.
+- Fixed Anthropic requests replaying signed server-compaction blocks with unsupported thread metadata, avoiding a rejected request before retrying.
+- Improved diagnostics for Anthropic connections that drop before a response by reporting elapsed time, upload state, and request size.
+- Fixed Anthropic conversations losing reasoning from earlier non-Claude turns or turns retained through compaction.
+- Fixed credential rotation and retry timing for custom providers using the Zhipu Coding Plan endpoint so Beijing-time quota resets are honored.
+- Fixed Claude Fable and Mythos usage-limit errors so rotation selects a sibling account with available quota when possible.
+- Invalid Antigravity CLI tool arguments now return validation errors and the expected schema to the model instead of ending the turn.
+- Abandoned Antigravity CLI login directories without credentials are automatically cleaned up after 24 hours.
+- Improved reliability of managed Antigravity CLI downloads on slow connections and provided more useful progress and timeout errors.
+- Fixed Antigravity CLI host tools with mixed-type union schemas being published incorrectly, allowing subagents to submit results.
+- Fixed Codex assistant messages in the `partial_answer` phase losing their phase when stored and replayed.
+
+## [18.22.0] - 2026-11-16
+
+### Fixed
+
+- Fixed slow streaming of Gemma tool calls with large arguments.
+
+## [18.21.0] - 2026-11-16
+
+### Added
+
+- Added automatic detection of thinking capabilities for previously unknown models, with persistent results and support for alternate effort and token-budget request formats.
+
+## [18.20.3] - 2026-11-16
+
+### Breaking Changes
+
+- Removed the public `isXdDevicePath` export from `providers/cursor-pi-args`. Ranged reads of `xd://` documents now use the standard line-selector behavior.
+
+### Fixed
+
+- Fixed rate-limit handling for Mistral and other OpenAI-compatible providers so requests with no available allowance fail immediately with an actionable error suggesting a model or plan change.
+- Fixed Anthropic OAuth requests for pooled Claude accounts to report accurate device and account information, including after credentials are rotated during a request.
+
 ## [18.20.2] - 2026-11-14
 
 ### Added
@@ -2558,3 +2615,4 @@
 Older entries are archived in [packages/ai/CHANGELOG.md@7dc0d0325754](https://github.com/can1357/oh-my-pi/blob/7dc0d0325754955b01c15b64b220b2cf27e670db/packages/ai/CHANGELOG.md).
 Older entries are archived in [packages/ai/CHANGELOG.md@b81a844b520a](https://github.com/can1357/oh-my-pi/blob/b81a844b520af43d1d190a99fcdc8928e242b315/packages/ai/CHANGELOG.md).
 Older entries are archived in [packages/ai/CHANGELOG.md@80ad1d6b2eb3](https://github.com/can1357/oh-my-pi/blob/80ad1d6b2eb3dd916d863841dcae79f4f96c5612/packages/ai/CHANGELOG.md).
+Older entries are archived in [packages/ai/CHANGELOG.md@6d3c42d33f26](https://github.com/can1357/oh-my-pi/blob/6d3c42d33f261e22588fbb7a96bff5af83a2e90e/packages/ai/CHANGELOG.md).

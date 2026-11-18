@@ -146,6 +146,7 @@ describe("web search transport authorization", () => {
 			isAvailable: (_auth, model) =>
 				model?.id === "duckduckgo" || model?.id === "parallel" || model?.id === "exa" || model?.id === "firecrawl",
 			isExplicitlyAvailable: () => true,
+			isKeyless: () => false,
 			search: async ({ model }) => {
 				attempted.push(model.id);
 				return {
@@ -186,6 +187,7 @@ describe("web search transport authorization", () => {
 			label: "Recorded grounding",
 			isAvailable: () => true,
 			isExplicitlyAvailable: () => true,
+			isKeyless: () => false,
 			search: async ({ model }) => {
 				attempted.push(`${model.provider}/${model.id}`);
 				return {

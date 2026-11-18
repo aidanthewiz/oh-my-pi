@@ -109,6 +109,12 @@ export type SubmittedUserInput = {
 	started: boolean;
 };
 
+/** A dialog that hands typing to the composer: registered by the ExtensionUiController approval, form and ask presenters, read by InputController's image and HTML paste routing. */
+export interface ComposerOwner {
+	component: Component;
+	owns(): boolean;
+}
+
 export interface InteractiveModeInitOptions {
 	suppressWelcomeIntro?: boolean;
 	clearInitialTerminalHistory?: boolean;
@@ -122,6 +128,11 @@ export type InteractiveSelectorDialogOptions = ExtensionUIDialogOptions &
 	Pick<HookSelectorOptions, "disabledIndices" | "inline">;
 
 export type SessionPickHandler = (session: SessionInfo) => void | Promise<void>;
+
+export interface SelectOnlyModelSelectorOptions {
+	currentSelector?: string;
+	onSelect: (selector: string) => void | Promise<void>;
+}
 
 /** Discovery metadata for {@link InteractiveModeContext.handleResumeSession}; the supplied path remains authoritative. */
 export interface ResumeSessionOptions {
@@ -157,13 +168,6 @@ export interface ShowStatusOptions {
 	toast?: boolean;
 	/** A button on the native toast (Undo); the ANSI line has none. */
 	action?: StatusNoticeAction;
-}
-
-export interface SelectOnlyModelSelectorOptions {
-	/** Use the selected `provider/id` for the caller's operation without mutating session defaults. */
-	onSelect: (selector: string) => void | Promise<void>;
-	/** `provider/id` initially highlighted in the picker. */
-	currentSelector?: string;
 }
 
 export interface AgentHubOpenOptions {
@@ -221,6 +225,8 @@ export interface InteractiveModeContext {
 	readonly focusedAgentId: string | undefined;
 	/** Set while a tool-approval dialog owns the composer: its drafts steer the main session awaiting that approval, even from a focused agent's view. */
 	approvalOwnsComposer?: boolean;
+	/** The mounted dialog that currently hands typing to the composer, if any. */
+	composerOwner?: ComposerOwner;
 	/** Focus the main view on an agent's live session (delegates to SessionFocusController.focusAgent). */
 	focusAgentSession(id: string): Promise<void>;
 	/** Focus the focused agent's parent session, falling back to main (delegates to focusParent). */
@@ -648,7 +654,7 @@ export interface InteractiveModeContext {
 	showModelSelector(options?: { temporaryOnly?: boolean; selectOnly?: SelectOnlyModelSelectorOptions }): void;
 	/** Session-only switch to an already-resolved model (`/switch <selector>`); compacts first when over context. */
 	switchSessionModel(model: Model, thinkingLevel?: ConfiguredThinkingLevel, role?: string): Promise<void>;
-	showPluginSelector(mode?: "install" | "uninstall"): void;
+	showPluginSelector(mode?: "install" | "uninstall"): Promise<void>;
 	showUserMessageSelector(startAt?: string): void;
 	showCopySelector(): void;
 	showTreeSelector(): void;
@@ -694,6 +700,10 @@ export interface InteractiveModeContext {
 	handleTanCommand(work: string, images?: ImageContent[]): Promise<boolean>;
 	hasActiveBtw(): boolean;
 	handleBtwEscape(): boolean;
+	/** The composer talks to a `/btw` note (Tern): plain drafts go to its topic as follow-ups. */
+	readonly isBtwFocused: boolean;
+	/** Sends a draft to the focused `/btw` note's topic; false when no follow-up started. */
+	submitBtwFollowUp(question: string, images?: ImageContent[]): Promise<boolean>;
 	handleBtwBranchKey(): Promise<boolean>;
 	canBranchBtw(): boolean;
 	handlesBtwBranchKey(): boolean;

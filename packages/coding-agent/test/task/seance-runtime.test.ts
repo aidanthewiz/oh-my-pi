@@ -356,6 +356,7 @@ describe("seance startup contracts", () => {
 				taskDepth: 1,
 				toolNames: ["read", "grep", "glob"],
 				requireYieldTool: true,
+				outputSchema: {},
 				...seanceIsolationOptions(cwd),
 				systemPrompt: defaultPrompt => {
 					defaultPromptBlocks = [...defaultPrompt];
@@ -373,6 +374,7 @@ describe("seance startup contracts", () => {
 				resolvedModel,
 				restrictToolNames: true,
 				spawns: "",
+				outputSchema: {},
 			});
 			await liveSession.sessionManager.ensureOnDisk();
 			const warmPrompt = [...liveSession.systemPrompt];

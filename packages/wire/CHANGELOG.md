@@ -5,6 +5,13 @@
 ### Breaking Changes
 
 - Collaboration protocol version 4 requires loop ownership on lifecycle events and activity snapshots. Version 3 peers are rejected during the handshake.
+## [18.22.0] - 2026-11-16
+
+### Added
+
+- Added optional picker icons for tooltips and accessible names, plus an option to control the placement of the search interface.
+- Added buttons, menu, and document component kinds, including menu-row action state changes and document text editing, commenting, and uncommenting events.
+
 ## [18.18.6] - 2026-11-09
 
 ### Added

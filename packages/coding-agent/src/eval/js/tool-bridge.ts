@@ -22,6 +22,7 @@ import {
 	runEvalStatus,
 	runEvalWait,
 } from "../handle-bridge";
+import { withEvalBridgeToolCall } from "../tool-bridge-policy";
 import { EVAL_WORKPOOL_BRIDGE_NAME, type EvalWorkpoolResult, runEvalWorkpool } from "../workpool-bridge";
 import {
 	bridgeValueFromToolResult,
@@ -73,7 +74,11 @@ function summarizePreludeResult(session: ToolSession): StatusSummarizer {
 	};
 }
 
-export async function callSessionTool(name: string, args: unknown, options: ToolBridgeOptions): Promise<ToolValue> {
+export function callSessionTool(name: string, args: unknown, options: ToolBridgeOptions): Promise<ToolValue> {
+	return withEvalBridgeToolCall(options.session.xdev, () => dispatchSessionTool(name, args, options));
+}
+
+async function dispatchSessionTool(name: string, args: unknown, options: ToolBridgeOptions): Promise<ToolValue> {
 	if (name === "__prelude__") {
 		const request = parsePreludeRequest(args);
 		const toolCallId = `prelude-${request.name}-${crypto.randomUUID()}`;

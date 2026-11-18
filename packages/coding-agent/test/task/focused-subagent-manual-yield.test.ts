@@ -170,7 +170,6 @@ async function spawnKeptAliveChild(options: { handler?: MockHandler; structured?
 			task: "report",
 			index: 0,
 			id: AGENT_ID,
-			structured,
 			outputSchema: structured ? { type: "string" } : undefined,
 			parentAgentId: PARENT_ID,
 			asyncJobManager: manager,
@@ -267,7 +266,7 @@ it.each([true, false])(
 			await child.session.prompt("finish up");
 			await publicationStarted.promise;
 			gate.resolve();
-			await child.session.settleAsyncWork();
+			await child.session.waitForRunEnd();
 			releasePublication.resolve();
 
 			await child.secondDelivery;
@@ -810,8 +809,7 @@ for (const source of ["queued steering", "async completion"] as const) {
 			expect(parent.outcome).toBe("injected");
 			expect(await Bun.file(child.artifact).text()).toContain("INITIAL_FINAL");
 			releaseContinuation.resolve();
-			await child.session.waitForIdle();
-			await child.session.settleAsyncWork();
+			await child.session.waitForRunEnd();
 			await child.session.waitForIrcReplies();
 			await manager.waitForOwnerJobs(PARENT_ID);
 			await manager.drainDeliveries({ filter: { ownerId: PARENT_ID } });

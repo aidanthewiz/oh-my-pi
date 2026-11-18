@@ -1,16 +1,16 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, spyOn, vi } from "bun:test";
-import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { Model } from "@oh-my-pi/pi-ai";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
+import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { SelectorController } from "@oh-my-pi/pi-coding-agent/modes/controllers/selector-controller";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import type { Component, OverlayHandle, OverlayOptions, TUI } from "@oh-my-pi/pi-tui";
-import { SessionSelectorComponent } from "@oh-my-pi/pi-tui/overlays/session-selector";
 import { AgentsHubComponent } from "@oh-my-pi/pi-tui/overlays/agents-hub";
 import { AgentHubOverlayComponent } from "@oh-my-pi/pi-tui/overlays/agent-hub";
 import { ModelHubComponent } from "@oh-my-pi/pi-tui/overlays/model-hub";
 import { SessionObserverRegistry } from "@oh-my-pi/pi-tui/overlays/session-observer-registry";
+import { SessionSelectorComponent } from "@oh-my-pi/pi-tui/overlays/session-selector";
 import * as activityClient from "@oh-my-pi/pi-coding-agent/stats/activity-client";
 import * as sessionPins from "@oh-my-pi/pi-coding-agent/session/session-pins";
 import { cfgTaskAgentModelOverrides } from "@oh-my-pi/pi-coding-agent/task/settings";
@@ -57,17 +57,16 @@ function overlayUi(): {
 	return { shown, setFocus, overlayStack, getFocused: () => focused, ui: { overlayStack, setFocus, showOverlay } };
 }
 
-/** A context whose model picker reads a supplied current catalog. */
-function pickerContext(ui: OverlayUi, models: Model[] = [], current?: Model, settings?: Settings) {
+function pickerContext(ui: OverlayUi, models: Model[] = [], model?: Model, settings = Settings.isolated()) {
 	return createInteractiveModeContext({
 		settings,
 		session: {
-			model: current,
+			model,
 			scopedModels: [],
 			getContextUsage: () => undefined,
 			effectiveServiceTier: () => undefined,
 			getRoleModelCycle: () => undefined,
-			resolveTemporaryModelThinkingLevel: () => undefined,
+			resolveTemporaryModelThinkingLevel: () => "off",
 			setModelTemporary: vi.fn(async () => {}),
 			applyRoleModel: vi.fn(async () => {}),
 			modelRegistry: {
@@ -246,7 +245,6 @@ describe("single-instance menus", () => {
 		shown[3]?.handleInput?.("\x1b");
 		expect(ui.overlayStack).toHaveLength(0);
 	});
-
 	it("raises an open model picker another overlay covers instead of focusing it hidden", () => {
 		const { ui, overlayStack } = overlayUi();
 		const controller = new SelectorController(pickerContext(ui));

@@ -2555,7 +2555,7 @@ type SessionState struct {
 	TokensPerSecond    *float64         `json:"tokensPerSecond"`
 	MessageCount       int64            `json:"messageCount"`
 	QueuedMessageCount int64            `json:"queuedMessageCount"`
-	// Background jobs or deliveries can still inject a follow-up and wake the session.
+	// Background jobs, their deliveries, child agents or queued peer messages can still wake the session.
 	HasPendingAsyncWork bool `json:"hasPendingAsyncWork"`
 	// Idle with nothing queued or pending; same predicate as `session_settled`.
 	IsSettled      bool                `json:"isSettled"`
@@ -2685,6 +2685,8 @@ type BashResult struct {
 	Images        []ImageContent             `json:"images,omitempty"`
 	// The embedded shell's final `ShellTrace` of the run; only when the caller asked for one.
 	Trace map[string]json.RawMessage `json:"trace,omitempty"`
+	// Set when the command overlapped another one on the session's persistent shell and ran in a fork of it.
+	Fork *ShellForkOutcome `json:"fork,omitempty"`
 }
 
 func (v *BashResult) UnmarshalJSON(data []byte) error {
@@ -2716,6 +2718,30 @@ func (v *BashResult) decodeFrom(raw map[string]json.RawMessage) error {
 	d.optional("workingDir", &out.WorkingDir)
 	d.optional("images", &out.Images)
 	d.optional("trace", &out.Trace)
+	d.optional("fork", &out.Fork)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
+type ShellForkOutcome struct {
+	// What the command set carried back into the session's shell; `false`: it stayed in the fork.
+	Carried bool `json:"carried"`
+	// It left background jobs running in the fork, where later commands' `jobs`, `wait` and `%N` miss them.
+	Jobs bool `json:"jobs"`
+}
+
+func (v *ShellForkOutcome) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "ShellForkOutcome", v.decodeFrom)
+}
+
+func (v *ShellForkOutcome) decodeFrom(raw map[string]json.RawMessage) error {
+	var out ShellForkOutcome
+	d := fieldDecoder{raw: raw, owner: "ShellForkOutcome"}
+	d.required("carried", &out.Carried)
+	d.required("jobs", &out.Jobs)
 	if d.err != nil {
 		return d.err
 	}
@@ -3675,6 +3701,8 @@ func (v *AgentLifecycleOutcome) UnmarshalJSON(data []byte) error {
 }
 
 type AgentStartEvent struct {
+	RunID   *string                `json:"runId,omitempty"`
+	Outcome *AgentLifecycleOutcome `json:"outcome,omitempty"`
 	// Calls of an unpaired assistant tail a continued run executes before its first model request.
 	ResumedToolCallIds []string `json:"resumedToolCallIds,omitempty"`
 }
@@ -3687,6 +3715,8 @@ func (v *AgentStartEvent) decodeFrom(raw map[string]json.RawMessage) error {
 	var out AgentStartEvent
 	d := fieldDecoder{raw: raw, owner: "AgentStartEvent"}
 	d.constant("type", "agent_start")
+	d.optional("runId", &out.RunID)
+	d.optional("outcome", &out.Outcome)
 	d.optional("resumedToolCallIds", &out.ResumedToolCallIds)
 	if d.err != nil {
 		return d.err
@@ -3703,10 +3733,11 @@ func (v AgentStartEvent) MarshalJSON() ([]byte, error) {
 type AgentEndEvent struct {
 	// Messages of the run; an oversized frame drops a prefix already delivered by `message_end` (see `messageCount`).
 	Messages []AgentMessage `json:"messages"`
-	// Original message count when the frame was compacted.
-	MessageCount *int64 `json:"messageCount,omitempty"`
+	RunID    *string        `json:"runId,omitempty"`
 	// This loop's outcome, independent of persisted transcript messages.
 	Outcome *AgentLifecycleOutcome `json:"outcome,omitempty"`
+	// Original message count when the frame was compacted.
+	MessageCount *int64 `json:"messageCount,omitempty"`
 	// False when a continuation or async delivery remains.
 	IsTerminal *bool `json:"isTerminal,omitempty"`
 	// The agent finished its turn and resumes only for queued input or background-job results.
@@ -3726,8 +3757,9 @@ func (v *AgentEndEvent) decodeFrom(raw map[string]json.RawMessage) error {
 	d := fieldDecoder{raw: raw, owner: "AgentEndEvent"}
 	d.constant("type", "agent_end")
 	d.required("messages", &out.Messages)
-	d.optional("messageCount", &out.MessageCount)
+	d.optional("runId", &out.RunID)
 	d.optional("outcome", &out.Outcome)
+	d.optional("messageCount", &out.MessageCount)
 	d.optional("isTerminal", &out.IsTerminal)
 	d.optional("yielded", &out.Yielded)
 	d.optional("awaitingAsyncWork", &out.AwaitingAsyncWork)
@@ -3745,7 +3777,10 @@ func (v AgentEndEvent) MarshalJSON() ([]byte, error) {
 	return encodeObject(plain(v), `"type":"agent_end"`, nil)
 }
 
-type TurnStartEvent struct{}
+type TurnStartEvent struct {
+	RunID   *string                `json:"runId,omitempty"`
+	Outcome *AgentLifecycleOutcome `json:"outcome,omitempty"`
+}
 
 func (v *TurnStartEvent) UnmarshalJSON(data []byte) error {
 	return decodeWith(data, "TurnStartEvent", v.decodeFrom)
@@ -3755,6 +3790,8 @@ func (v *TurnStartEvent) decodeFrom(raw map[string]json.RawMessage) error {
 	var out TurnStartEvent
 	d := fieldDecoder{raw: raw, owner: "TurnStartEvent"}
 	d.constant("type", "turn_start")
+	d.optional("runId", &out.RunID)
+	d.optional("outcome", &out.Outcome)
 	if d.err != nil {
 		return d.err
 	}
@@ -3768,8 +3805,10 @@ func (v TurnStartEvent) MarshalJSON() ([]byte, error) {
 }
 
 type TurnEndEvent struct {
-	Message     AgentMessage        `json:"message"`
-	ToolResults []ToolResultMessage `json:"toolResults"`
+	Message     AgentMessage           `json:"message"`
+	ToolResults []ToolResultMessage    `json:"toolResults"`
+	RunID       *string                `json:"runId,omitempty"`
+	Outcome     *AgentLifecycleOutcome `json:"outcome,omitempty"`
 }
 
 func (v *TurnEndEvent) UnmarshalJSON(data []byte) error {
@@ -3782,6 +3821,8 @@ func (v *TurnEndEvent) decodeFrom(raw map[string]json.RawMessage) error {
 	d.constant("type", "turn_end")
 	d.required("message", &out.Message)
 	d.required("toolResults", &out.ToolResults)
+	d.optional("runId", &out.RunID)
+	d.optional("outcome", &out.Outcome)
 	if d.err != nil {
 		return d.err
 	}
@@ -3795,7 +3836,9 @@ func (v TurnEndEvent) MarshalJSON() ([]byte, error) {
 }
 
 type MessageStartEvent struct {
-	Message AgentMessage `json:"message"`
+	Message AgentMessage           `json:"message"`
+	RunID   *string                `json:"runId,omitempty"`
+	Outcome *AgentLifecycleOutcome `json:"outcome,omitempty"`
 	// Shared by the start, updates, and end of one message; unique per process.
 	MessageID *string `json:"messageId,omitempty"`
 }
@@ -3809,6 +3852,8 @@ func (v *MessageStartEvent) decodeFrom(raw map[string]json.RawMessage) error {
 	d := fieldDecoder{raw: raw, owner: "MessageStartEvent"}
 	d.constant("type", "message_start")
 	d.required("message", &out.Message)
+	d.optional("runId", &out.RunID)
+	d.optional("outcome", &out.Outcome)
 	d.optional("messageId", &out.MessageID)
 	if d.err != nil {
 		return d.err
@@ -3823,8 +3868,10 @@ func (v MessageStartEvent) MarshalJSON() ([]byte, error) {
 }
 
 type MessageUpdateEvent struct {
-	Message               AgentMessage          `json:"message"`
-	AssistantMessageEvent AssistantMessageEvent `json:"assistantMessageEvent"`
+	Message               AgentMessage           `json:"message"`
+	AssistantMessageEvent AssistantMessageEvent  `json:"assistantMessageEvent"`
+	RunID                 *string                `json:"runId,omitempty"`
+	Outcome               *AgentLifecycleOutcome `json:"outcome,omitempty"`
 	// Shared by the start, updates, and end of one message; unique per process.
 	MessageID *string `json:"messageId,omitempty"`
 }
@@ -3839,6 +3886,8 @@ func (v *MessageUpdateEvent) decodeFrom(raw map[string]json.RawMessage) error {
 	d.constant("type", "message_update")
 	d.required("message", &out.Message)
 	d.required("assistantMessageEvent", &out.AssistantMessageEvent)
+	d.optional("runId", &out.RunID)
+	d.optional("outcome", &out.Outcome)
 	d.optional("messageId", &out.MessageID)
 	if d.err != nil {
 		return d.err
@@ -3853,7 +3902,9 @@ func (v MessageUpdateEvent) MarshalJSON() ([]byte, error) {
 }
 
 type MessageEndEvent struct {
-	Message AgentMessage `json:"message"`
+	Message AgentMessage           `json:"message"`
+	RunID   *string                `json:"runId,omitempty"`
+	Outcome *AgentLifecycleOutcome `json:"outcome,omitempty"`
 	// Shared by the start, updates, and end of one message; unique per process.
 	MessageID *string `json:"messageId,omitempty"`
 }
@@ -3867,6 +3918,8 @@ func (v *MessageEndEvent) decodeFrom(raw map[string]json.RawMessage) error {
 	d := fieldDecoder{raw: raw, owner: "MessageEndEvent"}
 	d.constant("type", "message_end")
 	d.required("message", &out.Message)
+	d.optional("runId", &out.RunID)
+	d.optional("outcome", &out.Outcome)
 	d.optional("messageId", &out.MessageID)
 	if d.err != nil {
 		return d.err
@@ -3881,10 +3934,12 @@ func (v MessageEndEvent) MarshalJSON() ([]byte, error) {
 }
 
 type ToolExecutionStartEvent struct {
-	ToolCallID string          `json:"toolCallId"`
-	ToolName   string          `json:"toolName"`
-	Args       json.RawMessage `json:"args,omitempty"`
-	Intent     *string         `json:"intent,omitempty"`
+	ToolCallID string                 `json:"toolCallId"`
+	ToolName   string                 `json:"toolName"`
+	RunID      *string                `json:"runId,omitempty"`
+	Outcome    *AgentLifecycleOutcome `json:"outcome,omitempty"`
+	Args       json.RawMessage        `json:"args,omitempty"`
+	Intent     *string                `json:"intent,omitempty"`
 }
 
 func (v *ToolExecutionStartEvent) UnmarshalJSON(data []byte) error {
@@ -3897,6 +3952,8 @@ func (v *ToolExecutionStartEvent) decodeFrom(raw map[string]json.RawMessage) err
 	d.constant("type", "tool_execution_start")
 	d.required("toolCallId", &out.ToolCallID)
 	d.required("toolName", &out.ToolName)
+	d.optional("runId", &out.RunID)
+	d.optional("outcome", &out.Outcome)
 	d.optional("args", &out.Args)
 	d.optional("intent", &out.Intent)
 	if d.err != nil {
@@ -3912,10 +3969,12 @@ func (v ToolExecutionStartEvent) MarshalJSON() ([]byte, error) {
 }
 
 type ToolExecutionUpdateEvent struct {
-	ToolCallID    string          `json:"toolCallId"`
-	ToolName      string          `json:"toolName"`
-	Args          json.RawMessage `json:"args,omitempty"`
-	PartialResult json.RawMessage `json:"partialResult,omitempty"`
+	ToolCallID    string                 `json:"toolCallId"`
+	ToolName      string                 `json:"toolName"`
+	RunID         *string                `json:"runId,omitempty"`
+	Outcome       *AgentLifecycleOutcome `json:"outcome,omitempty"`
+	Args          json.RawMessage        `json:"args,omitempty"`
+	PartialResult json.RawMessage        `json:"partialResult,omitempty"`
 }
 
 func (v *ToolExecutionUpdateEvent) UnmarshalJSON(data []byte) error {
@@ -3928,6 +3987,8 @@ func (v *ToolExecutionUpdateEvent) decodeFrom(raw map[string]json.RawMessage) er
 	d.constant("type", "tool_execution_update")
 	d.required("toolCallId", &out.ToolCallID)
 	d.required("toolName", &out.ToolName)
+	d.optional("runId", &out.RunID)
+	d.optional("outcome", &out.Outcome)
 	d.optional("args", &out.Args)
 	d.optional("partialResult", &out.PartialResult)
 	if d.err != nil {
@@ -3943,9 +4004,11 @@ func (v ToolExecutionUpdateEvent) MarshalJSON() ([]byte, error) {
 }
 
 type ToolStreamUpdateEvent struct {
-	ToolCallID string          `json:"toolCallId"`
-	ToolName   string          `json:"toolName"`
-	Update     json.RawMessage `json:"update,omitempty"`
+	ToolCallID string                 `json:"toolCallId"`
+	ToolName   string                 `json:"toolName"`
+	RunID      *string                `json:"runId,omitempty"`
+	Outcome    *AgentLifecycleOutcome `json:"outcome,omitempty"`
+	Update     json.RawMessage        `json:"update,omitempty"`
 }
 
 func (v *ToolStreamUpdateEvent) UnmarshalJSON(data []byte) error {
@@ -3958,6 +4021,8 @@ func (v *ToolStreamUpdateEvent) decodeFrom(raw map[string]json.RawMessage) error
 	d.constant("type", "tool_stream_update")
 	d.required("toolCallId", &out.ToolCallID)
 	d.required("toolName", &out.ToolName)
+	d.optional("runId", &out.RunID)
+	d.optional("outcome", &out.Outcome)
 	d.optional("update", &out.Update)
 	if d.err != nil {
 		return d.err
@@ -3972,10 +4037,12 @@ func (v ToolStreamUpdateEvent) MarshalJSON() ([]byte, error) {
 }
 
 type ToolExecutionEndEvent struct {
-	ToolCallID string          `json:"toolCallId"`
-	ToolName   string          `json:"toolName"`
-	Result     json.RawMessage `json:"result,omitempty"`
-	IsError    *bool           `json:"isError,omitempty"`
+	ToolCallID string                 `json:"toolCallId"`
+	ToolName   string                 `json:"toolName"`
+	RunID      *string                `json:"runId,omitempty"`
+	Outcome    *AgentLifecycleOutcome `json:"outcome,omitempty"`
+	Result     json.RawMessage        `json:"result,omitempty"`
+	IsError    *bool                  `json:"isError,omitempty"`
 }
 
 func (v *ToolExecutionEndEvent) UnmarshalJSON(data []byte) error {
@@ -3988,6 +4055,8 @@ func (v *ToolExecutionEndEvent) decodeFrom(raw map[string]json.RawMessage) error
 	d.constant("type", "tool_execution_end")
 	d.required("toolCallId", &out.ToolCallID)
 	d.required("toolName", &out.ToolName)
+	d.optional("runId", &out.RunID)
+	d.optional("outcome", &out.Outcome)
 	d.optional("result", &out.Result)
 	d.optional("isError", &out.IsError)
 	if d.err != nil {

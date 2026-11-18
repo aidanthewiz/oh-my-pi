@@ -237,7 +237,8 @@ describe("AgentSession auto-compaction queue resume", () => {
 		const waitSpy = vi.spyOn(scheduler, "wait");
 		session.subscribe((event: AgentSessionEvent) => {
 			if (event.type === "auto_compaction_end") onCompactionDone();
-			if (event.type === "agent_end") agentEndTerminalStates.push(event.isTerminal);
+			if (event.type === "agent_pause") agentEndTerminalStates.push(false);
+			if (event.type === "agent_end") agentEndTerminalStates.push(true);
 		});
 
 		const assistantMsg = {

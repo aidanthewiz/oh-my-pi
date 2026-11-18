@@ -48,22 +48,9 @@ const outputSchemaInputSchema = type("object | boolean | string | null");
 // Coarse per-spawn thinking effort; must stay in sync with TASK_EFFORTS in ../thinking.
 const effortRule = '"lo" | "med" | "hi"' as const;
 
-// Per-spawn fields the schema declares only conditionally: `sourceSession`
-// while seance is advertised, `model` while seance is advertised or per-call
-// model is enabled for task calls. Typed against SeanceTaskSchemaFields so a
-// field added there fails to compile until it is listed here too; a missed key
-// would be dropped on batch items.
-const GATED_ITEM_KEY_SET = { sourceSession: true, model: true } as const satisfies Record<SeanceItemKey, true>;
-const GATED_ITEM_KEYS = Object.keys(GATED_ITEM_KEY_SET);
+/** Preserve gated fields until preflight can reject stale, unadvertised input. */
+const GATED_ITEM_KEYS = ["model", "sourceSession"] as const;
 
-/**
- * Keep a batch item's gated keys through undeclared-key deletion: argument
- * validation re-attaches only root keys, so without this an undeclared
- * `tasks[].model` or `tasks[].sourceSession` is deleted before execute()
- * instead of reaching the preflight refusal, leaving the child on its own
- * model while the caller believes it pinned another. Other stale item keys are
- * still deleted, and the wire schema is unchanged.
- */
 function keepGatedItemKeys<T, I>(item: FluentType<T, I>): FluentType<unknown, I> {
 	return item.onUndeclaredKey("ignore").pipe((input: unknown): unknown => {
 		const out: unknown = item(input);
@@ -166,15 +153,10 @@ function taskAgentSchemaRule(defaultAgent: string): string {
 	return "string";
 }
 
-/** Task fields the seance schema adds or widens; `seanceTaskSchemaFields` in ./seance must match it exactly. */
 export type SeanceTaskSchemaFields = {
 	"sourceSession?"?: FluentType<string>;
 	"model?"?: FluentType<string | string[]>;
 };
-
-type SeanceItemKey = {
-	[K in keyof SeanceTaskSchemaFields]-?: K extends `${infer Name}?` ? Name : never;
-}[keyof SeanceTaskSchemaFields];
 
 function createTaskSchema(options: {
 	isolationEnabled: boolean;
@@ -194,10 +176,6 @@ function createTaskSchema(options: {
 		? { "outputSchema?": outputSchemaInputSchema, "schemaMode?": '"permissive" | "strict"' }
 		: {};
 	const toolsField = options.evalToolsEnabled ? { "tools?": "string[]" } : {};
-	// `model` is declared only when the caller may send it: a per-call selector
-	// while `task.perCallModel` allows task calls, or seance's selector list. An
-	// undeclared `model` still reaches preflight (root keys survive lenient
-	// validation; batch items keep it via keepGatedItemKeys) and is refused there.
 	const gatedFields = { ...(options.perCallModel ? { "model?": "string" } : {}), ...options.seanceFields };
 	if (options.batchEnabled) {
 		if (options.isolationEnabled) {
@@ -285,7 +263,7 @@ export function getTaskSchema(options: {
 	defaultAgent?: string;
 	/** Advertise the per-call `model` field (`task.perCallModel` allows task calls); default off. */
 	perCallModel?: boolean;
-	/** Advertise historical source/model fields for the bundled seance agent. */
+	/** Historical source/model fields, only while bundled seance is spawnable. */
 	seanceFields?: SeanceTaskSchemaFields;
 }): TaskToolSchemaInstance {
 	const defaultAgent = options.defaultAgent ?? "task";
@@ -345,7 +323,7 @@ export interface AgentDefinition {
 	thinkingLevel?: ConfiguredThinkingLevel;
 	output?: unknown;
 	blocking?: boolean;
-	/** `true` = task spawns keep the `yield` tool and this agent's `output` schema even when `task.structured` is off. */
+	/** `true` = task spawns keep this agent's `output` schema, and with it the `yield` tool, even when `task.structured` is off. */
 	structured?: boolean;
 	autoloadSkills?: string[];
 	/** When `false`, the agent's `read` tool returns verbatim file content instead of structural summaries. */

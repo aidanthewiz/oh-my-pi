@@ -6,6 +6,8 @@ import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { GlobTool } from "@oh-my-pi/pi-coding-agent/tools/glob";
 import { GrepTool } from "@oh-my-pi/pi-coding-agent/tools/grep";
 import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
+import { captureApprovalTargets, resolveApproval } from "@oh-my-pi/pi-coding-agent/tools/approval";
+
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { writeArchive } from "@oh-my-pi/pi-utils/ar";
 
@@ -90,5 +92,21 @@ describe("execution target parsing", () => {
 		const result = await new ReadTool(session).execute("read-list", { path: "a:1-2;b.txt" });
 		expect(JSON.stringify(result.content)).toContain("first-content");
 		expect(JSON.stringify(result.content)).toContain("second-content");
+	});
+	it("requires approval for absolute private host names across read and search", async () => {
+		for (const tool of [new ReadTool(session), new GrepTool(session), new GlobTool(session)]) {
+			for (const url of [
+				"http://intranet./a.txt",
+				"http://localhost.:8080/a.txt",
+				"http://db.corp.internal./a.txt",
+			]) {
+				const args = tool.name === "grep" ? { pattern: "hello", path: url } : { path: url };
+				const targets = await captureApprovalTargets(tool, args, cwd);
+				expect(targets.failed).toBe(false);
+				expect(resolveApproval(tool, args, "always-ask-cached", {}, undefined, undefined, targets).policy).toBe(
+					"prompt",
+				);
+			}
+		}
 	});
 });

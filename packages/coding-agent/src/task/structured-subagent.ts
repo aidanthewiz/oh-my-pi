@@ -44,7 +44,7 @@ import { buildOutputValidator } from "../tools/output-schema-validator";
 import { trackLateCleanup } from "../utils/late-cleanup";
 import { type DiscoveryResult, discoverAgents, getAgent } from "./discovery";
 import { renderStepPrompts } from "./steps";
-import { type ExecutorOptions, runSubprocess, type SubagentToolResult } from "./executor";
+import { type ExecutorOptions, runSubprocess, type SubagentToolResult, usesYield } from "./executor";
 import {
 	applyEligibleNestedPatches,
 	type IsolationContext,
@@ -138,11 +138,10 @@ export interface StructuredSubagentRequest {
 	 */
 	steps?: string[];
 	agent?: string;
-	/** Saved source session selected for the bundled seance agent. */
+	/** Saved source selected for the bundled historical consult. */
 	sourceSession?: string;
 	/**
-	 * Model chosen by host code (SDK callers, `omp cleanse --model`) or, for the
-	 * bundled seance agent, the override of its source session's saved model.
+	 * Model chosen by host code (SDK callers, `omp cleanse --model`).
 	 * Not gated by `task.perCallModel`.
 	 */
 	model?: string | string[];
@@ -152,11 +151,7 @@ export interface StructuredSubagentRequest {
 	 * operator-approved models.
 	 */
 	perCallModel?: string;
-	/**
-	 * The model-facing `model` of a task call naming the `seance` agent. Honoured as
-	 * the source-session override only when that name resolves to the bundled seance;
-	 * a project or user agent shadowing the name gets it as a {@link perCallModel}.
-	 */
+	/** Source-model override; custom agents named seance still use per-call approval. */
 	seanceModel?: string | string[];
 
 	/** Presence, rather than truthiness, makes this the highest-priority schema. */
@@ -165,9 +160,10 @@ export interface StructuredSubagentRequest {
 	/** Parent context inheritance. Default `inherit`; `none` starts without parent context files. */
 	contextFilePolicy?: ContextFilePolicy;
 	/**
-	 * `false` = no output schema (caller, agent, or session) and no `yield` tool:
-	 * the child's final assistant message is its result. An agent declaring
-	 * `structured: true` keeps both, resolved as if this were `true`. Default `true`.
+	 * `false` = ignore caller, agent, and session output schemas (`task.structured`
+	 * off); an agent declaring `structured: true` keeps them. Default `true`.
+	 * Without a resolved schema the child has no `yield` tool and its final
+	 * assistant message is its result.
 	 */
 	structured?: boolean;
 	/** Per-spawn thinking effort mapped onto the resolved model's supported range; overrides the agent's default selector. */
@@ -221,7 +217,6 @@ export interface EffectiveSubagentPolicy {
 	agent: AgentDefinition;
 	effectiveAgent: AgentDefinition;
 	modelOverride?: string[];
-	/** Prepared read-only source fork for the bundled seance agent. */
 	preparedSession?: PreparedSeanceSession;
 	/** Explicit pre-expansion model role alias selected for this run. */
 	modelRole?: string;
@@ -235,7 +230,7 @@ export interface EffectiveSubagentPolicy {
 	oauthAccountPools?: OAuthAccountPools;
 	/** Absent for a per-call `model`: a requested model that cannot run fails instead of falling back to the parent's. */
 	parentActiveModelPattern?: string;
-	/** Whether the child gets the `yield` tool; see {@link StructuredSubagentRequest.structured}. */
+	/** Whether the child gets the `yield` tool: exactly when {@link schema} resolved one (see {@link usesYield}). */
 	structured: boolean;
 	/** Present for a per-call `model`: every model the child sends to must stay approved by these grants. */
 	perCallModelGrants?: PerCallModelGrants;
@@ -303,10 +298,10 @@ function trimToUndefined(value: string | undefined): string | undefined {
 function resolveSchema(
 	request: StructuredSubagentRequest,
 	agent: AgentDefinition,
-	structured: boolean,
+	schemasAllowed: boolean,
 ): StructuredSubagentSchemaResolution {
 	const mode = request.schemaMode ?? request.session.outputSchemaMode ?? "permissive";
-	if (!structured) {
+	if (!schemasAllowed) {
 		return { schema: undefined, source: "none", mode, outputSchemaOverridesAgent: false };
 	}
 	if (Object.hasOwn(request, "outputSchema")) {
@@ -579,11 +574,14 @@ export async function resolveEffectiveSubagentPolicy(
 			);
 		}
 	}
-
 	const effectiveAgent = planMode ? createPlanModeAgent(agent) : agent;
 	// An agent declaring `structured: true` keeps its result contract when the caller opts out (`task.structured` off).
-	const structured = request.structured !== false || effectiveAgent.structured === true;
-	const schema = resolveSchema(request, effectiveAgent, structured);
+	const schema = resolveSchema(
+		request,
+		effectiveAgent,
+		request.structured !== false || effectiveAgent.structured === true,
+	);
+	const structured = usesYield(schema.schema);
 	if (schema.source === "caller" || (schema.source !== "none" && schema.mode === "strict")) {
 		const { error } = buildOutputValidator(schema.schema);
 		if (error) {
@@ -608,7 +606,6 @@ export async function resolveEffectiveSubagentPolicy(
 	const agentAccountPools = validateAgentAccountPools(cfgTaskAgentAccountPools.get(request.session.settings));
 	const oauthAccountPools = Object.hasOwn(agentAccountPools, agentName) ? agentAccountPools[agentName] : undefined;
 	const hasPreparedSeance = preparedSeance !== undefined;
-	// A `seance` name that resolved to anything but the bundled agent is an ordinary agent: its `model` is per-call.
 	const perCallSelector: unknown = request.perCallModel ?? (isBundledSeance(agent) ? undefined : request.seanceModel);
 	const parentActiveModel = request.session.getActiveModel?.();
 	const userTaggedEffort =
@@ -840,7 +837,6 @@ function buildExecutorOptions(
 		thinkingLevel: policy.effectiveAgent.thinkingLevel,
 		effort: policy.effort,
 		solutionSpace: request.solutionSpace?.trim() || undefined,
-		structured: policy.structured,
 		...(policy.schema.source === "none"
 			? {}
 			: {
@@ -877,7 +873,6 @@ function buildExecutorOptions(
 		contextFiles: request.contextFilePolicy === "none" ? [] : session.contextFiles,
 		noContextFiles: request.contextFilePolicy === "none" || session.noContextFiles,
 		skills,
-		// Autoload runs after session start, outside the seance isolation options.
 		autoloadSkills: preparedSession ? undefined : autoloadSkills,
 		workspaceTree: session.workspaceTree,
 		promptTemplates: session.promptTemplates,

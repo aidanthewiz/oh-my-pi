@@ -261,6 +261,7 @@ ${STALL_FETCH_DISABLE}
 return "done";`,
 		});
 		expect(valueOf(completed)).toBe("done");
+
 		const next = valueOf(
 			await invoke({
 				action: "run",

@@ -513,7 +513,7 @@ export interface SessionState {
 	tokensPerSecond?: number | null;
 	messageCount?: number;
 	queuedMessageCount?: number;
-	/** Background jobs or deliveries can still inject a follow-up and wake the session. */
+	/** Background jobs, their deliveries, child agents or queued peer messages can still wake the session. */
 	hasPendingAsyncWork?: boolean;
 	/** Idle with nothing queued or pending; same predicate as `session_settled`. */
 	isSettled?: boolean;
@@ -564,6 +564,15 @@ export interface BashResult {
 	images?: ImageContent[];
 	/** The embedded shell's final `ShellTrace` of the run; only when the caller asked for one. */
 	trace?: Record<string, unknown>;
+	/** Set when the command overlapped another one on the session's persistent shell and ran in a fork of it. */
+	fork?: ShellForkOutcome;
+}
+
+export interface ShellForkOutcome {
+	/** What the command set carried back into the session's shell; `false`: it stayed in the fork. */
+	carried: boolean;
+	/** It left background jobs running in the fork, where later commands' `jobs`, `wait` and `%N` miss them. */
+	jobs: boolean;
 }
 
 export interface FastModeResult {
@@ -818,6 +827,8 @@ export type AgentLifecycleOutcome = "success" | "error" | "aborted" | "unknown";
 
 export interface AgentStartEvent {
 	type: "agent_start";
+	runId?: string;
+	outcome?: AgentLifecycleOutcome;
 	/** Calls of an unpaired assistant tail a continued run executes before its first model request. */
 	resumedToolCallIds?: string[];
 }
@@ -826,10 +837,11 @@ export interface AgentEndEvent {
 	type: "agent_end";
 	/** Messages of the run; an oversized frame drops a prefix already delivered by `message_end` (see `messageCount`). */
 	messages: AgentMessage[];
-	/** Original message count when the frame was compacted. */
-	messageCount?: number;
+	runId?: string;
 	/** This loop's outcome, independent of persisted transcript messages. */
 	outcome?: AgentLifecycleOutcome;
+	/** Original message count when the frame was compacted. */
+	messageCount?: number;
 	/** False when a continuation or async delivery remains. */
 	isTerminal?: boolean;
 	/** The agent finished its turn and resumes only for queued input or background-job results. */
@@ -842,17 +854,23 @@ export interface AgentEndEvent {
 
 export interface TurnStartEvent {
 	type: "turn_start";
+	runId?: string;
+	outcome?: AgentLifecycleOutcome;
 }
 
 export interface TurnEndEvent {
 	type: "turn_end";
 	message: AgentMessage;
 	toolResults: ToolResultMessage[];
+	runId?: string;
+	outcome?: AgentLifecycleOutcome;
 }
 
 export interface MessageStartEvent {
 	type: "message_start";
 	message: AgentMessage;
+	runId?: string;
+	outcome?: AgentLifecycleOutcome;
 	/** Shared by the start, updates, and end of one message; unique per process. */
 	messageId?: string;
 }
@@ -861,6 +879,8 @@ export interface MessageUpdateEvent {
 	type: "message_update";
 	message: AgentMessage;
 	assistantMessageEvent: AssistantMessageEvent;
+	runId?: string;
+	outcome?: AgentLifecycleOutcome;
 	/** Shared by the start, updates, and end of one message; unique per process. */
 	messageId?: string;
 }
@@ -868,6 +888,8 @@ export interface MessageUpdateEvent {
 export interface MessageEndEvent {
 	type: "message_end";
 	message: AgentMessage;
+	runId?: string;
+	outcome?: AgentLifecycleOutcome;
 	/** Shared by the start, updates, and end of one message; unique per process. */
 	messageId?: string;
 }
@@ -876,6 +898,8 @@ export interface ToolExecutionStartEvent {
 	type: "tool_execution_start";
 	toolCallId: string;
 	toolName: string;
+	runId?: string;
+	outcome?: AgentLifecycleOutcome;
 	args?: unknown;
 	intent?: string;
 }
@@ -884,6 +908,8 @@ export interface ToolExecutionUpdateEvent {
 	type: "tool_execution_update";
 	toolCallId: string;
 	toolName: string;
+	runId?: string;
+	outcome?: AgentLifecycleOutcome;
 	args?: unknown;
 	partialResult?: unknown;
 }
@@ -892,6 +918,8 @@ export interface ToolStreamUpdateEvent {
 	type: "tool_stream_update";
 	toolCallId: string;
 	toolName: string;
+	runId?: string;
+	outcome?: AgentLifecycleOutcome;
 	update?: unknown;
 }
 
@@ -899,6 +927,8 @@ export interface ToolExecutionEndEvent {
 	type: "tool_execution_end";
 	toolCallId: string;
 	toolName: string;
+	runId?: string;
+	outcome?: AgentLifecycleOutcome;
 	result?: unknown;
 	isError?: boolean;
 }

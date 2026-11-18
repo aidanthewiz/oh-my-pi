@@ -50,7 +50,6 @@ export interface IntegrationsProbe {
 	): Promise<ToolCallOutcome & { abortsSeen: number }>;
 	readOptions(options: ExecutorOptions): Promise<{
 		roots: unknown;
-		suffix: string | undefined;
 		localRoot: string;
 		approvalTargets: readonly string[] | undefined;
 	}>;
@@ -186,7 +185,6 @@ function buildProbe(): IntegrationsProbe {
 		},
 		readOptions: async options => ({
 			roots: options.extensionRoots?.(),
-			suffix: options.preparedSession?.promptSuffix("model-x"),
 			localRoot: options.localProtocolOptions ? resolveLocalRoot(options.localProtocolOptions) : "",
 			approvalTargets: await options.customTools?.[0]?.approvalCacheTargets?.({ path: "a.txt" }),
 		}),

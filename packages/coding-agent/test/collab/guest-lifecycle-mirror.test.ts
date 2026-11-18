@@ -676,8 +676,8 @@ describe("collab guest extension lifecycle mirror", () => {
 			await snapshotApplied.promise;
 			await renderedBoundary;
 			if (!observed) throw new Error("Host pause lost lifecycle ownership");
-			expect(hostSession.hasPendingAsyncWork()).toBe(true);
-			expect(guestSession.hasPendingAsyncWork()).toBe(false);
+			expect(hostSession.wakeSources).toBeDefined();
+			expect(guestSession.wakeSources).toBeUndefined();
 			expect(hostSession.lifecycleState?.phase).toBe("continuing");
 			expect(hostSession.lifecycleState).toEqual(observed);
 			expect(pane).toBe("working");
@@ -707,7 +707,7 @@ describe("collab guest extension lifecycle mirror", () => {
 			jobs.cancel("host-background", { ownerId: "host-async-owner" });
 			hostWork.resolve("cancelled without wake");
 			await jobs.getJob("host-background")?.promise;
-			await hostSession.settleAsyncWork();
+			await hostSession.waitForRunEnd();
 			await completedNotification.promise;
 			expect(hostSession.lifecycleState).toEqual({ runId: observed.runId, phase: "idle", outcome: "success" });
 			expect(guestSession.lifecycleState).toEqual(hostSession.lifecycleState);
@@ -728,7 +728,7 @@ describe("collab guest extension lifecycle mirror", () => {
 			jobs.cancel("local-background", { ownerId: "guest-async-owner" });
 			localWork.resolve("cancelled");
 			await jobs.getJob("local-background")?.promise;
-			await guestSession.settleAsyncWork();
+			await guestSession.waitForRunEnd();
 			expect(guestSession.lifecycleState).toEqual({ runId: localState.runId, phase: "idle", outcome: "success" });
 
 			await harness.cleanup();
@@ -903,7 +903,7 @@ describe("collab guest extension lifecycle mirror", () => {
 				renderedEvents.push(event.type);
 				await handleEvent(event);
 				if (event.type === "auto_retry_start") retryStarted.resolve();
-				if (event.type === "agent_end" && event.isTerminal) recovered.resolve();
+				if (event.type === "agent_end") recovered.resolve();
 			});
 			const notifications: Parameters<typeof TERMINAL.sendNotification>[0][] = [];
 			const notificationSpy = spyOn(TERMINAL, "sendNotification").mockImplementation(notification => {

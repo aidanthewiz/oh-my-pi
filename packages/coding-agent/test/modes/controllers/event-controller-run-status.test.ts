@@ -128,7 +128,7 @@ describe("EventController run status at turn end", () => {
 	] as const)("reports retained %s instead of a pruned or stale transcript", async (outcome, messages, expected) => {
 		const controller = new EventController(createInteractiveModeContext());
 		await controller.handleEvent(AGENT_START);
-		await controller.handleEvent({ ...agentEnd([...messages]), outcome, isTerminal: true });
+		await controller.handleEvent({ ...agentEnd([...messages]), outcome });
 		expect(lastStatus()).toEqual(expected);
 	});
 });

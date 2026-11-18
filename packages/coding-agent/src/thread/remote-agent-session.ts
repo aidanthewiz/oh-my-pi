@@ -54,6 +54,7 @@ import type {
 	AgentLifecycleState,
 	AgentSessionEvent,
 	AgentSessionEventListener,
+	WakeSources,
 } from "../session/agent-session-events";
 import {
 	type AgentSessionAdvisorOverview,
@@ -70,12 +71,12 @@ import type {
 	AsyncJobInspection,
 	AsyncJobSnapshot,
 	AsyncJobTree,
+	DequeuedMessage,
 	EphemeralTurnOptions,
 	EphemeralTurnResult,
 	Prewalk,
 	PromptOptions,
 	ResolvedRoleModel,
-	RestoredQueuedMessage,
 	RoleModelCycle,
 	RoleModelCycleResult,
 	SessionStats,
@@ -133,6 +134,8 @@ export function emptyMirrorState(): SessionMirrorState {
 		isDisposed: true,
 		isSessionTransitioning: false,
 		lifecycleState: null,
+		isRunActive: false,
+		wakeSources: undefined,
 		promptSequence: 0,
 		runStartedAt: undefined,
 		ircWakesPending: false,
@@ -184,7 +187,6 @@ function emptyViewState(): SessionViewState {
 	return {
 		providerSessionId: "",
 		sessionName: undefined,
-		seanceSourceArtifactsDir: null,
 		leafId: null,
 		agentEffort: undefined,
 		tools: [],
@@ -207,7 +209,6 @@ function emptyViewState(): SessionViewState {
 		retryAttempt: 0,
 		isTtsrAbortPending: false,
 		hasInterruptibleInput: false,
-		hasPendingAsyncWork: false,
 		hasPostPromptWork: false,
 		queuedMessageCount: 0,
 		autoResolvedThinkingLevel: undefined,
@@ -359,7 +360,6 @@ export class RemoteAgentSession implements AgentViewSession {
 			getBranch: fromId => this.#entryIndex.pathTo(fromId),
 			getLeafId: () => this.#entryIndex.leafId(),
 			getConversationTip: () => conversationTip(this.#entries, this.#entryIndex.branchView()),
-			getSeanceSourceArtifactsDir: () => this.#view.seanceSourceArtifactsDir,
 			appendCustomEntry: (customType, data) => this.#appendCustomEntry(customType, data),
 			flush: () => this.#command("flushSession"),
 			ensureOnDisk: () => this.#command("ensureOnDisk"),
@@ -405,6 +405,14 @@ export class RemoteAgentSession implements AgentViewSession {
 	get lifecycleState(): AgentLifecycleState {
 		const state = this.#state.lifecycleState;
 		return state ? { ...state } : null;
+	}
+
+	get isRunActive(): boolean {
+		return !this.closed && this.#state.isRunActive;
+	}
+
+	get wakeSources(): WakeSources | undefined {
+		return this.#state.wakeSources;
 	}
 
 	get runStartedAt(): number | undefined {
@@ -544,16 +552,12 @@ export class RemoteAgentSession implements AgentViewSession {
 		return this.#view.queuedMessageCount;
 	}
 
-	hasPendingAsyncWork(): boolean {
-		return this.#view.hasPendingAsyncWork;
-	}
-
 	waitForIdle(): Promise<void> {
 		return this.#command("waitForIdle");
 	}
 
-	settleAsyncWork(): Promise<void> {
-		return this.#command("settleAsyncWork");
+	waitForRunEnd(): Promise<void> {
+		return this.#command("waitForRunEnd");
 	}
 
 	getSessionStats(): SessionStats {
@@ -773,14 +777,16 @@ export class RemoteAgentSession implements AgentViewSession {
 	 * delivering any restorable entry, so a message restored here is never
 	 * delivered too.
 	 */
-	popLastQueuedMessage(): RestoredQueuedMessage | undefined {
+	popLastQueuedMessage(): DequeuedMessage | undefined {
 		const queue = this.#view.restorableQueue;
 		const chips = this.#view.queuedMessages;
 		const steering = this.#lastRestorable(queue.steering);
 		const followUp = steering < 0 ? this.#lastRestorable(queue.followUp) : -1;
 		let popped: SessionQueuedEntry;
+		let from: DequeuedMessage["queue"];
 		if (steering >= 0) {
 			popped = queue.steering[steering];
+			from = "steering";
 			// Chips list live-steered messages ahead of the queue: restorable entries align with their tail.
 			const chip = chips.steering.length - (queue.steering.length - steering);
 			this.#view = {
@@ -790,6 +796,7 @@ export class RemoteAgentSession implements AgentViewSession {
 			};
 		} else if (followUp >= 0) {
 			popped = queue.followUp[followUp];
+			from = "followUp";
 			const chip = chips.followUp.length - (queue.followUp.length - followUp);
 			this.#view = {
 				...this.#view,
@@ -800,7 +807,7 @@ export class RemoteAgentSession implements AgentViewSession {
 			return undefined;
 		}
 		this.#withdraw(popped.id);
-		return popped.message;
+		return { ...popped.message, queue: from };
 	}
 
 	/**

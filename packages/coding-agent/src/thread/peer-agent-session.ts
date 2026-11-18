@@ -25,6 +25,7 @@ import type {
 	AgentLifecycleState,
 	AgentSessionEvent,
 	AgentSessionEventListener,
+	WakeSources,
 } from "../session/agent-session-events";
 import type {
 	AgentSessionDisposeOptions,
@@ -131,6 +132,18 @@ export class PeerAgentSession implements AgentSessionHandle {
 
 	get lifecycleState(): AgentLifecycleState {
 		return this.#field("lifecycleState");
+	}
+
+	get isRunActive(): boolean {
+		return this.#field("isRunActive");
+	}
+
+	get wakeSources(): WakeSources | undefined {
+		return this.#field("wakeSources");
+	}
+
+	waitForRunEnd(): Promise<void> {
+		return mainBridge().remote.call("waitForRunEnd", this);
 	}
 
 	get runStartedAt(): number | undefined {

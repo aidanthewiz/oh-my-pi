@@ -99,6 +99,51 @@ describe("MCPManager initial connection ownership", () => {
 		expect(manager.getConnectedServers()).toEqual([]);
 	});
 
+	it("drains a superseded owner's admitted tool discovery before returning without publishing it", async () => {
+		const manager = new MCPManager(process.cwd());
+		const stale = fakeConnection("server");
+		const discoveryStarted = Promise.withResolvers<void>();
+		const discovery = Promise.withResolvers<[]>();
+		const closing = Promise.withResolvers<void>();
+		const closeGate = Promise.withResolvers<void>();
+		let current = true;
+		let returned = false;
+		stale.transport.gateClose(closeGate.promise);
+		const close = stale.transport.close.bind(stale.transport);
+		vi.spyOn(stale.transport, "close").mockImplementation(async () => {
+			closing.resolve();
+			await close();
+		});
+		vi.spyOn(mcpClient, "connectToServer").mockResolvedValue(stale.connection);
+		vi.spyOn(mcpClient, "listTools").mockImplementation(() => {
+			discoveryStarted.resolve();
+			return discovery.promise;
+		});
+		const loading = manager.connectServers({ server: CONFIG }, {}, undefined, 0, { isCurrent: () => current });
+		const finished = loading.then(() => {
+			returned = true;
+		});
+		try {
+			await discoveryStarted.promise;
+			current = false;
+			discovery.resolve([]);
+			await closing.promise;
+			expect(returned).toBe(false);
+			expect(manager.getTools()).toEqual([]);
+			expect(manager.getConnectedServers()).toEqual([]);
+			closeGate.resolve();
+			await finished;
+			expect(stale.transport.closeCalls).toBe(1);
+			expect(manager.getTools()).toEqual([]);
+		} finally {
+			current = false;
+			discovery.resolve([]);
+			closeGate.resolve();
+			await finished;
+			await manager.disconnectAll();
+		}
+	});
+
 	it("aborts an unresolved background initialization during manager disposal", async () => {
 		const manager = new MCPManager(process.cwd());
 		const connectStarted = Promise.withResolvers<void>();

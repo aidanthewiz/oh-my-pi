@@ -8,7 +8,6 @@ import { getMCPConfigPath, getProjectDir } from "@oh-my-pi/pi-utils";
 import { getActiveProfile } from "@oh-my-pi/pi-utils/dirs";
 import { formatKeyHint } from "@oh-my-pi/pi-tui/app-keybindings";
 import { appKey } from "@oh-my-pi/pi-tui/chrome/keybinding-hints";
-import { clearCache as clearFsCache } from "../../capability/fs";
 import type { SourceMeta } from "../../capability/types";
 import { expandEnvVarsDeepForConfigLevel } from "../../discovery/helpers";
 import {
@@ -20,6 +19,7 @@ import {
 	OAuthIssuerMismatchError,
 	resolveMCPChildCredentialPolicy,
 	validateOAuthResourceMetadataUrl,
+	reconnectMCPServers,
 } from "../../mcp";
 import {
 	findMcpServerForAuth,
@@ -1872,26 +1872,14 @@ export class MCPCommandController {
 			return;
 		}
 
-		// Disconnect all existing servers
-		await this.ctx.mcpManager.disconnectAll();
-		this.#assertCurrentOwner();
-		// Prompt enrichment is asynchronous. Clear commands before rediscovery so
-		// removed/disabled servers cannot leave stale `/server:prompt` entries;
-		// newly loaded prompts repopulate them through the manager callback.
-		this.ctx.session.setMCPPromptCommands([]);
-		// External edits to mcp.json (not via writeMCPConfigFile) otherwise
-		// keep stale env/command after reload.
-		clearFsCache();
-
 		// Rediscover and connect, mirroring startup's discovery filters.
-		const result = await this.ctx.mcpManager.discoverAndConnect({
+		const result = await reconnectMCPServers(this.ctx.mcpManager, this.ctx.session, {
+			isCurrent: this.#isCurrentOwner,
 			enableProjectConfig: cfgMcpEnableProjectConfig.get(this.ctx.settings),
 			filterExa: true,
 			filterBrowser: this.ctx.session.getEvalPreludes().some(definition => definition.name === "browser"),
 			extensionRoots: this.ctx.session.effectiveExtensionRoots,
 		});
-		this.#assertCurrentOwner();
-		await this.ctx.session.refreshMCPTools(this.ctx.mcpManager.getTools());
 		this.#assertCurrentOwner();
 
 		this.#showMCPConnectionErrors(result.errors);

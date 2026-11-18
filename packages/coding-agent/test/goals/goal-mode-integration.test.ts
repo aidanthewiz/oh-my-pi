@@ -544,7 +544,8 @@ describe("InteractiveMode goal mode integration", () => {
 		const unregister = harness.asyncJobManager.registerDeliverySink("Main", () => {});
 		const terminalStates: Array<boolean | undefined> = [];
 		const unsubscribe = harness.session.subscribe(event => {
-			if (event.type === "agent_end") terminalStates.push(event.isTerminal);
+			if (event.type === "agent_pause") terminalStates.push(false);
+			if (event.type === "agent_end") terminalStates.push(true);
 		});
 		harness.asyncJobManager.register("bash", "pending build", () => gate.promise, { ownerId: "Main" });
 		const message: AssistantMessage = {
@@ -580,9 +581,8 @@ describe("InteractiveMode goal mode integration", () => {
 			gate.resolve("done");
 			await harness.asyncJobManager.waitForAll();
 			await harness.asyncJobManager.drainDeliveries();
-			expect(harness.session.hasPendingAsyncWork()).toBe(false);
-			harness.session.agent.emitExternalEvent({ type: "agent_end", messages: [message] });
-			await harness.session.waitForIdle();
+			expect(harness.session.wakeSources).toBeUndefined();
+			await harness.session.waitForRunEnd();
 			await harness.mode.eventController.drainSessionEvents();
 			expect(terminalStates).toEqual([false, true]);
 			await waiter.inputPromise;
@@ -874,4 +874,57 @@ describe("InteractiveMode goal mode integration", () => {
 		harness.mode.onInputCallback?.(harness.mode.startPendingSubmission({ text: "next turn" }));
 		await nextTurn;
 	});
+	const lateToolExitCases: Array<{
+		name: string;
+		exit: (mode: InteractiveMode, session: AgentSession, toolSession: ToolSession) => Promise<void>;
+	}> = [
+		{
+			name: "completing the goal",
+			exit: async (mode, session, toolSession) => {
+				const goalTool = (await createTools(toolSession, session.getActiveToolNames())).find(
+					tool => tool.name === "goal",
+				);
+				if (!goalTool) throw new Error("expected goal tool to be active");
+				await goalTool.execute("call-1", { op: "complete" });
+				const nextTurn = mode.getUserInput();
+				// getUserInput awaits the completion exit before arming onInputCallback.
+				for (let i = 0; i < 100 && session.getGoalModeState() !== undefined; i++) await waitForMicrotasks();
+				mode.onInputCallback?.(mode.startPendingSubmission({ text: "next turn" }));
+				await nextTurn;
+			},
+		},
+		{
+			name: "pausing the goal",
+			exit: async mode => {
+				vi.spyOn(mode, "showHookSelector").mockResolvedValue("Pause");
+				await mode.handleGoalModeCommand();
+			},
+		},
+		{
+			name: "dropping the goal",
+			exit: async mode => {
+				vi.spyOn(mode, "showHookSelector").mockResolvedValue("Drop");
+				vi.spyOn(mode, "showHookConfirm").mockResolvedValue(true);
+				await mode.handleGoalModeCommand();
+			},
+		},
+	];
+
+	for (const testCase of lateToolExitCases) {
+		it(`keeps a tool enabled after it registers when ${testCase.name}`, async () => {
+			await harness.mode.handleGoalModeCommand("Ship the release");
+			expect(await toolNamesFor(harness)).not.toContain("todo");
+
+			// A deferred extension registers and enables its tool after goal entry.
+			await harness.session.setActiveToolsByName([...harness.session.getEnabledToolNames(), "todo"]);
+			expect(await toolNamesFor(harness)).toContain("todo");
+			expect(await toolNamesFor(harness)).toContain("goal");
+
+			await testCase.exit(harness.mode, harness.session, harness.toolSession);
+
+			// Only `goal` goes away; the late tool stays enabled and dispatchable.
+			expect(await toolNamesFor(harness)).toContain("todo");
+			expect(await toolNamesFor(harness)).not.toContain("goal");
+		});
+	}
 });

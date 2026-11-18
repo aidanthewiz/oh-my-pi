@@ -15,10 +15,46 @@
 - Corrected bundled global Amazon Nova 2 Lite metadata to its published 1M context, 64K output, low/medium/high reasoning ladder, and explicit prompt-cache limits.
 - Scoped Google OAuth model caches to credentials and discovery endpoints, plus Gemini CLI projects. Startup restores only the current credential's cached catalog.
 - Scoped SambaNova model caches to credentials and discovery endpoints so keyless resolution retains the bundled seed instead of a previous authenticated roster.
+- Preserve per-account Codex catalog caches with the resolved wire version. Keep Modal and Bifrost discovery credential-gated and retain authored `bundle="always"` rows during frozen regeneration.
 - Keep the Anthropic inline-image byte budget off custom endpoints, including legacy models with official-endpoint compatibility rules.
 - Keep supported discovered models when other rows cannot be built; preserve cache fallback for incomplete responses.
 - Retained deterministic AWS, Nova, Mantle, and GPT-5.6 policies alongside the frozen 18.9.0 catalog source.
 - Derive AWS-hosted model throughput and prompt windows from the frozen provider catalog. Sonnet 4.5 follows the target's 200K prompt window instead of retaining the older 1M snapshot.
+## [18.22.1] - 2026-11-17
+
+### Fixed
+
+- Fixed Factory Droid's Muse Spark 1.3 support so image inputs work and the model is available without the retired feature flag.
+- Fixed GitLab Duo Claude models so earlier reasoning context is handled correctly during follow-up turns and compaction.
+- Fixed stale Command Code model metadata, including image-input support, reasoning controls, token pricing, and deployment context limits.
+- Fixed retry-reset timezone handling for custom providers using the Zhipu Coding Plan endpoint, including base URLs with trailing slashes.
+
+## [18.21.0] - 2026-11-16
+
+### Added
+
+- Added Modal as a hosted inference provider.
+
+### Changed
+
+- Changed the local speech model from Kokoro to Phonon 31M.
+- Improved reasoning capability detection by preserving unverified thinking-level support and using endpoint-specific probe results when available.
+
+### Fixed
+
+- Fixed xAI Grok OAuth model grok-composer-2.5-fast being incorrectly identified as non-reasoning; it now supports thinking levels from minimal through xhigh.
+
+## [18.20.3] - 2026-11-16
+
+### Added
+
+- Added publicly available image-sizing helpers for determining model-delivered image dimensions and fitting images to a specified long edge before coordinate mapping.
+
+### Fixed
+
+- Fixed image inputs being dropped for DeepSeek V4 Flash, restoring consistent multimodal image support.
+- Restricted reasoning-effort options for Mistral GLM 5.3, GLM 5.3 Flash, and Mistral Large 4 to the levels supported by those models.
+
 ## [18.20.2] - 2026-11-14
 
 ### Added

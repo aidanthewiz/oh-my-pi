@@ -44,6 +44,7 @@
 
 import type { SessionEntry as WireSessionEntry } from "@oh-my-pi/pi-wire";
 import type { AgentSessionEvent } from "../session/agent-session";
+import type { WireSessionEvent } from "../session/loop-end-wire";
 import type { SessionEntry } from "../session/session-entries";
 
 /**
@@ -427,16 +428,16 @@ export function oversizedEntryNotice(entryType: string): Extract<AgentSessionEve
  * Oversized notifications become a notice. Loop completions retain ownership
  * and continuation state even when their message snapshot must be omitted.
  */
-export function serializeReplicatedEvent(event: AgentSessionEvent): SerializedReplication<AgentSessionEvent> {
+export function serializeReplicatedEvent(event: WireSessionEvent): SerializedReplication<WireSessionEvent> {
 	const shrunk = shrinkPayloadShape(event);
 	if (shrunk.json !== null) return { value: shrunk.value, json: shrunk.json };
 	if (event.type === "agent_end") {
-		const completion: Extract<AgentSessionEvent, { type: "agent_end" }> = {
+		const completion: Extract<WireSessionEvent, { type: "agent_end" }> = {
 			type: "agent_end",
 			messages: [],
 			isTerminal: event.isTerminal,
 			yielded: event.yielded,
-			awaitingAsyncWork: event.awaitingAsyncWork,
+			...(event.awaitingAsyncWork ? { awaitingAsyncWork: true } : {}),
 			outcome: event.outcome,
 			...("runId" in event ? { runId: event.runId } : {}),
 		};

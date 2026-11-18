@@ -3136,7 +3136,7 @@ pub struct SessionState {
 	pub message_count: i64,
 	#[serde(rename = "queuedMessageCount", default = "default_session_state_queued_message_count")]
 	pub queued_message_count: i64,
-	/// Background jobs or deliveries can still inject a follow-up and wake the session.
+	/// Background jobs, their deliveries, child agents or queued peer messages can still wake the session.
 	#[serde(rename = "hasPendingAsyncWork", default = "default_session_state_has_pending_async_work")]
 	pub has_pending_async_work: bool,
 	/// Idle with nothing queued or pending; same predicate as `session_settled`.
@@ -3238,6 +3238,17 @@ pub struct BashResult {
 	/// The embedded shell's final `ShellTrace` of the run; only when the caller asked for one.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub trace: Option<Map<String, Value>>,
+	/// Set when the command overlapped another one on the session's persistent shell and ran in a fork of it.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub fork: Option<ShellForkOutcome>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ShellForkOutcome {
+	/// What the command set carried back into the session's shell; `false`: it stayed in the fork.
+	pub carried: bool,
+	/// It left background jobs running in the fork, where later commands' `jobs`, `wait` and `%N` miss them.
+	pub jobs: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -3744,6 +3755,10 @@ impl AgentLifecycleOutcome {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentStartEvent {
+	#[serde(rename = "runId", default, skip_serializing_if = "Option::is_none")]
+	pub run_id: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub outcome: Option<AgentLifecycleOutcome>,
 	/// Calls of an unpaired assistant tail a continued run executes before its first model request.
 	#[serde(rename = "resumedToolCallIds", default, skip_serializing_if = "Option::is_none")]
 	pub resumed_tool_call_ids: Option<Vec<String>>,
@@ -3753,12 +3768,14 @@ pub struct AgentStartEvent {
 pub struct AgentEndEvent {
 	/// Messages of the run; an oversized frame drops a prefix already delivered by `message_end` (see `messageCount`).
 	pub messages: Vec<AgentMessage>,
-	/// Original message count when the frame was compacted.
-	#[serde(rename = "messageCount", default, skip_serializing_if = "Option::is_none")]
-	pub message_count: Option<i64>,
+	#[serde(rename = "runId", default, skip_serializing_if = "Option::is_none")]
+	pub run_id: Option<String>,
 	/// This loop's outcome, independent of persisted transcript messages.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub outcome: Option<AgentLifecycleOutcome>,
+	/// Original message count when the frame was compacted.
+	#[serde(rename = "messageCount", default, skip_serializing_if = "Option::is_none")]
+	pub message_count: Option<i64>,
 	/// False when a continuation or async delivery remains.
 	#[serde(rename = "isTerminal", default, skip_serializing_if = "Option::is_none")]
 	pub is_terminal: Option<bool>,
@@ -3775,18 +3792,31 @@ pub struct AgentEndEvent {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct TurnStartEvent {}
+pub struct TurnStartEvent {
+	#[serde(rename = "runId", default, skip_serializing_if = "Option::is_none")]
+	pub run_id: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub outcome: Option<AgentLifecycleOutcome>,
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TurnEndEvent {
 	pub message: AgentMessage,
 	#[serde(rename = "toolResults")]
 	pub tool_results: Vec<ToolResultMessage>,
+	#[serde(rename = "runId", default, skip_serializing_if = "Option::is_none")]
+	pub run_id: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub outcome: Option<AgentLifecycleOutcome>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MessageStartEvent {
 	pub message: AgentMessage,
+	#[serde(rename = "runId", default, skip_serializing_if = "Option::is_none")]
+	pub run_id: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub outcome: Option<AgentLifecycleOutcome>,
 	/// Shared by the start, updates, and end of one message; unique per process.
 	#[serde(rename = "messageId", default, skip_serializing_if = "Option::is_none")]
 	pub message_id: Option<String>,
@@ -3797,6 +3827,10 @@ pub struct MessageUpdateEvent {
 	pub message: AgentMessage,
 	#[serde(rename = "assistantMessageEvent")]
 	pub assistant_message_event: AssistantMessageEvent,
+	#[serde(rename = "runId", default, skip_serializing_if = "Option::is_none")]
+	pub run_id: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub outcome: Option<AgentLifecycleOutcome>,
 	/// Shared by the start, updates, and end of one message; unique per process.
 	#[serde(rename = "messageId", default, skip_serializing_if = "Option::is_none")]
 	pub message_id: Option<String>,
@@ -3805,6 +3839,10 @@ pub struct MessageUpdateEvent {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MessageEndEvent {
 	pub message: AgentMessage,
+	#[serde(rename = "runId", default, skip_serializing_if = "Option::is_none")]
+	pub run_id: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub outcome: Option<AgentLifecycleOutcome>,
 	/// Shared by the start, updates, and end of one message; unique per process.
 	#[serde(rename = "messageId", default, skip_serializing_if = "Option::is_none")]
 	pub message_id: Option<String>,
@@ -3816,6 +3854,10 @@ pub struct ToolExecutionStartEvent {
 	pub tool_call_id: String,
 	#[serde(rename = "toolName")]
 	pub tool_name: String,
+	#[serde(rename = "runId", default, skip_serializing_if = "Option::is_none")]
+	pub run_id: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub outcome: Option<AgentLifecycleOutcome>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub args: Option<Value>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3828,6 +3870,10 @@ pub struct ToolExecutionUpdateEvent {
 	pub tool_call_id: String,
 	#[serde(rename = "toolName")]
 	pub tool_name: String,
+	#[serde(rename = "runId", default, skip_serializing_if = "Option::is_none")]
+	pub run_id: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub outcome: Option<AgentLifecycleOutcome>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub args: Option<Value>,
 	#[serde(rename = "partialResult", default, skip_serializing_if = "Option::is_none")]
@@ -3840,6 +3886,10 @@ pub struct ToolStreamUpdateEvent {
 	pub tool_call_id: String,
 	#[serde(rename = "toolName")]
 	pub tool_name: String,
+	#[serde(rename = "runId", default, skip_serializing_if = "Option::is_none")]
+	pub run_id: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub outcome: Option<AgentLifecycleOutcome>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub update: Option<Value>,
 }
@@ -3850,6 +3900,10 @@ pub struct ToolExecutionEndEvent {
 	pub tool_call_id: String,
 	#[serde(rename = "toolName")]
 	pub tool_name: String,
+	#[serde(rename = "runId", default, skip_serializing_if = "Option::is_none")]
+	pub run_id: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub outcome: Option<AgentLifecycleOutcome>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub result: Option<Value>,
 	#[serde(rename = "isError", default, skip_serializing_if = "Option::is_none")]

@@ -36,6 +36,7 @@ import { hasLiveDaemonProjectPresence, pruneDeadDaemonRuntimeDirs, readLiveDaemo
 import {
 	DAEMON_BROKER_PROTOCOL_VERSION,
 	DAEMON_IDLE_GRACE_ENV,
+	DAEMON_OUTPUT_PATTERN_FLAGS,
 	DAEMON_PROJECT_DIR_ENV,
 	DAEMON_PTY_COLUMNS,
 	DAEMON_PTY_ROWS,
@@ -765,7 +766,7 @@ class DaemonBroker {
 			await existing?.persistQueue;
 			if (spec.ready?.log) {
 				try {
-					new RegExp(spec.ready.log, "u");
+					new RegExp(spec.ready.log, DAEMON_OUTPUT_PATTERN_FLAGS);
 				} catch (error) {
 					throw new Error(`Invalid readiness regex: ${error instanceof Error ? error.message : String(error)}`);
 				}
@@ -797,7 +798,7 @@ class DaemonBroker {
 				portReady: spec.ready?.port === undefined,
 				readinessBuffer: "",
 				outputOffset: 0,
-				readyPattern: spec.ready?.log ? new RegExp(spec.ready.log, "u") : undefined,
+				readyPattern: spec.ready?.log ? new RegExp(spec.ready.log, DAEMON_OUTPUT_PATTERN_FLAGS) : undefined,
 				consecutiveFailures: 0,
 				persistQueue: Promise.resolve(),
 				completionCapable: owner !== undefined && this.#completionSubscriptions.has(owner),
@@ -1245,7 +1246,7 @@ class DaemonBroker {
 		let pattern: RegExp | undefined;
 		if (operation.pattern) {
 			try {
-				pattern = new RegExp(operation.pattern, "u");
+				pattern = new RegExp(operation.pattern, DAEMON_OUTPUT_PATTERN_FLAGS);
 			} catch (error) {
 				throw new Error(`Invalid wait regex: ${error instanceof Error ? error.message : String(error)}`);
 			}
@@ -1531,7 +1532,7 @@ class DaemonBroker {
 					portReady: detached && (spec.ready?.port === undefined || snapshot.state === "ready"),
 					readinessBuffer: "",
 					outputOffset: detached ? snapshot.outputBytes : 0,
-					readyPattern: spec.ready?.log ? new RegExp(spec.ready.log, "u") : undefined,
+					readyPattern: spec.ready?.log ? new RegExp(spec.ready.log, DAEMON_OUTPUT_PATTERN_FLAGS) : undefined,
 					consecutiveFailures: 0,
 					persistQueue: Promise.resolve(),
 					// Legacy files are rewritten once into the split layout.

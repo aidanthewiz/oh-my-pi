@@ -438,7 +438,7 @@ async function generateTitleOnlineWithModels(
 					}
 					return message;
 				},
-				{ signal, provider: model.provider },
+				{ signal, provider: model.provider, baseUrl: model.baseUrl },
 			);
 
 			if (response.stopReason === "aborted" || signal?.aborted) {

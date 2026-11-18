@@ -33,6 +33,7 @@ import {
 	type MnemopiProviderOptions,
 	truncateApproxTokens,
 } from "./config";
+import { embeddingFailureNotifier } from "./embedding-notice";
 import {
 	captureMnemopiRequestOwner,
 	getMnemopiScopedBanks,
@@ -529,6 +530,8 @@ async function resolveMnemopiProviderOptions(
 	const base: MnemopiProviderOptions = {
 		noEmbeddings: config.providerOptions.noEmbeddings,
 		embeddings: {
+			...(config.providerOptions.embeddings || undefined),
+			onRequestFailed: embeddingFailureNotifier(session),
 			allowLocal: () => !cfgOffline.get(settings) || session.model?.api === "local-inference",
 			// Initializing fastembed can download missing or corrupt files, even when
 			// the cache initially appears complete. Reuse only an already loaded model.

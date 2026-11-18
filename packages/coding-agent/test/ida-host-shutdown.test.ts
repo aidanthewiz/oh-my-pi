@@ -3,14 +3,14 @@ import * as fs from "node:fs/promises";
 import { IpcConnection, ipcEndpoint } from "@oh-my-pi/pi-natives";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { IdaHost } from "../src/ida/host";
-import type { IdaHostResponse } from "../src/ida/protocol";
+import type { DisasmHost } from "../src/disasm/host";
+import type { HostResponse } from "../src/disasm/protocol";
 
 type Gate<T> = PromiseWithResolvers<T>;
 
 interface SocketClient {
 	socket: IpcConnection;
-	send(frame: { id: number; op: string; [key: string]: unknown }, timeoutMs?: number): Promise<IdaHostResponse>;
+	send(frame: { id: number; op: string; [key: string]: unknown }, timeoutMs?: number): Promise<HostResponse>;
 	cancel(id: number, target: number): void;
 }
 
@@ -27,10 +27,10 @@ function bounded<T>(promise: Promise<T>, label: string, timeoutMs = 5_000): Prom
 
 async function connect(endpoint: string): Promise<SocketClient> {
 	const socket = await IpcConnection.connect(endpoint, { framing: "lines", timeoutMs: 5_000 });
-	const pending = new Map<number, Gate<IdaHostResponse>>();
+	const pending = new Map<number, Gate<HostResponse>>();
 	socket.start(
 		line => {
-			const frame = JSON.parse(line) as IdaHostResponse;
+			const frame = JSON.parse(line) as HostResponse;
 			pending.get(frame.id)?.resolve(frame);
 			pending.delete(frame.id);
 		},
@@ -42,8 +42,8 @@ async function connect(endpoint: string): Promise<SocketClient> {
 	);
 	return {
 		socket,
-		send(frame: { id: number; op: string; [key: string]: unknown }, timeoutMs?: number): Promise<IdaHostResponse> {
-			const response = Promise.withResolvers<IdaHostResponse>();
+		send(frame: { id: number; op: string; [key: string]: unknown }, timeoutMs?: number): Promise<HostResponse> {
+			const response = Promise.withResolvers<HostResponse>();
 			pending.set(frame.id, response);
 			socket.send(JSON.stringify(frame));
 			return bounded(response.promise, `response ${frame.id}`, timeoutMs);
@@ -65,7 +65,12 @@ test("pre-open cancellation stays socket-local and shutdown saves accepted mutat
 	class FakeWorker {
 		needsSave = false;
 		lock?: { release(): void };
-		static async start(_loc: unknown, _runtime: unknown, lock: { release(): void }): Promise<FakeWorker> {
+		static async start(
+			_backend: unknown,
+			_loc: unknown,
+			_runtime: unknown,
+			lock: { release(): void },
+		): Promise<FakeWorker> {
 			openEntered.resolve();
 			const worker = await openGate.promise;
 			worker.lock = lock;
@@ -85,20 +90,23 @@ test("pre-open cancellation stays socket-local and shutdown saves accepted mutat
 			throw new Error("deliberate close failure");
 		}
 	}
-	mock.module(import.meta.resolve("../src/ida/supervisor.ts"), () => ({ IdaWorker: FakeWorker }));
-	let host: IdaHost | undefined;
+	mock.module(import.meta.resolve("../src/disasm/supervisor.ts"), () => ({ DisasmWorker: FakeWorker }));
+	let host: DisasmHost | undefined;
 	const clients: SocketClient[] = [];
 	try {
 		// The worker mock must be installed before the host imports its supervisor.
-		const { IdaHost } = await import("../src/ida/host");
+		const { DisasmHost } = await import("../src/disasm/host");
 		const idb = path.join(root, "sample.i64");
 		await fs.writeFile(idb, "fake database");
-		host = new IdaHost({
+		host = new DisasmHost({
+			backend: "ida",
+			projectDir: root,
 			endpoint,
 			loc: {
 				id: "sample",
 				dir: root,
 				sourcePath: idb,
+				stagedPath: idb,
 				kind: "inplace",
 				openPath: idb,
 				isNew: false,
@@ -164,7 +172,12 @@ test("shutdown interrupts a stuck accepted call and closes the worker", async ()
 	class StuckWorker {
 		needsSave = true;
 		lock?: { release(): void };
-		static async start(_loc: unknown, _runtime: unknown, lock: { release(): void }): Promise<StuckWorker> {
+		static async start(
+			_backend: unknown,
+			_loc: unknown,
+			_runtime: unknown,
+			lock: { release(): void },
+		): Promise<StuckWorker> {
 			const worker = new StuckWorker();
 			worker.lock = lock;
 			return worker;
@@ -183,19 +196,22 @@ test("shutdown interrupts a stuck accepted call and closes the worker", async ()
 			this.lock?.release();
 		}
 	}
-	mock.module(import.meta.resolve("../src/ida/supervisor.ts"), () => ({ IdaWorker: StuckWorker }));
-	let host: IdaHost | undefined;
+	mock.module(import.meta.resolve("../src/disasm/supervisor.ts"), () => ({ DisasmWorker: StuckWorker }));
+	let host: DisasmHost | undefined;
 	let client: SocketClient | undefined;
 	try {
-		const { IdaHost } = await import("../src/ida/host");
+		const { DisasmHost } = await import("../src/disasm/host");
 		const idb = path.join(root, "sample.i64");
 		await fs.writeFile(idb, "fake database");
-		host = new IdaHost({
+		host = new DisasmHost({
+			backend: "ida",
+			projectDir: root,
 			endpoint,
 			loc: {
 				id: "sample",
 				dir: root,
 				sourcePath: idb,
+				stagedPath: idb,
 				kind: "inplace",
 				openPath: idb,
 				isNew: false,

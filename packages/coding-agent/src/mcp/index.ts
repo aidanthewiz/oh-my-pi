@@ -19,6 +19,8 @@ export * from "./manager";
 // OAuth Discovery
 export * from "./oauth-discovery";
 export * from "./project-trust";
+// Reconnect
+export * from "./reload";
 // Tool bridge
 export * from "./tool-bridge";
 // Tool cache

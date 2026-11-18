@@ -157,7 +157,6 @@ interface TaskDescriptionOptions {
 	parentSpawns: string;
 }
 
-/** Plan mode hides seance; a `spawns` list led by it defaults to the next permitted agent. */
 function defaultAgentFor(spawnPolicy: ResolvedSpawnPolicy, planMode: boolean): string {
 	if (!planMode || spawnPolicy.defaultAgent !== SEANCE_AGENT_NAME) return spawnPolicy.defaultAgent;
 	return spawnPolicy.allowedAgents?.find(agent => agent !== SEANCE_AGENT_NAME) ?? spawnPolicy.defaultAgent;
@@ -176,9 +175,7 @@ function renderDescription(options: TaskDescriptionOptions): string {
 		const allowed = new Set(spawnPolicy.allowedAgents);
 		filteredAgents = filteredAgents.filter(agent => allowed.has(agent.name));
 	}
-	if (options.planMode) {
-		filteredAgents = filteredAgents.filter(agent => !isBundledSeance(agent));
-	}
+	if (options.planMode) filteredAgents = filteredAgents.filter(agent => !isBundledSeance(agent));
 	const renderedAgents = filteredAgents.map(agent => ({
 		name: agent.name,
 		description: agent.description,
@@ -231,6 +228,9 @@ function validateShapeParams(batchEnabled: boolean, params: TaskParams): string 
 	}
 	if (batchEnabled && params.tasks !== undefined && Object.hasOwn(params, "agent")) {
 		return "Top-level `agent` is not part of the batch shape. Set `tasks[].agent` instead.";
+	}
+	if (batchEnabled && params.tasks !== undefined && params.model !== undefined) {
+		return "Top-level `model` is not part of the batch shape. Set `tasks[].model` instead.";
 	}
 	if (!batchEnabled) {
 		const disallowed = (["tasks", "context"] as const).filter(field => params[field] !== undefined);
@@ -339,10 +339,6 @@ function validateSpawnParams(
 	);
 }
 
-/**
- * A `model` on a call naming `seance` is checked at preflight, once the name resolves:
- * the bundled seance takes it as its source-session override, a shadowing agent as a per-call model.
- */
 function validateModel(
 	item: TaskItem | TaskParams,
 	label: string,
@@ -355,8 +351,7 @@ function validateModel(
 }
 
 function spawnModelFields(params: TaskParams): Pick<StructuredSubagentRequest, "perCallModel" | "seanceModel"> {
-	if (params.model === undefined) return {};
-	if (params.agent === SEANCE_AGENT_NAME) return { seanceModel: params.model };
+	if (params.agent === SEANCE_AGENT_NAME && params.model !== undefined) return { seanceModel: params.model };
 	// `validateModel` rejected anything but one string before dispatch.
 	return typeof params.model === "string" ? { perCallModel: params.model } : {};
 }
@@ -907,9 +902,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			!spawnPolicy.enabled ||
 			disabledAgents.includes(SEANCE_AGENT_NAME) ||
 			(spawnPolicy.allowedAgents !== null && !spawnPolicy.allowedAgents.includes(SEANCE_AGENT_NAME))
-		) {
+		)
 			return undefined;
-		}
 		const agents =
 			discoverySnapshots.get(discoveryCacheKey(this.session.cwd, this.session.effectiveExtensionRoots?.())) ??
 			this.#discoveredAgents;

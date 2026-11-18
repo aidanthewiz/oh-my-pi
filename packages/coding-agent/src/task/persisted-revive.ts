@@ -46,6 +46,7 @@ import {
 	replayRevivedAgentStart,
 	softRequestBudgetFor,
 	subagentRetryFallbackRole,
+	usesYield,
 } from "./executor";
 import { isCompletionProbeEnabled } from "./completion-probe";
 import { discoverAgents, getAgent } from "./discovery";
@@ -93,7 +94,6 @@ export interface PersistedReviveSpec {
 	readonly sessionFile: string;
 	/** Depth derived from the persisted parent chain (drives capability gating). */
 	readonly taskDepth: number;
-	/** The consulted source of a persisted seance session. */
 	readonly restoredSeance: RestoredSeanceSession | undefined;
 	/** The live top-level session revived agents join (cwd, extension roots, parent grants). */
 	readonly root: AgentSessionHandle;
@@ -101,7 +101,7 @@ export interface PersistedReviveSpec {
 	readonly rootAgentId: string;
 	readonly costGate: CostGateApi;
 	readonly asyncJobManager: AsyncJobManagerApi | undefined;
-	/** The root's artifact manager at revive time; a revived non-seance agent adopts it. */
+	/** The root's artifact manager at revive time; a revived agent adopts it. */
 	readonly artifactManager: ArtifactManagerApi | undefined;
 	readonly preparedExtensions: readonly PreparedExtension[] | undefined;
 	readonly authStorage: AuthStorage;
@@ -453,8 +453,7 @@ export async function revivePersistedSubagent(spec: PersistedReviveSpec, expecte
 			? [formatModelRoleAlias(init.modelRole), ...(init.resolvedModel ? [init.resolvedModel] : [])]
 			: init.resolvedModel;
 	// A session-local switch since spawn (a prewalk handoff) is the model the agent
-	// was working on; the spawn selection only backs it up when it is unavailable. A
-	// seance fork's selections belong to its source run, never to the consult.
+	// was working on; the spawn selection only backs it up when it is unavailable.
 	const sessionLocalModel = restoredSeance ? undefined : reopened.getSessionLocalModelChange()?.model;
 	// A per-call worker revives only onto its exact saved model: no role alias, no auth fallback.
 	const persistedModelPattern = init.perCallModel
@@ -475,8 +474,6 @@ export async function revivePersistedSubagent(spec: PersistedReviveSpec, expecte
 	// A restricted persisted contract must not consult process-global MCP
 	// state: same-name MCP tools are untrusted capability sources.
 	const restrictToolNames = restoredSeance !== undefined || init.restrictToolNames === true;
-	// The spawn's result contract: a session persisted without `yield` returned its final message.
-	const structured = revivedToolNames.includes("yield");
 	const mcpManager = restrictToolNames ? undefined : MCPManager.instance();
 	// Subscribe before minting proxies so a manager change during startup is replayed on bind.
 	// The revived session reopens its own view, keeping the tools its earlier requests rendered.
@@ -530,7 +527,7 @@ export async function revivePersistedSubagent(spec: PersistedReviveSpec, expecte
 			outputSchema: init.outputSchema,
 			outputSchemaMode: init.outputSchemaMode,
 			restrictToolNames: restrictToolNames || undefined,
-			requireYieldTool: structured,
+			requireYieldTool: usesYield(init.outputSchema),
 			systemPrompt: () => [...init.systemPrompt],
 			// Inherit current owner policy, never extension authority from a transcript.
 			extensionRoots: () => spec.root.effectiveExtensionRoots,
@@ -602,7 +599,6 @@ export async function revivePersistedSubagent(spec: PersistedReviveSpec, expecte
 			eventBus: spec.eventBus,
 			subagentEventBus: spec.subagentEventBus,
 			sessionFile,
-			structured,
 			outputSchema: init.outputSchema,
 			outputSchemaMode: init.outputSchemaMode,
 			artifactsDir: path.dirname(sessionFile),

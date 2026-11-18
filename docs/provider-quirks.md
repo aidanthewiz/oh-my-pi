@@ -61,7 +61,7 @@ The OpenAI Chat Completions provider implements HTTP POST JSON body streaming ov
 ### Catalog model handling
 
 - **Provider entry (`openai`)**: `packages/catalog/src/compat/rules/providers/openai.kdl` declares default model `gpt-5.5`. Environment keys: `OPENAI_API_KEY`.
-- **Authored seeds**: `daybreak-blue-latest`, `daybreak-red-latest`, `gpt-5.6-cyber`, `whisper-1`, `gpt-4o-transcribe`, `gpt-4o-mini-transcribe`, `text-embedding-3-small`, `text-embedding-3-large`, `text-embedding-ada-002`, `gpt-6-luna-decisions`; authored bundle policy `always`. Limits, capabilities, and prices are authored alongside these rows. `gpt-6-luna-decisions` is a `judge` model on `openai-decisions` with wire ID `gpt-6-luna`. The frozen bundle omits this row; `openaiModelManagerOptions` adds it only after successful discovery. Failed discovery and missing credentials do not add it.
+- **Authored seeds**: `daybreak-blue-latest`, `daybreak-red-latest`, `gpt-5.6-cyber`, `whisper-1`, `gpt-4o-transcribe`, `gpt-4o-mini-transcribe`, `text-embedding-3-small`, `text-embedding-3-large`, `text-embedding-ada-002`, `gpt-6-luna-decisions`; authored bundle policy `always`. Frozen regeneration retains these rows. `gpt-6-luna-decisions` is a `judge` model on `openai-decisions` with wire ID `gpt-6-luna`. Bundling metadata does not grant credential or paid-request authority.
 - **Model Resolvers & Managers**: `createOpenAICompatibleModelManagerOptions` in `packages/catalog/src/provider-models/openai-compat.ts` constructs model managers for `openai-completions` providers. It combines static/curated model definitions, bundled reference specs (`getBundledModels`), and live models fetched from remote catalog endpoints.
 - **Catalog Discovery**: `fetchOpenAICompatibleModels` in `packages/catalog/src/discovery/openai-compatible.ts` queries provider `/models` endpoints. It safely parses envelopes (`data`, `models`, `result`, `items`), enforces request timeouts using `withOpenAICompatibleDiscoveryTimeout`, validates model record schemas (`openAICompatibleModelRecordSchema`), applies custom mappers/filters, and deduplicates models by ID.
 
@@ -93,7 +93,7 @@ The OpenAI Responses provider (`packages/ai/src/providers/openai-responses.ts`) 
 ### Catalog model handling
 
 - **Provider entry (`openai`)**: `packages/catalog/src/compat/rules/providers/openai.kdl` declares default model `gpt-5.5`. Environment keys: `OPENAI_API_KEY`.
-- **Authored seeds**: `daybreak-blue-latest`, `daybreak-red-latest`, `gpt-5.6-cyber`, `whisper-1`, `gpt-4o-transcribe`, `gpt-4o-mini-transcribe`, `text-embedding-3-small`, `text-embedding-3-large`, `text-embedding-ada-002`, `gpt-6-luna-decisions`; authored bundle policy `always`. Limits, capabilities, and prices are authored alongside these rows. `gpt-6-luna-decisions` is a `judge` model on `openai-decisions` with wire ID `gpt-6-luna`. The frozen bundle omits this row; `openaiModelManagerOptions` adds it only after successful discovery. Failed discovery and missing credentials do not add it.
+- **Authored seeds**: The same `bundle="always"` OpenAI seeds remain present during frozen regeneration. See [OpenAI](#openai) for the authored rows.
 ## OpenAI Codex
 
 The OpenAI Codex provider integrates ChatGPT Plus/Pro subscription models using the OpenAI Responses API surface over SSE or WebSocket transport. Requests target the ChatGPT backend (`https://chatgpt.com/backend-api/codex/responses` or custom base URL) using ChatGPT OAuth tokens with account-level isolation. Entry modules include streaming in `packages/ai/src/providers/openai-codex-responses.ts`, request transformation in `packages/ai/src/providers/openai-codex/request-transformer.ts`, error and rate-limit parsing in `packages/ai/src/providers/openai-codex/response-handler.ts`, quota and usage tracking in `packages/ai/src/usage/openai-codex.ts`, reset management in `packages/ai/src/usage/openai-codex-reset.ts`, base URL normalization in `packages/ai/src/usage/openai-codex-base-url.ts`, auth policy in `packages/catalog/src/compat/rules/auth/openai-codex.kdl`, and OAuth handling in `packages/ai/src/registry/oauth/openai-codex.ts`.
@@ -141,6 +141,7 @@ Provider-specific overrides in `packages/catalog/src/compat/rules/providers/open
 - **Provider entry (`openai-codex`)**: `packages/catalog/src/compat/rules/providers/openai-codex.kdl` declares default model `gpt-5.5`. Environment keys: `OPENAI_CODEX_OAUTH_TOKEN`.
 - **Authored seeds**: `gpt-image-2`; bundle policy `always`. Limits, capabilities, and prices are authored alongside these rows.
 - **Dynamic discovery**: `fetchCodexModels` in `packages/catalog/src/discovery/codex.ts` queries `/codex/models` or `/models` with `v2StreamingEnabled: true`, parsing `reasoning_presets` (`effort`, `summary`) into `ModelSpec<"openai-codex-responses">`.
+- **Client version**: `getCodexClientVersion()` uses the pinned `CODEX_CLIENT_VERSION`, unless `PI_AI_CODEX_CLIENT_VERSION` explicitly overrides it. The process retains its first resolved version for requests and cache namespaces. Coreforge does not read a cached npm version or contact npm automatically. Credential hashes keep each account's catalog separate.
 - **Pricing fallback**: `applyCodexPricingFallback` in `packages/catalog/scripts/generate-models.ts` copies billable costs from `openai` provider entries with matching model IDs when Codex discovery models lack explicit cost metadata.
 
 ## Azure OpenAI
@@ -887,6 +888,27 @@ Baseten provides high-performance infrastructure for hosting open-weight LLMs (i
 - **Model Manager Options**: `basetenModelManagerOptions` in `packages/catalog/src/provider-models/openai-compat.ts` configures model resolution with `defaultBaseUrl: "https://inference.baseten.co/v1"` and `requireApiKey: true`.
 - **Dynamic Model Discovery & Pricing**: `fetchDynamicModels` queries `https://inference.baseten.co/v1/models`. `mapModel` parses raw record metadata including `supported_features`, `input_modalities` (`image` for vision capability), context and completion token bounds (`context_length`, `max_completion_tokens`), and per-million token pricing (`prompt`, `completion`, `input_cache_read`).
 - **Native Reasoning Identification**: Flags `reasoning: true` for `openai/gpt-oss-120b`, `deepseek-ai/DeepSeek-V4-Pro`, and `zai-org/GLM-5.2` when dynamic features list `reasoning` or `reasoning_effort`.
+
+## Bifrost (`bifrost`)
+
+Bifrost is a self-hosted open-source AI gateway that serves every configured upstream provider behind one OpenAI-compatible API (default `http://localhost:8080/v1`). Chat models use the OpenAI Chat Completions transport (`openai-completions`); decision models use the gateway's OpenAI Decisions route (`openai-decisions`, `POST {baseUrl}/decisions`).
+
+### Special casings
+
+- **Gateway roster**: model ids are `<bifrost-provider>/<model>` (`anthropic/claude-opus-5-5`, `openrouter/google/gemini-decision-1`, or a custom provider name such as `custom/drex-max-v1.1`). Nothing is bundled: `bifrost` is in `DISCOVERY_ONLY_PROVIDERS` (`packages/catalog/scripts/generate-models.ts`), and runtime discovery is authoritative (`dynamic-models-authoritative`).
+- **Row mapping (`bifrostModelManagerOptions` in `packages/catalog/src/provider-models/openai-compat.ts`)**: Bifrost rows are OpenRouter-shaped where its model datasheet knows the model: `context_length` / `top_provider.context_length` / `max_input_tokens`, `max_output_tokens` / `top_provider.max_completion_tokens`, `architecture.input_modalities`, `supported_parameters` (`tools`, `reasoning`), a `reasoning` capability object, and per-token USD `pricing` (`prompt`, `completion`, `input_cache_read`, `input_cache_write`). A row that sets `pricing.prompt` or `pricing.completion` is authoritative, so an explicit `"0"` stays free. Fields a row omits fall back to the bundled model of the upstream provider named by the id prefix, then to a bundled model with the same bare `<model>` id, then with the same full id; the reference's transport compat is not carried over.
+- **Decision usage**: Bifrost's `/decisions` responses report chat-style `usage.prompt_tokens` / `completion_tokens`; the `openai-decisions` decoder reads them when the Responses-style `input_tokens` / `output_tokens` are absent.
+- **Decision models**: Bifrost answers every upstream's decision models on `/decisions`, but its `/models` rows declare `decisions` output only for OpenRouter's. A row is an `openai-decisions` judge by the most specific evidence: its `architecture.output_modalities` when present; otherwise the upstream provider's bundled row for the same model (so `nanogpt/cloudflare/clef` stays chat); otherwise whether the full id or its `<model>` part is a bundled judge id anywhere (`cloudflare/clef`, `custom/drex-max-v1.1`). Decision ids omp does not bundle (self-hosted `ollama/nimble`, aliased `azure/Microsoft-Decision-1`) are listed as chat models.
+- **Judge retries and fallbacks**: omp sends no `fallbacks` to `/decisions`, but Bifrost can still retry (provider `network_config.max_retries`) and fall back (routing-rule `fallbacks`) on its side. Each native judge candidate also gets up to 3 HTTP attempts within `judgment.attemptTimeoutMs`, then the next `retry.fallbackChains.judge` entry, so the two layers multiply upstream calls during an outage, and omp can give up at its deadline while Bifrost keeps retrying. Keep one fallback layer: either omp's judge chain (Bifrost judge routes with `max_retries` 0 and no rule fallbacks), or Bifrost's (one omp judge candidate with `judgment.attemptTimeoutMs` above the gateway's worst case, and `judgment.hedgeAfterMs` off).
+- **Non-chat rows**: rows whose `architecture.output_modalities` contain neither `text` nor `decisions` are dropped in the mapper; metadata-less embedding, speech, transcription, image, and moderation ids are dropped by `exclude-models provider="bifrost"` in `runtime/behavior.kdl`.
+- **Proxy, not local server**: `bifrost` is in `PROXY_OPENAI_COMPAT_PROVIDERS` (`packages/catalog/src/compat/resolve.ts`), so a loopback base URL does not turn on the local-runtime request shaping (grammar tool schemas, reasoning-content replay, output clamping) meant for llama.cpp, vLLM, and similar servers.
+
+### Auth & usage
+
+- Login kind `api-key` is declared in `packages/catalog/src/compat/rules/auth/bifrost.kdl` and asks for a Bifrost virtual key (`sk-bf-...`). Environment key: `BIFROST_API_KEY`. A gateway without governance accepts any value.
+- `BIFROST_BASE_URL` sets the gateway's OpenAI-compatible root (`getDefaultModelDiscoveryBaseUrl` in `packages/catalog/src/provider-models/cache-provider-id.ts`); a `models.yml` provider `baseUrl` override wins. Discovery, chat, and judge requests all use it.
+- Discovery does not run without a credential: the default port `8080` is also llama.cpp's default, whose models must not appear as Bifrost models.
+- **Cache scope**: the model cache namespace hashes the API key and base URL (`bifrost` is in `CREDENTIAL_SCOPED_MODEL_CACHE_PROVIDERS`), since virtual keys can restrict the roster.
 
 ## Cerebras (`cerebras`)
 
@@ -2603,7 +2625,7 @@ Provider-specific overrides in `packages/catalog/src/compat/rules/providers/zhip
 ### Catalog model handling
 
 - **Provider entry (`local`)**: `packages/catalog/src/compat/rules/providers/local.kdl` declares default model `lfm2.5-230m`. Model management permits unauthenticated access.
-- **Authored seeds**: `kokoro`, `parakeet-tdt-0.6b-v3`, `whisper-base`, `whisper-small`, `whisper-large-v3-turbo`, `lfm2.5-230m`, `lfm2.5-350m`, `falcon-h1-90m`, `qwen3-1.7b`, `llama3.2:3b`, `gemma-3-1b`, `qwen2.5-1.5b`, `lfm2-1.2b`; bundle policy `always`. Limits, capabilities, and prices are authored alongside these rows.
+- **Authored seeds**: `phonon-31m`, `parakeet-tdt-0.6b-v3`, `whisper-base`, `whisper-small`, `whisper-large-v3-turbo`, `lfm2.5-230m`, `lfm2.5-350m`, `falcon-h1-90m`, `qwen3-1.7b`, `llama3.2:3b`, `gemma-3-1b`, `qwen2.5-1.5b`, `lfm2-1.2b`; bundle policy `always`. Limits, capabilities, and prices are authored alongside these rows.
 - Runtime manager: `localModelManagerOptions` in `packages/catalog/src/provider-models/special.ts`.
 
 ## Muse Code (Subscription) (`muse-code`)

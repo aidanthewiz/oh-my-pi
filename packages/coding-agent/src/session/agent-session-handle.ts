@@ -27,18 +27,23 @@ import type { AgentDefinition } from "../task/types";
 import type { WorkPoolYieldItem } from "../task/workpool-yield";
 import { currentThreadId } from "../thread/identity";
 import type { AgentSession } from "./agent-session";
-import type { AgentLifecycleState, AgentSessionEvent, AgentSessionEventListener } from "./agent-session-events";
+import type {
+	AgentLifecycleState,
+	AgentSessionEvent,
+	AgentSessionEventListener,
+	WakeSources,
+} from "./agent-session-events";
 import type {
 	AgentSessionDisposeOptions,
 	AsyncJobInspection,
 	AsyncJobSnapshot,
 	AsyncJobTree,
+	DequeuedMessage,
 	EphemeralTurnOptions,
 	EphemeralTurnResult,
 	Prewalk,
 	PromptOptions,
 	ResolvedRoleModel,
-	RestoredQueuedMessage,
 	RoleModelCycle,
 	RoleModelCycleResult,
 	SessionStats,
@@ -110,6 +115,12 @@ export interface AgentSessionHandle {
 	readonly isSessionTransitioning: boolean;
 	/** Authoritative run identity and continuation state. */
 	readonly lifecycleState: AgentLifecycleState;
+	/** Whether a run is open, including pauses awaiting owned work. */
+	readonly isRunActive: boolean;
+	/** Work that can resume the open run without user input. */
+	readonly wakeSources: WakeSources | undefined;
+	/** Wait until owned child, peer, delivery and continuation work retires. */
+	waitForRunEnd(): Promise<void>;
 	/** When the current run started; undefined between runs. */
 	readonly runStartedAt: number | undefined;
 	/** Whether the session still owes turns to IRC messages (held, queued, or awaiting compaction). */
@@ -177,8 +188,6 @@ export interface AgentViewSessionManager extends AgentSessionManagerHandle {
 	getLeafId(): string | null;
 	/** The newest entry that moves the conversation, when the active branch ends at it (`conversationTip`). */
 	getConversationTip(): SessionEntry | undefined;
-	/** Artifacts directory of the consulted seance source, when this is a seance session. */
-	getSeanceSourceArtifactsDir(): string | null;
 	/** Append a custom entry (a worker-homed session appends on its home thread). */
 	appendCustomEntry(customType: string, data?: unknown): void;
 	/** Flush pending writes to disk. */
@@ -310,12 +319,8 @@ export interface AgentViewSession extends AgentSessionHandle {
 	readonly hasPostPromptWork: boolean;
 	/** Number of messages waiting for a turn. */
 	readonly queuedMessageCount: number;
-	/** Whether owner-scoped async work can still resume the session. */
-	hasPendingAsyncWork(): boolean;
 	/** Wait for streaming, persistence, and deferred recovery to settle. */
 	waitForIdle(): Promise<void>;
-	/** Drain owner-scoped async jobs, their deliveries, and resulting turns. */
-	settleAsyncWork(): Promise<void>;
 	/** Tool execution updates of tools still running, for mid-tool attach. */
 	activeToolExecutionUpdates(): readonly ToolExecutionUpdateEvent[];
 	/** Await persistence of messages already emitted. */
@@ -391,8 +396,8 @@ export interface AgentViewSession extends AgentSessionHandle {
 	hasBuiltInTool(name: string): boolean;
 	/** Queued steering and follow-up messages. */
 	getQueuedMessages(): { steering: readonly string[]; followUp: readonly string[]; liveSteered: number };
-	/** Remove and return the newest queued message. */
-	popLastQueuedMessage(): RestoredQueuedMessage | undefined;
+	/** Remove and return the newest queued message with the queue it came from. */
+	popLastQueuedMessage(): DequeuedMessage | undefined;
 	/** Resume an interrupted turn. */
 	resume(): Promise<void>;
 	/** Retry the last failed turn. */

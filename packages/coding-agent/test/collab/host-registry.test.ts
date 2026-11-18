@@ -107,7 +107,7 @@ function makeHostContext(): { ctx: InteractiveModeContext; state: HostContextSta
 			get lifecycleState() {
 				return state.lifecycle;
 			},
-			subscribeLifecycle: (cb: HostContextState["subscribed"]) => {
+			subscribe: (cb: HostContextState["subscribed"]) => {
 				state.subscribed = cb;
 				return () => {};
 			},
@@ -212,7 +212,7 @@ describe("collab host registry lifecycle (#6099)", () => {
 				if (scenario === "older-completion") {
 					state.lifecycle = { runId: "second", phase: "running" };
 					state.subscribed!({ type: "agent_start", runId: "second" });
-					state.subscribed!({ type: "agent_end", runId: "first", messages: [], isTerminal: true });
+					state.subscribed!({ type: "agent_end", runId: "first", messages: [] });
 					await flush(100);
 					state.usedTokens = 128;
 					await flush(2_200);
@@ -220,11 +220,17 @@ describe("collab host registry lifecycle (#6099)", () => {
 					expect(latest?.lifecycle).toEqual({ runId: "second", phase: "running" });
 					state.isStreaming = false;
 					state.lifecycle = { runId: "second", phase: "idle" };
-					state.subscribed!({ type: "agent_end", runId: "second", messages: [], isTerminal: true });
+					state.subscribed!({ type: "agent_end", runId: "second", messages: [] });
 					await flush(100);
 				} else {
 					state.lifecycle = { runId: "first", phase: "continuing" };
-					state.subscribed!({ type: "agent_end", runId: "first", messages: [], isTerminal: false });
+					state.subscribed!({
+						type: "agent_pause",
+						runId: "first",
+						messages: [],
+						yielded: false,
+						awaiting: false,
+					});
 					await flush(100);
 					state.isStreaming = false;
 					state.lifecycle = { runId: "first", phase: "idle" };

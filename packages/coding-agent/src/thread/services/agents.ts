@@ -244,6 +244,7 @@ function serveBridge(): RpcServe<MainSessionBridge, SessionBridgeProtocol> {
 		dispose: (_bridge, session, options) => session.dispose(options),
 		deliverIrcMessage: (_bridge, session, msg) => session.deliverIrcMessage(msg),
 		waitForIrcReplies: (_bridge, session) => session.waitForIrcReplies(),
+		waitForRunEnd: (_bridge, session) => session.waitForRunEnd(),
 		setWorkPoolYieldItems: (_bridge, session, items) => session.setWorkPoolYieldItems(items),
 		emitIrcRelayObservation: (_bridge, session, record) => session.emitIrcRelayObservation(record),
 	};

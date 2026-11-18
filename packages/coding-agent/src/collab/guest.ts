@@ -29,6 +29,7 @@ import { createRelayIdentityTokenProvider } from "../identity/relay";
 import type { InteractiveModeContext } from "../modes/types";
 import { AgentRegistry } from "../registry/agent-registry";
 import type { AgentLifecycleState, AgentSessionLifecycleEvent } from "../session/agent-session";
+import { fromWireEvent } from "../session/loop-end-wire";
 import type { SessionEntry } from "../session/session-entries";
 import { mintSessionId, SessionManager } from "../session/session-manager";
 import { FileSessionStorage } from "../session/session-storage";
@@ -696,6 +697,7 @@ export class CollabGuestLink {
 				break;
 			}
 			case "event":
+				// Hosts send every stopped loop as a flagged `agent_end` (see loop-end-wire.ts).
 				this.#applyEvent(frame.event);
 				break;
 			case "state": {
@@ -799,7 +801,7 @@ export class CollabGuestLink {
 	}
 
 	#dispatchEvent(event: AgentSessionLifecycleEvent): void {
-		this.#ctx.eventController.dispatchSessionEvent(event).catch(err => {
+		this.#ctx.eventController.dispatchSessionEvent(fromWireEvent(event)).catch(err => {
 			logger.warn("collab guest event dispatch failed", { type: event.type, error: String(err) });
 		});
 	}

@@ -1079,9 +1079,9 @@ export class OAuthRefresher {
 						provider,
 					});
 				}
-				refreshPromise = customProvider.refreshToken(credential, signal);
+				refreshPromise = customProvider.refreshToken(credential, signal, reason);
 			} else {
-				refreshPromise = refreshOAuthToken(provider as OAuthProvider, credential, signal);
+				refreshPromise = refreshOAuthToken(provider as OAuthProvider, credential, signal, reason);
 			}
 		}
 		// Leased exchanges retain the actual provider operation through abort and persistence.

@@ -242,7 +242,7 @@ async function restoreInterruptedChild(options: { transcript?: "handoff" | "fall
 		const outcome = await restoreSession(session);
 		expect(outcome.subagents).toEqual([AGENT_ID]);
 		await manager.getJob(AGENT_ID)?.promise;
-		await session.settleAsyncWork();
+		await session.waitForRunEnd();
 		await session.waitForIdle();
 		const delivered = session.messages.filter(
 			message => message.role === "custom" && message.customType === "async-result",
@@ -450,7 +450,7 @@ it("does not replay interrupted child effects when /new cancels its registered j
 		const revivedHandle = AgentRegistry.global().get(childId)?.session;
 		const revived = revivedHandle ? localSession(revivedHandle) : undefined;
 		await revived?.waitForIdle();
-		await session.settleAsyncWork();
+		await session.waitForRunEnd();
 		await session.waitForIdle();
 		const probeAppends = await fs.readFile(probeFile, "utf8").then(
 			bytes =>

@@ -47,6 +47,7 @@ import type {
 	AgentLifecycleState,
 	AgentSessionEvent,
 	AgentSessionEventListener,
+	WakeSources,
 } from "../session/agent-session-events";
 import type {
 	AgentSessionDisposeOptions,
@@ -74,6 +75,8 @@ export interface SessionMirrorState {
 	isDisposed: boolean;
 	isSessionTransitioning: boolean;
 	lifecycleState: AgentLifecycleState;
+	isRunActive: boolean;
+	wakeSources: WakeSources | undefined;
 	promptSequence: number;
 	runStartedAt: number | undefined;
 	ircWakesPending: boolean;
@@ -162,7 +165,6 @@ export interface SessionViewState {
 	/** Provider-facing session id (`AgentSession.sessionId`). */
 	providerSessionId: string;
 	sessionName: string | undefined;
-	seanceSourceArtifactsDir: string | null;
 	leafId: string | null;
 	/** Effort applied to the agent loop (`agent.state.thinkingLevel`). */
 	agentEffort: Effort | undefined;
@@ -191,7 +193,6 @@ export interface SessionViewState {
 	retryAttempt: number;
 	isTtsrAbortPending: boolean;
 	hasInterruptibleInput: boolean;
-	hasPendingAsyncWork: boolean;
 	hasPostPromptWork: boolean;
 	queuedMessageCount: number;
 	autoResolvedThinkingLevel: Effort | undefined;
@@ -260,7 +261,7 @@ export type SessionHostProtocol = {
 	watch: RpcMethod<[on: boolean], void>;
 	settleInFlightMessagePersistence: RpcMethod<[], void>;
 	waitForIdle: RpcMethod<[], void>;
-	settleAsyncWork: RpcMethod<[], void>;
+	waitForRunEnd: RpcMethod<[], void>;
 	setThinkingLevel: RpcMethod<[level: ConfiguredThinkingLevel | undefined, persist?: boolean], void>;
 	/**
 	 * Retire queued message `id` (main restored it): take it out of its queue,
@@ -343,6 +344,7 @@ export type SessionBridgeProtocol = {
 	dispose: RpcMethod<[session: AgentSessionHandle, options?: AgentSessionDisposeOptions], void>;
 	deliverIrcMessage: RpcMethod<[session: AgentSessionHandle, msg: IrcMessage], "injected" | "woken">;
 	waitForIrcReplies: RpcMethod<[session: AgentSessionHandle], void>;
+	waitForRunEnd: RpcMethod<[session: AgentSessionHandle], void>;
 	setWorkPoolYieldItems: RpcMethod<[session: AgentSessionHandle, items: readonly WorkPoolYieldItem[]], void>;
 	emitIrcRelayObservation: RpcMethod<[session: AgentSessionHandle, record: CustomMessage], void>;
 };
@@ -360,6 +362,8 @@ export const SESSION_STATE_READERS: {
 	isDisposed: session => session.isDisposed,
 	isSessionTransitioning: session => session.isSessionTransitioning,
 	lifecycleState: session => toWireData(session.lifecycleState),
+	isRunActive: session => session.isRunActive,
+	wakeSources: session => toWireData(session.wakeSources),
 	runStartedAt: session => session.runStartedAt,
 	ircWakesPending: session => session.ircWakesPending,
 	isPaused: session => session.agent.isPaused,

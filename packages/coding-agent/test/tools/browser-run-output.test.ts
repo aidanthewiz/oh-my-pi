@@ -61,6 +61,9 @@ describe("browser handle enrichment — fill()", () => {
 						node.focused = true;
 					},
 					matches: () => false,
+					getRootNode() {
+						return { activeElement: this };
+					},
 				}),
 			frame: {
 				page: () => ({
@@ -147,7 +150,13 @@ describe("browser handle enrichment — guarded actions", () => {
 		const stub = {
 			type: async () => {},
 			evaluate: async (fn: (el: unknown) => unknown) => {
-				fn({ focus: () => {}, matches: () => false });
+				fn({
+					focus: () => {},
+					matches: () => false,
+					getRootNode() {
+						return { activeElement: this };
+					},
+				});
 			},
 			frame: {
 				page: () => ({
@@ -193,6 +202,53 @@ describe("browser handle enrichment — guarded actions", () => {
 			() => Promise<void>
 		>;
 		await expect(touch.touchStart!()).rejects.toThrow();
+	});
+
+	it("runs the guarded fill as a single op without re-entering the wrapped type()", async () => {
+		const node = { value: "old", focused: false };
+		const stub = {
+			evaluate: async (fn: (el: unknown) => unknown) =>
+				fn({
+					get value() {
+						return node.value;
+					},
+					set value(v: string) {
+						node.value = v;
+					},
+					focus: () => {
+						node.focused = true;
+					},
+					matches: () => false,
+					getRootNode() {
+						return { activeElement: this };
+					},
+				}),
+			type: async () => {},
+			frame: {
+				page: () => ({
+					keyboard: {
+						type: async (text: string) => {
+							node.value += text;
+						},
+					},
+				}),
+			},
+		} as unknown as ElementHandle;
+		let active = false;
+		const guard: HandleOpGuard = async (_label, fn) => {
+			if (active) throw new Error("Reentrant guarded action");
+			active = true;
+			try {
+				return await fn(new AbortController().signal);
+			} finally {
+				active = false;
+			}
+		};
+
+		await toActionableHandle(stub, guard).fill("fresh");
+
+		expect(node.value).toBe("fresh");
+		expect(node.focused).toBe(true);
 	});
 
 	it("rewraps a cached handle from its original methods for each browser run", async () => {

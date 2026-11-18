@@ -143,9 +143,6 @@ export class ArtifactManager implements ArtifactManagerApi {
 	 * @param ready Settles once `dir` is seeded (a session move copying the previous
 	 *   session's artifacts in the background). Id scans and lookups wait for it,
 	 *   so new ids never collide with copied ones. Must not reject.
-	 * @param reservedIdsDir Read-only directory whose ids stay reserved: a seance
-	 *   fork allocates past its source's ids so `artifact://<n>` from the inherited
-	 *   transcript keeps naming the source artifact.
 	 */
 	constructor(dir: string, ready?: Promise<void>, reservedIdsDir?: string) {
 		this.#dir = dir;
@@ -188,7 +185,7 @@ export class ArtifactManager implements ArtifactManagerApi {
 			try {
 				files.push(...(await fs.readdir(this.#reservedIdsDir)));
 			} catch {
-				// A missing source artifacts dir reserves nothing.
+				// A missing source artifact directory reserves no ids.
 			}
 		}
 		let maxId = -1;

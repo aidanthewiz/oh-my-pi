@@ -75,6 +75,9 @@ describe("frozen catalog generation", () => {
 			"frozen-fixture": { "snapshot-only": frozenModel("frozen-fixture", "snapshot-only") },
 			devin: { "swe-1-6-fast": frozenModel("devin", "swe-1-6-fast") },
 			ollama: { "private-host": frozenModel("ollama", "private-host") },
+			modal: { "private-deployment": frozenModel("modal", "private-deployment") },
+			bifrost: { "private-upstream": frozenModel("bifrost", "private-upstream") },
+			local: { kokoro: frozenModel("local", "kokoro", { api: "local-inference", baseUrl: "local://inference" }) },
 		};
 		await Bun.write(inputPath, encodeModelCatalog(input));
 
@@ -102,8 +105,20 @@ describe("frozen catalog generation", () => {
 			maxTokens: 128_000,
 		});
 		expect(getCatalogProvider(output, "openai-codex")?.["gpt-image-2"].kind).toBe("image");
+		expect(getCatalogProvider(output, "openai")?.["gpt-6-luna-decisions"]).toMatchObject({
+			api: "openai-decisions",
+			kind: "judge",
+			requestModelId: "gpt-6-luna",
+		});
+		expect(getCatalogProvider(output, "local")?.["phonon-31m"]).toMatchObject({
+			api: "local-inference",
+			kind: "tts",
+		});
+		expect(getCatalogProvider(output, "local")?.kokoro).toBeUndefined();
 		expect(getCatalogProvider(output, "devin")?.["swe-1-6-fast"]).toBeUndefined();
 		expect(getCatalogProviders(output)).not.toContain("ollama");
+		expect(getCatalogProviders(output)).not.toContain("modal");
+		expect(getCatalogProviders(output)).not.toContain("bifrost");
 		expect(globalThis.fetch).not.toHaveBeenCalled();
 		expect(authDiscovery.discoverAuthStorage).not.toHaveBeenCalled();
 	});

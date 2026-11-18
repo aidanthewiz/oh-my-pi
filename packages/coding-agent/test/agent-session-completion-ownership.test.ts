@@ -172,7 +172,7 @@ test.each([
 			expect(ends).toContain(starts[1]);
 			if (asyncPause) {
 				jobs.acknowledgeDeliveries(["newer-owner-job"]);
-				await session.settleAsyncWork();
+				await session.waitForRunEnd();
 			}
 			expect(session.isStreaming).toBe(false);
 			expect(session.lifecycleState?.runId).toBe(newerRunId);
@@ -294,7 +294,7 @@ test.each(outcomeCases)(
 			}
 
 			jobs.acknowledgeDeliveries(["outcome-job"]);
-			await session.settleAsyncWork();
+			await session.waitForRunEnd();
 			expect(session.lifecycleState?.runId).toBe(owner.runId);
 			expect(session.lifecycleState?.phase).toBe("idle");
 			expect(session.lifecycleState?.outcome).toBe(outcome);

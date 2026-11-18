@@ -23,6 +23,8 @@ export function isOfficialCodexApiUrl(baseUrl: string | undefined): boolean {
 
 /**
  * Pinned OpenAI Codex client version (corresponds to @openai/codex package version).
+ * `getCodexClientVersion()` in `./codex-version` also honors an explicit override;
+ * use that function for wire headers and cache namespaces.
  * Updated from npm by `bun run check-spoofed-versions --update`.
  *
  * The backend version-gates model availability against this value on both
@@ -31,7 +33,7 @@ export function isOfficialCodexApiUrl(baseUrl: string | undefined): boolean {
  * omitted from `/models` at 0.155.1 and listed at 0.159.0. An older pin
  * silently hides newer SKUs from discovery.
  */
-export const CODEX_CLIENT_VERSION = "0.159.0";
+export const CODEX_CLIENT_VERSION = "0.169.0";
 
 export const OPENAI_HEADERS = {
 	BETA: "OpenAI-Beta",

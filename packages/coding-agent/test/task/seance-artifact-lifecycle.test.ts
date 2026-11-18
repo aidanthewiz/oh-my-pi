@@ -182,6 +182,7 @@ describe("seance artifact lifecycle", () => {
 				assignment: "Read the saved context and submit a result.",
 				index: 0,
 				id: AGENT_ID,
+				outputSchema: {},
 				settings,
 				modelRegistry,
 				authStorage,
@@ -312,7 +313,6 @@ describe("seance artifact lifecycle", () => {
 				enableLsp: false,
 				enableMCP: false,
 				parentAgentId: "Main",
-				structured: false,
 				eventBus,
 			});
 			expect(result.exitCode).toBe(0);
@@ -593,6 +593,7 @@ describe("seance artifact lifecycle", () => {
 					assignment: "Read the saved context and submit a result.",
 					index: 0,
 					id,
+					outputSchema: {},
 					settings,
 					modelRegistry,
 					authStorage,
@@ -612,8 +613,10 @@ describe("seance artifact lifecycle", () => {
 			);
 			expect(files.toSorted()).toEqual([
 				"0.read.log",
+				"SeanceRepeatOne.json",
 				"SeanceRepeatOne.jsonl",
 				"SeanceRepeatOne.md",
+				"SeanceRepeatTwo.json",
 				"SeanceRepeatTwo.jsonl",
 				"SeanceRepeatTwo.md",
 			]);

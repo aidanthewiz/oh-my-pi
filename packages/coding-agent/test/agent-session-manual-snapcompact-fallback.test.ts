@@ -37,7 +37,7 @@ describe.each([
 	},
 	{
 		label: "wire-stripped",
-		provider: "deepseek",
+		provider: "fireworks",
 		id: "deepseek-v4-flash",
 	},
 ] as const)("AgentSession manual snapcompact $label fallback", ({ provider, id }) => {

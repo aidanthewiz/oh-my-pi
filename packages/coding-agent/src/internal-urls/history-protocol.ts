@@ -59,10 +59,7 @@ function diskIdsForCompletion(preferredArtifactDir?: string, onlyPreferred = fal
 	const key = onlyPreferred ? `\0session\0${preferredArtifactDir ?? ""}` : artifactsDirsFromRegistry().join("\0");
 	const cached = completionDiskIds.get(key);
 	if (cached) return cached;
-	const files = onlyPreferred
-		? sessionFilesFromDisk(preferredArtifactDir, { onlyPreferred: true })
-		: sessionFilesFromDisk();
-	const ids = files.then(files => [...files.keys()]);
+	const ids = sessionFilesFromDisk(preferredArtifactDir, { onlyPreferred }).then(files => [...files.keys()]);
 	completionDiskIds.set(key, ids);
 	ids.catch(() => completionDiskIds.delete(key));
 	return ids;
@@ -75,7 +72,7 @@ interface RefLookup {
 	visible: AgentRef[];
 	/** Caller root's artifact dir, scanned first by on-disk fallbacks. */
 	preferredArtifactDir?: string;
-	/** Restrict fallback scans to the caller's artifact tree. */
+	/** Restrict fallback scans to the consulted source root. */
 	onlyPreferred?: boolean;
 }
 
@@ -339,7 +336,6 @@ export class HistoryProtocolHandler implements ProtocolHandler {
 	 * Both the bare index and `history://<id>` lookups read this one source.
 	 */
 	async #roster(context: ResolveContext | undefined): Promise<Omit<RefLookup, "ref">> {
-		// A seance sees only the consulted session's transcript tree, read in place.
 		const seanceDir = context?.session?.seanceSourceArtifactsDir ?? context?.seanceSourceArtifactsDir;
 		if (seanceDir) return { visible: [], preferredArtifactDir: seanceDir, onlyPreferred: true };
 		const registry = AgentRegistry.global();
@@ -498,9 +494,7 @@ export class HistoryProtocolHandler implements ProtocolHandler {
 		preferredArtifactDir?: string,
 		onlyPreferred = false,
 	): Promise<{ id: string; file: string } | undefined> {
-		const files = onlyPreferred
-			? await sessionFilesFromDisk(preferredArtifactDir, { onlyPreferred: true })
-			: await sessionFilesFromDisk(preferredArtifactDir);
+		const files = await sessionFilesFromDisk(preferredArtifactDir, { onlyPreferred });
 		const lower = agentId.toLowerCase();
 		let match: { id: string; file: string } | undefined;
 		for (const [id, file] of files) {
@@ -526,9 +520,7 @@ export class HistoryProtocolHandler implements ProtocolHandler {
 		}));
 		// Merge on-disk transcripts for agents absent from the registry.
 		const registered = new Set(refs.map(ref => ref.id));
-		const disk = onlyPreferred
-			? await sessionFilesFromDisk(preferredArtifactDir, { onlyPreferred: true })
-			: await sessionFilesFromDisk(preferredArtifactDir);
+		const disk = await sessionFilesFromDisk(preferredArtifactDir, { onlyPreferred });
 		for (const id of disk.keys()) {
 			if (registered.has(id)) continue;
 			entries.push({ id, status: "on disk", kind: "—", parent: "—", lastActivity: "—" });

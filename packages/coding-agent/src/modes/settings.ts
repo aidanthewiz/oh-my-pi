@@ -483,6 +483,19 @@ export const cfgTuiRenderSvg = register({
 	},
 });
 
+export const cfgTuiRenderEmbeds = register({
+	id: "tui.renderEmbeds",
+	type: "boolean",
+	default: false,
+	ui: {
+		tab: "appearance",
+		group: "Display",
+		label: "Render Embedded Images and Pages",
+		description:
+			"Reply embeds require approved source loading; Coreforce CLI refuses raw image and page loading. Use the read or browser tool.",
+	},
+});
+
 export const cfgTuiAutoGraph = register({
 	id: "tui.autoGraph",
 	type: "enum",

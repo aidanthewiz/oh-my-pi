@@ -125,8 +125,9 @@ Each provider search transport receives a hard timeout from `providers.webSearch
    - Provider choice is the `web` model role. A candidate is a catalog model: `web/<engine>` for a search engine (for example `web/brave`, `web/duckduckgo`), or a chat model whose catalog entry declares a `webSearch` grounding (for example `anthropic/claude-haiku-4-5`, bundled `openai/gpt-6-luna`, or `openai/gpt-5.6-luna`), in which case that model runs the grounded search.
    - **Primary**: `modelRoles.web`. If it is set, its first selector pattern that matches an available model becomes the first candidate and is explicit. If it is unset, the role resolves through the built-in `web` priority list.
    - **Fallbacks**: `retry.fallbackChains.web`. If it is set (even as an empty list), exactly those selectors follow the primary and are explicit. If it is unset, every entry of the built-in `web` priority list that matches an available model follows as a non-explicit candidate. Duplicate models are dropped, and a model listed by any explicit selector stays explicit.
-   - **Explicit vs automatic**: explicit candidates use `isExplicitlyAvailable()`, so Perplexity and Public Web can run their unauthenticated paths when selected. Explicit Parallel, Exa, and Firecrawl may use configured API credentials; their automatic entries use only keyless paths and are skipped if credentials would trigger a billed API call. Other automatic candidates use `isAvailable()` and are skipped when unavailable.
-   - **Per-request selector**: `SearchQueryParams.model` (`omp q --model web/duckduckgo "…"`) replaces the whole chain with that single explicit candidate.
+   - **Explicit vs automatic**: explicit candidates use `isExplicitlyAvailable()`. Explicit Parallel, Exa, and Firecrawl may use configured API credentials; their automatic entries are skipped when credentials would select billed transport. Other automatic candidates use `isAvailable()`.
+   - **Keyless services** (`providers.webKeyless`, default `false`): automatic and configured role/fallback candidates reach anonymous services only when trusted settings enable them. Project and derived-agent settings cannot enable this permission. An explicit per-request selector (`coreforge q --model web/duckduckgo`) permits that one engine, subject to the existing provider/model policy and approval. Credential resolution failures never downgrade a configured engine to anonymous transport. Hosted search, configured SearXNG, and admitted credentialed engines retain their own authority.
+   - **Per-request selector**: `SearchQueryParams.model` (`coreforge q --model web/duckduckgo "…"`) replaces the whole chain with that single explicit candidate. The same provider/model policy still applies.
    - **xAI credential order**: xAI-grounded candidates are reordered among their own slots by provider priority, so an `xai-oauth` login runs before an `xai` API key wherever both appear (unless `modelProviderOrder` says otherwise); other candidates keep their positions.
    - **X-only queries**: Without a per-request selector, queries restricted to X hosts or `from:<handle>` authors promote the chain's eligible xAI candidates.
      The remaining chain follows afterward.
@@ -197,7 +198,7 @@ Each provider search transport receives a hard timeout from `providers.webSearch
       - `limit` and `num_search_results` are collapsed together before dispatch.
       - Output may include parsed free-text `answer`, `sources`, `requestId`.
    - **Exa** — `packages/coding-agent/src/web/search/providers/exa.ts`
-      - Availability: available unless `exa.enabled=false`. `EXA_API_KEY` or a stored credential for `exa` selects the billed API on explicit selection; otherwise search uses the public MCP. The automatic chain skips Exa when credentials would select its billed API.
+      - Availability: available unless `exa.enabled=false`. Explicit selection may use `EXA_API_KEY` or a stored Exa credential; the automatic chain skips Exa when credentials would select billed transport. Without credentials, its public MCP requires keyless permission. A configured credential that fails to resolve errors instead of downgrading to the MCP.
       - Querying: POST `https://api.exa.ai/search` with the resolved Exa API key, otherwise JSON-RPC `tools/call` against `https://mcp.exa.ai/mcp` for remote MCP tool `web_search_exa`.
       - `limit` and `num_search_results` are collapsed together before dispatch.
       - Output: synthesized `answer` from up to 3 result summaries, `sources`, `requestId`.
@@ -233,7 +234,7 @@ Each provider search transport receives a hard timeout from `providers.webSearch
       - `num_search_results ?? limit` is clamped to `1..20`, default `5`.
       - Output: `answer`, `sources`, `requestId`, `authMode: "api_key"`.
    - **Firecrawl** — `packages/coding-agent/src/web/search/providers/firecrawl.ts`
-      - Availability: explicit selection may use a configured Firecrawl API credential. The automatic chain skips Firecrawl when that credential would select billed API transport; without one, it uses the keyless endpoint.
+      - Availability: explicit selection may use a configured Firecrawl credential. The automatic chain skips Firecrawl when that credential would select billed transport. Without a credential or self-hosted endpoint, search requires keyless permission. A configured credential that fails to resolve against the hosted API errors instead of downgrading to keyless mode.
       - Querying: POST `https://api.firecrawl.dev/v2/search` with `sources: [{ type: "web" }]`. The endpoint is built by the shared resolver in `packages/coding-agent/src/web/firecrawl.ts`, which applies the `FIRECRAWL_BASE_URL` (alias `FIRECRAWL_API_URL`) self-hosting override. Google-style operators are formatted into the query; `recency` and parsed absolute dates map to `tbs`.
       - `limit` / `num_search_results`: collapsed and clamped to `1..100`, default `10`; output `sources`, `requestId`, and `authMode: "api_key" | "keyless"`.
       - The shared client also exposes `/scrape` as a `providers.fetch` reader backend, requiring a Firecrawl credential. API reference: [docs.firecrawl.dev](https://docs.firecrawl.dev).
@@ -254,8 +255,8 @@ Each provider search transport receives a hard timeout from `providers.webSearch
       - `limit` / `num_search_results`: `params.numSearchResults ?? params.limit`, clamped to `1..20`, default `10`.
       - Output: `sources`, `requestId`.
    - **Parallel** — `packages/coding-agent/src/web/search/providers/parallel.ts`, `packages/coding-agent/src/web/parallel.ts`
-      - Availability: always available when explicitly selected. In the automatic chain, Parallel uses its credential-free public MCP only when no Parallel credential is configured; otherwise it skips to the next candidate.
-      - Querying: authenticated requests POST `https://api.parallel.ai/v1beta/search` with `objective`, one search query, `mode:"fast"`, `excerpts.max_chars_per_result:10000`, and beta header `search-extract-2025-10-10`. Domain filters and `after:`/recency map to `source_policy`; explicit `after:` wins. Keyless requests call `web_search` at `https://search.parallel.ai/mcp`, retaining query operators and a recency-derived date hint. They include session id and the selected search candidate's model id when at most 100 characters, and identify the client as `omp/<version>`.
+      - Availability: explicit selection may use a configured Parallel credential. The automatic chain skips Parallel when credentials would select billed transport; otherwise its public MCP requires keyless permission. A configured credential that fails to resolve errors instead of downgrading to the MCP.
+      - Querying: authenticated requests POST `https://api.parallel.ai/v1beta/search` with `objective`, one search query, `mode:"fast"`, `excerpts.max_chars_per_result:10000`, and beta header `search-extract-2025-10-10`. Domain filters and `after:`/recency map to `source_policy`; explicit `after:` wins. Keyless requests call `web_search` at `https://search.parallel.ai/mcp` with only `objective` and `search_queries`, retaining query operators and a recency-derived date hint. No session or model identifiers are sent.
       - There is no provider fan-out here despite the name; the current adapter always sends a one-element `search_queries` array.
       - `limit` and `num_search_results` are collapsed together before dispatch, clamped to `1..40`, default `10`.
       - Output: `sources`, `requestId`.
@@ -344,7 +345,7 @@ Each provider search transport receives a hard timeout from `providers.webSearch
 
 ## Errors
 
-- Tool-level no-candidate case returns a normal tool result with `Error: No web search model configured.` (or `No web search model matches selector "<model>".`); it does not throw.
+- Tool-level no-candidate case returns a normal tool result with `Error: No web search model configured.` (or `No web search model matches selector "<model>".`, or the `providers.webKeyless` message when that setting skipped every candidate); it does not throw.
 - Tool-level all-failed case also returns a normal tool result with `Error: ...`; the message is either the single normalized provider error or a semicolon-separated summary of all failed providers.
 - Provider adapters usually throw `SearchProviderError(provider, message, status)` for HTTP or protocol failures.
 - Availability is provider-specific: most credentialed adapters inspect AuthStorage, while keyless engines and explicitly selected Perplexity/Public Web have separate admission rules.

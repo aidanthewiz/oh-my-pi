@@ -142,7 +142,7 @@ bazelisk build //:natives-all
 
 The driver builds `host` through the local Cargo/N-API path (`packages/natives/scripts/build-bindings.ts`) unless `OMP_NATIVE_BUILD_BACKEND=bazel` or extra Bazel arguments select Bazel. That path also regenerates declarations and ESM/enum exports. `OMP_NATIVE_BUILD_BACKEND=cargo` forces the host-only path. Windows hosts always use it and cannot build explicit Bazel cross targets.
 
-`OMP_NATIVE_CARGO_PROFILE` selects the Cargo profile (default `local`; `ci` strips only on non-Darwin hosts). The build script disables Cargo stripping on Darwin to avoid Xcode 27 Mach-O corruption. `OMP_NATIVE_FEATURES` passes optional features to `napi build --features` on that path, for example `wayland-pipewire`. Bazel builds ignore it.
+`OMP_NATIVE_CARGO_PROFILE` selects the Cargo profile (default `local`; `ci` strips only on non-Darwin hosts). The build script disables Cargo stripping on Darwin to avoid Xcode 27 Mach-O corruption. Wayland capture loads PipeWire dynamically; it no longer requires an optional Cargo feature.
 
 For explicit targets, the driver runs one `bazel build`, requires `execution_root` and `bazel cquery --output=files`, and installs dereferenced outputs into `--dest` (default `packages/natives/native`). Extra arguments after `--` pass to Bazel verbatim. It resolves `bazelisk` or `bazel` from `PATH`. `OMP_BAZEL_RC` supplies an optional `--bazelrc=` startup argument.
 

@@ -26,7 +26,8 @@ import { createRelayIdentityTokenProvider } from "../identity/relay";
 import type { InteractiveModeContext } from "../modes/types";
 import { AgentLifecycleManager } from "../registry/agent-lifecycle";
 import { type AgentRef, AgentRegistry } from "../registry/agent-registry";
-import type { AgentSessionEvent, AgentSessionLifecycleEvent } from "../session/agent-session";
+import type { AgentSessionEvent } from "../session/agent-session";
+import { toWireEvent, type WireSessionEvent } from "../session/loop-end-wire";
 import { stripImagesFromMessage, USER_INTERRUPT_LABEL } from "../session/messages";
 import type { SessionEntry as StoredSessionEntry } from "../session/session-entries";
 import { TASK_SUBAGENT_LIFECYCLE_CHANNEL, TASK_SUBAGENT_PROGRESS_CHANNEL } from "../task/types";
@@ -71,6 +72,7 @@ import {
 /** Events that change the footer state guests render. */
 const STATE_TRIGGER_EVENTS: Record<string, true> = {
 	agent_start: true,
+	agent_pause: true,
 	agent_end: true,
 	message_end: true,
 	tool_execution_end: true,
@@ -118,7 +120,7 @@ const COLLAB_BUS_CHANNELS = [
 	TASK_SUBAGENT_PROGRESS_CHANNEL,
 ] as const satisfies readonly BusChannel[];
 
-function isWireAgentEvent(event: AgentSessionLifecycleEvent): event is AgentSessionLifecycleEvent & WireAgentEvent {
+function isWireAgentEvent(event: WireSessionEvent): event is WireSessionEvent & WireAgentEvent {
 	return event.type in WIRE_AGENT_EVENT_TYPES;
 }
 
@@ -534,8 +536,15 @@ export class CollabHost {
 		}
 
 		this.#startedAt = Date.now();
-		this.#unsubscribe = this.#ctx.session.subscribeLifecycle(event => {
-			if (isWireAgentEvent(event)) this.#broadcastEvent(event);
+		// Subscribe as soon as the relay is open. A guest can join as soon as the
+		// link is visible (auto-start installs the room before this resolves).
+		// Frames are mirrored only while #broadcastAllowed() holds (at least one
+		// peer); a joining guest's welcome snapshot covers everything before that.
+		// The local registry work below is independent of this.
+		this.#unsubscribe = this.#ctx.session.subscribe(event => {
+			// Guests speak the per-loop `agent_end` wire shape (see loop-end-wire.ts).
+			const wireEvent = toWireEvent(event);
+			if (isWireAgentEvent(wireEvent)) this.#broadcastEvent(wireEvent);
 			this.#onEventForState(event);
 		});
 		// Subagent frames publish on the session tree's observability bus at
@@ -793,7 +802,7 @@ export class CollabHost {
 	}
 
 	/** Broadcast one session event, bounded and serialized exactly once. */
-	#broadcastEvent(event: AgentSessionEvent): void {
+	#broadcastEvent(event: WireSessionEvent): void {
 		if (event.type === "message_start") this.#messageSeq++;
 		if (!this.#broadcastAllowed()) return;
 		const frame = encodeEventFrame(serializeReplicatedEvent(event).json);

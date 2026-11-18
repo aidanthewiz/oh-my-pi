@@ -10,7 +10,7 @@ import { type as arkType } from "@oh-my-pi/omptype";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent, TextContent } from "@oh-my-pi/pi-ai";
 import { rasterizeSvg } from "@oh-my-pi/pi-natives";
-import { loadFormImage, MAX_FORM_IMAGE_BYTES, type FormMedia } from "@oh-my-pi/pi-tui/html-form/media";
+import { loadMedia, MAX_MEDIA_BYTES, type Media } from "@oh-my-pi/pi-tui/media";
 import { TERMINAL } from "@oh-my-pi/pi-tui";
 import { formatKeyHint } from "@oh-my-pi/pi-tui/app-keybindings";
 import { editorKey, editorKeys } from "@oh-my-pi/pi-tui/chrome/keybinding-hints";
@@ -32,6 +32,7 @@ import {
 	spansText,
 	type TextField,
 } from "@oh-my-pi/pi-tui/html-form/parse";
+import { shiftImageMarkers } from "@oh-my-pi/pi-tui/prompt/composer-attachments";
 import { disambiguateDisplayLabels } from "@oh-my-pi/pi-tui/render/render-utils";
 import { theme } from "@oh-my-pi/pi-tui/theme";
 import type { AskToolDetails } from "@oh-my-pi/pi-tui/tools/ask";
@@ -43,7 +44,6 @@ import askDescription from "../prompts/tools/ask.md" with { type: "text" };
 import { callRegisteredTool } from "../eval/js/session-tool";
 import askHeadlessForkMessage from "../prompts/tools/ask-headless-fork.md" with { type: "text" };
 import askResultTemplate from "../prompts/tools/ask-result.md" with { type: "text" };
-import { shiftImageMarkers } from "@oh-my-pi/pi-tui/prompt/composer-attachments";
 import { renderAttachmentSourceNotice } from "../session/attachment-source-notice";
 import { cfgSpeechEnabled } from "../tts/settings";
 import { vocalizer } from "../tts/vocalizer";
@@ -428,7 +428,7 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 		if (!isCurrent()) throw new ToolAbortError("Ask image answer owner changed");
 		const blocks: Array<TextContent | ImageContent> = [];
 		for (const [index, image] of images.entries()) {
-			const notice = renderAttachmentSourceNotice(image, index + 1);
+			const notice = renderAttachmentSourceNotice(image, index + 1, { askAnswer: true });
 			if (notice) blocks.push({ type: "text", text: notice.content });
 			// Keep the source tag: `attachment://N` resolves this result's images to their files.
 			blocks.push(image);
@@ -626,7 +626,7 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 				}
 				answered = { data, notes, timedOut };
 			} else if (extensionUi.formDialog) {
-				const media = new Map<string, FormMedia | Error>();
+				const media = new Map<string, Media | Error>();
 				for (const section of form.sections) {
 					for (const block of section.blocks) {
 						if (block.kind !== "image" || /^data:/i.test(block.src) || media.has(block.src)) continue;
@@ -650,16 +650,16 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 							const image: unknown = result.images[0];
 							if (!isRecord(image) || typeof image.data !== "string" || typeof image.mimeType !== "string")
 								throw new ToolError("Form media did not resolve to an approved image");
-							if (image.data.length > Math.ceil(MAX_FORM_IMAGE_BYTES / 3) * 4)
+							if (image.data.length > Math.ceil(MAX_MEDIA_BYTES / 3) * 4)
 								throw new ToolError("Form image exceeds the image byte limit");
 							let bytes: Uint8Array = Uint8Array.fromBase64(image.data);
-							if (bytes.byteLength > MAX_FORM_IMAGE_BYTES)
+							if (bytes.byteLength > MAX_MEDIA_BYTES)
 								throw new ToolError("Form image exceeds the image byte limit");
 							if (image.mimeType.toLowerCase() === "image/svg+xml") {
 								bytes = await rasterizeSvg(bytes, MAX_FORM_SVG_EDGE_PX, MAX_FORM_SVG_EDGE_PX);
 								dialogSignal.throwIfAborted();
 								if (!isCurrent()) throw new ToolAbortError("Ask media owner changed");
-								if (bytes.byteLength > MAX_FORM_IMAGE_BYTES)
+								if (bytes.byteLength > MAX_MEDIA_BYTES)
 									throw new ToolError("Form image exceeds the image byte limit");
 							}
 							const metadata = parseImageMetadata(bytes);
@@ -677,12 +677,13 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 					formDialog(html, {
 						timeout,
 						signal: dialogSignal,
-						loadMedia: async (source: string, mediaSignal: AbortSignal): Promise<FormMedia> => {
+						acceptImages: true,
+						loadMedia: async (source: string, mediaSignal: AbortSignal): Promise<Media> => {
 							const activeSignal = AbortSignal.any([dialogSignal, mediaSignal]);
 							activeSignal.throwIfAborted();
 							if (!isCurrent()) throw new ToolAbortError("Ask media owner changed");
 							if (/^data:/i.test(source)) {
-								const loaded = await loadFormImage(source, { cwd: this.session.cwd, signal: activeSignal });
+								const loaded = await loadMedia(source, { cwd: this.session.cwd, signal: activeSignal });
 								activeSignal.throwIfAborted();
 								if (!isCurrent()) throw new ToolAbortError("Ask media owner changed");
 								return loaded;
@@ -704,7 +705,14 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 				checkAnswerCurrent();
 			}
 
-			const notes = answered.notes?.length ? answered.notes : undefined;
+			const notes = answered.notes?.length
+				? answered.notes.map(({ images, ...note }) => {
+						if (!images?.length) return note;
+						const text = shiftImageMarkers(note.text, answerImages.length, images.length);
+						answerImages.push(...images);
+						return { ...note, text };
+					})
+				: undefined;
 			const details: AskToolDetails = {
 				answers: formAnswers(form, answered.data),
 				...(notes ? { notes } : {}),

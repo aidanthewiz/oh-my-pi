@@ -6,6 +6,12 @@
 
 - Fixed dashboard controls remaining busy after a cached query's refresh is abandoned by hiding the page or switching keys.
 - Preserve the Coreforce hammer favicon in the branded stats dashboard.
+## [18.22.1] - 2026-11-17
+
+### Fixed
+
+- Fixed the Gain tab undercounting savings for sessions that use snapcompact context compaction, including backfilling recent compaction history after upgrading.
+
 ## [18.20.1] - 2026-11-14
 
 ### Fixed

@@ -148,8 +148,15 @@ Recursive function, sourced-script, and eval execution grows native stack segmen
 
 Session-level bang-command executions pass the session ID captured when execution starts, preserving result ownership across a branch or session transition.
 
-Tool-call executions capture the session ID before asynchronous preparation and pass it as `sessionKey`, including calls that start in the foreground on the auto-background path, so variables, functions, and shell options carry over between calls. A managed job that starts in the background (`async: true`, or no foreground wait) uses a per-job `<session>:async:<jobId>` key instead, so it never holds the session's shell. Without a session ID, reuse falls back to shell config/snapshot/env.
-Concurrent calls never share one `Shell`: the native session runs one command at a time and `Shell.abort()` kills every in-flight run on it. `executeBash()` tracks in-flight keys in `shellSessionsInUse`; while a key is busy, overlapping calls skip the cache and create a one-shot `Shell` (the same isolation as quarantined sessions), and `BashTool` says so in the call's result (`onSessionShellBusy`). A call that moves to the background keeps the session's shell until it finishes. Only the owning call releases the in-use flag or deletes the cached session in its `finally`.
+Tool-call executions capture the session ID before asynchronous preparation and pass it as `sessionKey`. Foreground calls retain this key after auto-backgrounding, so later calls inherit their variables, functions, and shell options. Jobs started in the background use a per-job `<session>:async:<jobId>` key and never hold the session's shell. Without a session ID, reuse falls back to shell config/snapshot/env.
+
+Concurrent calls never share one `Shell`: the native session runs one command at a time, and `Shell.abort()` kills every in-flight run. `executeBash()` tracks active keys in `shellSessionsInUse`. Overlapping calls run in a one-shot `Shell.fork()` with the session's state from before its active command.
+
+After a fork settles, `Shell.adopt()` carries its variables, functions, aliases, options, and traps into the session shell and later forks. It does not carry the working directory or hash table. Adoption applies immediately when idle, or after the active command ends. When both commands set a name, the command that ends last wins.
+
+A fork with live background jobs remains retained until they exit. `BashResult.fork` reports whether adoption succeeded and whether background jobs remain. `BashTool` adds notices only for state that could not carry back or jobs that remain in the fork.
+
+A backgrounded foreground call keeps the session shell until it finishes. Only its owning call releases the active key or removes the cached shell after settlement.
 
 `exit`, errexit (`set -e`), and a stray top-level `return`/`break` end the command, not the native session; a timeout, cancellation, or failed run quarantines the session and the next call starts a fresh one.
 

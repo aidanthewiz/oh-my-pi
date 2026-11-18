@@ -120,10 +120,13 @@ describe("agent bridging across subagent workers", () => {
 		const prompting = remote.prompt("hello from main");
 		await waitFor(() => remote.isStreaming && ref.status === "running");
 		expect(remote.runStartedAt).toBeNumber();
+		expect(remote.isRunActive).toBe(true);
 
 		await probe.openGate();
 		expect(await prompting).toBe(true);
 		await waitFor(() => !remote.isStreaming && ref.status === "idle");
+		await remote.waitForRunEnd();
+		expect(remote.isRunActive).toBe(false);
 		const roles = remote.messages.map(message => message.role);
 		expect(roles).toContain("user");
 		expect(roles).toContain("assistant");
@@ -133,7 +136,7 @@ describe("agent bridging across subagent workers", () => {
 		expect(events).toContain("agent_end");
 	});
 
-	it("waits through a held turn and its queued follow-up before reporting idle", async () => {
+	it("waits through a held turn and its queued follow-up before reporting the run ended", async () => {
 		const { probe } = await startWorker();
 		await probe.open("W1", { gated: true });
 		const remote = mirrorOf(liveRef("W1").session);
@@ -142,11 +145,12 @@ describe("agent bridging across subagent workers", () => {
 		await remote.prompt("second question", { streamingBehavior: "followUp" });
 
 		let idleSettled = false;
-		const idle = remote.waitForIdle().then(() => {
+		const idle = remote.waitForRunEnd().then(() => {
 			idleSettled = true;
 		});
 		await probe.threadId();
 		expect(idleSettled).toBe(false);
+		expect(remote.isRunActive).toBe(true);
 
 		await probe.openGate();
 		await idle;
@@ -164,6 +168,8 @@ describe("agent bridging across subagent workers", () => {
 		).toEqual(["first question", "second question"]);
 		expect(remote.messages.filter(message => message.role === "assistant")).toHaveLength(2);
 		expect(remote.lifecycleState?.phase).toBe("idle");
+		expect(remote.isRunActive).toBe(false);
+		expect(remote.wakeSources).toBeUndefined();
 	});
 
 	it("republishes the message mirror after a history rewrite that keeps both endpoints", async () => {

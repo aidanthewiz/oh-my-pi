@@ -46,7 +46,11 @@ import {
 	type SearchResultDetails,
 } from "./types";
 
-import { cfgProvidersAntigravityEndpoint, cfgProvidersWebSearchTimeoutSeconds } from "../../session/settings";
+import {
+	cfgProvidersAntigravityEndpoint,
+	cfgProvidersWebKeyless,
+	cfgProvidersWebSearchTimeoutSeconds,
+} from "../../session/settings";
 
 /** Web search tool parameters schema */
 export const webSearchSchema = type({
@@ -263,6 +267,11 @@ async function executeSearch(
 		// Preserve the default for one-shot callers that do not initialize Settings.
 	}
 
+	// A concrete per-request selector still resolves through the policy-filtered pool above.
+	const keylessAllowed =
+		(params.model?.trim().length ?? 0) > 0 ||
+		(cfgProvidersWebKeyless.get(settings.grantAuthority()) && cfgProvidersWebKeyless.get(settings));
+	let keylessSkipped = false;
 	const failures: SearchProviderFailure[] = [];
 	let availableProviderCount = 0;
 	let lastProvider: { id: string; label: string } | undefined;
@@ -306,6 +315,10 @@ async function executeSearch(
 				provider = await getGroundedSearchProvider(model.webSearch);
 			} else {
 				throw new Error(`Model ${model.provider}/${model.id} does not support web search`);
+			}
+			if (!keylessAllowed && (await provider.isKeyless(authStorage, model))) {
+				keylessSkipped = true;
+				continue;
 			}
 			lastProvider = provider;
 			const available = candidate.explicit
@@ -401,7 +414,9 @@ async function executeSearch(
 			? "No web search backend is available on the active model's provider under --offline."
 			: params.model
 				? `No web search model matches selector "${params.model}".`
-				: "No web search model configured.";
+				: keylessSkipped
+					? "No configured web search service is available, and providers.webKeyless is off. Configure a search credential or turn providers.webKeyless on."
+					: "No web search model configured.";
 		return {
 			content: [{ type: "text" as const, text: `Error: ${message}` }],
 			details: { response: { provider: "none", sources: [] }, error: message },

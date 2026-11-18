@@ -133,7 +133,7 @@ function lastAssistantText(messages: readonly AgentMessage[]): string | undefine
 	return undefined;
 }
 
-/** Whether `<id>`'s published output predates a turn the agent is streaming now. */
+/** Whether `<id>`'s published output predates the run the agent has open now. */
 function isSuperseded(registry: AgentRegistryApi, outputId: string): boolean {
 	const ref = registry.get(outputId);
 	return ref !== undefined && ref.kind !== "advisor" && registry.isRunning(ref);
@@ -170,7 +170,7 @@ export class AgentProtocolHandler implements ProtocolHandler {
 		if (!outputId) throw new Error("agent:// URL requires an output ID: agent://<id>");
 		if (outputId === "all" || hasPathExtraction(url) || url.searchParams.has("q")) return null;
 		if (
-			!context?.session?.seanceSourceArtifactsDir &&
+			!(context?.session?.seanceSourceArtifactsDir ?? context?.seanceSourceArtifactsDir) &&
 			isSuperseded(context?.agentRegistry ?? context?.session?.agentRegistry ?? AgentRegistry.global(), outputId)
 		) {
 			return null;
@@ -236,9 +236,10 @@ export class AgentProtocolHandler implements ProtocolHandler {
 
 		const dirs = await this.#outputDirs(context);
 		const scan = dirs.length > 0 ? await this.#findOutput(dirs, outputId) : undefined;
-		const registry = context?.session?.seanceSourceArtifactsDir
-			? undefined
-			: (context?.agentRegistry ?? context?.session?.agentRegistry ?? AgentRegistry.global());
+		const registry =
+			(context?.session?.seanceSourceArtifactsDir ?? context?.seanceSourceArtifactsDir)
+				? undefined
+				: (context?.agentRegistry ?? context?.session?.agentRegistry ?? AgentRegistry.global());
 		if (!scan?.foundPath) {
 			// No published output yet. A registered agent (running, idle after a
 			// non-terminal yield, or parked before publishing) is the same
@@ -433,8 +434,7 @@ export class AgentProtocolHandler implements ProtocolHandler {
 	 * pre-existing global scan untouched.
 	 */
 	async #outputDirs(context: ResolveContext | undefined): Promise<string[]> {
-		// A seance reads the consulted source's agent outputs in place, nothing else.
-		const seanceDir = context?.session?.seanceSourceArtifactsDir;
+		const seanceDir = context?.session?.seanceSourceArtifactsDir ?? context?.seanceSourceArtifactsDir;
 		if (seanceDir) return [seanceDir];
 		const rootSessionFile = context?.sessionFile
 			? await ensurePersistedRoster(AgentRegistry.global(), context.sessionFile)

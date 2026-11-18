@@ -2723,7 +2723,7 @@
 				},
 				"hasPendingAsyncWork": {
 					"type": "boolean",
-					"description": "Background jobs or deliveries can still inject a follow-up and wake the session.",
+					"description": "Background jobs, their deliveries, child agents or queued peer messages can still wake the session.",
 					"default": false
 				},
 				"isSettled": {
@@ -2888,6 +2888,10 @@
 					"properties": {},
 					"additionalProperties": {},
 					"description": "The embedded shell's final `ShellTrace` of the run; only when the caller asked for one."
+				},
+				"fork": {
+					"$ref": "#/$defs/ShellForkOutcome",
+					"description": "Set when the command overlapped another one on the session's persistent shell and ran in a fork of it."
 				}
 			},
 			"required": [
@@ -2898,6 +2902,23 @@
 				"totalBytes",
 				"outputLines",
 				"outputBytes"
+			]
+		},
+		"ShellForkOutcome": {
+			"type": "object",
+			"properties": {
+				"carried": {
+					"type": "boolean",
+					"description": "What the command set carried back into the session's shell; `false`: it stayed in the fork."
+				},
+				"jobs": {
+					"type": "boolean",
+					"description": "It left background jobs running in the fork, where later commands' `jobs`, `wait` and `%N` miss them."
+				}
+			},
+			"required": [
+				"carried",
+				"jobs"
 			]
 		},
 		"FastModeResult": {
@@ -3728,6 +3749,12 @@
 				"type": {
 					"const": "agent_start"
 				},
+				"runId": {
+					"type": "string"
+				},
+				"outcome": {
+					"$ref": "#/$defs/AgentLifecycleOutcome"
+				},
 				"resumedToolCallIds": {
 					"type": "array",
 					"items": {
@@ -3753,13 +3780,16 @@
 					},
 					"description": "Messages of the run; an oversized frame drops a prefix already delivered by `message_end` (see `messageCount`)."
 				},
-				"messageCount": {
-					"type": "integer",
-					"description": "Original message count when the frame was compacted."
+				"runId": {
+					"type": "string"
 				},
 				"outcome": {
 					"$ref": "#/$defs/AgentLifecycleOutcome",
 					"description": "This loop's outcome, independent of persisted transcript messages."
+				},
+				"messageCount": {
+					"type": "integer",
+					"description": "Original message count when the frame was compacted."
 				},
 				"isTerminal": {
 					"type": "boolean",
@@ -3794,6 +3824,12 @@
 			"properties": {
 				"type": {
 					"const": "turn_start"
+				},
+				"runId": {
+					"type": "string"
+				},
+				"outcome": {
+					"$ref": "#/$defs/AgentLifecycleOutcome"
 				}
 			},
 			"required": [
@@ -3814,6 +3850,12 @@
 					"items": {
 						"$ref": "#/$defs/ToolResultMessage"
 					}
+				},
+				"runId": {
+					"type": "string"
+				},
+				"outcome": {
+					"$ref": "#/$defs/AgentLifecycleOutcome"
 				}
 			},
 			"required": [
@@ -3830,6 +3872,12 @@
 				},
 				"message": {
 					"$ref": "#/$defs/AgentMessage"
+				},
+				"runId": {
+					"type": "string"
+				},
+				"outcome": {
+					"$ref": "#/$defs/AgentLifecycleOutcome"
 				},
 				"messageId": {
 					"type": "string",
@@ -3853,6 +3901,12 @@
 				"assistantMessageEvent": {
 					"$ref": "#/$defs/AssistantMessageEvent"
 				},
+				"runId": {
+					"type": "string"
+				},
+				"outcome": {
+					"$ref": "#/$defs/AgentLifecycleOutcome"
+				},
 				"messageId": {
 					"type": "string",
 					"description": "Shared by the start, updates, and end of one message; unique per process."
@@ -3872,6 +3926,12 @@
 				},
 				"message": {
 					"$ref": "#/$defs/AgentMessage"
+				},
+				"runId": {
+					"type": "string"
+				},
+				"outcome": {
+					"$ref": "#/$defs/AgentLifecycleOutcome"
 				},
 				"messageId": {
 					"type": "string",
@@ -3894,6 +3954,12 @@
 				},
 				"toolName": {
 					"type": "string"
+				},
+				"runId": {
+					"type": "string"
+				},
+				"outcome": {
+					"$ref": "#/$defs/AgentLifecycleOutcome"
 				},
 				"args": {},
 				"intent": {
@@ -3918,6 +3984,12 @@
 				"toolName": {
 					"type": "string"
 				},
+				"runId": {
+					"type": "string"
+				},
+				"outcome": {
+					"$ref": "#/$defs/AgentLifecycleOutcome"
+				},
 				"args": {},
 				"partialResult": {}
 			},
@@ -3939,6 +4011,12 @@
 				"toolName": {
 					"type": "string"
 				},
+				"runId": {
+					"type": "string"
+				},
+				"outcome": {
+					"$ref": "#/$defs/AgentLifecycleOutcome"
+				},
 				"update": {}
 			},
 			"required": [
@@ -3958,6 +4036,12 @@
 				},
 				"toolName": {
 					"type": "string"
+				},
+				"runId": {
+					"type": "string"
+				},
+				"outcome": {
+					"$ref": "#/$defs/AgentLifecycleOutcome"
 				},
 				"result": {},
 				"isError": {

@@ -1251,6 +1251,7 @@ export class AskDialogComponent implements Component {
 	#releaseGuardForPointer(): void {
 		if (!this.#guardBlocks()) return;
 		this.#guardReleased = true;
+		this.options.inputGuard?.syncPresentation?.(false);
 		this.#native = undefined;
 	}
 

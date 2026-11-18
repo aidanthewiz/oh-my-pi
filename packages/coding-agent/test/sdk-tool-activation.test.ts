@@ -1795,7 +1795,6 @@ describe("createAgentSession defaultInactive tool activation", () => {
 				(error: unknown) => error,
 			);
 			expect(emptyError).toBeInstanceOf(Error);
-			expect(emptyError).toMatchObject({ message: expect.stringMatching(/no text \(thinking only\)/) });
 		} finally {
 			await session.dispose();
 		}

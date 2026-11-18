@@ -105,8 +105,8 @@ import type { ToolSession } from "../../tools";
 import { AskTool } from "../../tools/ask";
 import { type AskToolDetails } from "@oh-my-pi/pi-tui/tools/ask";
 import { sanitizeDisplayWarnings, shortenPath } from "@oh-my-pi/pi-tui/render/render-utils";
-import { sanitizeErrorLine } from "@oh-my-pi/pi-tui/chrome/error-block";
 import { ToolAbortError } from "../../tools/tool-errors";
+import { sanitizeErrorLine } from "@oh-my-pi/pi-tui/chrome/error-block";
 import { captureBrowserSession } from "../../utils/browser-session";
 import { copyToClipboard } from "../../utils/clipboard";
 import { openPath } from "../../utils/open";
@@ -877,7 +877,7 @@ export class SelectorController {
 			this.ctx.session.modelRegistry,
 			this.ctx.session.scopedModels,
 			{
-				onPick: async (model, selector, { overContext }) => {
+				onPick: async (model, selector, { overContext, thinkingLevel }) => {
 					if (!isCurrent() || viewed.model !== current) return;
 					if (selectOnly) {
 						done();
@@ -894,7 +894,7 @@ export class SelectorController {
 						// Over-context pick: close the picker first so the compaction
 						// loader is visible.
 						if (overContext) done();
-						await this.#applySessionModel(model, selector, undefined, overContext);
+						await this.#applySessionModel(model, selector, thinkingLevel, overContext);
 						if (!overContext) done();
 					} catch (error) {
 						if (this.ctx.viewSession !== viewed || viewed.sessionId !== viewedSessionId || viewed.isDisposed)
@@ -935,12 +935,21 @@ export class SelectorController {
 			{
 				currentContextTokens,
 				currentSelector,
-				taskModeKeys: focusedAgentId ? [] : this.ctx.keybindings.getKeys("app.model.selectTemporary"),
+				taskModeKeys: selectOnly || focusedAgentId ? [] : this.ctx.keybindings.getKeys("app.model.selectTemporary"),
 				taskSelector,
 				quickRoles: quickRoleCycle?.models,
 				quickRoleOrder,
 				currentQuickRole: quickRoleCycle?.models[quickRoleCycle.currentIndex]?.role,
 				selectOnly: selectOnly !== undefined,
+				// What #applySessionModel applies without a slider level: the model's role
+				// level, else the session's (auto carries over; a fixed level yields to the
+				// model's own default, as setModelTemporary re-applies it).
+				thinkingLevelFor: model => {
+					const roleLevel = viewed.resolveTemporaryModelThinkingLevel(model);
+					if (roleLevel !== undefined) return roleLevel;
+					const configured = viewed.configuredThinkingLevel();
+					return configured === AUTO_THINKING ? configured : (model.thinking?.defaultLevel ?? configured);
+				},
 			},
 		);
 		this.#mountMenu(menu, picker, () => {
@@ -1590,7 +1599,9 @@ export class SelectorController {
 	}
 
 	showCopySelector(): void {
-		const entries = this.ctx.sessionManager.getBranch().filter(isTranscriptEntry);
+		// The session on screen: a focused subagent's transcript, else the main one.
+		const session = this.ctx.viewSession;
+		const entries = session.sessionManager.getBranch().filter(isTranscriptEntry);
 		if (entries.length === 0) {
 			this.ctx.showStatus("Nothing to copy yet.");
 			return;
@@ -1604,10 +1615,10 @@ export class SelectorController {
 		};
 		const selector = new CopySelectorComponent(entries, {
 			ui: this.ctx.ui,
-			getTool: name => this.ctx.session.getToolByName(name),
-			isBuiltInTool: name => this.ctx.session.hasBuiltInTool(name),
-			getMessageRenderer: type => this.ctx.session.extensionRunner?.getMessageRenderer(type),
-			cwd: this.ctx.sessionManager.getCwd(),
+			getTool: name => session.getToolByName(name),
+			isBuiltInTool: name => session.hasBuiltInTool(name),
+			getMessageRenderer: type => session.extensionRunner?.getMessageRenderer(type),
+			cwd: session.sessionManager.getCwd(),
 			hideThinkingBlock: () => this.ctx.effectiveHideThinkingBlock,
 			proseOnlyThinking: () => this.ctx.proseOnlyThinking,
 			expandThinkingBlocks: () => this.ctx.expandThinkingBlocks,
@@ -2030,12 +2041,7 @@ export class SelectorController {
 								this.ctx.applySessionPin(session.id, pinned);
 							},
 						}
-					: {
-							title: "Select a Session to Consult",
-							actionLabel: "Select",
-							scopeLabel: false,
-							showCwd: true,
-						}),
+					: {}),
 				historyMatcher,
 				completeSessions: listing.complete,
 				loadAllSessions: () => SessionManager.listAllForPicker(),
@@ -2065,19 +2071,13 @@ export class SelectorController {
 			async (session: SessionInfo) => {
 				if (closed || !isCurrent()) return;
 				selector.lockInput();
-				if (onSelect) {
-					// Selection-only callers may open a follow-up picker; remove this
-					// fullscreen overlay before invoking them.
-					done();
-					try {
-						await onSelect(session);
-					} catch (error) {
-						this.ctx.showError(sanitizeErrorLine(error));
-					}
-					return;
-				}
 				let keepOpen = false;
 				try {
+					if (onSelect) {
+						done();
+						await onSelect(session);
+						return;
+					}
 					const success = await onSelectSession(session);
 					if (!isCurrent()) return;
 					if (!success) {

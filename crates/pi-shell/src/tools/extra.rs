@@ -434,7 +434,8 @@ fn has_separator(name: &OsStr) -> bool {
 enum Candidate {
 	/// The file that runs.
 	Runs(PathBuf),
-	/// A file that cannot be executed.
+	/// A file that cannot be executed (Unix only).
+	#[cfg_attr(not(unix), expect(dead_code, reason = "only Unix has execute bits"))]
 	Denied,
 }
 
