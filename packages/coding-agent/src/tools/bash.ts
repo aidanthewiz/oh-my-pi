@@ -688,6 +688,7 @@ type ManagedBashJobCompletion =
 	| {
 			kind: "failed";
 			error: unknown;
+			result: AgentToolResult<BashToolDetails>;
 	  };
 
 interface ManagedBashJobHandle {
@@ -1530,6 +1531,35 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		return text + formatOutputNotice(result.details?.meta);
 	}
 
+	#observeDeferredResult(job: ManagedBashJobHandle, onDeferredResult: AgentToolContext["onDeferredResult"]): void {
+		if (!onDeferredResult) return;
+		void job.completion
+			.then(completion => {
+				const result = completion.result;
+				const state =
+					completion.kind === "failed"
+						? result.details?.async?.state === "cancelled"
+							? "cancelled"
+							: "failed"
+						: result.isError === true
+							? "failed"
+							: "completed";
+				onDeferredResult({
+					...result,
+					details: {
+						...result.details,
+						async: { state, jobId: job.jobId, type: "bash" },
+					},
+				});
+			})
+			.catch(error => {
+				logger.warn("Deferred bash result observer failed", {
+					jobId: job.jobId,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			});
+	}
+
 	#startManagedBashJob(options: {
 		command: string;
 		commandCwd: string;
@@ -1705,7 +1735,19 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				} catch (error) {
 					const message = error instanceof Error ? error.message : String(error);
 					const output = latestText && !message.includes(latestText) ? `${latestText}\n\n${message}` : message;
-					completion.resolve({ kind: "failed", error });
+					const { output: _output, images, ...details } = latestProgressDetails ?? {};
+					completion.resolve({
+						kind: "failed",
+						error,
+						result: {
+							content: [{ type: "text", text: output }, ...(images ?? [])],
+							details: {
+								...details,
+								async: { state: runSignal.aborted ? "cancelled" : "failed", jobId, type: "bash" },
+							},
+							isError: true,
+						},
+					});
 					// Only a cancel aborts the job's own signal (deadlines end in a timed-out result).
 					await report(output, {
 						...latestProgressDetails,
@@ -1959,6 +2001,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				intent: this.session.getToolCallIntent?.(toolCallId),
 				toolCallId,
 			});
+			this.#observeDeferredResult(job, ctx?.onDeferredResult);
 			return this.#buildBackgroundStartResult(job.jobId, "", timeoutSec, {
 				requestedTimeoutSec,
 				notices: pendingNotices,
@@ -2004,6 +2047,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				toolCallId,
 			});
 			if (startBackgrounded) {
+				this.#observeDeferredResult(job, ctx?.onDeferredResult);
 				return this.#buildBackgroundStartResult(job.jobId, "", timeoutSec, {
 					requestedTimeoutSec,
 					notices: pendingNotices,
@@ -2034,6 +2078,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			}
 			job.background();
 			autoBgManager.backgroundJob(job.jobId);
+			this.#observeDeferredResult(job, ctx?.onDeferredResult);
 			// "steer": a queued user/peer message arrived mid-wait — background
 			// the command (it keeps running) so the message injects promptly.
 			// `job.notices` also carries the notices the run added so far.

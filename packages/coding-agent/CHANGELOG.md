@@ -8,6 +8,7 @@
 
 ### Added
 
+- Emit observation-only deferred tool results for final Bash job outcomes, including eval calls and completion after an agent abort. Retain the original conversation, input and MCP identity without starting model continuations.
 - Native AWS approvals offer **Allow for the rest of this session** for later commands, profiles, and SSO renewal without saving a configuration grant.
 - Keep job widgets local by default. Remote spec authoring requires managed or runtime consent, current model and account admission, bounded redacted context, and originating-journal accounting.
 - Expose session-bound native MCP calls to extensions. Honor `exposeTools: false` without disabling server startup or discovery.
@@ -23,6 +24,7 @@
 - Keep changelog rewrite authentication open until all admitted requests settle.
 - Preserve run ownership and continuation flags when oversized collaboration events omit their message snapshots.
 - Close saved-session selection before invoking its callback without resuming the source session.
+- Forward tool-call cancellation to runtime, session and standard approval dialogs so aborted prompts close before execution.
 - Require explicit saved-reset consent or `autoRedeem: yes` before spending credits, including imminent expirations in headless sessions.
 - Derive directory depth from the traversal stack to keep symlink-aware walker frames compact without extra allocations.
 - Keep injected pending filesystem operations pending for their first poll, even when their latency timer is already ready.

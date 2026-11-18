@@ -1140,6 +1140,12 @@ export interface AgentToolContext {
 	 * calls dispatched outside the loop); absent when the host has no sink.
 	 */
 	addAdditionalContext?(context: string): void;
+	/**
+	 * Report the actual terminal result of work whose execution returned a running result.
+	 * Capture before returning; invoke once, never for previews. Observers cannot rewrite
+	 * the execution outcome or inject additional model context.
+	 */
+	onDeferredResult?(result: AgentToolResult<unknown>): void;
 	/** Present only while the matching outer tool owns its finalized stream session. */
 	[SPECULATIVE_STREAM_SESSION]?: ToolSpeculationStreamSession;
 }

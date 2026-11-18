@@ -657,11 +657,26 @@ and `/new`. Commands retain their explicit prefill and session-transition action
 ### Tool lifecycle
 
 - `tool_call` (pre-exec, may block, revise the tool's execution `input`, or return passive `additionalContext`; for model-issued calls it fires at arg-prep time in the agent loop, so a revision is revalidated and seen by concurrency scheduling, execution events, the persisted assistant message, and the approval gate alike; passive context from non-blocking handlers is delivered after the batch's tool results in assistant call order, before the next provider request)
-- `tool_result` (post-exec, may patch content/details/isError or return passive `additionalContext`; result context is delivered outside the tool output even when `event.isError` is true, so a failure-specific handler can guide the next model step)
+- `tool_result` (returned-result middleware, or notification-only deferred completion as described below)
 - `tool_execution_start` / `tool_execution_update` / `tool_execution_end` (observability)
 - `tool_approval_requested` / `tool_approval_resolved` (observability; emitted by `wrapper.ts` only when a tool requires approval and an approval handler is registered)
 
-`tool_result` is middleware-style: handlers run in extension order and each sees prior modifications. Distinct non-blank `additionalContext` from every handler is preserved in registration order (repeats, compared ignoring surrounding whitespace, are dropped) and delivered before that call's `tool_call` context.
+Ordinary `tool_result` events are middleware-style: handlers run in extension order and each sees prior modifications. They may patch content/details/isError or return passive `additionalContext`, including for failures. Distinct non-blank context from every handler is preserved in registration order (repeats, compared ignoring surrounding whitespace, are dropped) and delivered before that call's `tool_call` context.
+
+Tools that return before their work finishes can publish one final `tool_result` with `completion: "deferred"`.
+It retains the original `sessionId`, `cwd`, `toolCallId`, normalized `input`, and MCP identity.
+Use this event's session identity rather than the handler's current conversation.
+The notification follows the ordinary returned-result handlers, including when work finishes before the tool returns.
+
+Deferred completion is observation-only. Each handler receives an isolated snapshot.
+Mutations and returned patches or `additionalContext` cannot change the job result or start a model continuation.
+Observer failures do not suppress later observers.
+
+Capture `AgentToolContext.onDeferredResult` before returning a running result.
+Call it once with the actual terminal result, not a progress preview.
+Bash reports final success, failure, timeout, or cancellation through this callback.
+Delivery does not depend on a progress listener or the originating turn remaining active.
+This includes eval's session-tool bridge and successful background work after an agent abort.
 
 ### Plan review lifecycle
 
