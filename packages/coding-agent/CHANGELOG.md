@@ -21,6 +21,8 @@
 - Keep erased TypeScript type declarations out of legacy extension runtime graphs, including inline-only named imports and exports.
 - Preserve Bun's native loader for attributed imports, mixed module/file use and package self-exports. Select dynamic import loaders at runtime without losing ordinary dependency remapping, CommonJS identity or reload behavior.
 - Preserve evaluated extension identities during lazy graph activation. Refresh only reachable, unconsumed frontiers when cached entries load again.
+- Defer unused helper preparation failures to helper use during cached extension loads. Refresh repaired helpers on explicit reload.
+- Preserve native file-URL cache identity across symlinks, queries and fragments. Keep bare-path hashes literal.
 - Preserve module- and parameter-scoped bindings in rewritten dynamic imports.
 - Keep hashbangs first for LF, CRLF, CR, U+2028 and U+2029 source.
 - Enable native WebMCP directly for current Chrome versions and managed Chrome for Testing.

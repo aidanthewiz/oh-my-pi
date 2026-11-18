@@ -664,6 +664,303 @@ assert.equal(repeated.warm.next(), 3);
 	);
 
 	it.each([
+		["mjs", "syntax"],
+		["cjs", "syntax"],
+		["cts", "transpile"],
+		["mjs", "missing"],
+		["cjs", "missing"],
+	] as const)(
+		"isolates unused %s helper %s failures from cached entries and healthy imports",
+		async (extension, failure) => {
+			const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "omp-cold-helper-failure-")));
+			roots.push(root);
+			for (const mode of ["native", "legacy"] as const) {
+				const fixture = path.join(root, mode);
+				for (const directory of [fixture, path.join(fixture, "home"), path.join(fixture, "tmp")]) {
+					fs.mkdirSync(directory);
+				}
+				fs.writeFileSync(path.join(fixture, "package.json"), '{"type":"module"}');
+				const cold = path.join(fixture, `cold.${extension}`);
+				const counter = "globalThis.__ownedColdLoads = (globalThis.__ownedColdLoads ?? 0) + 1;";
+				fs.writeFileSync(cold, counter + (extension === "mjs" ? "export default 1;" : "module.exports = 1;"));
+				const required = `require("./cold.${extension}")${extension === "mjs" ? ".default" : ""}`;
+				fs.writeFileSync(path.join(fixture, "optional.cjs"), `module.exports = { read: () => ${required} };`);
+				const warm = path.join(fixture, "warm.mjs");
+				fs.writeFileSync(warm, "let uses = 0; export default { next: () => ++uses };");
+				fs.writeFileSync(path.join(fixture, "healthy.mjs"), "export default 42;");
+				const entry = path.join(fixture, "entry.mjs");
+				fs.writeFileSync(
+					entry,
+					'import optional from "./optional.cjs"; import warm from "./warm.mjs"; export { optional, warm }; export const healthy = options => import("./healthy.mjs", options);',
+				);
+				const program = path.join(fixture, "consumer.mjs");
+				fs.writeFileSync(
+					program,
+					`
+import assert from "node:assert/strict";
+import fs from "node:fs";
+globalThis.fetch = Object.assign(async () => { throw Error("Owned refresh-failure consumer refuses network"); }, { preconnect() { throw Error("Owned refresh-failure consumer refuses network"); } });
+const entry = ${JSON.stringify(entry)};
+const loadEntry = async () => ${mode === "native" ? "await import(entry)" : `await (await import(${JSON.stringify(loaderUrl)})).loadLegacyPiModule(entry, { reload: false })`};
+const loaded = await loadEntry();
+assert.equal(loaded.warm.next(), 1);
+assert.equal(globalThis.__ownedColdLoads ?? 0, 0);
+${failure === "missing" ? `fs.rmSync(${JSON.stringify(cold)});` : `fs.writeFileSync(${JSON.stringify(cold)}, ${JSON.stringify(failure === "transpile" ? "const value = 1; const value = 2; module.exports = value;" : extension === "mjs" ? "export default ;" : "module.exports = ;")});`}
+fs.writeFileSync(${JSON.stringify(warm)}, "export const = ;");
+const repeated = await loadEntry();
+assert.equal(repeated, loaded);
+assert.equal(repeated.warm.next(), 2);
+assert.equal((await repeated.healthy({})).default, 42);
+assert.throws(() => repeated.optional.read());
+assert.equal(globalThis.__ownedColdLoads ?? 0, 0);
+assert.equal((await repeated.healthy({})).default, 42);
+fs.writeFileSync(${JSON.stringify(cold)}, ${JSON.stringify(counter + (extension === "mjs" ? "export default 2;" : "module.exports = 2;"))});
+const repaired = await loadEntry();
+assert.equal(repaired, loaded);
+assert.equal(repaired.optional.read(), 2);
+assert.equal(globalThis.__ownedColdLoads, 1);
+assert.equal(repaired.warm.next(), 3);
+`,
+				);
+				await runConsumer(fixture, program);
+			}
+		},
+	);
+
+	it.each([
+		["mjs", "dynamic"],
+		["cjs", "dynamic"],
+		["mjs", "static"],
+		["cjs", "static"],
+		["mjs", "symlink-url"],
+		["cjs", "symlink-url"],
+		["mjs", "url-fragment"],
+		["cjs", "url-fragment"],
+		["mjs", "url-query-fragment"],
+		["cjs", "url-query-fragment"],
+	] as const)(
+		"preserves a native %s file cache through %s imports after unused source preparation failed",
+		async (extension, cacheMode) => {
+			const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "omp-native-file-failure-")));
+			roots.push(root);
+			for (const mode of ["native", "legacy"] as const) {
+				const fixture = path.join(root, mode);
+				for (const directory of [fixture, path.join(fixture, "home"), path.join(fixture, "tmp")]) {
+					fs.mkdirSync(directory);
+				}
+				fs.writeFileSync(path.join(fixture, "package.json"), '{"type":"module"}');
+				const cold = path.join(fixture, `cold.${extension}`);
+				const alias = path.join(fixture, `alias.${extension}`);
+				if (cacheMode === "symlink-url") fs.symlinkSync(cold, alias, "file");
+				const coldUrl = pathToFileURL(cold).href;
+				const fileSpecifier =
+					cacheMode === "symlink-url"
+						? pathToFileURL(alias).href
+						: cacheMode === "url-fragment"
+							? `${coldUrl}#public`
+							: cacheMode === "url-query-fragment"
+								? `${coldUrl}?public=1#fragment`
+								: `./cold.${extension}`;
+				const counter = "globalThis.__ownedColdLoads = (globalThis.__ownedColdLoads ?? 0) + 1;";
+				fs.writeFileSync(cold, counter + (extension === "mjs" ? "export default 1;" : "module.exports = 1;"));
+				fs.writeFileSync(
+					path.join(fixture, "optional.cjs"),
+					`module.exports = { read: () => require("./cold.${extension}") };`,
+				);
+				const entry = path.join(fixture, "entry.mjs");
+				fs.writeFileSync(
+					entry,
+					cacheMode === "static"
+						? `import asset from "./cold.${extension}" with { type: "file" }; import optional from "./optional.cjs"; export { asset, optional };`
+						: `import optional from "./optional.cjs"; export { optional }; export const file = options => import(${JSON.stringify(fileSpecifier)}, options); export const fileUrl = options => import(${JSON.stringify(coldUrl)}, options);`,
+				);
+				const program = path.join(fixture, "consumer.mjs");
+				fs.writeFileSync(
+					program,
+					`
+import assert from "node:assert/strict";
+import fs from "node:fs";
+globalThis.fetch = Object.assign(async () => { throw Error("Owned native-file failure consumer refuses network"); }, { preconnect() { throw Error("Owned native-file failure consumer refuses network"); } });
+const entry = ${JSON.stringify(entry)};
+const loadEntry = async () => ${mode === "native" ? "await import(entry)" : `await (await import(${JSON.stringify(loaderUrl)})).loadLegacyPiModule(entry, { reload: false })`};
+const loaded = await loadEntry();
+fs.writeFileSync(${JSON.stringify(cold)}, ${JSON.stringify(extension === "mjs" ? "export default ;" : "module.exports = ;")});
+assert.equal(await loadEntry(), loaded);
+const assetModule = ${cacheMode === "static" ? "null" : 'await loaded.file({ with: { type: "file" } })'};
+const asset = ${cacheMode === "static" ? "loaded.asset" : "assetModule.default"};
+assert.equal(fs.realpathSync(asset), ${JSON.stringify(cold)});
+const required = loaded.optional.read();
+assert.equal(fs.realpathSync(required.default), ${JSON.stringify(cold)});
+${cacheMode === "symlink-url" || cacheMode.startsWith("url-") ? 'assert.equal(await loaded.fileUrl({ with: { type: "file" } }), assetModule);' : ""}
+assert.equal(globalThis.__ownedColdLoads ?? 0, 0);
+fs.writeFileSync(${JSON.stringify(cold)}, ${JSON.stringify(counter + (extension === "mjs" ? "export default 2;" : "module.exports = 2;"))});
+assert.equal(await loadEntry(), loaded);
+assert.equal(loaded.optional.read(), required);
+assert.equal(globalThis.__ownedColdLoads ?? 0, 0);
+`,
+				);
+				await runConsumer(fixture, program);
+			}
+		},
+	);
+
+	it.each(["mjs", "cjs"] as const)(
+		"preserves literal bare-path hashes and native refusal for %s file imports",
+		async extension => {
+			const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "omp-native-literal-hash-")));
+			roots.push(root);
+			for (const mode of ["native", "legacy"] as const) {
+				const fixture = path.join(root, mode);
+				for (const directory of [fixture, path.join(fixture, "home"), path.join(fixture, "tmp")]) {
+					fs.mkdirSync(directory);
+				}
+				fs.writeFileSync(path.join(fixture, "package.json"), '{"type":"module"}');
+				const cold = path.join(fixture, `cold.${extension}`);
+				fs.writeFileSync(
+					cold,
+					"globalThis.__ownedColdLoads = (globalThis.__ownedColdLoads ?? 0) + 1;" +
+						(extension === "mjs" ? "export default 1;" : "module.exports = 1;"),
+				);
+				fs.writeFileSync(
+					path.join(fixture, "optional.cjs"),
+					`module.exports = { read: () => require("./cold.${extension}") };`,
+				);
+				const entry = path.join(fixture, "entry.mjs");
+				fs.writeFileSync(
+					entry,
+					`import optional from "./optional.cjs"; export { optional }; export const invalid = options => import(${JSON.stringify(`${cold}#public`)}, options); export const file = options => import("./cold.${extension}", options);`,
+				);
+				const program = path.join(fixture, "consumer.mjs");
+				fs.writeFileSync(
+					program,
+					`
+import assert from "node:assert/strict";
+import fs from "node:fs";
+globalThis.fetch = Object.assign(async () => { throw Error("Owned literal-hash consumer refuses network"); }, { preconnect() { throw Error("Owned literal-hash consumer refuses network"); } });
+const entry = ${JSON.stringify(entry)};
+const loadEntry = async () => ${mode === "native" ? "await import(entry)" : `await (await import(${JSON.stringify(loaderUrl)})).loadLegacyPiModule(entry, { reload: false })`};
+const loaded = await loadEntry();
+fs.writeFileSync(${JSON.stringify(cold)}, ${JSON.stringify(extension === "mjs" ? "export default ;" : "module.exports = ;")});
+assert.equal(await loadEntry(), loaded);
+await assert.rejects(loaded.invalid({ with: { type: "file" } }));
+assert.equal(globalThis.__ownedColdLoads ?? 0, 0);
+const asset = await loaded.file({ with: { type: "file" } });
+assert.equal(fs.realpathSync(asset.default), ${JSON.stringify(cold)});
+assert.equal(fs.realpathSync(loaded.optional.read().default), ${JSON.stringify(cold)});
+assert.equal(globalThis.__ownedColdLoads ?? 0, 0);
+`,
+				);
+				await runConsumer(fixture, program);
+			}
+		},
+	);
+
+	it("retains a no-type descendant failure without poisoning its CommonJS facade", async () => {
+		const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "omp-cold-descendant-failure-")));
+		roots.push(root);
+		for (const mode of ["native", "legacy"] as const) {
+			const fixture = path.join(root, mode);
+			const dependency = path.join(fixture, "dependency");
+			for (const directory of [fixture, path.join(fixture, "home"), path.join(fixture, "tmp"), dependency]) {
+				fs.mkdirSync(directory);
+			}
+			fs.writeFileSync(path.join(fixture, "package.json"), '{"type":"module"}');
+			fs.writeFileSync(path.join(dependency, "package.json"), "{}");
+			const bad = path.join(dependency, "bad.js");
+			const counter = "globalThis.__ownedBadLoads = (globalThis.__ownedBadLoads ?? 0) + 1;";
+			fs.writeFileSync(bad, `${counter} export default 1;`);
+			const facade = path.join(dependency, "facade.cjs");
+			fs.writeFileSync(facade, 'module.exports = { read: () => require("./bad.js").default, healthy: () => 42 };');
+			fs.writeFileSync(
+				path.join(fixture, "optional.cjs"),
+				'module.exports = { open: () => require("./dependency/facade.cjs") };',
+			);
+			const entry = path.join(fixture, "entry.mjs");
+			fs.writeFileSync(entry, 'import optional from "./optional.cjs"; export { optional };');
+			const program = path.join(fixture, "consumer.mjs");
+			fs.writeFileSync(
+				program,
+				`
+import assert from "node:assert/strict";
+import fs from "node:fs";
+globalThis.fetch = Object.assign(async () => { throw Error("Owned descendant-failure consumer refuses network"); }, { preconnect() { throw Error("Owned descendant-failure consumer refuses network"); } });
+const entry = ${JSON.stringify(entry)};
+const loadEntry = async () => ${mode === "native" ? "await import(entry)" : `await (await import(${JSON.stringify(loaderUrl)})).loadLegacyPiModule(entry, { reload: false })`};
+const loaded = await loadEntry();
+assert.equal(globalThis.__ownedBadLoads ?? 0, 0);
+fs.writeFileSync(${JSON.stringify(bad)}, "export default ;");
+assert.equal(await loadEntry(), loaded);
+const facade = loaded.optional.open();
+assert.equal(facade.healthy(), 42);
+assert.throws(() => facade.read());
+assert.equal(globalThis.__ownedBadLoads ?? 0, 0);
+fs.writeFileSync(${JSON.stringify(facade)}, "module.exports = ;");
+fs.writeFileSync(${JSON.stringify(bad)}, ${JSON.stringify(`${counter} export default 2;`)});
+assert.equal(await loadEntry(), loaded);
+assert.equal(loaded.optional.open(), facade);
+assert.equal(facade.read(), 2);
+assert.equal(globalThis.__ownedBadLoads, 1);
+assert.equal(facade.healthy(), 42);
+`,
+			);
+			await runConsumer(fixture, program);
+		}
+	});
+
+	it.each(["mjs", "cts"] as const)(
+		"recovers a newly discovered failed %s helper without poisoning its CommonJS facade",
+		async extension => {
+			const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "omp-new-descendant-failure-")));
+			roots.push(root);
+			for (const mode of ["native", "legacy"] as const) {
+				const fixture = path.join(root, mode);
+				for (const directory of [fixture, path.join(fixture, "home"), path.join(fixture, "tmp")]) {
+					fs.mkdirSync(directory);
+				}
+				fs.writeFileSync(path.join(fixture, "package.json"), '{"type":"module"}');
+				const bad = path.join(fixture, `bad.${extension}`);
+				const facade = path.join(fixture, "facade.cjs");
+				fs.writeFileSync(facade, "module.exports = { read: () => 0, healthy: () => 42 };");
+				fs.writeFileSync(
+					path.join(fixture, "optional.cjs"),
+					'module.exports = { open: () => require("./facade.cjs") };',
+				);
+				const entry = path.join(fixture, "entry.mjs");
+				fs.writeFileSync(entry, 'import optional from "./optional.cjs"; export { optional };');
+				const nextFacade = `module.exports = { read: () => require("./bad.${extension}")${extension === "mjs" ? ".default" : ""}, healthy: () => 42 };`;
+				const counter = "globalThis.__ownedBadLoads = (globalThis.__ownedBadLoads ?? 0) + 1;";
+				const program = path.join(fixture, "consumer.mjs");
+				fs.writeFileSync(
+					program,
+					`
+import assert from "node:assert/strict";
+import fs from "node:fs";
+globalThis.fetch = Object.assign(async () => { throw Error("Owned new-descendant consumer refuses network"); }, { preconnect() { throw Error("Owned new-descendant consumer refuses network"); } });
+const entry = ${JSON.stringify(entry)};
+const loadEntry = async () => ${mode === "native" ? "await import(entry)" : `await (await import(${JSON.stringify(loaderUrl)})).loadLegacyPiModule(entry, { reload: false })`};
+const loaded = await loadEntry();
+fs.writeFileSync(${JSON.stringify(facade)}, ${JSON.stringify(nextFacade)});
+fs.writeFileSync(${JSON.stringify(bad)}, ${JSON.stringify(extension === "mjs" ? "export default ;" : "const value = 1; const value = 2; module.exports = value;")});
+assert.equal(await loadEntry(), loaded);
+const facade = loaded.optional.open();
+assert.equal(facade.healthy(), 42);
+assert.throws(() => facade.read());
+assert.equal(globalThis.__ownedBadLoads ?? 0, 0);
+fs.writeFileSync(${JSON.stringify(facade)}, "module.exports = ;");
+fs.writeFileSync(${JSON.stringify(bad)}, ${JSON.stringify(counter + (extension === "mjs" ? "export default 2;" : "module.exports = 2;"))});
+assert.equal(await loadEntry(), loaded);
+assert.equal(loaded.optional.open(), facade);
+assert.equal(facade.read(), 2);
+assert.equal(globalThis.__ownedBadLoads, 1);
+assert.equal(facade.healthy(), 42);
+`,
+				);
+				await runConsumer(fixture, program);
+			}
+		},
+	);
+
+	it.each([
 		["LF", "\n"],
 		["CRLF", "\r\n"],
 		["CR", "\r"],
