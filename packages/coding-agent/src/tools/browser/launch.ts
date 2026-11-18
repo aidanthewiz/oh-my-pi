@@ -648,7 +648,7 @@ export function buildHeadlessLaunchArgs(
 		"--disable-setuid-sandbox",
 		DISABLE_AUTOMATION_CONTROLLED_ARG,
 		"--hide-scrollbars",
-		"--enable-features=WebMCP,WebMCPTesting,DevToolsWebMCPSupport",
+		"--enable-features=WebMCP,DevToolsWebMCPSupport",
 		`--window-size=${viewport.width},${viewport.height}`,
 	];
 	if (features.ignoreHttpsErrors) launchArgs.push("--ignore-certificate-errors");

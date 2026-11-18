@@ -60,7 +60,7 @@ export interface DaemonBrokerClient {
 	): (options?: DaemonCompletionUnregisterOptions) => void;
 	/** Canonical project directory or synthetic directory identifying a global scope. */
 	readonly projectDir: string;
-	request(operation: DaemonOperation, signal?: AbortSignal): Promise<DaemonRpcResult>;
+	request(operation: DaemonOperation, signal?: AbortSignal, validate?: () => void): Promise<DaemonRpcResult>;
 	close(): void;
 }
 
@@ -139,11 +139,12 @@ class SocketDaemonClient implements DaemonBrokerClient {
 		this.#idleGraceMs = options.idleGraceMs;
 	}
 
-	async request(operation: DaemonOperation, signal?: AbortSignal): Promise<DaemonRpcResult> {
+	async request(operation: DaemonOperation, signal?: AbortSignal, validate?: () => void): Promise<DaemonRpcResult> {
 		if (this.#closed) throw new Error("Daemon broker client is closed");
 		if (signal?.aborted) throw new Error("Daemon broker request aborted");
 		await this.#connect();
 		if (signal?.aborted) throw new Error("Daemon broker request aborted");
+		validate?.();
 		const socket = this.#socket;
 		if (!socket || socket.closed) throw new Error("Daemon broker socket is unavailable");
 

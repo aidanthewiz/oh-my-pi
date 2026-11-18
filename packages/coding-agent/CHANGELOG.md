@@ -23,7 +23,6 @@
 - Accept copied hashline Write paths and content, inner intent fields, and both active and mounted AWS presentations. Preserve exact normalized input and live native invocation ownership.
 - Deliver private AWS stdin through an actual anonymous pipe or unnamed Unix stream under delivery policy v3. Bound writes, join flush and EOF, reject file-backed stdin optimizations, and refuse previous or mixed delivery-policy/fingerprint tuples.
 - Read socket-backed stdin directly in native preload qualification. Preserve exact-byte comparison and real non-Bun receivers on Linux.
-- Enable native WebMCP on current Chrome while preserving legacy testing flags.
 - Keep Python zoom qualification JSON within bounded output columns when temporary paths are long.
 - Qualify private stdin backpressure through the same unsettled native operation, independent of platform-specific write and flush phases.
 - Complete fixture navigation, join cancelled browser click work before page teardown, and await CDP rejections without nested event loops.
@@ -35,14 +34,26 @@
 - Join owned process cleanup using kernel creation identities and actual reaping. Preserve a pinned Darwin group anchor until acknowledged retirement, and reject unknown or replaced receiver identities.
 - Preserve constructor-registered tool session callbacks so active native scopes stop when the SDK adopts or forks a session.
 - Acquire session cleanup ownership before forwarding constructor callbacks. Failed startup keeps pooled credential restrictions until cleanup settles and preserves unrelated live roots.
+- Retire headless parent-approval capabilities alongside native tool scopes before asynchronous session teardown.
 - Settle restored session generations before rollback reconciliation without declaring transition readiness or skipping native cleanup.
 - Handle ordinary synchronous disposer returns without losing subsequent session cleanup. Continue to await native cancellation and asynchronous disposers.
 - Reap known receiver identities independently after guardian loss. Preserve unproved ownership as `WORKER_FAILED` through cancellation so later handoffs stay blocked.
 - Compare Linux descriptor aliases with their exact kernel identities. Keep unknown or conflicting descriptor snapshots unproved.
 - Keep committed-session events and transcript recording connected when cleanup rejects. Retire outgoing messages at transcript commit and propagate cleanup failures without carrying an old aside into the new conversation.
+- Route headless task DCG reviews to the live parent TUI without enabling child UI or reusing grants. Revalidate both sessions' authority and the exact invocation through backend dispatch. Preserve typed denial, cancellation, and unavailable errors.
+- Keep session-owned OAuth account restrictions until deferred startup cleanup finishes.
+- Keep erased TypeScript type declarations out of legacy extension runtime graphs, including inline-only named imports and exports.
+- Preserve Bun's native loader for attributed imports, mixed module/file use and package self-exports. Select dynamic import loaders at runtime without losing ordinary dependency remapping, CommonJS identity or reload behavior.
+- Preserve evaluated extension identities during lazy graph activation. Refresh only reachable, unconsumed frontiers when cached entries load again.
+- Defer unused helper preparation failures to helper use during cached extension loads. Refresh repaired helpers on explicit reload.
+- Preserve native file-URL cache identity across symlinks, queries and fragments. Keep bare-path hashes literal.
+- Preserve module- and parameter-scoped bindings in rewritten dynamic imports.
+- Keep hashbangs first for LF, CRLF, CR, U+2028 and U+2029 source.
+- Enable native WebMCP directly for current Chrome versions and managed Chrome for Testing.
 - Synchronize shell TERM-output qualification with a child release gate and controlled cancellation deadlines instead of wall-clock sleeps.
 - Synchronize session lease race qualification with an observed held lease before racing claims and probes.
 - Separate hosted Chromium readiness from connection deadlines, close timed-out qualification pipes before cleanup, and preserve startup failures.
+- Verify staged upload lifetime against its owning tab during browser qualification, without counting unrelated workers' temporary files.
 - Honor configured MCP `oauth.scope` over metadata, challenge, and authorization-URL scopes during registration and authorization.
 - Preserve MCP metadata environment references across toggles and OAuth write-back; validate their resolved URLs under the original source's environment policy.
 - Require explicit approval for every managed Drata MCP call regardless of read-only annotations or permissive default approval modes.

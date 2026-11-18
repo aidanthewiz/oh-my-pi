@@ -65,6 +65,7 @@ import { AstGrepTool } from "./ast-grep";
 import { AwsTool } from "./aws";
 import type { ToolExecutionHostCapabilities } from "./tool-execution-host";
 import { BashTool } from "./bash";
+import type { SubagentRuntimeApprovalHandler } from "./subagent-runtime-approval";
 import { type BuiltinToolName, type HiddenToolName, normalizeToolNames } from "./builtin-names";
 import { type CheckpointState, CheckpointTool, type CompletedRewindState, RewindTool } from "./checkpoint";
 import { ContextNotesTool, NewContextTool } from "./context-notes";
@@ -243,6 +244,8 @@ export interface ToolSession {
 	canPromptUser?: boolean;
 	/** Keep `ask` in a headless fork's roster; execution still requires UI. */
 	advertiseHeadlessAsk?: boolean;
+	/** Capture the live owning TUI's per-call runtime-approval capability. */
+	getSubagentRuntimeApproval?: () => SubagentRuntimeApprovalHandler | undefined;
 	/** The user approves `cfg://` writes for this session (top-level TUI session only). */
 	settingsApproval?: boolean;
 	/**
