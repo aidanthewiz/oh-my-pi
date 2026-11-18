@@ -12,12 +12,15 @@
 //! `LaunchServices`, which attributes it to the host terminal and adds a
 //! duplicate Dock tile per session (issue #12491).
 
-use std::sync::LazyLock;
+use std::{ptr::NonNull, sync::LazyLock};
 
 use anyhow::Context;
+use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2_app_kit::NSSpellChecker;
-use objc2_foundation::{NSArray, NSRange, NSString, NSTextCheckingType};
+use objc2_foundation::{
+	NSArray, NSOrthography, NSRange, NSString, NSTextCheckingResult, NSTextCheckingType,
+};
 
 type Job = Box<dyn FnOnce() + Send + 'static>;
 
@@ -96,37 +99,57 @@ fn ns_range(start: u32, length: u32) -> anyhow::Result<NSRange> {
 	})
 }
 
-/// Every misspelled word in `text`. Call on the spelling thread.
+/// Every misspelled word in `text`, awaiting the native background request.
 ///
 /// # Errors
-/// Returns an error when a range overflows.
-pub fn check(text: &str) -> anyhow::Result<Vec<SpellingRange>> {
-	let checker = checker();
-	let text = NSString::from_str(text);
-	let full = NSRange { location: 0, length: text.length() };
-	// `checkString:...` honors `automaticallyIdentifiesLanguages`, selecting
-	// the dictionary per detected run; the legacy `checkSpellingOfString:`
-	// used only the shared checker's single current language (issue #9334).
-	// SAFETY: `options`/`orthography` are nil and `word_count` is null, all
-	// documented as valid; the returned array is retained by objc2.
-	let results = unsafe {
-		checker.checkString_range_types_options_inSpellDocumentWithTag_orthography_wordCount(
-			&text,
-			full,
-			NSTextCheckingType::Spelling.bits(),
-			None,
-			0,
-			None,
-			std::ptr::null_mut(),
-		)
-	};
+/// Returns an error when a range overflows, the spelling thread stops, or the
+/// native request ends without a result.
+pub async fn check(text: String) -> anyhow::Result<Vec<SpellingRange>> {
+	let (reply, result) = flume::bounded(1);
+	run(move || {
+		let checker = checker();
+		let text = NSString::from_str(&text);
+		let full = NSRange { location: 0, length: text.length() };
+		let completion = RcBlock::new(
+			move |_: isize,
+			      results: NonNull<NSArray<NSTextCheckingResult>>,
+			      _: NonNull<NSOrthography>,
+			      _: isize| {
+				// SAFETY: AppKit lends live results for this callback. Only owned
+				// Rust ranges leave its arbitrary execution context.
+				let ranges = spelling_ranges(unsafe { results.as_ref() });
+				let _ = reply.try_send(ranges);
+			},
+		);
+		// Synchronous checks can return no results when the spelling service
+		// times out. SAFETY: `options` is nil; AppKit copies the block for
+		// background use.
+		unsafe {
+			checker
+				.requestCheckingOfString_range_types_options_inSpellDocumentWithTag_completionHandler(
+					&text,
+					full,
+					NSTextCheckingType::Spelling.bits(),
+					None,
+					0,
+					Some(&completion),
+				);
+		}
+		Ok(())
+	})
+	.await?;
+	result
+		.recv_async()
+		.await
+		.context("native spelling request ended without a result")?
+}
+
+fn spelling_ranges(results: &NSArray<NSTextCheckingResult>) -> anyhow::Result<Vec<SpellingRange>> {
 	let mut ranges = Vec::new();
-	for result in &results {
+	for result in results {
 		let range = result.range();
-		// With `automaticallyIdentifiesLanguages`, `checkString:` also returns
-		// an orthography result spanning the entire string; only spelling
-		// results mark misspellings (rendering them as typo ranges doubled
-		// editor text).
+		// Automatic language identification can also return whole-string
+		// orthography; it is not a misspelling.
 		if result.resultType() != NSTextCheckingType::Spelling {
 			continue;
 		}
@@ -231,4 +254,30 @@ pub fn correction(text: &str, start: u32, length: u32) -> anyhow::Result<Option<
 	let value = checker
 		.correctionForWordRange_inString_language_inSpellDocumentWithTag(range, &text, &language, 0);
 	Ok(value.map(|value| value.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn excludes_whole_string_orthography_from_utf16_word_spans() {
+		objc2::rc::autoreleasepool(|_| {
+			let orthography = NSOrthography::defaultOrthographyForLanguage(&NSString::from_str("en"));
+			let results = NSArray::from_retained_slice(&[
+				NSTextCheckingResult::orthographyCheckingResultWithRange_orthography(
+					NSRange { location: 0, length: 26 },
+					&orthography,
+				),
+				NSTextCheckingResult::spellCheckingResultWithRange(NSRange {
+					location: 9,
+					length:   10,
+				}),
+			]);
+			assert_eq!(spelling_ranges(&results).unwrap(), vec![SpellingRange {
+				start:  9,
+				length: 10,
+			}],);
+		});
+	}
 }

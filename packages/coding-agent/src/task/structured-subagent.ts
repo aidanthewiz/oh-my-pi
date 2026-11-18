@@ -777,6 +777,7 @@ function buildExecutorOptions(
 		id,
 		taskDepth: session.taskDepth ?? 0,
 		parentHasUI: session.hasUI,
+		parentRuntimeApproval: session.getSubagentRuntimeApproval?.(),
 		invokedAt: request.invokedAt,
 		acquiredAt: request.acquiredAt,
 		modelOverride: policy.modelOverride,

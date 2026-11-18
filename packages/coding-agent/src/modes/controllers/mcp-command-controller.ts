@@ -19,6 +19,7 @@ import {
 	MCPManager,
 	OAuthIssuerMismatchError,
 	resolveMCPChildCredentialPolicy,
+	validateOAuthResourceMetadataUrl,
 } from "../../mcp";
 import {
 	findMcpServerForAuth,
@@ -671,14 +672,30 @@ export class MCPCommandController {
 					}
 					const authResult = analyzeAuthError(error as Error, finalConfig.url);
 					if (authResult.requiresAuth) {
-						let oauth = authResult.authType === "oauth" ? (authResult.oauth ?? null) : null;
+						const configuredMetadataUrl = finalConfig.oauth?.resourceMetadataUrl;
+						const metadataError = validateOAuthResourceMetadataUrl(configuredMetadataUrl);
+						if (metadataError) {
+							this.ctx.showError(metadataError);
+							return;
+						}
+						const resourceMetadataUrl =
+							configuredMetadataUrl === undefined
+								? authResult.resourceMetadataUrl
+								: new URL(configuredMetadataUrl).href;
+						let oauth =
+							!finalConfig.oauth?.resourceMetadataUrl && authResult.authType === "oauth"
+								? (authResult.oauth ?? null)
+								: null;
 						if (!oauth && finalConfig.url) {
 							try {
 								oauth = await discoverOAuthEndpoints(
 									finalConfig.url,
 									authResult.authServerUrl,
-									authResult.resourceMetadataUrl,
-									{ protectedScopes: authResult.scopes },
+									resourceMetadataUrl,
+									{
+										protectedScopes: authResult.scopes,
+										requireResourceMetadata: configuredMetadataUrl !== undefined,
+									},
 								);
 							} catch (discoveryError) {
 								// Name a misconfigured advertised server; other failures fall through below.
@@ -690,10 +707,9 @@ export class MCPCommandController {
 								}
 							}
 						}
-						if (oauth && !oauth.scopes && authResult.resourceMetadataUrl) {
-							// JSON-error-body path skips `discoverOAuthEndpoints`; fetch the
-							// advertised protected-resource metadata for the required scopes.
-							const scopes = await fetchResourceMetadataScopes(authResult.resourceMetadataUrl);
+						if (oauth && finalConfig.oauth?.scope === undefined && !oauth.scopes && resourceMetadataUrl) {
+							// JSON-error-body endpoints may omit scopes advertised by the resource.
+							const scopes = await fetchResourceMetadataScopes(resourceMetadataUrl);
 							if (scopes) oauth = { ...oauth, scopes };
 						}
 
@@ -713,8 +729,10 @@ export class MCPCommandController {
 								oauth.tokenUrl,
 								oauth.clientId ?? finalConfig.oauth?.clientId ?? "",
 								finalConfig.oauth?.clientSecret ?? "",
-								oauth.scopes ?? "",
+								finalConfig.oauth?.scope ?? oauth.scopes ?? "",
 								{
+									clientName: finalConfig.oauth?.clientName,
+									overrideScopes: finalConfig.oauth?.scope !== undefined,
 									callbackPort: finalConfig.oauth?.callbackPort,
 									callbackPath: finalConfig.oauth?.callbackPath,
 									redirectUri: finalConfig.oauth?.redirectUri,
@@ -802,6 +820,7 @@ export class MCPCommandController {
 		scopes: string,
 		opts?: {
 			clientName?: string;
+			overrideScopes?: boolean;
 			callbackPort?: number;
 			callbackPath?: string;
 			redirectUri?: string;
@@ -831,6 +850,7 @@ export class MCPCommandController {
 					clientId,
 					clientSecret,
 					scopes,
+					overrideScopes: opts?.overrideScopes,
 					serverUrl: opts?.serverUrl,
 					registrationUrl: opts?.registrationUrl,
 					clientName: opts?.clientName,
@@ -1074,7 +1094,10 @@ export class MCPCommandController {
 			const filePath = getMCPConfigPath(scope, cwd);
 
 			// Add server to config
-			await addMCPServer(filePath, name, config, { assertCurrent: () => this.#assertCurrentOwner() });
+			await addMCPServer(filePath, name, config, {
+				assertCurrent: () => this.#assertCurrentOwner(),
+				sourceLevel: scope,
+			});
 			this.#assertCurrentOwner();
 
 			// Reload MCP manager
@@ -1612,7 +1635,9 @@ export class MCPCommandController {
 			}
 
 			const updated: MCPServerConfig = { ...found.config, enabled };
-			await updateMCPServer(found.filePath, name, updated);
+			await updateMCPServer(found.filePath, name, updated, {
+				sourceLevel: (found.sourceLevel ?? found.scope) === "project" ? "project" : "user",
+			});
 			if (enabled) {
 				await this.#connectEnabledMCPServer(name);
 			} else {
@@ -1713,6 +1738,7 @@ export class MCPCommandController {
 			await updateMCPServer(found.filePath, name, updated, {
 				expectedConfig: found.config,
 				assertCurrent: () => this.#assertCurrentOwner(),
+				sourceLevel: (found.sourceLevel ?? found.scope) === "project" ? "project" : "user",
 			});
 			await this.reloadServers();
 

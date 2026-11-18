@@ -767,8 +767,9 @@ async function wrappedExecute(
 		}
 		return result;
 	} catch (e) {
-		// Re-throw with formatted message so agent-loop sets isError flag
-		throw new Error(renderError(e));
+		const message = renderError(e);
+		if (e instanceof Error && message === e.message) throw e;
+		throw new Error(message);
 	}
 }
 

@@ -496,6 +496,8 @@ export interface ExecutorOptions {
 	taskDepth?: number;
 	/** Whether the parent session has the interactive TUI surface. */
 	parentHasUI?: boolean;
+	/** Owning root's live, per-call runtime approval capability. */
+	parentRuntimeApproval?: CreateAgentSessionOptions["parentRuntimeApproval"];
 	/**
 	 * Override the `task.maxRuntimeMs` wall-clock cap for this run. When provided
 	 * it wins over the settings value; `0` disables the per-subagent wall-clock
@@ -991,8 +993,8 @@ function getUsageTokens(usage: unknown): number {
  * than rebuilding a raw `tools/call` request, so the Task/subagent path shares
  * the source tool's authoritative outbound boundary: harness-intent (`i`)
  * stripping, optional-placeholder pruning, local-URL resolution, reconnect
- * retry, abort handling, and result/provider metadata. The source tool is
- * re-resolved on every call by raw MCP server/tool metadata (not the normalized
+ * retry, abort handling, and result/provider metadata. Source approval and
+ * execution are re-resolved by raw MCP server/tool metadata (not the normalized
  * display name), so a reconnect that swaps the instance in `getTools()` is
  * always honored. The source transport owns the configured MCP deadline,
  * including timeout=0; a second Task deadline would silently cap longer calls.
@@ -1002,23 +1004,30 @@ export function createMCPProxyTools(mcpManager: MCPManager): CustomTool[] {
 	return mcpManager.getTools().map(tool => {
 		const serverName = tool.mcpServerName ?? "";
 		const mcpToolName = tool.mcpToolName ?? "";
+		const resolveSource = () =>
+			mcpManager.getTools().find(t => t.mcpServerName === serverName && t.mcpToolName === mcpToolName);
 		return {
 			name: tool.name,
+			legacyName: tool.legacyName,
 			label: tool.label ?? tool.name,
 			description: tool.description ?? "",
 			parameters: tool.parameters,
 			strict: tool.strict,
 			mcpServerName: serverName,
 			mcpToolName,
+			mcpReadOnlyHint: tool.mcpReadOnlyHint,
+			approval: (params, context) => {
+				const source = resolveSource() ?? tool;
+				const approval = source.approval;
+				return typeof approval === "function" ? approval.call(source, params, context) : (approval ?? "exec");
+			},
 			execute: async (toolCallId, params, onUpdate, ctx, signal) => {
 				if (signal?.aborted) {
 					throw new ToolAbortError();
 				}
 				// Re-resolve by raw MCP metadata so a reconnect that replaced the
 				// source instance is picked up; the display name alone is not enough.
-				const source = mcpManager
-					.getTools()
-					.find(t => t.mcpServerName === serverName && t.mcpToolName === mcpToolName);
+				const source = resolveSource();
 				if (!source?.execute) {
 					return {
 						content: [{ type: "text" as const, text: `MCP error: tool ${mcpToolName} no longer available` }],
@@ -5053,6 +5062,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					preloadedPreparedExtensions: options.preloadedPreparedExtensions,
 					preloadedCustomToolPaths: restrictToolNames ? [] : options.preloadedCustomToolPaths,
 					hasUI: false,
+					parentRuntimeApproval: options.parentRuntimeApproval,
 					prewalk,
 					spawns: spawnsEnv,
 					taskDepth: childDepth,

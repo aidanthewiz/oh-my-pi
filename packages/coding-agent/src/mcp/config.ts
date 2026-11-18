@@ -11,8 +11,10 @@ import type { EffectiveExtensionRoots, SourceMeta } from "../capability/types";
 import type { MCPServer } from "../discovery";
 import { loadCapability } from "../discovery";
 import { COREFORGE_MCP_PROVIDER_ID } from "../discovery/coreforge";
+import { expandEnvVarsDeepForConfigLevel } from "../discovery/helpers";
 import { MANAGED_MCP_FILENAME, MANAGED_MCP_PROVIDER_ID } from "../discovery/mcp-managed";
 import { readMCPConfigFile } from "./config-writer";
+import { validateOAuthResourceMetadataUrl } from "./oauth-discovery";
 import { type MCPProjectTrustHandler, resolveCoreforgeProjectTrust } from "./project-trust";
 import type { MCPConfigFile, MCPServerConfig } from "./types";
 
@@ -398,9 +400,14 @@ export function filterExaMCPServers(
 }
 
 /**
- * Validate server config has required fields.
+ * Validate server fields without changing the definition.
+ * @param sourceLevel Ownership for raw placeholders; omitted for already-expanded runtime configuration.
  */
-export function validateServerConfig(name: string, config: MCPServerConfig): string[] {
+export function validateServerConfig(
+	name: string,
+	config: MCPServerConfig,
+	sourceLevel?: "user" | "project",
+): string[] {
 	const errors: string[] = [];
 
 	const serverType = config.type ?? "stdio";
@@ -427,6 +434,14 @@ export function validateServerConfig(name: string, config: MCPServerConfig): str
 	} else {
 		errors.push(`Server "${name}": unknown server type "${serverType}"`);
 	}
+
+	const metadataUrl = config.oauth?.resourceMetadataUrl;
+	const resolvedMetadataUrl =
+		sourceLevel === undefined || metadataUrl === undefined
+			? metadataUrl
+			: expandEnvVarsDeepForConfigLevel(metadataUrl, sourceLevel);
+	const oauthMetadataError = validateOAuthResourceMetadataUrl(resolvedMetadataUrl);
+	if (oauthMetadataError) errors.push(`Server "${name}": ${oauthMetadataError}`);
 
 	return errors;
 }

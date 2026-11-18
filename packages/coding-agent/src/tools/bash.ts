@@ -531,6 +531,7 @@ function formatDcgRuntimeApproval(
 	return {
 		reason: `Destructive Command Guard requires review (${rule})`,
 		tuiStyle: "destructive",
+		allowParentApproval: true,
 		prompt: prompt.render(dcgApprovalPrompt, {
 			rule,
 			reason: decision.reason,
@@ -570,6 +571,7 @@ type ManagedBashJobCompletion =
 	| {
 			kind: "failed";
 			error: unknown;
+			result: AgentToolResult<BashToolDetails>;
 	  };
 
 interface ManagedBashJobHandle {
@@ -834,7 +836,13 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 	readonly strict = true;
 	readonly #preparedExecutions = new WeakMap<
 		object,
-		{ toolCallId: string; approved: boolean; inputFingerprint: string; execution: PreparedBashExecution }
+		{
+			toolCallId: string;
+			approved: boolean;
+			inputFingerprint: string;
+			execution: PreparedBashExecution;
+			validate?: () => void;
+		}
 	>();
 
 	constructor(private readonly session: ToolSession) {}
@@ -1036,7 +1044,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		return formatDcgRuntimeApproval(normalizedInput, execution, execution.dcgDecision);
 	}
 
-	approveRuntimeApproval(toolCallId: string, args: unknown): void {
+	approveRuntimeApproval(toolCallId: string, args: unknown, validate?: () => void): void {
 		if (typeof args !== "object" || args === null) return;
 		const cached = this.#preparedExecutions.get(args);
 		if (
@@ -1046,6 +1054,8 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		) {
 			return;
 		}
+		validate?.();
+		cached.validate = validate;
 		cached.approved = true;
 	}
 
@@ -1232,10 +1242,40 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		return text + formatOutputNotice(result.details?.meta);
 	}
 
+	#observeDeferredResult(job: ManagedBashJobHandle, onDeferredResult: AgentToolContext["onDeferredResult"]): void {
+		if (!onDeferredResult) return;
+		void job.completion
+			.then(completion => {
+				const result = completion.result;
+				const state =
+					completion.kind === "failed"
+						? result.details?.async?.state === "cancelled"
+							? "cancelled"
+							: "failed"
+						: result.isError === true
+							? "failed"
+							: "completed";
+				onDeferredResult({
+					...result,
+					details: {
+						...result.details,
+						async: { state, jobId: job.jobId, type: "bash" },
+					},
+				});
+			})
+			.catch(error => {
+				logger.warn("Deferred bash result observer failed", {
+					jobId: job.jobId,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			});
+	}
+
 	#startManagedBashJob(options: {
 		command: string;
 		commandCwd: string;
 		preflight: PreparedBashExecution["preflight"];
+		validate?: () => void;
 		timeoutMs: number | undefined;
 		timeoutSec: number | undefined;
 		requestedTimeoutSec?: number;
@@ -1312,6 +1352,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				try {
 					const { path: artifactPath, id: artifactId } =
 						(await this.session.allocateOutputArtifact?.("bash")) ?? {};
+					options.validate?.();
 					const result = await executeBash(options.command, {
 						settings: this.session.settings,
 						cwd: options.commandCwd,
@@ -1326,6 +1367,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 						timeout: options.timeoutMs ?? 0,
 						signal: runSignal,
 						preflight: options.preflight,
+						validate: options.validate,
 						gitGuard: cfgBashGitGuard.get(this.session.settings),
 						// Bound to the job's own signal: the job outlives the call that started it.
 						filesystem: this.#urlFilesystem(runSignal, options.approvalTier, onReply).shellFilesystem(),
@@ -1380,7 +1422,19 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				} catch (error) {
 					const message = error instanceof Error ? error.message : String(error);
 					const output = latestText && !message.includes(latestText) ? `${latestText}\n\n${message}` : message;
-					completion.resolve({ kind: "failed", error });
+					const { output: _output, images, ...details } = latestProgressDetails ?? {};
+					completion.resolve({
+						kind: "failed",
+						error,
+						result: {
+							content: [{ type: "text", text: output }, ...(images ?? [])],
+							details: {
+								...details,
+								async: { state: runSignal.aborted ? "cancelled" : "failed", jobId, type: "bash" },
+							},
+							isError: true,
+						},
+					});
 					// Only a cancel aborts the job's own signal (deadlines end in a timed-out result).
 					await report(output, {
 						...latestProgressDetails,
@@ -1440,6 +1494,8 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		if (cached) this.#preparedExecutions.delete(input);
 		const cacheMatches = cached?.toolCallId === toolCallId && cached.inputFingerprint === bashInputFingerprint(input);
 		const runtimeApproved = cacheMatches === true && cached.approved;
+		const validateApproval = runtimeApproved ? cached.validate : undefined;
+		validateApproval?.();
 		let prepared = cacheMatches
 			? cached.execution
 			: await this.#prepareExecution(normalizedInput, signal, ctx, sessionEnv);
@@ -1448,6 +1504,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				throw new ToolError("Bash execution route or shell changed after safety review; review the command again.");
 			}
 			const materialized = await this.#prepareExecution(normalizedInput, signal, ctx, sessionEnv);
+			validateApproval?.();
 			if (!sameBashBackend(prepared.backend, materialized.backend)) {
 				throw new ToolError("Bash execution route or shell changed after safety review; review the command again.");
 			}
@@ -1519,6 +1576,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					env: { ...prepared.preflight.env, ...sessionEnv },
 					ready: normalizedInput.ready,
 					shell: { ...backend.shellConfig, prefix: undefined },
+					validate: validateApproval,
 				},
 				signal,
 				normalizedInput.ready === undefined ? undefined : ctx?.toolCall?.steeringSignal,
@@ -1588,6 +1646,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			const job = this.#startManagedBashJob({
 				command,
 				preflight: prepared.preflight,
+				validate: validateApproval,
 				commandCwd,
 				timeoutMs,
 				timeoutSec,
@@ -1601,6 +1660,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				sessionEnv,
 				intent: this.session.getToolCallIntent?.(toolCallId),
 			});
+			this.#observeDeferredResult(job, ctx?.onDeferredResult);
 			return this.#buildBackgroundStartResult(job.jobId, "", timeoutSec, {
 				requestedTimeoutSec,
 				notices: pendingNotices,
@@ -1630,6 +1690,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			const job = this.#startManagedBashJob({
 				command,
 				preflight: prepared.preflight,
+				validate: validateApproval,
 				commandCwd,
 				timeoutMs,
 				timeoutSec,
@@ -1644,6 +1705,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				intent: this.session.getToolCallIntent?.(toolCallId),
 			});
 			if (startBackgrounded) {
+				this.#observeDeferredResult(job, ctx?.onDeferredResult);
 				return this.#buildBackgroundStartResult(job.jobId, "", timeoutSec, {
 					requestedTimeoutSec,
 					notices: pendingNotices,
@@ -1673,6 +1735,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			}
 			job.background();
 			autoBgManager.backgroundJob(job.jobId);
+			this.#observeDeferredResult(job, ctx?.onDeferredResult);
 			// "steer": a queued user/peer message arrived mid-wait — background
 			// the command (it keeps running) so the message injects promptly.
 			// `job.notices` also carries the temporary-shell notice once the run started.
@@ -1750,6 +1813,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			try {
 				const bridgeEnv = { ...prepared.preflight.env, ...sessionEnv };
 				const shellSpawn = wrapShellLineForClientTerminal(command, backend.shellConfig);
+				validateApproval?.();
 				const createP = backend.createTerminal.call(backend.bridge, {
 					command: shellSpawn.command,
 					args: shellSpawn.args,
@@ -1965,6 +2029,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 
 		// Allocate artifact for truncated output storage
 		const { path: artifactPath, id: artifactId } = (await this.session.allocateOutputArtifact?.("bash")) ?? {};
+		validateApproval?.();
 
 		if (pty && backend.kind !== "local-pty") {
 			pendingNotices.push("pty requested but unavailable in this environment; ran without a terminal");
@@ -1990,6 +2055,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 						artifactPath,
 						artifactId,
 						shell: backend.shellConfig,
+						validate: validateApproval,
 					})
 				: await executeBash(command, {
 						settings: this.session.settings,
@@ -2000,6 +2066,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 						timeout: timeoutMs ?? 0,
 						signal,
 						preflight: prepared.preflight,
+						validate: validateApproval,
 						gitGuard: cfgBashGitGuard.get(this.session.settings),
 						filesystem: this.#urlFilesystem(signal, approvalTier, text => {
 							replies.push(text);

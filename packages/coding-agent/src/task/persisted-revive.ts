@@ -455,6 +455,9 @@ export function createPersistedSubagentReviverFactory(
 					// createAgentSession default to wildcard ("*").
 					spawns: init.spawns ?? "",
 					hasUI: false,
+					parentRuntimeApproval: restoredSeance
+						? undefined
+						: ctx.session.extensionRunner?.getSubagentRuntimeApproval(),
 					enableLsp: restrictToolNames ? false : ctx.enableLsp,
 					...(restrictToolNames
 						? {

@@ -330,7 +330,7 @@ async function handleAddCommand(rest: string, runtime: SlashCommandRuntime): Pro
 	if (!config) return usage(MCP_ADD_USAGE, runtime);
 	try {
 		const filePath = getMCPConfigPath(parsed.scope, runtime.cwd);
-		await addMCPServer(filePath, parsed.name, config);
+		await addMCPServer(filePath, parsed.name, config, { sourceLevel: parsed.scope });
 		await runtime.output(`Added MCP server "${parsed.name}" (${parsed.scope}).`);
 		return commandConsumed();
 	} catch (err) {
@@ -444,12 +444,16 @@ async function handleEnableDisableCommand(
 			readMCPConfigFile(projectPath),
 		]);
 		if (projectConfig.mcpServers?.[name] !== undefined) {
-			await updateMCPServer(projectPath, name, { ...projectConfig.mcpServers[name], enabled } as MCPServerConfig);
+			await updateMCPServer(projectPath, name, { ...projectConfig.mcpServers[name], enabled } as MCPServerConfig, {
+				sourceLevel: "project",
+			});
 			await runtime.output(`Server "${name}" ${enabled ? "enabled" : "disabled"} (project config).`);
 			return commandConsumed();
 		}
 		if (userConfig.mcpServers?.[name] !== undefined) {
-			await updateMCPServer(userPath, name, { ...userConfig.mcpServers[name], enabled } as MCPServerConfig);
+			await updateMCPServer(userPath, name, { ...userConfig.mcpServers[name], enabled } as MCPServerConfig, {
+				sourceLevel: "user",
+			});
 			await runtime.output(`Server "${name}" ${enabled ? "enabled" : "disabled"} (user config).`);
 			return commandConsumed();
 		}

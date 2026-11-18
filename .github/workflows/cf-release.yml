@@ -604,7 +604,7 @@ jobs:
     env:
       RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
       MACOS_SIGNING: ${{ secrets.APPLE_CERTIFICATE_P12 != '' && secrets.APPLE_CERTIFICATE_PASSWORD != '' && secrets.APPLE_API_KEY_ID != '' && secrets.APPLE_API_ISSUER_ID != '' && secrets.APPLE_API_KEY != '' }}
-    runs-on: macos-14
+    runs-on: xcode-27
     permissions:
       contents: read
     steps:

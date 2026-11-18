@@ -8,12 +8,32 @@
 
 ### Added
 
+- Emit observation-only deferred tool results for final Bash job outcomes, including eval calls and completion after an agent abort. Retain the original conversation, input and MCP identity without starting model continuations.
 - Native AWS approvals offer **Allow for the rest of this session** for later commands, profiles, and SSO renewal without saving a configuration grant.
 - Keep job widgets local by default. Remote spec authoring requires managed or runtime consent, current model and account admission, bounded redacted context, and originating-journal accounting.
 - Expose session-bound native MCP calls to extensions. Honor `exposeTools: false` without disabling server startup or discovery.
+- Support explicitly trusted MCP protected-resource metadata through `oauth.resourceMetadataUrl`, including hosted servers whose canonical resource differs from the MCP endpoint.
+- Select the JavaScript debug adapter's executable with `JS_DEBUG_NODE` independently of the target runtime, and reject invalid paths without fallback.
 
 ### Fixed
 
+- Route headless task DCG reviews to the live parent TUI without enabling child UI or reusing grants. Revalidate both sessions' authority and the exact invocation through backend dispatch. Preserve typed denial, cancellation, and unavailable errors.
+- Keep session-owned OAuth account restrictions until deferred startup cleanup finishes.
+- Keep erased TypeScript type declarations out of legacy extension runtime graphs, including inline-only named imports and exports.
+- Preserve Bun's native loader for attributed imports, mixed module/file use and package self-exports. Select dynamic import loaders at runtime without losing ordinary dependency remapping, CommonJS identity or reload behavior.
+- Preserve evaluated extension identities during lazy graph activation. Refresh only reachable, unconsumed frontiers when cached entries load again.
+- Defer unused helper preparation failures to helper use during cached extension loads. Refresh repaired helpers on explicit reload.
+- Preserve native file-URL cache identity across symlinks, queries and fragments. Keep bare-path hashes literal.
+- Preserve module- and parameter-scoped bindings in rewritten dynamic imports.
+- Keep hashbangs first for LF, CRLF, CR, U+2028 and U+2029 source.
+- Enable native WebMCP directly for current Chrome versions and managed Chrome for Testing.
+- Synchronize shell TERM-output qualification with a child release gate and controlled cancellation deadlines instead of wall-clock sleeps.
+- Synchronize session lease race qualification with an observed held lease before racing claims and probes.
+- Separate hosted Chromium readiness from connection deadlines, close timed-out qualification pipes before cleanup, and preserve startup failures.
+- Verify staged upload lifetime against its owning tab during browser qualification, without counting unrelated workers' temporary files.
+- Honor configured MCP `oauth.scope` over metadata, challenge, and authorization-URL scopes during registration and authorization.
+- Preserve MCP metadata environment references across toggles and OAuth write-back; validate their resolved URLs under the original source's environment policy.
+- Require explicit approval for every managed Drata MCP call regardless of read-only annotations or permissive default approval modes.
 - Preserve the exact durable journal and its parent directory in shutdown, fork-return and fatal-recovery commands. Quote paths for POSIX shells and PowerShell, including sessions opened with a different future-session directory.
 - Separate MCP fixture startup from request deadlines. Make connected-browser viewport qualification deterministic and preserve navigation failures during cleanup.
 - Serialize and atomically publish shared ACP handle mappings. Fork unloaded handles from their continued conversation instead of the original transcript.

@@ -21,6 +21,7 @@ zstd.workspace = true
 # SmolLM2 runs on the GPU through candle's Metal backend on macOS; the
 # portable CPU decoder (src/smollm/cpu.rs) needs no ML framework.
 [target.'cfg(target_os = "macos")'.dependencies]
+block2 = "=0.6.2"
 candle-core = { workspace = true, features = ["metal"] }
 candle-nn = { workspace = true, features = ["metal"] }
 # The `apple` engine and the process-wide AppKit spelling thread
