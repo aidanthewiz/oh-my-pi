@@ -30,7 +30,7 @@
 - Remove the unsupported rsync cross-run byte-total invariant; preserve exact live counters, transfer contents, and protocol coverage.
 - Scan every owned qualification-file byte without decoding binary assets. Preserve cross-chunk leak checks and fixed, nonsecret failure phases.
 - Separate synthetic tmux executable readiness from bounded protocol queries. Preserve runtime query deadlines and credential-filtering checks.
-- Isolate home-dotenv cache qualification from managed-launch markers without changing production dotenv authority.
+- Isolate home-dotenv cache qualification from managed-launch markers and filtered-child sentinels without changing production dotenv authority.
 - Apply normalized device authorization before capability probes, including policy revocation during approval. Preserve active and mounted AWS dispatch and exact native invocation ownership.
 - Join owned process cleanup using kernel creation identities and actual reaping. Preserve a pinned Darwin group anchor until acknowledged retirement, and reject unknown or replaced receiver identities.
 - Preserve constructor-registered tool session callbacks so active native scopes stop when the SDK adopts or forks a session.
