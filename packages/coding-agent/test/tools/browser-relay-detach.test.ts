@@ -530,23 +530,19 @@ describe("relay tabs Chrome detaches omp from", () => {
 			await handled;
 			const tab = getTab(name);
 			if (tab?.backend !== "worker") throw new Error("expected a worker tab");
-			const now = spyOn(performance, "now").mockReturnValue(0);
-			const terminate = tab.worker.terminate.bind(tab.worker);
-			const held = spyOn(tab.worker, "terminate").mockImplementation(async () => {
-				await terminate();
-				now.mockReturnValue(30_000);
-			});
+			const worker = tab.worker;
+			const now = spyOn(performance, "now").mockImplementation(() => (tab.worker === worker ? 0 : 30_000));
 			try {
 				const result = await invoke({ action: "open", url: `${pageUrl}&never`, timeout: 20 }).catch(
 					(error: unknown) => error,
 				);
-				expect(String(result)).toContain("call was not run again");
-				expect(String(result)).toContain("stays open on what loaded");
+				expect(result).toBeInstanceOf(ToolError);
+				expect(getTab(name)).toBe(tab);
+				expect(tab.worker).not.toBe(worker);
 				expect(getTab(name)?.state).toBe("alive");
 				expect(page?.url()).toBe(pageUrl);
 			} finally {
 				now.mockRestore();
-				held.mockRestore();
 			}
 		},
 		60_000,

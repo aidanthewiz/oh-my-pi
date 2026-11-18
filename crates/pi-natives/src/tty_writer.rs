@@ -670,11 +670,32 @@ mod tests {
 
 	fn read_exact_output(fd: i32, expected: usize) -> Vec<u8> {
 		let mut output = Vec::with_capacity(expected);
-		wait_until(|| {
+		let deadline = Instant::now() + Duration::from_secs(3);
+		let mut readable = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+		loop {
 			read_available(fd, &mut output);
-			output.len() >= expected
-		});
-		output
+			if output.len() >= expected {
+				return output;
+			}
+			let now = Instant::now();
+			assert!(now < deadline, "timed out waiting for worker");
+			let timeout_ms = (deadline - now).as_millis().clamp(1, i32::MAX as u128) as i32;
+			// SAFETY: this reader owns fd and readable is valid writable poll
+			// storage.
+			let result = unsafe { libc::poll(&mut readable, 1, timeout_ms) };
+			if result < 0 {
+				let err = std::io::Error::last_os_error();
+				if err.kind() == std::io::ErrorKind::Interrupted {
+					continue;
+				}
+				panic!("PTY poll: {err}");
+			}
+			if readable.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+				read_available(fd, &mut output);
+				assert!(output.len() >= expected, "PTY closed before expected output");
+				return output;
+			}
+		}
 	}
 
 	#[test]
