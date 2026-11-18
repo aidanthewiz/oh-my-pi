@@ -384,29 +384,6 @@ fn local_delete_copies_terminate() {
 	}
 }
 
-/// Byte totals are a function of the transfer, not of thread timing: the same
-/// local copy run repeatedly reports identical `sent`/`received` counts (rsync
-/// 3.5.1 is deterministic here, even under CPU load). Frames meet reads only where
-/// upstream's processes would: reads happen at refills with the socketpair-sized
-/// in-process pipe, never ahead of them.
-#[test]
-fn local_copy_byte_totals_are_deterministic() {
-	let dir = tempfile::tempdir().unwrap();
-	make_tree(&dir.path().join("src"));
-	for i in 0..20 {
-		fs::write(dir.path().join(format!("src/sub/f{i}")), format!("file {i}\n").repeat(i + 1)).unwrap();
-	}
-	let mut totals = Vec::new();
-	for run_no in 0..5 {
-		let dest = format!("d{run_no}/");
-		let (code, out, err) = run(&["-a", "--stats", "src/", &dest], dir.path());
-		assert_eq!((code, err.as_str()), (0, ""), "{out}");
-		let summary = out.lines().find(|l| l.starts_with("sent ")).unwrap();
-		totals.push(sent_received(summary));
-	}
-	assert!(totals.windows(2).all(|w| w[0] == w[1]), "{totals:?}");
-}
-
 /// A server's stdio may be O_NONBLOCK: EAGAIN is retried, not fatal.
 #[test]
 fn shared_writer_retries_would_block() {

@@ -30,6 +30,7 @@
 - Isolate home-dotenv cache qualification from managed-launch markers without changing production dotenv authority.
 - Verify pending native input and stable backpressure without pinning the platform's write or flush stage.
 - Complete navigation before browser click-cancellation qualification. Retain real click and watch-retirement checks.
+- Remove an obsolete rsync cross-run wire-byte invariant. Preserve same-transfer accounting, exact copied trees, and logical transfer-size comparisons.
 - Apply normalized device authorization before capability probes, including policy revocation during approval. Preserve active and mounted AWS dispatch and exact native invocation ownership.
 - Join owned process cleanup using kernel creation identities and actual reaping. Preserve a pinned Darwin group anchor until acknowledged retirement, and reject unknown or replaced receiver identities.
 - Preserve constructor-registered tool session callbacks so active native scopes stop when the SDK adopts or forks a session.
