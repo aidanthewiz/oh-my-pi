@@ -304,22 +304,23 @@ class KiroAttempt {
 		this.#stream.push({ type: "toolcall_end", contentIndex: tool.index, toolCall: block, partial: this.output });
 	}
 
-	/**
-	 * Close open blocks and finalize tools that never got `stop`. A truncated or
-	 * filtered turn's unfinished calls carry cut-off arguments, so they are
-	 * dropped instead and never reach the agent loop.
-	 */
-	finish(dropUnfinishedTools: boolean): void {
+	finish(): boolean {
 		this.#closeThinking();
 		this.#closeText();
+		return this.discardUnfinishedTools();
+	}
+
+	/** Only a provider-confirmed stop makes a tool executable, even on an otherwise clean EOF. */
+	discardUnfinishedTools(): boolean {
 		const dropped: number[] = [];
-		for (const tool of this.#tools.values()) {
+		for (const [id, tool] of this.#tools) {
 			if (tool.done) continue;
-			if (dropUnfinishedTools) dropped.push(tool.index);
-			else this.#finishTool(tool);
+			dropped.push(tool.index);
+			this.#tools.delete(id);
 		}
 		// Splice from the end so earlier indices stay valid.
 		for (const index of dropped.reverse()) this.output.content.splice(index, 1);
+		return dropped.length > 0;
 	}
 
 	/**
@@ -464,7 +465,7 @@ export function streamKiro(model: Model, context: Context, options: KiroOptions 
 
 				const contentFiltered = attempt.stopReason === "CONTENT_FILTERED" || attempt.refusal !== undefined;
 				const truncated = attempt.stopReason === "MAX_TOKENS" || attempt.stopReason === "LENGTH";
-				attempt.finish(contentFiltered || truncated);
+				const unfinishedTools = attempt.finish();
 				attempt.finalizeUsage(model);
 				if (contentFiltered) {
 					const category = kiroString(attempt.refusal?.category);
@@ -476,6 +477,9 @@ export function streamKiro(model: Model, context: Context, options: KiroOptions 
 					};
 					const label = category ? `Refusal (${category})` : "Refusal";
 					throw responseError(`${label}: ${explanation ?? "content was filtered by Kiro"}`, "content-blocked");
+				}
+				if (unfinishedTools && !truncated) {
+					throw responseError("Kiro stream ended with unfinished tool calls", "incomplete-stream");
 				}
 				if (!attempt.visible) {
 					throw responseError("Kiro stream ended without visible output", "incomplete-stream");
@@ -493,6 +497,7 @@ export function streamKiro(model: Model, context: Context, options: KiroOptions 
 				return;
 			}
 		} catch (error) {
+			attempt.discardUnfinishedTools();
 			const result = await AIError.finalize(error, {
 				api: model.api,
 				provider: model.provider,

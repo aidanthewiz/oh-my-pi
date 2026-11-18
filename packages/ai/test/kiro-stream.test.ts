@@ -3,7 +3,7 @@ import * as AIError from "@oh-my-pi/pi-ai/error";
 import { crc32 } from "@oh-my-pi/pi-ai/providers/aws-eventstream";
 import { type KiroOptions, streamKiro } from "@oh-my-pi/pi-ai/providers/kiro/stream";
 import type { KiroRequest } from "@oh-my-pi/pi-ai/providers/kiro/transform";
-import type { Context, FetchImpl, Model } from "@oh-my-pi/pi-ai/types";
+import type { AssistantMessageEvent, Context, FetchImpl, Model } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { encodeKiroCredential } from "@oh-my-pi/pi-catalog/wire/kiro";
 
@@ -77,13 +77,16 @@ async function run(
 ) {
 	let attempts = 0;
 	const waits: number[] = [];
-	const result = await streamKiro(MODEL, CONTEXT, {
+	const events: AssistantMessageEvent[] = [];
+	const stream = streamKiro(MODEL, CONTEXT, {
 		apiKey: API_KEY,
 		fetch: async (_input, init) => respond(++attempts, init),
 		providerRetryWait: async delay => void waits.push(delay),
 		...options,
-	}).result();
-	return { attempts, waits, result };
+	});
+	for await (const event of stream) events.push(event);
+	const result = await stream.result();
+	return { attempts, waits, result, events };
 }
 
 test("streams reasoning, text, and tool calls in order with usage from token metrics", async () => {
@@ -124,6 +127,114 @@ test("streams reasoning, text, and tool calls in order with usage from token met
 	]);
 	// 37.5% of the 32,000-token window.
 	expect(result.usage).toMatchObject({ input: 11, output: 7, cacheRead: 13, totalTokens: 31, contextTokens: 12_000 });
+});
+
+test.each<[string, Record<string, unknown>, string | undefined]>([
+	["no arguments or stop reason", {}, undefined],
+	["complete JSON without stop reason", { input: '{"path":"a.txt"}' }, undefined],
+	["complete JSON with tool-use metadata", { input: '{"path":"a.txt"}' }, "TOOL_USE"],
+	["empty JSON with a false stop", { input: "{}", stop: false }, "END_TURN"],
+	["object snapshot without confirmation", { input: { path: "a.txt" } }, "TOOL_USE"],
+])("rejects unconfirmed tool calls at clean EOF: %s", async (_name, input, stopReason) => {
+	const { attempts, waits, result, events } = await run(() =>
+		eventsResponse([
+			["assistantResponseEvent", { content: "Preparing the file." }],
+			["contextUsageEvent", { contextUsagePercentage: 25 }],
+			[
+				"metadataEvent",
+				{ stopReason, tokenUsage: { uncachedInputTokens: 11, outputTokens: 7, cacheReadInputTokens: 3 } },
+			],
+			["toolUseEvent", { toolUseId: "pending", name: "write", ...input }],
+		]),
+	);
+
+	expect(attempts).toBe(1);
+	expect(waits).toEqual([]);
+	expect(result.stopReason).toBe("error");
+	expect(AIError.is(result.errorId, AIError.Flag.Transient)).toBe(true);
+	expect(result.content).toEqual([{ type: "text", text: "Preparing the file." }]);
+	expect(result.usage).toMatchObject({ input: 11, output: 7, cacheRead: 3, totalTokens: 21, contextTokens: 8_000 });
+	expect(events.filter(event => event.type === "toolcall_end" || event.type === "done")).toEqual([]);
+	expect(events.filter(event => event.type === "text_delta").map(event => event.delta)).toEqual([
+		"Preparing the file.",
+	]);
+	expect(events.at(-1)?.type).toBe("error");
+});
+
+test("preserves confirmed calls and text while discarding interleaved unfinished calls at EOF", async () => {
+	const { attempts, waits, result, events } = await run(() =>
+		eventsResponse([
+			["assistantResponseEvent", { content: "Before." }],
+			["toolUseEvent", { toolUseId: "pending-first", name: "write", input: '{"path":"a.txt"}' }],
+			["toolUseEvent", { toolUseId: "confirmed", name: "read", input: { path: "b.txt" }, stop: true }],
+			["toolUseEvent", { toolUseId: "pending-last", name: "write" }],
+			["assistantResponseEvent", { content: "After." }],
+			["metadataEvent", { stopReason: "TOOL_USE", tokenUsage: { uncachedInputTokens: 5, outputTokens: 9 } }],
+		]),
+	);
+
+	expect(attempts).toBe(1);
+	expect(waits).toEqual([]);
+	expect(result.stopReason).toBe("error");
+	expect(AIError.is(result.errorId, AIError.Flag.Transient)).toBe(true);
+	expect(result.content).toEqual([
+		{ type: "text", text: "Before." },
+		{ type: "toolCall", id: "confirmed", name: "read", arguments: { path: "b.txt" } },
+		{ type: "text", text: "After." },
+	]);
+	expect(result.usage).toMatchObject({ input: 5, output: 9, totalTokens: 14 });
+	expect(events.filter(event => event.type === "toolcall_end").map(event => event.toolCall.id)).toEqual(["confirmed"]);
+	expect(events.some(event => event.type === "done")).toBe(false);
+	expect(events.at(-1)?.type).toBe("error");
+});
+
+test.each<[string, Record<string, unknown>]>([
+	["empty object snapshot", { input: {} }],
+	["empty object JSON", { input: "{}" }],
+	["no argument fragments", {}],
+])("accepts a confirmed tool call with %s", async (_name, input) => {
+	const { attempts, result, events } = await run(() =>
+		eventsResponse([
+			["toolUseEvent", { toolUseId: "confirmed", name: "list", ...input }],
+			["toolUseEvent", { toolUseId: "confirmed", stop: true }],
+		]),
+	);
+
+	expect(attempts).toBe(1);
+	expect(result.stopReason).toBe("toolUse");
+	expect(result.content).toEqual([{ type: "toolCall", id: "confirmed", name: "list", arguments: {} }]);
+	expect(events.filter(event => event.type === "toolcall_end").map(event => event.toolCall)).toEqual([
+		{ type: "toolCall", id: "confirmed", name: "list", arguments: {} },
+	]);
+	expect(events.at(-1)?.type).toBe("done");
+});
+
+test.each<[string, Uint8Array]>([
+	["provider exception", CAPACITY_FRAME],
+	["incomplete frame", VISIBLE.subarray(0, 20)],
+	["malformed confirmed arguments", ev("toolUseEvent", { toolUseId: "pending", input: '{"path":', stop: true })],
+])("discards unfinished calls on %s without replaying", async (_name, terminalFrame) => {
+	const { attempts, waits, result, events } = await run(() =>
+		framesResponse([
+			VISIBLE,
+			ev("toolUseEvent", { toolUseId: "pending", name: "write" }),
+			ev("toolUseEvent", { toolUseId: "confirmed", name: "read", input: { path: "b.txt" }, stop: true }),
+			ev("metadataEvent", { tokenUsage: { uncachedInputTokens: 5, outputTokens: 9 } }),
+			terminalFrame,
+		]),
+	);
+
+	expect(attempts).toBe(1);
+	expect(waits).toEqual([]);
+	expect(result.stopReason).toBe("error");
+	expect(result.content).toEqual([
+		{ type: "text", text: "partial answer" },
+		{ type: "toolCall", id: "confirmed", name: "read", arguments: { path: "b.txt" } },
+	]);
+	expect(result.usage).toMatchObject({ input: 5, output: 9, totalTokens: 14 });
+	expect(events.filter(event => event.type === "toolcall_end").map(event => event.toolCall.id)).toEqual(["confirmed"]);
+	expect(events.some(event => event.type === "done")).toBe(false);
+	expect(events.at(-1)?.type).toBe("error");
 });
 
 test("retries one pre-output capacity throttle with the identical frozen body and per-attempt CLI headers", async () => {
