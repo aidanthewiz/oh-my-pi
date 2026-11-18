@@ -25,8 +25,20 @@ export async function withFakeTmux<T>(
 			.join("\n");
 		const delay = options?.replyDelayMs ? `sleep ${options.replyDelayMs / 1000}\n` : "";
 		const tmux = path.join(binDir, "tmux");
-		await Bun.write(tmux, `#!/bin/sh\n${delay}case "$*" in\n${cases}\n*) exit 64 ;;\nesac\n`);
+		await Bun.write(
+			tmux,
+			`#!/bin/sh\n${delay}case "$*" in\n'__omp_fixture_ready__') exit 0 ;;\n${cases}\n*) exit 64 ;;\nesac\n`,
+		);
 		await fs.chmod(tmux, 0o755);
+		const ready = Bun.spawn([tmux, "__omp_fixture_ready__"], {
+			env: { PATH: "/usr/bin:/bin" },
+			stdin: "ignore",
+			stdout: "ignore",
+			stderr: "ignore",
+			timeout: 5_000,
+			killSignal: "SIGKILL",
+		});
+		if ((await ready.exited) !== 0) throw new Error("Owned tmux fixture could not start");
 		return await run(binDir);
 	} finally {
 		await fs.rm(binDir, { force: true, recursive: true });

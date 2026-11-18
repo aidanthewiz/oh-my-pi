@@ -1,4 +1,5 @@
 import * as path from "node:path";
+import { isPromise } from "node:util/types";
 import { type CallRecord, ChangeJournal, callDetails } from "./commit/selective/journal";
 import { createCommitPrelude } from "./commit/selective/prelude-definition";
 import { cfgDisasmBackend } from "./disasm/active";
@@ -16,6 +17,8 @@ import {
 	type StreamFn,
 	type ThinkingLevel,
 } from "@oh-my-pi/pi-agent-core";
+import { getCleanupOwnedToolCallArgs } from "@oh-my-pi/pi-agent-core/agent-loop";
+import { resolveToolCancellationBehavior } from "@oh-my-pi/pi-agent-core/tool-cancellation";
 import type {
 	Api,
 	Context,
@@ -167,7 +170,7 @@ import {
 } from "./extensibility/skills";
 import { type FileSlashCommand, loadSlashCommands as loadSlashCommandsInternal } from "./extensibility/slash-commands";
 import type { HindsightSessionStateApi } from "./hindsight/state";
-import { LocalProtocolHandler, type LocalProtocolOptions, outRepliesActive } from "./internal-urls";
+import { InternalUrlRouter, LocalProtocolHandler, type LocalProtocolOptions, outRepliesActive } from "./internal-urls";
 import { stripXdUnderscorePrefix, stripXdUrlPrefix } from "@oh-my-pi/pi-tui/tools/xd-url";
 import { holdSharedLsp } from "./lsp/client";
 import { LSP_STARTUP_EVENT_CHANNEL, type LspStartupEvent } from "./lsp/startup-events";
@@ -220,7 +223,6 @@ import {
 	type PlanYolo,
 	type Prewalk,
 } from "./session/agent-session";
-import type { AgentSessionDisposeOptions } from "./session/agent-session-types";
 import type { AdvisorToolFactory } from "./session/session-advisors";
 import {
 	applyUnpausedProviders,
@@ -353,6 +355,7 @@ import {
 	warmupLspServers,
 	xdevEntries,
 } from "./tools";
+import { TOOL_EXECUTION_HOST_CAPABILITIES } from "./tools/tool-execution-host";
 import { forgetSessionApprovals } from "./tools/approval-cache";
 import { formatExtensionLoadNotifications } from "./extensibility/extensions/load-errors";
 import {
@@ -377,7 +380,11 @@ import { ToolContextStore } from "./tools/context";
 import { isIrcEnabled } from "./irc/messaging";
 import { imageGenTool } from "./tools/image-gen";
 import { wrapToolWithMetaNotice } from "./tools/output-meta";
+import { recoverConflictUriPrefix } from "./tools/conflict-detect";
 import { isFilesystemSourcePath } from "./tools/path-utils";
+import { unwrapHashlineHeaderPath } from "./tools/hashline-header-path";
+import { stripWriteContent } from "./tools/write-content";
+import { parseDeviceArgs, resolveXdevTool } from "./tools/xdev";
 import { queueResolveHandler } from "./tools/resolve";
 import { ttsTool } from "./tools/tts";
 import { resolveActiveRepoContext } from "./utils/active-repo-context";
@@ -507,7 +514,10 @@ const cfgSkillsAndCommandsDiscovery = combine({
 });
 
 /** Settings deciding which configured extension sources a session loads. */
-const cfgExtensionSources = combine({ extensions: cfgExtensions, disabledExtensions: cfgDisabledExtensions });
+const cfgExtensionSources = combine({
+	extensions: cfgExtensions,
+	disabledExtensions: cfgDisabledExtensions,
+});
 
 type McpNotificationEntry = {
 	serverName: string;
@@ -515,7 +525,13 @@ type McpNotificationEntry = {
 };
 
 type LateDiagnosticsDetails = {
-	files: Array<{ path: string; summary: string; errored: boolean; messages: string[]; unreported?: string[] }>;
+	files: Array<{
+		path: string;
+		summary: string;
+		errored: boolean;
+		messages: string[];
+		unreported?: string[];
+	}>;
 };
 
 function buildLateDiagnosticsBatchMessage(
@@ -1343,11 +1359,20 @@ export async function resolvePrewalkTarget(
 		deferUnregistered = false,
 		beforeRefresh,
 		settings,
-	}: { deferUnregistered?: boolean; beforeRefresh?: () => Promise<void>; settings?: Settings } = {},
+	}: {
+		deferUnregistered?: boolean;
+		beforeRefresh?: () => Promise<void>;
+		settings?: Settings;
+	} = {},
 ): Promise<{ prewalk?: Prewalk; warnings: string[]; deferred: boolean }> {
 	let refreshedProviders: Set<string> | undefined;
 	const resolveCandidate = (pattern: string) =>
-		resolveCliModel({ cliModel: pattern, modelRegistry, preferences, settings });
+		resolveCliModel({
+			cliModel: pattern,
+			modelRegistry,
+			preferences,
+			settings,
+		});
 	let authenticated: ResolveCliModelResult | undefined;
 	let firstUnauthenticated: ResolveCliModelResult | undefined;
 	let lastResolution: ResolveCliModelResult | undefined;
@@ -1419,7 +1444,14 @@ export async function resolvePrewalkTarget(
 	} else if (!modelRegistry.hasConfiguredAuth(resolved.model)) {
 		warnings.push(`prewalk disabled — no API key for ${resolved.model.provider}/${resolved.model.id}`);
 	} else {
-		return { prewalk: { target: resolved.model, thinkingLevel: resolved.thinkingLevel }, warnings, deferred: false };
+		return {
+			prewalk: {
+				target: resolved.model,
+				thinkingLevel: resolved.thinkingLevel,
+			},
+			warnings,
+			deferred: false,
+		};
 	}
 	return { warnings, deferred: false };
 }
@@ -1609,6 +1641,10 @@ export function customToolToDefinition(tool: CustomTool, sourcePath?: string): T
 		loadMode: defaultLoadModeForToolName(tool.name, tool.loadMode),
 		deferrable: tool.deferrable,
 		readsSkillUris: tool.readsSkillUris,
+		cancellationBehavior:
+			typeof tool.cancellationBehavior === "function"
+				? tool.cancellationBehavior.bind(tool)
+				: tool.cancellationBehavior,
 		approval: typeof tool.approval === "function" ? tool.approval.bind(tool) : tool.approval,
 		// Extension tools take part in Ask-and-remember grants through the same bridge.
 		approvalCacheTargets:
@@ -1634,7 +1670,11 @@ export function customToolToDefinition(tool: CustomTool, sourcePath?: string): T
 			? (result, options, theme): Component => {
 					const component = tool.renderResult?.(
 						result,
-						{ expanded: options.expanded, isPartial: options.isPartial, spinnerFrame: options.spinnerFrame },
+						{
+							expanded: options.expanded,
+							isPartial: options.isPartial,
+							spinnerFrame: options.spinnerFrame,
+						},
 						theme,
 					);
 					// Return empty component if undefined to match Component type requirement
@@ -1680,7 +1720,10 @@ function createCustomToolsExtension(tools: CustomTool[], sourcePaths?: ReadonlyM
 				try {
 					await tool.onSession(event, createCustomToolContext(ctx));
 				} catch (err) {
-					logger.warn("Custom tool onSession error", { tool: tool.name, error: String(err) });
+					logger.warn("Custom tool onSession error", {
+						tool: tool.name,
+						error: String(err),
+					});
 				}
 			}
 		};
@@ -1701,7 +1744,14 @@ function createCustomToolsExtension(tools: CustomTool[], sourcePaths?: ReadonlyM
 			runOnSession({ reason: "shutdown", previousSessionFile: undefined }, ctx),
 		);
 		api.on("auto_compaction_start", async (event, ctx) =>
-			runOnSession({ reason: "auto_compaction_start", trigger: event.reason, action: event.action }, ctx),
+			runOnSession(
+				{
+					reason: "auto_compaction_start",
+					trigger: event.reason,
+					action: event.action,
+				},
+				ctx,
+			),
 		);
 		api.on("auto_compaction_end", async (event, ctx) =>
 			runOnSession(
@@ -1834,6 +1884,7 @@ const CAPTURE_DROPPED_KEYS = [
 	"speculation",
 	"interruptible",
 	"handlesToolInterrupt",
+	"cancellationBehavior",
 	"matcherDigest",
 	"matcherPaths",
 	"matcherEntries",
@@ -1864,7 +1915,10 @@ function refusedCaptureTool(tool: AgentTool): AgentTool {
 		label: tool.label,
 		description: tool.description,
 		parameters: tool.parameters,
-		execute: async () => ({ content: [{ type: "text", text: CAPTURE_REFUSED }], isError: true }),
+		execute: async () => ({
+			content: [{ type: "text", text: CAPTURE_REFUSED }],
+			isError: true,
+		}),
 	};
 	for (const key of CAPTURE_ADVERTISED_KEYS) if (tool[key] !== undefined) Object.assign(refused, { [key]: tool[key] });
 	return refused;
@@ -1923,7 +1977,11 @@ export function createAutoLearnCaptureRunner(
 			options.sourceAgent.sessionId;
 		// Resolve headers once so the tool list and the request agree on which tools the host runs.
 		const captureModel: Model = sourceModel.resolveHeaders
-			? { ...sourceModel, resolveHeaders: undefined, headers: { ...(await sourceModel.resolveHeaders(signal)) } }
+			? {
+					...sourceModel,
+					resolveHeaders: undefined,
+					headers: { ...(await sourceModel.resolveHeaders(signal)) },
+				}
 			: sourceModel;
 		if (signal?.aborted) return;
 		const hostRuns = (name: string) => hostRunsTool(captureModel, name);
@@ -1951,7 +2009,12 @@ export function createAutoLearnCaptureRunner(
 							: block,
 					);
 				}
-				return { ...message, content, responseId: undefined, providerPayload: undefined };
+				return {
+					...message,
+					content,
+					responseId: undefined,
+					providerPayload: undefined,
+				};
 			}
 			if (message.role === "user" || message.role === "developer") {
 				return { ...message, providerPayload: undefined };
@@ -2107,7 +2170,11 @@ async function createAgentSessionScoped(
 	let modelRegistry =
 		options.modelRegistry ??
 		new ModelRegistry(
-			options.authStorage ?? (await logger.time("discoverModels", discoverAuthStorage, agentDir, { settings, cwd })),
+			options.authStorage ??
+				(await logger.time("discoverModels", discoverAuthStorage, agentDir, {
+					settings,
+					cwd,
+				})),
 			path.join(agentDir, "models.yml"),
 			{
 				settings,
@@ -2209,7 +2276,9 @@ async function createAgentSessionScoped(
 		try {
 			return await resolveActiveRepoContext(repoCwd);
 		} catch (err) {
-			logger.debug("Failed to resolve active repo context", { err: String(err) });
+			logger.debug("Failed to resolve active repo context", {
+				err: String(err),
+			});
 			return null;
 		}
 	};
@@ -2285,8 +2354,8 @@ async function createAgentSessionScoped(
 			(provider, explicit) => explicit || !ownPins.has(provider),
 		);
 	}
-	// From here on the session resolves every key through its pools; see
-	// SessionAccountPoolScope. A startup failure leaves no session to lift them.
+	// From here on the session resolves every key through its SessionAccountPoolScope.
+	// Session ownership transfers after construction; earlier failures release them here.
 	const accountPoolScope = SessionAccountPoolScope.create(modelRegistry, options.oauthAccountPools, providerSessionId);
 	let accountPoolOwnedBySession = false;
 	if (accountPoolScope) {
@@ -2567,7 +2636,12 @@ async function createAgentSessionScoped(
 		if (existingSession.injectedTtsrRules.length > 0) {
 			ttsrManager.restoreInjected(existingSession.injectedTtsrRules);
 		}
-		return { ttsrManager, rulebookRules, alwaysApplyRules, allRules: rulesResult.items };
+		return {
+			ttsrManager,
+			rulebookRules,
+			alwaysApplyRules,
+			allRules: rulesResult.items,
+		};
 	});
 	const { ttsrManager, allRules } = discovered;
 	// Mutable so the mid-session prompt rebuild (on /clear and /new) can re-discover
@@ -2620,6 +2694,7 @@ async function createAgentSessionScoped(
 		options.getApiKey ?? (requestModel => modelRegistry.resolver(requestModel, agent.sessionId));
 	let session!: AgentSession;
 	let hasSession = false;
+	let sessionHandedOff = false;
 	let hasRegistered = false;
 	const restrictToolNames = options.restrictToolNames === true;
 	// The session tree shares one cost gate: a subagent is given its parent's; a root
@@ -2802,7 +2877,36 @@ async function createAgentSessionScoped(
 		// entries capture it at fetch time and are dropped at injection if a newer
 		// mutation (any tool) bumped it in the meantime.
 		const fileMutationVersions = new Map<string, number>();
-		const disposeCallbacks = new Set<() => void>();
+		const disposeCallbacks = new Set<() => void | Promise<void>>();
+		const beginDisposeCallbacks = new Set<() => void | Promise<void>>();
+		const deferredToolSessionChangeCallbacks = new Map<() => void | Promise<void>, (() => void) | undefined>();
+		const pendingDisposeCallbackCleanups: Promise<void>[] = [];
+		const queueDisposeCallback = (callback: () => void | Promise<void>, phase: "begin" | "complete"): void => {
+			let cleanup: void | Promise<void>;
+			try {
+				cleanup = callback();
+			} catch (error) {
+				cleanup = Promise.reject(error);
+			}
+			if (!isPromise(cleanup)) return;
+			pendingDisposeCallbackCleanups.push(cleanup);
+			void cleanup.catch(error =>
+				logger.warn(`Session ${phase}-dispose callback failed`, {
+					error: String(error),
+				}),
+			);
+		};
+		const drainDisposeCallbackCleanups = async (): Promise<void> => {
+			let failures: unknown[] | undefined;
+			while (pendingDisposeCallbackCleanups.length > 0) {
+				const results = await Promise.allSettled(pendingDisposeCallbackCleanups.splice(0));
+				for (const result of results) {
+					if (result.status === "rejected") (failures ??= []).push(result.reason);
+				}
+			}
+			if (failures?.length === 1) throw failures[0];
+			if (failures) throw new AggregateError(failures, "Session dispose callback cleanup failed");
+		};
 		const activeToolNames = new Set<string>();
 		const toolRegistry = new Map<string, Tool & Pick<ToolDefinition, "defaultInactive">>();
 		const setActiveToolNames = (names: Iterable<string>): void => {
@@ -3049,6 +3153,62 @@ async function createAgentSessionScoped(
 				session ? session.trackEvalExecution(execution, abortController) : execution,
 			getSessionId: () => sessionManager.getSessionId?.() ?? null,
 			isDisposed: () => session?.isDisposed ?? false,
+			getToolExecutionCapabilities: (tool, args) => {
+				if (
+					!hasSession ||
+					session.isDisposed ||
+					!sessionManager.getSessionId() ||
+					resolveToolCancellationBehavior(tool, args) !== "await-cleanup"
+				)
+					return undefined;
+				const direct =
+					agent.state.tools.find(candidate => candidate.name === tool.name) ??
+					(toolSession.xdev && resolveMountedXdevExecutable(toolSession.xdev, tool.name));
+				if (
+					direct &&
+					resolveToolCancellationBehavior(direct, args) === "await-cleanup" &&
+					Bun.deepEquals(getCleanupOwnedToolCallArgs(direct), args)
+				)
+					return TOOL_EXECUTION_HOST_CAPABILITIES;
+				const target = toolSession.xdev && resolveXdevTool(toolSession.xdev, tool.name);
+				const executable =
+					target && toolSession.xdev ? (toolSession.xdev.decorateExecution?.(target) ?? target) : undefined;
+				const writer = agent.state.tools.find(candidate => candidate.name === "write");
+				if (
+					!target ||
+					!executable ||
+					!writer ||
+					resolveToolCancellationBehavior(executable, args) !== "await-cleanup"
+				)
+					return undefined;
+				const invocation = getCleanupOwnedToolCallArgs(writer);
+				if (
+					!invocation ||
+					typeof invocation !== "object" ||
+					!("path" in invocation) ||
+					typeof invocation.path !== "string" ||
+					!("content" in invocation) ||
+					typeof invocation.content !== "string" ||
+					resolveToolCancellationBehavior(writer, invocation) !== "await-cleanup"
+				)
+					return undefined;
+				try {
+					const router = InternalUrlRouter.instance();
+					const { path } = recoverConflictUriPrefix(
+						router.peelWriteSelector(unwrapHashlineHeaderPath(invocation.path), "write"),
+					);
+					if (path !== `xd://${tool.name}`) return undefined;
+					const writeTarget = router.writeTarget(path);
+					const content =
+						writeTarget?.spec.write?.payload === "verbatim"
+							? invocation.content
+							: stripWriteContent(toolSession, invocation.content).text;
+					const normalized = parseDeviceArgs(target, content, "execution-capability", () => "");
+					return Bun.deepEquals(normalized, args) ? TOOL_EXECUTION_HOST_CAPABILITIES : undefined;
+				} catch {
+					return undefined;
+				}
+			},
 			captureOwnerCurrent: ({ allowParked = false } = {}) => captureSessionOwner(allowParked),
 			captureRequestOwner,
 			captureOwnerLifetimeCurrent: () => {
@@ -3101,11 +3261,24 @@ async function createAgentSessionScoped(
 			queueLaunchCompletion: notification =>
 				session?.queueLaunchCompletion(notification) ??
 				Promise.reject(new Error("Session unavailable for launch completion delivery")),
-			registerDisposeCallback: callback => {
-				disposeCallbacks.add(callback);
-				return () => disposeCallbacks.delete(callback);
+			registerDisposeCallback: (callback, options) => {
+				if (options?.phase === "begin" && hasSession && session.isDisposed) {
+					queueDisposeCallback(callback, "begin");
+					return () => {};
+				}
+				const callbacks = options?.phase === "begin" ? beginDisposeCallbacks : disposeCallbacks;
+				callbacks.add(callback);
+				return () => callbacks.delete(callback);
 			},
-			registerSessionChangeCallback: callback => session?.registerSessionChangeCallback(callback),
+			registerSessionChangeCallback: callback => {
+				if (hasSession) return session.registerSessionChangeCallback(callback);
+				deferredToolSessionChangeCallbacks.set(callback, undefined);
+				return () => {
+					const unsubscribe = deferredToolSessionChangeCallbacks.get(callback);
+					deferredToolSessionChangeCallbacks.delete(callback);
+					unsubscribe?.();
+				};
+			},
 			bumpFileMutationVersion: path => {
 				const next = (fileMutationVersions.get(path) ?? 0) + 1;
 				fileMutationVersions.set(path, next);
@@ -4250,7 +4423,10 @@ async function createAgentSessionScoped(
 				modelRegistry,
 				modelMatchPreferences,
 				disabledProviderIds(settings),
-				{ beforeRefresh: discoveryInFlight ? () => discoveryInFlight : undefined, settings },
+				{
+					beforeRefresh: discoveryInFlight ? () => discoveryInFlight : undefined,
+					settings,
+				},
 			);
 			prewalk = selection.prewalk;
 			deferredPrewalk = undefined;
@@ -4515,7 +4691,10 @@ async function createAgentSessionScoped(
 		// reconcile can add and remove exactly the entries it owns and never a
 		// same-named extension tool, which keeps precedence over them.
 		const settingsGatedCustomEntries = new Map<string, Tool>();
-		const reconcileSettingsGatedCustomTools = async (): Promise<{ added: Tool[]; removed: string[] }> => {
+		const reconcileSettingsGatedCustomTools = async (): Promise<{
+			added: Tool[];
+			removed: string[];
+		}> => {
 			const added: Tool[] = [];
 			const removed: string[] = [];
 			if (restrictToolNames) return { added, removed };
@@ -4690,7 +4869,11 @@ async function createAgentSessionScoped(
 			const custom = await reconcileSettingsGatedCustomTools();
 			removed.push(...custom.removed);
 			for (const entry of custom.added) {
-				added.push({ name: entry.name, builtIn: false, activate: entry.hidden !== true });
+				added.push({
+					name: entry.name,
+					builtIn: false,
+					activate: entry.hidden !== true,
+				});
 			}
 			syncXdevState();
 			return { added, removed, xdev: toolSession.xdev };
@@ -4885,7 +5068,10 @@ async function createAgentSessionScoped(
 					options.rules ??
 						logger
 							.time("rediscoverRules", () =>
-								loadCapability<Rule>(ruleCapability.id, { cwd: promptCwd, agentDir }),
+								loadCapability<Rule>(ruleCapability.id, {
+									cwd: promptCwd,
+									agentDir,
+								}),
 							)
 							.then(result => result.items),
 				]);
@@ -5042,7 +5228,10 @@ async function createAgentSessionScoped(
 			const promptTools = projectSystemPromptToolMetadata(
 				tools,
 				nativeTools && !inlineToolDescriptors
-					? { mode: "compact", toolNames: [...toolNames, ...mountedPromptToolNames] }
+					? {
+							mode: "compact",
+							toolNames: [...toolNames, ...mountedPromptToolNames],
+						}
 					: { mode: "full" },
 			);
 			const defaultPrompt = await buildSystemPromptInternal({
@@ -6035,6 +6224,7 @@ async function createAgentSessionScoped(
 			titleSystemPrompt: options.titleSystemPrompt,
 			autoTitle: options.autoTitle === true && !isSubagentSession,
 		});
+		// Own the session before forwarding callbacks that can throw during startup.
 		hasSession = true;
 		session.setSideRequestOwnerCapture(toolSession.captureOwnerCurrent!, transitionOwnerCurrent =>
 			captureSessionOwner(false, transitionOwnerCurrent),
@@ -6042,6 +6232,109 @@ async function createAgentSessionScoped(
 		accountPoolOwnedBySession = true;
 		session.addDisposer(retireSubagentApprovalScope);
 		session.addDisposer(session.registerSessionChangeCallback(retireSubagentApprovalScope));
+		session.addDisposer(() => {
+			for (const callback of beginDisposeCallbacks) {
+				beginDisposeCallbacks.delete(callback);
+				queueDisposeCallback(callback, "begin");
+			}
+			return drainDisposeCallbackCleanups();
+		});
+		// MCP notification bridge cleanup — assigned when the bridge is wired below,
+		// invoked from the dispose wrapper AND registered as a postmortem so both
+		// explicit-dispose (SDK embedders that reuse the process across sessions) and
+		// process-exit paths tear the listener down. Nulled after use so the closure
+		// graph (`extensionRunner`, `session`) can be GC'd instead of retained by the
+		// process-global postmortem list.
+		let unsubscribeMcpNotifications: (() => void) | undefined;
+		let unregisterMcpPostmortem: (() => void) | undefined;
+
+		{
+			const originalDispose = session.dispose.bind(session);
+			let tinyClientReleased = false;
+			let disposeCall: Promise<void> | undefined;
+			const disposeSession: AgentSession["dispose"] = async options => {
+				const failures: unknown[] = [];
+				try {
+					// Reject new session work (eval starts) the moment disposal
+					// begins — the lifecycle await below opens an async gap before
+					// AgentSession.dispose() would otherwise set its guards.
+					session.beginDispose();
+					if (sessionHandedOff && agentKind === "main") {
+						// Top-level teardown owns the global agent lifecycle: park timers,
+						// adopted subagent sessions, revivers. Tear it down while shared
+						// resources (kernels, MCP, LSP) are still live. Subagent disposal
+						// must NOT touch the global lifecycle.
+						const vibeRegistry = VibeSessionRegistry.global();
+						const vibeParentSession = {
+							getAgentId: () => resolvedAgentId,
+							getSessionId: () => sessionManager.getSessionId(),
+							getSessionFile: () => sessionManager.getSessionFile() ?? null,
+							sessionManager,
+							asyncJobManager: scopedAsyncJobManager,
+							settings,
+							getActiveModelString,
+						};
+						await vibeRegistry.suspendScope(vibeRegistry.ownerScope(vibeParentSession), scopedAsyncJobManager);
+						await AgentLifecycleManager.global().dispose();
+					}
+				} catch (error) {
+					failures.push(error);
+				}
+				try {
+					await originalDispose(options);
+				} catch (error) {
+					failures.push(error);
+				} finally {
+					// The tiny-model client is a process singleton shared by every session.
+					// Only the session that owns process state drops its connections, once:
+					// that fails every request still in flight, and a repeat dispose must not
+					// cancel requests other sessions made since.
+					if (sessionHandedOff && bindsProcessState && !tinyClientReleased) {
+						tinyClientReleased = true;
+						try {
+							await shutdownTinyTitleClient();
+						} catch (error) {
+							logger.warn("Session dispose: tiny-model client shutdown failed", { error: String(error) });
+						}
+					}
+					try {
+						unregisterUnlessParked();
+						unsubscribeCredentialDisabled();
+						unbindSessionEffects?.();
+						restoreProviderToggles?.();
+						unsubscribeMcpNotifications?.();
+						unregisterMcpPostmortem?.();
+						for (const unsubscribe of deferredToolSessionChangeCallbacks.values()) unsubscribe?.();
+						deferredToolSessionChangeCallbacks.clear();
+					} catch (error) {
+						failures.push(error);
+					}
+					do {
+						for (const callback of disposeCallbacks) {
+							disposeCallbacks.delete(callback);
+							queueDisposeCallback(callback, "complete");
+						}
+						try {
+							await drainDisposeCallbackCleanups();
+						} catch (error) {
+							failures.push(error);
+						}
+					} while (disposeCallbacks.size > 0 || pendingDisposeCallbackCleanups.length > 0);
+					try {
+						await releaseDsmReferences(toolSession);
+					} catch (error) {
+						failures.push(error);
+					}
+					// Drop refs so the process-global postmortem list doesn't retain
+					// the bridge closure past explicit dispose.
+					unsubscribeMcpNotifications = undefined;
+					unregisterMcpPostmortem = undefined;
+				}
+				if (failures.length === 1) throw failures[0];
+				if (failures.length > 1) throw new AggregateError(failures, "Session disposal failed");
+			};
+			session.dispose = options => (disposeCall ??= disposeSession(options));
+		}
 		if (inheritedWidgetOwnerCurrent)
 			options.asyncJobManager?.bindWidgetSession?.(inheritedWidgetOwnerCurrent, session);
 		if (toolSession.captureWidgetProducer) {
@@ -6056,6 +6349,9 @@ async function createAgentSessionScoped(
 		// The session now owns its cost gate.
 		if (options.deferSkillDescriptionCompression !== true) skillDescriptions.startCompression();
 		credentialNoticeSession = session;
+		for (const callback of deferredToolSessionChangeCallbacks.keys()) {
+			deferredToolSessionChangeCallbacks.set(callback, session.registerSessionChangeCallback(callback));
+		}
 		// Tool state belongs to one conversation: /new and switchSession fire the
 		// change callbacks, so start a fresh one there. Stale hashline tags would
 		// otherwise surface as "issued in this session" in mismatch diagnostics
@@ -6105,8 +6401,8 @@ async function createAgentSessionScoped(
 		}
 		if (ownedSkillDescriptionStore) {
 			// Let in-flight compressions land before releasing the file.
-			session.addDisposer(
-				() => void skillDescriptions.waitForPending().finally(() => ownedSkillDescriptionStore.close()),
+			session.addDisposer(() =>
+				skillDescriptions.waitForPending().finally(() => ownedSkillDescriptionStore.close()),
 			);
 		}
 		// A caller-supplied store belongs to the caller (the CLI keeps it in sync itself).
@@ -6570,7 +6866,7 @@ async function createAgentSessionScoped(
 
 		// Attach the live session to the pre-registered ref so peers can route IRC
 		// messages here. Refresh sessionFile in case it was unavailable at pre-register
-		// time. The dispose wrapper below unregisters on teardown (unless parked).
+		// time. The dispose wrapper unregisters on teardown (unless parked).
 		if (
 			!registeredAgentRef ||
 			!agentRegistry.attachSession(
@@ -6590,75 +6886,6 @@ async function createAgentSessionScoped(
 				agentRegistry.attachSession(resolvedAgentId, session, sessionManager.getSessionFile() ?? null, attachedRef);
 			}),
 		);
-		// MCP notification bridge cleanup — assigned when the bridge is wired below,
-		// invoked from the dispose wrapper AND registered as a postmortem so both
-		// explicit-dispose (SDK embedders that reuse the process across sessions) and
-		// process-exit paths tear the listener down. Nulled after use so the closure
-		// graph (`extensionRunner`, `session`) can be GC'd instead of retained by the
-		// process-global postmortem list.
-		let unsubscribeMcpNotifications: (() => void) | undefined;
-		let unregisterMcpPostmortem: (() => void) | undefined;
-
-		{
-			const originalDispose = session.dispose.bind(session);
-			let tinyClientReleased = false;
-			session.dispose = async (disposeOptions?: AgentSessionDisposeOptions) => {
-				try {
-					// Reject new session work (eval starts) the moment disposal
-					// begins — the lifecycle await below opens an async gap before
-					// AgentSession.dispose() would otherwise set its guards.
-					session.beginDispose();
-					if (agentKind === "main") {
-						// Top-level teardown owns the global agent lifecycle: park timers,
-						// adopted subagent sessions, revivers. Tear it down while shared
-						// resources (kernels, MCP, LSP) are still live. Subagent disposal
-						// must NOT touch the global lifecycle.
-						const vibeRegistry = VibeSessionRegistry.global();
-						const vibeParentSession = {
-							getAgentId: () => resolvedAgentId,
-							getSessionId: () => sessionManager.getSessionId(),
-							getSessionFile: () => sessionManager.getSessionFile() ?? null,
-							sessionManager,
-							asyncJobManager: scopedAsyncJobManager,
-							settings,
-							getActiveModelString,
-						};
-						await vibeRegistry.suspendScope(vibeRegistry.ownerScope(vibeParentSession), scopedAsyncJobManager);
-						await AgentLifecycleManager.global().dispose();
-					}
-					await originalDispose(disposeOptions);
-				} finally {
-					// The tiny-model client is a process singleton shared by every session.
-					// Only the session that owns process state drops its connections, once:
-					// that fails every request still in flight, and a repeat dispose must not
-					// cancel requests other sessions made since.
-					if (bindsProcessState && !tinyClientReleased) {
-						tinyClientReleased = true;
-						try {
-							await shutdownTinyTitleClient();
-						} catch (error) {
-							logger.warn("Session dispose: tiny-model client shutdown failed", { error: String(error) });
-						}
-					}
-					unregisterUnlessParked();
-					unsubscribeCredentialDisabled();
-					unbindSessionEffects?.();
-					restoreProviderToggles?.();
-					unsubscribeMcpNotifications?.();
-					unregisterMcpPostmortem?.();
-					try {
-						for (const callback of disposeCallbacks) callback();
-					} finally {
-						disposeCallbacks.clear();
-						await releaseDsmReferences(toolSession);
-					}
-					// Drop refs so the process-global postmortem list doesn't retain
-					// the bridge closure past explicit dispose.
-					unsubscribeMcpNotifications = undefined;
-					unregisterMcpPostmortem = undefined;
-				}
-			};
-		}
 		disposeCallbacks.add(
 			settings.onEffectiveChange(
 				allSettings().filter(setting => setting.definition.credential === true),
@@ -6670,7 +6897,11 @@ async function createAgentSessionScoped(
 		if (prewarmModel?.api === "openai-codex-responses") {
 			// `.api` equality doesn't narrow the generic; the guard makes this cast sound.
 			const codexModel = prewarmModel as Model<"openai-codex-responses">;
-			if (isOpenAICodexWebSocketPreferred(codexModel, { preferWebsockets: session.preferWebsockets })) {
+			if (
+				isOpenAICodexWebSocketPreferred(codexModel, {
+					preferWebsockets: session.preferWebsockets,
+				})
+			) {
 				void (async () => {
 					try {
 						const codexPrewarmApiKey = options.getApiKey
@@ -6758,7 +6989,10 @@ async function createAgentSessionScoped(
 						if (!cfgStartupQuiet.get(settings)) eventBus.emit(LSP_STARTUP_EVENT_CHANNEL, event);
 					} catch (error) {
 						const errorMessage = error instanceof Error ? error.message : String(error);
-						logger.warn("LSP server warmup failed", { cwd, error: errorMessage });
+						logger.warn("LSP server warmup failed", {
+							cwd,
+							error: errorMessage,
+						});
 						for (const server of startupLspServers) {
 							server.status = "error";
 							server.error = errorMessage;
@@ -6899,7 +7133,9 @@ async function createAgentSessionScoped(
 			ownedMcpManager.setOnPromptsChanged(serverName => {
 				const promptCommands = buildMCPPromptCommands(ownedManager);
 				session.setMCPPromptCommands(promptCommands);
-				logger.debug("MCP prompt commands refreshed", { path: `mcp:${serverName}` });
+				logger.debug("MCP prompt commands refreshed", {
+					path: `mcp:${serverName}`,
+				});
 			});
 			const notificationDebounceTimers = new Map<string, Timer>();
 			const clearDebounceTimers = () => {
@@ -7010,7 +7246,10 @@ async function createAgentSessionScoped(
 					if (!isActive()) throw new Error("Deferred extension owner changed before provider registration");
 					modelRegistry.registerProvider(name, config, sourceId);
 				}
-				await extensionRunner.addExtensions(loaded.extensions, { isActive, onBound: allowReentrantMessages });
+				await extensionRunner.addExtensions(loaded.extensions, {
+					isActive,
+					onBound: allowReentrantMessages,
+				});
 				if (!isActive()) throw new Error("Deferred extension owner changed while activating");
 				activated = true;
 				const deferredPrepared = loaded.preparedExtensions ?? [];
@@ -7024,6 +7263,7 @@ async function createAgentSessionScoped(
 		startDeferredMCPDiscovery?.(session);
 
 		startupCleanup.move();
+		sessionHandedOff = true;
 		return {
 			session,
 			captureOwnerCurrent: toolSession.captureOwnerCurrent!,

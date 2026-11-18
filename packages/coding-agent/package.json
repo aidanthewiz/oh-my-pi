@@ -552,6 +552,9 @@
 	},
 	"dependencies": {
 		"@agentclientprotocol/sdk": "catalog:",
+		"@aws-sdk/client-secrets-manager": "3.1150.0",
+		"@aws-sdk/client-sso": "3.1150.0",
+		"@aws-sdk/client-sts": "3.1150.0",
 		"@azure/msal-node": "catalog:",
 		"@babel/parser": "catalog:",
 		"@oh-my-pi/omp-stats": "catalog:",

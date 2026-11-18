@@ -7,6 +7,7 @@
  */
 /** Blob-broker selector shared by the CLI dispatcher and worker launcher. */
 export const BLOB_BROKER_WORKER_ARG = "__omp_worker_blob_broker";
+export const AWS_SECRET_INPUT_WORKER_ARG = "__omp_worker_aws_secret_input";
 /** Computer-worker selector shared by the CLI dispatcher and worker launcher. */
 export const COMPUTER_WORKER_ARG = "__omp_worker_computer";
 /** Daemon-broker selector shared by the CLI dispatcher and worker launcher. */

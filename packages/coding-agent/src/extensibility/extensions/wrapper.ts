@@ -7,6 +7,7 @@ import {
 	type AgentToolResult,
 	type AgentToolUpdateCallback,
 	isNonBlankContext,
+	resolveToolCancellationBehavior,
 	type ToolLoadMode,
 } from "@oh-my-pi/pi-agent-core";
 import type { ComputerSafetyCheck, ImageContent, Static, TextContent, TSchema } from "@oh-my-pi/pi-ai";
@@ -37,7 +38,13 @@ import { withFileMutationSession } from "../../tools/file-write-fallback";
 import { mcpToolEventIdentity, normalizeToolEventInput, resolveToolEventInput } from "../tool-event-input";
 import { applyToolProxy } from "../tool-proxy";
 import type { ExtensionRunner } from "./runner";
-import type { ExtensionAgentIdentity, RegisteredTool, ToolCallEventResult, ToolResultEvent } from "./types";
+import type {
+	ExtensionAgentIdentity,
+	RegisteredTool,
+	ToolCallEventResult,
+	ToolResultEvent,
+	ToolResultEventResult,
+} from "./types";
 
 /**
  * Second `renderCall` argument that satisfies both the omp and the upstream-pi
@@ -84,6 +91,7 @@ export class RegisteredToolAdapter implements AgentTool<any, any, any> {
 	declare parameters: any;
 	declare label: string;
 	declare strict: boolean;
+	declare readonly cancellationBehavior?: AgentTool["cancellationBehavior"];
 
 	renderCall?: (args: any, options: any, theme: any) => any;
 	renderResult?: (result: any, options: any, theme: any, args?: any) => any;
@@ -231,6 +239,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 	declare parameters: TParameters;
 	declare label: string;
 	declare strict: boolean;
+	declare readonly cancellationBehavior?: AgentTool["cancellationBehavior"];
 	readonly #agent: ExtensionAgentIdentity | undefined;
 
 	constructor(
@@ -810,6 +819,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		// Execute the actual tool
 		let result: AgentToolResult<TDetails, TParameters>;
 		let executionError: Error | undefined;
+		const awaitCleanup = resolveToolCancellationBehavior(this.tool, effectiveParams) === "await-cleanup";
 
 		try {
 			// Name the owning session for process-wide file-mutation fallbacks and
@@ -828,31 +838,47 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				details: undefined as TDetails,
 			};
 		}
+		const executionResult = result;
+		const retainsCleanupResult = !executionError && awaitCleanup;
 		try {
+			if (retainsCleanupResult && signal?.aborted) return executionResult;
 			if (!loopDispatchedToolCall) {
-				const postflight = await this.runner.runToolCallPreflightAfter?.(toolCallId, result, context);
-				if (postflight) result = postflight as AgentToolResult<TDetails, TParameters>;
+				try {
+					const postflight = await this.runner.runToolCallPreflightAfter?.(toolCallId, result, context);
+					if (retainsCleanupResult && signal?.aborted) return executionResult;
+					if (postflight) result = postflight as AgentToolResult<TDetails, TParameters>;
+				} catch (error) {
+					if (retainsCleanupResult && signal?.aborted) return executionResult;
+					throw error;
+				}
 			}
 
 			// Emit tool_result event - extensions can modify the result and error status
 			if (resultMcpIdentity) {
-				const resultResult = await this.runner.emitToolResult(
-					{
-						type: "tool_result",
-						toolName: this.tool.name,
-						toolCallId,
-						...resultMcpIdentity,
-						...resultOrigin,
-						input: normalizeToolEventInput(
-							this.tool.name,
-							resolveToolEventInput(this.tool, toolEventArgs(effectiveParams, context)),
-						),
-						content: result.content,
-						details: result.details,
-						isError: !!executionError || result.isError === true,
-					},
-					this.#agent,
-				);
+				let resultResult: ToolResultEventResult | undefined;
+				try {
+					resultResult = await this.runner.emitToolResult(
+						{
+							type: "tool_result",
+							toolName: this.tool.name,
+							toolCallId,
+							...resultMcpIdentity,
+							...resultOrigin,
+							input: normalizeToolEventInput(
+								this.tool.name,
+								resolveToolEventInput(this.tool, toolEventArgs(effectiveParams, context)),
+							),
+							content: result.content,
+							details: result.details,
+							isError: !!executionError || result.isError === true,
+						},
+						this.#agent,
+					);
+				} catch (error) {
+					if (retainsCleanupResult && signal?.aborted) return executionResult;
+					throw error;
+				}
+				if (retainsCleanupResult && signal?.aborted) return executionResult;
 
 				// Handler context reports into this call's sink like tool-authored
 				// context: it is delivered even for a failed call (the handler saw

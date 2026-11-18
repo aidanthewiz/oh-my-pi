@@ -110,7 +110,9 @@ describe("AgentSession account pools after a dispose deadline", () => {
 		const codexResetCoordinator = createCodexAutoRedeemCoordinator();
 		codexResetCoordinator.resetLockPath = path.join(tempDir.path(), "reset-fences");
 		const session = new AgentSession({
-			agent: new Agent({ initialState: { model, systemPrompt: ["test"], tools: [] } }),
+			agent: new Agent({
+				initialState: { model, systemPrompt: ["test"], tools: [] },
+			}),
 			sessionManager,
 			settings: Settings.isolated(),
 			modelRegistry,
@@ -183,7 +185,12 @@ describe("AgentSession account pools after a dispose deadline", () => {
 		vi.spyOn(authStorage.resets, "redeem").mockImplementation(async () => {
 			entered.resolve();
 			await response.promise;
-			return { ok: true, code: "reset", provider: "anthropic", creditId: "synthetic-credit" };
+			return {
+				ok: true,
+				code: "reset",
+				provider: "anthropic",
+				creditId: "synthetic-credit",
+			};
 		});
 		const redemption = session.redeemResetCredit({
 			provider: "anthropic",
@@ -416,7 +423,10 @@ describe("AgentSession account pools after a dispose deadline", () => {
 						sessionManager: SessionManager.inMemory(tempDir.path()),
 						authStorage,
 						modelRegistry: new ModelRegistry(authStorage, tempDir.join("models.yml")),
-						settings: Settings.isolated({ "async.enabled": false, "compaction.enabled": false }),
+						settings: Settings.isolated({
+							"async.enabled": false,
+							"compaction.enabled": false,
+						}),
 						model,
 						providerSessionId: PROVIDER_SESSION_ID,
 						oauthAccountPools: { anthropic: ["email:c@example.com|org:org-c"] },
@@ -444,7 +454,10 @@ describe("SDK inherited account-pool lifetime", () => {
 	let model: Model<Api>;
 	let outsideCredentialId: number;
 	let sessions: AgentSession[];
-	let requests: Array<{ sessionId: string | undefined; key: string | undefined }>;
+	let requests: Array<{
+		sessionId: string | undefined;
+		key: string | undefined;
+	}>;
 
 	function registerModel(registry: ModelRegistry): void {
 		registry.registerProvider(provider, {
@@ -478,7 +491,10 @@ describe("SDK inherited account-pool lifetime", () => {
 			login: async () => {
 				throw new Error("Login is not used");
 			},
-			refreshToken: async credentials => ({ ...credentials, expires: Date.now() + 3_600_000 }),
+			refreshToken: async credentials => ({
+				...credentials,
+				expires: Date.now() + 3_600_000,
+			}),
 			getApiKey: credentials => credentials.access,
 		});
 		registerCustomApi(
@@ -586,9 +602,63 @@ describe("SDK inherited account-pool lifetime", () => {
 		expect(requests.slice(before)).toEqual([{ sessionId: session.agent.sessionId, key: `synthetic-${account}` }]);
 	}
 
+	it("keeps an unrelated adopted session usable after another SDK startup fails", async () => {
+		const peer = await createSession("StartupPeer", shared, {
+			[provider]: ["account:a"],
+		});
+		const registry = AgentRegistry.global();
+		registry.setStatus("StartupPeer", "idle");
+		const lifecycle = AgentLifecycleManager.global();
+		lifecycle.adopt("StartupPeer", { idleTtlMs: 0 });
+		const startupError = new Error("synthetic startup failure");
+		const registration = vi
+			.spyOn(AgentSession.prototype, "registerSessionChangeCallback")
+			.mockImplementationOnce(function (this: AgentSession) {
+				sessions.push(this);
+				throw startupError;
+			});
+		try {
+			await expect(
+				createAgentSession({
+					cwd: tempDir.path(),
+					agentDir: tempDir.path(),
+					authStorage,
+					modelRegistry: shared,
+					sessionManager: SessionManager.inMemory(tempDir.path()),
+					agentId: "FailedStartup",
+					providerSessionId: "failed-startup-peer",
+					model,
+					settings: Settings.isolated({
+						"async.enabled": false,
+						"compaction.enabled": false,
+						"retry.enabled": false,
+						"advisor.enabled": false,
+						"todo.enabled": false,
+					}),
+					cacheWarming: false,
+					toolNames: ["read"],
+					disableExtensionDiscovery: true,
+					enableLsp: false,
+					skills: [],
+					contextFiles: [],
+					promptTemplates: [],
+					slashCommands: [],
+					rules: [],
+				}),
+			).rejects.toBe(startupError);
+			expect(await lifecycle.ensureLive("StartupPeer")).toBe(peer);
+			await request(peer, "a");
+		} finally {
+			registration.mockRestore();
+			await lifecycle.release("StartupPeer");
+		}
+	});
+
 	it("keeps child requests and warm revival authorized after the parent parks, without affecting siblings", async () => {
 		const identities = ["account:a"];
-		const parent = await createSession("PoolParent", shared, { [provider]: identities });
+		const parent = await createSession("PoolParent", shared, {
+			[provider]: identities,
+		});
 		const inherited = parent.modelRegistry;
 		const manager = SessionManager.create(tempDir.path(), tempDir.join("sessions"));
 		const child = await createSession("PoolChild", inherited, undefined, manager);
@@ -599,7 +669,10 @@ describe("SDK inherited account-pool lifetime", () => {
 		AgentRegistry.global().setStatus("PoolParent", "idle");
 		lifecycle.adopt("PoolParent", { idleTtlMs: 0 });
 		await lifecycle.park("PoolParent");
-		expect(AgentRegistry.global().get("PoolParent")).toMatchObject({ status: "parked", session: null });
+		expect(AgentRegistry.global().get("PoolParent")).toMatchObject({
+			status: "parked",
+			session: null,
+		});
 		identities[0] = "account:b";
 		await request(child, "a");
 		await request(sibling, "a");
@@ -635,8 +708,12 @@ describe("SDK inherited account-pool lifetime", () => {
 	});
 
 	it("uses explicit child authorization rather than the released inherited pool", async () => {
-		const parent = await createSession("ExplicitParent", shared, { [provider]: ["account:a"] });
-		const child = await createSession("ExplicitChild", parent.modelRegistry, { [provider]: ["account:b"] });
+		const parent = await createSession("ExplicitParent", shared, {
+			[provider]: ["account:a"],
+		});
+		const child = await createSession("ExplicitChild", parent.modelRegistry, {
+			[provider]: ["account:b"],
+		});
 		await parent.dispose();
 		await request(child, "b");
 		const inheritedChild = await createSession("ExplicitGrandchild", child.modelRegistry);
@@ -645,12 +722,19 @@ describe("SDK inherited account-pool lifetime", () => {
 	});
 
 	it("keeps inherited deny-all pools closed after parent disposal and rejects sibling rotation", async () => {
-		const parent = await createSession("DeniedParent", shared, { [provider]: [] });
+		const parent = await createSession("DeniedParent", shared, {
+			[provider]: [],
+		});
 		const child = await createSession("DeniedChild", parent.modelRegistry);
 		await parent.dispose();
 		const resolver = child.modelRegistry.resolver(model, child.agent.sessionId);
 		await expect(resolveApiKeyOnce(resolver)).rejects.toThrow();
-		await expect(resolver({ lastChance: true, error: new Error("synthetic unauthorized") })).rejects.toThrow();
+		await expect(
+			resolver({
+				lastChance: true,
+				error: new Error("synthetic unauthorized"),
+			}),
+		).rejects.toThrow();
 		expect(requests).toEqual([]);
 	});
 
@@ -662,7 +746,9 @@ describe("SDK inherited account-pool lifetime", () => {
 		);
 		const configuredRegistry = new ModelRegistry(authStorage, configPath);
 		registerModel(configuredRegistry);
-		const parent = await createSession("ConfiguredParent", configuredRegistry, { [provider]: ["account:a"] });
+		const parent = await createSession("ConfiguredParent", configuredRegistry, {
+			[provider]: ["account:a"],
+		});
 		const child = await createSession("ConfiguredChild", parent.modelRegistry);
 		await parent.dispose();
 		await expect(resolveApiKeyOnce(child.modelRegistry.resolver(model, child.agent.sessionId))).rejects.toThrow();

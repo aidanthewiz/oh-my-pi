@@ -4,10 +4,13 @@
 
 ### Added
 
+- Added intrinsic `AgentTool.cancellationBehavior`, `resolveToolCancellationBehavior`, and `TOOL_CANCELLATION_CLEANUP_VERSION` for bounded cancellation cleanup.
+- Add opt-in JSON values to `AgentTool.docTopics` without changing markdown document topics.
 - Expose an optional tool-context callback for terminal results produced after a tool returns.
 
 ### Fixed
 
+- Preserve cleanup-owned tool results when cancellation interrupts outer execution or postflight hooks.
 - Validate tool arguments without imposing unrelated renderer theme types on the tool metadata.
 - Preserve visible signed narration in compaction summaries without retaining private reasoning.
 - Fixed queued follow-ups being delayed by non-triggering custom messages appended at the end of a turn.

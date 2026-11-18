@@ -8,6 +8,7 @@
 
 ### Added
 
+- Add generic `xd://aws` secret delivery through finite stdin to an exact-approved local process on Darwin and Linux. Pin the AWS identity and secret version, verify live host/worker capabilities, preserve AWS and receiver guards, and return bounded raw consumer output. The native route supports existing static profiles and unexpired SSO without automatic sign-in or retry; cancellation reports uncertain writes and reaps owned processes.
 - Emit observation-only deferred tool results for final Bash job outcomes, including eval calls and completion after an agent abort. Retain the original conversation, input and MCP identity without starting model continuations.
 - Native AWS approvals offer **Allow for the rest of this session** for later commands, profiles, and SSO renewal without saving a configuration grant.
 - Keep job widgets local by default. Remote spec authoring requires managed or runtime consent, current model and account admission, bounded redacted context, and originating-journal accounting.
@@ -18,6 +19,7 @@
 ### Fixed
 
 - Wait for owned jobs, delivered result turns, and persistence in restore qualification before publishing raster inputs.
+- Preserve early cancellation of ordinary virtual devices without abandoning cleanup-owned calls.
 - Guard unborn HEADs and commit selected working copies without changing unrelated staged entries. Keep hook messages private per commit.
 - Preserve resolved merge parents and finish merge state, including merges whose trees do not change.
 - Restore automatic merge stashes. Preserve conflicted edits in a recovery stash and report the already-created commit when restoration fails.
@@ -75,6 +77,28 @@
 - Reject legacy OAuth metadata that contradicts the protected resource captured from an exact challenge.
 - Keep cache replay admission bound to its storage session when a provider session override is active.
 - Wait for owned post-turn work and controller events before scheduling a goal continuation.
+- Expose the full registered AWS JSON input schema through `xd://aws/schema`. Require complete schema and `aws-secret-input/v1` capability comparison before authentication or approval. Preserve native session-disposal and cancellation cleanup. Source delivery does not publish an engine or adopt an installed runtime.
+- Require actual native invocation ownership under `native-tool-host/v2` for AWS secret input. Preserve native Agent dispatch and native Write → `xd://aws` with intrinsic cleanup. Reject JavaScript/Python Eval and naked SDK/direct execution before approval UI, provider work, or receiver execution, even through registered wrappers or nested Write calls. Capability discovery does not authorize unsupported paths. Preserve authorized receiver reads and writes, bounded raw output, and normal retention.
+- Accept copied hashline Write paths and content, inner intent fields, and both active and mounted AWS presentations. Preserve exact normalized input and live native invocation ownership.
+- Deliver private AWS stdin through an actual anonymous pipe or unnamed Unix stream under delivery policy v3. Bound writes, join flush and EOF, reject file-backed stdin optimizations, and refuse previous or mixed delivery-policy/fingerprint tuples.
+- Read socket-backed stdin directly in native preload qualification. Preserve exact-byte comparison and real non-Bun receivers on Linux.
+- Keep Python zoom qualification JSON within bounded output columns when temporary paths are long.
+- Qualify private stdin backpressure through the same unsettled native operation, independent of platform-specific write and flush phases.
+- Complete fixture navigation, join cancelled browser click work before page teardown, and await CDP rejections without nested event loops.
+- Remove unsupported rsync cross-run wire-byte equality; preserve same-transfer counters, exact copied trees, and logical transfer-size checks.
+- Scan every owned qualification-file byte without decoding binary assets. Preserve cross-chunk leak checks and fixed, nonsecret failure phases.
+- Separate synthetic tmux executable readiness from bounded protocol queries. Preserve runtime query deadlines and credential-filtering checks.
+- Isolate home-dotenv cache qualification from managed-launch markers and filtered-child sentinels without changing production dotenv authority.
+- Apply normalized device authorization before capability probes, including policy revocation during approval. Preserve active and mounted AWS dispatch and exact native invocation ownership.
+- Join owned process cleanup using kernel creation identities and actual reaping. Preserve a pinned Darwin group anchor until acknowledged retirement, and reject unknown or replaced receiver identities.
+- Preserve constructor-registered tool session callbacks so active native scopes stop when the SDK adopts or forks a session.
+- Acquire session cleanup ownership before forwarding constructor callbacks. Failed startup keeps pooled credential restrictions until cleanup settles and preserves unrelated live roots.
+- Retire headless parent-approval capabilities alongside native tool scopes before asynchronous session teardown.
+- Settle restored session generations before rollback reconciliation without declaring transition readiness or skipping native cleanup.
+- Handle ordinary synchronous disposer returns without losing subsequent session cleanup. Continue to await native cancellation and asynchronous disposers.
+- Reap known receiver identities independently after guardian loss. Preserve unproved ownership as `WORKER_FAILED` through cancellation so later handoffs stay blocked.
+- Compare Linux descriptor aliases with their exact kernel identities. Keep unknown or conflicting descriptor snapshots unproved.
+- Keep committed-session events and transcript recording connected when cleanup rejects. Retire outgoing messages at transcript commit and propagate cleanup failures without carrying an old aside into the new conversation.
 - Route headless task DCG reviews to the live parent TUI without enabling child UI or reusing grants. Revalidate both sessions' authority and the exact invocation through backend dispatch. Preserve typed denial, cancellation, and unavailable errors.
 - Keep session-owned OAuth account restrictions until deferred startup cleanup finishes.
 - Keep erased TypeScript type declarations out of legacy extension runtime graphs, including inline-only named imports and exports.

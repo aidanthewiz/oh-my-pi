@@ -11,6 +11,7 @@ import {
 	isNonBlankContext,
 	joinAdditionalContext,
 } from "@oh-my-pi/pi-agent-core";
+import { withoutCleanupOwnedToolCall } from "@oh-my-pi/pi-agent-core/agent-loop";
 import type {
 	AssistantMessage,
 	CredentialDisabledEvent,
@@ -427,7 +428,7 @@ async function raceHandlerWithTimeout<T>(
 	armTimer();
 	try {
 		if (signal?.aborted) return EXTENSION_HANDLER_ABORTED;
-		const workPromise = Promise.resolve(work(handlerSignal, timeoutBudget));
+		const workPromise = Promise.resolve(withoutCleanupOwnedToolCall(() => work(handlerSignal, timeoutBudget)));
 		const result = await Promise.race([workPromise, interruptPromise]);
 		if (result === EXTENSION_HANDLER_TIMEOUT) {
 			await Promise.race([
@@ -820,7 +821,7 @@ export class ExtensionRunner {
 		args: unknown,
 		context?: AgentToolContext,
 	): Promise<{ block?: boolean; reason?: string } | undefined> {
-		return this.#toolCallPreflight?.before?.(toolCallId, tool, args, context);
+		return withoutCleanupOwnedToolCall(() => this.#toolCallPreflight?.before?.(toolCallId, tool, args, context));
 	}
 
 	async runToolCallPreflightAfter(
@@ -828,11 +829,11 @@ export class ExtensionRunner {
 		result: AgentToolResult,
 		context?: AgentToolContext,
 	): Promise<AgentToolResult | undefined> {
-		return this.#toolCallPreflight?.after?.(toolCallId, result, context);
+		return withoutCleanupOwnedToolCall(() => this.#toolCallPreflight?.after?.(toolCallId, result, context));
 	}
 
 	cancelToolCallPreflight(toolCallId: string): void {
-		this.#toolCallPreflight?.cancel?.(toolCallId);
+		withoutCleanupOwnedToolCall(() => this.#toolCallPreflight?.cancel?.(toolCallId));
 	}
 
 	/** Whether a native built-in of `name` is available to delegate to. */
@@ -876,12 +877,14 @@ export class ExtensionRunner {
 			throw new Error(`invokeTool: delegation depth exceeded 8 (recursive invokeTool for "${name}"?)`);
 		}
 		const toolCallId = `invoke-${name}-${Date.now().toString(36)}-${depth}`;
-		return (await resolved.tool.execute(
-			toolCallId,
-			params as never,
-			options?.signal,
-			options?.onUpdate as never,
-			options?.callerContext ?? resolved.makeContext(),
+		return (await withoutCleanupOwnedToolCall(() =>
+			resolved.tool.execute(
+				toolCallId,
+				params as never,
+				options?.signal,
+				options?.onUpdate as never,
+				options?.callerContext ?? resolved.makeContext(),
+			),
 		)) as AgentToolResult<TDetails>;
 	}
 

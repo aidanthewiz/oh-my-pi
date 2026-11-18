@@ -73,7 +73,7 @@ function createTestSession(cwd: string, overrides: Partial<ToolSession> = {}): T
  */
 function passthroughRunner(seen: string[] = []): ExtensionRunner {
 	return {
-		hasHandlers: () => true,
+		hasHandlers: (eventType: string) => eventType === "tool_call",
 		consumeToolCallEmitted: () => false,
 		runScoped<T>(fn: () => T): T {
 			return fn();

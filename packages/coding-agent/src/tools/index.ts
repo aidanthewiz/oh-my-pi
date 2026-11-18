@@ -68,6 +68,7 @@ import { AskTool } from "./ask";
 import { AstEditTool } from "./ast-edit";
 import { AstGrepTool } from "./ast-grep";
 import { AwsTool } from "./aws";
+import type { ToolExecutionHostCapabilities } from "./tool-execution-host";
 import { BashTool } from "./bash";
 import type { SubagentRuntimeApprovalHandler } from "./subagent-runtime-approval";
 import { type BuiltinToolName, type HiddenToolName, normalizeToolNames } from "./builtin-names";
@@ -628,10 +629,18 @@ export interface ToolSession {
 	queueDeferredMessage?(message: CustomMessage): void;
 	/** Queue a broker supervised-process completion for the owning session. */
 	queueLaunchCompletion?(notification: DaemonCompletionNotification): Promise<void>;
-	/** Register cleanup that runs when this session is disposed; returns a handle that removes the cleanup. */
-	registerDisposeCallback?(callback: () => void): (() => void) | void;
-	/** Register cleanup that runs when this ToolSession adopts a different session ID. */
-	registerSessionChangeCallback?(callback: () => void): (() => void) | void;
+	/** Begin callbacks start synchronously; disposal awaits cleanup from both phases before returning. */
+	registerDisposeCallback?(
+		callback: () => void | Promise<void>,
+		options?: { phase?: "begin" | "complete" },
+	): (() => void) | void;
+	/** Start cleanup synchronously at session/context boundaries; async transitions await completion. */
+	registerSessionChangeCallback?(callback: () => void | Promise<void>): (() => void) | void;
+	/** Prove the actual live invocation owns cancellation cleanup and the current session lifecycle. */
+	getToolExecutionCapabilities?(
+		tool: Pick<Tool, "name" | "cancellationBehavior">,
+		args: unknown,
+	): ToolExecutionHostCapabilities | undefined;
 	/** Queue late LSP diagnostics (arrived after an edit/write returned) to be shown
 	 *  in the transcript and delivered to the model at the next yield, like background
 	 *  job results. */

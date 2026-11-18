@@ -1024,6 +1024,8 @@ export interface ToolDefinition<TParams extends TSchema = TSchema, TDetails = un
 	loadMode?: ToolLoadMode;
 	/** If true, tool may stage deferred changes that require explicit resolve/discard. */
 	deferrable?: boolean;
+	/** Intrinsic host execution policy; never copied from remote annotations or model arguments. */
+	readonly cancellationBehavior?: AgentTool["cancellationBehavior"];
 	/** Whether this tool can read `skill://` instruction content. */
 	readsSkillUris?: boolean;
 	/** Tool approval tier. Defaults to `"exec"` when omitted.

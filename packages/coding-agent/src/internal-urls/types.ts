@@ -102,6 +102,12 @@ export interface SchemeWritePolicy {
 	 * still follows {@link SchemeWritePolicy.tier}.
 	 */
 	cancels?(url: InternalUrl): boolean;
+	/** Resolve the dispatched operation's intrinsic policy, not a scheme-wide cancellation opt-in. */
+	cancellationBehavior?(
+		url: InternalUrl,
+		content: string | undefined,
+		session: ToolSession | undefined,
+	): "await-cleanup" | undefined;
 }
 
 /**

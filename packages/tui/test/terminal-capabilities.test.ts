@@ -276,7 +276,6 @@ describe("tmux client terminal resolution", () => {
 		return withFakeTmux(
 			{ [CLIENT_QUERY]: clientReport, [PASSTHROUGH_QUERY]: "on" },
 			async binDir => {
-				const tmux = path.join(binDir, "tmux");
 				const env = subprocessEnv({
 					PI_TEST_RUNTIME: undefined,
 					BUN_ENV: undefined,
@@ -290,14 +289,6 @@ describe("tmux client terminal resolution", () => {
 					SSH_CONNECTION: "client 1 server 22",
 					PATH: `${binDir}${path.delimiter}${Bun.env.PATH ?? ""}`,
 				});
-				const fixtureWarmup = Bun.spawn([tmux, "display-message", "-p", "#{client_termtype}\t#{client_termname}"], {
-					env,
-					stdout: "ignore",
-					stderr: "ignore",
-					timeout: 5_000,
-					killSignal: "SIGKILL",
-				});
-				if ((await fixtureWarmup.exited) !== 0) throw new Error("Owned tmux profile fixture could not start");
 				const proc = Bun.spawn({
 					cmd: [
 						process.execPath,
@@ -339,14 +330,26 @@ esac
 `,
 				);
 				const tmux = `/tmp/coreforge-sxl-${crypto.randomUUID()},4244,0`;
+				const fixtureEnv = {
+					PATH: `${binDir}${path.delimiter}${Bun.env.PATH ?? ""}`,
+					TMUX: tmux,
+					TMUX_EXPECTED: tmux,
+					TMUX_PANE: "%19",
+				};
+				const ready = Bun.spawn([path.join(binDir, "tmux"), "display-message", "-p", "#{client_name}"], {
+					env: fixtureEnv,
+					stdin: "ignore",
+					stdout: "ignore",
+					stderr: "ignore",
+					timeout: 5_000,
+					killSignal: "SIGKILL",
+				});
+				if ((await ready.exited) !== 0) throw new Error("Owned tmux profile fixture could not start");
 				const secret = `synthetic-secret-${crypto.randomUUID()}`;
 				expect(
 					tmuxClientRendersSixel({
 						...subprocessEnv({}),
-						PATH: `${binDir}${path.delimiter}${Bun.env.PATH ?? ""}`,
-						TMUX: tmux,
-						TMUX_EXPECTED: tmux,
-						TMUX_PANE: "%19",
+						...fixtureEnv,
 						OPENAI_API_KEY: secret,
 						BORROWED_VALUE: secret,
 						AWS_ACCESS_KEY_ID: "synthetic-access-key",

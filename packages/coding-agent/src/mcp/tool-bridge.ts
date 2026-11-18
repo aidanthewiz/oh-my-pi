@@ -551,7 +551,7 @@ async function isAwsAuthenticationFailure(
 			context,
 		);
 		await assertMcpOwnerCurrent(context, signal);
-		if (result.details?.code === "AUTH_REQUIRED") return true;
+		if (result.details && "code" in result.details && result.details.code === "AUTH_REQUIRED") return true;
 		const group = (await resolveTrustedAwsProfile(profile))?.ssoGroup;
 		await assertMcpOwnerCurrent(context, signal);
 		return (

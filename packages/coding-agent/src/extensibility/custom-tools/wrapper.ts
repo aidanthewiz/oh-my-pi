@@ -17,6 +17,7 @@ export class CustomToolAdapter<
 	declare label: string;
 	declare description: string;
 	declare parameters: TParams;
+	declare readonly cancellationBehavior?: AgentTool["cancellationBehavior"];
 	readonly strict: boolean | undefined;
 	readonly loadMode: ToolLoadMode;
 

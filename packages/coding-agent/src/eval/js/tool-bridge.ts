@@ -1,3 +1,4 @@
+import { withoutCleanupOwnedToolCall } from "@oh-my-pi/pi-agent-core/agent-loop";
 import { isRecord } from "@oh-my-pi/pi-utils";
 import type { ToolSession } from "../../tools";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
@@ -141,5 +142,5 @@ async function dispatchSessionTool(name: string, args: unknown, options: ToolBri
 	if (name === EVAL_WORKPOOL_BRIDGE_NAME) {
 		return await runEvalWorkpool(args, options);
 	}
-	return callRegisteredTool(name, args, options);
+	return withoutCleanupOwnedToolCall(() => callRegisteredTool(name, args, options));
 }

@@ -24,7 +24,10 @@ import { CF_COMMAND, CF_DISPLAY_VERSION, CF_VERSION } from "./cli/cf-version";
 import { installSqliteLockShim } from "@oh-my-pi/pi-natives/sqlite-locks";
 import { isNativeShell, runNativeShell } from "./cli/native-shell";
 import { extractProfileFlags } from "./cli/profile-bootstrap";
+import type * as AwsSecretInputWorker from "./tools/aws-secret-input-worker";
+import type * as AwsSecretInputWorkerClient from "./tools/aws-secret-input-worker-client";
 import {
+	AWS_SECRET_INPUT_WORKER_ARG,
 	BLOB_BROKER_WORKER_ARG,
 	COMPUTER_WORKER_ARG,
 	DAEMON_BROKER_WORKER_ARG,
@@ -185,6 +188,12 @@ async function runSmokeTest(): Promise<void> {
 	await smokeTestTerminalOutputWorker();
 	await smokeTestTextPredictDaemon();
 	await smokeTestSubagentWorker();
+	if (process.platform !== "win32") {
+		const {
+			probeAwsSecretInputWorker,
+		}: typeof AwsSecretInputWorkerClient = require("./tools/aws-secret-input-worker-client");
+		await probeAwsSecretInputWorker();
+	}
 	process.stdout.write("smoke-test: ok\n");
 }
 
@@ -199,6 +208,11 @@ const TTS_WORKER_ARG = "__omp_worker_tts";
 const MNEMOPI_EMBED_WORKER_ARG = "__omp_worker_mnemopi_embed";
 
 async function runWorkerEntrypoint(arg: string | undefined): Promise<boolean> {
+	if (arg === AWS_SECRET_INPUT_WORKER_ARG) {
+		const { startAwsSecretInputWorker }: typeof AwsSecretInputWorker = require("./tools/aws-secret-input-worker");
+		await startAwsSecretInputWorker();
+		return true;
+	}
 	if (arg === TINY_WORKER_ARG) {
 		await runTinyWorker();
 		return true;
