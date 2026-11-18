@@ -78,6 +78,8 @@ The non-releasing exemption admits only explicit cache documentation/workflows a
 
 The baseline is the latest published roll in the current package family, not an unpublished tag or the merge's first parent. Pending runtime, mixed, unknown, renamed/deleted artifact input, and empty diffs retain the normal release decision. A missing published baseline cannot suppress publication. Git, metadata, and parse errors abort preparation.
 
+Non-cache engine test changes retain the normal release decision. Do not merge a release-requiring candidate under cache-only authorization.
+
 The classifier runs after merged-PR/current-tip checks and before branch release-tag allocation. It never handles the manual tag path.
 
 Each fresh dispatch creates `omp-bazel-v1/canary/probe-<run-id>-<attempt>/`. Use a fresh dispatch rather than reusing stale snapshot artifacts from a failed attempt.
