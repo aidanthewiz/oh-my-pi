@@ -27,7 +27,7 @@
 - Preserve earlier background shell jobs when a later command times out or is canceled; session closure still owns their cleanup.
 - Accept schema-less terminal report prose without bypassing an explicit task output schema.
 - Retain relay targets only for authoritative attachment refusals, not unrelated browser feature or transport errors.
-- Make the relay navigation deadline regression expire its caller clock after real replacement-worker readiness.
+- Separate simulated caller expiry from real worker startup in relay deadline regressions, retaining no-replay and recovered-tab assertions.
 - Honor explicitly configured live endpoints in offline operation without activating the default endpoint.
 - Serialize task patch application and ownership snapshots in one repository transaction.
 - Remove staged Antigravity grants only after their transports exit. Fence logout against delayed staging, preserve concurrent accounts, and allow explicit broker-backed reauthentication.

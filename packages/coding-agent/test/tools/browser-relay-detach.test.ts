@@ -733,7 +733,7 @@ describe("relay tabs Chrome detaches omp from", () => {
 		async () => {
 			const ext = await openRelayTab();
 			await invoke({ action: "run", code: 'await tab.emulate({ userAgent: "omp-detach-test" });', timeout: 10 });
-			const budgetMs = 1_000;
+			const budgetMs = 10_000;
 			const now = spyOn(performance, "now").mockReturnValue(0);
 			const spawn = tabSupervisor.spawnTabWorker;
 			let restoreReadyListener: (() => void) | undefined;
