@@ -76,7 +76,7 @@ jobs:
   cache_restore:
     needs: prepare
     if: vars.CI_CACHE_ENABLED == 'true' && needs.prepare.outputs.native_changed == 'true'
-    uses: Coreforce-CAD/oh-my-pi/.github/workflows/cf-cache-read.yml@d4088c9fcf2f06974b1d6023e2676b45a677164b
+    uses: Coreforce-CAD/oh-my-pi/.github/workflows/cf-cache-read.yml@eb12d4088909f550fade50241ed47b9fbce215b0
     with:
       enabled: true
       slots: '["darwin-arm64-xcode-27","darwin-x64-macos-15-intel","linux-x64-ubuntu-22.04","linux-arm64-ubuntu-24.04-arm","linux-musl-x64-ubuntu-22.04","linux-musl-arm64-ubuntu-24.04-arm","win32-x64-ubuntu-24.04"]'

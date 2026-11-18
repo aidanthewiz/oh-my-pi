@@ -83,7 +83,7 @@ jobs:
   cache_restore:
     needs: prepare
     if: vars.CI_CACHE_ENABLED == 'true' && needs.prepare.outputs.native_changed == 'true'
-    uses: Coreforce-CAD/oh-my-pi/.github/workflows/cf-cache-read.yml@d4088c9fcf2f06974b1d6023e2676b45a677164b
+    uses: Coreforce-CAD/oh-my-pi/.github/workflows/cf-cache-read.yml@eb12d4088909f550fade50241ed47b9fbce215b0
     with:
       enabled: true
       slots: '["linux-x64-ubuntu-24.04"]'
@@ -275,7 +275,7 @@ jobs:
   cache_publish:
     needs: [prepare, validate, publish]
     if: ${{ !cancelled() && vars.CI_CACHE_ENABLED == 'true' && startsWith(github.ref, 'refs/tags/relay/v') && needs.prepare.result == 'success' && needs.prepare.outputs.native_changed == 'true' && needs.validate.result == 'success' && needs.publish.result == 'success' }}
-    uses: Coreforce-CAD/oh-my-pi/.github/workflows/cf-cache-write.yml@d4088c9fcf2f06974b1d6023e2676b45a677164b
+    uses: Coreforce-CAD/oh-my-pi/.github/workflows/cf-cache-write.yml@eb12d4088909f550fade50241ed47b9fbce215b0
     with:
       enabled: true
       source-sha: ${{ github.sha }}

@@ -77,7 +77,7 @@ jobs:
 
   read-cold:
     needs: prepare
-    uses: Coreforce-CAD/oh-my-pi/.github/workflows/cf-cache-read.yml@d4088c9fcf2f06974b1d6023e2676b45a677164b
+    uses: Coreforce-CAD/oh-my-pi/.github/workflows/cf-cache-read.yml@eb12d4088909f550fade50241ed47b9fbce215b0
     with:
       enabled: true
       slots: '["linux-x64-ubuntu-22.04"]'
@@ -148,7 +148,7 @@ jobs:
 
   save-cold:
     needs: [prepare, cold-build]
-    uses: Coreforce-CAD/oh-my-pi/.github/workflows/cf-cache-write.yml@d4088c9fcf2f06974b1d6023e2676b45a677164b
+    uses: Coreforce-CAD/oh-my-pi/.github/workflows/cf-cache-write.yml@eb12d4088909f550fade50241ed47b9fbce215b0
     with:
       enabled: true
       source-sha: ${{ needs.prepare.outputs.source-sha }}
@@ -162,7 +162,7 @@ jobs:
 
   read-warm:
     needs: [prepare, save-cold]
-    uses: Coreforce-CAD/oh-my-pi/.github/workflows/cf-cache-read.yml@d4088c9fcf2f06974b1d6023e2676b45a677164b
+    uses: Coreforce-CAD/oh-my-pi/.github/workflows/cf-cache-read.yml@eb12d4088909f550fade50241ed47b9fbce215b0
     with:
       enabled: true
       slots: '["linux-x64-ubuntu-22.04"]'
