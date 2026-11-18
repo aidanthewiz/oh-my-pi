@@ -8,6 +8,7 @@
 
 ### Fixed
 
+- Preserve commits in reftable repositories through Git's CLI, including configured signing, hooks, author overrides and selected alternate-index contents.
 - Finish native Git commits after cherry-pick or revert conflict resolution. Preserve the original cherry-pick author/date and pending sequencer work.
 - Use native background requests for macOS spelling checks. Preserve per-request UTF-16 ranges and omit whole-string orthography results.
 - Pin the Windows cross-build SDK to the catalog and MSI format supported by xwin 0.6.5. Preserve Linux/macOS build hosts and the ARM64 SDK selection.

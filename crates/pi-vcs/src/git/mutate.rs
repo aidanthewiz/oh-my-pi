@@ -214,6 +214,9 @@ impl GitRepo {
 		if cancel.as_ref().is_some_and(CancellationToken::is_cancelled) {
 			return Err(Error::Canceled);
 		}
+		if self.is_reftable() {
+			return self.commit_create_cli(message, options, cancel).await;
+		}
 		let merge_head_path = self.info().git_dir.join("MERGE_HEAD");
 		let read_state = |path: &Path| -> Result<Option<Vec<u8>>> {
 			match fs::read(path) {
@@ -769,6 +772,134 @@ impl GitRepo {
 			return Err(error);
 		}
 		Ok(id.to_hex().to_string())
+	}
+
+	async fn commit_create_cli(
+		&self,
+		message: &str,
+		options: &CommitOptions,
+		cancel: Option<CancellationToken>,
+	) -> Result<String> {
+		let old_head = self.head_sha()?;
+		if let Some(expected) = &options.expected_head {
+			let expected = expected
+				.as_deref()
+				.map(|revision| {
+					self.resolve_ref(revision)?.ok_or_else(|| {
+						Error::backend("git commit resolve expected HEAD", "revision not found")
+					})
+				})
+				.transpose()?;
+			if expected != old_head {
+				return Err(Error::HeadMoved {
+					expected: expected.unwrap_or_else(|| "unborn HEAD".into()),
+					actual:   old_head,
+				});
+			}
+		}
+		let mut process = RunOptions {
+			cancel,
+			env: options.env.clone(),
+			index_path: options.index_path.clone(),
+			..RunOptions::default()
+		};
+		let mut private_index = None;
+		if let Some(index_path) = &options.index_path {
+			if !index_path.is_file() {
+				return Err(Error::backend(
+					"git commit",
+					format!("index file not found: {}", index_path.display()),
+				));
+			}
+			if !options.files.is_empty() {
+				let file = gix::tempfile::new(
+					&self.info().git_dir,
+					gix::tempfile::ContainingDirectory::Exists,
+					gix::tempfile::AutoRemove::Tempfile,
+				)?
+				.take()
+				.ok_or_else(|| Error::backend("git commit", "private index file was removed"))?;
+				let path = file.into_temp_path();
+				fs::copy(index_path, &path)?;
+				process.index_path = Some(path.to_path_buf());
+				private_index = Some(path);
+				let base = if let Some(head) = &old_head {
+					head.clone()
+				} else {
+					process.stdin = Some(Vec::new());
+					let output = run_checked(
+						self.root(),
+						&[
+							"hash-object".into(),
+							"-w".into(),
+							"-t".into(),
+							"tree".into(),
+							"--stdin".into(),
+						],
+						&process,
+					)
+					.await?;
+					process.stdin = None;
+					output.stdout.trim().to_owned()
+				};
+				let mut args = vec!["reset".into(), "-q".into(), base, "--".into(), ".".into()];
+				args.extend(
+					options
+						.files
+						.iter()
+						.map(|path| format!(":(top,exclude,literal){}", normalize_stage_path(path))),
+				);
+				run_checked(self.root(), &args, &process).await?;
+			}
+		}
+		let mut args = vec![
+			"-c".into(),
+			"safe.directory=*".into(),
+			"commit".into(),
+			"--file=-".into(),
+			"--cleanup=whitespace".into(),
+		];
+		if options.allow_empty {
+			args.push("--allow-empty".into());
+		}
+		if options.amend {
+			args.push("--amend".into());
+		}
+		if options.no_verify {
+			args.push("--no-verify".into());
+		}
+		if let Some(author) = &options.author {
+			args.push(format!("--author={} <{}>", author.name, author.email));
+			if let Some(date) = &author.date {
+				args.push(format!("--date={date}"));
+			}
+		}
+		if !options.files.is_empty() && private_index.is_none() {
+			args.extend(["--only".into(), "--".into()]);
+			args.extend(
+				options
+					.files
+					.iter()
+					.map(|path| literal_pathspec(&normalize_stage_path(path))),
+			);
+		}
+		process.stdin = Some(message.as_bytes().to_vec());
+		let result = run_checked(self.root(), &args, &process).await;
+		// Git owns hook execution, signing, index locking and the reference CAS.
+		// Preserve the public error when a hook moved HEAD before publication.
+		if result.is_err() {
+			let actual = self.head_sha()?;
+			if actual != old_head {
+				return Err(Error::HeadMoved {
+					expected: old_head.unwrap_or_else(|| "unborn HEAD".into()),
+					actual,
+				});
+			}
+		}
+		result?;
+		self
+			.head_sha()?
+			.ok_or_else(|| Error::backend("git commit", "HEAD is unborn after commit"))
 	}
 
 	/// Write a commit object for `tree` on top of `parents` without touching
@@ -2831,8 +2962,29 @@ mod tests {
 	}
 
 	fn fixture() -> (TempDir, GitRepo) {
+		fixture_with_ref_format(false).unwrap()
+	}
+
+	fn fixture_with_ref_format(reftable: bool) -> Option<(TempDir, GitRepo)> {
 		let temp = tempfile::tempdir().unwrap();
-		git(temp.path(), &["init", "-q", "-b", "main"]);
+		let mut args = vec!["init", "-q", "-b", "main"];
+		if reftable {
+			args.push("--ref-format=reftable");
+		}
+		let output = Command::new("git")
+			.arg("-C")
+			.arg(temp.path())
+			.args(args)
+			.output()
+			.unwrap();
+		if !output.status.success() {
+			let stderr = String::from_utf8_lossy(&output.stderr);
+			if reftable && stderr.contains("ref-format") {
+				eprintln!("skipping reftable coverage: this git has no --ref-format ({stderr})");
+				return None;
+			}
+			panic!("git init: {stderr}");
+		}
 		git(temp.path(), &["config", "user.name", "Test"]);
 		git(temp.path(), &["config", "user.email", "test@example.com"]);
 		git(temp.path(), &["config", "commit.gpgSign", "false"]);
@@ -2846,7 +2998,7 @@ mod tests {
 		git(temp.path(), &["add", "."]);
 		git(temp.path(), &["commit", "-qm", "base"]);
 		let repo = GitRepo::require(temp.path()).unwrap();
-		(temp, repo)
+		Some((temp, repo))
 	}
 
 	#[test]
@@ -2971,6 +3123,123 @@ mod tests {
 		assert_eq!(git(temp.path(), &["status", "--porcelain"]), "A  new");
 		repo.unstage(&[]).unwrap();
 		assert_eq!(git(temp.path(), &["status", "--porcelain"]), "?? new");
+	}
+
+	#[tokio::test]
+	async fn reftable_commit_preserves_staging_author_and_amend() {
+		let Some((temp, repo)) = fixture_with_ref_format(true) else {
+			return;
+		};
+		assert!(repo.is_reftable());
+		fs::write(temp.path().join("a"), "committed\n").unwrap();
+		git(temp.path(), &["add", "a"]);
+		fs::write(temp.path().join("a"), "unstaged\n").unwrap();
+		let first = repo
+			.commit_create(
+				"reftable commit",
+				&CommitOptions {
+					author: Some(CommitAuthor {
+						name:  "Other".into(),
+						email: "other@example.com".into(),
+						date:  Some("2001-02-03T04:05:06Z".into()),
+					}),
+					expected_head: Some(repo.head_sha().unwrap()),
+					..Default::default()
+				},
+				None,
+			)
+			.await
+			.unwrap();
+		assert_eq!(first, git(temp.path(), &["rev-parse", "HEAD"]));
+		assert_eq!(git(temp.path(), &["show", "HEAD:a"]), "committed");
+		assert_eq!(fs::read(temp.path().join("a")).unwrap(), b"unstaged\n");
+		assert_eq!(
+			git(temp.path(), &["show", "-s", "--format=%an <%ae> %at", "HEAD"]),
+			"Other <other@example.com> 981173106"
+		);
+		let amended = repo
+			.commit_create("amended", &CommitOptions { amend: true, ..Default::default() }, None)
+			.await
+			.unwrap();
+		assert_ne!(first, amended);
+		assert_eq!(git(temp.path(), &["rev-list", "--count", "HEAD"]), "2");
+		assert!(matches!(
+			repo
+				.commit_create(
+					"stale",
+					&CommitOptions { expected_head: Some(Some(first)), ..Default::default() },
+					None,
+				)
+				.await,
+			Err(Error::HeadMoved { .. })
+		));
+	}
+
+	#[tokio::test]
+	async fn reftable_selected_index_commit_preserves_worktree_and_shared_index() {
+		let Some((temp, repo)) = fixture_with_ref_format(true) else {
+			return;
+		};
+		fs::write(temp.path().join("a"), "working copy\n").unwrap();
+		fs::write(temp.path().join("b"), "unrelated staged\n").unwrap();
+		git(temp.path(), &["add", "b"]);
+		let before = fs::read(temp.path().join(".git/index")).unwrap();
+		let alt = alternate_index(&temp);
+		repo
+			.commit_create(
+				"selected reftable index",
+				&CommitOptions { files: vec!["a".into()], index_path: Some(alt), ..Default::default() },
+				None,
+			)
+			.await
+			.unwrap();
+		assert_eq!(git(temp.path(), &["show", "HEAD:a"]), "alt");
+		assert_eq!(git(temp.path(), &["show", "HEAD:b"]), "two");
+		assert_eq!(fs::read(temp.path().join(".git/index")).unwrap(), before);
+		assert_eq!(fs::read(temp.path().join("a")).unwrap(), b"working copy\n");
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn reftable_commit_honors_hooks_and_signing_failure() {
+		let Some((temp, repo)) = fixture_with_ref_format(true) else {
+			return;
+		};
+		write_hook(&temp.path().join(".git/hooks/pre-commit"), "printf 'rejected' >&2\nexit 1", true);
+		let base = repo.head_sha().unwrap();
+		assert!(
+			repo
+				.commit_create(
+					"rejected",
+					&CommitOptions { allow_empty: true, ..Default::default() },
+					None,
+				)
+				.await
+				.is_err()
+		);
+		assert_eq!(repo.head_sha().unwrap(), base);
+		repo
+			.commit_create(
+				"verified bypass",
+				&CommitOptions { allow_empty: true, no_verify: true, ..Default::default() },
+				None,
+			)
+			.await
+			.unwrap();
+		let before_signing = repo.head_sha().unwrap();
+		git(temp.path(), &["config", "commit.gpgSign", "true"]);
+		git(temp.path(), &["config", "gpg.program", "/bin/false"]);
+		assert!(
+			repo
+				.commit_create(
+					"signing must not be bypassed",
+					&CommitOptions { allow_empty: true, no_verify: true, ..Default::default() },
+					None,
+				)
+				.await
+				.is_err()
+		);
+		assert_eq!(repo.head_sha().unwrap(), before_signing);
 	}
 
 	/// Build `<git_dir>/alt-index` from HEAD plus a changed `a`, leaving the
