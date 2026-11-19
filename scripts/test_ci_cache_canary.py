@@ -22,6 +22,7 @@ import tempfile
 import threading
 import unittest
 from unittest.mock import patch
+from urllib.parse import parse_qs
 
 HELPER = Path(__file__).with_name("ci_cache_canary.py").resolve()
 SPEC = importlib.util.spec_from_file_location("ci_cache_canary", HELPER)
@@ -221,7 +222,8 @@ class CanaryTrustProbeTests(unittest.TestCase):
 
     def run_probe(self, claims, results=None):
         payload = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
-        response = io.StringIO(json.dumps({"value": f"header.{payload}.signature"}))
+        self.issued_token = f"header.{payload}.signature"
+        response = io.StringIO(json.dumps({"value": self.issued_token}))
         output, errors = io.StringIO(), io.StringIO()
         with patch.dict(os.environ, self.env, clear=True), \
                 patch.object(probe.urllib.request, "urlopen", return_value=response), \
@@ -351,6 +353,20 @@ class CanaryTrustProbeTests(unittest.TestCase):
             server.server_close()
         self.assertEqual(result, 0, errors)
         self.assertEqual(len(requests), 2)
+        common = {
+            "Action": ["AssumeRoleWithWebIdentity"],
+            "Version": ["2011-06-15"],
+            "RoleSessionName": ["cache-denial-" + self.env["GITHUB_RUN_ID"]],
+            "WebIdentityToken": [self.issued_token],
+            "DurationSeconds": ["900"],
+        }
+        self.assertEqual(
+            [parse_qs(request.decode("utf-8"), keep_blank_values=True, strict_parsing=True) for request in requests],
+            [
+                {**common, "RoleArn": [self.env["CI_CACHE_READ_ROLE"]]},
+                {**common, "RoleArn": [self.env["CI_CACHE_WRITE_ROLE"]]},
+            ],
+        )
         receipt = json.loads((self.root / "cache-canary-trust-denial.json").read_text())
         self.assertEqual([row["result"] for row in receipt["roles"]], ["AccessDenied", "AccessDenied"])
 
