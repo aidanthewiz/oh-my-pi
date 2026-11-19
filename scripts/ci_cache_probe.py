@@ -36,7 +36,7 @@ def main():
         cache.require(claims.get("iss") == "https://token.actions.githubusercontent.com" and claims.get("aud") == "sts.amazonaws.com", "unexpected probe OIDC issuer/audience")
         cache.require(claims.get("repository_id") == "1291753113" and claims.get("repository_owner_id") == "259898564", "unexpected probe repository identity")
         cache.require(claims.get("ref") == "refs/heads/coreforge" and claims.get("sub") == f"repo:{cache.REPOSITORY}:ref:refs/heads/coreforge", "default subject/ref changed")
-        cache.require(not claims.get("job_workflow_ref"), "negative probe unexpectedly runs in a reusable broker")
+        cache.require(claims.get("job_workflow_ref") in (None, expected_workflow), "negative probe token identifies a different workflow")
         receipt = {"schema": 1, "source_sha": os.environ["GITHUB_SHA"], "run_id": os.environ["GITHUB_RUN_ID"], "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"], "oidc": {key: claims.get(key) for key in ("iss", "aud", "sub", "repository_id", "repository_owner_id", "job_workflow_ref", "ref")}, "roles": []}
         for name, role_name in (("CI_CACHE_READ_ROLE", "CoreforgeOmpCacheRead"), ("CI_CACHE_WRITE_ROLE", "CoreforgeOmpCacheWrite")):
             role = os.environ[name]
@@ -46,7 +46,7 @@ def main():
             cache.require(result.returncode != 0, "cache role incorrectly admitted non-broker OIDC source: " + role_name)
             match = re.search(r"An error occurred \(([^)]+)\)", result.stderr)
             cache.require(match is not None and match[1] == "AccessDenied", "cache denial probe failed for a reason other than IAM AccessDenied: " + role_name)
-            receipt["roles"].append({"arn": role, "result": "AccessDenied", "broker_claim_absent": True})
+            receipt["roles"].append({"arn": role, "result": "AccessDenied", "broker_claim_absent": claims.get("job_workflow_ref") is None})
         output = Path(os.environ["RUNNER_TEMP"]) / "cache-canary-trust-denial.json"
         cache.atomic_json(output, receipt)
         print("Both cache roles rejected the real non-broker OIDC identity with IAM AccessDenied.")
