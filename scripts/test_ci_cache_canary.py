@@ -270,9 +270,33 @@ class CanaryTrustProbeTests(unittest.TestCase):
         self.assertFalse((self.root / "cache-canary-trust-denial.json").exists())
 
     def test_invalid_identity_token_is_not_an_iam_denial(self):
-        result, _, _ = self.run_probe(self.claims, [self.denied("InvalidIdentityToken")])
+        denied = self.denied("InvalidIdentityToken")
+        denied.stderr += ": do-not-log-raw-response"
+        result, _, errors = self.run_probe(self.claims, [denied])
         self.assertEqual(result, 1)
+        self.assertIn("exit=254 error=InvalidIdentityToken", errors)
+        self.assertNotIn("do-not-log-raw-response", errors)
         self.assertFalse((self.root / "cache-canary-trust-denial.json").exists())
+
+    def test_cli_failures_report_safe_categories_without_raw_stderr(self):
+        cases = [
+            ("Error parsing parameter '--cli-input-json': do-not-log-token", "invalid-cli-json-input"),
+            ("Invalid endpoint: do-not-log-endpoint", "invalid-endpoint"),
+            ("Unknown options: do-not-log-value", "unsupported-cli-option"),
+            ("SSL validation failed for do-not-log-url", "tls-validation-failure"),
+            ("Could not connect to the endpoint URL: do-not-log-url", "endpoint-connection-failure"),
+            ("Unable to locate credentials. do-not-log-value", "credentials-unavailable"),
+            ("Failed to connect to proxy URL: do-not-log-url", "proxy-connection-failure"),
+            ("unrecognized failure do-not-log-token", "unclassified-cli-error"),
+        ]
+        for stderr, code in cases:
+            with self.subTest(code=code):
+                result, _, errors = self.run_probe(self.claims, [subprocess.CompletedProcess([], 252, "", stderr)])
+                self.assertEqual(result, 1)
+                self.assertIn(f"exit=252 error={code}", errors)
+                self.assertNotIn("do-not-log", errors)
+                self.assertFalse((self.root / "cache-canary-trust-denial.json").exists())
+
 
 
 if __name__ == "__main__":
