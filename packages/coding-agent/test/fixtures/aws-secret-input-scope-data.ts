@@ -34,12 +34,12 @@ export const SSO_PROFILE_CONFIG = [
 	"",
 ].join("\n");
 
-export function syntheticSsoToken(expiresAt = FIXTURE_NOW + 60_000): string {
+export function syntheticSsoToken(expiresAt = FIXTURE_NOW + 60_000, startUrl = SSO_START_URL): string {
 	return JSON.stringify({
 		accessToken: SYNTHETIC_SESSION_TOKEN,
 		expiresAt: new Date(expiresAt).toISOString(),
 		region: "us-east-1",
-		startUrl: SSO_START_URL,
+		startUrl,
 	});
 }
 

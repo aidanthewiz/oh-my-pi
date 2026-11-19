@@ -999,16 +999,6 @@ export async function runAwsSecretInputNativeProbe(
 			);
 			requireNativeProof(choices.length === approvals + 1 && runWorkers === 1);
 			requireNativeProof(Bun.deepEquals(choices.at(-1)?.options, ["Deny", "Approve once"]));
-			const displayedRequests = (choices.at(-1)?.title ?? "").split("\n").flatMap(line => {
-				const start = line.indexOf("{");
-				if (start < 0) return [];
-				try {
-					return [JSON.parse(line.slice(start)) as unknown];
-				} catch {
-					return [];
-				}
-			});
-			requireNativeProof(displayedRequests.some(displayed => Bun.deepEquals(displayed, request)));
 			const visibleNumbers = new Set((choices.at(-1)?.title ?? "").match(/\d+/gu));
 			for (const value of [
 				AWS_SECRET_INPUT_LIMITS.maxInputBytes,

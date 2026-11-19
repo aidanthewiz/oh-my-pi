@@ -18,6 +18,8 @@
 
 ### Fixed
 
+- Accept matching legacy and session SSO settings and valid AWS portal paths when delivering secrets through private stdin.
+- Show exact AWS approval bindings without duplicating inline consumer source; retain one-use approval and command-guard explanations.
 - Test relay call-budget exhaustion after real worker readiness without consuming its initialization budget.
 - Wait for the cancellation trap's file content, not its creation event, before checking Bash cleanup.
 - Synchronize rsync output-pass tests with completed writes instead of worker-thread scheduling.
