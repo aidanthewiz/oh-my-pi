@@ -8,10 +8,14 @@ fi
 
 # shellcheck source=/dev/null
 . /etc/os-release
-if [[ "$ID" != ubuntu || "$VERSION_ID" != 24.04 ]]; then
-  echo "CI package setup requires Ubuntu 24.04" >&2
-  exit 1
-fi
+case "$ID:$VERSION_ID" in
+  ubuntu:22.04) suite=jammy ;;
+  ubuntu:24.04) suite=noble ;;
+  *)
+    echo "CI package setup requires Ubuntu 22.04 or 24.04" >&2
+    exit 1
+    ;;
+esac
 
 case "$(dpkg --print-architecture)" in
   amd64)
@@ -33,13 +37,13 @@ trap 'rm -f -- "$sources"' EXIT
 cat > "$sources" <<EOF
 Types: deb
 URIs: $archive
-Suites: noble noble-updates noble-backports
+Suites: $suite $suite-updates $suite-backports
 Components: main restricted universe multiverse
 Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
 
 Types: deb
 URIs: $security
-Suites: noble-security
+Suites: $suite-security
 Components: main restricted universe multiverse
 Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
 EOF
