@@ -34,7 +34,8 @@ esac
 
 sources="$(mktemp "${RUNNER_TEMP:-/tmp}/cf-ubuntu.XXXXXX.sources")"
 trap 'rm -f -- "$sources"' EXIT
-cat > "$sources" <<EOF
+write_sources() {
+  cat > "$sources" <<EOF
 Types: deb
 URIs: $archive
 Suites: $suite $suite-updates $suite-backports
@@ -47,6 +48,8 @@ Suites: $suite-security
 Components: main restricted universe multiverse
 Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
 EOF
+}
+write_sources
 
 options=(
   -o "Dir::Etc::sourcelist=$sources"
@@ -56,5 +59,16 @@ options=(
   -o "Acquire::Retries=2"
   -o "APT::Update::Error-Mode=any"
 )
-sudo timeout --kill-after=10s 5m apt-get "${options[@]}" update
+if sudo timeout --kill-after=10s 5m apt-get "${options[@]}" update; then
+  :
+else
+  update_status=$?
+  if [[ "$security" == "$archive" ]]; then
+    exit "$update_status"
+  fi
+  echo "Ubuntu index update failed ($update_status); retrying the signed security pocket through $archive" >&2
+  security=$archive
+  write_sources
+  sudo timeout --kill-after=10s 5m apt-get "${options[@]}" update
+fi
 sudo timeout --kill-after=10s 5m apt-get "${options[@]}" install --yes --no-install-recommends -- "$@"

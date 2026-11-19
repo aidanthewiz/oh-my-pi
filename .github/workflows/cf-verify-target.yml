@@ -77,6 +77,11 @@ jobs:
         with:
           ref: ${{ inputs.source-sha }}
           persist-credentials: false
+      - name: Install Linux reference build dependencies
+        if: inputs.native-changed == true && inputs.target == 'linux-x64'
+        run: |
+          bash scripts/ci-install-ubuntu-packages.sh \
+            libacl1-dev libattr1-dev libxxhash-dev libzstd-dev liblz4-dev libssl-dev libidn2-dev
       - name: Require Apple Foundation Models toolchain
         if: inputs.target == 'darwin-arm64'
         run: |
@@ -222,8 +227,6 @@ jobs:
           CARGO_BUILD_JOBS: "2"
         run: |
           set -euo pipefail
-          bash scripts/ci-install-ubuntu-packages.sh \
-            libacl1-dev libattr1-dev libxxhash-dev libzstd-dev liblz4-dev libssl-dev libidn2-dev
           work="$(mktemp -d "$RUNNER_TEMP/rsync-reference.XXXXXX")"
           trap 'rm -rf -- "$work"' EXIT
           curl --fail --location --silent --show-error --proto '=https' \
