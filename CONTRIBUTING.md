@@ -33,6 +33,13 @@ Coreforge companion qualification runs in its own repository. Engine qualificati
 
 ## CI scheduling and required checks
 
+A planner from the exact PR base selects the validation scope; a missing policy requires full verification.
+Only non-executable, regular root `README.md` and `CONTRIBUTING.md` changes qualify for the documentation fast path.
+That path checks the actual Git diff and whitespace without installing dependencies or running the build matrix.
+Changes under `docs/` still require full verification: their Markdown is embedded in the shipped CLI.
+Mixed, executable, nonregular, unknown, and empty changes require full verification or fail closed.
+
+Full verification runs TypeScript lint, format, and type checks once, before the expensive platform jobs.
 Each of the eight native targets has its own named Actions group for build and platform-specific checks.
 Linux x64 and macOS ARM64 qualification start after their own producer, without waiting for unrelated targets.
 Their `Full engine` subgroup contains three TypeScript shards, source/compiled smoke checks, and unchanged Rust workspace qualification.
@@ -42,8 +49,9 @@ The Linux producer also supplies all managed consumer lanes and relay validation
 Relay consumes the immutable same-run artifact ID and verifies source, run, attempt, platform, and file hashes.
 Tagged relay publication remains in `relay.yml`, with its existing cache and publishing permissions.
 
-The stable `required CI` check succeeds only after every required dependency succeeds.
-Missing, skipped, cancelled, or failed dependencies cannot satisfy it.
+The stable `required CI` check verifies the exact PR plan and complete dependency inventory.
+A full plan requires every heavy dependency to succeed; a documentation plan requires those jobs to be skipped.
+Failed planning, stale identities, missing jobs, and unexpected job states cannot pass.
 Optional cache failures remain separate from required producer and consumer results.
 
 Activate the branch rule in this order:
@@ -96,9 +104,13 @@ These checks do not qualify live S3/OIDC, the native-addon matrix, or deployed p
 ## Dependency releases
 
 A verified artifact-changing pull request merged into `coreforge` triggers an engine dependency release through `.github/workflows/cf-release.yml`.
-Cache-only CI changes since the latest published engine ancestor do not allocate or publish an engine tag. Unreleased runtime changes retain the release path.
+Non-shipping root documentation and proven cache-only changes do not allocate an engine tag.
+Unreleased runtime changes and embedded `docs/` changes retain the release path.
 Changes to native build commands, signing, matrices, or release admission retain the release path, even inside the release workflow.
-Manual four-part recovery tags retain their existing tip, package-version, and roll safeguards.
+Automatic publication requires the exact merged PR's latest successful GitHub Actions `required CI` check.
+The qualified PR head and release commit must have identical Git trees; stale or unqualified content is rejected before builds.
+Manual four-part recovery tags retain their separately authorized tip, package-version, and roll safeguards.
+Their source must also match the immutable triggering event, including annotated tags.
 Coreforge installers use the exact release and checksums recorded in `engine.lock`.
 Do not use upstream's `bun run release` for this fork's dependency channel.
 
@@ -109,6 +121,8 @@ Each receipt retains its original producer attempt; a later publishing attempt c
 Future producer attempts and results from another source or run are rejected.
 Release checksums include that manifest; it is an integrity record, not an independent cryptographic attestation.
 Release builds retain final channel stamping and signing rather than relabeling differently stamped PR binaries.
+Published checksums are verified before extracting or loading native addons or executing downloaded binaries.
+Use failed-job retries to resume publication; rerunning every job deliberately rebuilds the release.
 
 ## Contribution licensing
 

@@ -612,7 +612,7 @@ function validateTypescriptShard(): void {
 }
 
 async function typescript(partition: "typescript" | "typescript-tests" | "typescript-smoke"): Promise<void> {
-	if (partition !== "typescript-tests") await run(["bun", "run", "ci:check:full"]);
+	if (partition === "typescript") await run(["bun", "run", "ci:check:full"]);
 	if (partition !== "typescript-smoke") await run(["bun", "run", "ci:test:ts"]);
 	if (partition === "typescript-tests") return;
 	await run(["bun", "run", "ci:test:smoke"]);

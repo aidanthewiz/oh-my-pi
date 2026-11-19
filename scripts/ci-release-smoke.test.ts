@@ -144,3 +144,109 @@ describe.skipIf(process.platform === "win32")("real release smoke invocation", (
 		await expect(smokeReleaseBinary(target, assets, identity)).rejects.toThrow("failed (17)");
 	});
 });
+
+describe.skipIf(process.platform === "win32")("published native verification", () => {
+	async function runVerification(corruptArchive: boolean, missingNativeChecksum = false) {
+		const { root, assets } = await fixture();
+		const packageDirectory = path.join(root, "package");
+		const tools = path.join(root, "tools");
+		const work = path.join(root, "work");
+		await Promise.all([fs.mkdir(packageDirectory), fs.mkdir(tools), fs.mkdir(work)]);
+		const native = path.join(packageDirectory, "pi_natives.darwin-arm64.node");
+		const archive = path.join(assets, `coreforge-pi-natives-darwin-arm64-${identity.releaseTag}.tgz`);
+		const binary = path.join(assets, "omp-darwin-arm64");
+		const tar = Bun.which("tar");
+		if (!tar) throw new Error("Published native verification regression requires tar");
+		async function packNative() {
+			const child = Bun.spawn([tar!, "-czf", archive, "-C", root, "package"], {
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			const [status, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()]);
+			if (status !== 0) throw new Error(`Cannot create native fixture: ${stderr}`);
+		}
+		await fs.writeFile(native, "synthetic native fixture");
+		await fs.writeFile(binary, "synthetic binary fixture");
+		await packNative();
+		const lines = await Promise.all(
+			[binary, archive].map(async file => {
+				const hash = new Bun.CryptoHasher("sha256").update(await fs.readFile(file)).digest("hex");
+				return `${hash}  ${path.basename(file)}\n`;
+			}),
+		);
+		await fs.writeFile(
+			path.join(assets, "SHA256SUMS.txt"),
+			(missingNativeChecksum ? [lines[0], lines[0]] : lines).join(""),
+		);
+		if (corruptArchive) {
+			await fs.writeFile(native, "different valid archive with an unverified native payload");
+			await packNative();
+		}
+		const loadMarker = path.join(root, "native-loaded");
+		const extractMarker = path.join(root, "native-extracted");
+		await fs.writeFile(
+			path.join(tools, "gh"),
+			`#!/bin/sh\nwhile [ "$#" -gt 0 ]; do\nif [ "$1" = --pattern ]; then\nshift\ncp "$FIXTURE_ASSETS/$1" .\nexit $?\nfi\nshift\ndone\nexit 19\n`,
+			{ mode: 0o755 },
+		);
+		await fs.writeFile(path.join(tools, "node"), '#!/bin/sh\nprintf loaded > "$NATIVE_LOAD_MARKER"\n', {
+			mode: 0o755,
+		});
+		await fs.writeFile(
+			path.join(tools, "tar"),
+			`#!/bin/sh\nprintf extracted > "$NATIVE_EXTRACT_MARKER"\nexec ${JSON.stringify(tar)} "$@"\n`,
+			{ mode: 0o755 },
+		);
+		const workflow = Bun.YAML.parse(
+			await Bun.file(new URL("../.github/workflows/cf-release.yml", import.meta.url)).text(),
+		) as { jobs: { verify_release: { steps: { name?: string; run?: string }[] } } };
+		const steps = workflow.jobs.verify_release.steps;
+		const binaryExecution = steps.findIndex(step => step.name === "Verify published macOS arm64 binary");
+		if (binaryExecution < 0) throw new Error("Published binary execution step is missing");
+		const shell = steps
+			.slice(0, binaryExecution)
+			.map(step => step.run ?? "")
+			.join("\n");
+		const child = Bun.spawn(["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", shell], {
+			cwd: work,
+			env: {
+				PATH: `${tools}:${process.env.PATH ?? "/usr/bin:/bin"}`,
+				HOME: root,
+				GITHUB_REPOSITORY: "fixture/repo",
+				RELEASE_TAG: identity.releaseTag,
+				FIXTURE_ASSETS: assets,
+				NATIVE_LOAD_MARKER: loadMarker,
+				NATIVE_EXTRACT_MARKER: extractMarker,
+			},
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [status, stdout, stderr] = await Promise.all([
+			child.exited,
+			new Response(child.stdout).text(),
+			new Response(child.stderr).text(),
+		]);
+		return { status, stdout, stderr, loadMarker, extractMarker };
+	}
+
+	test("rejects changed downloaded native bytes before extraction or native loading", async () => {
+		const { status, loadMarker, extractMarker } = await runVerification(true);
+		expect(status).not.toBe(0);
+		expect(await Bun.file(extractMarker).exists()).toBe(false);
+		expect(await Bun.file(loadMarker).exists()).toBe(false);
+	});
+
+	test("rejects a missing native checksum even with two matching checksum lines", async () => {
+		const { status, loadMarker, extractMarker } = await runVerification(false, true);
+		expect(status).not.toBe(0);
+		expect(await Bun.file(extractMarker).exists()).toBe(false);
+		expect(await Bun.file(loadMarker).exists()).toBe(false);
+	});
+
+	test("extracts and loads the native addon after both published checksums pass", async () => {
+		const { status, stderr, loadMarker, extractMarker } = await runVerification(false);
+		expect({ status, stderr }).toEqual({ status: 0, stderr: "" });
+		expect(await fs.readFile(extractMarker, "utf8")).toBe("extracted");
+		expect(await fs.readFile(loadMarker, "utf8")).toBe("loaded");
+	});
+});

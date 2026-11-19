@@ -7,10 +7,10 @@ import re
 import subprocess
 import sys
 
+from ci_pr_scope import is_documentation_change
+
 
 CACHE_FILES = frozenset({
-    b'CONTRIBUTING.md',
-    b'docs/ci-cache-iam.md',
     b'.github/workflows/cf-verify.yml',
     b'.github/workflows/relay.yml',
 })
@@ -20,6 +20,7 @@ CACHE_PATH = re.compile(
 )
 COMMIT = re.compile(r'[0-9a-fA-F]{40}')
 PUBLISHED_TAG = re.compile(r'v[0-9]+\.[0-9]+\.[0-9]+\.[1-9][0-9]*')
+RAW_CHANGE = re.compile(rb':([0-7]{6}) ([0-7]{6}) [0-9a-f]{40} [0-9a-f]{40} ([A-Z][0-9]*)')
 RELEASE_WORKFLOW = b'.github/workflows/cf-release.yml'
 START = '# coreforge-cache-publication:start'
 END = '# coreforge-cache-publication:end'
@@ -115,11 +116,29 @@ def should_release(source: str, published_ref: str | None = None) -> bool:
         raise ValueError('published ref must be a full commit ID or four-part engine tag')
     base = command(['git', 'rev-parse', '--verify', f'{ref}^{{commit}}']).decode().strip()
     command(['git', 'merge-base', '--is-ancestor', base, source])
-    output = command(['git', 'diff', '--name-only', '--no-renames', '-z', base, source, '--'])
-    paths = output.split(b'\0')[:-1]
-    if not paths:
+    output = command([
+        'git', 'diff', '--raw', '--no-abbrev', '--no-renames', '-z', base, source, '--',
+    ])
+    if not output:
         return True
-    for path in paths:
+    records = output.split(b'\0')
+    if records[-1] != b'' or len(records) % 2 != 1:
+        raise ValueError('malformed NUL-delimited release diff')
+    for index in range(0, len(records) - 1, 2):
+        header, path = records[index:index + 2]
+        change = RAW_CHANGE.fullmatch(header)
+        if change is None or not path:
+            raise ValueError('malformed release diff entry')
+        old_mode, new_mode, status = change.groups()
+        regular = (
+            status == b'A' and old_mode == b'000000' and new_mode in (b'100644', b'100755')
+            or status == b'D' and old_mode in (b'100644', b'100755') and new_mode == b'000000'
+            or status == b'M' and old_mode == new_mode and old_mode in (b'100644', b'100755')
+        )
+        if not regular:
+            return True
+        if is_documentation_change(path, old_mode, new_mode, status):
+            continue
         if path == RELEASE_WORKFLOW:
             if not cache_only_workflow_change(base, source):
                 return True

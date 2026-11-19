@@ -18,9 +18,8 @@ SPEC.loader.exec_module(release)
 
 
 class PathPolicyTests(unittest.TestCase):
-    def test_only_direct_cache_names_and_explicit_documentation_are_exempt(self):
+    def test_only_direct_cache_names_are_cache_paths(self):
         allowed = [
-            b'CONTRIBUTING.md', b'docs/ci-cache-iam.md',
             b'.github/workflows/cf-verify.yml',
             b'.github/workflows/relay.yml', b'.github/workflows/cf-cache-read.yml',
             b'.github/workflows/cf-cache-A0_b-c.yml', b'scripts/ci_cache.py',
@@ -33,7 +32,7 @@ class PathPolicyTests(unittest.TestCase):
         denied = [
             b'packages/coding-agent/package.json', b'crates/runtime.rs',
             b'scripts/ci-release-build-binaries.ts', b'Cargo.lock',
-            b'README.md', b'docs/ci-cache-iam.md.bak',
+            b'README.md', b'CONTRIBUTING.md', b'docs/ci-cache-iam.md', b'docs/ci-cache-iam.md.bak',
             b'.github/workflows/cf-release.yml',
             b'.github/workflows/cf-cache-.yml', b'.github/workflows/cf-cache-read.yaml',
             b'.github/workflows/cf-cache-nested/read.yml',
@@ -96,6 +95,9 @@ class GitFixture:
         self.git('remote', 'add', 'origin', str(self.origin))
         self.files = {
             'packages/coding-agent/package.json': b'{"version":"1.2.3"}\n',
+            'README.md': b'repository overview\n',
+            'CONTRIBUTING.md': b'contributor workflow\n',
+            'docs/ci-cache-iam.md': b'embedded cache policy\n',
             'crates/runtime.rs': b'fn artifact_input() {}\n',
             '.github/workflows/cf-release.yml': json.dumps(artifact_workflow()).encode(),
         }
@@ -106,8 +108,8 @@ class GitFixture:
         package.write_bytes(self.files['packages/coding-agent/package.json'])
         scripts = self.repo / 'scripts'
         scripts.mkdir()
-        (scripts / SCRIPT.name).symlink_to(SCRIPT)
-        (scripts / 'ci-released-native.ts').symlink_to(SCRIPT.with_name('ci-released-native.ts'))
+        for name in [SCRIPT.name, 'ci-released-native.ts', 'ci_release_admission.py', 'ci_pr_scope.py']:
+            (scripts / name).symlink_to(SCRIPT.with_name(name))
 
     def run(self, args, *, data=None, cwd=None, env=None):
         return subprocess.run(args, input=data, cwd=cwd or self.repo,
@@ -137,7 +139,8 @@ class GitFixture:
                 if isinstance(contents, dict):
                     mode, kind, oid = '040000', 'tree', write_tree(contents)
                 else:
-                    mode, kind, oid = '100644', 'blob', self.object('blob', contents)
+                    mode, contents = contents if isinstance(contents, tuple) else ('100644', contents)
+                    kind, oid = 'blob', self.object('blob', contents)
                 records.append(f'{mode} {kind} {oid}\t{name}'.encode() + b'\0')
             return self.git('mktree', '-z', data=b''.join(records))
 
@@ -168,26 +171,53 @@ class GitFixture:
         self.git('push', '--quiet', 'origin', f'{source}:refs/fixtures/{source}')
         self.git('--git-dir', str(self.origin), 'update-ref', 'refs/heads/coreforge', source)
 
-    def tag(self, name, source):
-        self.git('update-ref', f'refs/tags/{name}', source)
+    def tag(self, name, source, *, annotated=False):
+        target = source
+        if annotated:
+            target = self.object('tag', (
+                f'object {source}\ntype commit\ntag {name}\n'
+                'tagger Fixture <fixture@invalid> 1700000000 +0000\n\nfixture tag\n'
+            ).encode())
+        self.git('update-ref', f'refs/tags/{name}', target)
         self.git('push', '--quiet', 'origin', f'refs/tags/{name}')
+        return target
 
     def prepare(self, shell, source, *, ref_type='branch', ref_name='coreforge', merged=1,
-                published=('v1.2.3.1',), tip=None, records=None, metadata_failure=False):
+                published=('v1.2.3.1',), tip=None, records=None, metadata_failure=False,
+                qualified_head=None, check_status='completed', check_conclusion='success',
+                admission_failure=False):
         self.publish_tip(tip or source)
         gh = self.bin / 'gh'
         gh.write_text('''#!/usr/bin/env python3
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 args = sys.argv[1:]
 with Path(os.environ['GH_CALLS']).open('a') as stream:
     stream.write(json.dumps(args) + '\\n')
-expected = ['api', 'repos/fixture/repo/commits/' + os.environ['EVENT_SHA'] + '/pulls',
-            '--jq', '[.[] | select(.merged_at != null and .base.ref == "coreforge")] | length']
-if args == expected:
-    print(os.environ['MERGED_COUNT'])
+source = os.environ['EVENT_SHA']
+head = os.environ['QUALIFIED_HEAD']
+prefix = 'repos/fixture/repo'
+if args == ['api', prefix + '/commits/' + source + '/pulls?per_page=100', '--paginate', '--slurp']:
+    if os.environ['ADMISSION_FAILURE'] == 'true':
+        sys.exit(98)
+    pull = {'number': 17, 'merged_at': '2026-11-18T12:00:00Z', 'merge_commit_sha': source,
+            'base': {'ref': 'coreforge', 'repo': {'full_name': 'fixture/repo'}},
+            'head': {'sha': head, 'repo': {'full_name': 'fixture/repo'}}}
+    print(json.dumps([[pull] * int(os.environ['MERGED_COUNT'])]))
+    sys.exit(0)
+if args == ['api', prefix + '/commits/' + head + '/check-runs?check_name=required%20CI&filter=latest&per_page=100',
+            '--paginate', '--slurp']:
+    print(json.dumps([{'check_runs': [{'id': 1, 'name': 'required CI', 'app': {'slug': 'github-actions'},
+                                     'head_sha': head, 'status': os.environ['CHECK_STATUS'],
+                                     'conclusion': json.loads(os.environ['CHECK_CONCLUSION'])}]}]))
+    sys.exit(0)
+if len(args) == 2 and args[0] == 'api' and args[1].startswith(prefix + '/git/commits/'):
+    commit = args[1].rsplit('/', 1)[1]
+    tree = subprocess.check_output(['git', 'rev-parse', commit + '^{tree}']).decode().strip()
+    print(json.dumps({'sha': commit, 'tree': {'sha': tree}}))
     sys.exit(0)
 if args == ['release', 'list', '--repo', 'fixture/repo', '--exclude-drafts', '--limit', '1000',
             '--json', 'tagName,isDraft']:
@@ -212,6 +242,11 @@ sys.exit(97)
                'RELEASE_RECORDS': json.dumps(records if records is not None else
                                              [{'tagName': tag, 'isDraft': False} for tag in published]),
                'METADATA_FAILURE': 'true' if metadata_failure else 'false'}
+        env.update({
+            'QUALIFIED_HEAD': qualified_head or source, 'CHECK_STATUS': check_status,
+            'CHECK_CONCLUSION': json.dumps(check_conclusion),
+            'ADMISSION_FAILURE': 'true' if admission_failure else 'false',
+        })
         result = self.run(['bash', '--noprofile', '--norc', '-e', '-o', 'pipefail', '-c', shell], env=env)
         outputs = dict(line.split('=', 1) for line in output.read_text().splitlines())
         requests = [json.loads(line) for line in calls.read_text().splitlines()]
@@ -238,6 +273,44 @@ class GitDecisionTests(unittest.TestCase):
         other = self.fixture.commit({**self.fixture.files, 'crates/runtime.rs': b'other runtime'})
         source = self.fixture.commit(files, [self.fixture.base, other])
         self.assert_decision(source, 'false')
+
+    def test_regular_root_docs_and_cache_changes_do_not_republish_artifacts(self):
+        for path in ('README.md', 'CONTRIBUTING.md'):
+            for contents in (b'updated public guidance\n', None):
+                with self.subTest(path=path, contents=contents):
+                    source = self.fixture.changed({path: contents, 'scripts/ci_cache_probe.py': b'cache'})
+                    self.assert_decision(source, 'false')
+            files = dict(self.fixture.files)
+            files.pop(path)
+            base = self.fixture.commit(files, [self.fixture.base])
+            source = self.fixture.commit({**files, path: b'new public guidance\n'}, [base])
+            result = self.fixture.classify(source, published_ref=base)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, b'false\n')
+
+    def test_embedded_docs_including_cache_policy_require_an_artifact_release(self):
+        for path in ('docs/ci-cache-iam.md', 'docs/new-guide.md', 'docs/README.md'):
+            with self.subTest(path=path):
+                self.assert_decision(self.fixture.changed({path: b'changed embedded documentation'}), 'true')
+        self.assert_decision(self.fixture.changed({'docs/ci-cache-iam.md': None}), 'true')
+
+    def test_nonregular_paths_and_executable_root_docs_cannot_skip_release(self):
+        for changes in [
+            {'README.md': ('120000', b'crates/runtime.rs')},
+            {'CONTRIBUTING.md': ('120000', b'crates/runtime.rs')},
+            {'README.md': ('100755', b'executable document')},
+            {'scripts/ci_cache_probe.py': ('120000', b'../crates/runtime.rs')},
+            {'README.md': b'documentation', 'crates/runtime.rs': b'changed artifact'},
+        ]:
+            with self.subTest(changes=changes):
+                self.assert_decision(self.fixture.changed(changes), 'true')
+        for path in ('README.md', 'CONTRIBUTING.md'):
+            files = {**self.fixture.files, path: ('100755', b'executable guidance')}
+            base = self.fixture.commit(files, [self.fixture.base])
+            source = self.fixture.commit({**files, path: ('100755', b'changed executable guidance')}, [base])
+            result = self.fixture.classify(source, published_ref=base)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, b'true\n')
 
     def test_nul_delimited_runtime_filename_cannot_masquerade_as_cache_path(self):
         source = self.fixture.changed({'scripts/ci_cache_probe.py\nunknown': b'artifact input'})
@@ -321,7 +394,7 @@ class PrepareWorkflowTests(unittest.TestCase):
 
     def test_cache_only_branch_exits_before_tag_allocation_or_release_lookup(self):
         source = self.fixture.changed({
-            'CONTRIBUTING.md': b'cache adoption', 'docs/ci-cache-iam.md': b'cache policy',
+            'CONTRIBUTING.md': b'cache adoption',
             '.github/workflows/cf-verify.yml': b'cache reader',
             '.github/workflows/relay.yml': b'cache consumer',
             '.github/workflows/cf-cache-read.yml': b'broker',
@@ -332,7 +405,18 @@ class PrepareWorkflowTests(unittest.TestCase):
         result, outputs, calls = self.fixture.prepare(self.shell, source)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(outputs, {'should_release': 'false'})
-        self.assertEqual([call[:2] for call in calls], [['api', calls[0][1]], ['release', 'list']])
+        self.assertEqual([call[:2] for call in calls if call[0] == 'release'], [['release', 'list']])
+        self.assertFalse(any(call[0] == 'api' for call in calls))
+
+    def test_non_artifact_changes_skip_pending_or_stale_qualification(self):
+        source = self.fixture.changed({'README.md': b'public guidance'})
+        result, outputs, calls = self.fixture.prepare(
+            self.shell, source, qualified_head=self.fixture.base,
+            check_status='in_progress', check_conclusion=None,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(outputs, {'should_release': 'false'})
+        self.assertFalse(any(call[0] == 'api' for call in calls))
 
     def test_artifact_changes_empty_diff_and_renames_keep_release_decision(self):
         changes = [
@@ -357,11 +441,57 @@ class PrepareWorkflowTests(unittest.TestCase):
         self.assertEqual(outputs, {'release_tag': 'v1.2.3.7', 'should_release': 'true', 'release_sha': source})
         self.assertEqual(calls, [])
 
-    def test_branch_still_requires_merged_pr_and_current_tip_before_classifier(self):
+    def test_manual_annotated_event_can_identify_the_tag_object_or_peeled_commit(self):
+        source = self.fixture.changed({'scripts/ci_cache_probe.py': b'cache'})
+        annotated = self.fixture.tag('v1.2.3.7', source, annotated=True)
+        for event in (annotated, source):
+            with self.subTest(event=event):
+                result, outputs, calls = self.fixture.prepare(
+                    self.shell, event, ref_type='tag', ref_name='v1.2.3.7', tip=source, merged=0,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(outputs, {
+                    'release_tag': 'v1.2.3.7', 'should_release': 'true', 'release_sha': source,
+                })
+                self.assertEqual(calls, [])
+
+    def test_manual_tag_cannot_substitute_a_new_target_for_the_triggering_event(self):
+        event = self.fixture.changed({'scripts/ci_cache_probe.py': b'original event'})
+        current = self.fixture.changed({'crates/runtime.rs': b'current tip'})
+        self.fixture.tag('v1.2.3.7', current)
+        for event_sha in (event, 'f' * 40):
+            with self.subTest(event_sha=event_sha):
+                result, outputs, calls = self.fixture.prepare(
+                    self.shell, event_sha, ref_type='tag', ref_name='v1.2.3.7', tip=current,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(outputs, {})
+                self.assertEqual(calls, [])
+
+    def test_automatic_release_accepts_distinct_commits_with_identical_qualified_trees(self):
+        files = {**self.fixture.files, 'crates/runtime.rs': b'qualified artifact'}
+        head = self.fixture.commit(files, [self.fixture.base])
+        source = self.fixture.commit(files, [self.fixture.base, head])
+        self.assert_release(source, qualified_head=head)
+
+    def test_automatic_release_rejects_missing_qualification_and_unqualified_merge_content(self):
+        source = self.fixture.changed({'crates/runtime.rs': b'new artifact'})
+        for kwargs in [
+            {'check_status': 'in_progress', 'check_conclusion': None},
+            {'check_conclusion': 'failure'},
+            {'qualified_head': self.fixture.base},
+            {'admission_failure': True},
+        ]:
+            with self.subTest(kwargs=kwargs):
+                result, outputs, _ = self.fixture.prepare(self.shell, source, **kwargs)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(outputs, {})
+
+    def test_artifact_release_still_requires_merged_pr_and_current_tip(self):
         for merged, stale in [(0, False), (1, True)]:
             with self.subTest(merged=merged, stale=stale):
-                source = self.fixture.base
-                tip = self.fixture.changed({'crates/runtime.rs': b'new runtime'}) if stale else source
+                source = self.fixture.changed({'crates/runtime.rs': b'candidate runtime'})
+                tip = self.fixture.changed({'crates/runtime.rs': b'newer runtime'}) if stale else source
                 result, outputs, _ = self.fixture.prepare(
                     self.shell, source, merged=merged, tip=tip,
                 )

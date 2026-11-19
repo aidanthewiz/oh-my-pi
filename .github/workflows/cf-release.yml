@@ -46,6 +46,10 @@ permissions:
 jobs:
   prepare:
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: read
     outputs:
       release_tag: ${{ steps.release.outputs.release_tag }}
       should_release: ${{ steps.release.outputs.should_release }}
@@ -72,26 +76,21 @@ jobs:
           if [ "$EVENT_REF_TYPE" = "tag" ]; then
             TAG="$EVENT_REF_NAME"
             RELEASE_SHA="$(git rev-parse "$TAG^{commit}")"
+            EVENT_COMMIT="$(git rev-parse --verify "$EVENT_SHA^{commit}")"
+            if [ "$RELEASE_SHA" != "$EVENT_COMMIT" ]; then
+              echo "tag $TAG now identifies $RELEASE_SHA, not event commit $EVENT_COMMIT - refusing to release"
+              exit 1
+            fi
             if [ "$RELEASE_SHA" != "$TIP" ]; then
               echo "tag commit $RELEASE_SHA is not the coreforge tip ($TIP) - refusing to release"
               exit 1
             fi
           else
-            MERGED_PR_COUNT="$(
-              gh api "repos/${GITHUB_REPOSITORY}/commits/${EVENT_SHA}/pulls" \
-                --jq '[.[] | select(.merged_at != null and .base.ref == "coreforge")] | length'
-            )"
-            if [ "$MERGED_PR_COUNT" -eq 0 ]; then
-              echo "$EVENT_SHA was not introduced by a merged coreforge pull request - manual release required"
-              echo "should_release=false" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
             if [ "$EVENT_SHA" != "$TIP" ]; then
               echo "coreforge advanced from $EVENT_SHA to $TIP - a newer run will publish the tip"
               echo "should_release=false" >> "$GITHUB_OUTPUT"
               exit 0
             fi
-
             # coreforge-cache-publication:start
             RELEASE_LIST="$(mktemp)"
             trap 'rm -f "$RELEASE_LIST"' EXIT
@@ -100,11 +99,21 @@ jobs:
             PUBLISHED_TAG="$(bun scripts/ci-released-native.ts resolve-optional "$PKG" "$RELEASE_LIST")"
             SHOULD_RELEASE="$(python3 scripts/ci_cache_release.py "$EVENT_SHA" --published-ref "$PUBLISHED_TAG")"
             if [ "$SHOULD_RELEASE" = "false" ]; then
-              echo "$EVENT_SHA has only cache changes since $PUBLISHED_TAG - no engine release"
+              echo "$EVENT_SHA has only non-artifact changes since $PUBLISHED_TAG - no engine release"
               echo "should_release=false" >> "$GITHUB_OUTPUT"
               exit 0
             fi
             # coreforge-cache-publication:end
+
+            ADMISSION="$(python3 scripts/ci_release_admission.py "$EVENT_SHA")"
+            case "$ADMISSION" in
+              true) ;;
+              false)
+                echo "should_release=false" >> "$GITHUB_OUTPUT"
+                exit 0
+                ;;
+              *) echo "invalid automatic release admission: $ADMISSION"; exit 1 ;;
+            esac
 
             LAST=0
             RESUME_TAG=""
@@ -468,11 +477,13 @@ jobs:
           name: binary-${{ matrix.target }}
           path: packages/coding-agent/binaries/${{ matrix.binary }}
           if-no-files-found: error
+          overwrite: true
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: native-${{ matrix.target }}
           path: release-assets/coreforge-pi-natives-${{ matrix.target }}-${{ env.RELEASE_TAG }}.tgz
           if-no-files-found: error
+          overwrite: true
       - name: Save successful GitHub hot cache
         if: success() && matrix.windows != '1' && steps.bazel-cache.outputs.cache-primary-key != '' && steps.bazel-cache.outputs.cache-hit != 'true'
         continue-on-error: true
@@ -546,6 +557,7 @@ jobs:
           name: release-smoke-${{ matrix.target }}
           path: release-smoke-receipts/*.json
           if-no-files-found: error
+          overwrite: true
 
   cache_publish:
     needs: [prepare, build, release, verify_release]
@@ -670,16 +682,13 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --pattern "omp-darwin-arm64"
           chmod +x omp-darwin-arm64
-      - name: Verify published source-install native addon
+      - name: Download published source-install native addon
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release download "$RELEASE_TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --pattern "coreforge-pi-natives-darwin-arm64-${RELEASE_TAG}.tgz"
-          tar -xzf "coreforge-pi-natives-darwin-arm64-${RELEASE_TAG}.tgz"
-          test -f package/pi_natives.darwin-arm64.node
-          node -e 'require("./package/pi_natives.darwin-arm64.node")'
       - name: Verify published checksums
         env:
           GH_TOKEN: ${{ github.token }}
@@ -687,12 +696,22 @@ jobs:
           gh release download "$RELEASE_TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --pattern "SHA256SUMS.txt"
-          grep -F \
-            -e "  omp-darwin-arm64" \
-            -e "  coreforge-pi-natives-darwin-arm64-${RELEASE_TAG}.tgz" \
-            SHA256SUMS.txt > SHA256SUMS.verify
-          test "$(wc -l < SHA256SUMS.verify)" -eq 2
+          awk -v binary="omp-darwin-arm64" \
+              -v native="coreforge-pi-natives-darwin-arm64-${RELEASE_TAG}.tgz" '
+            $2 == binary || $2 == native { count[$2]++; print }
+            END {
+              if (count[binary] != 1 || count[native] != 1) {
+                print "missing or duplicate release checksum" > "/dev/stderr"
+                exit 1
+              }
+            }
+          ' SHA256SUMS.txt > SHA256SUMS.verify
           shasum -a 256 -c SHA256SUMS.verify
+      - name: Verify published source-install native addon
+        run: |
+          tar -xzf "coreforge-pi-natives-darwin-arm64-${RELEASE_TAG}.tgz"
+          test -f package/pi_natives.darwin-arm64.node
+          node -e 'require("./package/pi_natives.darwin-arm64.node")'
       - name: Verify published macOS arm64 binary
         run: |
           codesign -dvvv ./omp-darwin-arm64

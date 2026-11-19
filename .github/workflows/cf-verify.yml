@@ -17,9 +17,43 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  plan:
+    name: Plan verified PR scope
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    outputs:
+      scope: ${{ steps.scope.outputs.scope }}
+      base_sha: ${{ steps.scope.outputs.base_sha }}
+      source_sha: ${{ steps.scope.outputs.source_sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Classify the exact PR with the base revision policy
+        id: scope
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          SOURCE_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ && "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git --no-replace-objects rev-parse --verify HEAD)" = "$SOURCE_SHA"
+          test "$(git --no-replace-objects rev-parse --verify "${BASE_SHA}^{commit}")" = "$BASE_SHA"
+          if git --no-replace-objects cat-file -e "${BASE_SHA}:scripts/ci_pr_scope.py"; then
+            git --no-replace-objects show "${BASE_SHA}:scripts/ci_pr_scope.py" > "$RUNNER_TEMP/ci_pr_scope.py"
+            python3 "$RUNNER_TEMP/ci_pr_scope.py" "$BASE_SHA" "$SOURCE_SHA" >> "$GITHUB_OUTPUT"
+          else
+            echo "No base revision scope policy; require full verification."
+            echo "scope=full" >> "$GITHUB_OUTPUT"
+          fi
+          printf 'base_sha=%s\nsource_sha=%s\n' "$BASE_SHA" "$SOURCE_SHA" >> "$GITHUB_OUTPUT"
+
   prepare:
     name: Source checks and native inputs
-    if: github.event.pull_request.head.repo.full_name == github.repository
+    needs: plan
+    if: needs.plan.outputs.scope == 'full'
     runs-on: ubuntu-24.04
     outputs:
       native_changed: ${{ steps.native.outputs.changed }}
@@ -46,6 +80,8 @@ jobs:
           bun-version: "1.4.4"
       - name: Install source verification dependencies
         run: bun install --frozen-lockfile
+      - name: Verify qualification and release helpers
+        run: bun test --no-env-file scripts/ci-qualification-engine.test.ts scripts/ci-release-smoke.test.ts
       - name: Check source before native builds
         run: bun run ci:check:full
       - name: Verify selective LLVM extraction
@@ -54,6 +90,10 @@ jobs:
         run: python3 -m unittest discover -s scripts -p 'test_ci_cache*.py'
       - name: Verify required CI aggregation
         run: python3 -m unittest discover -s scripts -p 'test_ci_required.py'
+      - name: Verify pull request scope classification
+        run: python3 -m unittest discover -s scripts -p 'test_ci_pr_scope.py'
+      - name: Verify automatic release admission
+        run: python3 -m unittest discover -s scripts -p 'test_ci_release_admission.py'
       - name: Select native verification source
         id: native
         env:
@@ -231,7 +271,8 @@ jobs:
 
   browser_relay:
     name: Build browser extension
-    if: github.event.pull_request.head.repo.full_name == github.repository
+    needs: plan
+    if: needs.plan.outputs.scope == 'full'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -249,20 +290,19 @@ jobs:
 
   required:
     name: required CI
-    needs: [prepare, darwin_arm64, darwin_x64, linux_x64, linux_arm64, linux_musl_x64, linux_musl_arm64, win32_x64, win32_arm64, browser_relay]
+    needs: [plan, prepare, darwin_arm64, darwin_x64, linux_x64, linux_arm64, linux_musl_x64, linux_musl_arm64, win32_x64, win32_arm64, browser_relay]
     if: always()
     runs-on: ubuntu-24.04
     permissions:
       contents: read
     env:
       NEEDS: ${{ toJSON(needs) }}
+      BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      SOURCE_SHA: ${{ github.event.pull_request.head.sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           persist-credentials: false
-      - name: Require every CI dependency
-        run: |
-          python3 scripts/ci-required.py prepare \
-            darwin_arm64 darwin_x64 linux_x64 linux_arm64 \
-            linux_musl_x64 linux_musl_arm64 win32_x64 win32_arm64 browser_relay
+      - name: Require the verified CI plan
+        run: python3 scripts/ci-required.py "$BASE_SHA" "$SOURCE_SHA"
