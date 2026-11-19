@@ -18,6 +18,7 @@
 
 ### Fixed
 
+- Test relay call-budget exhaustion after real worker readiness without consuming its initialization budget.
 - Start peer-reply test deadlines after agent initialization so startup cannot consume the reply window.
 - Complete browser directory uploads only after Chrome finishes file selection, including empty directories and shadow-root inputs.
 - Expose the full registered AWS JSON input schema through `xd://aws/schema`. Require complete schema and `aws-secret-input/v1` capability comparison before authentication or approval. Preserve native session-disposal and cancellation cleanup. Source delivery does not publish an engine or adopt an installed runtime.

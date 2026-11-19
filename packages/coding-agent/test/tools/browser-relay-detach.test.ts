@@ -522,15 +522,26 @@ describe("relay tabs Chrome detaches omp from", () => {
 			await invoke({ action: "run", code: 'await tab.emulate({ userAgent: "omp-detach-test" });', timeout: 10 });
 			const tab = getTab(name);
 			if (tab?.backend !== "worker") throw new Error("expected a worker tab");
-			// Hold the re-adoption for the call's whole budget once the detached worker is gone. Real time: the
-			// re-adoption's own init deadline reads the same clock, so a faked clock would fail it instead.
-			const budgetMs = 1_000;
-			const terminate = tab.worker.terminate.bind(tab.worker);
-			const held = spyOn(tab.worker, "terminate").mockImplementation(async () => {
-				await terminate();
-				await Bun.sleep(budgetMs);
-			});
+			// Charge elapsed call time only after the replacement is ready, without starving its real initialization.
+			const budgetMs = 10_000;
+			const workerProperty = Object.getOwnPropertyDescriptor(tab, "worker");
+			if (!workerProperty?.configurable || !("value" in workerProperty)) {
+				throw new Error("expected a configurable worker property");
+			}
+			let worker = tab.worker;
+			let elapsedMs = 0;
+			const now = performance.now.bind(performance);
+			const clock = spyOn(performance, "now").mockImplementation(() => now() + elapsedMs);
 			try {
+				Object.defineProperty(tab, "worker", {
+					configurable: true,
+					enumerable: workerProperty.enumerable,
+					get: () => worker,
+					set: (replacement: typeof worker) => {
+						worker = replacement;
+						elapsedMs = budgetMs;
+					},
+				});
 				const reapplying = ext.nextSend("Network.setUserAgentOverride");
 				const next = runInTab(name, {
 					code: "await page.evaluate(() => { window.budgetRuns = (window.budgetRuns ?? 0) + 1; });",
@@ -542,7 +553,8 @@ describe("relay tabs Chrome detaches omp from", () => {
 				expect(await next).toBeInstanceOf(ToolError);
 				expect(await page?.evaluate("window.budgetRuns ?? 0")).toBe(0);
 			} finally {
-				held.mockRestore();
+				clock.mockRestore();
+				Object.defineProperty(tab, "worker", { ...workerProperty, value: worker });
 			}
 			expect((await invoke(readMark)).value).toBe("kept");
 		},
