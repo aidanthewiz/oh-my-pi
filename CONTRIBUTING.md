@@ -103,6 +103,7 @@ The token travels through stdin via `--web-identity-token`, never through a comm
 AWS CLI 2.40/2.41 loads `--cli-input-json` twice; do not use a one-shot pipe for that argument.
 
 Run `python3 -m unittest discover -s scripts -p 'test_ci_cache*.py'` for cache and real broker-guard boundaries.
+The canary scopes its `ci` preset to build commands so administrative shutdown remains valid before snapshot packing.
 Local qualification exercised a real Bazel 9.2.0 C build with isolated output bases and a loopback repository download.
 Warm restore produced a disk-cache hit with repository downloads disabled; changed inputs rebuilt correctly, and a miss ran a real cold build.
 These checks do not qualify live S3/OIDC, the native-addon matrix, or deployed performance.

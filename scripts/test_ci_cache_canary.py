@@ -1,6 +1,6 @@
 """Receipt regressions using Bun and a host-compiled Node-API addon.
 
-Linux and macOS require Bun, a C compiler, and AWS CLI on PATH. Missing
+Linux and macOS require Bun, Bazelisk, a C compiler, and AWS CLI on PATH. Missing
 tools on supported platforms fail rather than claim proof.
 No Bazel compilation, AWS calls, credential checks, or real cache roots are
 used. A loopback-only STS fixture exercises the actual CLI request parser.
@@ -17,6 +17,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import shlex
 import sys
 import tempfile
 import threading
@@ -35,6 +36,8 @@ with patch.object(sys, "path", [str(HELPER.parent), *sys.path]):
 @unittest.skipUnless(sys.platform in ("linux", "darwin"), "host Node-API fixture supports Linux and macOS")
 class CanaryReceiptTests(unittest.TestCase):
     def setUp(self):
+        self.bazelisk = shutil.which("bazelisk")
+        self.bazelisk_home = os.environ.get("BAZELISK_HOME")
         self.compiler = shutil.which("cc") or shutil.which("clang") or shutil.which("gcc")
         if not self.compiler or not shutil.which("bun"):
             self.fail("canary receipt tests require Bun and a C compiler (cc, clang, or gcc) on PATH")
@@ -173,9 +176,42 @@ napi_value napi_register_module_v1(napi_env env, napi_value exports) {
         self.assertFalse(self.receipt.exists(), "wrong-version native bytes received a success receipt")
 
     def test_matching_native_callback_allows_receipt_for_exact_loaded_bytes(self):
+        if self.bazelisk is None:
+            self.fail("the real Bazel shutdown regression requires Bazelisk on PATH")
+        launcher = self.root / "bin" / "bazelisk"
+        launcher.write_text(
+            "#!/bin/sh\nexec " + shlex.quote(self.bazelisk) + ' --nosystem_rc --nohome_rc "$@"\n'
+        )
+        (self.checkout / "MODULE.bazel").write_text('module(name = "cache_canary_test")\n')
+        (self.checkout / ".bazelrc").write_text("build:ci --announce_rc\n")
+        version = (HELPER.parent.parent / ".bazelversion").read_text().strip()
+        original_build = self.build_without_bazel
+
+        def build_with_server(rc, log):
+            build_log = original_build(rc, log)
+            # Without a running server, shutdown does not validate command configs.
+            started = subprocess.run(
+                [str(launcher), f"--bazelrc={rc}", "info", "release"],
+                cwd=self.checkout, capture_output=True, text=True, timeout=90,
+            )
+            self.assertEqual(started.returncode, 0, started.stderr)
+            return build_log
+
         self.compile_addon(self.version)
         expected_digest = hashlib.sha256(self.addon.read_bytes()).hexdigest()
-        result, _, errors = self.run_canary()
+        with patch.dict(os.environ, {
+            "BAZELISK_HOME": self.bazelisk_home or str(self.root / "bazelisk"),
+            "USE_BAZEL_VERSION": version,
+        }), patch.object(self, "build_without_bazel", side_effect=build_with_server):
+            try:
+                result, _, errors = self.run_canary()
+            finally:
+                cleanup = subprocess.run(
+                    [self.bazelisk, "--ignore_all_rc_files",
+                     f"--output_user_root={self.runner / 'cache-canary-output'}", "shutdown"],
+                    cwd=self.checkout, capture_output=True, text=True, timeout=30,
+                )
+                self.assertEqual(cleanup.returncode, 0, cleanup.stderr)
         self.assertEqual(result, 0, errors)
         self.assertEqual(self.evidence.read_text().splitlines(), ["loaded", "version:" + self.version])
         receipt = json.loads(self.receipt.read_text())
