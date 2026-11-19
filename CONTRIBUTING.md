@@ -104,7 +104,9 @@ Do not use upstream's `bun run release` for this fork's dependency channel.
 
 Before publication, all eight final binaries run `--version` and `--smoke-test` on matching execution platforms.
 Musl binaries use the repository's pinned Alpine runtime image.
-The publisher verifies `release-verification.json` against every binary's actual digest and the same source, run, and attempt.
+The publisher verifies `release-verification.json` against every binary's actual digest and the same source and workflow run.
+Each receipt retains its original producer attempt; a later publishing attempt can reuse earlier successful results.
+Future producer attempts and results from another source or run are rejected.
 Release checksums include that manifest; it is an integrity record, not an independent cryptographic attestation.
 Release builds retain final channel stamping and signing rather than relabeling differently stamped PR binaries.
 

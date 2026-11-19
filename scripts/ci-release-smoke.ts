@@ -160,8 +160,16 @@ export async function verifyReleaseSmoke(
 		assert((await fs.lstat(file)).isFile(), `Receipt is not a regular file: ${target}`);
 		const receipt: ReleaseSmokeReceipt = JSON.parse(await fs.readFile(file, "utf8"));
 		assert.equal(receipt.schemaVersion, 1, "Unknown release smoke schema");
-		for (const key of ["sourceSha", "releaseTag", "runId", "runAttempt"] as const)
+		for (const key of ["sourceSha", "releaseTag", "runId"] as const)
 			assert.equal(receipt[key], identity[key], `Release smoke ${key} mismatch: ${target}`);
+		// A failed-jobs rerun retains successful producers from earlier attempts of this same run.
+		assert(
+			typeof receipt.runAttempt === "string" &&
+				/^[1-9]\d*$/.test(receipt.runAttempt) &&
+				receipt.runAttempt.trim() === receipt.runAttempt &&
+				BigInt(receipt.runAttempt) <= BigInt(identity.runAttempt),
+			`Invalid or future release smoke producer runAttempt: ${target}`,
+		);
 		assert.equal(receipt.target, target, "Release smoke target mismatch");
 		assert.equal(receipt.smokePassed, true, `Release smoke failed: ${target}`);
 		assert.equal(receipt.version.split("/").length, 2, `Malformed release version: ${target}`);

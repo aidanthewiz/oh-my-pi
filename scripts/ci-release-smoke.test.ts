@@ -70,11 +70,26 @@ describe("release publication integrity", () => {
 		await expect(verifyReleaseSmoke(assets, receipts, identity)).rejects.toThrow("Published bytes differ");
 	});
 
-	test("rejects receipts from another workflow attempt", async () => {
+	test("preserves successful producer receipts when only publication is retried", async () => {
 		const { assets, receipts } = await completeFixture();
 		await changeReceipt(receipts, { runAttempt: "1" });
-		await expect(verifyReleaseSmoke(assets, receipts, identity)).rejects.toThrow("runAttempt mismatch");
+		const proof = await verifyReleaseSmoke(assets, receipts, identity);
+		expect(proof.find(receipt => receipt.target === "linux-x64")?.runAttempt).toBe("1");
 	});
+
+	test("rejects receipts from another workflow run", async () => {
+		const { assets, receipts } = await completeFixture();
+		await changeReceipt(receipts, { runId: "12344" });
+		await expect(verifyReleaseSmoke(assets, receipts, identity)).rejects.toThrow("runId mismatch");
+	});
+
+	for (const runAttempt of ["3", "0", "-1", "01", "1.5", "1\n", 1]) {
+		test(`rejects invalid or future producer attempt ${JSON.stringify(runAttempt)}`, async () => {
+			const { assets, receipts } = await completeFixture();
+			await changeReceipt(receipts, { runAttempt });
+			await expect(verifyReleaseSmoke(assets, receipts, identity)).rejects.toThrow("producer runAttempt");
+		});
+	}
 
 	test("rejects a failed smoke even when the artifact hashes match", async () => {
 		const { assets, receipts } = await completeFixture();
