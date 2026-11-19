@@ -18,6 +18,8 @@
 
 ### Fixed
 
+- Synchronize shell job-control fixtures with actual shell startup before starting their signal delays.
+- Synchronize lifecycle fixtures with actual approval presentation, retained consumer output, and SIGTERM-handler readiness without relaxing their assertions or timeouts.
 - Scope cached Kiro model unions to all participating account routes, preserving cache reuse across token rotation without reusing removed-account entitlements.
 - Close owned headless browser processes even after their CDP connection is lost, before removing their profiles.
 - Wait for owned jobs, delivered result turns, and persistence in restore qualification before publishing raster inputs.

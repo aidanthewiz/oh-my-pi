@@ -200,11 +200,16 @@ describe.skipIf(process.platform === "win32")("headless subagent runtime approva
 			closeLinkBrowser: () => undefined,
 		} as unknown as InteractiveModeContext;
 		const controller = new ExtensionUiController(context);
+		const selectorRequested = Promise.withResolvers<void>();
 		const runner = fixture.session.extensionRunner;
 		if (!runner) throw new Error("Missing parent extension runner");
 		const uiContext: ExtensionUIContext = {
 			...runner.getUIContext(),
-			select: (title, options, dialogOptions) => controller.showCollabAwareSelector(title, options, dialogOptions),
+			select: (title, options, dialogOptions) => {
+				const selected = controller.showCollabAwareSelector(title, options, dialogOptions);
+				selectorRequested.resolve();
+				return selected;
+			},
 		};
 		await initializeExtensions(fixture.session, {
 			mode,
@@ -218,7 +223,7 @@ describe.skipIf(process.platform === "win32")("headless subagent runtime approva
 		});
 		display.start();
 		displays.push(display);
-		return { ...fixture, terminal, display, context, uiContext };
+		return { ...fixture, terminal, display, context, uiContext, selectorRequested: selectorRequested.promise };
 	}
 
 	async function reinitializeParent(owner: { session: AgentSession; uiContext: ExtensionUIContext }): Promise<void> {
@@ -937,11 +942,18 @@ describe.skipIf(process.platform === "win32")("headless subagent runtime approva
 				.finally(() => {
 					finished = true;
 				});
+			const initial = await Promise.race([
+				owner.selectorRequested.then(() => ({ kind: "approval" as const })),
+				settled.then(task => ({ kind: "settled" as const, task })),
+			]);
+			if (initial.kind === "settled")
+				throw new Error(`Task ended before approval: ${JSON.stringify({ task: initial.task, bashOutcome })}`);
 			await owner.terminal.waitForRender(
 				() => owner.terminal.getScrollBuffer().join("\n").includes("OwnedSpawn") || finished,
 			);
-			if (finished || !owner.context.hookSelector)
+			if (finished)
 				throw new Error(`Task ended before approval: ${JSON.stringify({ task: await settled, bashOutcome })}`);
+			expect(owner.context.hookSelector).toBeDefined();
 			expect(owner.terminal.getScrollBuffer().join("\n")).toContain("OwnedSpawn");
 			const childSession = AgentRegistry.global().get("OwnedSpawn")?.session;
 			if (!childSession) throw new Error("Missing spawned approval child");

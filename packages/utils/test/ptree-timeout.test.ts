@@ -670,8 +670,8 @@ describe.skipIf(process.platform !== "linux")("ptree subreaper stop", () => {
 		["an AbortSignal", (_child: ChildProcess, controller: AbortController) => controller.abort()],
 	] as const) {
 		it(`gives the command its SIGTERM before the hard kill on ${name}`, async () => {
-			// A command that cleans up on SIGTERM must get the chance on a graceful
-			// stop, not only a SIGKILL.
+			// The child inherits ignored SIGTERM so a children-first signal cannot
+			// end wait and let the shell exit before its own handler runs.
 			const dir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-utils-subreaper-stop-"));
 			const pidFile = path.join(dir, "pid");
 			const marker = path.join(dir, "cleaned");
@@ -681,7 +681,7 @@ describe.skipIf(process.platform !== "linux")("ptree subreaper stop", () => {
 					[
 						"/bin/sh",
 						"-c",
-						`trap 'echo cleaned > "${marker}"; exit 0' TERM; echo $$ > '${pidFile}'; sleep 3600 & wait`,
+						`trap "" TERM; sleep 3600 & trap 'echo cleaned > "${marker}"; exit 0' TERM; echo $$ > '${pidFile}'; wait`,
 					],
 					{ subreaper: true, signal: controller.signal },
 				);
