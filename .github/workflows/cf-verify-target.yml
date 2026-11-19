@@ -486,9 +486,9 @@ jobs:
             ${{ runner.temp }}/qualification-cargo
             ${{ runner.temp }}/qualification-rustup
             target
-          key: qualification-cargo-v1-${{ inputs.target }}-${{ matrix.receipt }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', '.cargo/config.toml') }}
+          key: qualification-cargo-v1-${{ inputs.target }}-${{ matrix.scope == 'rust' && 'rust' || 'typescript' }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', '.cargo/config.toml') }}
           restore-keys: |
-            qualification-cargo-v1-${{ inputs.target }}-${{ matrix.receipt }}-
+            qualification-cargo-v1-${{ inputs.target }}-${{ matrix.scope == 'rust' && 'rust' || 'typescript' }}-
       - name: Install pinned qualification tools
         shell: bash
         run: |
@@ -548,7 +548,7 @@ jobs:
           if-no-files-found: error
           path: ${{ runner.temp }}/qualification-engine-${{ matrix.receipt }}
       - name: Save compatible Cargo qualification cache
-        if: success() && steps.cargo-cache.outputs.cache-hit != 'true'
+        if: success() && matrix.scope != 'typescript-tests' && steps.cargo-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |

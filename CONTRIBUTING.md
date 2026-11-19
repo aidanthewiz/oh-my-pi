@@ -37,6 +37,7 @@ Each native target owns its producer and dependent qualification jobs.
 Linux and Darwin qualification start after their own producer, without waiting for unrelated targets.
 Each platform runs three TypeScript test shards, the complete source/compiled smoke scope, and unchanged Rust qualification.
 Keep shard inputs identical; do not restore independent test-timing histories into shard jobs.
+TypeScript shards restore the existing shared toolchain cache; only the smoke lane saves it.
 The Linux producer also supplies all managed consumer lanes and relay validation.
 Relay consumes the immutable same-run artifact ID and verifies source, run, attempt, platform, and file hashes.
 Tagged relay publication remains in `relay.yml`, with its existing cache and publishing permissions.
