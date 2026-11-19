@@ -22,6 +22,7 @@
 - Wait for the cancellation trap's file content, not its creation event, before checking Bash cleanup.
 - Synchronize rsync output-pass tests with completed writes instead of worker-thread scheduling.
 - Provision CI packages before native compilation and use bounded, signature-verified Ubuntu repository failover.
+- Let targeted CI reruns reuse verified same-run producer inputs and replace only their own qualification reports.
 - Start peer-reply test deadlines after agent initialization so startup cannot consume the reply window.
 - Complete browser directory uploads only after Chrome finishes file selection, including empty directories and shadow-root inputs.
 - Expose the full registered AWS JSON input schema through `xd://aws/schema`. Require complete schema and `aws-secret-input/v1` capability comparison before authentication or approval. Preserve native session-disposal and cancellation cleanup. Source delivery does not publish an engine or adopt an installed runtime.

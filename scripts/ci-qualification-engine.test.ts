@@ -41,6 +41,111 @@ async function qualificationAdmission(mode: string, shard?: string) {
 	return { exitCode, result };
 }
 
+async function producerFixture(producerAttempt: unknown = "1") {
+	const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "cf-producer-rerun-"));
+	roots.push(workspace);
+	const platform = `${process.platform}-${process.arch}`;
+	const repo = path.resolve(import.meta.dir, "..");
+	const git = (args: string[]) => {
+		const result = Bun.spawnSync(["git", ...args], { cwd: repo, stdout: "pipe", stderr: "pipe" });
+		if (result.exitCode !== 0) throw new Error(result.stderr.toString());
+		return result.stdout.toString().trim();
+	};
+	const sourceSha = git(["rev-parse", "HEAD"]);
+	const gitDir = git(["rev-parse", "--absolute-git-dir"]);
+	const generatedSources = [
+		{
+			sourcePath: "packages/coding-agent/src/cli/cf-version.generated.ts",
+			artifactPath: "qualification-effective-source/cf-version.generated.ts",
+		},
+		{
+			sourcePath: "packages/stats/src/embedded-client.generated.txt",
+			artifactPath: "qualification-effective-source/embedded-client.generated.txt",
+		},
+	];
+	const paths = [
+		`packages/coding-agent/binaries/omp-${platform}`,
+		`packages/natives/native/pi_natives.${platform}.node`,
+		"LICENSE",
+		"THIRD-PARTY-NOTICES.txt",
+		...generatedSources.map(file => file.artifactPath),
+	];
+	const files: { path: string; sha256: string; size: number }[] = [];
+	for (const relative of paths) {
+		const text = `synthetic qualification input: ${relative}\n`;
+		const file = path.join(workspace, relative);
+		await fs.mkdir(path.dirname(file), { recursive: true });
+		await fs.writeFile(file, text);
+		files.push({
+			path: relative,
+			sha256: new Bun.CryptoHasher("sha256").update(text).digest("hex"),
+			size: Buffer.byteLength(text),
+		});
+	}
+	const manifest = {
+		schemaVersion: 1,
+		sourceSha,
+		platform,
+		runId: "12345",
+		runAttempt: producerAttempt,
+		files,
+		generatedSources,
+		effectiveSource: {
+			"native-effective": {},
+			"binary-effective": {
+				files: generatedSources.map(file => ({
+					...files.find(input => input.path === file.artifactPath)!,
+					path: file.sourcePath,
+				})),
+			},
+		},
+		versions: {},
+		config: {},
+	};
+	await fs.mkdir(path.join(workspace, "scripts"));
+	await fs.copyFile(
+		path.join(import.meta.dir, "ci-qualification-engine.ts"),
+		path.join(workspace, "scripts/ci-qualification-engine.ts"),
+	);
+	await fs.writeFile(path.join(workspace, "qualification-inputs.json"), JSON.stringify(manifest));
+	return { workspace, sourceSha, gitDir, platform, manifest };
+}
+
+async function verifyProducerFixture(fixture: Awaited<ReturnType<typeof producerFixture>>, consumerAttempt = "2") {
+	const receipts = path.join(fixture.workspace, "receipts");
+	const child = Bun.spawn(
+		[
+			process.execPath,
+			"--no-env-file",
+			path.join(fixture.workspace, "scripts/ci-qualification-engine.ts"),
+			"verify-inputs",
+			fixture.platform,
+			fixture.sourceSha,
+		],
+		{
+			cwd: fixture.workspace,
+			env: {
+				PATH: process.env.PATH ?? "/usr/bin:/bin",
+				HOME: fixture.workspace,
+				TMPDIR: fixture.workspace,
+				...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}),
+				GIT_DIR: fixture.gitDir,
+				GIT_WORK_TREE: fixture.workspace,
+				SOURCE_SHA: fixture.sourceSha,
+				GITHUB_RUN_ID: "12345",
+				GITHUB_RUN_ATTEMPT: consumerAttempt,
+				QUALIFICATION_RECEIPT_DIR: receipts,
+			},
+			stdin: "ignore",
+			stdout: "ignore",
+			stderr: "pipe",
+		},
+	);
+	const [exitCode, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()]);
+	const result = await Bun.file(path.join(receipts, "result-verify-inputs.json")).json();
+	return { exitCode, stderr, result, receipts };
+}
+
 describe("TypeScript qualification partition admission", () => {
 	for (const shard of [undefined, "", "1", "0/3", "4/3", "1/2", "2/4", "01/3", "1/03", " 1/3", "1/3\n"]) {
 		test(`rejects ${JSON.stringify(shard)} before executing partitioned tests and records failure`, async () => {
@@ -79,6 +184,65 @@ describe("TypeScript qualification partition admission", () => {
 			expect(result.commands).toEqual([]);
 		});
 	}
+});
+
+describe("Qualification producer reuse on targeted reruns", () => {
+	for (const consumerAttempt of ["1", "2"]) {
+		test(`consumer attempt ${consumerAttempt} verifies the original producer without relabeling it`, async () => {
+			const fixture = await producerFixture();
+			const { exitCode, result, receipts } = await verifyProducerFixture(fixture, consumerAttempt);
+			expect(exitCode).toBe(0);
+			expect(result).toMatchObject({ passed: true, runAttempt: consumerAttempt, sourceSha: fixture.sourceSha });
+			expect(await Bun.file(path.join(receipts, "verified-inputs.json")).json()).toEqual(fixture.manifest);
+		});
+	}
+
+	for (const producerAttempt of ["3", "0", "-1", "01", "1.5", "1\n", "", 1, null]) {
+		test(`rejects invalid or future producer attempt ${JSON.stringify(producerAttempt)}`, async () => {
+			const fixture = await producerFixture(producerAttempt);
+			const { exitCode, result, receipts } = await verifyProducerFixture(fixture);
+			expect(exitCode).not.toBe(0);
+			expect(result.passed).toBe(false);
+			expect(await Bun.file(path.join(receipts, "verified-inputs.json")).exists()).toBe(false);
+		});
+	}
+
+	for (const consumerAttempt of ["0", "01", "1.5", "1\n", ""]) {
+		test(`rejects invalid consumer attempt ${JSON.stringify(consumerAttempt)}`, async () => {
+			const fixture = await producerFixture();
+			const { exitCode, result } = await verifyProducerFixture(fixture, consumerAttempt);
+			expect(exitCode).not.toBe(0);
+			expect(result.passed).toBe(false);
+		});
+	}
+
+	for (const changed of [
+		{ sourceSha: "f".repeat(40) },
+		{ runId: "54321" },
+		{ platform: "other-platform" },
+		{ schemaVersion: 2 },
+	]) {
+		test(`rejects mismatched producer identity ${Object.keys(changed)[0]}`, async () => {
+			const fixture = await producerFixture();
+			await fs.writeFile(
+				path.join(fixture.workspace, "qualification-inputs.json"),
+				JSON.stringify({ ...fixture.manifest, ...changed }),
+			);
+			const { exitCode, result, receipts } = await verifyProducerFixture(fixture);
+			expect(exitCode).not.toBe(0);
+			expect(result.passed).toBe(false);
+			expect(await Bun.file(path.join(receipts, "verified-inputs.json")).exists()).toBe(false);
+		});
+	}
+
+	test("still rejects changed artifact bytes on a later consumer attempt", async () => {
+		const fixture = await producerFixture();
+		await fs.appendFile(path.join(fixture.workspace, fixture.manifest.files[0]!.path), "changed");
+		const { exitCode, result, receipts } = await verifyProducerFixture(fixture);
+		expect(exitCode).not.toBe(0);
+		expect(result.passed).toBe(false);
+		expect(await Bun.file(path.join(receipts, "verified-inputs.json")).exists()).toBe(false);
+	});
 });
 
 describe.skipIf(process.platform === "win32")("Unix Rust executable retirement", () => {

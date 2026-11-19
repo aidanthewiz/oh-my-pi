@@ -306,7 +306,18 @@ async function verifyInputs(target: string, sha: string | undefined): Promise<In
 	assert.equal(manifest.sourceSha, sourceSha);
 	assert.equal(manifest.platform, target);
 	assert.equal(manifest.runId, Bun.env.GITHUB_RUN_ID);
-	assert.equal(manifest.runAttempt, Bun.env.GITHUB_RUN_ATTEMPT);
+	const consumerAttempt = Bun.env.GITHUB_RUN_ATTEMPT!;
+	assert(
+		/^[1-9]\d*$/.test(consumerAttempt) && consumerAttempt.trim() === consumerAttempt,
+		"Invalid qualification consumer runAttempt",
+	);
+	assert(
+		typeof manifest.runAttempt === "string" &&
+			/^[1-9]\d*$/.test(manifest.runAttempt) &&
+			manifest.runAttempt.trim() === manifest.runAttempt &&
+			BigInt(manifest.runAttempt) <= BigInt(consumerAttempt),
+		"Invalid or future qualification producer runAttempt",
+	);
 	assert(
 		manifest.effectiveSource["native-effective"] && manifest.effectiveSource["binary-effective"],
 		"Missing effective producer input snapshots",

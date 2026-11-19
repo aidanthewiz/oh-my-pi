@@ -158,6 +158,7 @@ jobs:
           name: qualification-engine-${{ inputs.target }}-${{ matrix.receipt }}
           retention-days: 3
           if-no-files-found: error
+          overwrite: true
           path: ${{ runner.temp }}/qualification-engine-${{ matrix.receipt }}
       - name: Save compatible Cargo qualification cache
         if: success() && matrix.scope != 'typescript-tests' && steps.cargo-cache.outputs.cache-hit != 'true'
