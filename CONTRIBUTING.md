@@ -48,8 +48,8 @@ Optional cache failures remain separate from required producer and consumer resu
 
 Activate the branch rule in this order:
 
-1. Merge PR #102 through its approved merge path, preserving its immutable broker ancestry.
-2. Merge this scheduling change after exact-head hosted qualification and required review.
+1. Complete exact-head hosted qualification and required review for the combined cache and scheduling change.
+2. Merge PR #102 through its approved merge path, preserving its immutable broker ancestry.
 3. Require `required CI` from GitHub Actions in the existing `coreforge` ruleset.
 4. Preserve independent review, latest-push approval, thread resolution, and history protections.
 
