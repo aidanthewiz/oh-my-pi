@@ -61,7 +61,7 @@ Staging these values does not enable the backend. Never store static AWS keys, t
 `cf-cache-canary.yml` accepts only deliberate dispatch from protected `coreforge`. It publishes no release, tag, package, image, or application deployment. The workflow must first exist on the protected default branch; a feature-only source proposal is not an operational cache.
 
 1. Apply the approved infrastructure change through its existing protected plan/apply path.
-2. Merge the approved cache-only engine source through required independent/latest-push review and authorized merge gates. Before merge, compare the candidate with the latest published engine ancestor: the classifier must report `false`. If runtime changes remain unpublished, wait for their separately authorized release; do not use the cache merge to publish them. The resulting preparation must report `should_release=false` without allocating an engine tag.
+2. Merge approved source through required independent/latest-push review and an authorized merge commit. Compare the candidate with the latest published engine ancestor using the actual classifier. For a cache-only `false` result, retain `should_release=false` without allocating an engine tag. A release-significant `true` result requires explicit normal-publication authority and successful signed release verification before the canary. Never broaden classifier exemptions or bypass publication gates.
 3. Verify bucket controls, exact IAM workflow pins, default OIDC metadata, and cache variables while `CI_CACHE_ENABLED=false`.
 4. Dispatch the bounded verification:
 
