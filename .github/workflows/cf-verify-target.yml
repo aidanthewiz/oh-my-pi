@@ -1,0 +1,475 @@
+name: cf-verify-target
+
+on:
+  workflow_call:
+    inputs:
+      source-sha:
+        type: string
+        required: true
+      native-changed:
+        type: boolean
+        required: true
+      release-tag:
+        type: string
+        required: true
+      target:
+        type: string
+        required: true
+      runner:
+        type: string
+        required: true
+      binary:
+        type: string
+        required: true
+      native-targets:
+        type: string
+        default: ""
+      cross:
+        type: boolean
+        default: false
+      windows:
+        type: boolean
+        default: false
+      qualification-runner:
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  build:
+    name: Build native addon and CLI
+    env:
+      SOURCE_SHA: ${{ inputs.source-sha }}
+      CARGO_BUILD_JOBS: "2"
+    runs-on: ${{ inputs.runner }}
+    outputs:
+      qualification-artifact-id: ${{ steps.qualification-inputs.outputs.artifact-id }}
+    steps:
+      - name: Download released native addon
+        if: inputs.native-changed != true && inputs.windows != true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release-tag }}
+          ASSET_NAME: coreforge-pi-natives-${{ inputs.target }}-${{ inputs.release-tag }}.tgz
+        run: |
+          mkdir -p "$RUNNER_TEMP/released-native"
+          gh release download \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern "$ASSET_NAME" \
+            --pattern SHA256SUMS.txt \
+            --dir "$RUNNER_TEMP/released-native" \
+            -- "$RELEASE_TAG"
+      - name: Download released native addon (Windows ARM64)
+        if: inputs.native-changed != true && inputs.windows == true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release-tag }}
+          ASSET_NAME: coreforge-pi-natives-${{ inputs.target }}-${{ inputs.release-tag }}.tgz
+        shell: pwsh
+        run: |
+          $download = Join-Path $env:RUNNER_TEMP "released-native"
+          New-Item -ItemType Directory -Force $download | Out-Null
+          gh release download --repo $env:GITHUB_REPOSITORY --pattern $env:ASSET_NAME --pattern SHA256SUMS.txt --dir $download -- $env:RELEASE_TAG
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.source-sha }}
+          persist-credentials: false
+      - name: Install Linux reference build dependencies
+        if: inputs.native-changed == true && inputs.target == 'linux-x64'
+        run: |
+          bash scripts/ci-install-ubuntu-packages.sh \
+            libacl1-dev libattr1-dev libxxhash-dev libzstd-dev liblz4-dev libssl-dev libidn2-dev
+      - name: Require Apple Foundation Models toolchain
+        if: inputs.target == 'darwin-arm64'
+        run: |
+          toolchain="$(/bin/sh crates/pi-natives/src/applefm/build-bridge.sh detect)"
+          if [ -z "$toolchain" ]; then
+            echo "::error::Darwin ARM64 verification requires Swift 6.4+ and macOS 27 SDK; refusing an addon without the Apple Foundation Models bridge"
+            exit 1
+          fi
+          printf 'Apple Foundation Models bridge: %s\n' "$toolchain"
+      - name: Test Apple Foundation Models gate
+        if: inputs.target == 'darwin-arm64'
+        run: |
+          swiftc -swift-version 6 -parse-as-library -D APPLEFM_GATE_TEST \
+            crates/pi-natives/src/applefm/bridge.swift \
+            crates/pi-natives/src/applefm/gate-test.swift \
+            -o "$RUNNER_TEMP/applefm-gate-test"
+          "$RUNNER_TEMP/applefm-gate-test"
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: "1.4.4"
+      - name: Resolve verification version
+        if: inputs.windows != true
+        run: |
+          PKG="$(bun -e 'console.log(JSON.parse(await Bun.file("packages/coding-agent/package.json").text()).version)')"
+          echo "VERIFY_VERSION=${PKG}.0" >> "$GITHUB_ENV"
+      - name: Resolve verification version (Windows)
+        if: inputs.windows == true
+        shell: pwsh
+        run: |
+          $pkg = (bun -e 'console.log(JSON.parse(await Bun.file("packages/coding-agent/package.json").text()).version)').Trim()
+          "VERIFY_VERSION=$pkg.0" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Reclaim disk for large native builds
+        if: inputs.native-changed == true && (inputs.target == 'win32-x64' || inputs.target == 'linux-x64' || inputs.target == 'linux-musl-x64')
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /opt/hostedtoolcache/CodeQL
+          df -h /
+      - run: bun install --frozen-lockfile
+      - name: Install pinned qualification toolchain
+        if: inputs.target == 'linux-x64' || inputs.target == 'darwin-arm64'
+        run: |
+          channel="$(bun -e 'console.log(Bun.TOML.parse(await Bun.file("rust-toolchain.toml").text()).toolchain.channel)')"
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy --no-self-update
+          echo "RUSTUP_TOOLCHAIN=$channel" >> "$GITHUB_ENV"
+          echo "RUSTUP_AUTO_INSTALL=0" >> "$GITHUB_ENV"
+      - name: Bind native source identity
+        if: inputs.target == 'linux-x64' || inputs.target == 'darwin-arm64'
+        env:
+          QUALIFICATION_RECEIPT_DIR: ${{ runner.temp }}/qualification-producer
+        run: bun scripts/ci-qualification-engine.ts snapshot native-effective
+      - name: Identify compatible Bazel caches
+        if: inputs.native-changed == true && inputs.windows != true
+        id: cache-identity
+        continue-on-error: true
+        run: python3 scripts/ci_cache.py identity --slot "${{ inputs.target }}-${{ inputs.runner }}" --output "$RUNNER_TEMP/cache-identity.json"
+      - name: Download durable Bazel snapshot
+        if: inputs.native-changed == true && inputs.windows != true && vars.CI_CACHE_ENABLED == 'true'
+        id: cache-download
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: cache-restore-${{ inputs.target }}-${{ inputs.runner }}
+          path: ${{ runner.temp }}/cache-restore
+      - name: Restore durable Bazel snapshot
+        if: steps.cache-identity.outcome == 'success' && steps.cache-download.outcome == 'success'
+        id: cache-restore
+        continue-on-error: true
+        run: |
+          python3 scripts/ci_cache.py restore --identity "$RUNNER_TEMP/cache-identity.json" \
+            --snapshot "$RUNNER_TEMP/cache-restore" \
+            --disk "$HOME/.cache/omp-bazel-disk" --repo "$HOME/.cache/omp-bazel-repo"
+      - name: Report unavailable durable cache
+        if: steps.cache-identity.outcome == 'failure' || steps.cache-download.outcome == 'failure' || steps.cache-restore.outcome == 'failure'
+        run: echo "::warning::Bazel snapshot unavailable; required native build will run with compatible hot cache or cold inputs."
+      - name: Restore compatible GitHub hot cache
+        if: steps.cache-identity.outcome == 'success' && steps.cache-restore.outputs.hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cache/omp-bazel-disk
+            ~/.cache/omp-bazel-repo
+          key: coreforge-bazel-v2-${{ steps.cache-identity.outputs.key }}-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'MODULE.bazel', 'MODULE.bazel.lock', 'rust-toolchain.toml', 'rustfmt.toml', '.bazelrc', '.bazelignore', '.bazelversion', 'bazel/**', 'crates/**', 'BUILD.bazel') }}
+          restore-keys: |
+            coreforge-bazel-v2-${{ steps.cache-identity.outputs.key }}-
+      - name: Build native addon from Coreforge sources
+        if: inputs.native-changed == true && inputs.windows != true
+        env:
+          NATIVE_TARGETS: ${{ inputs.native-targets }}
+        run: |
+          set -euo pipefail
+          if [ "$(ulimit -Sn)" != unlimited ] && [ "$(ulimit -Sn)" -lt 65536 ]; then ulimit -Sn 65536 || true; fi
+          mkdir -p "$HOME/.cache/omp-bazel-disk" "$HOME/.cache/omp-bazel-repo"
+          {
+            echo "common --config=ci"
+            echo "common --disk_cache=$HOME/.cache/omp-bazel-disk"
+            echo "common --repository_cache=$HOME/.cache/omp-bazel-repo"
+          } > "$RUNNER_TEMP/coreforge-bazel.rc"
+          export OMP_BAZEL_RC="$RUNNER_TEMP/coreforge-bazel.rc"
+          read -r -a targets <<< "$NATIVE_TARGETS"
+          if [ "${{ inputs.target }}" = linux-x64 ] || [ "${{ inputs.target }}" = darwin-arm64 ]; then
+            export QUALIFICATION_RECEIPT_DIR="$RUNNER_TEMP/qualification-producer"
+            bun scripts/ci-qualification-engine.ts snapshot native-effective
+            bun scripts/ci-qualification-engine.ts build-native "${targets[@]}"
+          else
+            bun scripts/bazel-natives.ts "${targets[@]}"
+          fi
+          ls packages/natives/native/*.node
+      - name: Build native addon from Coreforge sources (Windows ARM64)
+        if: inputs.native-changed == true && inputs.windows == true
+        env:
+          OMP_NATIVE_CARGO_PROFILE: ci
+        run: bun scripts/bazel-natives.ts host --dest packages/natives/native
+      - name: Verify Windows pipe relay closure
+        if: inputs.native-changed == true && inputs.windows == true
+        shell: pwsh
+        env:
+          CARGO_TERM_COLOR: never
+        run: |
+          cargo test --locked --profile ci --target aarch64-pc-windows-msvc -p brush-core --lib pipetap::tests:: -- --nocapture 2>&1 | Tee-Object -Variable relayOutput
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          foreach ($name in @("idle_producer_is_released_when_consumer_exits", "producer_eof_preserves_every_byte_and_closes_the_mirror", "windows_query_failure_is_not_eof")) {
+            if (-not ($relayOutput -match "^test pipetap::tests::$name \.\.\. ok$")) {
+              throw "Windows pipe relay case did not pass: $name"
+            }
+          }
+      - name: Install verified released native addon
+        if: inputs.native-changed != true
+        run: bun scripts/ci-released-native.ts install "${{ inputs.release-tag }}" "${{ inputs.target }}" packages/natives/native "${{ runner.temp }}/released-native"
+      - name: Verify artifact publication ownership
+        if: inputs.cross != true
+        working-directory: packages/coding-agent
+        run: bun test --timeout=30000 ./test/artifacts-integrity.test.ts
+      - name: Install project-local TUI test dependencies
+        if: inputs.windows == true
+        run: bun install --cwd .omp/tools --frozen-lockfile
+      - name: Verify project-local Windows PTY behavior
+        if: inputs.windows == true
+        run: bun test ./.omp/tests/tui.test.ts --timeout 30000
+      - name: Verify Linux rsync reference interoperability
+        if: inputs.native-changed == true && inputs.target == 'linux-x64'
+        env:
+          CARGO_BUILD_JOBS: "2"
+        run: |
+          set -euo pipefail
+          work="$(mktemp -d "$RUNNER_TEMP/rsync-reference.XXXXXX")"
+          trap 'rm -rf -- "$work"' EXIT
+          curl --fail --location --silent --show-error --proto '=https' \
+            https://github.com/RsyncProject/rsync/releases/download/v3.5.1/rsync-3.5.1.tar.gz \
+            --output "$work/rsync-3.5.1.tar.gz"
+          printf '%s  %s\n' \
+            c55f9c9dc10fb8bec397b399a0fdded53cc9a2d8e30891bb0d63724d25c37bef \
+            "$work/rsync-3.5.1.tar.gz" | sha256sum --check -
+          tar -xzf "$work/rsync-3.5.1.tar.gz" -C "$work"
+          (
+            cd "$work/rsync-3.5.1"
+            CFLAGS='-O2 -g0' ./configure.sh --with-included-zlib --with-included-popt \
+              --enable-acl-support --enable-xattr-support --enable-iconv --enable-iconv-open
+            make -j2 rsync
+          )
+          export PI_RSYNC_REFERENCE_BINARY="$work/rsync-3.5.1/rsync"
+          "$PI_RSYNC_REFERENCE_BINARY" --version | tee "$work/version.txt"
+          bun -e '
+            import assert from "node:assert/strict";
+            const text = await Bun.file(process.argv[1]).text();
+            assert(text.startsWith("rsync  version 3.5.1  protocol version 33\n"));
+            const lines = text.split("\n");
+            for (const [header, required] of [
+              ["Checksum list:", ["xxh128", "xxh3", "xxh64", "md5", "md4", "sha1", "none"]],
+              ["Compress list:", ["zstd", "lz4", "zlibx", "zlib", "none"]],
+              ["Daemon auth list:", ["sha512", "sha256", "sha1", "md5", "md4"]],
+            ]) {
+              const start = lines.indexOf(header);
+              assert(start >= 0, header);
+              const values = new Set();
+              for (let i = start + 1; i < lines.length && /^\s/.test(lines[i]); i++) {
+                for (const value of lines[i].trim().split(/\s+/)) values.add(value);
+              }
+              for (const value of required) assert(values.has(value), `${header} ${value}`);
+            }
+            for (const feature of ["ACLs", "xattrs", "iconv"]) {
+              assert(text.includes(feature) && !text.includes(`no ${feature}`), feature);
+            }
+          ' "$work/version.txt"
+          channel="$(bun -e 'console.log(Bun.TOML.parse(await Bun.file("rust-toolchain.toml").text()).toolchain.channel)')"
+          rustup toolchain install "$channel" --profile minimal --no-self-update
+          export RUSTUP_TOOLCHAIN="$channel" RUSTUP_AUTO_INSTALL=0
+          export CARGO_TARGET_DIR="$PWD/target"
+          export RUSTC="$(rustup which --toolchain "$channel" rustc)"
+          export RUSTDOC="$(rustup which --toolchain "$channel" rustdoc)"
+          cargo="$(rustup which --toolchain "$channel" cargo)"
+          unset RSYNC_CONFORMANCE_FILTER
+          "$cargo" test --locked --profile ci --target x86_64-unknown-linux-gnu -p pi-builtins --lib -- --test-threads=2 --nocapture
+          "$cargo" build --locked --profile ci --target x86_64-unknown-linux-gnu -p pi-builtins --example rsync_peer
+          python3 crates/pi-builtins/tests/rsync_options_filters_peer_regressions.py \
+            --native "$CARGO_TARGET_DIR/x86_64-unknown-linux-gnu/ci/examples/rsync_peer" \
+            --reference "$PI_RSYNC_REFERENCE_BINARY" --scratch "$work" --case all
+      - name: Verify embedded Apple Foundation Models bridge
+        if: inputs.target == 'darwin-arm64'
+        run: |
+          addon=packages/natives/native/pi_natives.darwin-arm64.node
+          test -s "$addon"
+          grep -aqF OmpAppleFm "$addon" ||
+            { echo "::error::Darwin ARM64 addon lacks the embedded Apple Foundation Models bridge"; exit 1; }
+          if otool -L "$addon" | grep -E 'libswift|FoundationModels'; then
+            echo "::error::Darwin ARM64 addon directly links the Swift runtime or FoundationModels"; exit 1
+          fi
+      - name: Package source-built native addon
+        if: inputs.native-changed == true && inputs.windows != true
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          native_target="${{ inputs.target }}"
+          if [[ "$native_target" == linux-musl-* ]]; then native_target="${native_target/linux-musl-/linux-}"; fi
+          addons=(packages/natives/native/pi_natives."${native_target}"*.node)
+          expected=1
+          if [ "${{ inputs.target }}" = "linux-x64" ]; then expected=2; fi
+          if [ "${#addons[@]}" -ne "$expected" ]; then
+            echo "expected $expected native files for ${{ inputs.target }}, found ${#addons[@]}" >&2
+            printf '  %s\n' "${addons[@]}" >&2
+            exit 1
+          fi
+          mkdir -p release-assets/package
+          cp "${addons[@]}" release-assets/package/
+          cp LICENSE THIRD-PARTY-NOTICES.txt release-assets/package/
+          archive="release-assets/coreforge-pi-natives-${{ inputs.target }}-verify.tgz"
+          tar -czf "$archive" -C release-assets package
+          test -s "$archive"
+      - name: Package source-built native addon (Windows ARM64)
+        if: inputs.native-changed == true && inputs.windows == true
+        shell: pwsh
+        run: |
+          $addons = @(Get-ChildItem "packages/natives/native/pi_natives.win32-arm64*.node")
+          if ($addons.Count -ne 1) {
+            throw "expected 1 native file for win32-arm64, found $($addons.Count)"
+          }
+          New-Item -ItemType Directory -Force release-assets/package | Out-Null
+          Copy-Item $addons[0].FullName release-assets/package/
+          Copy-Item LICENSE, THIRD-PARTY-NOTICES.txt release-assets/package/ -ErrorAction Stop
+          $archive = "release-assets/coreforge-pi-natives-win32-arm64-verify.tgz"
+          tar -czf $archive -C release-assets package
+          if (-not (Test-Path $archive) -or (Get-Item $archive).Length -eq 0) {
+            throw "native archive is missing: $archive"
+          }
+      - name: Inject verification channel version
+        if: inputs.windows != true
+        run: bun scripts/set-cf-version.ts "$VERIFY_VERSION"
+      - name: Inject verification channel version (Windows)
+        if: inputs.windows == true
+        shell: pwsh
+        run: bun scripts/set-cf-version.ts $env:VERIFY_VERSION
+      - name: Build binary
+        if: inputs.target != 'linux-x64' && inputs.target != 'darwin-arm64'
+        env:
+          RELEASE_TARGETS: ${{ inputs.target }}
+        run: bun run ci:release:build-binaries
+      - name: Build and bind qualification binary
+        if: inputs.target == 'linux-x64' || inputs.target == 'darwin-arm64'
+        env:
+          RELEASE_TARGETS: ${{ inputs.target }}
+          QUALIFICATION_RECEIPT_DIR: ${{ runner.temp }}/qualification-producer
+        run: bun scripts/ci-qualification-engine.ts build-binary
+      - name: Smoke binary
+        if: inputs.windows != true && inputs.cross != true
+        run: |
+          OUT="$(./packages/coding-agent/binaries/${{ inputs.binary }} --version)"
+          echo "reported: $OUT"
+          case "$OUT" in
+            */"$VERIFY_VERSION") echo "version verified: $OUT" ;;
+            *) echo "expected */$VERIFY_VERSION, got $OUT" >&2; exit 1 ;;
+          esac
+      - name: Smoke binary (Windows ARM64)
+        if: inputs.windows == true
+        shell: pwsh
+        run: |
+          $binaryPath = (Resolve-Path "packages/coding-agent/binaries/${{ inputs.binary }}").Path
+          $out = (& $binaryPath --version).Trim()
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Write-Host "reported: $out"
+          if (-not $out.EndsWith("/$env:VERIFY_VERSION")) {
+            throw "expected */$env:VERIFY_VERSION, got $out"
+          }
+          & $binaryPath --smoke-test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Verify binary asset
+        if: inputs.windows != true
+        run: test -s "packages/coding-agent/binaries/${{ inputs.binary }}"
+      - name: Verify binary asset (Windows ARM64)
+        if: inputs.windows == true
+        shell: pwsh
+        run: |
+          $binaryPath = "packages/coding-agent/binaries/${{ inputs.binary }}"
+          if (-not (Test-Path $binaryPath) -or (Get-Item $binaryPath).Length -eq 0) {
+            throw "binary asset is missing: $binaryPath"
+          }
+      - name: Seal qualification inputs
+        if: inputs.target == 'linux-x64' || inputs.target == 'darwin-arm64'
+        env:
+          QUALIFICATION_RECEIPT_DIR: ${{ runner.temp }}/qualification-producer
+          NATIVE_SOURCE: ${{ inputs.native-changed && 'pull-request' || inputs.release-tag }}
+        run: bun scripts/ci-qualification-engine.ts inputs "${{ inputs.target }}"
+      - name: Retain exact-head qualification inputs
+        if: inputs.target == 'linux-x64' || inputs.target == 'darwin-arm64'
+        id: qualification-inputs
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: qualification-inputs-${{ inputs.target }}
+          retention-days: 3
+          if-no-files-found: error
+          path: |
+            qualification-inputs.json
+            qualification-effective-source/**
+            packages/natives/native/**
+            packages/coding-agent/binaries/${{ inputs.binary }}
+            LICENSE
+            THIRD-PARTY-NOTICES.txt
+            packages/natives/LICENSE
+            packages/natives/THIRD-PARTY-NOTICES.txt
+            packages/coding-agent/LICENSE
+            packages/coding-agent/THIRD-PARTY-NOTICES.txt
+      - name: Retain qualification producer receipts
+        if: always() && (inputs.target == 'linux-x64' || inputs.target == 'darwin-arm64')
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: qualification-producer-${{ inputs.target }}
+          retention-days: 3
+          if-no-files-found: error
+          path: ${{ runner.temp }}/qualification-producer
+
+  qualification_engine:
+    name: Full engine
+    needs: build
+    if: ${{ !cancelled() && needs.build.result == 'success' && (inputs.target == 'linux-x64' || inputs.target == 'darwin-arm64') }}
+    uses: ./.github/workflows/cf-verify-engine.yml
+    with:
+      source-sha: ${{ inputs.source-sha }}
+      target: ${{ inputs.target }}
+      qualification-runner: ${{ inputs.qualification-runner }}
+    permissions:
+      contents: read
+      actions: read
+
+  qualification_consumers:
+    name: Managed consumers
+    needs: build
+    if: ${{ !cancelled() && needs.build.result == 'success' && inputs.target == 'linux-x64' }}
+    uses: ./.github/workflows/cf-qualification-consumers.yml
+    with:
+      source-sha: ${{ inputs.source-sha }}
+    permissions:
+      contents: read
+      actions: read
+
+  relay:
+    name: Relay validation
+    needs: build
+    if: ${{ !cancelled() && needs.build.result == 'success' && inputs.target == 'linux-x64' }}
+    uses: ./.github/workflows/cf-relay-validate.yml
+    with:
+      qualification-artifact-id: ${{ needs.build.outputs.qualification-artifact-id }}
+      source-sha: ${{ inputs.source-sha }}
+      qualification-run-id: ${{ github.run_id }}
+      qualification-run-attempt: ${{ github.run_attempt }}
+    permissions:
+      contents: read
+      actions: read
+
+  required:
+    name: Platform gate
+    needs: [build, qualification_engine, qualification_consumers, relay]
+    if: always()
+    runs-on: ubuntu-24.04
+    permissions: {}
+    env:
+      TARGET: ${{ inputs.target }}
+      BUILD_RESULT: ${{ needs.build.result }}
+      ENGINE_RESULT: ${{ needs.qualification_engine.result }}
+      CONSUMERS_RESULT: ${{ needs.qualification_consumers.result }}
+      RELAY_RESULT: ${{ needs.relay.result }}
+    steps:
+      - name: Require every target qualification lane
+        run: |
+          set -euo pipefail
+          test "$BUILD_RESULT" = success
+          if [ "$TARGET" = linux-x64 ] || [ "$TARGET" = darwin-arm64 ]; then
+            test "$ENGINE_RESULT" = success
+          fi
+          if [ "$TARGET" = linux-x64 ]; then
+            test "$CONSUMERS_RESULT" = success
+            test "$RELAY_RESULT" = success
+          fi

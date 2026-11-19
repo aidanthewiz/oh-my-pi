@@ -46,6 +46,10 @@ permissions:
 jobs:
   prepare:
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: read
     outputs:
       release_tag: ${{ steps.release.outputs.release_tag }}
       should_release: ${{ steps.release.outputs.should_release }}
@@ -72,25 +76,44 @@ jobs:
           if [ "$EVENT_REF_TYPE" = "tag" ]; then
             TAG="$EVENT_REF_NAME"
             RELEASE_SHA="$(git rev-parse "$TAG^{commit}")"
+            EVENT_COMMIT="$(git rev-parse --verify "$EVENT_SHA^{commit}")"
+            if [ "$RELEASE_SHA" != "$EVENT_COMMIT" ]; then
+              echo "tag $TAG now identifies $RELEASE_SHA, not event commit $EVENT_COMMIT - refusing to release"
+              exit 1
+            fi
             if [ "$RELEASE_SHA" != "$TIP" ]; then
               echo "tag commit $RELEASE_SHA is not the coreforge tip ($TIP) - refusing to release"
               exit 1
             fi
           else
-            MERGED_PR_COUNT="$(
-              gh api "repos/${GITHUB_REPOSITORY}/commits/${EVENT_SHA}/pulls" \
-                --jq '[.[] | select(.merged_at != null and .base.ref == "coreforge")] | length'
-            )"
-            if [ "$MERGED_PR_COUNT" -eq 0 ]; then
-              echo "$EVENT_SHA was not introduced by a merged coreforge pull request - manual release required"
-              echo "should_release=false" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
             if [ "$EVENT_SHA" != "$TIP" ]; then
               echo "coreforge advanced from $EVENT_SHA to $TIP - a newer run will publish the tip"
               echo "should_release=false" >> "$GITHUB_OUTPUT"
               exit 0
             fi
+            # coreforge-cache-publication:start
+            RELEASE_LIST="$(mktemp)"
+            trap 'rm -f "$RELEASE_LIST"' EXIT
+            gh release list --repo "$GITHUB_REPOSITORY" --exclude-drafts --limit 1000 \
+              --json tagName,isDraft > "$RELEASE_LIST"
+            PUBLISHED_TAG="$(bun scripts/ci-released-native.ts resolve-optional "$PKG" "$RELEASE_LIST")"
+            SHOULD_RELEASE="$(python3 scripts/ci_cache_release.py "$EVENT_SHA" --published-ref "$PUBLISHED_TAG")"
+            if [ "$SHOULD_RELEASE" = "false" ]; then
+              echo "$EVENT_SHA has only non-artifact changes since $PUBLISHED_TAG - no engine release"
+              echo "should_release=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            # coreforge-cache-publication:end
+
+            ADMISSION="$(python3 scripts/ci_release_admission.py "$EVENT_SHA")"
+            case "$ADMISSION" in
+              true) ;;
+              false)
+                echo "should_release=false" >> "$GITHUB_OUTPUT"
+                exit 0
+                ;;
+              *) echo "invalid automatic release admission: $ADMISSION"; exit 1 ;;
+            esac
 
             LAST=0
             RESUME_TAG=""
@@ -140,9 +163,22 @@ jobs:
             echo "release_sha=$RELEASE_SHA"
           } >> "$GITHUB_OUTPUT"
 
-  build:
+  cache_restore:
     needs: prepare
-    if: needs.prepare.outputs.should_release == 'true'
+    if: vars.CI_CACHE_ENABLED == 'true' && needs.prepare.outputs.should_release == 'true'
+    uses: Coreforce-CAD/oh-my-pi/.github/workflows/cf-cache-read.yml@c4d074b6ef60c229874d0fda96740cd71877f94c
+    with:
+      enabled: true
+      slots: '["darwin-arm64-xcode-27","darwin-x64-macos-15-intel","linux-x64-ubuntu-22.04","linux-arm64-ubuntu-24.04-arm","linux-musl-x64-ubuntu-22.04","linux-musl-arm64-ubuntu-24.04-arm","win32-x64-ubuntu-24.04"]'
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+
+  build:
+    name: build (${{ matrix.target }})
+    needs: [prepare, cache_restore]
+    if: ${{ !cancelled() && needs.prepare.result == 'success' && needs.prepare.outputs.should_release == 'true' }}
     concurrency:
       group: cf-release-build-${{ matrix.target }}
       cancel-in-progress: true
@@ -266,17 +302,42 @@ jobs:
           sudo rm -rf /usr/local/lib/android /opt/hostedtoolcache/CodeQL
           df -h /
       - run: bun install --frozen-lockfile
-      - name: Restore Bazel native build cache
+      - name: Identify compatible Bazel caches
         if: matrix.windows != '1'
+        id: cache-identity
+        continue-on-error: true
+        run: python3 scripts/ci_cache.py identity --slot "${{ matrix.target }}-${{ matrix.os }}" --output "$RUNNER_TEMP/cache-identity.json"
+      - name: Download durable Bazel snapshot
+        if: matrix.windows != '1' && vars.CI_CACHE_ENABLED == 'true'
+        id: cache-download
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: cache-restore-${{ matrix.target }}-${{ matrix.os }}
+          path: ${{ runner.temp }}/cache-restore
+      - name: Restore durable Bazel snapshot
+        if: steps.cache-identity.outcome == 'success' && steps.cache-download.outcome == 'success'
+        id: cache-restore
+        continue-on-error: true
+        run: |
+          python3 scripts/ci_cache.py restore --identity "$RUNNER_TEMP/cache-identity.json" \
+            --snapshot "$RUNNER_TEMP/cache-restore" \
+            --disk "$HOME/.cache/omp-bazel-disk" --repo "$HOME/.cache/omp-bazel-repo"
+      - name: Report unavailable durable cache
+        if: steps.cache-identity.outcome == 'failure' || steps.cache-download.outcome == 'failure' || steps.cache-restore.outcome == 'failure'
+        run: echo "::warning::Bazel snapshot unavailable; required native build will run with compatible hot cache or cold inputs."
+      - name: Restore compatible GitHub hot cache
+        if: steps.cache-identity.outcome == 'success' && steps.cache-restore.outputs.hit != 'true'
         id: bazel-cache
+        continue-on-error: true
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cache/omp-bazel-disk
             ~/.cache/omp-bazel-repo
-          key: coreforge-bazel-v1-${{ matrix.target }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'MODULE.bazel', 'MODULE.bazel.lock', 'rust-toolchain.toml', 'rustfmt.toml', '.bazelrc', '.bazelignore', '.bazelversion', 'bazel/**', 'crates/**', 'BUILD.bazel') }}
+          key: coreforge-bazel-v2-${{ steps.cache-identity.outputs.key }}-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'MODULE.bazel', 'MODULE.bazel.lock', 'rust-toolchain.toml', 'rustfmt.toml', '.bazelrc', '.bazelignore', '.bazelversion', 'bazel/**', 'crates/**', 'BUILD.bazel') }}
           restore-keys: |
-            coreforge-bazel-v1-${{ matrix.target }}-${{ runner.os }}-${{ runner.arch }}-
+            coreforge-bazel-v2-${{ steps.cache-identity.outputs.key }}-
       - name: Build native addon from Coreforge sources
         if: matrix.windows != '1'
         env:
@@ -299,14 +360,6 @@ jobs:
         env:
           OMP_NATIVE_CARGO_PROFILE: ci
         run: bun scripts/bazel-natives.ts host --dest packages/natives/native
-      - name: Save Bazel native build cache
-        if: matrix.windows != '1' && steps.bazel-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ~/.cache/omp-bazel-disk
-            ~/.cache/omp-bazel-repo
-          key: ${{ steps.bazel-cache.outputs.cache-primary-key }}
       - name: Verify embedded Apple Foundation Models bridge
         if: matrix.target == 'darwin-arm64'
         run: |
@@ -419,27 +472,118 @@ jobs:
           }
           & $binaryPath --smoke-test
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: binary-${{ matrix.target }}
           path: packages/coding-agent/binaries/${{ matrix.binary }}
           if-no-files-found: error
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+          overwrite: true
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: native-${{ matrix.target }}
           path: release-assets/coreforge-pi-natives-${{ matrix.target }}-${{ env.RELEASE_TAG }}.tgz
           if-no-files-found: error
+          overwrite: true
+      - name: Save successful GitHub hot cache
+        if: success() && matrix.windows != '1' && steps.bazel-cache.outputs.cache-primary-key != '' && steps.bazel-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cache/omp-bazel-disk
+            ~/.cache/omp-bazel-repo
+          key: ${{ steps.bazel-cache.outputs.cache-primary-key }}
+      - name: Prepare successful durable cache candidate
+        if: success() && matrix.windows != '1' && vars.CI_CACHE_ENABLED == 'true' && steps.cache-identity.outcome == 'success'
+        id: cache-pack
+        continue-on-error: true
+        run: |
+          BAZEL="$(command -v bazelisk || command -v bazel)"
+          "$BAZEL" --bazelrc="$RUNNER_TEMP/coreforge-bazel.rc" shutdown
+          python3 scripts/ci_cache.py pack --identity "$RUNNER_TEMP/cache-identity.json" \
+            --disk "$HOME/.cache/omp-bazel-disk" --repo "$HOME/.cache/omp-bazel-repo" \
+            --output "$RUNNER_TEMP/cache-snapshot"
+      - name: Retain durable cache candidate for successful-release publication
+        if: success() && steps.cache-pack.outcome == 'success'
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: snapshot-${{ matrix.target }}-${{ matrix.os }}
+          path: ${{ runner.temp }}/cache-snapshot
+          retention-days: 1
+          if-no-files-found: error
+
+  release_smoke:
+    name: smoke release (${{ matrix.target }})
+    needs: [prepare, build]
+    if: ${{ !cancelled() && needs.prepare.result == 'success' && needs.prepare.outputs.should_release == 'true' && needs.build.result == 'success' }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: darwin-arm64, os: xcode-27 }
+          - { target: darwin-x64, os: macos-15-intel }
+          - { target: linux-x64, os: ubuntu-22.04 }
+          - { target: linux-arm64, os: ubuntu-24.04-arm }
+          - { target: linux-musl-x64, os: ubuntu-22.04 }
+          - { target: linux-musl-arm64, os: ubuntu-24.04-arm }
+          - { target: win32-x64, os: windows-2025 }
+          - { target: win32-arm64, os: windows-11-arm }
+    runs-on: ${{ matrix.os }}
+    env:
+      SOURCE_SHA: ${{ needs.prepare.outputs.release_sha }}
+      RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.release_sha }}
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: "1.4.4"
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: binary-${{ matrix.target }}
+          path: release-smoke-assets
+      - name: Verify downloaded macOS signature
+        if: startsWith(matrix.target, 'darwin-')
+        run: codesign --verify --strict --verbose=4 release-smoke-assets/omp-${{ matrix.target }}
+      - name: Exercise final release binary
+        run: bun --no-env-file scripts/ci-release-smoke.ts smoke "${{ matrix.target }}" release-smoke-assets release-smoke-receipts
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-smoke-${{ matrix.target }}
+          path: release-smoke-receipts/*.json
+          if-no-files-found: error
+          overwrite: true
+
+  cache_publish:
+    needs: [prepare, build, release, verify_release]
+    if: ${{ !cancelled() && vars.CI_CACHE_ENABLED == 'true' && needs.prepare.result == 'success' && needs.build.result == 'success' && needs.release.result == 'success' && needs.verify_release.result == 'success' }}
+    uses: Coreforce-CAD/oh-my-pi/.github/workflows/cf-cache-write.yml@c4d074b6ef60c229874d0fda96740cd71877f94c
+    with:
+      enabled: true
+      source-sha: ${{ needs.prepare.outputs.release_sha }}
+      expected-workflow: cf-release
+      build-result: ${{ needs.build.result }}
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
 
   release:
     permissions:
       contents: write
-    needs: [prepare, build]
-    if: needs.prepare.outputs.should_release == 'true'
+    needs: [prepare, build, release_smoke]
+    if: ${{ !cancelled() && needs.prepare.result == 'success' && needs.prepare.outputs.should_release == 'true' && needs.build.result == 'success' && needs.release_smoke.result == 'success' }}
     concurrency:
       group: cf-release-publish
       cancel-in-progress: false
     env:
       RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+      SOURCE_SHA: ${{ needs.prepare.outputs.release_sha }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -456,16 +600,23 @@ jobs:
           UPSTREAM_TAG="${RELEASE_TAG%.*}"
           git fetch --no-tags "https://github.com/${OMP_UPSTREAM_REPO}.git" \
             "refs/tags/${UPSTREAM_TAG}:refs/tags/${UPSTREAM_TAG}"
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: binary-*
           path: release-assets
           merge-multiple: true
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: native-*
           path: release-assets
           merge-multiple: true
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: release-smoke-*
+          path: ${{ runner.temp }}/release-smoke-receipts
+          merge-multiple: true
+      - name: Bind publication to smoke-tested bytes
+        run: bun --no-env-file scripts/ci-release-smoke.ts verify release-assets "$RUNNER_TEMP/release-smoke-receipts" release-assets/release-verification.json
       - name: Build Coreforge Browser Relay extension
         run: |
           bun --cwd=packages/browser-relay run build
@@ -475,7 +626,8 @@ jobs:
           bun scripts/ci-release-checksums.ts release-assets/SHA256SUMS.txt \
             release-assets/omp-* \
             release-assets/coreforge-pi-natives-*.tgz \
-            release-assets/coreforge-browser-relay-extension.zip
+            release-assets/coreforge-browser-relay-extension.zip \
+            release-assets/release-verification.json
       - name: Generate release notes
         # Floor at the latest published release so canceled candidates remain in the combined notes.
         env:
@@ -514,7 +666,7 @@ jobs:
 
   verify_release:
     needs: [prepare, release]
-    if: needs.prepare.outputs.should_release == 'true'
+    if: ${{ !cancelled() && needs.prepare.result == 'success' && needs.prepare.outputs.should_release == 'true' && needs.release.result == 'success' }}
     env:
       RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
       MACOS_SIGNING: ${{ secrets.APPLE_CERTIFICATE_P12 != '' && secrets.APPLE_CERTIFICATE_PASSWORD != '' && secrets.APPLE_API_KEY_ID != '' && secrets.APPLE_API_ISSUER_ID != '' && secrets.APPLE_API_KEY != '' }}
@@ -530,16 +682,13 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --pattern "omp-darwin-arm64"
           chmod +x omp-darwin-arm64
-      - name: Verify published source-install native addon
+      - name: Download published source-install native addon
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release download "$RELEASE_TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --pattern "coreforge-pi-natives-darwin-arm64-${RELEASE_TAG}.tgz"
-          tar -xzf "coreforge-pi-natives-darwin-arm64-${RELEASE_TAG}.tgz"
-          test -f package/pi_natives.darwin-arm64.node
-          node -e 'require("./package/pi_natives.darwin-arm64.node")'
       - name: Verify published checksums
         env:
           GH_TOKEN: ${{ github.token }}
@@ -547,12 +696,22 @@ jobs:
           gh release download "$RELEASE_TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --pattern "SHA256SUMS.txt"
-          grep -F \
-            -e "  omp-darwin-arm64" \
-            -e "  coreforge-pi-natives-darwin-arm64-${RELEASE_TAG}.tgz" \
-            SHA256SUMS.txt > SHA256SUMS.verify
-          test "$(wc -l < SHA256SUMS.verify)" -eq 2
+          awk -v binary="omp-darwin-arm64" \
+              -v native="coreforge-pi-natives-darwin-arm64-${RELEASE_TAG}.tgz" '
+            $2 == binary || $2 == native { count[$2]++; print }
+            END {
+              if (count[binary] != 1 || count[native] != 1) {
+                print "missing or duplicate release checksum" > "/dev/stderr"
+                exit 1
+              }
+            }
+          ' SHA256SUMS.txt > SHA256SUMS.verify
           shasum -a 256 -c SHA256SUMS.verify
+      - name: Verify published source-install native addon
+        run: |
+          tar -xzf "coreforge-pi-natives-darwin-arm64-${RELEASE_TAG}.tgz"
+          test -f package/pi_natives.darwin-arm64.node
+          node -e 'require("./package/pi_natives.darwin-arm64.node")'
       - name: Verify published macOS arm64 binary
         run: |
           codesign -dvvv ./omp-darwin-arm64

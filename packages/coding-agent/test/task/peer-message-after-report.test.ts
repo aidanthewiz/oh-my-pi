@@ -123,9 +123,13 @@ async function startRun(options: {
 	authStorage.keys.setRuntime("mock", "test-key");
 	const modelRegistry = new ModelRegistry(authStorage);
 	let request = 0;
+	const peerInbox = Promise.withResolvers<Awaited<ReturnType<IrcBus["wait"]>>>();
 	const mock = createMockModel({
 		handler: async context => {
 			const n = ++request;
+			if (n === 1) {
+				void IrcBus.global().wait(PEER_ID, { from: AGENT_ID }, 10_000).then(peerInbox.resolve, peerInbox.reject);
+			}
 			await options.beforeResponse?.(n);
 			return options.respond?.(n, context) ?? answer(context);
 		},
@@ -138,7 +142,6 @@ async function startRun(options: {
 	});
 	// The peer has no session: what the subagent sends it lands on this bus waiter.
 	AgentRegistry.global().register({ id: PEER_ID, displayName: "peer", kind: "sub", session: null });
-	const peerInbox = IrcBus.global().wait(PEER_ID, { from: AGENT_ID }, 10_000);
 	const run = runSubprocess({
 		cwd,
 		artifactsDir,
@@ -176,7 +179,7 @@ async function startRun(options: {
 		artifact: path.join(artifactsDir, `${AGENT_ID}.md`),
 		artifactsDir,
 		deliveries,
-		peerInbox,
+		peerInbox: peerInbox.promise,
 		close,
 		mock,
 	};

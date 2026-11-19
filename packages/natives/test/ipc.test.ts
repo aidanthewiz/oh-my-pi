@@ -347,19 +347,31 @@ describe("native IPC", () => {
 		const script = `
 			const { IpcConnection } = require(${JSON.stringify(nativeModule)});
 			IpcConnection.connect(${JSON.stringify(endpoint)}, { framing: "lines" }).then(connection => {
-				connection.start(() => {}, () => {});
-				connection.unref();
-				console.log("connected");
+				connection.start(() => {
+					connection.unref();
+					console.log("connected");
+				}, () => {});
 			});
 		`;
 		const child = Bun.spawn([process.execPath, "-e", script], { stdout: "pipe", stderr: "inherit" });
-		const peer = record(await accepted);
+		const stdout = new Response(child.stdout).text();
+		cleanups.push(async () => {
+			if (child.exitCode === null) child.kill();
+			await Promise.all([child.exited, stdout]);
+		});
+		const connection = await Promise.race([
+			accepted,
+			child.exited.then(code => {
+				throw new Error(`IPC client exited with ${code} before server acceptance`);
+			}),
+		]);
+		const peer = record(connection);
+		expect(connection.send("unref")).toBe(true);
 		// Real time is the subject here: a leaked loop ref means the child never
 		// exits, so the only observable failure is the deadline expiring.
 		const exited = await Promise.race([child.exited, Bun.sleep(10_000).then(() => "timeout" as const)]);
-		if (exited === "timeout") child.kill();
 		expect(exited).toBe(0);
-		expect(await new Response(child.stdout).text()).toContain("connected");
+		expect(await stdout).toContain("connected");
 		await peer.closed;
 		expect(peer.reason).toBeNull();
 	});

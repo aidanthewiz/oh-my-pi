@@ -1,0 +1,80 @@
+name: cf-relay-validate
+
+on:
+  workflow_call:
+    inputs:
+      qualification-artifact-id:
+        description: Immutable artifact ID returned by the Linux producer in this workflow run
+        type: string
+        required: true
+      source-sha:
+        description: Exact same-repository coreforge pull-request head
+        type: string
+        required: true
+      qualification-run-id:
+        type: string
+        required: true
+      qualification-run-attempt:
+        type: string
+        required: true
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      SOURCE_SHA: ${{ inputs.source-sha }}
+    steps:
+      - name: Require same-run pull-request qualification inputs
+        env:
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          QUALIFICATION_ARTIFACT_ID: ${{ inputs.qualification-artifact-id }}
+          QUALIFICATION_RUN_ID: ${{ inputs.qualification-run-id }}
+          QUALIFICATION_RUN_ATTEMPT: ${{ inputs.qualification-run-attempt }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_EVENT_NAME" = pull_request
+          test "$PR_BASE_REF" = coreforge
+          test "$PR_HEAD_REPOSITORY" = "$GITHUB_REPOSITORY"
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$SOURCE_SHA" = "$PR_HEAD_SHA"
+          [[ "$QUALIFICATION_ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
+          test "$QUALIFICATION_RUN_ID" = "$GITHUB_RUN_ID"
+          test "$QUALIFICATION_RUN_ATTEMPT" = "$GITHUB_RUN_ATTEMPT"
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.source-sha }}
+          persist-credentials: false
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: "1.4.4"
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Download same-run sealed Linux inputs
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ inputs.qualification-artifact-id }}
+          merge-multiple: true
+          path: .
+      - name: Verify exact producer inputs
+        run: bun scripts/ci-qualification-engine.ts verify-inputs linux-x64 "$SOURCE_SHA"
+        env:
+          QUALIFICATION_RECEIPT_DIR: ${{ runner.temp }}/qualification-relay
+      - name: Validate relay using sealed native inputs
+        uses: ./.github/actions/relay-validation
+      - name: Retain relay qualification receipts
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: qualification-relay-linux-x64
+          path: ${{ runner.temp }}/qualification-relay
+          if-no-files-found: error
+          retention-days: 3
