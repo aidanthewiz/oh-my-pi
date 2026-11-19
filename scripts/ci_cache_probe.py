@@ -59,8 +59,15 @@ def main():
         for name, role_name in (("CI_CACHE_READ_ROLE", "CoreforgeOmpCacheRead"), ("CI_CACHE_WRITE_ROLE", "CoreforgeOmpCacheWrite")):
             role = os.environ[name]
             cache.require(role == f"arn:aws-us-gov:iam::800128555654:role/{role_name}", "unexpected probe role")
-            body = {"RoleArn": role, "RoleSessionName": "cache-denial-" + os.environ["GITHUB_RUN_ID"], "WebIdentityToken": token, "DurationSeconds": 900}
-            result = subprocess.run(["aws", "sts", "assume-role-with-web-identity", "--cli-input-json", "file:///dev/stdin", "--region", region, "--output", "json", "--no-cli-pager", "--no-sign-request"], input=json.dumps(body), text=True, capture_output=True, timeout=60)
+            result = subprocess.run(
+                ["aws", "sts", "assume-role-with-web-identity",
+                 "--role-arn", role,
+                 "--role-session-name", "cache-denial-" + os.environ["GITHUB_RUN_ID"],
+                 "--web-identity-token", "file:///dev/stdin",
+                 "--duration-seconds", "900", "--region", region,
+                 "--output", "json", "--no-cli-pager", "--no-sign-request"],
+                input=token, text=True, capture_output=True, timeout=60,
+            )
             cache.require(result.returncode != 0, "cache role incorrectly admitted non-broker OIDC source: " + role_name)
             error_code = _failure_code(result.stderr)
             cache.require(error_code == "AccessDenied", f"cache denial probe failed for {role_name}: exit={result.returncode} error={error_code}")

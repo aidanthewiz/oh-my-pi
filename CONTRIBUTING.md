@@ -99,6 +99,8 @@ Keep `CI_CACHE_ENABLED=false` until governed apply, protected source adoption, a
 The negative OIDC probe accepts a missing `job_workflow_ref` or this direct canary workflow, never another workflow identity.
 Both cache roles must still reject its real token with IAM `AccessDenied`; other errors cannot satisfy the probe.
 Failure diagnostics expose only the CLI exit status and service error code or fixed error category, never raw stderr or tokens.
+The token travels through stdin via `--web-identity-token`, never through a command-line value or persistent file.
+AWS CLI 2.40/2.41 loads `--cli-input-json` twice; do not use a one-shot pipe for that argument.
 
 Run `python3 -m unittest discover -s scripts -p 'test_ci_cache*.py'` for cache and real broker-guard boundaries.
 Local qualification exercised a real Bazel 9.2.0 C build with isolated output bases and a loopback repository download.

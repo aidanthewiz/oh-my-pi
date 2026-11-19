@@ -1,14 +1,15 @@
 """Receipt regressions using Bun and a host-compiled Node-API addon.
 
-Linux and macOS require Bun and a C compiler on PATH. Other platforms skip
-explicitly; missing tools on supported platforms fail rather than claim proof.
-No Bazel compilation, credential checks, network access, or real cache roots
-are used. The canonical loader and package-version reader run unchanged.
+Linux and macOS require Bun, a C compiler, and AWS CLI on PATH. Missing
+tools on supported platforms fail rather than claim proof.
+No Bazel compilation, AWS calls, credential checks, or real cache roots are
+used. A loopback-only STS fixture exercises the actual CLI request parser.
 """
 
 import base64
 import contextlib
 import hashlib
+from http.server import BaseHTTPRequestHandler, HTTPServer
 import importlib.util
 import io
 import json
@@ -18,8 +19,10 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
+from urllib.parse import parse_qs
 
 HELPER = Path(__file__).with_name("ci_cache_canary.py").resolve()
 SPEC = importlib.util.spec_from_file_location("ci_cache_canary", HELPER)
@@ -219,7 +222,8 @@ class CanaryTrustProbeTests(unittest.TestCase):
 
     def run_probe(self, claims, results=None):
         payload = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
-        response = io.StringIO(json.dumps({"value": f"header.{payload}.signature"}))
+        self.issued_token = f"header.{payload}.signature"
+        response = io.StringIO(json.dumps({"value": self.issued_token}))
         output, errors = io.StringIO(), io.StringIO()
         with patch.dict(os.environ, self.env, clear=True), \
                 patch.object(probe.urllib.request, "urlopen", return_value=response), \
@@ -296,6 +300,75 @@ class CanaryTrustProbeTests(unittest.TestCase):
                 self.assertIn(f"exit=252 error={code}", errors)
                 self.assertNotIn("do-not-log", errors)
                 self.assertFalse((self.root / "cache-canary-trust-denial.json").exists())
+
+    @unittest.skipUnless(os.name == "posix", "the protected Linux canary uses /dev/stdin")
+    def test_real_cli_reads_stdin_once_and_reaches_both_local_denials(self):
+        aws = shutil.which("aws")
+        if aws is None:
+            self.fail("the local request-parser regression requires AWS CLI on PATH")
+        requests = []
+
+        class DenySTS(BaseHTTPRequestHandler):
+            def do_POST(self):
+                requests.append(self.rfile.read(int(self.headers["Content-Length"])))
+                body = (
+                    b'<ErrorResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/">'
+                    b"<Error><Type>Sender</Type><Code>AccessDenied</Code>"
+                    b"<Message>Local test denial</Message></Error>"
+                    b"<RequestId>local-only</RequestId></ErrorResponse>"
+                )
+                self.send_response(403)
+                self.send_header("Content-Type", "text/xml")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        server = HTTPServer(("127.0.0.1", 0), DenySTS)
+        worker = threading.Thread(target=server.serve_forever, daemon=True)
+        worker.start()
+        real_run = subprocess.run
+
+        def invoke_local_sts(arguments, **kwargs):
+            return real_run(
+                [aws, *arguments[1:], "--endpoint-url", f"http://127.0.0.1:{server.server_port}"],
+                **kwargs,
+                env={
+                    "PATH": os.defpath,
+                    "HOME": str(self.root),
+                    "AWS_CONFIG_FILE": os.devnull,
+                    "AWS_SHARED_CREDENTIALS_FILE": os.devnull,
+                    "AWS_EC2_METADATA_DISABLED": "true",
+                    "AWS_PAGER": "",
+                },
+            )
+
+        try:
+            result, _, errors = self.run_probe(self.claims, invoke_local_sts)
+        finally:
+            server.shutdown()
+            worker.join()
+            server.server_close()
+        self.assertEqual(result, 0, errors)
+        self.assertEqual(len(requests), 2)
+        common = {
+            "Action": ["AssumeRoleWithWebIdentity"],
+            "Version": ["2011-06-15"],
+            "RoleSessionName": ["cache-denial-" + self.env["GITHUB_RUN_ID"]],
+            "WebIdentityToken": [self.issued_token],
+            "DurationSeconds": ["900"],
+        }
+        self.assertEqual(
+            [parse_qs(request.decode("utf-8"), keep_blank_values=True, strict_parsing=True) for request in requests],
+            [
+                {**common, "RoleArn": [self.env["CI_CACHE_READ_ROLE"]]},
+                {**common, "RoleArn": [self.env["CI_CACHE_WRITE_ROLE"]]},
+            ],
+        )
+        receipt = json.loads((self.root / "cache-canary-trust-denial.json").read_text())
+        self.assertEqual([row["result"] for row in receipt["roles"]], ["AccessDenied", "AccessDenied"])
 
 
 
