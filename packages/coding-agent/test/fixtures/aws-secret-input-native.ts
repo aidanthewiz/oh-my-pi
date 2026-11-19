@@ -68,6 +68,28 @@ export function requireNativeProof(value: unknown): asserts value {
 	if (!value) throw new Error(FAILURE);
 }
 
+function requireVisibleApprovalBindings(title: string, request: AwsSecretInputRequest): void {
+	const lines = title.split(/\r?\n/u);
+	const identity = lines.find(line => /\b(?:caller|identity)\b.*\baccount\b/iu.test(line)) ?? "";
+	requireNativeProof(identity.match(/\b\d{12}\b/u)?.[0] === request.secretInput.expectedIdentity.account);
+	requireNativeProof(
+		identity.match(/\baws(?:-us-gov|-cn)?\b/u)?.[0] === request.secretInput.expectedIdentity.partition,
+	);
+	const caller = lines.find(line => /\b(?:caller|identity)\b.*\barn\b/iu.test(line)) ?? "";
+	requireNativeProof(caller.includes(JSON.stringify(request.secretInput.expectedIdentity.arn)));
+	const selection = lines.find(line => /\b(?:selection|pointer)\b/iu.test(line)) ?? "";
+	if (request.secretInput.jsonPointer === undefined) {
+		requireNativeProof(/\bSecretString\b/u.test(selection) && /\bSecretBinary\b/u.test(selection));
+	} else {
+		requireNativeProof(selection.includes(JSON.stringify(request.secretInput.jsonPointer)));
+	}
+	const newline = lines
+		.find(line => /\bnewline\b/iu.test(line))
+		?.match(/\b(?:true|false)\b/iu)?.[0]
+		?.toLowerCase();
+	requireNativeProof(newline === String(request.secretInput.appendNewline === true));
+}
+
 export function awsSecretInputNativeResponse(result: AgentToolResult<unknown>): Record<string, unknown> | undefined {
 	if (!isRecord(result.details)) return undefined;
 	const details =
@@ -954,9 +976,12 @@ export async function runAwsSecretInputNativeProbe(
 			native = install();
 			choice = "deny";
 			const approvals = choices.length;
-			const request = awsSecretInputLifecycleRequest(root);
+			const request = structuredClone(awsSecretInputLifecycleRequest(root));
+			request.secretInput.jsonPointer = "/credentials/password";
+			request.secretInput.appendNewline = true;
 			const invocation = await invoke(request, "denied");
 			requireNativeProof(invocation.failed && choices.length === approvals + 1 && runWorkers === 0);
+			requireVisibleApprovalBindings(choices.at(-1)?.title ?? "", request);
 			await atWriteExecution(request, "denied", async () => {
 				requireNativeFailure(await native.execute("denied", request), "APPROVAL_REQUIRED");
 			});
@@ -1009,6 +1034,7 @@ export async function runAwsSecretInputNativeProbe(
 				requireNativeProof(visibleNumbers.has(String(value)));
 			const guarded = (await readNativeGuardReceipts(root)).slice(guardsBefore);
 			const title = choices.at(-1)?.title ?? "";
+			requireVisibleApprovalBindings(title, request);
 			requireNativeProof(
 				guarded.some(guard => guard.command.includes("sts") && guard.command.includes("get-caller-identity")),
 			);
