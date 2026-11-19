@@ -83,6 +83,7 @@ Cache-only failures produce warnings; they never skip required work or turn a fa
 Build jobs receive verified snapshot data through one-day GitHub transfer artifacts, never AWS credentials.
 Immutable reusable brokers execute only protected `coreforge` helper code.
 The writer verifies the actual source, run attempt, successful predecessor graph, and same-run snapshot provenance before OIDC.
+The writer normalizes a single-artifact download into its slot directory before OIDC, preserving the multi-artifact layout and all provenance checks.
 Engine publication waits for all eight platform builds, release publication, and `verify_release`.
 Relay cache publication waits for successful validation and the existing guarded relay publication.
 PR, `pull_request_target`, and `workflow_run` execution cannot publish shared snapshots.

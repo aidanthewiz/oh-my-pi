@@ -146,19 +146,45 @@ napi_value napi_register_module_v1(napi_env env, napi_value exports) {
         log.write_text("fixture native build completed\n")
         return log.read_text()
 
-    def run_canary(self):
+    def run_canary(self, phase="cold", cold_receipt=None, build=None):
         output, errors = io.StringIO(), io.StringIO()
+        arguments = [phase, "--snapshot", str(self.snapshot)]
+        if cold_receipt is not None:
+            arguments.extend(["--cold-receipt", str(cold_receipt)])
+        if build is None:
+            build = self.build_warm_without_bazel if phase == "warm" else self.build_without_bazel
         previous = Path.cwd()
         try:
             os.chdir(self.checkout)
             with patch.object(canary, "require_builder", return_value=self.authority), \
                     patch.object(canary.cache, "make_identity", return_value=self.identity), \
-                    patch.object(canary, "native_build", side_effect=self.build_without_bazel), \
+                    patch.object(canary, "native_build", side_effect=build), \
                     contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
-                result = canary.main(["cold", "--snapshot", str(self.snapshot)])
+                result = canary.main(arguments)
         finally:
             os.chdir(previous)
         return result, output.getvalue(), errors.getvalue()
+
+    def prepare_warm(self):
+        self.compile_addon(self.version)
+        result, _, errors = self.run_canary()
+        self.assertEqual(result, 0, errors)
+        cold_receipt = self.receipt
+        self.snapshot = self.runner / "cache-snapshot"
+        canary.cache.atomic_json(self.snapshot / "status.json", {"state": "snapshot"})
+        self.runner = self.root / "warm-runner"
+        self.runner.mkdir()
+        self.home = self.root / "warm-home"
+        self.home.mkdir()
+        os.environ.update(HOME=str(self.home), TMPDIR=str(self.runner), RUNNER_TEMP=str(self.runner))
+        self.receipt = self.runner / "cache-canary-warm.json"
+        return cold_receipt
+
+    def build_warm_without_bazel(self, rc, log):
+        payload = self.home / ".cache/omp-bazel-disk/cas/aa" / ("a" * 64)
+        self.assertEqual(payload.read_bytes(), b"fixture compiled action")
+        log.write_text("fixture native build completed\n1 disk cache hit\n")
+        return log.read_text()
 
     def test_unloadable_addon_cannot_produce_success_receipt(self):
         self.addon.write_bytes(b"not a native library\n")
@@ -219,6 +245,43 @@ napi_value napi_register_module_v1(napi_env env, napi_value exports) {
         self.assertEqual(receipt["source_sha"], self.authority["source_sha"])
         self.assertTrue(receipt["confirmed_s3_miss"])
         self.assertFalse(receipt["restored"])
+
+    def test_warm_restores_the_cold_archive_and_checks_the_loaded_native_bytes(self):
+        cold_receipt = self.prepare_warm()
+        result, _, errors = self.run_canary("warm", cold_receipt)
+        self.assertEqual(result, 0, errors)
+        receipt = json.loads(self.receipt.read_text())
+        self.assertTrue(receipt["restored"])
+        self.assertTrue(receipt["incompatible_snapshot_missed"])
+        self.assertFalse(receipt["confirmed_s3_miss"])
+        self.assertEqual(receipt["disk_cache_hits"], 1)
+        self.assertEqual(receipt["addon_sha256"], json.loads(cold_receipt.read_text())["addon_sha256"])
+        self.assertEqual(self.evidence.read_text().splitlines(),
+                         ["loaded", "version:" + self.version, "loaded", "version:" + self.version])
+
+    def test_warm_build_without_cache_hits_cannot_produce_success_receipt(self):
+        cold_receipt = self.prepare_warm()
+        result, _, _ = self.run_canary("warm", cold_receipt, build=self.build_without_bazel)
+        self.assertEqual(result, 1)
+        self.assertFalse(self.receipt.exists())
+
+    def test_warm_requires_the_same_cold_native_digest(self):
+        cold_receipt = self.prepare_warm()
+        cold = json.loads(cold_receipt.read_text())
+        cold["addon_sha256"] = "0" * 64
+        canary.cache.atomic_json(cold_receipt, cold)
+        result, _, _ = self.run_canary("warm", cold_receipt)
+        self.assertEqual(result, 1)
+        self.assertFalse(self.receipt.exists())
+
+    def test_warm_requires_the_same_cold_source(self):
+        cold_receipt = self.prepare_warm()
+        cold = json.loads(cold_receipt.read_text())
+        cold["source_sha"] = "2" * 40
+        canary.cache.atomic_json(cold_receipt, cold)
+        result, _, _ = self.run_canary("warm", cold_receipt)
+        self.assertEqual(result, 1)
+        self.assertFalse(self.receipt.exists())
 
 
 class CanaryTrustProbeTests(unittest.TestCase):
