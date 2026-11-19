@@ -14,6 +14,24 @@ import urllib.request
 import ci_cache as cache
 
 
+def _failure_code(stderr):
+    match = re.search(r"An error occurred \(([A-Za-z][A-Za-z0-9]{0,63})\)", stderr)
+    if match:
+        return match[1]
+    for marker, code in (
+        ("Error parsing parameter '--cli-input-json'", "invalid-cli-json-input"),
+        ("Invalid endpoint:", "invalid-endpoint"),
+        ("Unknown options:", "unsupported-cli-option"),
+        ("SSL validation failed", "tls-validation-failure"),
+        ("Could not connect to the endpoint URL", "endpoint-connection-failure"),
+        ("Unable to locate credentials", "credentials-unavailable"),
+        ("Failed to connect to proxy URL", "proxy-connection-failure"),
+    ):
+        if marker in stderr:
+            return code
+    return "unclassified-cli-error"
+
+
 def main():
     try:
         expected_workflow = f"{cache.REPOSITORY}/.github/workflows/cf-cache-canary.yml@refs/heads/coreforge"
@@ -44,8 +62,8 @@ def main():
             body = {"RoleArn": role, "RoleSessionName": "cache-denial-" + os.environ["GITHUB_RUN_ID"], "WebIdentityToken": token, "DurationSeconds": 900}
             result = subprocess.run(["aws", "sts", "assume-role-with-web-identity", "--cli-input-json", "file:///dev/stdin", "--region", region, "--output", "json", "--no-cli-pager", "--no-sign-request"], input=json.dumps(body), text=True, capture_output=True, timeout=60)
             cache.require(result.returncode != 0, "cache role incorrectly admitted non-broker OIDC source: " + role_name)
-            match = re.search(r"An error occurred \(([^)]+)\)", result.stderr)
-            cache.require(match is not None and match[1] == "AccessDenied", "cache denial probe failed for a reason other than IAM AccessDenied: " + role_name)
+            error_code = _failure_code(result.stderr)
+            cache.require(error_code == "AccessDenied", f"cache denial probe failed for {role_name}: exit={result.returncode} error={error_code}")
             receipt["roles"].append({"arn": role, "result": "AccessDenied", "broker_claim_absent": claims.get("job_workflow_ref") is None})
         output = Path(os.environ["RUNNER_TEMP"]) / "cache-canary-trust-denial.json"
         cache.atomic_json(output, receipt)
