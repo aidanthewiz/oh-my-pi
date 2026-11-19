@@ -68,7 +68,7 @@ jobs:
         run: python3 scripts/ci_cache_probe.py
       - name: Retain nonsecret trust-denial evidence
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: cache-canary-trust-denial
           path: ${{ runner.temp }}/cache-canary-trust-denial.json
@@ -77,7 +77,7 @@ jobs:
 
   read-cold:
     needs: prepare
-    uses: Coreforce-CAD/oh-my-pi/.github/workflows/cf-cache-read.yml@eb12d4088909f550fade50241ed47b9fbce215b0
+    uses: Coreforce-CAD/oh-my-pi/.github/workflows/cf-cache-read.yml@c4d074b6ef60c229874d0fda96740cd71877f94c
     with:
       enabled: true
       slots: '["linux-x64-ubuntu-22.04"]'
@@ -118,7 +118,7 @@ jobs:
       - name: Reclaim unused hosted tools for the existing native target
         run: sudo rm -rf /usr/local/lib/android /opt/hostedtoolcache/CodeQL
       - run: bun install --frozen-lockfile
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: cache-restore-canary-cold-linux-x64-ubuntu-22.04
           path: ${{ runner.temp }}/cache-restore
@@ -128,7 +128,7 @@ jobs:
           if [ "$(ulimit -Sn)" != unlimited ] && [ "$(ulimit -Sn)" -lt 65536 ]; then ulimit -Sn 65536 || true; fi
           python3 scripts/ci_cache_canary.py cold --snapshot "$RUNNER_TEMP/cache-restore"
       - name: Transfer the inert successful cache candidate
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: snapshot-linux-x64-ubuntu-22.04
           path: ${{ runner.temp }}/cache-snapshot
@@ -137,7 +137,7 @@ jobs:
           retention-days: 1
       - name: Retain cold consumer evidence
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: cache-canary-cold-consumer
           path: |
@@ -148,7 +148,7 @@ jobs:
 
   save-cold:
     needs: [prepare, cold-build]
-    uses: Coreforce-CAD/oh-my-pi/.github/workflows/cf-cache-write.yml@eb12d4088909f550fade50241ed47b9fbce215b0
+    uses: Coreforce-CAD/oh-my-pi/.github/workflows/cf-cache-write.yml@c4d074b6ef60c229874d0fda96740cd71877f94c
     with:
       enabled: true
       source-sha: ${{ needs.prepare.outputs.source-sha }}
@@ -162,7 +162,7 @@ jobs:
 
   read-warm:
     needs: [prepare, save-cold]
-    uses: Coreforce-CAD/oh-my-pi/.github/workflows/cf-cache-read.yml@eb12d4088909f550fade50241ed47b9fbce215b0
+    uses: Coreforce-CAD/oh-my-pi/.github/workflows/cf-cache-read.yml@c4d074b6ef60c229874d0fda96740cd71877f94c
     with:
       enabled: true
       slots: '["linux-x64-ubuntu-22.04"]'
@@ -203,11 +203,11 @@ jobs:
       - name: Reclaim unused hosted tools for the existing native target
         run: sudo rm -rf /usr/local/lib/android /opt/hostedtoolcache/CodeQL
       - run: bun install --frozen-lockfile
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: cache-restore-canary-warm-linux-x64-ubuntu-22.04
           path: ${{ runner.temp }}/cache-restore
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: cache-canary-cold-consumer
           path: ${{ runner.temp }}/cold-consumer
@@ -219,7 +219,7 @@ jobs:
             --cold-receipt "$RUNNER_TEMP/cold-consumer/cache-canary-cold.json"
       - name: Retain warm consumer evidence
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: cache-canary-warm-consumer
           path: |

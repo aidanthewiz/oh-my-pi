@@ -157,7 +157,7 @@ jobs:
   cache_restore:
     needs: prepare
     if: vars.CI_CACHE_ENABLED == 'true' && needs.prepare.outputs.should_release == 'true'
-    uses: Coreforce-CAD/oh-my-pi/.github/workflows/cf-cache-read.yml@eb12d4088909f550fade50241ed47b9fbce215b0
+    uses: Coreforce-CAD/oh-my-pi/.github/workflows/cf-cache-read.yml@c4d074b6ef60c229874d0fda96740cd71877f94c
     with:
       enabled: true
       slots: '["darwin-arm64-xcode-27","darwin-x64-macos-15-intel","linux-x64-ubuntu-22.04","linux-arm64-ubuntu-24.04-arm","linux-musl-x64-ubuntu-22.04","linux-musl-arm64-ubuntu-24.04-arm","win32-x64-ubuntu-24.04"]'
@@ -302,7 +302,7 @@ jobs:
         if: matrix.windows != '1' && vars.CI_CACHE_ENABLED == 'true'
         id: cache-download
         continue-on-error: true
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: cache-restore-${{ matrix.target }}-${{ matrix.os }}
           path: ${{ runner.temp }}/cache-restore
@@ -463,12 +463,12 @@ jobs:
           }
           & $binaryPath --smoke-test
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: binary-${{ matrix.target }}
           path: packages/coding-agent/binaries/${{ matrix.binary }}
           if-no-files-found: error
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: native-${{ matrix.target }}
           path: release-assets/coreforge-pi-natives-${{ matrix.target }}-${{ env.RELEASE_TAG }}.tgz
@@ -495,7 +495,7 @@ jobs:
       - name: Retain durable cache candidate for successful-release publication
         if: success() && steps.cache-pack.outcome == 'success'
         continue-on-error: true
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: snapshot-${{ matrix.target }}-${{ matrix.os }}
           path: ${{ runner.temp }}/cache-snapshot
@@ -505,7 +505,7 @@ jobs:
   cache_publish:
     needs: [prepare, build, release, verify_release]
     if: ${{ !cancelled() && vars.CI_CACHE_ENABLED == 'true' && needs.prepare.result == 'success' && needs.build.result == 'success' && needs.release.result == 'success' && needs.verify_release.result == 'success' }}
-    uses: Coreforce-CAD/oh-my-pi/.github/workflows/cf-cache-write.yml@eb12d4088909f550fade50241ed47b9fbce215b0
+    uses: Coreforce-CAD/oh-my-pi/.github/workflows/cf-cache-write.yml@c4d074b6ef60c229874d0fda96740cd71877f94c
     with:
       enabled: true
       source-sha: ${{ needs.prepare.outputs.release_sha }}
@@ -542,12 +542,12 @@ jobs:
           UPSTREAM_TAG="${RELEASE_TAG%.*}"
           git fetch --no-tags "https://github.com/${OMP_UPSTREAM_REPO}.git" \
             "refs/tags/${UPSTREAM_TAG}:refs/tags/${UPSTREAM_TAG}"
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: binary-*
           path: release-assets
           merge-multiple: true
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: native-*
           path: release-assets
