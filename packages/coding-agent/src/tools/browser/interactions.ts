@@ -1425,6 +1425,62 @@ async function pickFiles(realm: Realm, paths: string[], signal: AbortSignal | un
 	}
 }
 
+interface FileSelectionWatch {
+	ready: Promise<void>;
+	stop(): void;
+}
+
+function watchFileSelection(el: unknown): FileSelectionWatch {
+	type Listener = (event: { target: unknown; isTrusted: boolean }) => void;
+	interface WatchTarget {
+		addEventListener(type: string, listener: Listener, capture: boolean): void;
+		removeEventListener(type: string, listener: Listener, capture: boolean): void;
+	}
+	const element = el as PageElement & WatchTarget;
+	const root = element.getRootNode() as unknown as WatchTarget;
+	const { promise, resolve } = Promise.withResolvers<void>();
+	const stop = (): void => {
+		root.removeEventListener("change", onChange, true);
+		if (root !== element) element.removeEventListener("change", onChange, true);
+		resolve();
+	};
+	const onChange: Listener = event => {
+		if (event.target === element && event.isTrusted) stop();
+	};
+	root.addEventListener("change", onChange, true);
+	if (root !== element) element.addEventListener("change", onChange, true);
+	return { ready: promise, stop };
+}
+
+async function releaseFileSelectionWatch(watch: JSHandle<FileSelectionWatch>): Promise<void> {
+	try {
+		await watch.evaluate(watch => watch.stop());
+	} finally {
+		await watch.dispose();
+	}
+}
+
+async function watchInputSelection(
+	input: ElementHandle,
+	signal: AbortSignal | undefined,
+): Promise<JSHandle<FileSelectionWatch>> {
+	const realm = input.frame.isolatedRealm();
+	const target = await untilAbortedOrReleased(
+		signal,
+		() => realm.adoptHandle(input),
+		late => late.dispose(),
+	);
+	try {
+		return await untilAbortedOrReleased(
+			signal,
+			() => realm.evaluateHandle(watchFileSelection, target),
+			releaseFileSelectionWatch,
+		);
+	} finally {
+		await target.dispose().catch(() => undefined);
+	}
+}
+
 /**
  * Hand a file input the files: staged copies' paths, or contents streamed into the isolated world. `filling` runs once
  * the files are being set, after staging or streaming has succeeded.
@@ -1439,10 +1495,17 @@ async function deliverToInput(
 ): Promise<void> {
 	if (route === "paths") {
 		const staged = await staging.stage(sources, signal);
-		await untilAborted(signal, () => {
-			filling?.();
-			return setFileInputPaths(input, staged);
-		});
+		// CDP acknowledges a directory before its asynchronous file selection completes.
+		const watch = sources.some(source => source.directory) ? await watchInputSelection(input, signal) : undefined;
+		try {
+			await untilAborted(signal, () => {
+				filling?.();
+				return setFileInputPaths(input, staged);
+			});
+			if (watch) await untilAborted(signal, () => watch.evaluate(watch => watch.ready));
+		} finally {
+			if (watch) await releaseFileSelectionWatch(watch).catch(() => undefined);
+		}
 		return;
 	}
 	const realm = input.frame.isolatedRealm();
