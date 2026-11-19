@@ -28,6 +28,7 @@ const configKeys = [
 	"CARGO_PROFILE_CI_STRIP",
 	"CARGO_PROFILE_RELEASE_STRIP",
 	"OMP_TEST_CONCURRENCY",
+	"OMP_TEST_SHARD",
 	"OMP_TEST_TIMEOUT",
 	"OMP_TEST_CHUNK_TIMEOUT",
 	"RELEASE_TARGETS",
@@ -598,9 +599,22 @@ async function legal(): Promise<void> {
 	});
 }
 
-async function typescript(): Promise<void> {
-	await run(["bun", "run", "ci:check:full"]);
-	await run(["bun", "run", "ci:test:ts"]);
+function validateTypescriptShard(): void {
+	if (mode === "typescript-tests") {
+		const shard = Bun.env.OMP_TEST_SHARD;
+		assert(
+			shard === "1/3" || shard === "2/3" || shard === "3/3",
+			"typescript-tests requires OMP_TEST_SHARD to be exactly 1/3, 2/3, or 3/3",
+		);
+	} else if (mode === "typescript" || mode === "typescript-smoke") {
+		assert.equal(Bun.env.OMP_TEST_SHARD, undefined, `${mode} requires OMP_TEST_SHARD to be unset`);
+	}
+}
+
+async function typescript(partition: "typescript" | "typescript-tests" | "typescript-smoke"): Promise<void> {
+	if (partition !== "typescript-tests") await run(["bun", "run", "ci:check:full"]);
+	if (partition !== "typescript-smoke") await run(["bun", "run", "ci:test:ts"]);
+	if (partition === "typescript-tests") return;
 	await run(["bun", "run", "ci:test:smoke"]);
 	const binary = path.join(root, `packages/coding-agent/binaries/omp-${platform}`);
 	for (const args of [["--version"], ["--help"], ["stats", "--help"], ["--smoke-test"], ["--license"]])
@@ -761,6 +775,7 @@ if (import.meta.main) {
 	let passed = false;
 	let failure: string | undefined;
 	try {
+		validateTypescriptShard();
 		await identity();
 		if (mode === "snapshot") {
 			assert(/^[a-z-]+$/.test(process.argv[3] ?? ""), "Missing snapshot label");
@@ -772,11 +787,11 @@ if (import.meta.main) {
 			await run(["bun", "scripts/bazel-natives.ts", ...process.argv.slice(3)]);
 		} else if (mode === "inputs") await makeInputs(process.argv[3]);
 		else if (mode === "verify-inputs") await verifyInputs(process.argv[3], process.argv[4]);
-		else if (mode === "typescript" || mode === "rust") {
+		else if (mode === "typescript" || mode === "typescript-tests" || mode === "typescript-smoke" || mode === "rust") {
 			await verifyInputs(platform, sourceSha);
 			const before = await snapshot("suite-effective");
-			if (mode === "typescript") await typescript();
-			else await rust();
+			if (mode === "rust") await rust();
+			else await typescript(mode);
 			const after = await snapshot("suite-after");
 			assert.deepEqual(after.files, before.files, "Qualification changed tracked source inputs");
 			await verifyInputs(platform, sourceSha);

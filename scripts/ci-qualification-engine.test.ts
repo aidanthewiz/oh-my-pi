@@ -21,6 +21,66 @@ async function executable(file: string) {
 	return file;
 }
 
+async function qualificationAdmission(mode: string, shard?: string) {
+	const receipts = await fs.mkdtemp(path.join(os.tmpdir(), "cf-qualification-admission-"));
+	roots.push(receipts);
+	const env: Record<string, string> = {
+		PATH: process.env.PATH ?? "/usr/bin:/bin",
+		HOME: receipts,
+		TMPDIR: receipts,
+		...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}),
+	};
+	if (shard !== undefined) env.OMP_TEST_SHARD = shard;
+	env.QUALIFICATION_RECEIPT_DIR = receipts;
+	const child = Bun.spawn(
+		[process.execPath, "--no-env-file", path.join(import.meta.dir, "ci-qualification-engine.ts"), mode],
+		{ cwd: receipts, env, stdin: "ignore", stdout: "ignore", stderr: "ignore" },
+	);
+	const exitCode = await child.exited;
+	const result = await Bun.file(path.join(receipts, `result-${mode}.json`)).json();
+	return { exitCode, result };
+}
+
+describe("TypeScript qualification partition admission", () => {
+	for (const shard of [undefined, "", "1", "0/3", "4/3", "1/2", "2/4", "01/3", "1/03", " 1/3", "1/3\n"]) {
+		test(`rejects ${JSON.stringify(shard)} before executing partitioned tests and records failure`, async () => {
+			const { exitCode, result } = await qualificationAdmission("typescript-tests", shard);
+			expect(exitCode).not.toBe(0);
+			expect(result.passed).toBe(false);
+			expect(result.error).toContain("typescript-tests requires OMP_TEST_SHARD to be exactly 1/3, 2/3, or 3/3");
+			expect(result.commands).toEqual([]);
+		});
+	}
+
+	for (const mode of ["typescript", "typescript-smoke"]) {
+		for (const shard of ["", "1/3"]) {
+			test(`${mode} rejects inherited shard ${JSON.stringify(shard)}`, async () => {
+				const { exitCode, result } = await qualificationAdmission(mode, shard);
+				expect(exitCode).not.toBe(0);
+				expect(result.passed).toBe(false);
+				expect(result.error).toContain(`${mode} requires OMP_TEST_SHARD to be unset`);
+				expect(result.commands).toEqual([]);
+			});
+		}
+	}
+
+	for (const [mode, shard] of [
+		["typescript-tests", "1/3"],
+		["typescript-tests", "2/3"],
+		["typescript-tests", "3/3"],
+		["typescript-smoke", undefined],
+		["typescript", undefined],
+	] as const) {
+		test(`${mode} ${shard ?? "unpartitioned"} still requires exact source identity`, async () => {
+			const { exitCode, result } = await qualificationAdmission(mode, shard);
+			expect(exitCode).not.toBe(0);
+			expect(result.passed).toBe(false);
+			expect(result.error).toContain("SOURCE_SHA must be the exact PR head SHA");
+			expect(result.commands).toEqual([]);
+		});
+	}
+});
+
 describe.skipIf(process.platform === "win32")("Unix Rust executable retirement", () => {
 	test("retires a closed Cargo unit executable while retaining dependencies and build output", async () => {
 		const { workspace, target } = await fixture();

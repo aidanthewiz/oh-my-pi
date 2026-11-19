@@ -1,30 +1,6 @@
 name: relay
 
 on:
-  pull_request:
-    branches:
-      - coreforge
-    paths:
-      - ".github/workflows/relay.yml"
-      - "Dockerfile.relay"
-      - "Dockerfile.relay.dockerignore"
-      - "bun.lock"
-      - "package.json"
-      - "scripts/ci-released-native.ts"
-      - "packages/collab-web/**"
-      - "packages/coding-agent/scripts/generate-share-viewer.ts"
-      - "packages/coding-agent/src/cli-commands.ts"
-      - "packages/coding-agent/src/cli/relay-cli.ts"
-      - "packages/coding-agent/src/commands/relay.ts"
-      - "packages/coding-agent/src/config/settings-schema.ts"
-      - "packages/coding-agent/src/export/share.ts"
-      - "packages/coding-agent/src/identity/relay.ts"
-      - "packages/coding-agent/src/modes/controllers/command-controller.ts"
-      - "packages/coding-agent/src/slash-commands/builtin-registry.ts"
-      - "packages/coding-agent/src/collab/**"
-      - "packages/coding-agent/src/export/html/**"
-      - "packages/relay/**"
-      - "packages/wire/**"
   push:
     tags:
       - "relay/v*"
@@ -126,11 +102,6 @@ jobs:
 
       - name: Install dependencies
         run: bun install --frozen-lockfile
-      - name: Check relay clients
-        run: |
-          bun --cwd=packages/wire run check
-          bun --cwd=packages/collab-web run check
-          bun --cwd=packages/coding-agent run check
 
       - name: Reclaim disk for source native build
         if: needs.prepare.outputs.native_changed == 'true'
@@ -216,52 +187,8 @@ jobs:
           "$BAZEL" --bazelrc="$RUNNER_TEMP/coreforge-bazel.rc" clean --expunge
           df -h /
 
-      - name: Test relay clients
-        run: |
-          bun test packages/coding-agent/test/relay-identity.test.ts packages/coding-agent/test/share.test.ts packages/coding-agent/test/collab/relay-client-backpressure.test.ts
-          bun --cwd=packages/collab-web run test
-
-      - name: Check relay package
-        run: bun --cwd=packages/relay run check
-
-      - name: Test relay package
-        run: bun --cwd=packages/relay run test
-
-      - name: Build browser clients and relay
-        run: |
-          bun --cwd=packages/collab-web run build
-          bun packages/coding-agent/scripts/generate-share-viewer.ts /tmp/share-viewer.html
-          bun --cwd=packages/relay run build
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-
-      - name: Build relay image
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
-        with:
-          context: .
-          file: Dockerfile.relay
-          push: false
-          platforms: linux/amd64
-
-      - name: Retain validated native addons for publication
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: relay-native-linux-x64
-          path: packages/natives/native/pi_natives.linux-x64*.node
-          if-no-files-found: error
-          retention-days: 1
-
-      - name: Download retained native addons for verification
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          name: relay-native-linux-x64
-          path: ${{ runner.temp }}/relay-native-roundtrip
-
-      - name: Verify native artifact contents
-        run: |
-          cmp packages/natives/native/pi_natives.linux-x64-baseline.node "$RUNNER_TEMP/relay-native-roundtrip/pi_natives.linux-x64-baseline.node"
-          cmp packages/natives/native/pi_natives.linux-x64-modern.node "$RUNNER_TEMP/relay-native-roundtrip/pi_natives.linux-x64-modern.node"
+      - name: Validate relay using prepared native inputs
+        uses: ./.github/actions/relay-validation
       - name: Retain successful relay cache candidate
         if: success() && steps.cache-pack.outcome == 'success'
         continue-on-error: true

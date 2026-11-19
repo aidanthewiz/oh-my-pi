@@ -21,7 +21,7 @@ Identify skipped checks and environment blockers. Do not mark them as successful
 Update each affected package's `[Unreleased]` changelog for user-facing changes.
 Read back the published pull request description and check only verified items.
 
-Pull request verification uses Bun 1.4.4 in `cf-verify.yml` and `relay.yml`.
+Pull request verification uses Bun 1.4.4 through `cf-verify.yml` and its read-only reusable workflows.
 Release preparation and packaging also use Bun 1.4.4 without changing the embedded binary runtime.
 The release binary compiler and container runtime have separate version contracts.
 Qualify those distributions separately before changing their runtime versions.
@@ -31,9 +31,34 @@ Hosted jobs run complete TypeScript and Rust checks, SDK consumers, synthetic da
 Visual artifacts retain current, historical reference, and peer images; inspection remains a separate evidence requirement.
 Coreforge companion qualification runs in its own repository. Engine qualification needs no companion credentials.
 
+## CI scheduling and required checks
+
+Each native target owns its producer and dependent qualification jobs.
+Linux and Darwin qualification start after their own producer, without waiting for unrelated targets.
+Each platform runs three TypeScript test shards, the complete source/compiled smoke scope, and unchanged Rust qualification.
+Keep shard inputs identical; do not restore independent test-timing histories into shard jobs.
+The Linux producer also supplies all managed consumer lanes and relay validation.
+Relay consumes the immutable same-run artifact ID and verifies source, run, attempt, platform, and file hashes.
+Tagged relay publication remains in `relay.yml`, with its existing cache and publishing permissions.
+
+The stable `required CI` check succeeds only after every required dependency succeeds.
+Missing, skipped, cancelled, or failed dependencies cannot satisfy it.
+Optional cache failures remain separate from required producer and consumer results.
+
+Activate the branch rule in this order:
+
+1. Merge PR #102 through its approved merge path, preserving its immutable broker ancestry.
+2. Merge this scheduling change after exact-head hosted qualification and required review.
+3. Require `required CI` from GitHub Actions in the existing `coreforge` ruleset.
+4. Preserve independent review, latest-push approval, thread resolution, and history protections.
+
+Do not require the new check before its workflow exists on the protected branch.
+Local workflow tests do not replace hosted native, browser, SDK, database, or visual qualification.
+
+
 ## Durable native build caches
 
-The seven Linux/macOS Bazel native jobs in `cf-verify` and `cf-release`, plus relay validation, support private-S3 snapshots.
+The seven Bazel native slots in `cf-verify` and `cf-release`, plus tagged relay validation, support private-S3 snapshots.
 Windows ARM64 and full Rust qualification use Cargo and retain their existing cache ownership.
 No build, test, signing, qualification, or release command is replaced by a cache hit.
 
@@ -75,6 +100,12 @@ Changes to native build commands, signing, matrices, or release admission retain
 Manual four-part recovery tags retain their existing tip, package-version, and roll safeguards.
 Coreforge installers use the exact release and checksums recorded in `engine.lock`.
 Do not use upstream's `bun run release` for this fork's dependency channel.
+
+Before publication, all eight final binaries run `--version` and `--smoke-test` on matching execution platforms.
+Musl binaries use the repository's pinned Alpine runtime image.
+The publisher verifies `release-verification.json` against every binary's actual digest and the same source, run, and attempt.
+Release checksums include that manifest; it is an integrity record, not an independent cryptographic attestation.
+Release builds retain final channel stamping and signing rather than relabeling differently stamped PR binaries.
 
 ## Contribution licensing
 
