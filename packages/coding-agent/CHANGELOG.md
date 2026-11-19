@@ -18,6 +18,7 @@
 
 ### Fixed
 
+- Start peer-reply test deadlines after agent initialization so startup cannot consume the reply window.
 - Complete browser directory uploads only after Chrome finishes file selection, including empty directories and shadow-root inputs.
 - Expose the full registered AWS JSON input schema through `xd://aws/schema`. Require complete schema and `aws-secret-input/v1` capability comparison before authentication or approval. Preserve native session-disposal and cancellation cleanup. Source delivery does not publish an engine or adopt an installed runtime.
 - Require actual native invocation ownership under `native-tool-host/v2` for AWS secret input. Preserve native Agent dispatch and native Write → `xd://aws` with intrinsic cleanup. Reject JavaScript/Python Eval and naked SDK/direct execution before approval UI, provider work, or receiver execution, even through registered wrappers or nested Write calls. Capability discovery does not authorize unsupported paths. Preserve authorized receiver reads and writes, bounded raw output, and normal retention.
