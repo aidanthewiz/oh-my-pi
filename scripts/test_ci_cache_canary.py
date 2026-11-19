@@ -6,6 +6,7 @@ No Bazel compilation, credential checks, network access, or real cache roots
 are used. The canonical loader and package-version reader run unchanged.
 """
 
+import base64
 import contextlib
 import hashlib
 import importlib.util
@@ -25,6 +26,7 @@ SPEC = importlib.util.spec_from_file_location("ci_cache_canary", HELPER)
 canary = importlib.util.module_from_spec(SPEC)
 with patch.object(sys, "path", [str(HELPER.parent), *sys.path]):
     SPEC.loader.exec_module(canary)
+    import ci_cache_probe as probe
 
 
 @unittest.skipUnless(sys.platform in ("linux", "darwin"), "host Node-API fixture supports Linux and macOS")
@@ -178,6 +180,99 @@ napi_value napi_register_module_v1(napi_env env, napi_value exports) {
         self.assertEqual(receipt["source_sha"], self.authority["source_sha"])
         self.assertTrue(receipt["confirmed_s3_miss"])
         self.assertFalse(receipt["restored"])
+
+
+class CanaryTrustProbeTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="ci-cache-trust-test-")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.workflow = f"{probe.cache.REPOSITORY}/.github/workflows/cf-cache-canary.yml@refs/heads/coreforge"
+        self.claims = {
+            "iss": "https://token.actions.githubusercontent.com",
+            "aud": "sts.amazonaws.com",
+            "repository_id": "1291753113",
+            "repository_owner_id": "259898564",
+            "ref": "refs/heads/coreforge",
+            "sub": f"repo:{probe.cache.REPOSITORY}:ref:refs/heads/coreforge",
+        }
+        self.env = {
+            "GITHUB_ACTIONS": "true",
+            "GITHUB_REPOSITORY": probe.cache.REPOSITORY,
+            "GITHUB_EVENT_NAME": "workflow_dispatch",
+            "GITHUB_REF": "refs/heads/coreforge",
+            "GITHUB_WORKFLOW_REF": self.workflow,
+            "GITHUB_SHA": "1" * 40,
+            "GITHUB_RUN_ID": "123",
+            "GITHUB_RUN_ATTEMPT": "1",
+            "CI_CACHE_REGION": "us-gov-west-1",
+            "CI_CACHE_READ_ROLE": "arn:aws-us-gov:iam::800128555654:role/CoreforgeOmpCacheRead",
+            "CI_CACHE_WRITE_ROLE": "arn:aws-us-gov:iam::800128555654:role/CoreforgeOmpCacheWrite",
+            "ACTIONS_ID_TOKEN_REQUEST_URL": "https://example.invalid/oidc",
+            "ACTIONS_ID_TOKEN_REQUEST_TOKEN": "synthetic-request-token",
+            "RUNNER_TEMP": str(self.root),
+        }
+
+    @staticmethod
+    def denied(code="AccessDenied"):
+        return subprocess.CompletedProcess([], 254, "", f"An error occurred ({code}) when calling the AssumeRoleWithWebIdentity operation")
+
+    def run_probe(self, claims, results=None):
+        payload = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
+        response = io.StringIO(json.dumps({"value": f"header.{payload}.signature"}))
+        output, errors = io.StringIO(), io.StringIO()
+        with patch.dict(os.environ, self.env, clear=True), \
+                patch.object(probe.urllib.request, "urlopen", return_value=response), \
+                patch.object(probe.subprocess, "run", side_effect=results or [self.denied(), self.denied()]) as sts, \
+                contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+            result = probe.main()
+        return result, sts.call_count, errors.getvalue()
+
+    def test_direct_canary_workflow_claim_still_requires_both_iam_denials(self):
+        result, calls, errors = self.run_probe({**self.claims, "job_workflow_ref": self.workflow})
+        self.assertEqual(result, 0, errors)
+        self.assertEqual(calls, 2)
+        receipt = json.loads((self.root / "cache-canary-trust-denial.json").read_text())
+        self.assertEqual([row["result"] for row in receipt["roles"]], ["AccessDenied", "AccessDenied"])
+        self.assertEqual(receipt["oidc"]["job_workflow_ref"], self.workflow)
+        self.assertTrue(all(not row["broker_claim_absent"] for row in receipt["roles"]))
+
+    def test_legacy_direct_token_without_workflow_claim_is_supported(self):
+        result, calls, errors = self.run_probe(self.claims)
+        self.assertEqual(result, 0, errors)
+        self.assertEqual(calls, 2)
+
+    def test_trusted_broker_tokens_are_rejected_before_sts(self):
+        for role in ("read", "write"):
+            with self.subTest(role=role):
+                workflow = f"{probe.cache.REPOSITORY}/.github/workflows/cf-cache-{role}.yml@" + "a" * 40
+                result, calls, _ = self.run_probe({**self.claims, "job_workflow_ref": workflow})
+                self.assertEqual(result, 1)
+                self.assertEqual(calls, 0)
+                self.assertFalse((self.root / "cache-canary-trust-denial.json").exists())
+
+    def test_different_or_empty_workflow_claim_is_rejected(self):
+        for workflow in (self.workflow.replace("refs/heads/coreforge", "refs/heads/other"), ""):
+            with self.subTest(workflow=workflow):
+                result, calls, _ = self.run_probe({**self.claims, "job_workflow_ref": workflow})
+                self.assertEqual(result, 1)
+                self.assertEqual(calls, 0)
+
+    def test_successful_role_assumption_cannot_produce_denial_evidence(self):
+        result, _, _ = self.run_probe(self.claims, [subprocess.CompletedProcess([], 0, "{}", "")])
+        self.assertEqual(result, 1)
+        self.assertFalse((self.root / "cache-canary-trust-denial.json").exists())
+
+    def test_denial_of_only_the_first_role_is_insufficient(self):
+        result, calls, _ = self.run_probe(self.claims, [self.denied(), subprocess.CompletedProcess([], 0, "{}", "")])
+        self.assertEqual(result, 1)
+        self.assertEqual(calls, 2)
+        self.assertFalse((self.root / "cache-canary-trust-denial.json").exists())
+
+    def test_invalid_identity_token_is_not_an_iam_denial(self):
+        result, _, _ = self.run_probe(self.claims, [self.denied("InvalidIdentityToken")])
+        self.assertEqual(result, 1)
+        self.assertFalse((self.root / "cache-canary-trust-denial.json").exists())
 
 
 if __name__ == "__main__":

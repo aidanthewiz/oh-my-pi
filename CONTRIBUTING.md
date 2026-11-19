@@ -96,6 +96,9 @@ The existing governed infrastructure workspace owns [the bucket, IAM roles, and 
 AWS trust uses exact immutable `job_workflow_ref` conditions directly; the repository's default OIDC subject and existing relay/cosign authentication remain unchanged.
 Keep `CI_CACHE_ENABLED=false` until governed apply, protected source adoption, and the non-releasing `cf-cache-canary` cold/save/warm proof succeed.
 
+The negative OIDC probe accepts a missing `job_workflow_ref` or this direct canary workflow, never another workflow identity.
+Both cache roles must still reject its real token with IAM `AccessDenied`; other errors cannot satisfy the probe.
+
 Run `python3 -m unittest discover -s scripts -p 'test_ci_cache*.py'` for cache and real broker-guard boundaries.
 Local qualification exercised a real Bazel 9.2.0 C build with isolated output bases and a loopback repository download.
 Warm restore produced a disk-cache hit with repository downloads disabled; changed inputs rebuilt correctly, and a miss ran a real cold build.
