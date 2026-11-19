@@ -128,8 +128,7 @@ jobs:
       - name: Install Linux qualification dependencies
         if: runner.os == 'Linux'
         run: |
-          sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends ninja-build pkg-config cmake libclang-dev libasound2-dev libudev-dev libssl-dev python3 redis-server bubblewrap lsof
+          bash scripts/ci-install-ubuntu-packages.sh ninja-build pkg-config cmake libclang-dev libasound2-dev libudev-dev libssl-dev python3 redis-server bubblewrap lsof
           if [[ "${{ matrix.scope }}" == typescript-* ]]; then
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi

@@ -2637,12 +2637,22 @@ mod tests {
 		w.write_all(&[5u8; 26]).unwrap();
 		thread::sleep(Duration::from_millis(30));
 		assert!(sink.take().is_empty(), "buffered data is not written outside a pass");
-		w.output_pass(true).unwrap();
-		thread::sleep(Duration::from_millis(30));
-		assert_eq!(sink.take().len(), 10);
-		w.output_pass(true).unwrap();
-		thread::sleep(Duration::from_millis(30));
-		assert_eq!(sink.take().len(), 10);
+		for _ in 0..2 {
+			let before = lock(&w.shared.out.state).attempts;
+			w.output_pass(true).unwrap();
+			// A descheduled write may finish after the pass's bounded wait.
+			let (state, _) = w
+				.shared
+				.out
+				.cond
+				.wait_timeout_while(lock(&w.shared.out.state), Duration::from_secs(5), |state| {
+					state.attempts <= before && state.failed.is_none()
+				})
+				.unwrap_or_else(PoisonError::into_inner);
+			assert!(state.attempts > before, "output write did not complete: {:?}", state.failed);
+			drop(state);
+			assert_eq!(sink.take().len(), 10);
+		}
 		w.flush().unwrap();
 		assert_eq!(sink.take().len(), 10);
 	}

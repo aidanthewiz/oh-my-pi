@@ -70,8 +70,7 @@ jobs:
         run: bun scripts/ci-qualification-engine.ts verify-inputs linux-x64 "$SOURCE_SHA"
       - name: Install isolated fixture tools
         run: |
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends -y bubblewrap python3-venv procps fonts-dejavu-core
+          bash scripts/ci-install-ubuntu-packages.sh bubblewrap python3-venv procps fonts-dejavu-core
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           test -x /usr/bin/google-chrome
           /usr/bin/google-chrome --version
@@ -146,7 +145,8 @@ jobs:
         with:
           name: qualification-runtime-domains-compiled
           path: ${{ runner.temp }}/domain-inputs/compiled
-      - run: sudo apt-get update && sudo apt-get install --no-install-recommends -y fonts-dejavu-core
+      - name: Install raster fonts
+        run: bash scripts/ci-install-ubuntu-packages.sh fonts-dejavu-core
       - name: Produce current and peer raster evidence
         env:
           CF_QUAL_SOURCE_SHA: ${{ inputs.source-sha }}

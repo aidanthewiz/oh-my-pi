@@ -222,8 +222,7 @@ jobs:
           CARGO_BUILD_JOBS: "2"
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends \
+          bash scripts/ci-install-ubuntu-packages.sh \
             libacl1-dev libattr1-dev libxxhash-dev libzstd-dev liblz4-dev libssl-dev libidn2-dev
           work="$(mktemp -d "$RUNNER_TEMP/rsync-reference.XXXXXX")"
           trap 'rm -rf -- "$work"' EXIT
