@@ -18,7 +18,7 @@ concurrency:
 
 jobs:
   prepare:
-    name: classify native inputs
+    name: Source checks and native inputs
     if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-24.04
     outputs:
@@ -76,6 +76,7 @@ jobs:
           fi
 
   cache_restore:
+    name: Restore build caches
     needs: prepare
     if: vars.CI_CACHE_ENABLED == 'true' && needs.prepare.outputs.native_changed == 'true'
     uses: Coreforce-CAD/oh-my-pi/.github/workflows/cf-cache-read.yml@c4d074b6ef60c229874d0fda96740cd71877f94c
@@ -87,68 +88,149 @@ jobs:
       actions: read
       id-token: write
 
-  build:
-    name: native / ${{ matrix.target }}
+  darwin_arm64:
+    name: macOS ARM64
     needs: [prepare, cache_restore]
     if: ${{ !cancelled() && needs.prepare.result == 'success' }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: darwin-arm64
-            os: xcode-27
-            binary: omp-darwin-arm64
-            native_targets: darwin-arm64
-            qualification_os: xcode-27
-          - target: darwin-x64
-            os: macos-15-intel
-            binary: omp-darwin-x64
-            native_targets: darwin-x64-baseline
-          - target: linux-x64
-            os: ubuntu-22.04
-            binary: omp-linux-x64
-            native_targets: "linux-x64-baseline linux-x64-modern"
-            qualification_os: ubuntu-24.04
-          - target: linux-arm64
-            os: ubuntu-24.04-arm
-            binary: omp-linux-arm64
-            native_targets: linux-arm64
-          - target: linux-musl-x64
-            os: ubuntu-22.04
-            cross: "1"
-            binary: omp-linux-musl-x64
-            native_targets: linux-musl-x64-baseline
-          - target: linux-musl-arm64
-            os: ubuntu-24.04-arm
-            cross: "1"
-            binary: omp-linux-musl-arm64
-            native_targets: linux-musl-arm64
-          - target: win32-x64
-            os: ubuntu-24.04
-            cross: "1"
-            binary: omp-windows-x64.exe
-            native_targets: win32-x64-baseline
-          - target: win32-arm64
-            os: windows-11-arm
-            windows: "1"
-            binary: omp-windows-arm64.exe
     uses: ./.github/workflows/cf-verify-target.yml
     with:
       source-sha: ${{ github.event.pull_request.head.sha }}
       native-changed: ${{ needs.prepare.outputs.native_changed == 'true' }}
       release-tag: ${{ needs.prepare.outputs.release_tag }}
-      target: ${{ matrix.target }}
-      runner: ${{ matrix.os }}
-      binary: ${{ matrix.binary }}
-      native-targets: ${{ matrix.native_targets || '' }}
-      cross: ${{ matrix.cross == '1' }}
-      windows: ${{ matrix.windows == '1' }}
-      qualification-runner: ${{ matrix.qualification_os || '' }}
+      target: darwin-arm64
+      runner: xcode-27
+      binary: omp-darwin-arm64
+      native-targets: darwin-arm64
+      qualification-runner: xcode-27
+    permissions:
+      contents: read
+      actions: read
+
+  darwin_x64:
+    name: macOS x64
+    needs: [prepare, cache_restore]
+    if: ${{ !cancelled() && needs.prepare.result == 'success' }}
+    uses: ./.github/workflows/cf-verify-target.yml
+    with:
+      source-sha: ${{ github.event.pull_request.head.sha }}
+      native-changed: ${{ needs.prepare.outputs.native_changed == 'true' }}
+      release-tag: ${{ needs.prepare.outputs.release_tag }}
+      target: darwin-x64
+      runner: macos-15-intel
+      binary: omp-darwin-x64
+      native-targets: darwin-x64-baseline
+    permissions:
+      contents: read
+      actions: read
+
+  linux_x64:
+    name: Linux x64
+    needs: [prepare, cache_restore]
+    if: ${{ !cancelled() && needs.prepare.result == 'success' }}
+    uses: ./.github/workflows/cf-verify-target.yml
+    with:
+      source-sha: ${{ github.event.pull_request.head.sha }}
+      native-changed: ${{ needs.prepare.outputs.native_changed == 'true' }}
+      release-tag: ${{ needs.prepare.outputs.release_tag }}
+      target: linux-x64
+      runner: ubuntu-22.04
+      binary: omp-linux-x64
+      native-targets: linux-x64-baseline linux-x64-modern
+      qualification-runner: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
+
+  linux_arm64:
+    name: Linux ARM64
+    needs: [prepare, cache_restore]
+    if: ${{ !cancelled() && needs.prepare.result == 'success' }}
+    uses: ./.github/workflows/cf-verify-target.yml
+    with:
+      source-sha: ${{ github.event.pull_request.head.sha }}
+      native-changed: ${{ needs.prepare.outputs.native_changed == 'true' }}
+      release-tag: ${{ needs.prepare.outputs.release_tag }}
+      target: linux-arm64
+      runner: ubuntu-24.04-arm
+      binary: omp-linux-arm64
+      native-targets: linux-arm64
+    permissions:
+      contents: read
+      actions: read
+
+  linux_musl_x64:
+    name: Linux musl x64
+    needs: [prepare, cache_restore]
+    if: ${{ !cancelled() && needs.prepare.result == 'success' }}
+    uses: ./.github/workflows/cf-verify-target.yml
+    with:
+      source-sha: ${{ github.event.pull_request.head.sha }}
+      native-changed: ${{ needs.prepare.outputs.native_changed == 'true' }}
+      release-tag: ${{ needs.prepare.outputs.release_tag }}
+      target: linux-musl-x64
+      runner: ubuntu-22.04
+      binary: omp-linux-musl-x64
+      native-targets: linux-musl-x64-baseline
+      cross: true
+    permissions:
+      contents: read
+      actions: read
+
+  linux_musl_arm64:
+    name: Linux musl ARM64
+    needs: [prepare, cache_restore]
+    if: ${{ !cancelled() && needs.prepare.result == 'success' }}
+    uses: ./.github/workflows/cf-verify-target.yml
+    with:
+      source-sha: ${{ github.event.pull_request.head.sha }}
+      native-changed: ${{ needs.prepare.outputs.native_changed == 'true' }}
+      release-tag: ${{ needs.prepare.outputs.release_tag }}
+      target: linux-musl-arm64
+      runner: ubuntu-24.04-arm
+      binary: omp-linux-musl-arm64
+      native-targets: linux-musl-arm64
+      cross: true
+    permissions:
+      contents: read
+      actions: read
+
+  win32_x64:
+    name: Windows x64
+    needs: [prepare, cache_restore]
+    if: ${{ !cancelled() && needs.prepare.result == 'success' }}
+    uses: ./.github/workflows/cf-verify-target.yml
+    with:
+      source-sha: ${{ github.event.pull_request.head.sha }}
+      native-changed: ${{ needs.prepare.outputs.native_changed == 'true' }}
+      release-tag: ${{ needs.prepare.outputs.release_tag }}
+      target: win32-x64
+      runner: ubuntu-24.04
+      binary: omp-windows-x64.exe
+      native-targets: win32-x64-baseline
+      cross: true
+    permissions:
+      contents: read
+      actions: read
+
+  win32_arm64:
+    name: Windows ARM64
+    needs: [prepare, cache_restore]
+    if: ${{ !cancelled() && needs.prepare.result == 'success' }}
+    uses: ./.github/workflows/cf-verify-target.yml
+    with:
+      source-sha: ${{ github.event.pull_request.head.sha }}
+      native-changed: ${{ needs.prepare.outputs.native_changed == 'true' }}
+      release-tag: ${{ needs.prepare.outputs.release_tag }}
+      target: win32-arm64
+      runner: windows-11-arm
+      binary: omp-windows-arm64.exe
+      windows: true
     permissions:
       contents: read
       actions: read
 
   browser_relay:
+    name: Build browser extension
     if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-24.04
     steps:
@@ -167,7 +249,7 @@ jobs:
 
   required:
     name: required CI
-    needs: [prepare, build, browser_relay]
+    needs: [prepare, darwin_arm64, darwin_x64, linux_x64, linux_arm64, linux_musl_x64, linux_musl_arm64, win32_x64, win32_arm64, browser_relay]
     if: always()
     runs-on: ubuntu-24.04
     permissions:
@@ -180,4 +262,7 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha }}
           persist-credentials: false
       - name: Require every CI dependency
-        run: python3 scripts/ci-required.py prepare build browser_relay
+        run: |
+          python3 scripts/ci-required.py prepare \
+            darwin_arm64 darwin_x64 linux_x64 linux_arm64 \
+            linux_musl_x64 linux_musl_arm64 win32_x64 win32_arm64 browser_relay

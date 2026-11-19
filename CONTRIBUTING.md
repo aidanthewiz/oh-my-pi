@@ -33,9 +33,9 @@ Coreforge companion qualification runs in its own repository. Engine qualificati
 
 ## CI scheduling and required checks
 
-Each native target owns its producer and dependent qualification jobs.
-Linux and Darwin qualification start after their own producer, without waiting for unrelated targets.
-Each platform runs three TypeScript test shards, the complete source/compiled smoke scope, and unchanged Rust qualification.
+Each of the eight native targets has its own named Actions group for build and platform-specific checks.
+Linux x64 and macOS ARM64 qualification start after their own producer, without waiting for unrelated targets.
+Their `Full engine` subgroup contains three TypeScript shards, source/compiled smoke checks, and unchanged Rust workspace qualification.
 Keep shard inputs identical; do not restore independent test-timing histories into shard jobs.
 TypeScript shards restore the existing shared toolchain cache; only the smoke lane saves it.
 The Linux producer also supplies all managed consumer lanes and relay validation.
