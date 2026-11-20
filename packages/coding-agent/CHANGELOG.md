@@ -19,7 +19,7 @@
 ### Fixed
 
 - Synchronize shell job-control fixtures with actual shell startup before starting their signal delays.
-- Query terminated job state explicitly in PTY fixtures when zsh defers asynchronous notifications, without resuming stopped jobs.
+- Query terminated job state without status filters in PTY fixtures when zsh defers asynchronous notifications, without resuming stopped jobs.
 - Synchronize lifecycle fixtures with actual approval presentation, retained consumer output, and SIGTERM-handler readiness without relaxing their assertions or timeouts.
 - Wait for native IPC disconnect delivery before testing broker recovery after its runtime directory disappears.
 - Reuse validated native embedding inputs across compiled secret-input test workers without changing their runtime checks or deadlines.

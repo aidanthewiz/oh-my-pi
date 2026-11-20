@@ -220,15 +220,15 @@ fn a_suspended_loop_takes_the_rest_of_the_loop_with_it() -> io::Result<()> {
 		]);
 		line(pty, "kill -9 %1")?;
 		line(pty, "echo done")?;
-		// `jobs` refreshes child state even when zsh defers its asynchronous
-		// notice. Unlike `wait`, it does not resume a stopped compound job.
+		// `jobs -r` filters a stopped superjob before printing its terminated
+		// subjob. Unfiltered `jobs` reports both without resuming either.
 		let deadline = Instant::now() + TIMEOUT;
 		while !pty.output().contains("killed") {
 			let remaining = deadline.saturating_duration_since(Instant::now());
 			if remaining.is_zero() {
 				break;
 			}
-			line(pty, "jobs -r")?;
+			line(pty, "jobs")?;
 			pty.settle(Duration::from_millis(100).min(remaining), remaining)?;
 		}
 		pty.read_until("killed", Duration::ZERO)?;
