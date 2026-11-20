@@ -62,6 +62,7 @@ Activate the branch rule in this order:
 4. Preserve independent review, latest-push approval, thread resolution, and history protections.
 
 Do not require the new check before its workflow exists on the protected branch.
+Check workflow edits locally with Actionlint and ShellCheck. Pinned toolchain lookups must succeed before compilation.
 Local workflow tests do not replace hosted native, browser, SDK, database, or visual qualification.
 
 

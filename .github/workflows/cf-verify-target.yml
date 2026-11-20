@@ -260,18 +260,19 @@ jobs:
               for (let i = start + 1; i < lines.length && /^\s/.test(lines[i]); i++) {
                 for (const value of lines[i].trim().split(/\s+/)) values.add(value);
               }
-              for (const value of required) assert(values.has(value), `${header} ${value}`);
+              for (const value of required) assert(values.has(value), header + " " + value);
             }
             for (const feature of ["ACLs", "xattrs", "iconv"]) {
-              assert(text.includes(feature) && !text.includes(`no ${feature}`), feature);
+              assert(text.includes(feature) && !text.includes("no " + feature), feature);
             }
           ' "$work/version.txt"
           channel="$(bun -e 'console.log(Bun.TOML.parse(await Bun.file("rust-toolchain.toml").text()).toolchain.channel)')"
           rustup toolchain install "$channel" --profile minimal --no-self-update
           export RUSTUP_TOOLCHAIN="$channel" RUSTUP_AUTO_INSTALL=0
           export CARGO_TARGET_DIR="$PWD/target"
-          export RUSTC="$(rustup which --toolchain "$channel" rustc)"
-          export RUSTDOC="$(rustup which --toolchain "$channel" rustdoc)"
+          RUSTC="$(rustup which --toolchain "$channel" rustc)"
+          RUSTDOC="$(rustup which --toolchain "$channel" rustdoc)"
+          export RUSTC RUSTDOC
           cargo="$(rustup which --toolchain "$channel" cargo)"
           unset RSYNC_CONFORMANCE_FILTER
           "$cargo" test --locked --profile ci --target x86_64-unknown-linux-gnu -p pi-builtins --lib -- --test-threads=2 --nocapture
