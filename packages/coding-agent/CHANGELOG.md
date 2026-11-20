@@ -5,6 +5,8 @@
 ### Changed
 
 - Sync upstream v18.22.2 while retaining Coreforce model, account, approval, and resource-ownership policies.
+- Preserve user outcomes, acceptance criteria, and authorization limits in delegated work; keep multi-area research aligned with the full requested scope.
+- Limit clarification questions to necessary current decisions and document native AWS parameter naming, output controls, and batching boundaries.
 
 ### Added
 

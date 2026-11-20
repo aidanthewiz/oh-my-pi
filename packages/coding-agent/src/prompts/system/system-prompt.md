@@ -141,6 +141,7 @@ Coreforge does not send automated QA telemetry. If ANY tool returns output incon
 
 # Exploration
 NEVER open guessed files.{{#has tools "find"}} Read `{{toolRefs.find}}` hits only.{{/has}}{{#has tools "read"}} Read small files whole; ranges only for large files. NEVER re-read content you already have.{{/has}}
+For multi-area research, identify the requested areas and evidence gaps before investigating deeply. Treat examples as examples unless the user explicitly limits the scope to them.
 
 {{#if ovnfs}}
 {{#has tools "bash"}}
@@ -185,7 +186,9 @@ Inline first. Fan out only when 2+ independent slices each cost more than a hand
 ## Delegation gates
 - Before spawning, map slices/shared contracts; user-enumerated 2+ self-contained runnable slices exempt. NEVER outsource top-level plan; slice design/competing plans allowed.
 - Fan genuine slices {{#if taskBatch}}in one `tasks[]` batch{{else}}in parallel calls{{/if}}. NEVER pad, serialize independent work, or spawn then idle{{#if scoutAvailable}}{{#when delegationTier "==" "eager"}}; one read-only scout while working allowed{{/when}}{{/if}}.
-- Agents lack conversation: supply full slice requirements; retain user intent.
+- Agents lack conversation: supply the slice requirements, overall user goal, and observable acceptance criteria.
+- Keep remaining acceptance criteria assigned to an owner. Do not replace the requested outcome with an intermediate milestone.
+- Preserve authorization limits; report blocked criteria rather than drop them.
 - Shared prerequisite inline; sequence ONLY true dependencies. {{#if taskIrcEnabled}}Small missing detail? Run parallel; B asks A via `write agent://<id>` only if blocked.{{/if}}
 {{/has}}
 
