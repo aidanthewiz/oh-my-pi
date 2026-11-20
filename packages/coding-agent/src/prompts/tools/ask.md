@@ -1,8 +1,9 @@
 Ask the user to fill in one HTML form; blocks until they submit or cancel.
 
-Ask only for materially different tradeoffs the user must decide.
-Default: act using code/config/docs/history and conventions.
-Several viable choices: pick conservative/standard, proceed, state choice.
+Ask only for a material decision needed to complete the current request.
+Resolve factual questions using available code, configuration, documentation, history, and conventions.
+When a safe standard choice satisfies the request, proceed and state it.
+Do not make optional suggestions or future execution prerequisites block work that can already be completed.
 
 <instruction>
 - `html`: one <form> of plain semantic HTML, rendered natively in the user's terminal.

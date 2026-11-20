@@ -4,6 +4,10 @@ Provide an explicit profile, service, operation, and structured parameters. Supp
 
 Use AWS CLI operation names such as `get-caller-identity`, not managed MCP's Smithy PascalCase names.
 
+Use API parameter names inside `parameters`, such as `RoleName`, not dashed CLI flags such as `role-name`. Do not supply CLI query/output controls; the native route controls output projection.
+
+Follow each operation's documented batching constraints. For example, `describe-service-revisions` requires revision IDs from one ECS service. Use separate calls for different ECS services; independent calls may run concurrently.
+
 For ordinary AWS requests, an authentication failure can offer one approved sign-in and retry the original operation once. Later credential expiry can renew authentication again. A declined or failed sign-in pauses automatic recovery for that SSO group. Without an interactive surface, the tool returns an explicit login command. Do not add automatic sign-in loops. Use `service: "sso", operation: "login"` only for a user-requested sign-in, including retries after an earlier decline, failure, or completed login. Secret-input requests never sign in or retry automatically.
 
 Read calls are identified through AWS's public service authorization reference. Missing mappings and known stateful IAM reads, including SQS consumption, workload invocation, and credential issuance, require approval. Read-only queries can still incur charges.
