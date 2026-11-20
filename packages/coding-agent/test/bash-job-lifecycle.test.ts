@@ -54,11 +54,13 @@ it.skipIf(process.platform === "win32")(
 		await ready.promise;
 		const id = result.details?.async?.jobId;
 		if (!id) throw new Error("expected background job");
+		const cleanedPath = path.join(cwd, "cleaned");
 		const watchAbort = new AbortController();
 		const watcher = fs.watch(cwd, { signal: watchAbort.signal });
 		const cleaned = (async () => {
 			for await (const event of watcher) {
-				if (event.filename === "cleaned") return true;
+				// File creation can precede the trap's write.
+				if (event.filename === "cleaned" && (await fs.stat(cleanedPath)).size > 0) return true;
 			}
 			return false;
 		})();
@@ -70,7 +72,7 @@ it.skipIf(process.platform === "win32")(
 			expect(cancelled.details?.proc).toMatchObject({ cancelled: [{ id, status: "cancelled" }] });
 			await manager.waitForAll();
 			expect(await Promise.race([cleaned, deadline.promise])).toBe(true);
-			expect(await Bun.file(path.join(cwd, "cleaned")).text()).toBe("cleaned");
+			expect(await Bun.file(cleanedPath).text()).toBe("cleaned");
 		} finally {
 			clearTimeout(watchdog);
 			watchAbort.abort();

@@ -451,6 +451,31 @@ return { errors, dropped: await tab.evaluate(() => window.dropped.map(file => fi
 		}
 	}, 60_000);
 
+	test("settles empty and populated folder selections when delegated change handlers stop propagation", async () => {
+		const { run, close } = await openConnectedTab("browser-upload-folder-empty", { proxy: routeProxy("paths") });
+		try {
+			await fs.mkdir(path.join(tempDir, "empty-selection-album"), { recursive: true });
+			const folder = path.join(tempDir, "populated-selection-album");
+			await fs.mkdir(path.join(folder, "nested"), { recursive: true });
+			await Bun.write(path.join(folder, "nested", "after-empty.txt"), "after empty");
+			const received = await run(`
+await tab.evaluate(() => document.addEventListener("change", event => event.stopPropagation(), true));
+await tab.uploadFile("#folder", "empty-selection-album");
+const empty = await tab.evaluate(() => [...document.querySelector("#folder").files].map(file => file.name));
+await tab.uploadFile("#folder", "populated-selection-album");
+const populated = await tab.evaluate(() => Promise.all(
+	[...document.querySelector("#folder").files].map(async file => [file.webkitRelativePath, await file.text()]),
+));
+return { empty, populated };`);
+			expect(received).toEqual({
+				empty: [],
+				populated: [["populated-selection-album/nested/after-empty.txt", "after empty"]],
+			});
+		} finally {
+			await close();
+		}
+	}, 60_000);
+
 	test("refuses a folder by name where the browser takes only contents", async () => {
 		const { run, close } = await openConnectedTab("browser-upload-folder-contents", {
 			proxy: routeProxy("contents"),

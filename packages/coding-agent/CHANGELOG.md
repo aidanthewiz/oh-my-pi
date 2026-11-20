@@ -81,6 +81,13 @@
 - Reject legacy OAuth metadata that contradicts the protected resource captured from an exact challenge.
 - Keep cache replay admission bound to its storage session when a provider session override is active.
 - Wait for owned post-turn work and controller events before scheduling a goal continuation.
+- Test relay call-budget exhaustion after real worker readiness without consuming its initialization budget.
+- Wait for the cancellation trap's file content, not its creation event, before checking Bash cleanup.
+- Synchronize rsync output-pass tests with completed writes instead of worker-thread scheduling.
+- Provision CI packages before native compilation and use bounded, signature-verified Ubuntu repository failover.
+- Let targeted CI reruns reuse verified same-run producer inputs and replace only their own qualification reports.
+- Start peer-reply test deadlines after agent initialization so startup cannot consume the reply window.
+- Complete browser directory uploads only after Chrome finishes file selection, including empty directories and shadow-root inputs.
 - Expose the full registered AWS JSON input schema through `xd://aws/schema`. Require complete schema and `aws-secret-input/v1` capability comparison before authentication or approval. Preserve native session-disposal and cancellation cleanup. Source delivery does not publish an engine or adopt an installed runtime.
 - Require actual native invocation ownership under `native-tool-host/v2` for AWS secret input. Preserve native Agent dispatch and native Write → `xd://aws` with intrinsic cleanup. Reject JavaScript/Python Eval and naked SDK/direct execution before approval UI, provider work, or receiver execution, even through registered wrappers or nested Write calls. Capability discovery does not authorize unsupported paths. Preserve authorized receiver reads and writes, bounded raw output, and normal retention.
 - Accept copied hashline Write paths and content, inner intent fields, and both active and mounted AWS presentations. Preserve exact normalized input and live native invocation ownership.

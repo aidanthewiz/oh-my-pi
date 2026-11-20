@@ -1,0 +1,229 @@
+name: cf-cache-canary
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cf-cache-canary
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      canary-id: ${{ steps.source.outputs.canary-id }}
+      source-sha: ${{ steps.source.outputs.source-sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Require protected non-releasing source and explicit cache inputs
+        id: source
+        env:
+          CI_CACHE_BUCKET: ${{ vars.CI_CACHE_BUCKET }}
+          CI_CACHE_REGION: ${{ vars.CI_CACHE_REGION }}
+          CI_CACHE_PREFIX: ${{ vars.CI_CACHE_PREFIX }}
+          CI_CACHE_READ_ROLE: ${{ vars.CI_CACHE_READ_ROLE }}
+          CI_CACHE_WRITE_ROLE: ${{ vars.CI_CACHE_WRITE_ROLE }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = Coreforce-CAD/oh-my-pi
+          test "$GITHUB_EVENT_NAME" = workflow_dispatch
+          test "$GITHUB_REF" = refs/heads/coreforge
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -n "$CI_CACHE_BUCKET"
+          test "$CI_CACHE_REGION" = us-gov-west-1
+          test -n "$CI_CACHE_PREFIX"
+          test -n "$CI_CACHE_READ_ROLE"
+          test -n "$CI_CACHE_WRITE_ROLE"
+          echo "canary-id=probe-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+          echo "source-sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+
+  authority-probes:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      CI_CACHE_REGION: ${{ vars.CI_CACHE_REGION }}
+      CI_CACHE_READ_ROLE: ${{ vars.CI_CACHE_READ_ROLE }}
+      CI_CACHE_WRITE_ROLE: ${{ vars.CI_CACHE_WRITE_ROLE }}
+      AWS_EC2_METADATA_DISABLED: "true"
+      AWS_CONFIG_FILE: /dev/null
+      AWS_SHARED_CREDENTIALS_FILE: /dev/null
+      AWS_IGNORE_CONFIGURED_ENDPOINT_URLS: "true"
+      AWS_ENDPOINT_URL: ""
+      AWS_ENDPOINT_URL_STS: ""
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.source-sha }}
+          persist-credentials: false
+      - name: Prove both roles reject a real non-broker OIDC token
+        run: python3 scripts/ci_cache_probe.py
+      - name: Retain nonsecret trust-denial evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cache-canary-trust-denial
+          path: ${{ runner.temp }}/cache-canary-trust-denial.json
+          if-no-files-found: error
+          retention-days: 2
+
+  read-cold:
+    needs: prepare
+    uses: Coreforce-CAD/oh-my-pi/.github/workflows/cf-cache-read.yml@c4d074b6ef60c229874d0fda96740cd71877f94c
+    with:
+      enabled: true
+      slots: '["linux-x64-ubuntu-22.04"]'
+      canary-id: ${{ needs.prepare.outputs.canary-id }}
+      transfer: cold
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+
+  cold-build:
+    name: cold-build
+    needs: [prepare, read-cold, authority-probes]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    env:
+      CARGO_BUILD_JOBS: "2"
+      AWS_EC2_METADATA_DISABLED: "true"
+      AWS_CONFIG_FILE: /dev/null
+      AWS_SHARED_CREDENTIALS_FILE: /dev/null
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.source-sha }}
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: "1.4.4"
+      - name: Isolate the credential-free build home
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/cache-canary-home" "$RUNNER_TEMP/cache-canary-cargo"
+          chmod 700 "$RUNNER_TEMP/cache-canary-home" "$RUNNER_TEMP/cache-canary-cargo"
+          echo "HOME=$RUNNER_TEMP/cache-canary-home" >> "$GITHUB_ENV"
+          echo "CARGO_HOME=$RUNNER_TEMP/cache-canary-cargo" >> "$GITHUB_ENV"
+      - name: Reclaim unused hosted tools for the existing native target
+        run: sudo rm -rf /usr/local/lib/android /opt/hostedtoolcache/CodeQL
+      - run: bun install --frozen-lockfile
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: cache-restore-canary-cold-linux-x64-ubuntu-22.04
+          path: ${{ runner.temp }}/cache-restore
+      - name: Compile and load the real native addon from a confirmed S3 miss
+        run: |
+          set -euo pipefail
+          if [ "$(ulimit -Sn)" != unlimited ] && [ "$(ulimit -Sn)" -lt 65536 ]; then ulimit -Sn 65536 || true; fi
+          python3 scripts/ci_cache_canary.py cold --snapshot "$RUNNER_TEMP/cache-restore"
+      - name: Transfer the inert successful cache candidate
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: snapshot-linux-x64-ubuntu-22.04
+          path: ${{ runner.temp }}/cache-snapshot
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+      - name: Retain cold consumer evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cache-canary-cold-consumer
+          path: |
+            ${{ runner.temp }}/cache-canary-cold.json
+            ${{ runner.temp }}/cache-canary-build.log
+          if-no-files-found: error
+          retention-days: 2
+
+  save-cold:
+    needs: [prepare, cold-build]
+    uses: Coreforce-CAD/oh-my-pi/.github/workflows/cf-cache-write.yml@c4d074b6ef60c229874d0fda96740cd71877f94c
+    with:
+      enabled: true
+      source-sha: ${{ needs.prepare.outputs.source-sha }}
+      expected-workflow: cf-cache-canary
+      build-result: ${{ needs.cold-build.result }}
+      canary-id: ${{ needs.prepare.outputs.canary-id }}
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+
+  read-warm:
+    needs: [prepare, save-cold]
+    uses: Coreforce-CAD/oh-my-pi/.github/workflows/cf-cache-read.yml@c4d074b6ef60c229874d0fda96740cd71877f94c
+    with:
+      enabled: true
+      slots: '["linux-x64-ubuntu-22.04"]'
+      canary-id: ${{ needs.prepare.outputs.canary-id }}
+      transfer: warm
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+
+  warm-build:
+    name: warm-build
+    needs: [prepare, cold-build, save-cold, read-warm, authority-probes]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    env:
+      CARGO_BUILD_JOBS: "2"
+      AWS_EC2_METADATA_DISABLED: "true"
+      AWS_CONFIG_FILE: /dev/null
+      AWS_SHARED_CREDENTIALS_FILE: /dev/null
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.source-sha }}
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: "1.4.4"
+      - name: Isolate the credential-free build home
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/cache-canary-home" "$RUNNER_TEMP/cache-canary-cargo"
+          chmod 700 "$RUNNER_TEMP/cache-canary-home" "$RUNNER_TEMP/cache-canary-cargo"
+          echo "HOME=$RUNNER_TEMP/cache-canary-home" >> "$GITHUB_ENV"
+          echo "CARGO_HOME=$RUNNER_TEMP/cache-canary-cargo" >> "$GITHUB_ENV"
+      - name: Reclaim unused hosted tools for the existing native target
+        run: sudo rm -rf /usr/local/lib/android /opt/hostedtoolcache/CodeQL
+      - run: bun install --frozen-lockfile
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: cache-restore-canary-warm-linux-x64-ubuntu-22.04
+          path: ${{ runner.temp }}/cache-restore
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: cache-canary-cold-consumer
+          path: ${{ runner.temp }}/cold-consumer
+      - name: Consume real S3 actions and downloads in a separate native build
+        run: |
+          set -euo pipefail
+          if [ "$(ulimit -Sn)" != unlimited ] && [ "$(ulimit -Sn)" -lt 65536 ]; then ulimit -Sn 65536 || true; fi
+          python3 scripts/ci_cache_canary.py warm --snapshot "$RUNNER_TEMP/cache-restore" \
+            --cold-receipt "$RUNNER_TEMP/cold-consumer/cache-canary-cold.json"
+      - name: Retain warm consumer evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cache-canary-warm-consumer
+          path: |
+            ${{ runner.temp }}/cache-canary-warm.json
+            ${{ runner.temp }}/cache-canary-build.log
+          if-no-files-found: error
+          retention-days: 2

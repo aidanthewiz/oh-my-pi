@@ -347,27 +347,34 @@ describe("native IPC", () => {
 		const script = `
 			const { IpcConnection } = require(${JSON.stringify(nativeModule)});
 			IpcConnection.connect(${JSON.stringify(endpoint)}, { framing: "lines" }).then(connection => {
-				connection.start(() => {}, () => {});
-				connection.unref();
-				console.log("connected");
+				connection.start(() => {
+					connection.unref();
+					console.log("connected");
+				}, () => {});
 			});
 		`;
 		const child = Bun.spawn([process.execPath, "-e", script], { stdout: "pipe", stderr: "inherit" });
-		try {
-			// Booting the child loads the native addon, which takes seconds on a loaded
-			// machine; only a child that never connects at all fails here.
-			const connection = await Promise.race([accepted, Bun.sleep(45_000).then(() => undefined)]);
-			if (!connection) throw new Error("the child never connected");
-			const peer = record(connection);
-			// Real time is the subject from here: a leaked loop ref means the child
-			// never exits, so the only observable failure is the deadline expiring.
-			const deadline = Bun.sleep(10_000).then(() => "timeout" as const);
-			expect(await Promise.race([child.exited, deadline])).toBe(0);
-			expect(await new Response(child.stdout).text()).toContain("connected");
-			expect(await Promise.race([peer.closed.then(() => "closed" as const), deadline])).toBe("closed");
-			expect(peer.reason).toBeNull();
-		} finally {
-			child.kill();
-		}
+		const stdout = new Response(child.stdout).text();
+		cleanups.push(async () => {
+			if (child.exitCode === null) child.kill();
+			await Promise.all([child.exited, stdout]);
+		});
+		const connection = await Promise.race([
+			accepted,
+			child.exited.then(code => {
+				throw new Error(`IPC client exited with ${code} before server acceptance`);
+			}),
+			Bun.sleep(45_000).then(() => {
+				throw new Error("the child never connected");
+			}),
+		]);
+		const peer = record(connection);
+		expect(connection.send("unref")).toBe(true);
+		// Real time is the subject here: a leaked loop ref means the child never exits.
+		const deadline = Bun.sleep(10_000).then(() => "timeout" as const);
+		expect(await Promise.race([child.exited, deadline])).toBe(0);
+		expect(await stdout).toContain("connected");
+		expect(await Promise.race([peer.closed.then(() => "closed" as const), deadline])).toBe("closed");
+		expect(peer.reason).toBeNull();
 	}, 60_000);
 });

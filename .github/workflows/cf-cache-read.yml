@@ -1,0 +1,163 @@
+name: cf-cache-read
+
+on:
+  workflow_call:
+    inputs:
+      slots:
+        description: JSON array of Bazel cache slots
+        required: true
+        type: string
+      enabled:
+        description: Owner-controlled cache enablement
+        default: false
+        type: boolean
+      canary-id:
+        description: Protected dispatch namespace; empty for production
+        default: ""
+        type: string
+      transfer:
+        description: Canary-only cold or warm artifact identity
+        default: ""
+        type: string
+
+permissions: {}
+
+jobs:
+  fetch:
+    if: >-
+      github.repository == 'Coreforce-CAD/oh-my-pi' &&
+      (github.event_name == 'pull_request' || github.event_name == 'push' ||
+      (inputs.canary-id != '' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/coreforge'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        slot: ${{ fromJSON(inputs.slots) }}
+    env:
+      CI_CACHE_BUCKET: ${{ vars.CI_CACHE_BUCKET }}
+      CI_CACHE_REGION: ${{ vars.CI_CACHE_REGION }}
+      CI_CACHE_PREFIX: ${{ vars.CI_CACHE_PREFIX }}
+      CI_CACHE_CANARY_ID: ${{ inputs.canary-id }}
+      CANARY_ID: ${{ inputs.canary-id }}
+      TRANSFER: ${{ inputs.transfer }}
+      REQUESTED: ${{ inputs.enabled }}
+      ENABLED: ${{ vars.CI_CACHE_ENABLED }}
+      READ_ROLE: ${{ vars.CI_CACHE_READ_ROLE }}
+      CACHE_SLOT: ${{ matrix.slot }}
+      CALLER_WORKFLOW_REF: ${{ github.workflow_ref }}
+      CALLER_WORKFLOW_SHA: ${{ github.workflow_sha }}
+      AWS_ENDPOINT_URL: ""
+      AWS_ENDPOINT_URL_S3: ""
+      AWS_IGNORE_CONFIGURED_ENDPOINT_URLS: "true"
+      AWS_CONFIG_FILE: /dev/null
+      AWS_SHARED_CREDENTIALS_FILE: /dev/null
+    steps:
+      - name: Checkout protected helper only
+        id: checkout
+        continue-on-error: ${{ inputs.canary-id == '' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Coreforce-CAD/oh-my-pi
+          ref: coreforge
+          persist-credentials: false
+
+      - name: Guard execution source and configuration before OIDC
+        if: steps.checkout.outcome == 'success'
+        id: guard
+        continue-on-error: ${{ inputs.canary-id == '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci_cache_guard.py authorize-read
+
+      - name: Record allowlisted actual OIDC claims
+        if: steps.guard.outputs.enabled == 'true'
+        id: oidc
+        continue-on-error: ${{ inputs.canary-id == '' }}
+        run: python3 scripts/ci_cache_guard.py oidc --broker read
+
+      - name: Assume cache read role
+        if: steps.oidc.outcome == 'success'
+        id: credentials
+        continue-on-error: ${{ inputs.canary-id == '' }}
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.CI_CACHE_READ_ROLE }}
+          aws-region: ${{ vars.CI_CACHE_REGION }}
+          role-session-name: cache-read-${{ github.run_id }}-${{ github.run_attempt }}
+          translate-env-variables: false
+          output-env-credentials: true
+          unset-current-credentials: true
+
+      - name: Verify and record actual STS caller
+        if: steps.credentials.outcome == 'success'
+        id: identity
+        continue-on-error: ${{ inputs.canary-id == '' }}
+        run: python3 scripts/ci_cache_guard.py identity --broker read
+
+      - name: Fetch inert snapshot
+        if: steps.identity.outcome == 'success'
+        id: fetch
+        continue-on-error: ${{ inputs.canary-id == '' }}
+        env:
+          CACHE_SLOT: ${{ matrix.slot }}
+          CI_CACHE_PREFIX: ${{ steps.guard.outputs.prefix }}
+        run: python3 scripts/ci_cache.py fetch --slot "$CACHE_SLOT" --output "$RUNNER_TEMP/cache-fetch"
+
+      - name: Record cache-only outcome
+        if: always()
+        env:
+          REQUESTED: ${{ inputs.enabled }}
+          ENABLED: ${{ vars.CI_CACHE_ENABLED }}
+          GUARD_OUTCOME: ${{ steps.guard.outcome }}
+          CHECKOUT_OUTCOME: ${{ steps.checkout.outcome }}
+          CREDENTIAL_OUTCOME: ${{ steps.credentials.outcome }}
+          FETCH_OUTCOME: ${{ steps.fetch.outcome }}
+          OIDC_OUTCOME: ${{ steps.oidc.outcome }}
+          IDENTITY_OUTCOME: ${{ steps.identity.outcome }}
+          CANARY_ID: ${{ inputs.canary-id }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+
+          requested = bool(os.environ['CANARY_ID']) or (os.environ['REQUESTED'] == 'true' and os.environ['ENABLED'] == 'true')
+          outcomes = {name: os.environ[name] for name in ('GUARD_OUTCOME', 'CHECKOUT_OUTCOME', 'OIDC_OUTCOME', 'CREDENTIAL_OUTCOME', 'IDENTITY_OUTCOME', 'FETCH_OUTCOME')}
+          failed = any(value == 'failure' for value in outcomes.values())
+          state = 'disabled'
+          if failed:
+              state = 'error'
+              print('::warning::Durable cache read failed; use a real cold build. ' + json.dumps(outcomes))
+          elif requested:
+              root = Path(os.environ['RUNNER_TEMP']) / 'cache-fetch'
+              state = ('snapshot' if (root / 'manifest.json').is_file() else 'miss') if os.environ['FETCH_OUTCOME'] == 'success' else 'unavailable'
+          if requested:
+              root = Path(os.environ['RUNNER_TEMP']) / 'cache-fetch'
+              root.mkdir(parents=True, exist_ok=True)
+              (root / 'status.json').write_text(json.dumps({'state': state, 'steps': outcomes}) + '\n')
+              import shutil
+              receipts = Path(os.environ['RUNNER_TEMP']) / 'cache-receipts'
+              if receipts.is_dir():
+                  shutil.copytree(receipts, root / 'receipts', dirs_exist_ok=True)
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              summary.write(f'Durable S3 cache read: **{state}**. This is not a build or verification result.\n')
+          PY
+
+      - name: Transfer inert restore data
+        if: always() && steps.guard.outcome == 'success' && steps.guard.outputs.enabled == 'true'
+        id: upload
+        continue-on-error: ${{ inputs.canary-id == '' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ steps.guard.outputs.artifact }}
+          path: ${{ runner.temp }}/cache-fetch/
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Report transfer failure
+        if: always() && steps.upload.outcome == 'failure'
+        run: echo '::warning::Durable cache artifact transfer failed; use a real cold build.'
