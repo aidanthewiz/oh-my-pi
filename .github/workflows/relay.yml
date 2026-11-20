@@ -159,7 +159,7 @@ jobs:
           if [ "$(ulimit -Sn)" != unlimited ] && [ "$(ulimit -Sn)" -lt 65536 ]; then ulimit -Sn 65536 || true; fi
           mkdir -p "$HOME/.cache/omp-bazel-disk" "$HOME/.cache/omp-bazel-repo"
           {
-            echo "common --config=ci"
+            echo "build --config=ci"
             echo "common --disk_cache=$HOME/.cache/omp-bazel-disk"
             echo "common --repository_cache=$HOME/.cache/omp-bazel-repo"
           } > "$RUNNER_TEMP/coreforge-bazel.rc"
