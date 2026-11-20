@@ -6,6 +6,7 @@
  */
 import type { JobWidgetView } from "@oh-my-pi/pi-tui/tools/job-widget";
 import type { AsyncJob } from "../async/job-manager";
+import type { AgentRef } from "../registry/agent-registry";
 
 /** Id of a task job's source carrying its subagent's finished tool calls. */
 export const TOOLS_SOURCE_ID = "tools";
@@ -57,6 +58,17 @@ export interface JobWidgetBrief {
 	stage?: string;
 }
 
+/**
+ * Main-issued, one-use custody for one SDK lineage and one canonical job row.
+ * Worker callbacks may revoke custody, but cannot grant or renew it.
+ * Task renewal follows canonical SDK physical-loop disposition within one prompt sequence.
+ * Terminal completion retires custody.
+ */
+export interface JobWidgetProducer {
+	bindTaskOwner(owner: AgentRef): void;
+	revoke(): void;
+}
+
 /** What a job offers its widget; set at registration by jobs that can be watched (bash, task). */
 export interface JobWidgetInputs {
 	/** The job's text sources now; a task's list grows as its subagent starts jobs. */
@@ -64,6 +76,10 @@ export interface JobWidgetInputs {
 	brief(): JobWidgetBrief;
 	/** Producer-captured root/session/owner affinity. Missing or false permits local derivation only. */
 	canAuthor?(): boolean;
+	/** Worker custody supplements, but never replaces, the local producer-affinity guard. */
+	readonly producer?: JobWidgetProducer;
+	/** Main-owned cancellation of worker authoring; local derivation and completed specs remain available. */
+	readonly authorSignal?: AbortSignal;
 }
 
 /**

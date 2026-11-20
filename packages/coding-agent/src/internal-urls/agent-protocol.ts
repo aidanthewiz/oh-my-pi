@@ -26,7 +26,7 @@ import * as path from "node:path";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { fuzzyFilter } from "@oh-my-pi/pi-tui/fuzzy";
 import { formatDuration, isEnoent, prompt } from "@oh-my-pi/pi-utils";
-import { type AgentRef, AgentRegistry } from "../registry/agent-registry";
+import { type AgentRef, AgentRegistry, type AgentRegistryApi } from "../registry/agent-registry";
 import { ensurePersistedRoster } from "../registry/persisted-agents";
 import { executeSend, isIrcEnabled } from "../irc/messaging";
 import { applyQuery } from "./json-query";
@@ -42,6 +42,7 @@ import type {
 	InternalUrl,
 	ProtocolHandler,
 	ResolveContext,
+	SchemeHost,
 	SchemeSpec,
 	UrlCompletion,
 	WriteContext,
@@ -132,8 +133,8 @@ function lastAssistantText(messages: readonly AgentMessage[]): string | undefine
 	return undefined;
 }
 
-/** Whether `<id>`'s published output predates a turn the agent is streaming now. */
-function isSuperseded(registry: AgentRegistry, outputId: string): boolean {
+/** Whether `<id>`'s published output predates the run the agent has open now. */
+function isSuperseded(registry: AgentRegistryApi, outputId: string): boolean {
 	const ref = registry.get(outputId);
 	return ref !== undefined && ref.kind !== "advisor" && registry.isRunning(ref);
 }
@@ -154,8 +155,8 @@ export class AgentProtocolHandler implements ProtocolHandler {
 		write: { via: "handler", payload: "verbatim", scope: "coordination", tier: () => "read" },
 	};
 
-	promptDoc(): string {
-		return agentPromptDoc.trim();
+	promptDoc(host: SchemeHost): string {
+		return prompt.render(agentPromptDoc, { subagent: host.subagent }).trim();
 	}
 
 	/**
@@ -169,7 +170,7 @@ export class AgentProtocolHandler implements ProtocolHandler {
 		if (!outputId) throw new Error("agent:// URL requires an output ID: agent://<id>");
 		if (outputId === "all" || hasPathExtraction(url) || url.searchParams.has("q")) return null;
 		if (
-			!context?.session?.seanceSourceArtifactsDir &&
+			!(context?.session?.seanceSourceArtifactsDir ?? context?.seanceSourceArtifactsDir) &&
 			isSuperseded(context?.agentRegistry ?? context?.session?.agentRegistry ?? AgentRegistry.global(), outputId)
 		) {
 			return null;
@@ -235,9 +236,10 @@ export class AgentProtocolHandler implements ProtocolHandler {
 
 		const dirs = await this.#outputDirs(context);
 		const scan = dirs.length > 0 ? await this.#findOutput(dirs, outputId) : undefined;
-		const registry = context?.session?.seanceSourceArtifactsDir
-			? undefined
-			: (context?.agentRegistry ?? context?.session?.agentRegistry ?? AgentRegistry.global());
+		const registry =
+			(context?.session?.seanceSourceArtifactsDir ?? context?.seanceSourceArtifactsDir)
+				? undefined
+				: (context?.agentRegistry ?? context?.session?.agentRegistry ?? AgentRegistry.global());
 		if (!scan?.foundPath) {
 			// No published output yet. A registered agent (running, idle after a
 			// non-terminal yield, or parked before publishing) is the same
@@ -296,6 +298,8 @@ export class AgentProtocolHandler implements ProtocolHandler {
 
 		let extractedFrom = scan.foundPath;
 		let sidecarSnapshot: { generation: string; ctime: bigint } | undefined;
+		const shape: InternalResource["shape"] = extraction || hasQueryExtraction ? "value" : "document";
+		let absent: true | undefined;
 		if (extraction || hasQueryExtraction) {
 			let jsonValue: unknown;
 			let parsed = false;
@@ -336,6 +340,7 @@ export class AgentProtocolHandler implements ProtocolHandler {
 			const extracted = hasQueryExtraction
 				? applyQuery(jsonValue, queryParam!)
 				: extractJsonPath(jsonValue, decodedSegments);
+			if (extracted === undefined) absent = true;
 			if (typeof extracted === "string") {
 				// A string field (e.g. a scout's markdown `report`) reads as prose,
 				// not as a JSON-escaped single line.
@@ -350,6 +355,7 @@ export class AgentProtocolHandler implements ProtocolHandler {
 			}
 			notes.push(`Extracted: ${hasQueryExtraction ? queryParam : `/${decodedSegments.join("/")}`}`);
 			if (parsed) notes.push(`Source: ${path.basename(extractedFrom!)}`);
+			if (absent) notes.push("JSON path not found");
 		}
 		const currentPrimary = statSync(scan.foundPath, { bigint: true });
 		if (artifactFileGeneration(currentPrimary) !== snapshot.generation || currentPrimary.ctimeNs !== snapshot.ctime)
@@ -370,7 +376,8 @@ export class AgentProtocolHandler implements ProtocolHandler {
 			size: Buffer.byteLength(content, "utf-8"),
 			sourcePath: extractedFrom,
 			notes,
-			shape: extraction || hasQueryExtraction ? "value" : "document",
+			shape,
+			...(absent ? { absent } : {}),
 		};
 	}
 
@@ -427,8 +434,7 @@ export class AgentProtocolHandler implements ProtocolHandler {
 	 * pre-existing global scan untouched.
 	 */
 	async #outputDirs(context: ResolveContext | undefined): Promise<string[]> {
-		// A seance reads the consulted source's agent outputs in place, nothing else.
-		const seanceDir = context?.session?.seanceSourceArtifactsDir;
+		const seanceDir = context?.session?.seanceSourceArtifactsDir ?? context?.seanceSourceArtifactsDir;
 		if (seanceDir) return [seanceDir];
 		const rootSessionFile = context?.sessionFile
 			? await ensurePersistedRoster(AgentRegistry.global(), context.sessionFile)

@@ -67,7 +67,7 @@ use pi_walker::{
 )]
 pub(crate) struct Rg {
 	/// A pattern to search for. May be repeated.
-	#[arg(short = 'e', long = "regexp", value_name = "PATTERN")]
+	#[arg(short = 'e', long = "regexp", value_name = "PATTERN", allow_hyphen_values = true)]
 	patterns: Vec<String>,
 
 	/// Read patterns from a file, one pattern per line.
@@ -1098,7 +1098,11 @@ impl PathFilters {
 		let override_match = self
 			.overrides
 			.as_ref()
-			.map(|overrides| overrides.matched(path, is_dir));
+			.map(|overrides| {
+				// Strip components so `cwd/./...` still matches cwd-anchored globs.
+				let relative = path.strip_prefix(&self.cwd).unwrap_or(path);
+				overrides.matched(relative, is_dir)
+			});
 		if override_match
 			.as_ref()
 			.is_some_and(|matched| matches!(matched, Match::Ignore(_)))
@@ -1826,7 +1830,7 @@ impl Running {
 	}
 }
 
-/// Searches the files below `root` on parallel workers, writing each file's
+/// Searches the files below `root` on bounded parallel workers, writing each file's
 /// output in path order.
 #[allow(
 	clippy::too_many_arguments,
@@ -1851,11 +1855,8 @@ async fn search_dir<M: Matcher<Captures: Send> + Clone + Send + Sync + 'static, 
 	else {
 		return Ok(SearchOutcome { any_match: false, had_error });
 	};
-	let workers = if cli.line_buffered && !cli.no_line_buffered {
-		1
-	} else {
-		parallelism
-	};
+	let line_buffered = cli.line_buffered && !cli.no_line_buffered;
+	let workers = if line_buffered { 1 } else { parallelism };
 	let halt = HaltOnDrop::new();
 	let shared = dir_search(host, cli, matcher, searcher, operand, root, show_names, opts, &halt, false);
 	let mut any_match = false;
@@ -2364,11 +2365,29 @@ mod tests {
 		(code, capture.out(), capture.err())
 	}
 
+	fn anchored_glob_tree() -> tempfile::TempDir {
+		let tree = tempfile::tempdir().unwrap();
+		for file in ["docs/evidence/a.txt", "docs/c.txt", "src/b.txt"] {
+			let path = tree.path().join(file);
+			std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+			std::fs::write(path, "needle\n").unwrap();
+		}
+		tree
+	}
+
 	#[tokio::test(flavor = "multi_thread")]
 	async fn max_count_stops_after_one_match() {
 		let (code, out, err) = run(&["-m1", "hit", "-"], "hit\nmiss\nhit\n").await;
 		assert_eq!(code, 0, "{err}");
 		assert_eq!(out, "hit\n");
+	}
+
+	/// `-e` exists so a pattern may start with `-` (ripgrep); clap used to
+	/// read `-e --canary` as an unknown `--canary` flag and exit 2.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn regexp_operand_may_start_with_a_dash() {
+		let (code, out, err) = run(&["-e", "--canary", "-"], "x --canary\ny\n").await;
+		assert_eq!((code, out.as_str()), (0, "x --canary\n"), "{err}");
 	}
 
 	#[tokio::test(flavor = "multi_thread")]
@@ -2516,6 +2535,59 @@ mod tests {
 		).await;
 		assert_eq!(code, 0, "{}", capture.err());
 		assert!(capture.out().contains("UPPER.TXT:hit\n"));
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn anchored_negative_glob_excludes_under_dot_operand() {
+		let tree = anchored_glob_tree();
+		let (code, capture) =
+			run_async_util::<Rg>(&["-n", "needle", "--glob", "!docs/evidence/**", "."], "", tree.path())
+				.await;
+		assert_eq!(code, 0, "{}", capture.err());
+		assert_eq!(capture.out(), "docs/c.txt:1:needle\nsrc/b.txt:1:needle\n");
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn anchored_positive_glob_includes_under_dot_operand() {
+		let tree = anchored_glob_tree();
+		let (code, capture) =
+			run_async_util::<Rg>(&["-n", "needle", "-g", "src/*.txt", "."], "", tree.path()).await;
+		assert_eq!(code, 0, "{}", capture.err());
+		assert_eq!(capture.out(), "src/b.txt:1:needle\n");
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn anchored_glob_uses_dot_when_no_operand() {
+		let tree = anchored_glob_tree();
+		let (code, capture) =
+			run_async_util::<Rg>(&["-n", "needle", "--glob", "!docs/evidence/**"], "", tree.path())
+				.await;
+		assert_eq!(code, 0, "{}", capture.err());
+		assert_eq!(capture.out(), "docs/c.txt:1:needle\nsrc/b.txt:1:needle\n");
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn anchored_glob_is_relative_to_cwd_with_directory_operand() {
+		let tree = anchored_glob_tree();
+		let (code, capture) =
+			run_async_util::<Rg>(&["-n", "needle", "-g", "!docs/evidence/**", "docs"], "", tree.path())
+				.await;
+		assert_eq!(code, 0, "{}", capture.err());
+		assert_eq!(capture.out(), "docs/c.txt:1:needle\n");
+
+		let (code, capture) =
+			run_async_util::<Rg>(&["-n", "needle", "-g", "!evidence/**", "docs"], "", tree.path()).await;
+		assert_eq!(code, 0, "{}", capture.err());
+		assert_eq!(capture.out(), "docs/c.txt:1:needle\ndocs/evidence/a.txt:1:needle\n");
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn anchored_iglob_matches_case_insensitively_under_dot_operand() {
+		let tree = anchored_glob_tree();
+		let (code, capture) =
+			run_async_util::<Rg>(&["-n", "needle", "--iglob", "SRC/*.TXT", "."], "", tree.path()).await;
+		assert_eq!(code, 0, "{}", capture.err());
+		assert_eq!(capture.out(), "src/b.txt:1:needle\n");
 	}
 
 	#[tokio::test(flavor = "multi_thread")]
@@ -2673,13 +2745,4 @@ mod tests {
 		let err = capture.err();
 		assert!(err.contains("rg: big: pattern file larger than 256 MiB"), "{err}");
 	}
-}
-
-use brush_core::{ShellExtensions, builtins::Registration};
-
-use crate::host::async_util;
-
-/// Creates the ripgrep-compatible `rg` builtin registration.
-pub(crate) fn rg_builtin<SE: ShellExtensions>() -> Registration<SE> {
-	async_util::<Rg, SE>()
 }

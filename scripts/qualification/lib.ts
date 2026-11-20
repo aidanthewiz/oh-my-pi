@@ -2,7 +2,6 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
-import { createRequire } from "node:module";
 import * as path from "node:path";
 
 export function required(name: string): string {
@@ -173,16 +172,12 @@ export async function compileFixture(entry: string, outfile: string): Promise<vo
 	const checkout = required("CF_QUAL_CHECKOUT");
 	// Load the build graph only after restoring producer overlays and installing private HOME.
 	const { compileCodingAgent } = await import(path.join(checkout, "packages/coding-agent/scripts/compile-binary.ts"));
-	const require = createRequire(path.join(checkout, "scripts/ci-release-build-binaries.ts"));
-	const transformersVersion = require("@huggingface/transformers/package.json").version;
-	assert.equal(typeof transformersVersion, "string");
 	const before = await fingerprint(required("CF_QUAL_NATIVE_ORIGINAL"));
 	assert.equal(before, required("CF_QUAL_NATIVE_SHA256"));
 	await compileCodingAgent({
 		repoRoot: checkout,
 		entrypoint: entry,
 		outfile,
-		transformersVersion,
 		native: { platform: "linux", arch: "x64" },
 		target: "bun-linux-x64",
 		minifyIdentifiers: true,

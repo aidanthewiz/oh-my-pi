@@ -1,7 +1,7 @@
 import { TERMINAL } from "@oh-my-pi/pi-tui";
 import { untilAborted } from "@oh-my-pi/pi-utils";
 import type { ExtensionUIContext } from "../extensibility/extensions/types";
-import { type AgentRef, type AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
+import { type AgentRef, MAIN_AGENT_ID, type AgentRegistryApi } from "../registry/agent-registry";
 import type { AgentSession } from "../session/agent-session";
 import {
 	approvalRestrictions,
@@ -14,6 +14,8 @@ import {
 } from "./approval";
 import type { ToolSession } from "./index";
 import { cfgApprovalNotify } from "./settings";
+import type { AgentSessionHandle } from "../session/agent-session-handle";
+import { registerRpcError, rpcSync } from "../thread/rpc";
 
 export interface SubagentRuntimeApprovalRequest {
 	readonly agentId: string;
@@ -69,8 +71,14 @@ export class ParentRuntimeApprovalError extends Error {
 	}
 }
 
+registerRpcError("ParentRuntimeApprovalError", message =>
+	Object.assign(Object.setPrototypeOf(new Error(message), ParentRuntimeApprovalError.prototype), {
+		name: "ParentRuntimeApprovalError",
+	}),
+);
+
 interface ApprovalHostState {
-	readonly registry: AgentRegistry;
+	readonly registry: AgentRegistryApi;
 	readonly lifetime: AbortSignal;
 	readonly rootReference: WeakRef<AgentSession>;
 	readonly rootAgentReference?: WeakRef<AgentRef>;
@@ -87,7 +95,7 @@ export type SubagentRuntimeApprovalHandler = (
 
 export function createSubagentRuntimeApprovalHandler(options: {
 	root: AgentSession;
-	registry: AgentRegistry;
+	registry: AgentRegistryApi;
 	toolSession: ToolSession;
 	signal: AbortSignal;
 }): SubagentRuntimeApprovalHandler {
@@ -156,7 +164,8 @@ async function requestSubagentRuntimeApproval(
 	const origin = registry.get(request.agentId);
 	const originSession = origin?.session;
 	const chain: string[] = [];
-	const ancestry: Array<{ reference: NonNullable<typeof origin>; session: AgentSession; parentId?: string }> = [];
+	const ancestry: Array<{ reference: NonNullable<typeof origin>; session: AgentSessionHandle; parentId?: string }> =
+		[];
 	const visited = new Set<string>();
 	let current = origin;
 	while (current && current !== rootRef) {
@@ -176,7 +185,7 @@ async function requestSubagentRuntimeApproval(
 		!originSession ||
 		origin === rootRef ||
 		current !== rootRef ||
-		originSession.sessionId !== request.sessionId ||
+		originSession.sessionManager.getSessionId() !== request.sessionId ||
 		originSession.sessionManager.getCwd() !== request.cwd
 	)
 		return {
@@ -253,7 +262,7 @@ async function requestSubagentRuntimeApproval(
 				reference.status !== "aborted",
 		) &&
 		root.getToolByName(request.toolName) === tool &&
-		originSession.sessionId === request.sessionId &&
+		originSession.sessionManager.getSessionId() === request.sessionId &&
 		originSession.sessionManager.getCwd() === request.cwd &&
 		ownerCurrent() &&
 		runner.hasUI() &&
@@ -304,7 +313,7 @@ async function requestSubagentRuntimeApproval(
 		if (choice === "Approve once")
 			return {
 				decision: "approved",
-				validate: () => {
+				validate: rpcSync(() => {
 					callerSignal?.throwIfAborted();
 					if (!isCurrent())
 						throw new ParentRuntimeApprovalError(request.toolName, {
@@ -312,7 +321,7 @@ async function requestSubagentRuntimeApproval(
 							reason: "state-changed",
 							detail: "The approval request or parent authority changed before execution.",
 						});
-				},
+				}),
 			};
 		if (choice === "Deny") return { decision: "denied" };
 		if (choice === undefined) return { decision: "cancelled", reason: "selector-cancelled" };

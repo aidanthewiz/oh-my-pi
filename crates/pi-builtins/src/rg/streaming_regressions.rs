@@ -1,13 +1,10 @@
 use std::{
-	io::{self, Read, SeekFrom, Write},
+	io::{self, SeekFrom},
 	path::Path,
 	sync::{Arc, atomic::{AtomicUsize, Ordering}},
 	time::{Duration, Instant},
 };
-use brush_core::{
-	openfiles::{OpenFile, OpenFiles, Stream},
-	ProfileLoadBehavior, RcLoadBehavior, Shell, SourceInfo,
-};
+use crate::extras::{self, Fd, Invocation};
 use tokio::sync::{Notify, Semaphore};
 
 const ROOT: &str = "mem://stream/dir";
@@ -117,20 +114,19 @@ impl pi_vfs::FileSystem for Provider {
 	}
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 struct Recording {
 	bytes: Arc<parking_lot::Mutex<Vec<u8>>>,
 	seen: Arc<Notify>,
 }
 
-impl Read for Recording {
-	fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+#[async_trait::async_trait]
+impl pi_vfs::FileHandle for Recording {
+	async fn read(&self, _: &mut [u8]) -> io::Result<usize> {
 		Ok(0)
 	}
-}
 
-impl Write for Recording {
-	fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+	async fn write(&self, bytes: &[u8]) -> io::Result<usize> {
 		self.bytes.lock().extend_from_slice(bytes);
 		if bytes.contains(&b'\n') {
 			self.seen.notify_one();
@@ -138,24 +134,16 @@ impl Write for Recording {
 		Ok(bytes.len())
 	}
 
-	fn flush(&mut self) -> io::Result<()> {
+	async fn seek(&self, _: SeekFrom) -> io::Result<u64> {
+		Err(io::ErrorKind::Unsupported.into())
+	}
+
+	async fn metadata(&self) -> io::Result<pi_vfs::Metadata> {
+		Err(io::ErrorKind::Unsupported.into())
+	}
+
+	async fn flush(&self) -> io::Result<()> {
 		Ok(())
-	}
-}
-
-impl Stream for Recording {
-	fn clone_box(&self) -> Box<dyn Stream> {
-		Box::new(self.clone())
-	}
-
-	#[cfg(unix)]
-	fn try_clone_to_owned(&self) -> Result<std::os::fd::OwnedFd, brush_core::Error> {
-		Err(brush_core::error::ErrorKind::CannotConvertToNativeFd.into())
-	}
-
-	#[cfg(unix)]
-	fn try_borrow_as_fd(&self) -> Result<std::os::fd::BorrowedFd<'_>, brush_core::Error> {
-		Err(brush_core::error::ErrorKind::CannotConvertToNativeFd.into())
 	}
 }
 
@@ -165,34 +153,33 @@ async fn file_and_directory_records_reach_the_host_before_late_input() {
 		for flags in ["", "--line-buffered", "--no-line-buffered"] {
 			let provider = GatedFs::new();
 			let _release = ReleaseGate(provider.gate.clone());
-			let mut shell = Shell::builder()
-				.profile(ProfileLoadBehavior::Skip).rc(RcLoadBehavior::Skip)
-				.builtins(crate::factory::default_builtins(crate::factory::BuiltinSet::BashMode))
-				.build().await.unwrap();
-			for (name, builtin) in crate::factory::utility_builtins() {
-				shell.register_builtin(name, builtin);
-			}
-			shell.set_filesystem(pi_vfs::Fs::new(Arc::new(Provider(provider.clone()))));
-			shell.set_working_dir(Path::new(ROOT)).await.unwrap();
 			let capture = Recording::default();
 			let error = Recording::default();
-			let mut params = shell.default_exec_params();
-			params.set_fd(OpenFiles::STDIN_FD, OpenFile::Stream(Box::new(Recording::default())));
-			params.set_fd(OpenFiles::STDOUT_FD, OpenFile::Stream(Box::new(capture.clone())));
-			params.set_fd(OpenFiles::STDERR_FD, OpenFile::Stream(Box::new(error.clone())));
-			let script = format!("rg -N --no-filename {flags} needle {operand}");
-			let source = SourceInfo::from("rg-streaming-regression");
+			let mut argv = vec!["rg".to_owned(), "-N".to_owned(), "--no-filename".to_owned()];
+			if !flags.is_empty() {
+				argv.push(flags.to_owned());
+			}
+			argv.extend(["needle".to_owned(), operand.to_owned()]);
+			let mut invocation = Invocation::new(
+				argv,
+				Path::new(ROOT).to_path_buf(),
+				pi_vfs::Fs::new(Arc::new(Provider(provider.clone()))),
+			);
+			invocation.stdio = [
+				Fd::Closed,
+				Fd::from(pi_vfs::File::from_handle(capture.clone())),
+				Fd::from(pi_vfs::File::from_handle(error.clone())),
+			];
 			let observe = async {
 				let early = tokio::time::timeout(Duration::from_secs(5), capture.seen.notified()).await.is_ok();
 				provider.gate.add_permits(1);
 				early
 			};
 			let (result, early) = tokio::time::timeout(Duration::from_secs(20), async {
-				tokio::join!(shell.run_string(&script, &source, &params), observe)
+				tokio::join!(extras::run(invocation), observe)
 			}).await.expect("released rg must finish");
-			let code = u8::from(result.unwrap().exit_code);
 			assert!(early, "{operand} {flags}: output waited for a late input read");
-			assert_eq!(code, 0);
+			assert_eq!(result, 0);
 			assert_eq!(*capture.bytes.lock(), *provider.body);
 			assert!(error.bytes.lock().is_empty());
 		}
@@ -238,9 +225,30 @@ fn buffering_flags_do_not_block_current_thread_pipeline_consumers() {
 async fn pipeline_child() {
 	let flags = std::env::var("PI_RG_STREAM_TEST_FLAGS").expect("watchdog child only");
 	let root = std::path::PathBuf::from(std::env::var_os("PI_RG_STREAM_TEST_ROOT").expect("parent-owned fixture"));
-	let script = format!("rg {flags} needle sample | rg --count needle");
-	let (code, out, err) = crate::host::run_script(&script, "", &root).await;
-	assert_eq!(code, 0, "{err}");
-	assert_eq!(out, "524288\n");
+	let output = tempfile::NamedTempFile::new().unwrap();
+	let error = tempfile::NamedTempFile::new().unwrap();
+	let (reader, writer) = std::io::pipe().unwrap();
+	let mut argv = vec!["rg".to_owned()];
+	if !flags.is_empty() {
+		argv.push(flags);
+	}
+	argv.extend(["needle".to_owned(), "sample".to_owned()]);
+	let mut producer = Invocation::new(argv, root.clone(), pi_vfs::Fs::native());
+	producer.stdio = [Fd::Closed, Fd::from(writer), Fd::from(error.as_file().try_clone().unwrap())];
+	let mut consumer = Invocation::new(
+		vec!["rg".to_owned(), "--count".to_owned(), "needle".to_owned()],
+		root,
+		pi_vfs::Fs::native(),
+	);
+	consumer.stdio = [
+		Fd::from(reader),
+		Fd::from(output.as_file().try_clone().unwrap()),
+		Fd::from(error.as_file().try_clone().unwrap()),
+	];
+	let (producer_code, consumer_code) = tokio::join!(extras::run(producer), extras::run(consumer));
+	let err = std::fs::read_to_string(error.path()).unwrap();
+	assert_eq!(producer_code, 0, "{err}");
+	assert_eq!(consumer_code, 0, "{err}");
+	assert_eq!(std::fs::read_to_string(output.path()).unwrap(), "524288\n");
 	assert_eq!(err, "");
 }

@@ -560,6 +560,29 @@ describe("auth-gateway POST /v1/systemone", () => {
 		expect(sizes.sort((a, b) => b - a)).toEqual([16, 4]);
 	});
 
+	it("records the usage of chunks that succeeded when a split judgment fails", async () => {
+		harness = await boot(init => {
+			const ids = Object.keys(JSON.parse(String(init?.body)).questions);
+			if (ids.includes("q32")) return new Response("bad chunk", { status: 400 });
+			return Response.json({
+				model: "openjev-4b",
+				answers: Object.fromEntries(ids.map(id => [id, { type: "noul", noul: 0.5 }])),
+				usage: { input_tokens: 10, output_tokens: 1 },
+			});
+		});
+		const recorded: { usage: { input: number; output: number } }[] = [];
+		spyOn(harness.storage.usage, "observe").mockImplementation(entry => {
+			recorded.push(entry);
+		});
+		const questions = Object.fromEntries(
+			Array.from({ length: 40 }, (_, i) => [`q${i}`, { type: "noul", instructions: `Question ${i}?` }]),
+		);
+		const response = await post(harness.url, "/v1/systemone", { model: "openjev-4b", state: "s", questions });
+		expect(response.status).toBe(400);
+		expect(recorded).toHaveLength(1);
+		expect(recorded[0].usage).toMatchObject({ input: 20, output: 2 });
+	});
+
 	it("keeps a rotated sibling credential when a delayed chunk rejects its original key", async () => {
 		harness = await boot(() => Response.json(UPSTREAM_ANSWER));
 		const storage = harness.storage;

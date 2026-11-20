@@ -12,6 +12,7 @@ import { cfgDisabledModels } from "../../src/config/model-settings";
 import { Settings } from "../../src/config/settings";
 import { EVAL_TIMEOUT_PAUSE_OP, EVAL_TIMEOUT_RESUME_OP } from "../../src/eval/bridge-timeout";
 import {
+	type CompletionAttempt,
 	EVAL_HANDLE_CONCURRENCY,
 	getCompletionHandle,
 	releaseCompletionHandles,
@@ -19,7 +20,7 @@ import {
 	type EvalCompletionBridgeOptions,
 	type EvalCompletionResult,
 } from "../../src/eval/completion-bridge";
-import { runEvalWait } from "../../src/eval/handle-bridge";
+import { type EvalHandleSnapshot, runEvalCancel, runEvalStatus, runEvalWait } from "../../src/eval/handle-bridge";
 import { IdleTimeout } from "../../src/eval/idle-timeout";
 import { disposeAllVmContexts } from "../../src/eval/js/context-manager";
 import { executeJs } from "../../src/eval/js/executor";
@@ -46,6 +47,19 @@ async function runEvalCompletionAndWait(
 	if (entry.error) throw new ToolError(entry.error);
 	if (!entry.result) throw new Error(`Completion handle ${handle.id} returned no result`);
 	return entry.result;
+}
+
+/** Waits for a completion, then reads its attempt log through `__status__`. */
+async function waitWithAttempts(
+	args: unknown,
+	session: ToolSession,
+): Promise<{ snapshot?: EvalHandleSnapshot; attempts?: CompletionAttempt[] }> {
+	const { id } = await runEvalCompletion(args, { session });
+	const waited = await runEvalWait({ items: [{ kind: "completion", id }] }, { session });
+	return {
+		snapshot: waited.items[0],
+		attempts: runEvalStatus({ item: { kind: "completion", id } }, { session }).attempts,
+	};
 }
 
 function makeModel(provider: string, id: string, extra: Partial<ModelSpec<Api>> = {}): Model<Api> {
@@ -154,10 +168,11 @@ async function runPythonCompletionsInSubprocess(tempDir: TempDir): Promise<Pytho
 	const settingsPath = path.resolve(import.meta.dir, "../../src/config/settings.ts");
 	const code = [
 		"import json",
-		'plain = completion("hi", model="smol").wait()',
+		'plain_handle = completion("hi", model="smol")',
+		"plain = plain_handle.wait()",
 		// `await` resolves on a worker thread; it must keep the cell's run context.
 		'structured = await completion("hi", schema={"type": "object"})',
-		'print(json.dumps({"plain": plain, "structured": structured}))',
+		'print(json.dumps({"plain": plain, "attempts": plain_handle.attempts, "structured": structured}))',
 	].join("\n");
 	await Bun.write(
 		scriptPath,
@@ -188,6 +203,7 @@ const session = {
 	settings,
 	modelRegistry: {
 		getAvailable: () => [SMOL],
+		find: (provider, id) => (provider === SMOL.provider && id === SMOL.id ? SMOL : undefined),
 		getApiKey: async () => "test-key",
 		resolver: () => async () => "test-key",
 	},
@@ -280,7 +296,7 @@ describe("runEvalCompletion", () => {
 		const session = { ...makeSession(), costGate } as ToolSession;
 		const resolving = Promise.withResolvers<void>();
 		const credential = Promise.withResolvers<string>();
-		vi.spyOn(session.modelRegistry!, "getApiKey").mockImplementation(() => {
+		vi.spyOn(session.modelRegistry!, "resolver").mockImplementation(() => async () => {
 			resolving.resolve();
 			return credential.promise;
 		});
@@ -301,7 +317,7 @@ describe("runEvalCompletion", () => {
 		const controller = new AbortController();
 		const resolving = Promise.withResolvers<void>();
 		const credential = Promise.withResolvers<string>();
-		vi.spyOn(session.modelRegistry!, "getApiKey").mockImplementation(() => {
+		vi.spyOn(session.modelRegistry!, "resolver").mockImplementation(() => async () => {
 			resolving.resolve();
 			return credential.promise;
 		});
@@ -315,6 +331,64 @@ describe("runEvalCompletion", () => {
 		await entry.promise;
 		expect(entry.error).toContain("completion cancelled before dispatch");
 		expect(provider).not.toHaveBeenCalled();
+	});
+
+	it("does not dispatch or fall back after the originating session changes during credential resolution", async () => {
+		const session = makeSession();
+		let sessionId = "origin";
+		session.getSessionId = () => sessionId;
+		cfgRetryFallbackChains.set(session.settings, { smol: ["p/slow"] });
+		const resolving = Promise.withResolvers<void>();
+		const credential = Promise.withResolvers<string>();
+		vi.spyOn(session.modelRegistry!, "resolver").mockImplementation(() => async () => {
+			resolving.resolve();
+			return credential.promise;
+		});
+		const provider = vi.spyOn(ai, "completeSimple");
+		const completion = runEvalCompletionAndWait({ prompt: "q", model: "smol" }, { session });
+		await resolving.promise;
+		sessionId = "replacement";
+		credential.resolve("origin-key");
+		await expect(completion).rejects.toBeInstanceOf(ToolError);
+		expect(provider).not.toHaveBeenCalled();
+	});
+
+	it("reuses the admitted credential instead of selecting a second account at dispatch", async () => {
+		const session = makeSession();
+		let resolutions = 0;
+		session.modelRegistry!.resolver = () => async () => {
+			if (++resolutions !== 1) throw new Error("A second account selection was attempted");
+			return "admitted-synthetic-key";
+		};
+		vi.spyOn(ai, "completeSimple").mockImplementation(async (model, _context, options) => {
+			if (typeof options?.apiKey !== "function") throw new Error("Missing owned credential resolver");
+			await options.apiKey({ lastChance: false, error: undefined, signal: options.signal });
+			await options.onPayload?.({}, model, options.signal);
+			return assistant({ text: "completed under the admitted account" });
+		});
+		const result = await runEvalCompletionAndWait({ prompt: "q", model: "smol" }, { session });
+		expect(result.text).toBe("completed under the admitted account");
+		expect(resolutions).toBe(1);
+	});
+
+	it("records a completed billed attempt but never starts a fallback after its owner changes", async () => {
+		const costGate = new CostGate(Settings.isolated(), 0, () => {});
+		const session = { ...makeSession(), costGate } as ToolSession;
+		let current = true;
+		session.captureOwnerCurrent = () => () => current;
+		cfgRetryFallbackChains.set(session.settings, { smol: ["p/slow"] });
+		const provider = vi.spyOn(ai, "completeSimple").mockImplementation(async (model, _context, options) => {
+			await options?.onPayload?.({}, model, options.signal);
+			current = false;
+			const billed = assistant({ stopReason: "error", errorMessage: "provider response arrived after transition" });
+			billed.usage.cost.total = 0.25;
+			return billed;
+		});
+		await expect(runEvalCompletionAndWait({ prompt: "q", model: "smol" }, { session })).rejects.toBeInstanceOf(
+			ToolError,
+		);
+		expect(provider).toHaveBeenCalledTimes(1);
+		expect(costGate.spent).toBe(0.25);
 	});
 
 	it("runs session admission before a completion can reach the provider", async () => {
@@ -506,11 +580,12 @@ describe("runEvalCompletion", () => {
 			.mockResolvedValueOnce(assistant({ stopReason: "error", errorMessage: "b down" }))
 			.mockResolvedValueOnce(assistant({ text: "c answer" }));
 
-		await runEvalCompletionAndWait({ prompt: "q", model: "slow" }, { session });
+		const { attempts } = await waitWithAttempts({ prompt: "q", model: "slow" }, session);
 
 		const nested = spy.mock.calls[2]?.[2] as { reasoning?: unknown; disableReasoning?: unknown };
 		expect(nested.reasoning).toBeUndefined();
 		expect(nested.disableReasoning).toBe(true);
+		expect(attempts?.map(attempt => attempt.effort)).toEqual([Effort.High, "off", "off"]);
 	});
 
 	it("inherits disabled reasoning for a bare fallback after an explicit :off primary", async () => {
@@ -533,7 +608,7 @@ describe("runEvalCompletion", () => {
 		expect(fallbackOpts.disableReasoning).toBe(true);
 	});
 
-	it("skips keyless fallbacks without spending retry budget", async () => {
+	it("skips keyless fallbacks without spending retry budget and logs every attempt", async () => {
 		const b = makeModel("p", "b");
 		const c = makeModel("p", "c");
 		const session = makeSession({ available: [SMOL, b, c] });
@@ -541,17 +616,24 @@ describe("runEvalCompletion", () => {
 		cfgRetryMaxRetries.set(session.settings, 1);
 		const registry = session.modelRegistry;
 		if (!registry) throw new Error("test requires a model registry");
-		registry.getApiKey = async model => (model.id === "b" ? undefined : "test-key");
+		registry.resolver = target => async () =>
+			typeof target !== "string" && target.id === "b" ? undefined : "test-key";
 		const spy = vi
 			.spyOn(ai, "completeSimple")
 			.mockResolvedValueOnce(assistant({ stopReason: "error", errorMessage: "smol down" }))
 			.mockResolvedValueOnce(assistant({ text: "c answer" }));
 
-		const result = await runEvalCompletionAndWait({ prompt: "q", model: "smol" }, { session });
+		const { snapshot, attempts } = await waitWithAttempts({ prompt: "q", model: "smol" }, session);
 
 		// b never reaches completeSimple: the keyless preflight skips it.
 		expect(spy.mock.calls.map(call => (call[0] as Model<Api>).id)).toEqual(["smol", "c"]);
-		expect(result.text).toBe("c answer");
+		expect(snapshot).toMatchObject({ status: "completed", text: "c answer" });
+		expect(snapshot).not.toHaveProperty("attempts");
+		expect(attempts).toEqual([
+			{ model: "p/smol", effort: null, outcome: "failed", error: "smol down" },
+			{ model: "p/b", effort: null, outcome: "no-credentials" },
+			{ model: "p/c", effort: null, outcome: "succeeded" },
+		]);
 	});
 
 	it("walks shared descendants once per inherited effort", async () => {
@@ -614,24 +696,6 @@ describe("runEvalCompletion", () => {
 			"quota exhausted",
 		);
 		expect(spy.mock.calls.map(call => (call[0] as Model<Api>).id)).toEqual(["smol"]);
-	});
-
-	it("forwards the session id to the API key lookup", async () => {
-		vi.spyOn(ai, "completeSimple").mockResolvedValue(assistant({ text: "ok" }));
-		const session = makeSession();
-		session.getSessionId = () => "sess-1";
-		const seen: unknown[][] = [];
-		const registry = session.modelRegistry;
-		if (!registry) throw new Error("test requires a model registry");
-		registry.getApiKey = async (model, sessionId, options) => {
-			seen.push([model, sessionId, options]);
-			return "test-key";
-		};
-
-		await runEvalCompletionAndWait({ prompt: "q", model: "smol" }, { session });
-
-		expect(seen.length).toBe(1);
-		expect(seen[0]?.[1]).toBe("sess-1");
 	});
 
 	it("returns the completion text in plain mode", async () => {
@@ -1013,6 +1077,45 @@ describe("runEvalCompletion", () => {
 		).rejects.toBeInstanceOf(ToolError);
 	});
 
+	it("marks the answering attempt failed when its output is unusable", async () => {
+		vi.spyOn(ai, "completeSimple").mockResolvedValue(assistant({ text: "not json" }));
+		const { attempts } = await waitWithAttempts(
+			{ prompt: "q", model: "smol", schema: { type: "object" } },
+			makeSession(),
+		);
+		expect(attempts).toEqual([
+			{
+				model: "p/smol",
+				effort: null,
+				outcome: "failed",
+				error: "completion() did not return a structured response matching the schema.",
+			},
+		]);
+	});
+
+	it("reports a running attempt live and marks it cancelled on cancel", async () => {
+		const started = Promise.withResolvers<void>();
+		vi.spyOn(ai, "completeSimple").mockImplementation(async (_model, _context, options) => {
+			started.resolve();
+			const signal = options?.signal;
+			if (!signal) throw new Error("completion request did not receive an abort signal");
+			const aborted = Promise.withResolvers<never>();
+			signal.addEventListener("abort", () => aborted.reject(signal.reason), { once: true });
+			return await aborted.promise;
+		});
+		const session = makeSession();
+		const item = {
+			kind: "completion" as const,
+			id: (await runEvalCompletion({ prompt: "q", model: "smol" }, { session })).id,
+		};
+		await started.promise;
+		expect(runEvalStatus({ item }, { session }).attempts?.map(attempt => attempt.outcome)).toEqual(["running"]);
+
+		runEvalCancel({ item }, { session });
+		await runEvalWait({ items: [item] }, { session });
+		expect(runEvalStatus({ item }, { session }).attempts?.map(attempt => attempt.outcome)).toEqual(["cancelled"]);
+	});
+
 	it("bounds in-flight handles and admits queued ones as earlier requests settle", async () => {
 		const total = EVAL_HANDLE_CONCURRENCY + 8;
 		const gate = Promise.withResolvers<void>();
@@ -1106,7 +1209,7 @@ describe("completion() through eval runtimes", () => {
 			[
 				'const handles = [completion("hi", { model: "smol" }), completion("hi", { schema: { type: "object" } })];',
 				"const [plain, structured] = await wait(handles);",
-				"return JSON.stringify({ plain, structured });",
+				"return JSON.stringify({ plain, structured, attempts: await handles[0].attempts() });",
 			].join("\n"),
 			{ cwd: tempDir.path(), sessionId, session: makeSession({ cwd: tempDir.path() }), sessionFile },
 		);
@@ -1115,6 +1218,7 @@ describe("completion() through eval runtimes", () => {
 		expect(JSON.parse(result.output.trim())).toEqual({
 			plain: "hello from smol",
 			structured: { ok: true, n: 3 },
+			attempts: [{ model: "p/smol", effort: null, outcome: "succeeded" }],
 		});
 	});
 
@@ -1138,6 +1242,23 @@ describe("completion() through eval runtimes", () => {
 		const result = await executeJs("print((await wait(handles))[0]);", options);
 		expect(result.exitCode).toBe(0);
 		expect(result.output.trim()).toBe("hello from the next cell");
+	});
+
+	it("refuses a number passed to wait() instead of returning at once as if it had slept", async () => {
+		using tempDir = TempDir.createSync("@omp-eval-wait-number-");
+		const options = {
+			cwd: tempDir.path(),
+			sessionId: `js-wait-number:${crypto.randomUUID()}`,
+			session: makeSession({ cwd: tempDir.path() }),
+			sessionFile: path.join(tempDir.path(), "session.jsonl"),
+		};
+		const result = await executeJs(
+			"try { await wait(1800); print('returned'); } catch (error) { print(error.message); }",
+			options,
+		);
+		expect(result.exitCode).toBe(0);
+		expect(result.output).not.toContain("returned");
+		expect(result.output).toContain("not a sleep");
 	});
 
 	it("times out waiting on a running completion started in an earlier JavaScript cell", async () => {
@@ -1175,6 +1296,7 @@ describe("completion() through eval runtimes", () => {
 			expect(JSON.parse(result.output.trim())).toEqual({
 				plain: "hello from python",
 				structured: { ok: true },
+				attempts: [{ model: "p/smol", effort: null, outcome: "succeeded" }],
 			});
 		} finally {
 			tempDir.removeSync();

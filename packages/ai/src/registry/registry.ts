@@ -7,6 +7,7 @@ import { amazonBedrockTransport } from "./amazon-bedrock";
 import { bedrockMantleTransport } from "./bedrock-mantle";
 import { buildProviderDefinition, type ProviderTransport } from "./build";
 import { cloudflareAiGatewayTransport } from "./cloudflare-ai-gateway";
+import { kiroTransport } from "./kiro";
 import { museCodeTransport } from "./muse-code";
 import { snowflakeTransport } from "./snowflake";
 import type { ProviderDefinition } from "./types";
@@ -25,6 +26,7 @@ const TRANSPORTS: Record<string, ProviderTransport> = {
 	},
 	"bedrock-mantle": bedrockMantleTransport,
 	"cloudflare-ai-gateway": cloudflareAiGatewayTransport,
+	kiro: kiroTransport,
 	"muse-code": museCodeTransport,
 	snowflake: snowflakeTransport,
 };

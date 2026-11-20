@@ -6,7 +6,8 @@ import { clearCustomApis } from "@oh-my-pi/pi-ai/api-registry";
 import { startAuthGateway } from "@oh-my-pi/pi-ai/auth-gateway";
 import { AuthStorage } from "@oh-my-pi/pi-ai/auth-storage";
 import { createMockModel, registerMockApi } from "@oh-my-pi/pi-ai/providers/mock";
-import { encodeStream, formatError, parseRequest } from "@oh-my-pi/pi-ai/providers/pi-native-server";
+import { noStoreErrorResponse } from "@oh-my-pi/pi-ai/auth-gateway/http";
+import { encodeStream, parseRequest } from "@oh-my-pi/pi-ai/providers/pi-native-server";
 import type {
 	AssistantMessage,
 	AssistantMessageEvent,
@@ -154,6 +155,15 @@ describe("pi-native parseRequest", () => {
 			options: { acceptEmptyResponse: true },
 		});
 		expect(parsed.options.acceptEmptyResponse).toBe(true);
+	});
+
+	it("forwards omitDemotedReasoning so a stripped retry leaves other models' reasoning out server-side", () => {
+		const parsed = parseRequest({
+			modelId: "anthropic/claude-opus-5-5",
+			context: baseContext,
+			options: { omitDemotedReasoning: true },
+		});
+		expect(parsed.options.omitDemotedReasoning).toBe(true);
 	});
 
 	it("preserves headers, metadata, sessionId, thinkingBudgets, and hidden thinking summaries", () => {
@@ -565,9 +575,9 @@ describe("pi-native encodeStream", () => {
 	});
 });
 
-describe("pi-native formatError", () => {
+describe("pi-native error envelope", () => {
 	it("emits { error: { type, message } } with the given status", async () => {
-		const res = formatError(401, "authentication_error", "no credential");
+		const res = noStoreErrorResponse(401, "authentication_error", "no credential");
 		expect(res.status).toBe(401);
 		expect(res.headers.get("Content-Type")).toBe("application/json; charset=utf-8");
 		expect(await res.json()).toEqual({ error: { type: "authentication_error", message: "no credential" } });

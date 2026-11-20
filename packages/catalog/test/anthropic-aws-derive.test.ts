@@ -1,7 +1,6 @@
 import { describe, expect, it } from "bun:test";
-import { providerEntry, seedModels } from "../src/compat/providers";
-import { getBundledModel } from "../src/models";
-import { ANTHROPIC_AWS_PLATFORM_MODEL_IDS, deriveAnthropicAwsModels } from "../src/provider-models/openai-compat";
+import { seedModels } from "../src/compat/providers";
+import { deriveAnthropicAwsModels } from "../src/provider-models/openai-compat";
 import type { Api, ModelSpec } from "../src/types";
 
 /**
@@ -75,20 +74,5 @@ describe("deriveAnthropicAwsModels", () => {
 	it("only clones anthropic-messages models", () => {
 		const nonMessages = { ...spec("claude-sonnet-5"), api: "openai-completions" } as ModelSpec<Api>;
 		expect(deriveAnthropicAwsModels([nonMessages])).toHaveLength(0);
-	});
-
-	it("includes the provider's default model in the platform list", () => {
-		// The anthropic-aws catalog entry's defaultModel must be derivable.
-		expect(ANTHROPIC_AWS_PLATFORM_MODEL_IDS).toContain("claude-opus-4-8");
-	});
-
-	it("bundles the configured default model", () => {
-		const defaultModel = providerEntry("anthropic-aws")?.defaultModel;
-		expect(defaultModel).toBe("claude-opus-4-8");
-		expect(getBundledModel("anthropic-aws", defaultModel!)).toMatchObject({
-			id: defaultModel,
-			provider: "anthropic-aws",
-			baseUrl: "https://aws-external-anthropic.us-east-1.api.aws",
-		});
 	});
 });

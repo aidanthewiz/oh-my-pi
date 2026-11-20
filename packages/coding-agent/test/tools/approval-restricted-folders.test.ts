@@ -246,6 +246,7 @@ function harness(
 					tools: new Map(),
 					assistantThinkingRenderers: [],
 					assistantTextRenderers: [],
+					transcriptPresenters: [],
 					linkSchemes: [],
 					fileWriteFallbackHandlers: [],
 					fileDeleteFallbackHandlers: [],
@@ -269,7 +270,7 @@ function harness(
 	runner.initialize(
 		{
 			sendMessage: () => {},
-			sendUserMessage: () => {},
+			sendUserMessage: async () => {},
 			appendEntry: () => {},
 			setLabel: () => {},
 			getActiveTools: () => [],

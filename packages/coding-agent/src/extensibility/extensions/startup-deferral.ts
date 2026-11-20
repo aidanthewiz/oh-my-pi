@@ -10,11 +10,13 @@
  */
 import * as fs from "node:fs/promises";
 import { isRecord, logger } from "@oh-my-pi/pi-utils";
-import type { AgentStorage } from "../../session/agent-storage";
+import type { AgentStorageApi } from "../../session/agent-storage";
 import { resolvePath } from "../utils";
 import type { Extension } from "./types";
 
-const CACHE_PREFIX = "extension_startup:v1:";
+// Bumped whenever canBindAfterStartup counts a new registration, so verdicts recorded without it
+// are not trusted.
+const CACHE_PREFIX = "extension_startup:v2:";
 const CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 
 interface StartupVerdict {
@@ -37,7 +39,7 @@ async function fingerprintSource(resolvedPath: string): Promise<string | undefin
 	}
 }
 
-function readVerdict(storage: AgentStorage, resolvedPath: string): StartupVerdict | undefined {
+function readVerdict(storage: AgentStorageApi, resolvedPath: string): StartupVerdict | undefined {
 	try {
 		const raw = storage.getCache(`${CACHE_PREFIX}${resolvedPath}`);
 		if (!raw) return undefined;
@@ -58,7 +60,11 @@ export function canBindAfterStartup(extension: Extension): boolean {
 		extension.shortcuts.size === 0 &&
 		extension.composerShapes.size === 0 &&
 		extension.fileWriteFallbackHandlers.length === 0 &&
-		extension.fileDeleteFallbackHandlers.length === 0
+		extension.fileDeleteFallbackHandlers.length === 0 &&
+		extension.assistantTextRenderers.length === 0 &&
+		extension.assistantThinkingRenderers.length === 0 &&
+		extension.linkSchemes.length === 0 &&
+		extension.messageRenderers.size === 0
 	);
 }
 
@@ -68,7 +74,7 @@ export function canBindAfterStartup(extension: Extension): boolean {
  * Order within each list follows `paths`.
  */
 export async function partitionStartupExtensions(
-	storage: AgentStorage,
+	storage: AgentStorageApi,
 	paths: readonly string[],
 	cwd: string,
 ): Promise<StartupExtensionPartition> {
@@ -91,7 +97,7 @@ export async function partitionStartupExtensions(
  * Record each freshly bound file-backed extension's observed startup verdict.
  * Later registrations and dependency/environment changes are not classified.
  */
-export async function recordStartupVerdicts(storage: AgentStorage, extensions: readonly Extension[]): Promise<void> {
+export async function recordStartupVerdicts(storage: AgentStorageApi, extensions: readonly Extension[]): Promise<void> {
 	const expiresAtSec = Math.floor((Date.now() + CACHE_TTL_MS) / 1000);
 	await Promise.all(
 		extensions.map(async extension => {

@@ -9,7 +9,9 @@
  */
 
 import { InternalUrlRouter } from "../internal-urls";
-import { FileChangeType, notifyWorkspaceWatchedFiles } from "../lsp/client";
+import { logger } from "@oh-my-pi/pi-utils";
+import { notifyWorkspaceWatchedFiles } from "../lsp/client";
+import { FileChangeType } from "../lsp/types";
 import type { ToolSession } from ".";
 import { resolvePlanPath, targetsLocalSandbox } from "./plan-mode-guard";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
@@ -93,31 +95,27 @@ export async function routeWriteThroughBridge(
 	try {
 		await bridge.writeTextFile({ path: absolutePath, content });
 	} catch (error) {
-		throw new ToolError(error instanceof Error ? error.message : String(error));
+		throw new ToolError(
+			`ACP write did not return success; the file may have changed: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	} finally {
+		session.bumpFileMutationVersion?.(absolutePath);
 	}
-	if (session.enableLsp ?? true) {
-		await notifyWorkspaceWatchedFiles(session.cwd, [{ filePath: absolutePath, type: changeType }], signal);
-	}
-	session.bumpFileMutationVersion?.(absolutePath);
-
-	// Best-effort verification: the client already flushed the write (that's
-	// the whole point of `fs/write_text_file`), so the file on disk reflects
-	// whatever the client actually persisted, formatter and all. If the
-	// read-back itself fails, fall back to trusting `content` rather than
-	// failing an otherwise-successful write. This is a best-effort signal,
-	// not a guarantee: ACP defines no ordering between a client acking the
-	// write and its own async format-on-save settling, so a client that acks
-	// before its formatter runs will look verbatim here. That degrades to
-	// the pre-fix behavior for THIS write, but never corrupts state: the
-	// next `readText` still observes whatever the client eventually settles
-	// on, and a real desync there surfaces as an honest stale-tag error
-	// instead of a silently wrong tag.
-	let actualText = content;
+	let actualText: string;
 	try {
 		actualText = await Bun.file(absolutePath).text();
-	} catch {
-		// Unreadable right after a reported-successful write; nothing more we
-		// can verify here.
+	} catch (error) {
+		throw new ToolError(
+			`ACP acknowledged the write to ${absolutePath}, but its persisted contents could not be verified; the file may have changed: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
+	if (session.enableLsp ?? true) {
+		try {
+			// The editor already committed; notification cannot cancel or undo that operation.
+			await notifyWorkspaceWatchedFiles(session.cwd, [{ filePath: absolutePath, type: changeType }]);
+		} catch (error) {
+			logger.warn("LSP notification failed after an acknowledged ACP write", { path: absolutePath, error });
+		}
 	}
 	return { text: actualText, driftedFromRequest: actualText !== content };
 }

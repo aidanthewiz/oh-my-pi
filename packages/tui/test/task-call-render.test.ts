@@ -1,6 +1,4 @@
 import { beforeAll, describe, expect, it } from "bun:test";
-import * as os from "node:os";
-import * as path from "node:path";
 import { getThemeByName, setThemeInstance, type Theme } from "@oh-my-pi/pi-tui/theme";
 import type { TaskParams } from "@oh-my-pi/pi-tui/tools/task";
 import { taskToolRenderer } from "@oh-my-pi/pi-tui/tools/task";
@@ -15,7 +13,7 @@ describe("task renderer: streaming call preview", () => {
 		setThemeInstance(theme);
 	});
 
-	function render(args: TaskParams, expanded = false): string {
+	function render(args: Parameters<typeof taskToolRenderer.renderCall>[0], expanded = false): string {
 		const component = taskToolRenderer.renderCall(args, { expanded, isPartial: true }, theme);
 		return Bun.stripANSI(component.render(160).join("\n"));
 	}
@@ -64,33 +62,49 @@ describe("task renderer: streaming call preview", () => {
 		expect(out).toContain("First");
 	});
 
-	it("shows an unnamed streamed task file as a shortened, sanitized path in both renderers", () => {
-		const args: TaskParams = { taskFile: path.join(os.homedir(), "prompts", "review\t\x1b[31mauth\x1b[0m\n.md") };
-		const expected = "~/prompts/review auth .md";
-		const out = render(args);
-		const view = taskToolRenderer.describeCall(args, { argsComplete: false, expanded: false, isPartial: true });
+	it("preserves a flat assignment and context while adjacent fields have invalid streamed types", () => {
+		const out = render({
+			name: "ReviewAuth",
+			agent: 42,
+			task: "Review the authentication boundary.",
+			context: "Keep existing account authority.",
+			tasks: "[",
+		});
+		const row = out.split("\n").find(line => line.includes("ReviewAuth"));
 
-		expect(out).toContain(expected);
-		expect(out).not.toContain(os.homedir());
-		expect(view?.body).toMatchObject([{ k: "agent", p: { name: "agent", task: expected, status: "pending" } }]);
+		expect(out).toContain("Keep existing account authority.");
+		expect(row).toContain("Review the authentication boundary.");
 	});
 
-	it("shows each batch task file in both pending previews", () => {
-		const args: TaskParams = {
+	it("preserves valid batch assignments and their order around malformed entries", () => {
+		const out = render({
 			tasks: [
-				{ taskFile: path.join(os.homedir(), "prompts", "review.md") },
-				{ name: "Implement", taskFile: "/tmp/implementation.md" },
+				null,
+				7,
+				{ name: "Partial", agent: { name: "scout" }, task: "Inspect the streamed arguments." },
+				{ name: "Review", agent: "reviewer", task: "Review the final assignment." },
 			],
+		});
+		const lines = out.split("\n");
+		const partial = lines.find(line => line.includes("Partial"));
+		const review = lines.find(line => line.includes("Review:"));
+
+		expect(partial).toContain("Inspect the streamed arguments.");
+		expect(review).toContain("Review the final assignment.");
+		expect(review).toContain(`${theme.format.bracketLeft}reviewer${theme.format.bracketRight}`);
+		expect(out.indexOf("Partial")).toBeLessThan(out.indexOf("Review:"));
+	});
+
+	it("previews a stepped item by its first step and step count in both renderers", () => {
+		const args: TaskParams = {
+			tasks: [{ name: "Implement", steps: ["Add the parser.\nDetails follow.", "Wire it in.", "Test it."] }],
 		};
 		const out = render(args);
 		const view = taskToolRenderer.describeCall(args, { argsComplete: true, expanded: false, isPartial: false });
 
-		expect(out).toContain("#1: ~/prompts/review.md");
-		expect(out).toContain("Implement: /tmp/implementation.md");
-		expect(view?.body).toMatchObject([
-			{ k: "agent", p: { name: "#1", task: "~/prompts/review.md" } },
-			{ k: "agent", p: { name: "Implement", task: "/tmp/implementation.md" } },
-		]);
+		expect(out).toContain("Implement: Add the parser. [3 steps]");
+		expect(view?.body).toMatchObject([{ k: "agent", p: { name: "Implement" } }]);
+		expect(JSON.stringify(view?.body)).toContain("Add the parser.");
 	});
 
 	it("always renders the full task markdown, collapsed or expanded", () => {

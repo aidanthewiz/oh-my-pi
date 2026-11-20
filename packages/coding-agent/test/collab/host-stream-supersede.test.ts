@@ -15,7 +15,6 @@ import { CollabHost } from "@oh-my-pi/pi-coding-agent/collab/host";
 import { COLLAB_PROTO, type CollabFrame, parseCollabLink } from "@oh-my-pi/pi-coding-agent/collab/protocol";
 import { CollabSocket } from "@oh-my-pi/pi-coding-agent/collab/relay-client";
 import type {
-	AgentSessionEvent,
 	AgentSessionLifecycleEvent,
 	AgentSessionLifecycleListener,
 } from "@oh-my-pi/pi-coding-agent/session/agent-session-events";
@@ -28,10 +27,13 @@ import {
 	waitFor,
 } from "./helpers/throttled-host";
 
-const cleanups: (() => void)[] = [];
-afterEach(() => {
-	for (const cleanup of cleanups.splice(0).reverse()) cleanup();
-	uninstallInMemoryRelay();
+const cleanups: (() => void | Promise<void>)[] = [];
+afterEach(async () => {
+	try {
+		for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
+	} finally {
+		uninstallInMemoryRelay();
+	}
 });
 
 function assistant(text: string) {
@@ -63,7 +65,7 @@ function streamedUpdate(text: string, delta: string): AgentSessionLifecycleEvent
 	};
 }
 
-function textOf(event: AgentSessionEvent): string {
+function textOf(event: AgentSessionLifecycleEvent): string {
 	if (event.type !== "message_update" || event.message.role !== "assistant") return "";
 	const block = event.message.content[0];
 	return block?.type === "text" ? block.text : "";
@@ -90,7 +92,7 @@ it("supersedes queued updates of a streaming message instead of ending the room"
 		for (const listener of listeners.slice()) listener(event);
 	};
 	const host = new CollabHost(ctx);
-	cleanups.push(() => void host.stop("test done"));
+	cleanups.push(() => host.stop("test done"));
 
 	await host.start("ws://localhost:8788");
 	const parsed = parseCollabLink(host.link);
@@ -100,11 +102,11 @@ it("supersedes queued updates of a streaming message instead of ending the room"
 
 	const guest = new CollabSocket({ wsUrl: parsed.wsUrl, role: "guest", key });
 	cleanups.push(() => guest.close());
-	const events: AgentSessionEvent[] = [];
+	const events: AgentSessionLifecycleEvent[] = [];
 	const welcomed = Promise.withResolvers<void>();
 	guest.onFrame = (frame: CollabFrame) => {
 		if (frame.t === "welcome") welcomed.resolve();
-		if (frame.t === "event") events.push(frame.event as AgentSessionEvent);
+		if (frame.t === "event") events.push(frame.event);
 	};
 	guest.onOpen = () => guest.send({ t: "hello", proto: COLLAB_PROTO, name: "watcher" });
 	guest.connect();

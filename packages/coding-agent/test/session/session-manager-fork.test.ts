@@ -680,7 +680,6 @@ describe("SessionManager.forkFrom", () => {
 			await source.close();
 		}
 	});
-
 	it("does not copy artifacts when the caller opts out", async () => {
 		using tempDir = TempDir.createSync("@omp-session-fork-no-artifacts-");
 		const { cwd, sessionDir, sourceFile } = await createSessionWithArtifacts(tempDir.path());

@@ -38,6 +38,8 @@ async function resolveEnvInChild(opts: {
 	ambient: Record<string, string | undefined>;
 	keys: string[];
 	childKeys?: string[];
+	trustedKeys?: string[];
+	runtimeOverlay?: Record<string, string>;
 	managed: boolean;
 	cwd?: string;
 	projectEnvContent?: string;
@@ -85,11 +87,13 @@ async function resolveEnvInChild(opts: {
 		await Bun.write(
 			probePath,
 			[
-				`import { $env, filterChildShellEnv, filterUserMcpChildEnv } from ${JSON.stringify(envUrl)};`,
+				`import { $env, filterChildShellEnv, filterUserMcpChildEnv, getTrustedEnvValue } from ${JSON.stringify(envUrl)};`,
 				`const keys = ${JSON.stringify(opts.keys)};`,
 				`const childKeys = ${JSON.stringify(opts.childKeys ?? [])};`,
 				`const spawnedChildKeys = ${JSON.stringify(opts.spawnedChildKeys ?? [])};`,
 				"const out = {};",
+				`Object.assign(Bun.env, ${JSON.stringify(opts.runtimeOverlay ?? {})});`,
+				`for (const key of ${JSON.stringify(opts.trustedKeys ?? [])}) out['trusted:' + key] = getTrustedEnvValue(key);`,
 				"for (const k of keys) out[k] = $env[k];",
 				`const childEnv = filterChildShellEnv(Bun.env, process.cwd(), ${JSON.stringify(opts.childOverlay)});`,
 				"for (const k of childKeys) out['child:' + k] = childEnv[k];",
@@ -116,7 +120,8 @@ async function resolveEnvInChild(opts: {
 			// puts OMP_DOTENV_OVERRIDE/OMP_PROFILE in `ambient` can't silently
 			// contradict `managed`/`profile`.
 			...opts.ambient,
-			HOME: opts.profile ? home : process.env.HOME,
+			HOME: home,
+			USERPROFILE: home,
 			...(opts.profile ? { OMP_PROFILE: opts.profile } : { PI_CODING_AGENT_DIR: agentDir }),
 			OMP_DOTENV_OVERRIDE: opts.managed ? "1" : undefined,
 			OMP_CF_PRODUCT_VERSION: opts.managed ? "test-product-version" : undefined,
@@ -161,6 +166,49 @@ async function resolveEnvInChild(opts: {
 }
 
 describe("managed dotenv precedence (OMP_DOTENV_OVERRIDE=1)", () => {
+	it("keeps profile destination authority after a runtime environment mutation", async () => {
+		const out = await resolveEnvInChild({
+			agentEnvContent: "PI_BUILD_URL=https://profile.invalid\n",
+			ambient: { PI_BUILD_URL: "https://launcher.invalid" },
+			projectEnvContent: "PI_BUILD_URL=https://project.invalid\n",
+			runtimeOverlay: { PI_BUILD_URL: "https://runtime.invalid" },
+			keys: ["PI_BUILD_URL"],
+			trustedKeys: ["PI_BUILD_URL"],
+			managed: true,
+		});
+		expect(out.PI_BUILD_URL).toBe("https://runtime.invalid");
+		expect(out["trusted:PI_BUILD_URL"]).toBe("https://profile.invalid");
+	});
+
+	it("does not admit a new destination from an unmanaged project dotenv", async () => {
+		const out = await resolveEnvInChild({
+			agentEnvContent: "",
+			ambient: {},
+			projectEnvContent: "PI_BUILD_URL=https://project.invalid\n",
+			keys: ["PI_BUILD_URL"],
+			trustedKeys: ["PI_BUILD_URL"],
+			managed: false,
+			launchWithNoEnvFile: true,
+		});
+		expect(out.PI_BUILD_URL).toBe("https://project.invalid");
+		expect(out["trusted:PI_BUILD_URL"]).toBeUndefined();
+	});
+
+	it("retains captured launch authority outside managed mode", async () => {
+		const out = await resolveEnvInChild({
+			agentEnvContent: "PI_BUILD_URL=https://profile.invalid\n",
+			ambient: { PI_BUILD_URL: "https://launcher.invalid" },
+			projectEnvContent: "PI_BUILD_URL=https://project.invalid\n",
+			runtimeOverlay: { PI_BUILD_URL: "https://runtime.invalid" },
+			keys: ["PI_BUILD_URL"],
+			trustedKeys: ["PI_BUILD_URL"],
+			managed: false,
+			launchWithNoEnvFile: true,
+		});
+		expect(out.PI_BUILD_URL).toBe("https://runtime.invalid");
+		expect(out["trusted:PI_BUILD_URL"]).toBe("https://launcher.invalid");
+	});
+
 	it("profile .env OVERRIDES a conflicting ambient value", async () => {
 		const out = await resolveEnvInChild({
 			agentEnvContent: "OPENAI_API_KEY=from-dotenv\n",

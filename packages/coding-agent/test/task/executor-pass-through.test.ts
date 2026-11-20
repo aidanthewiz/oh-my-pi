@@ -6,7 +6,9 @@ import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { cfgCompaction } from "@oh-my-pi/pi-coding-agent/session/context-settings";
-import type { LoadExtensionsResult } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
+import type { ToolPathWithSource } from "@oh-my-pi/pi-coding-agent/extensibility/custom-tools";
+import type { LoadExtensionsResult, PreparedExtension } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
+import type { MCPManager } from "@oh-my-pi/pi-coding-agent/mcp/manager";
 import type { CreateAgentSessionOptions, CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession, AgentSessionEvent, PromptOptions } from "@oh-my-pi/pi-coding-agent/session/agent-session";
@@ -117,6 +119,156 @@ function createModelRegistry(
 describe("runSubprocess child policy", () => {
 	afterEach(() => {
 		vi.restoreAllMocks();
+	});
+
+	it("removes MCP and fresh discovery sources for a restricted child", async () => {
+		const session = yieldEmittingSession();
+		const persistedInits: Array<{ restrictToolNames?: boolean; tools: string[] }> = [];
+		vi.spyOn(session.sessionManager, "appendSessionInit").mockImplementation(init => {
+			persistedInits.push(init);
+			return "session-init";
+		});
+		const spy = vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
+		const preloadedExtensionPaths = ["/hostile/extensions/read.ts"];
+		const preloadedPreparedExtensions: PreparedExtension[] = [
+			{
+				path: preloadedExtensionPaths[0]!,
+				resolvedPath: preloadedExtensionPaths[0]!,
+				factory: () => {},
+				error: null,
+			},
+		];
+		const preloadedCustomToolPaths: ToolPathWithSource[] = [
+			{ path: "/hostile/tools/read.ts", source: { provider: "test", providerName: "Test", level: "project" } },
+		];
+		const getTools = vi.fn(() => [{ name: "read", label: "hostile/read" }]);
+		const mcpManager = { getTools } as unknown as MCPManager;
+
+		const result = await runSubprocess({
+			...baseOptions,
+			id: "restricted-child",
+			restrictToolNames: true,
+			mcpManager,
+			preloadedExtensionPaths,
+			preloadedPreparedExtensions,
+			preloadedCustomToolPaths,
+			outputSchema: { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"] },
+			outputSchemaMode: "strict",
+		});
+
+		expect(result.exitCode).toBe(0);
+		const forwarded = spy.mock.calls[0]?.[0];
+		expect(forwarded?.restrictToolNames).toBe(true);
+		expect(forwarded?.enableMCP).toBe(false);
+		expect(forwarded?.mcpManager).toBeUndefined();
+		expect(forwarded?.customTools).toBeUndefined();
+		expect(forwarded?.mcpTools).toBeUndefined();
+		expect(forwarded?.preloadedExtensionPaths).toEqual([]);
+		expect(forwarded?.preloadedCustomToolPaths).toEqual([]);
+		expect(getTools).not.toHaveBeenCalled();
+		expect(forwarded?.outputSchemaMode).toBe("strict");
+		expect(persistedInits).toHaveLength(1);
+		expect(persistedInits[0]).toMatchObject({ restrictToolNames: true, tools: ["read", "yield"] });
+	});
+
+	it("persists xd://-mounted tools from the enabled set", async () => {
+		const session = yieldEmittingSession();
+		vi.spyOn(session, "getActiveToolNames").mockReturnValue(["read", "yield"]);
+		vi.spyOn(session, "getEnabledToolNames").mockReturnValue(["read", "lsp", "yield"]);
+		const appendSessionInit = vi.spyOn(session.sessionManager, "appendSessionInit");
+		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
+
+		const result = await runSubprocess({ ...baseOptions, id: "xdev-child" });
+
+		expect(result.exitCode).toBe(0);
+		expect(appendSessionInit).toHaveBeenCalledWith(expect.objectContaining({ tools: ["read", "lsp", "yield"] }));
+	});
+
+	it("omits transport-only write from the persisted cold-revival contract", async () => {
+		const session = yieldEmittingSession();
+		vi.spyOn(session, "getEnabledToolNames").mockReturnValue(["read", "write", "yield"]);
+		const appendSessionInit = vi.spyOn(session.sessionManager, "appendSessionInit");
+		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
+
+		const result = await runSubprocess({
+			...baseOptions,
+			id: "transport-only-child",
+			agent: { ...baseAgent, tools: ["read"] },
+		});
+
+		expect(result.exitCode).toBe(0);
+		expect(appendSessionInit).toHaveBeenCalledWith(expect.objectContaining({ tools: ["read", "yield"] }));
+	});
+
+	it("persists write when the original subagent contract grants it", async () => {
+		const session = yieldEmittingSession();
+		vi.spyOn(session, "getEnabledToolNames").mockReturnValue(["read", "write", "yield"]);
+		const appendSessionInit = vi.spyOn(session.sessionManager, "appendSessionInit");
+		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
+
+		const result = await runSubprocess({
+			...baseOptions,
+			id: "writable-child",
+			agent: { ...baseAgent, tools: ["read", "write"] },
+		});
+
+		expect(result.exitCode).toBe(0);
+		expect(appendSessionInit).toHaveBeenCalledWith(expect.objectContaining({ tools: ["read", "write", "yield"] }));
+	});
+
+	it("persists @advisor expanded against the spawning owner's roles so cold revival keeps its model", async () => {
+		const session = yieldEmittingSession();
+		const appendSessionInit = vi.spyOn(session.sessionManager, "appendSessionInit");
+		const spy = vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
+		// A nested spawn's owner is a parent subagent whose advisor role overrides the root's.
+		const parentSettings = Settings.isolated({ modelRoles: { advisor: "anthropic/claude-sonnet-4-5" } });
+
+		const result = await runSubprocess({
+			...baseOptions,
+			id: "nested-advised-child",
+			settings: parentSettings,
+			agent: { ...baseAgent, advisor: "@advisor:high" },
+		});
+
+		expect(result.exitCode).toBe(0);
+		expect(spy.mock.calls[0]?.[0]?.settings?.getModelRole("advisor")).toBe("anthropic/claude-sonnet-4-5:high");
+		expect(appendSessionInit).toHaveBeenCalledWith(
+			expect.objectContaining({ advisor: "anthropic/claude-sonnet-4-5:high" }),
+		);
+	});
+
+	it("preserves the legacy result shape when no output schema is selected", async () => {
+		const session = yieldEmittingSession();
+		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
+
+		const result = await runSubprocess({ ...baseOptions, id: "legacy-output-child" });
+
+		expect(result.exitCode).toBe(0);
+		expect(Object.hasOwn(result, "structuredOutput")).toBe(false);
+	});
+
+	it("caps caller-requested effort at task.maxEffort", async () => {
+		const model = getBundledModel("openai-codex", "gpt-5.6-sol");
+		if (!model) throw new Error("Expected gpt-5.6-sol model to exist");
+		const settings = Settings.isolated({ "task.maxEffort": "low" });
+		settings.setModelRole("task", `${model.provider}/${model.id}`);
+		const session = yieldEmittingSession();
+		const spy = vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
+
+		const result = await runSubprocess({
+			...baseOptions,
+			agent: { ...baseAgent, model: ["@task"] },
+			id: "subagent-effort-ceiling",
+			effort: "hi",
+			settings,
+			modelRegistry: createModelRegistry(model),
+		});
+
+		expect(result.exitCode).toBe(0);
+		expect(spy.mock.calls[0]?.[0]?.thinkingLevel).toBe(Effort.Low);
+		// The ceiling itself rides into the session so retry-fallback recovery
+		// can re-clamp to it after model swaps.
+		expect(spy.mock.calls[0]?.[0]?.thinkingLevelCeiling).toBe(Effort.Low);
 	});
 
 	it("rejects a spawn when task.maxEffort is below the model floor", async () => {
@@ -293,13 +445,13 @@ describe("runSubprocess per-agent service-tier overrides", () => {
 		expect(childTiers(spy.mock.calls[0]?.[0])).toEqual({});
 	});
 
-	it("resolves the override against the auth-fallback model rather than the requested one", async () => {
+	it("does not substitute the parent model when the requested model has no credentials", async () => {
 		const requested = getBundledModel("anthropic", "claude-sonnet-4-5");
 		const parentModel = getBundledModel("openai-codex", "gpt-5.6-sol");
 		if (!requested || !parentModel) throw new Error("Expected bundled service-tier models to exist");
 		const session = yieldEmittingSession();
 		const spy = vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
-		// The requested Anthropic model has no working credentials; the parent's OpenAI model does.
+		// The parent's credentials cannot authorize a different requested provider.
 		const modelRegistry = createModelRegistry([requested, parentModel], async provider =>
 			provider === parentModel.provider ? "test-key" : undefined,
 		);
@@ -314,10 +466,8 @@ describe("runSubprocess per-agent service-tier overrides", () => {
 			modelRegistry,
 		});
 
-		expect(result.exitCode).toBe(0);
-		expect(spy.mock.calls[0]?.[0]?.model?.provider).toBe(parentModel.provider);
-		// `scale` is an OpenAI-only tier: it lands on the fallback family and never on Anthropic.
-		expect(childTiers(spy.mock.calls[0]?.[0])).toEqual({ openai: "scale" });
+		expect(result.exitCode).toBe(1);
+		expect(spy).not.toHaveBeenCalled();
 	});
 
 	it("scopes a concrete override to the model the session resolves instead of broadcasting it", async () => {

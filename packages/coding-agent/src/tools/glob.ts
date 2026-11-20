@@ -100,7 +100,7 @@ export interface GlobToolOptions {
 	operations?: GlobOperations;
 	/** Remap slash-only paths to the session cwd before root-search validation. */
 	rootPathAlias?: boolean;
-	/** Native glob binding. Override only in tests. */
+	/** Glob backend (`natives.glob`). Override only in tests. */
 	nativeGlob?: typeof natives.glob;
 	/** Filesystem stat used before native scans. Override only in tests. */
 	stat?: typeof fs.promises.stat;
@@ -131,12 +131,21 @@ export class GlobTool implements AgentTool<typeof findSchema, GlobToolDetails> {
 			sessionResolveContext(this.session),
 		);
 
-	async #patterns(pathInput: string | string[] | undefined): Promise<string[]> {
+	async #patterns(
+		pathInput: string | string[] | undefined,
+		filesystem = new InternalUrlFilesystem({
+			context: sessionResolveContext(this.session, { containSkillPaths: true }),
+			tier: searchPathTier({ path: pathInput }),
+		}),
+	): Promise<string[]> {
 		const paths = toPathList(pathInput);
 		const effectivePaths = paths.length > 0 ? paths : ["."];
 		const entries = this.#customOps
 			? effectivePaths
-			: await expandDelimitedPathEntries(effectivePaths, this.session.cwd, { splitter: parseFindPattern });
+			: await expandDelimitedPathEntries(effectivePaths, this.session.cwd, {
+					splitter: parseFindPattern,
+					mixedLocalPaths: filesystem,
+				});
 		const patterns = entries.map(input => normalizePathLikeInput(input).replace(/\\/g, "/"));
 		return this.#rootPathAlias ? patterns.map(pattern => (/^\/+$/.test(pattern) ? "." : pattern)) : patterns;
 	}
@@ -222,16 +231,15 @@ export class GlobTool implements AgentTool<typeof findSchema, GlobToolDetails> {
 		const immediateAbortSignal = this.#customOps?.glob ? signal : preparationController?.signal;
 		const execution = untilAborted(immediateAbortSignal, async () => {
 			const formatScopePath = (targetPath: string): string => formatPathRelativeToCwd(targetPath, this.session.cwd);
-			const aliasResolvedPatterns = await this.#patterns(pathInput);
-			if (aliasResolvedPatterns.some(pattern => /^\/+$/.test(pattern))) {
-				throw new ToolError("Searching from root directory '/' is not allowed");
-			}
 			const internalRouter = InternalUrlRouter.instance();
-			// Internal URLs resolve inside the native walk, bounded by the tier this call was approved at.
 			const urlFilesystem = new InternalUrlFilesystem({
 				context: sessionResolveContext(this.session, { signal, containSkillPaths: true }),
 				tier: resolveToolTier(this, params),
 			});
+			const aliasResolvedPatterns = await this.#patterns(pathInput, urlFilesystem);
+			if (aliasResolvedPatterns.some(pattern => /^\/+$/.test(pattern))) {
+				throw new ToolError("Searching from root directory '/' is not allowed");
+			}
 			const normalizedPatterns = aliasResolvedPatterns.map(pattern => internalRouter.normalize(pattern));
 			if (normalizedPatterns.some(pattern => pattern.length === 0)) {
 				throw new ToolError("`path` must contain non-empty globs or paths");

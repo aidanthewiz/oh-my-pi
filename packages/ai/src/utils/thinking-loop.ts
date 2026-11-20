@@ -483,6 +483,7 @@ export function guardThinkingLoopStream(
 					controller.abort(
 						AIError.attach(new Error(THINKING_LOOP_ERROR_MARKER), AIError.create(AIError.Flag.ThinkingLoop)),
 					);
+					if (options?.waitForTerminalDrain) snapshot = await inner.result();
 					outer.push({
 						type: "error",
 						reason: "error",

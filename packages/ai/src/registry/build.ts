@@ -24,6 +24,7 @@ export type ProviderTransport = Pick<
 	| "prepareRequest"
 	| "mapSimpleOptions"
 	| "prepareModelDiscovery"
+	| "getApiKey"
 >;
 
 function envResolver(env: CompiledAuthProvider["env"]): KeyResolver | undefined {

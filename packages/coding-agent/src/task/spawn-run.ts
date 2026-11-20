@@ -40,12 +40,14 @@ export interface SpawnRunOwner {
 	signal?: AbortSignal;
 	onUpdate?: AgentToolUpdateCallback<TaskToolDetails>;
 	onArtifactsRetained?: (cleanup: () => Promise<void>) => void;
+	onAgentRegistered?: (ref: AgentRef) => void;
 }
 
 export class SpawnRun {
 	readonly #controller = new AbortController();
 	#onUpdate: AgentToolUpdateCallback<TaskToolDetails> | undefined;
 	#onArtifactsRetained: ((cleanup: () => Promise<void>) => void) | undefined;
+	#onAgentRegistered: ((ref: AgentRef) => void) | undefined;
 	/**
 	 * The subagent's finished tool calls with their results, as the `tools`
 	 * source of its job widget; closed once the run settles.
@@ -77,6 +79,7 @@ export class SpawnRun {
 					tools: this.tools,
 					onAgentRegistered: ref => {
 						this.#ownerRef = new WeakRef(ref);
+						this.#onAgentRegistered?.(ref);
 					},
 				});
 			} finally {
@@ -101,5 +104,8 @@ export class SpawnRun {
 		}
 		this.#onUpdate = owner.onUpdate;
 		this.#onArtifactsRetained = owner.onArtifactsRetained;
+		this.#onAgentRegistered = owner.onAgentRegistered;
+		const ref = this.ownerRef;
+		if (ref) this.#onAgentRegistered?.(ref);
 	}
 }

@@ -1,4 +1,3 @@
-import { isRecord } from "@oh-my-pi/pi-utils";
 import type { ExtensionUIContext } from "./types";
 
 /** Runs a dialog that waits for the user's answer, so its session can treat the time as the user's, not the agent's. */
@@ -12,15 +11,15 @@ const DIALOGS: Record<string, true> = {
 	editor: true,
 	custom: true,
 	askDialog: true,
+	formDialog: true,
 	approve: true,
 };
 
 type Method = (...args: unknown[]) => unknown;
 
 /**
- * `ui` with each dialog run through `track`, unless its options give it a deadline (`ask.timeout`): such a dialog
- * settles on its own and the agent goes on, possibly with nobody at the machine, so its time stays the agent's. Every
- * other member passes through. Members are read from `ui` on every access, so one it replaces later is the one called.
+ * Hold every pending dialog, including timed dialogs, until it settles.
+ * Other members pass through; replaced methods are resolved on each access.
  */
 export function trackUserWaits(ui: ExtensionUIContext, track: UserWaitTracker): ExtensionUIContext {
 	// Wrappers keep their identity while the member they wrap does.
@@ -32,10 +31,7 @@ export function trackUserWaits(ui: ExtensionUIContext, track: UserWaitTracker): 
 			const cached = methods.get(property);
 			if (cached?.value === value) return cached.method;
 			const method: Method = Object.hasOwn(DIALOGS, property)
-				? (...args) =>
-						args.some(arg => isRecord(arg) && typeof arg.timeout === "number" && arg.timeout > 0)
-							? value.apply(target, args)
-							: track(() => value.apply(target, args))
+				? (...args) => track(() => value.apply(target, args))
 				: value.bind(target);
 			methods.set(property, { value: value as Method, method });
 			return method;

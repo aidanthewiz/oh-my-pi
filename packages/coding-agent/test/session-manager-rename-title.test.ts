@@ -111,7 +111,8 @@ describe("SessionManager.renameSessionTitle", () => {
 		const absolute = path.join(directory, "literal:12-34.jsonl");
 		fs.renameSync(original, absolute);
 		const relativeDirectory = path.relative(process.cwd(), directory);
-		const listed = await SessionManager.listForPicker(tempDir.path(), relativeDirectory, undefined, "directory");
+		const listing = await SessionManager.listForPicker(tempDir.path(), relativeDirectory, undefined, "directory");
+		const listed = await listing.complete;
 		expect(listed.map(session => session.path)).toEqual([path.join(relativeDirectory, "literal:12-34.jsonl")]);
 		expect(await SessionManager.renameSessionTitle(listed[0]!.path, "Relative  Title")).toBe("Relative Title");
 		expect(await SessionManager.renameSessionTitle(absolute, "Absolute  Title")).toBe("Absolute Title");

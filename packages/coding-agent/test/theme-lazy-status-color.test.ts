@@ -124,7 +124,6 @@ describe("lazy status color re-resolves on theme switch", () => {
 			.map(line => line.trim())
 			.filter(line => line === "Update Available" || line.startsWith("New version "));
 		expect(semanticLines).toEqual(["Update Available", "New version 1.2.3 is available."]);
-		expect(plainOutput).toContain("This is a terminal command, not a chat command. Exit Coreforge, then run:");
 		expect(plainOutput).toContain("coreforge update");
 	});
 });

@@ -22,6 +22,7 @@ import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import { runSubagentFollowUpTurn, runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
 import { __resetDirsFromEnvForTests, removeWithRetries, setAgentDir } from "@oh-my-pi/pi-utils";
 import { createInMemoryAuthStorage } from "../helpers/agent-session-setup";
+import { localSession } from "../helpers/local-session";
 
 const AGENT_ID = "Reporter";
 const PARENT_ID = "Main";
@@ -151,7 +152,7 @@ async function startRun(options: {
 		id: AGENT_ID,
 		parentAgentId: PARENT_ID,
 		asyncJobManager: manager,
-		structured: options.structured ?? false,
+		outputSchema: options.structured ? {} : undefined,
 		modelOverride: "mock/mock-model",
 		authStorage,
 		modelRegistry,
@@ -187,8 +188,9 @@ async function startRun(options: {
 
 /** Lets the subagent's current turn, its relays and the parent's deliveries settle. */
 async function settle(): Promise<void> {
-	const session = AgentRegistry.global().get(AGENT_ID)?.session;
-	if (session) {
+	const handle = AgentRegistry.global().get(AGENT_ID)?.session;
+	if (handle) {
+		const session = localSession(handle);
 		await session.waitForIdle();
 		await session.waitForIrcReplies();
 	}
@@ -286,7 +288,10 @@ it("keeps the report when answering the peer takes tool calls", async () => {
 	}
 }, 20_000);
 
-/** Sends `body` from `from` once the report's turn (request 1) has ended, before the run settles. */
+/**
+ * Sends `body` from `from` once the report's loop (request 1) has stopped, before the run settles:
+ * at its pause when background work keeps the run open, else at the run's end.
+ */
 function afterReport(from: string, body: string) {
 	const sent = Promise.withResolvers<{ outcome: string }>();
 	return {
@@ -295,7 +300,7 @@ function afterReport(from: string, body: string) {
 			if (request !== 1) return;
 			const session = AgentRegistry.global().get(AGENT_ID)?.session;
 			const unsubscribe = session?.subscribe(event => {
-				if (event.type !== "agent_end") return;
+				if (event.type !== "agent_end" && event.type !== "agent_pause") return;
 				unsubscribe?.();
 				sent.resolve(IrcBus.global().send({ from, to: AGENT_ID, body }));
 			});
@@ -383,8 +388,12 @@ it("lets the agent answer its own child's question while its run waits on that c
 		},
 	});
 	try {
-		expect((await childAsked.sent).outcome).toBe("woken");
+		await childAsked.sent;
 		await answering.promise;
+		const question = child.mock.calls[1]?.context;
+		if (!question) throw new Error("Child question did not reach a model request");
+		expect(latestInput(question)).toContain(CHILD_ID);
+		expect(latestInput(question)).toContain(PEER_BODY);
 		job.resolve();
 		expect((await child.run).output).toBe(REPORT);
 	} finally {
@@ -453,7 +462,6 @@ it("keeps a follow-up turn's report when a peer message arrives right after it",
 			id: AGENT_ID,
 			agent: { name: "task", description: "test", systemPrompt: "test", tools: ["read"], source: "bundled" },
 			message: "report again",
-			structured: false,
 			artifactsDir: child.artifactsDir,
 		});
 		expect(followUp.output).toBe("FOLLOW_UP_REPORT");
@@ -488,8 +496,7 @@ it("publishes an owned service completion after its task monitor detaches while 
 	try {
 		expect((await child.run).output).toContain("INITIAL_RESULT");
 		release = await held.promise;
-		const session = AgentRegistry.global().get(AGENT_ID)?.session;
-		if (!session) throw new Error("kept-alive subagent has no live session");
+		const session = localSession(AgentRegistry.global().get(AGENT_ID)?.session);
 		expect(session.ircWakesPending).toBe(true);
 		const owner = session.sessionManager.getSessionId();
 		await session.queueLaunchCompletion({
@@ -577,6 +584,7 @@ it("keeps a structured follow-up's yield when a peer message arrives as a turn o
 			agent: { name: "task", description: "test", systemPrompt: "test", tools: ["read"], source: "bundled" },
 			message: "report again",
 			artifactsDir: child.artifactsDir,
+			outputSchema: {},
 		});
 		expect((await peerSent)?.outcome).not.toBe("failed");
 		expect(followUp.output).toContain("FOLLOW_UP");

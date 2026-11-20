@@ -1,7 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { filterModelsByConfiguredScope } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
+import { cfgEnabledModels } from "@oh-my-pi/pi-coding-agent/config/model-settings";
+import { MANAGED_CONFIG_FILE_ENV, MANAGED_CONFIG_FILENAME, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import { acquireFileLock, getProjectAgentDir, logger, TempDir } from "@oh-my-pi/pi-utils";
 import { YAML } from "bun";
@@ -44,6 +47,102 @@ describe("Settings layer refresh", () => {
 		fs.mkdirSync(getProjectAgentDir(project), { recursive: true });
 		fs.writeFileSync(path.join(getProjectAgentDir(project), "settings.json"), JSON.stringify(settings));
 	}
+
+	it("keeps managed model grants and provenance across worker mirrors and live reloads", async () => {
+		delete process.env[MANAGED_CONFIG_FILE_ENV];
+		delete Bun.env[MANAGED_CONFIG_FILE_ENV];
+		delete process.env.PI_CONFIG_FILES;
+		delete Bun.env.PI_CONFIG_FILES;
+		const managedPath = path.join(agentDir, MANAGED_CONFIG_FILENAME);
+		await writeConfig({ enabledModels: ["fixture/global"] });
+		writeProjectSettings(startProject, { enabledModels: ["fixture/project"], extensions: ["./untrusted"] });
+		await Bun.write(
+			managedPath,
+			YAML.stringify({
+				enabledModels: ["fixture/approved"],
+				modelRoles: { default: "fixture/approved" },
+				extensions: ["./trusted"],
+			}),
+		);
+		const owner = await Settings.loadIsolated({ cwd: startProject, agentDir });
+		const mirror = Settings.mirror(
+			{
+				write: () => {
+					throw new Error("Unexpected mirror write");
+				},
+				refresh: async () => {
+					await owner.reloadFromDisk();
+					return owner.mirrorState();
+				},
+				cloneForCwd: cwd => owner.cloneForCwd(cwd),
+			},
+			owner.mirrorState(),
+		);
+		const child = mirror.overlay({}, { derived: true });
+		const models = ["approved", "denied", "project", "global"].map(id =>
+			buildModel({
+				id,
+				name: id,
+				api: "openai-completions",
+				provider: "fixture",
+				baseUrl: "https://fixture.invalid/v1",
+				reasoning: false,
+				input: ["text"],
+				cost: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 8192,
+				maxTokens: 1024,
+			}),
+		);
+		for (const settings of [owner, mirror, child]) {
+			expect(filterModelsByConfiguredScope(models, settings.grantAuthority()).map(model => model.id)).toEqual([
+				"approved",
+			]);
+			expect(settings.getModelRole("default")).toBe("fixture/approved");
+			expect(cfgEnabledModels.provenance(settings)).toBe("managed");
+			expect(settings.getModelRoleProvenance("default")).toBe("managed");
+			expect(settings.extensionsSourceLevel()).toBe("user");
+			expect(settings.getManagedConfigFile()).toBe(managedPath);
+		}
+		expect(() => cfgEnabledModels.override(child, ["fixture/denied"])).toThrow();
+		expect(() => mirror.overlay({ modelRoles: { default: "fixture/denied" } })).toThrow();
+
+		await Bun.write(
+			managedPath,
+			YAML.stringify({ enabledModels: ["fixture/denied"], modelRoles: { default: "fixture/denied" } }),
+		);
+		await mirror.reloadFromDisk();
+		for (const settings of [owner, mirror, child]) {
+			expect(filterModelsByConfiguredScope(models, settings.grantAuthority()).map(model => model.id)).toEqual([
+				"denied",
+			]);
+			expect(settings.getModelRole("default")).toBe("fixture/denied");
+			expect(cfgEnabledModels.provenance(settings)).toBe("managed");
+			expect(settings.getModelRoleProvenance("default")).toBe("managed");
+			expect(settings.getManagedConfigFile()).toBe(managedPath);
+		}
+		expect(() => cfgEnabledModels.override(child, ["fixture/approved"])).toThrow();
+		expect(() => mirror.overlay({ modelRoles: { default: "fixture/approved" } })).toThrow();
+	});
+
+	it("does not turn project role changes into grants when settings cross a worker boundary", () => {
+		const owner = Settings.isolated({ modelRoles: { default: "fixture/operator" }, enabledModels: ["@default"] });
+		owner.setProjectModelRole("default", "fixture/project");
+		const mirror = Settings.mirror(
+			{
+				write: () => {
+					throw new Error("Unexpected mirror write");
+				},
+				refresh: async () => owner.mirrorState(),
+				cloneForCwd: cwd => owner.cloneForCwd(cwd),
+			},
+			owner.mirrorState(),
+		);
+		const child = mirror.overlay({ modelRoles: { default: "fixture/child" } }, { derived: true });
+		expect(mirror.getModelRole("default")).toBe("fixture/project");
+		expect(child.getModelRole("default")).toBe("fixture/child");
+		expect(mirror.grantAuthority().getModelRole("default")).toBe("fixture/operator");
+		expect(child.grantAuthority().getModelRole("default")).toBe("fixture/operator");
+	});
 
 	it("rejects an on-disk value that fails validation and keeps the previous layers", async () => {
 		await writeConfig({ providers: { maxInFlightRequests: { openai: 2 } } });

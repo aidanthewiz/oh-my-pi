@@ -7,11 +7,11 @@ import { sessionFilesFromDisk } from "../internal-urls/registry-helpers";
 import seanceAssignmentTemplate from "../prompts/system/seance-assignment.md" with { type: "text" };
 import seanceTaskGuidanceTemplate from "../prompts/tools/seance-task-guidance.md" with { type: "text" };
 import { buildSessionContext, getRestorableSessionModels } from "../session/session-context";
-import { listSessionsReadOnly } from "../session/session-listing";
+import { findSessionFiles, listSessionsReadOnly } from "../session/session-listing";
 import { sessionDirForCwd } from "../session/session-paths";
 import { resolveSessionLeafId, type SessionEntry } from "../session/session-entries";
 import { FileSessionStorage, type SessionStorage } from "../session/session-storage";
-import { SessionManager, type PersistedSessionInit } from "../session/session-manager";
+import type { PersistedSessionInit } from "../session/session-manager";
 import { loadSessionFile } from "../session/session-loader";
 import type { ModelRegistry } from "../config/model-registry";
 import type { TaskItem, TaskParams } from "@oh-my-pi/pi-tui/tools/task";
@@ -104,8 +104,8 @@ async function validateSourceFile(file: string, storage: SessionStorage): Promis
 
 /**
  * Resolve an explicit session path or an unambiguous stored session id without opening its writer.
- * Ids search the caller's artifact tree, then the current project; `includeGlobal` (user-typed
- * `/seance` ids) also searches every project's sessions.
+ * Ids search the caller's artifact tree, then the current project, then every project by filename,
+ * so a short id copied from `archive` or another project's listing resolves without its path.
  */
 export async function resolveSeanceSource(
 	selector: string,
@@ -113,7 +113,6 @@ export async function resolveSeanceSource(
 		cwd: string;
 		sessionDirHint?: string;
 		artifactsDirHint?: string;
-		includeGlobal?: boolean;
 		storage?: SessionStorage;
 	},
 ): Promise<ResolvedSeanceSource> {
@@ -150,10 +149,10 @@ export async function resolveSeanceSource(
 	const local = await listSessionsReadOnly(sessionDir, storage);
 	const localMatch = chooseId(local, source);
 	if (localMatch) return validateSourceFile(localMatch.path, storage);
-	if (options.includeGlobal) {
-		const matchGlobal = chooseId(await SessionManager.listAll(storage), source);
-		if (matchGlobal) return validateSourceFile(matchGlobal.path, storage);
-	}
+	// Filename lookup: a header scan of every project takes seconds on large session trees.
+	const global = await findSessionFiles(source);
+	if (global.length > 1) throw new Error(`Session selector "${label}" is ambiguous.`);
+	if (global.length === 1) return validateSourceFile(global[0]!, storage);
 	throw new Error(`Session "${label}" was not found.`);
 }
 const modelSelectorInputSchema = type("string | string[]");
@@ -172,10 +171,8 @@ function validateSeanceFields(
 	if (agent !== SEANCE_AGENT_NAME) {
 		if (item.sourceSession !== undefined)
 			return `\`sourceSession\` is only accepted for the \`${SEANCE_AGENT_NAME}\` agent.`;
-		// Elsewhere `model` is the per-call selector, decided by `task.perCallModel` at preflight.
 		return undefined;
 	}
-	// Hidden bundled seance (plan mode, policy) is rejected at spawn; a custom shadow is an ordinary agent.
 	if (!seanceAdvertised) return undefined;
 	if (typeof item.sourceSession !== "string" || item.sourceSession.trim().length === 0) {
 		return `${label} selects the \`${SEANCE_AGENT_NAME}\` agent and requires a non-empty \`sourceSession\`.`;
@@ -281,9 +278,7 @@ export async function prepareSeance(context: {
 	return {
 		modelPatterns,
 		session: {
-			fork: {
-				sourceFile: source.file,
-			},
+			fork: { sourceFile: source.file },
 			promptSuffix: resolvedModel =>
 				prompt.render(seanceAssignmentTemplate, {
 					sourceSession: safeSourceLabel(source.id),
@@ -315,19 +310,13 @@ export async function restoreSeanceSession(context: {
 		init.resolvedModel.trim().length === 0 ||
 		!Array.isArray(init.tools) ||
 		!init.tools.every(tool => typeof tool === "string") ||
-		// `grep.enabled`/`glob.enabled` may have trimmed the spawn's list; `read` is the minimum.
 		!init.tools.includes("read") ||
 		typeof cwd !== "string" ||
 		cwd.trim().length === 0
-	) {
+	)
 		return undefined;
-	}
 	const modelPattern = init.resolvedModel.trim();
 	await modelRegistry.awaitBackgroundRefresh().catch(() => {});
 	if (!resolveSessionModelSelector(modelRegistry, modelPattern)) return undefined;
-	return {
-		cwd,
-		modelPattern,
-		toolNames: init.tools.filter(name => readOnlyTools.has(name)),
-	};
+	return { cwd, modelPattern, toolNames: init.tools.filter(name => readOnlyTools.has(name)) };
 }

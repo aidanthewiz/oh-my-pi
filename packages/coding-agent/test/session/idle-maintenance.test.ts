@@ -199,7 +199,7 @@ describe("AgentSession idle maintenance", () => {
 			async finishWithoutWake() {
 				h.jobs?.acknowledgeDeliveries(["idle-job"]);
 				done.resolve("finished");
-				await drive(h.session.settleAsyncWork());
+				await drive(h.session.waitForRunEnd());
 				await flush();
 			},
 		};
@@ -949,22 +949,45 @@ describe("AgentSession idle maintenance", () => {
 
 		it("recaps on schedule while background work that can still wake the session runs", async () => {
 			const h = await startSession({ backgroundJobs: true });
-			h.enable();
+			const recap = Promise.withResolvers<string>();
+			h.session.enableIdleMaintenance({
+				onRecap: text => {
+					h.recaps.push(text);
+					recap.resolve(text);
+				},
+			});
+			const held = h.side.hold();
 			const job = startBackgroundJob(h);
 
-			await runTurn(h);
-			expect(h.session.hasPendingAsyncWork()).toBe(true);
-			await elapse(RECAP_DELAY_MS - 1);
-			expect(sideCalls(h)).toBe(0);
-			vi.advanceTimersByTime(1);
-			await until(() => h.recaps.length === 1, "the recap");
-			await flush();
-			await elapse(3 * RECAP_DELAY_MS);
+			try {
+				await runTurn(h);
+				expect(h.session.wakeSources).toBeDefined();
+				await elapse(RECAP_DELAY_MS - 1);
+				expect(sideCalls(h)).toBe(0);
+				vi.advanceTimersByTime(1);
+				await wait(held.started);
+				expect(h.session.wakeSources).toBeDefined();
+				expect(h.recaps).toEqual([]);
+				expect(journal()).toEqual([]);
 
-			expect(h.session.hasPendingAsyncWork()).toBe(true);
+				held.release({ content: [RECAP] });
+				expect(await wait(recap.promise)).toBe(RECAP);
+				await flush();
+				await elapse(3 * RECAP_DELAY_MS);
+
+				expect(h.session.wakeSources).toBeDefined();
+				expect(sideCalls(h)).toBe(1);
+				expect(h.recaps).toEqual([RECAP]);
+				expect(journal()).toEqual([RECAP]);
+			} finally {
+				held.release({ content: [RECAP] });
+				await job.finishWithoutWake();
+			}
+			expect(h.session.wakeSources).toBeUndefined();
+			await elapse(RECAP_DELAY_MS);
 			expect(sideCalls(h)).toBe(1);
 			expect(h.recaps).toEqual([RECAP]);
-			await job.finishWithoutWake();
+			expect(journal()).toEqual([RECAP]);
 		});
 
 		it("holds idle compaction while background work can still wake the session, then compacts once it drains without a wake", async () => {
@@ -985,7 +1008,7 @@ describe("AgentSession idle maintenance", () => {
 			expect(compaction).not.toHaveBeenCalled();
 
 			await job.finishWithoutWake();
-			expect(h.session.hasPendingAsyncWork()).toBe(false);
+			expect(h.session.wakeSources).toBeUndefined();
 			await elapse(COMPACTION_DELAY_MS);
 			await until(() => compaction.mock.calls.length === 1, "the idle compaction pass");
 			await elapse(2 * COMPACTION_DELAY_MS);

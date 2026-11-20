@@ -167,6 +167,7 @@ function createHarness(options?: { hangPrompt?: boolean; asyncJobManager?: Async
 		sessionManager: SessionManager.inMemory(),
 		getActiveToolNames: () => ["read", "yield"],
 		getEnabledToolNames: () => ["read", "yield"],
+		getMountedXdevToolNames: () => [],
 		getToolByName: () => undefined,
 		setActiveToolsByName: async () => {},
 		setWorkPoolYieldItems: () => {},
@@ -192,9 +193,8 @@ function createHarness(options?: { hangPrompt?: boolean; asyncJobManager?: Async
 		prepareForHeadlessAdvisorDrain: () => {},
 		waitForAdvisorCatchup: async () => true,
 		getLastAssistantMessage: () => messages[messages.length - 1],
-		hasPendingAsyncWork: () => false,
 		getAsyncJobSnapshot: () => ({ running: [], recent: [] }),
-		settleAsyncWork: async () => {},
+		waitForRunEnd: async () => {},
 		abort: async () => {
 			abortEntered.resolve();
 		},
@@ -207,6 +207,7 @@ function createHarness(options?: { hangPrompt?: boolean; asyncJobManager?: Async
 			wakeObserver = observer;
 		},
 		trackIrcReply: () => {},
+		hasIrcInterrupts: () => false,
 		holdIrcWakes: () => () => {},
 		hasQueuedIrcFrom: () => false,
 		subscribeRunState: () => () => {},
@@ -516,7 +517,7 @@ await withArtifactPublicationLock(async () => {
 	it("terminalizes the ref when an autonomous wake turn's yield is accepted", async () => {
 		const harness = createHarness();
 		registerRunning(harness.session);
-		attachIrcWakeTurnMonitor(harness.session, { id: AGENT_ID, agent: baseAgent });
+		attachIrcWakeTurnMonitor(harness.session, { id: AGENT_ID, agent: baseAgent, outputSchema: {} });
 		const observer = harness.wakeObserver();
 		expect(observer).toBeDefined();
 
@@ -556,7 +557,7 @@ await withArtifactPublicationLock(async () => {
 			session: harness.session,
 			status: "idle",
 		});
-		attachIrcWakeTurnMonitor(harness.session, { id: AGENT_ID, agent: baseAgent });
+		attachIrcWakeTurnMonitor(harness.session, { id: AGENT_ID, agent: baseAgent, outputSchema: {} });
 		const observer = harness.wakeObserver();
 		if (!observer) throw new Error("wake-turn observer was not registered");
 
@@ -610,7 +611,6 @@ await withArtifactPublicationLock(async () => {
 		attachIrcWakeTurnMonitor(harness.session, {
 			id: AGENT_ID,
 			agent: baseAgent,
-			structured: false,
 			artifactsDir,
 		});
 		const observer = harness.wakeObserver();
@@ -700,7 +700,7 @@ await withArtifactPublicationLock(async () => {
 			session: harness.session,
 			status: "idle",
 		});
-		attachIrcWakeTurnMonitor(harness.session, { id: AGENT_ID, agent: baseAgent, structured: false, artifactsDir });
+		attachIrcWakeTurnMonitor(harness.session, { id: AGENT_ID, agent: baseAgent, artifactsDir });
 		const observer = harness.wakeObserver();
 		if (!observer) throw new Error("wake-turn observer was not registered");
 		const accepted = '{"report":"accepted verdict"}';
@@ -753,7 +753,6 @@ await withArtifactPublicationLock(async () => {
 				id: AGENT_ID,
 				agent: baseAgent,
 				message: "review the revision",
-				structured: false,
 				artifactsDir,
 			});
 			expect(result.exitCode).toBe(0);
@@ -786,7 +785,7 @@ await withArtifactPublicationLock(async () => {
 			session: harness.session,
 			status: "idle",
 		});
-		attachIrcWakeTurnMonitor(harness.session, { id: AGENT_ID, agent: baseAgent, structured: false, artifactsDir });
+		attachIrcWakeTurnMonitor(harness.session, { id: AGENT_ID, agent: baseAgent, artifactsDir });
 		const observer = harness.wakeObserver();
 		if (!observer) throw new Error("wake-turn observer was not registered");
 
@@ -839,7 +838,7 @@ await withArtifactPublicationLock(async () => {
 			session: harness.session,
 			status: "idle",
 		});
-		attachIrcWakeTurnMonitor(harness.session, { id: AGENT_ID, agent: baseAgent, structured: false, artifactsDir });
+		attachIrcWakeTurnMonitor(harness.session, { id: AGENT_ID, agent: baseAgent, artifactsDir });
 		const observer = harness.wakeObserver();
 		if (!observer) throw new Error("wake-turn observer was not registered");
 		const accepted = '{"report":"accepted verdict"}';
@@ -883,7 +882,7 @@ await withArtifactPublicationLock(async () => {
 			session: harness.session,
 			status: "idle",
 		});
-		attachIrcWakeTurnMonitor(harness.session, { id: AGENT_ID, agent: baseAgent, structured: false, artifactsDir });
+		attachIrcWakeTurnMonitor(harness.session, { id: AGENT_ID, agent: baseAgent, artifactsDir });
 		const observer = harness.wakeObserver();
 		if (!observer) throw new Error("wake-turn observer was not registered");
 		const accepted = '{"report":"accepted verdict"}';
@@ -927,7 +926,7 @@ await withArtifactPublicationLock(async () => {
 			session: harness.session,
 			status: "idle",
 		});
-		attachIrcWakeTurnMonitor(harness.session, { id: AGENT_ID, agent: baseAgent, structured: false, artifactsDir });
+		attachIrcWakeTurnMonitor(harness.session, { id: AGENT_ID, agent: baseAgent, artifactsDir });
 		const observer = harness.wakeObserver();
 		if (!observer) throw new Error("wake-turn observer was not registered");
 
@@ -1013,7 +1012,6 @@ await withArtifactPublicationLock(async () => {
 				id: AGENT_ID,
 				agent: baseAgent,
 				message: "continue",
-				structured: false,
 				artifactsDir,
 				signal: AbortSignal.abort("cancelled"),
 			});
@@ -1098,7 +1096,7 @@ await withArtifactPublicationLock(async () => {
 	it("blocks the parent's wait on a turn its message woke and returns the turn's answer once", async () => {
 		const manager = new AsyncJobManager({});
 		const harness = createHarness({ asyncJobManager: manager });
-		const ircReplies: string[] = [];
+		const inbox: IrcMessage[] = [];
 		const asyncReplies: string[] = [];
 		manager.registerDeliverySink("Parent", (_id, text) => {
 			asyncReplies.push(text);
@@ -1109,8 +1107,9 @@ await withArtifactPublicationLock(async () => {
 			kind: "main",
 			session: {
 				sessionManager: SessionManager.inMemory(),
-				deliverIrcMessage: async (message: { body: string }) => {
-					ircReplies.push(message.body);
+				hasIrcInterrupts: () => inbox.length > 0,
+				deliverIrcMessage: async (message: IrcMessage) => {
+					inbox.push(message);
 					return "injected";
 				},
 			} as unknown as AgentSession,
@@ -1148,8 +1147,15 @@ await withArtifactPublicationLock(async () => {
 				} as unknown as AgentMessage,
 			]);
 			expect(manager.getRunningJobs({ ownerId: "Parent" }).map(job => job.agentId)).toEqual([AGENT_ID]);
+			const receipt = await IrcBus.global().send({ from: "Peer", to: "Parent", body: "review the parser too" });
+			expect(receipt.outcome).not.toBe("failed");
+			const waitTool = new WaitTool(parent);
+			const interrupted = await waitTool.execute("queued-mail-wait", {});
+			expect(interrupted.details).toMatchObject({ interrupted: true, jobs: [] });
+			expect(inbox.splice(0)).toMatchObject([{ from: "Peer", to: "Parent", body: "review the parser too" }]);
+			expect(manager.getRunningJobs({ ownerId: "Parent" }).map(job => job.agentId)).toEqual([AGENT_ID]);
 			let settled = false;
-			const waiting = new WaitTool(parent).execute("parent-wait", {}).then(result => {
+			const waiting = waitTool.execute("parent-wait", {}).then(result => {
 				settled = true;
 				return result;
 			});
@@ -1159,11 +1165,10 @@ await withArtifactPublicationLock(async () => {
 			await finish?.(undefined);
 
 			const result = await waiting;
-			expect(result.details?.jobs).toMatchObject([
-				{ id: AGENT_ID, status: "completed", resultText: "mask path fixed too" },
-			]);
+			expect(result.details?.jobs).toMatchObject([{ id: AGENT_ID, status: "completed" }]);
+			expect(result.details?.jobs?.[0]?.resultText).toContain("mask path fixed too");
 			await manager.drainDeliveries({ timeoutMs: 1000 });
-			expect(ircReplies).toEqual([]);
+			expect(inbox).toEqual([]);
 			expect(asyncReplies).toEqual([]);
 		} finally {
 			await manager.dispose({ timeoutMs: 1000 });
@@ -1387,7 +1392,7 @@ await withArtifactPublicationLock(async () => {
 			session: harness.session,
 			status: "idle",
 		});
-		attachIrcWakeTurnMonitor(harness.session, { id: AGENT_ID, agent: baseAgent, structured: false, artifactsDir });
+		attachIrcWakeTurnMonitor(harness.session, { id: AGENT_ID, agent: baseAgent, artifactsDir });
 		const observer = harness.wakeObserver();
 		if (!observer) throw new Error("wake-turn observer was not registered");
 		// The parent's message reaches the idle child through the real bus and bridge, as a live send would.
@@ -1526,7 +1531,6 @@ await withArtifactPublicationLock(async () => {
 			id: AGENT_ID,
 			agent: baseAgent,
 			message: "original parent request",
-			structured: false,
 		});
 		try {
 			await entered.promise;

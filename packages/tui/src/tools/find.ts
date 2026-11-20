@@ -58,12 +58,29 @@ export interface FindHit {
 	truncated: boolean;
 }
 
+/** One literal keyword line from a file the lexical pass already read; unranked and not semantically judged. */
+export interface FindLexicalMatch {
+	/** Display path relative to {@link FindToolDetails.cwd}, or an internal URL under URL scopes. */
+	rel: string;
+	/** 1-based line number in the file. */
+	line: number;
+	/** Verbatim source line, trimmed and clipped. */
+	snippet: string;
+}
+
 /**
  * How much of a search the judge actually covered. `unavailable`: every judge
  * request failed, so an empty result is not evidence of absence. `partial`:
- * some requests failed. `complete`: none failed (or none were needed).
+ * some requests failed, or the call's deadline cut verification short.
+ * `complete`: none failed (or none were needed).
  */
 export type FindCoverage = "complete" | "partial" | "unavailable";
+
+/** Verification cut short by the call's deadline: complete passages verified of those routed to it. */
+export interface FindTimeout {
+	verified: number;
+	passages: number;
+}
 
 /** Search accounting reported alongside the hits. */
 export interface FindStats {
@@ -98,8 +115,12 @@ export interface FindToolDetails {
 	/** Verified-passage probability at or above which a file is a hit. */
 	threshold: number;
 	hits: FindHit[];
+	/** Literal keyword lines from the already-read files, present when every judge request failed. */
+	lexicalFallback?: FindLexicalMatch[];
 	coverage: FindCoverage;
 	stats: FindStats;
+	/** Set when the deadline ended verification; the hits are those verified before it. */
+	timeout?: FindTimeout;
 	elapsedMs: number;
 	/** Session cwd; hit paths are relative to it. */
 	cwd: string;
@@ -310,20 +331,35 @@ export const findToolRenderer = {
 		if (failed) meta.push(uiTheme.fg("warning", failed));
 		const unanswered = stats.unanswered > 0 ? `${stats.unanswered} unanswered` : undefined;
 		if (unanswered) meta.push(uiTheme.fg("warning", unanswered));
+		const { timeout } = details;
+		if (timeout)
+			meta.push(uiTheme.fg("warning", `timed out, ${timeout.verified}/${timeout.passages} passages verified`));
 
 		if (hits.length === 0) {
 			const emptyMeta = ["0 hits", ...scope, `$${stats.cost.toFixed(4)}`, formatDuration(details.elapsedMs)];
 			if (failed) emptyMeta.push(uiTheme.fg("warning", failed));
 			if (unanswered) emptyMeta.push(uiTheme.fg("warning", unanswered));
+			if (timeout)
+				emptyMeta.push(
+					uiTheme.fg("warning", `timed out, ${timeout.verified}/${timeout.passages} passages verified`),
+				);
 			const header = renderStatusLine(
 				{ icon: "warning", title: "Find", titleColor: "toolTitle", description, meta: emptyMeta },
 				uiTheme,
 			);
+			const fallback = details.lexicalFallback ?? [];
 			const empty =
-				details.coverage === "partial" || stats.unanswered > 0
-					? "No relevant passages found in the judged files"
-					: "No relevant passages found";
+				fallback.length > 0
+					? "Unranked literal keyword matches (not semantically judged)"
+					: details.coverage === "partial" || stats.unanswered > 0
+						? "No relevant passages found in the judged files"
+						: "No relevant passages found";
 			const lines = [header, formatEmptyMessage(empty, uiTheme)];
+			for (const match of fallback) {
+				lines.push(
+					`  ${formatStyledPath(`${match.rel}:${match.line}`, uiTheme)} ${uiTheme.fg("toolOutput", replaceTabs(match.snippet))}`,
+				);
+			}
 			for (const failure of stats.failures) lines.push(uiTheme.fg("warning", failure));
 			return new Text(lines.join("\n"), 0, 0);
 		}
@@ -412,6 +448,10 @@ export const findToolRenderer = {
 		const failed =
 			stats.failed > 0 ? [span(`${stats.failed}/${stats.requests} requests failed`, "warning")] : undefined;
 		const unanswered = stats.unanswered > 0 ? [span(`${stats.unanswered} unanswered`, "warning")] : undefined;
+		const { timeout } = details;
+		const timedOut = timeout
+			? [span(`timed out, ${timeout.verified}/${timeout.passages} passages verified`, "warning")]
+			: undefined;
 		const accounting = [
 			`${stats.filesRead} files read`,
 			`τ ${threshold.toFixed(2)}`,
@@ -423,6 +463,15 @@ export const findToolRenderer = {
 			keyed(text([span(failure, "warning")], { wrap: "word", role: "omp.tool.notice" }), `fail${i}`),
 		);
 		if (hits.length === 0) {
+			const fallback = (details.lexicalFallback ?? []).map((match, i) =>
+				keyed(
+					text([span(`${match.rel}:${match.line}`, "muted"), span(` ${replaceTabs(match.snippet)}`)], {
+						wrap: "word",
+					}),
+					`lex${i}`,
+				),
+			);
+			const body = [...fallback, ...failures];
 			return {
 				tool: findNativeHead(
 					query,
@@ -435,7 +484,7 @@ export const findToolRenderer = {
 				),
 				tone: "warning",
 				inline: true,
-				body: failures.length > 0 ? failures : undefined,
+				body: body.length > 0 ? body : undefined,
 			};
 		}
 		const shown = options.expanded ? hits : hits.slice(0, COLLAPSED_HITS);
@@ -458,6 +507,7 @@ export const findToolRenderer = {
 					scope,
 					failed,
 					unanswered,
+					timedOut,
 				]),
 			),
 			inline: true,

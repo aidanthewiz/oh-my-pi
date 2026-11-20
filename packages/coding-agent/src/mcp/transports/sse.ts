@@ -87,9 +87,18 @@ export class LegacySseTransport implements MCPTransport {
 		return signal ? AbortSignal.any([signal, this.#lifecycleController.signal]) : this.#lifecycleController.signal;
 	}
 
-	#assertRequestOwner(options?: MCPRequestOptions): void {
+	#assertLocalRequestOwner(options?: MCPRequestOptions): void {
+		options?.signal?.throwIfAborted();
 		if (options?.mcpOwnerCurrent?.() === false) {
 			throw new DOMException("MCP request owner changed", "AbortError");
+		}
+	}
+
+	async #assertRequestOwner(options?: MCPRequestOptions): Promise<void> {
+		this.#assertLocalRequestOwner(options);
+		if (options?.mcpCheckOwner) {
+			await options.mcpCheckOwner();
+			this.#assertLocalRequestOwner(options);
 		}
 	}
 
@@ -257,7 +266,7 @@ export class LegacySseTransport implements MCPTransport {
 		options?: MCPRequestOptions,
 	): Promise<T> {
 		options?.signal?.throwIfAborted();
-		this.#assertRequestOwner(options);
+		await this.#assertRequestOwner(options);
 		if (!this.#connected || !this.#endpointUrl) {
 			throw new Error("Transport not connected");
 		}
@@ -319,10 +328,10 @@ export class LegacySseTransport implements MCPTransport {
 			}
 			await response.body?.cancel();
 			const result = await deferred.promise;
-			this.#assertRequestOwner(options);
+			await this.#assertRequestOwner(options);
 			return result as T;
 		} catch (error) {
-			this.#assertRequestOwner(options);
+			await this.#assertRequestOwner(options);
 			this.#pending.delete(id);
 			operation.clear();
 			if (pending.abortHandler) operation.signal?.removeEventListener("abort", pending.abortHandler);
@@ -407,24 +416,27 @@ export class LegacySseTransport implements MCPTransport {
 			Accept: "application/json, text/event-stream",
 		};
 		const payload = JSON.stringify(body);
-		this.#assertRequestOwner(options);
+		await this.#assertRequestOwner(options);
+		this.#assertLocalRequestOwner(options);
 		let response = await this.#fetch(endpointUrl, { method: "POST", body: payload, signal }, generated);
 		const status = AIError.status(response);
 		if (options?.allowAuthRetry === false || !this.onAuthError || (status !== 401 && status !== 403)) return response;
 
 		let refreshedHeaders: Record<string, string> | null;
 		try {
-			this.#assertRequestOwner(options);
+			await this.#assertRequestOwner(options);
+			this.#assertLocalRequestOwner(options);
 			refreshedHeaders = await this.onAuthError();
-			this.#assertRequestOwner(options);
+			await this.#assertRequestOwner(options);
 		} catch (error) {
 			await response.body?.cancel();
 			throw error;
 		}
 		if (!refreshedHeaders) return response;
 		await response.body?.cancel();
-		this.#assertRequestOwner(options);
+		await this.#assertRequestOwner(options);
 		this.#config.headers = refreshedHeaders;
+		this.#assertLocalRequestOwner(options);
 		response = await this.#fetch(endpointUrl, { method: "POST", body: payload, signal }, generated);
 		return response;
 	}

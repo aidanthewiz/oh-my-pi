@@ -6,6 +6,7 @@ import type { Context, Message } from "../src/types";
 import corpus from "./fixtures/factory-droid-native-requests.json" with { type: "json" };
 import { factoryModel, workosJwt } from "./helpers/factory-droid";
 import {
+	mergeNativeCaptures,
 	NATIVE_CASES,
 	type NativeCapture,
 	type NativeCase,
@@ -85,6 +86,7 @@ function resumed(capture: NativeCapture): Message[] {
 async function encode(capture: NativeCapture, turn: 0 | 1): Promise<NativeRequest | undefined> {
 	const model = factoryModel(capture.model, [capture.upstream]);
 	model.factoryDroidOrgId = "org-capture";
+	model.factoryDroidRefusalFallbacks = ["claude-opus-5"];
 	// The capture pinned each upstream through live routing.
 	model.factoryDroidRoutingSource = "configured_order";
 	const disabled = capture.effort === "off" || capture.effort === "none";
@@ -130,5 +132,26 @@ describe("Factory Droid native request parity", () => {
 	)("%s matches the native dialect on every recorded turn", async (_label, capture) => {
 		expect(await encode(capture, 0)).toEqual(capture.requests[0]);
 		if (!capture.prime) expect(await encode(capture, 1)).toEqual(capture.requests[1]);
+	});
+});
+
+describe("mergeNativeCaptures", () => {
+	it("replaces recaptured cases, keeps failed or unselected ones from the previous corpus, drops undeclared ones", () => {
+		const entry = (testCase: NativeCase, tag: string): NativeCapture => ({
+			...testCase,
+			requests: [{ path: tag, headers: {}, body: {} }],
+		});
+		// Declared cases that differ only by `prime`, so a recapture of one must not replace the other.
+		const unprimed: NativeCase = { model: "claude-opus-4-8", upstream: "anthropic", effort: "off" };
+		const primed: NativeCase = { ...unprimed, prime: "high" };
+		const previous = [
+			entry(primed, "old"),
+			entry(unprimed, "old"),
+			entry({ model: "retired-model", upstream: "anthropic", effort: "high" }, "old"),
+		];
+		expect(mergeNativeCaptures(previous, [entry(primed, "new")])).toEqual([
+			entry(unprimed, "old"),
+			entry(primed, "new"),
+		]);
 	});
 });

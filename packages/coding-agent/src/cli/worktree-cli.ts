@@ -12,6 +12,8 @@
  *     marker naming the live omp process. A task-isolation sandbox whose owner
  *     is still running remains protected even with `--all`.
  *     `clear` removes only verified unmounted, unowned task-isolation leftovers.
+ *     An ovnfs-backed sandbox has no `m`; its record names the ovnfs checkout,
+ *     which `clear` removes first (`task/ovnfs.ts`).
  *
  * Legacy entries from before the encoding change keep working because git still
  * tracks them by branch name. This command exists to GC them on demand.
@@ -29,6 +31,7 @@ import {
 	ISOLATION_OWNER_FILE,
 	readRetainedMountBackend,
 } from "../task/isolation-ownership";
+import { releaseOvnfsCheckout } from "../task/ovnfs";
 import { formatIsolationBackend, parseIsolationBackend } from "../task/worktree";
 
 import { cfgIsolationBackend, cfgWorktreeClone } from "../task/settings";
@@ -239,6 +242,7 @@ export async function clearWorktrees(options: ClearWorktreesOptions): Promise<{ 
 				}
 			} else {
 				const stopped = target.kind === "task-isolation" && (await stopRetainedMount(target.path));
+				if (target.kind === "task-isolation") await releaseOvnfsCheckout(target.path);
 				await assertWorktreeRemovalSafe(target.path, { stoppedRoot: stopped });
 				await fs.rm(target.path, { recursive: true, force: true });
 				if (target.parentRepo) parentsToPrune.add(target.parentRepo);

@@ -12,13 +12,14 @@ import { CollabSocket } from "@oh-my-pi/pi-coding-agent/collab/relay-client";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import type { AgentSessionLifecycleListener } from "@oh-my-pi/pi-coding-agent/session/agent-session-events";
 import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { installInMemoryRelay, uninstallInMemoryRelay } from "./helpers/in-memory-relay";
 
 interface Fixture {
 	ctx: InteractiveModeContext;
 	isStreaming: boolean;
-	emit: (event: { type: string; [key: string]: unknown }) => void;
+	emit: AgentSessionLifecycleListener;
 	append: (entry: SessionEntry) => void;
 }
 
@@ -125,15 +126,19 @@ describe("collab host with no joined guest", () => {
 	it("mirrors no events or entries until a guest joins, then delivers the first frame after its welcome", async () => {
 		const fixture = makeFixture();
 		const transport = await startHost(fixture);
-		const send = spyOn(transport, "send").mockImplementation(() => {});
-		spyOn(transport, "sendBatch").mockImplementation(() => {});
+		const send = spyOn(transport, "send").mockImplementation(() => true);
+		spyOn(transport, "broadcastAdvisory").mockImplementation(frame => transport.send(frame));
+		spyOn(transport, "sendBatch").mockImplementation((frames, peer) => {
+			for (const frame of frames) transport.send(frame, peer);
+			return true;
+		});
 
-		fixture.emit({ type: "agent_start" });
+		fixture.emit({ type: "agent_start", runId: "before-join" });
 		fixture.append(textEntry("before-join"));
 		expect(send.mock.calls).toEqual([]);
 
 		transport.onFrame!({ t: "hello", proto: COLLAB_PROTO, name: "guest" }, 1);
-		fixture.emit({ type: "agent_start" });
+		fixture.emit({ type: "agent_start", runId: "after-join" });
 		fixture.append(textEntry("after-join"));
 
 		const types = send.mock.calls.map(([frame]) => frameType(frame));
@@ -145,8 +150,12 @@ describe("collab host with no joined guest", () => {
 	it("drops a pending state refresh when the last peer leaves before the debounce fires", async () => {
 		const fixture = makeFixture();
 		const transport = await startHost(fixture);
-		const send = spyOn(transport, "send").mockImplementation(() => {});
-		spyOn(transport, "sendBatch").mockImplementation(() => {});
+		const send = spyOn(transport, "send").mockImplementation(() => true);
+		spyOn(transport, "broadcastAdvisory").mockImplementation(frame => transport.send(frame));
+		spyOn(transport, "sendBatch").mockImplementation((frames, peer) => {
+			for (const frame of frames) transport.send(frame, peer);
+			return true;
+		});
 		vi.useFakeTimers();
 		transport.onFrame!({ t: "hello", proto: COLLAB_PROTO, name: "guest" }, 1);
 		send.mockClear();
@@ -161,21 +170,25 @@ describe("collab host with no joined guest", () => {
 	it("re-sends a state that matches the last one sent before the room emptied", async () => {
 		const fixture = makeFixture();
 		const transport = await startHost(fixture);
-		const send = spyOn(transport, "send").mockImplementation(() => {});
-		spyOn(transport, "sendBatch").mockImplementation(() => {});
+		const send = spyOn(transport, "send").mockImplementation(() => true);
+		spyOn(transport, "broadcastAdvisory").mockImplementation(frame => transport.send(frame));
+		spyOn(transport, "sendBatch").mockImplementation((frames, peer) => {
+			for (const frame of frames) transport.send(frame, peer);
+			return true;
+		});
 		vi.useFakeTimers();
 		const stateFrames = () => send.mock.calls.filter(([frame]) => frameType(frame) === "state");
 
 		transport.onFrame!({ t: "hello", proto: COLLAB_PROTO, name: "first" }, 1);
 		fixture.isStreaming = true;
-		fixture.emit({ type: "agent_start" });
+		fixture.emit({ type: "agent_start", runId: "first" });
 		vi.advanceTimersByTime(500);
 		expect(stateFrames()).toHaveLength(1);
 
 		// The room empties and the session goes idle while nobody is watching.
 		transport.onControl!({ t: "peer-left", peer: 1 });
 		fixture.isStreaming = false;
-		fixture.emit({ type: "agent_end" });
+		fixture.emit({ type: "agent_end", runId: "first", messages: [], isTerminal: true, yielded: true });
 		vi.advanceTimersByTime(500);
 		expect(stateFrames()).toHaveLength(1);
 
@@ -183,7 +196,7 @@ describe("collab host with no joined guest", () => {
 		// again before the join's state refresh fires must still reach it.
 		transport.onFrame!({ t: "hello", proto: COLLAB_PROTO, name: "first" }, 2);
 		fixture.isStreaming = true;
-		fixture.emit({ type: "agent_start" });
+		fixture.emit({ type: "agent_start", runId: "second" });
 		vi.advanceTimersByTime(500);
 		expect(stateFrames()).toHaveLength(2);
 	});

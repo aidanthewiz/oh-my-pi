@@ -27,8 +27,6 @@ import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manage
 import { __resetDirsFromEnvForTests, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
 import { mockSchedulerWaitWithClock } from "./helpers/mock-scheduler-clock";
 
-import { cfgClaudeResetsAutoRedeem } from "@oh-my-pi/pi-coding-agent/session/settings";
-
 const ACCOUNT_ID = "claude-account";
 const EMAIL = "claude@example.com";
 const ORG_ID = "11111111-1111-4111-8111-111111111111";
@@ -844,8 +842,8 @@ describe("Claude saved-reset trigger integration", () => {
 		expect([...coordinator.lastAttemptAtByAccount.keys()]).toEqual([`anthropic|${ORG_ID}|${CREDENTIAL_ID}`]);
 	});
 
-	it.each(["yes", "no", "unset"] as const)(
-		"consumes an imminent reset without a prompt UI unless auto-redeem is no (%s)",
+	it.each(["unset", "yes", "no"] as const)(
+		"honors explicit headless auto-redeem consent for an imminent reset (%s)",
 		async autoRedeem => {
 			const status = claudeStatus(false);
 			for (const credit of status.credits) {
@@ -865,7 +863,7 @@ describe("Claude saved-reset trigger integration", () => {
 			await session.fetchUsageReports();
 			await coordinator.sweepPromise;
 			expect(targets).toEqual(
-				autoRedeem !== "no"
+				autoRedeem === "yes"
 					? [
 							{
 								provider: "anthropic",
@@ -882,13 +880,11 @@ describe("Claude saved-reset trigger integration", () => {
 			coordinator.lastSweepAt = 0;
 			await session.fetchUsageReports();
 			await coordinator.sweepPromise;
-			expect(targets).toHaveLength(autoRedeem !== "no" ? 1 : 0);
+			expect(targets).toHaveLength(autoRedeem === "yes" ? 1 : 0);
 		},
 	);
 
 	it("does not spend headlessly before independent Claude consent", async () => {
-		// Codex being disabled does not enable Claude, and short of a reset about to expire an unset headless
-		// session cannot spend silently.
 		const status = claudeStatus(false);
 		const { session, coordinator, targets } = buildSession({
 			report: withInventory(claudeReport(0.5), status),
@@ -900,44 +896,66 @@ describe("Claude saved-reset trigger integration", () => {
 		await coordinator.sweepPromise;
 		expect(targets).toHaveLength(0);
 		expect(coordinator.attemptedKeys.size).toBe(0);
-		expect(cfgClaudeResetsAutoRedeem.get(session.settings)).toBe("unset");
 	});
 
-	it("still asks before spending an imminent reset when a prompt UI is available", async () => {
-		const status = claudeStatus(false);
-		for (const credit of status.credits) {
-			credit.expiresAt = new Date(Date.now() + 4 * 60_000).toISOString();
-		}
-		const { availableCount, redeemableCount, eligible, nextCreditId, credits } = status;
-		const report = {
-			...claudeReport(0.5),
-			resetCredits: { availableCount, redeemableCount, eligible, nextCreditId, credits },
-		};
-		status.report = report;
-		const { session, coordinator, targets } = buildSession({
-			withExtensionRunner: true,
-			report,
-			status,
-			autoRedeem: "unset",
-			salvageHorizonHours: 0,
-		});
-		const questions: string[] = [];
-		await initializeExtensions(session, {
-			reportSendError: () => {},
-			reportRuntimeError: () => {},
-			uiContext: Object.create(session.extensionRunner!.getUIContext(), {
-				select: {
-					value: async (question: string) => {
-						questions.push(question);
-						return "No";
+	it.each(["Yes", "No"] as const)(
+		"waits for interactive consent before spending an imminent reset (%s)",
+		async choice => {
+			const status = claudeStatus(false);
+			for (const credit of status.credits) {
+				credit.expiresAt = new Date(Date.now() + 4 * 60_000).toISOString();
+			}
+			const { availableCount, redeemableCount, eligible, nextCreditId, credits } = status;
+			const report = {
+				...claudeReport(0.5),
+				resetCredits: { availableCount, redeemableCount, eligible, nextCreditId, credits },
+			};
+			status.report = report;
+			const { session, coordinator, targets } = buildSession({
+				withExtensionRunner: true,
+				report,
+				status,
+				autoRedeem: "unset",
+				salvageHorizonHours: 0,
+			});
+			const prompted = Promise.withResolvers<void>();
+			const consent = Promise.withResolvers<"Yes" | "No">();
+			await initializeExtensions(session, {
+				reportSendError: () => {},
+				reportRuntimeError: () => {},
+				uiContext: Object.create(session.extensionRunner!.getUIContext(), {
+					select: {
+						value: async () => {
+							prompted.resolve();
+							return consent.promise;
+						},
 					},
-				},
-			}),
-		});
+				}),
+			});
 
-		await session.fetchUsageReports();
-		await coordinator.sweepPromise;
-		expect(questions).toEqual([expect.stringContaining("Spend a saved Claude rate-limit reset?")]);
-		expect(targets).toEqual([]);
-	});
+			const fetching = session.fetchUsageReports();
+			try {
+				await prompted.promise;
+				expect(targets).toEqual([]);
+			} finally {
+				consent.resolve(choice);
+				await fetching;
+				await coordinator.sweepPromise;
+			}
+			expect(targets).toEqual(
+				choice === "Yes"
+					? [
+							{
+								provider: "anthropic",
+								credentialId: CREDENTIAL_ID,
+								creditId: "cedar-grant-1",
+								accountId: ACCOUNT_ID,
+								email: EMAIL,
+								orgId: ORG_ID,
+							},
+						]
+					: [],
+			);
+		},
+	);
 });

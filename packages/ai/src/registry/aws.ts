@@ -51,12 +51,17 @@ function isEc2Host(): boolean {
 
 let awsProfileProbe: { key: string; value: boolean } | undefined;
 
-/** Change stamp of one shared INI file; an unavailable file has its own stamp. */
+/**
+ * Change stamp of one shared INI file. A file that cannot be stat'ed (absent,
+ * `~/.aws` is a regular file, unsearchable parent) shares one stamp:
+ * `readAwsIniSync` reads every such file as absent too.
+ */
 function awsFileStamp(filePath: string): string {
 	try {
 		const stat = fs.statSync(filePath, { throwIfNoEntry: false });
 		return stat ? `${stat.mtimeMs}:${stat.size}` : "-";
 	} catch {
+		// `throwIfNoEntry` covers ENOENT only; ENOTDIR, EACCES and ELOOP still throw.
 		return "-";
 	}
 }

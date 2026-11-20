@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import * as BedrockProvider from "@oh-my-pi/pi-ai/providers/amazon-bedrock";
 import { setBedrockProviderModule, streamBedrock } from "@oh-my-pi/pi-ai/providers/register-builtins";
+import { completeSimple } from "@oh-my-pi/pi-ai/stream";
 import type { AssistantMessage, Context, Model } from "@oh-my-pi/pi-ai/types";
 import type { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
@@ -62,6 +63,72 @@ function createAssistantMessage(
 const baseContext: Context = { messages: [] };
 
 describe("register-builtins lazy streams", () => {
+	it.each(["caller-abort", "provider-failure", "unattributable-result"] as const)(
+		"retains admitted completion custody through %s without inventing usage",
+		async failure => {
+			const entered = Promise.withResolvers<void>();
+			const interrupt = Promise.withResolvers<void>();
+			const final = Promise.withResolvers<AssistantMessage>();
+			const controller = new AbortController();
+			const message = createAssistantMessage();
+			message.usage = {
+				...message.usage,
+				input: 17,
+				output: 5,
+				totalTokens: 22,
+				cost: { ...message.usage.cost, total: 0.25 },
+			};
+			const providerFailure = new AIError.StreamTimeoutError("provider stalled after admission");
+			let draining = false;
+			const source = {
+				async *[Symbol.asyncIterator]() {
+					yield { type: "start", partial: createAssistantMessage() } as const;
+					entered.resolve();
+					await interrupt.promise;
+					throw providerFailure;
+				},
+				result() {
+					draining = true;
+					return final.promise;
+				},
+			} as unknown as AssistantMessageEventStream;
+			setBedrockProviderModule({ streamBedrock: () => source });
+			const billed: number[] = [];
+			let completed = false;
+			const pending = completeSimple(createModel(), baseContext, {
+				signal: controller.signal,
+				waitForTerminalDrain: true,
+				onAttempt: result => billed.push(result.usage.cost.total),
+			}).then(result => {
+				completed = true;
+				return result;
+			});
+			try {
+				await entered.promise;
+				if (failure === "caller-abort") controller.abort(new Error("caller cancelled"));
+				interrupt.resolve();
+				await drainMicrotasksUntil(() => draining, "completion discarded its admitted provider result");
+				expect(completed).toBe(false);
+				expect(billed).toEqual([]);
+				if (failure === "unattributable-result") {
+					final.reject(new Error("provider result unavailable"));
+					await expect(pending).rejects.toBe(providerFailure);
+					expect(billed).toEqual([]);
+				} else {
+					final.resolve(message);
+					const result = await pending;
+					expect(result.stopReason).toBe(failure === "caller-abort" ? "aborted" : "error");
+					expect(result.usage).toMatchObject({ input: 17, output: 5, totalTokens: 22, cost: { total: 0.25 } });
+					expect(billed).toEqual([0.25]);
+				}
+			} finally {
+				interrupt.resolve();
+				final.resolve(message);
+				await pending.catch(() => {});
+			}
+		},
+	);
+
 	it("resolves the outer stream result from source.result() when no terminal event is iterated", async () => {
 		const finalMessage = createAssistantMessage("stop");
 		const partialMessage = createAssistantMessage("stop");

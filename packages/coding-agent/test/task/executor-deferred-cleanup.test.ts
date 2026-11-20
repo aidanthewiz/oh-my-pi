@@ -89,9 +89,7 @@ function mockSession(opts: {
 			return true;
 		},
 		getLastAssistantMessage: () => state.messages[state.messages.length - 1],
-		hasPendingAsyncWork: () => false,
 		getAsyncJobSnapshot: () => ({ running: [], recent: [] }),
-		settleAsyncWork: async () => {},
 		abort: opts.abort ?? (async () => {}),
 		dispose: async () => {
 			disposed = true;

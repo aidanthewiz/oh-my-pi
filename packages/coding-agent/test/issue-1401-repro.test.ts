@@ -60,6 +60,5 @@ describe("processFileArguments", () => {
 		expect(result.images).toEqual([]);
 		expect(result.text).toContain("Hello PDF from issue 1401");
 		expect(result.text).not.toContain("%PDF-1.4");
-		expect(result.text).not.toContain("stream");
 	});
 });

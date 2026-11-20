@@ -63,6 +63,7 @@ const schema = { type: "object", properties: { answer: { type: "integer" } }, re
 type Scenario = { token: string; structured: boolean; fail: boolean };
 let active: Scenario | undefined;
 const wire: Array<{ token: string; child: boolean; tools: string[]; result: string }> = [];
+const pendingInputs = new Set<string>();
 let server: Bun.Server<undefined> | undefined;
 let cleanupRuntime: (() => Promise<void>) | undefined;
 let authClose: (() => Promise<void>) | undefined;
@@ -77,6 +78,7 @@ try {
  assert.equal(digest(await fs.readFile(native.path)), nativeSha256);
  if (compiled) assert(outsideSources(await fs.realpath(native.path)));
  const { createAgentSession } = await import("../../packages/coding-agent/src/sdk");
+ const { encodeResponsesToolCallId } = await import("../../packages/ai/src/providers/openai-shared");
  const { initializeExtensions } = await import("../../packages/coding-agent/src/modes/runtime-init");
  const { Settings } = await import("../../packages/coding-agent/src/config/settings");
  const { ModelRegistry } = await import("../../packages/coding-agent/src/config/model-registry");
@@ -106,12 +108,27 @@ try {
    assert(tool && typeof tool === "object" && "name" in tool && typeof tool.name === "string");
    return tool.name;
   });
+  const input = body.input as Array<Record<string, unknown>>;
+  const pendingCallId = `pending-${active.token}`, probeCallId = `probe-${active.token}`;
+  const needsProbe = input.some(item => item.type === "function_call_output" && item.call_id === pendingCallId)
+   && !input.some(item => item.type === "function_call_output" && item.call_id === probeCallId);
   const id = `resp_restore_${wire.length}`, events: Array<Record<string, unknown>> = [
    { type: "response.created", response: { id, status: "in_progress" } },
   ];
   const billedUsage = { input_tokens: 0, output_tokens: 0, total_tokens: 0, input_tokens_details: { cached_tokens: 0 }, output_tokens_details: { reasoning_tokens: 0 } };
   let result: string;
-  if (child && active.fail) {
+  if (needsProbe) {
+   assert(tools.includes("restore_probe")); pendingInputs.add(active.token); result = "toolUse";
+   const args = JSON.stringify({ token: active.token });
+   const item = { type: "function_call", id: `fc_probe_${active.token}`, call_id: probeCallId, name: "restore_probe", arguments: args, status: "completed" };
+   events.push(
+    { type: "response.output_item.added", output_index: 0, item: { ...item, arguments: "", status: "in_progress" } },
+    { type: "response.function_call_arguments.delta", output_index: 0, item_id: item.id, delta: args },
+    { type: "response.function_call_arguments.done", output_index: 0, item_id: item.id, arguments: args },
+    { type: "response.output_item.done", output_index: 0, item },
+    { type: "response.completed", response: { id, status: "completed", output: [item], usage: billedUsage } },
+   );
+  } else if (child && active.fail) {
    result = "error";
    events.push({ type: "response.failed", response: { id, status: "failed", usage: billedUsage,
     error: { code: "invalid_request_error", message: "Owned deterministic transport failure" } } });
@@ -145,12 +162,13 @@ try {
  modelRegistry.registerProvider(provider, { api: apiName, baseUrl: endpoint, apiKey: "synthetic-owned-loopback-only",
   models: [{ id: "owned", name: "Owned restore transport", reasoning: false, input: ["text"], cost: usage.cost, contextWindow: 32768, maxTokens: 1024 }] }, owner);
  const model = modelRegistry.find(provider, "owned"); assert(model);
- const pending = (token: string) => reply([{ type: "toolCall", id: `probe-${token}`, name: "restore_probe", arguments: { token } }], "toolUse");
+ const pending = (token: string) => reply([{ type: "toolCall", id: `pending-${token}`, name: "restore_probe", arguments: { token } }], "toolUse");
  async function fixture(label: string, options: { child?: boolean; structured?: boolean; fail?: boolean; mainInterrupted?: boolean; capacity?: number; coldReviveGate?: boolean } = {}) {
   AgentLifecycleManager.resetGlobalForTests(); AgentRegistry.resetGlobalForTests();
   const token = `${label}-${randomUUID()}`; active = { token, structured: options.structured === true, fail: options.fail === true };
   const cwd = path.join(root, token); await fs.mkdir(cwd);
   const probeFile = path.join(cwd, "probe.jsonl");
+  const executedCallIds: string[] = [];
   const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
   const releaseOther: Array<() => void> = [];
   const coldEntered = Promise.withResolvers<void>(), coldRelease = Promise.withResolvers<void>();
@@ -160,8 +178,13 @@ try {
     models: [{ id: "owned", name: "Owned restore transport", reasoning: false, input: ["text"], cost: usage.cost, contextWindow: 32768, maxTokens: 1024 }] });
    pi.registerTool({ name: "restore_probe", label: "Owned restoration probe", description: "Append one owned restoration receipt", approval: "write",
     parameters: pi.zod.object({ token: pi.zod.string() }),
-    async execute(toolCallId, params, signal) {
-     assert.equal(params.token, token); assert.equal(toolCallId, `probe-${token}`);
+    async execute(toolCallId, params, signal, _onUpdate, ctx) {
+     executedCallIds.push(toolCallId);
+     assert.equal(params.token, token); assert.equal(toolCallId, encodeResponsesToolCallId(`probe-${token}`, `fc_probe_${token}`));
+     const closed = ctx.sessionManager.getBranch().find(entry => entry.type === "message" && entry.message.role === "toolResult" && entry.message.toolCallId === `pending-${token}`);
+     assert(closed?.type === "message" && closed.message.role === "toolResult", "RESTORE_PENDING_CLOSED");
+     assert.equal(closed.message.isError, true, "RESTORE_PENDING_CLOSED_AS_ERROR");
+     assert(pendingInputs.has(token), "RESTORE_PENDING_RESULT_REACHED_MODEL");
      await fs.appendFile(probeFile, JSON.stringify({ token, toolCallId }) + "\n", { mode: 0o600 });
      entered.resolve();
      const aborted = Promise.withResolvers<never>();
@@ -216,6 +239,8 @@ try {
    await bounded(lifecycle.dispose(), `${label} lifecycle dispose`);
    await bounded(session.dispose(), `${label} root dispose`);
    assert.equal(await manager.dispose({ timeoutMs: 10000 }), true, "All owned job bodies must settle before fixture retirement");
+   const liveCallId = encodeResponsesToolCallId(`probe-${token}`, `fc_probe_${token}`);
+   assert(executedCallIds.every(toolCallId => toolCallId === liveCallId), "RESTORE_PENDING_NOT_EXECUTED");
   };
   cleanupRuntime = close;
   await initializeExtensions(session, { reportSendError: (_action, error) => { throw error; }, reportRuntimeError: error => { throw error.error; } });
@@ -236,7 +261,15 @@ try {
   };
   const publications = () => session.messages.filter(message => message.role === "custom" && message.customType === "async-result" && JSON.stringify(message).includes(childId ?? "NO_CHILD"));
   const jobs = () => manager.getAllJobs().filter(job => job.agentId === childId).map(job => ({ id: job.id, status: job.status, ownerId: job.ownerId }));
-  const settle = async () => { await bounded(session.settleAsyncWork(), `${label} async settlement`); await session.settleInFlightMessagePersistence(); await persisted.flush(); };
+  const settle = async () => {
+   await bounded((async () => {
+    await manager.waitForAll();
+    assert.equal(await manager.drainDeliveries(), true);
+    await session.waitForRunEnd();
+   })(), `${label} async settlement`);
+   await session.settleInFlightMessagePersistence();
+   await persisted.flush();
+  };
   return { token, session, persisted, rootFile, userId, manager, lifecycle, entered, release, releaseOther, coldEntered, coldRelease, childFile, childId, crashBytes, writes, publications, jobs, settle,
    async close() { await close(); cleanupRuntime = undefined; } };
  }
@@ -393,7 +426,7 @@ assert(cleanupComplete); await assert.rejects(fs.lstat(root), (error: NodeJS.Err
 console.log(JSON.stringify({ proof: "v18103-restore-runtime", status: "passed", compiled, candidateVersion, nativeSha256, sourceInputSha256,
  sourceDigest, engineHead, mergeHead, companionHead, cases: cases.map(item => ({ ...item, status: "passed" })), privateRootRemoved: true, networkAttempts, paidRequests: 0, loopbackRequests, ownedPreconnects,
  syntheticModelTurns: wire, limits: ["In-process duplicate admission and retained-job identity only; no permanent exactly-once guarantee across arbitrary crashes.",
- "Probe replay starts from an owned persisted pending call whose first execution never happened; unknown effects before an arbitrary crash cannot be inferred.",
+ "Owned pending calls have never executed before interruption. Recovery closes their unknown outcomes without replay; only a fresh model-issued probe executes. Unknown effects before arbitrary crashes cannot be inferred.",
  "Terminal-job sensitivity deliberately rewinds only closed owned child transcripts while retaining their actual completed or failed job records.",
  "No real provider, credentials, desktop, browser, Tern, user input, or publication service is exercised.",
  "Source identity is bound to a copied manifest; the parent must verify source hashes and enforce genuine compiled checkout-read denial and outbound network sandboxing."] }));

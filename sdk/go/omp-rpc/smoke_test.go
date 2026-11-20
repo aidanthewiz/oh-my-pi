@@ -171,12 +171,12 @@ func TestSmoke(t *testing.T) {
 
 	phases, err := client.SetTodos(ctx, SetTodosCommand{Phases: []TodoPhase{{
 		Name:  "Smoke",
-		Tasks: []TodoItem{{Content: "Wait for review", Status: TodoStatusBlocked, Blocker: Ptr("needs approval")}},
+		Tasks: []TodoItem{{Content: "Wait for review", Status: TodoStatusInProgress}},
 	}}})
-	if err != nil || len(phases) != 1 || phases[0].Tasks[0].Status != TodoStatusBlocked {
+	if err != nil || len(phases) != 1 || phases[0].Tasks[0].Status != TodoStatusInProgress {
 		t.Fatalf("set_todos: %#v %v", phases, err)
 	}
-	t.Logf("set_todos: %s/%s status=%s blocker=%q", phases[0].Name, phases[0].Tasks[0].Content, phases[0].Tasks[0].Status, deref(phases[0].Tasks[0].Blocker))
+	t.Logf("set_todos: %s/%s status=%s", phases[0].Name, phases[0].Tasks[0].Content, phases[0].Tasks[0].Status)
 
 	events, err := client.SetEventFilter(ctx, SetEventFilterCommand{Events: nil})
 	if err != nil || events != nil {
@@ -212,6 +212,23 @@ func TestSmoke(t *testing.T) {
 		t.Fatalf("bash: %#v %v", bash, err)
 	}
 	t.Logf("bash: output=%q exitCode=%d", bash.Output, deref(bash.ExitCode))
+	private, err := client.Bash(ctx, BashCommand{Command: "echo sdk-private-marker", ExcludeFromContext: Ptr(true)})
+	if err != nil || strings.TrimSpace(private.Output) != "sdk-private-marker" {
+		t.Fatalf("excluded bash: %#v %v", private, err)
+	}
+	history, err := client.GetMessages(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorded := false
+	for _, message := range history {
+		if execution, ok := message.Value.(BashExecutionMessage); ok && strings.TrimSpace(execution.Output) == "sdk-private-marker" {
+			recorded = execution.ExcludeFromContext != nil && *execution.ExcludeFromContext
+		}
+	}
+	if !recorded {
+		t.Fatal("excluded shell output lost its context exclusion in session history")
+	}
 	finish()
 }
 

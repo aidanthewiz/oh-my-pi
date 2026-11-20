@@ -71,12 +71,14 @@ for (const page of pages) {
 if (!picked) throw new Error(`no page matching ${JSON.stringify(matcher)}`);
 const targetId = targetIdOf(picked.target());
 const wsEndpoint = supervisor.wsEndpoint();
+const workerEndpoint = new URL(wsEndpoint);
+workerEndpoint.searchParams.set("claim", targetId);
 console.log("picked target:", targetId);
 
 step("worker: second connection via browserWSEndpoint");
 const worker = await puppeteer
 	.connect({
-		browserWSEndpoint: wsEndpoint,
+		browserWSEndpoint: workerEndpoint.toString(),
 		defaultViewport: null,
 		protocolTimeout: 20_000,
 	})

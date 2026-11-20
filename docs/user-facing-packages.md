@@ -75,14 +75,14 @@ Sources: [`packages/browser-relay/README.md`](../packages/browser-relay/README.m
 
 - Package: private `@oh-my-pi/browser-relay`; user command: `coreforge browser-relay`.
 - Setup: run `coreforge browser-relay install`, load the unpacked extension from
-  `~/.omp/browser-relay/extension`, then opt in per call with `app.relay: true` — or set
+  `~/.omp/browser-relay/extension`, then opt in per call with `app: "relay"` — or set
   `browser.relay`, which makes the relay the profile-wide default across projects (scope
   details in the package README).
 - Behavior: the relay auto-starts through the profile-independent global daemon broker; consumers
-  across projects hold leases, and the relay stops after the last lease is released. `app.target`
+  across projects hold leases, and the relay stops after the last lease is released. `target`
   borrows a tab by exact CDP target id or URL/title substring; otherwise Coreforge opens its own background tab, which a URL
   navigates and close removes. `coreforge browser-relay --no-group` disables automatic tab grouping.
-- Security/limits: it binds loopback and requires a relay token. Chrome
+- Security/limits: it binds loopback, enforces the local origin boundary, and requires a machine-local relay token for discovery, CDP, and extension attachment. Public `/json/version` exposes liveness metadata only. Chrome
   internal pages, DevTools, Web Store, extension pages, and tabs with DevTools open cannot attach.
 
 ### `packages/collab-web` — browser client for collaborative sessions

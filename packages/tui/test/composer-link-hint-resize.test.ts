@@ -4,6 +4,7 @@ import { TranscriptContainer } from "@oh-my-pi/pi-tui/chrome/transcript-containe
 import { Composer } from "@oh-my-pi/pi-tui/prompt/composer";
 import { formatExtensionLink, setExtensionLinks } from "@oh-my-pi/pi-tui/render/extension-links";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
+import { sliceByColumn } from "../src/utils";
 import { withoutTerminalMultiplexer } from "./helpers/terminal-multiplexer";
 import { VirtualRenderScheduler } from "./virtual-render-scheduler";
 import { VirtualTerminal } from "./virtual-terminal";
@@ -55,6 +56,17 @@ class LinkTail implements Component {
 	}
 }
 
+function shownHint(terminal: UnansweredProbeTerminal): string {
+	for (const [row, line] of terminal.getViewport().entries()) {
+		const tag = terminal
+			.getViewportRowReverseColumns(row)
+			.map(column => sliceByColumn(line, column, 1))
+			.join("");
+		if (/^[a-z]+$/.test(tag)) return tag;
+	}
+	throw new Error("No link hint is displayed");
+}
+
 describe("link hints require a displayed viewport", () => {
 	for (const phase of ["alt", "in-place", "probe"] as const) {
 		it(`rejects the old tag during ${phase} resize and permits fresh hints after recovery`, async () => {
@@ -83,11 +95,12 @@ describe("link hints require a displayed viewport", () => {
 				expect(composer.viewportLinkCount()).toBe(1);
 				composer.startLinkHints(() => {});
 				composer.ui.renderNow();
-				terminal.sendInput("a");
+				terminal.sendInput(shownHint(terminal));
 				expect(activations).toEqual(["demo:open/7"]);
 				activations.length = 0;
 				composer.startLinkHints(() => {});
 				composer.ui.renderNow();
+				const staleTag = shownHint(terminal);
 				expect(composer.linkHintsActive).toBe(true);
 				terminal.droppedReports = 0;
 
@@ -100,7 +113,7 @@ describe("link hints require a displayed viewport", () => {
 					expect(terminal.droppedReports).toBe(0);
 				}
 				expect(composer.ui.getMutableViewport().length).toBe(0);
-				terminal.sendInput("a");
+				terminal.sendInput(staleTag);
 				expect(activations).toEqual([]);
 				expect(composer.linkHintsActive).toBe(false);
 
@@ -111,7 +124,7 @@ describe("link hints require a displayed viewport", () => {
 				expect(composer.viewportLinkCount()).toBe(1);
 				composer.startLinkHints(() => {});
 				composer.ui.renderNow();
-				terminal.sendInput("a");
+				terminal.sendInput(shownHint(terminal));
 				expect(activations).toEqual(["demo:open/7"]);
 			} finally {
 				removeInput();

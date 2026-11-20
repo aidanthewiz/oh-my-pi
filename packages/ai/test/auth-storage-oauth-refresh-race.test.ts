@@ -1888,12 +1888,12 @@ describe("AuthStorage OAuth refresh race", () => {
 		const releaseRefresh = Promise.withResolvers<void>();
 		const usageStarted = Promise.withResolvers<void>();
 		const releaseUsage = Promise.withResolvers<void>();
-		const report: UsageReport = {
+		const report = {
 			provider,
 			fetchedAt: Date.now(),
 			limits: [],
 			metadata: { ownedProof: "persisted-after-caller-cancellation" },
-		};
+		} satisfies UsageReport;
 		oauthUtils.registerOAuthProvider({
 			id: provider,
 			name: provider,
@@ -1985,7 +1985,7 @@ describe("AuthStorage OAuth refresh race", () => {
 			try {
 				await persisted.credentials.reload();
 				expect(await persisted.usage.reports()).toEqual([
-					expect.objectContaining({ provider, metadata: report.metadata }),
+					expect.objectContaining({ provider, metadata: expect.objectContaining(report.metadata) }),
 				]);
 			} finally {
 				await persisted.close();

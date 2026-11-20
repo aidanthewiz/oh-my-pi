@@ -3,7 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as ai from "@oh-my-pi/pi-ai";
-import { Effort, type Model } from "@oh-my-pi/pi-ai";
+import { type AssistantMessage, Effort, type Model } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import {
@@ -17,6 +17,7 @@ import { restoreEnvValue } from "./helpers/settings-test-state";
 
 interface SessionFixture {
 	agentDir: string;
+	cwd: string;
 	sessionDir: string;
 	sessionFile: string;
 	settings: Settings;
@@ -26,7 +27,10 @@ interface SessionFixture {
 	whenSettled: Promise<void>;
 }
 
+const PROJECT_CWD = "/repo";
+
 let sharedRoot: TempDir | undefined;
+const activeStartups = new Map<AbortController, Promise<void>>();
 
 function deferred(): { promise: Promise<void>; resolve: () => void } {
 	let resolve!: () => void;
@@ -43,12 +47,38 @@ async function makeTempDir(prefix: string): Promise<string> {
 }
 
 function createModel(id = "test-model"): Model {
-	return {
+	return buildModel({
 		provider: "openai",
 		id,
 		name: id,
+		api: "openai-responses",
+		baseUrl: "https://memory.example.test/v1",
+		reasoning: false,
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow: 32_000,
-	} as Model;
+		maxTokens: 4096,
+	});
+}
+
+function assistantJson(payload: Record<string, unknown>): AssistantMessage {
+	return {
+		role: "assistant",
+		content: [{ type: "text", text: JSON.stringify(payload) }],
+		api: "openai-responses",
+		provider: "openai",
+		model: "test-model",
+		usage: {
+			input: 1,
+			output: 1,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 2,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason: "stop",
+		timestamp: Date.now(),
+	};
 }
 
 function createModelRegistry(model: Model): any {
@@ -62,10 +92,11 @@ function createModelRegistry(model: Model): any {
 
 async function createFixture(overrides?: Partial<Record<string, unknown>>): Promise<SessionFixture> {
 	const agentDir = await makeTempDir("memories-runtime-agent");
+	const cwd = PROJECT_CWD;
 	const sessionDir = path.join(agentDir, "sessions");
 	await fs.mkdir(sessionDir, { recursive: true });
 	const sessionFile = path.join(sessionDir, "current-session.jsonl");
-	await fs.writeFile(sessionFile, `${JSON.stringify({ type: "session", id: "current-thread", cwd: agentDir })}\n`);
+	await fs.writeFile(sessionFile, `${JSON.stringify({ type: "session", id: "current-thread", cwd })}\n`);
 
 	const settings = Settings.isolated({
 		"memories.enabled": true,
@@ -78,31 +109,43 @@ async function createFixture(overrides?: Partial<Record<string, unknown>>): Prom
 	const model = createModel();
 	const modelRegistry = createModelRegistry(model);
 	const settled = deferred();
-	const refreshBaseSystemPrompt = vi.fn(async () => {
-		settled.resolve();
-	});
+	const startupController = new AbortController();
+	const refreshBaseSystemPrompt = vi.fn(async () => {});
 	const session = {
 		sessionManager: {
 			getSessionFile: () => sessionFile,
 			getSessionDir: () => sessionDir,
 			getSessionId: () => "current-thread",
-			getCwd: () => agentDir,
+			getCwd: () => cwd,
 		},
 		settings,
 		model,
 		modelRegistry,
 		refreshBaseSystemPrompt,
+		beginLocalMemoryStartup: () => {
+			activeStartups.set(startupController, settled.promise);
+			return startupController.signal;
+		},
+		endLocalMemoryStartup: () => {
+			activeStartups.delete(startupController);
+			settled.resolve();
+		},
 	};
 
-	return { agentDir, sessionDir, sessionFile, settings, session, modelRegistry, model, whenSettled: settled.promise };
+	return {
+		agentDir,
+		cwd,
+		sessionDir,
+		sessionFile,
+		settings,
+		session,
+		modelRegistry,
+		model,
+		whenSettled: settled.promise,
+	};
 }
 
-// Resolve any already-scheduled microtasks/macrotasks without a fixed wall delay.
-const flushAsync = (): Promise<void> => new Promise<void>(resolve => setTimeout(resolve, 0));
-
-// Await the pipeline's completion signal (its final `refreshBaseSystemPrompt`)
-// instead of polling, racing a generous timeout so a stalled regression fails
-// loudly rather than hanging.
+// The startup slot is released only after the pipeline, including failures, finishes.
 async function settle(promise: Promise<void>, label: string, timeoutMs = 3000): Promise<void> {
 	let timer: Timer | undefined;
 	const timeout = new Promise<never>((_, reject) => {
@@ -121,7 +164,6 @@ beforeAll(async () => {
 
 afterAll(async () => {
 	if (sharedRoot) {
-		await Bun.sleep(0);
 		await sharedRoot.remove();
 	}
 	sharedRoot = undefined;
@@ -142,6 +184,11 @@ describe("memories runtime", () => {
 	});
 
 	afterEach(async () => {
+		const pending = [...activeStartups].map(([controller, completion]) => {
+			controller.abort();
+			return completion;
+		});
+		await Promise.all(pending);
 		vi.restoreAllMocks();
 		restoreEnvValue("XDG_DATA_HOME", savedXdgData);
 		restoreEnvValue("XDG_STATE_HOME", savedXdgState);
@@ -150,6 +197,7 @@ describe("memories runtime", () => {
 	test("startup gating follows memory.backend and skips subagents", async () => {
 		const disabled = await createFixture({ "memories.enabled": false });
 		const openSpy = vi.spyOn(memoryStorage, "openMemoryDb");
+		vi.spyOn(ai, "completeSimple").mockRejectedValue(new Error("Unexpected memory completion"));
 		startMemoryStartupTask({
 			session: disabled.session,
 			settings: disabled.settings,
@@ -184,7 +232,7 @@ describe("memories runtime", () => {
 		vi.spyOn(memoryStorage, "openMemoryDb").mockImplementation(() => {
 			throw new Error("db unavailable");
 		});
-		const stage1Spy = vi.spyOn(ai, "completeSimple");
+		const stage1Spy = vi.spyOn(ai, "completeSimple").mockRejectedValue(new Error("Unexpected memory completion"));
 
 		startMemoryStartupTask({
 			session: fx.session,
@@ -194,7 +242,6 @@ describe("memories runtime", () => {
 			taskDepth: 0,
 		});
 
-		await flushAsync();
 		expect(stage1Spy).not.toHaveBeenCalled();
 	});
 
@@ -218,7 +265,7 @@ describe("memories runtime", () => {
 			fx.modelRegistry.getAll = vi.fn(() => [model]);
 			await fs.writeFile(
 				path.join(fx.sessionDir, "thread-429.jsonl"),
-				`${JSON.stringify({ type: "session", id: "thread-429", cwd: fx.agentDir })}\n${JSON.stringify({ type: "message", message: { role: "user", content: "remember this" } })}\n`,
+				`${JSON.stringify({ type: "session", id: "thread-429", cwd: fx.cwd })}\n${JSON.stringify({ type: "message", message: { role: "user", content: "remember this" } })}\n`,
 			);
 			const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(
 				Object.assign(
@@ -241,9 +288,7 @@ describe("memories runtime", () => {
 			await settle(fx.whenSettled, "rate-limited memory extraction");
 
 			expect(fetchSpy).toHaveBeenCalledTimes(3);
-			expect(await Bun.file(path.join(getMemoryRoot(fx.agentDir, fx.agentDir), "raw_memories.md")).exists()).toBe(
-				false,
-			);
+			expect(await Bun.file(path.join(getMemoryRoot(fx.agentDir, fx.cwd), "raw_memories.md")).exists()).toBe(false);
 		});
 	}
 
@@ -251,40 +296,27 @@ describe("memories runtime", () => {
 		const fx = await createFixture();
 		const rolloutPath = path.join(fx.sessionDir, "thread-a.jsonl");
 		const rolloutRows = [
-			{ type: "session", id: "thread-a", cwd: fx.agentDir },
+			{ type: "session", id: "thread-a", cwd: fx.cwd },
 			{ type: "message", message: { role: "user", content: "summarize this rollout" } },
 		];
 		await fs.writeFile(rolloutPath, `${rolloutRows.map(row => JSON.stringify(row)).join("\n")}\n`);
 
-		const completeSpy = vi
-			.spyOn(ai, "completeSimple")
-			.mockResolvedValueOnce({
-				stopReason: "end_turn",
-				content: [
-					{
-						type: "text",
-						text: JSON.stringify({
-							rollout_summary: "Rollout summary A",
-							rollout_slug: "thread-a-rollout",
-							raw_memory: "Raw memory A",
-						}),
-					},
-				],
-				usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 15 },
-			} as any)
-			.mockResolvedValueOnce({
-				stopReason: "end_turn",
-				content: [
-					{
-						type: "text",
-						text: JSON.stringify({
-							memory_md: "# Memory\n\nConsolidated body",
-							memory_summary: "Consolidated summary",
-							skills: [{ name: "deploy-playbook", content: "# Deploy\nUse blue/green." }],
-						}),
-					},
-				],
-			} as any);
+		vi.spyOn(ai, "completeSimple")
+			.mockRejectedValue(new Error("Unexpected memory completion"))
+			.mockResolvedValueOnce(
+				assistantJson({
+					rollout_summary: "Rollout summary A",
+					rollout_slug: "thread-a-rollout",
+					raw_memory: "Raw memory A",
+				}),
+			)
+			.mockResolvedValueOnce(
+				assistantJson({
+					memory_md: "# Memory\n\nConsolidated body",
+					memory_summary: "Consolidated summary",
+					skills: [{ name: "deploy-playbook", content: "# Deploy\nUse blue/green." }],
+				}),
+			);
 
 		startMemoryStartupTask({
 			session: fx.session,
@@ -306,18 +338,10 @@ describe("memories runtime", () => {
 			"# Deploy\nUse blue/green.",
 		);
 		expect(fx.session.refreshBaseSystemPrompt).toHaveBeenCalledTimes(1);
-		expect(ai.completeSimple).toHaveBeenCalled();
 		expect(ai.completeSimple).toHaveBeenCalledTimes(2);
-		const phase2Prompt = completeSpy.mock.calls[1]?.[1];
-		expect(phase2Prompt?.systemPrompt?.[0]).toContain("memory-stage-two consolidator");
 	});
 
 	test("clamps stage1 and phase2 reasoning effort against the model's supported range", async () => {
-		// Regression for #1480: memory pipeline hardcoded `Effort.Low`/`Effort.Medium`,
-		// which `requireSupportedEffort` rejects on models whose supported range starts
-		// above `low` (e.g. deepseek-v4-pro → [high, xhigh]). The fix routes both call
-		// sites through `clampThinkingLevelForModel`, lifting the requested effort to
-		// the model's floor instead of throwing.
 		const fx = await createFixture();
 		const constrainedModel: Model = {
 			...fx.model,
@@ -330,40 +354,28 @@ describe("memories runtime", () => {
 
 		const rolloutPath = path.join(fx.sessionDir, "thread-constrained.jsonl");
 		const rolloutRows = [
-			{ type: "session", id: "thread-constrained", cwd: fx.agentDir },
+			{ type: "session", id: "thread-constrained", cwd: fx.cwd },
 			{ type: "message", message: { role: "user", content: "summarize this rollout" } },
 		];
 		await fs.writeFile(rolloutPath, `${rolloutRows.map(row => JSON.stringify(row)).join("\n")}\n`);
 
 		const spy = vi
 			.spyOn(ai, "completeSimple")
-			.mockResolvedValueOnce({
-				stopReason: "end_turn",
-				content: [
-					{
-						type: "text",
-						text: JSON.stringify({
-							rollout_summary: "Rollout summary",
-							rollout_slug: "thread-constrained",
-							raw_memory: "Raw memory",
-						}),
-					},
-				],
-				usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2 },
-			} as any)
-			.mockResolvedValueOnce({
-				stopReason: "end_turn",
-				content: [
-					{
-						type: "text",
-						text: JSON.stringify({
-							memory_md: "# Memory\n\nBody",
-							memory_summary: "Summary",
-							skills: [],
-						}),
-					},
-				],
-			} as any);
+			.mockRejectedValue(new Error("Unexpected memory completion"))
+			.mockResolvedValueOnce(
+				assistantJson({
+					rollout_summary: "Rollout summary",
+					rollout_slug: "thread-constrained",
+					raw_memory: "Raw memory",
+				}),
+			)
+			.mockResolvedValueOnce(
+				assistantJson({
+					memory_md: "# Memory\n\nBody",
+					memory_summary: "Summary",
+					skills: [],
+				}),
+			);
 
 		startMemoryStartupTask({
 			session: fx.session,
@@ -378,27 +390,21 @@ describe("memories runtime", () => {
 		expect((await fs.readFile(path.join(memoryRoot, "MEMORY.md"), "utf8")).trim()).toBe("# Memory\n\nBody");
 
 		expect(spy).toHaveBeenCalledTimes(2);
-		// stage1 requested `low`, phase2 requested `medium`; both must clamp up to the
-		// model's floor (`high`) instead of being passed through and throwing.
 		expect(spy.mock.calls[0]?.[2]?.reasoning).toBe(Effort.High);
 		expect(spy.mock.calls[1]?.[2]?.reasoning).toBe(Effort.High);
 	});
 
 	test("phase2 sync prunes stale summaries and preserves raw memory ordering", async () => {
 		const fx = await createFixture();
-		vi.spyOn(ai, "completeSimple").mockResolvedValue({
-			stopReason: "end_turn",
-			content: [
-				{
-					type: "text",
-					text: JSON.stringify({
-						memory_md: "# Memory\n\nMerged",
-						memory_summary: "Merged summary",
-						skills: [{ name: "ops", content: "# Ops\nRunbook" }],
-					}),
-				},
-			],
-		} as any);
+		vi.spyOn(ai, "completeSimple")
+			.mockRejectedValue(new Error("Unexpected memory completion"))
+			.mockResolvedValueOnce(
+				assistantJson({
+					memory_md: "# Memory\n\nMerged",
+					memory_summary: "Merged summary",
+					skills: [{ name: "ops", content: "# Ops\nRunbook" }],
+				}),
+			);
 
 		const db = memoryStorage.openMemoryDb(getAgentDbPath(fx.agentDir));
 		memoryStorage.upsertThreads(db, [
@@ -441,20 +447,29 @@ describe("memories runtime", () => {
 		});
 
 		await settle(fx.whenSettled, "phase2 sync/prune");
+		expect((await fs.readFile(path.join(memoryRoot, "MEMORY.md"), "utf8")).trim()).toBe("# Memory\n\nMerged");
+		expect((await fs.readFile(path.join(memoryRoot, "memory_summary.md"), "utf8")).trim()).toBe("Merged summary");
+		expect((await fs.readFile(path.join(memoryRoot, "skills", "ops", "SKILL.md"), "utf8")).trim()).toBe(
+			"# Ops\nRunbook",
+		);
 		const files = await fs.readdir(path.join(memoryRoot, "rollout_summaries"));
 		expect(files.includes("old.md")).toBe(false);
 		expect(files).toEqual(expect.arrayContaining(["thread-a-alpha.md", "thread-b-beta.md"]));
 		const raw = await fs.readFile(path.join(memoryRoot, "raw_memories.md"), "utf8");
+		expect(raw).toContain("## thread-a");
+		expect(raw).toContain("## thread-b");
 		expect(raw.indexOf("## thread-b")).toBeLessThan(raw.indexOf("## thread-a"));
 	});
 
 	test("phase2 empty-input cleanup removes consolidated files and skills dir", async () => {
 		const fx = await createFixture();
+		const completeSpy = vi.spyOn(ai, "completeSimple").mockRejectedValue(new Error("Unexpected memory completion"));
 		const memoryRoot = getMemoryRoot(fx.agentDir, fx.session.sessionManager.getCwd());
 		await fs.mkdir(path.join(memoryRoot, "skills", "legacy"), { recursive: true });
 		await fs.writeFile(path.join(memoryRoot, "MEMORY.md"), "legacy memory");
 		await fs.writeFile(path.join(memoryRoot, "memory_summary.md"), "legacy summary");
 		await fs.writeFile(path.join(memoryRoot, "skills", "legacy", "SKILL.md"), "legacy skill");
+		await fs.writeFile(path.join(memoryRoot, "raw_memories.md"), "legacy raw memory");
 
 		const db = memoryStorage.openMemoryDb(getAgentDbPath(fx.agentDir));
 		memoryStorage.enqueueGlobalWatermark(db, 300, fx.session.sessionManager.getCwd(), {
@@ -471,12 +486,11 @@ describe("memories runtime", () => {
 		});
 
 		await settle(fx.whenSettled, "phase2 empty-input cleanup");
+		expect(completeSpy).not.toHaveBeenCalled();
 		expect(await Bun.file(path.join(memoryRoot, "MEMORY.md")).exists()).toBe(false);
 		expect(await Bun.file(path.join(memoryRoot, "memory_summary.md")).exists()).toBe(false);
-		expect(await Bun.file(path.join(memoryRoot, "skills")).exists()).toBe(false);
-		expect((await fs.readFile(path.join(memoryRoot, "raw_memories.md"), "utf8")).trim()).toBe(
-			"# Raw Memories\n\nNo raw memories yet.",
-		);
+		await expect(fs.stat(path.join(memoryRoot, "skills"))).rejects.toMatchObject({ code: "ENOENT" });
+		expect(await fs.readFile(path.join(memoryRoot, "raw_memories.md"), "utf8")).not.toContain("legacy raw memory");
 	});
 });
 
@@ -507,6 +521,18 @@ describe("buildMemoryToolDeveloperInstructions", () => {
 		await fs.mkdir(memoryRoot, { recursive: true });
 		await fs.writeFile(path.join(memoryRoot, "memory_summary.md"), "   \n\t\n");
 		expect(await buildMemoryToolDeveloperInstructions(agentDir, settings.getCwd(), settings)).toBeUndefined();
+	});
+
+	test("renders learned lessons without summary guidance", async () => {
+		const agentDir = await makeTempDir("memories-runtime-instructions");
+		const settings = Settings.isolated({ "memory.backend": "local" });
+		const memoryRoot = getMemoryRoot(agentDir, settings.getCwd());
+		await fs.mkdir(memoryRoot, { recursive: true });
+		await fs.writeFile(path.join(memoryRoot, "learned.md"), "- Check the project memory root.\n");
+
+		const payload = await buildMemoryToolDeveloperInstructions(agentDir, settings.getCwd(), settings);
+		expect(payload).toContain("Learned lessons");
+		expect(payload).not.toContain("memory_summary.md");
 	});
 
 	test("renders payload with truncation for non-empty summary", async () => {

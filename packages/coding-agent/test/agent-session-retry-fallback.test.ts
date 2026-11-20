@@ -9,6 +9,7 @@ import {
 	type Api,
 	type AssistantMessage,
 	Effort,
+	type FetchImpl,
 	type Message,
 	type Model,
 	type ModelUsageHealth,
@@ -22,7 +23,8 @@ import { buildParams } from "@oh-my-pi/pi-ai/providers/openai-responses";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { writeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
-import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import { fingerprintStaticModels } from "@oh-my-pi/pi-catalog/model-manager";
+import { getBundledModel, getBundledModels } from "@oh-my-pi/pi-catalog/models";
 import { resolveModelCacheProviderId } from "@oh-my-pi/pi-catalog/provider-models";
 import type { ModelSpec } from "@oh-my-pi/pi-catalog/types";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
@@ -41,11 +43,12 @@ import {
 } from "@oh-my-pi/pi-coding-agent/session/retry-fallback-chains";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { computerTurnInFlight, registerComputerController } from "@oh-my-pi/pi-coding-agent/tools/computer/supervisor";
-import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
+import { convertToLlm, USER_INTERRUPT_LABEL } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
-import { TempDir } from "@oh-my-pi/pi-utils";
+import { __resetDirsFromEnvForTests, setAgentDir, TempDir, withTimeout } from "@oh-my-pi/pi-utils";
 import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import { mockSchedulerWaitWithClock } from "./helpers/mock-scheduler-clock";
+import { restoreEnvValue } from "./helpers/settings-test-state";
 
 import { cfgRetryUsageReservePolicy } from "@oh-my-pi/pi-coding-agent/session/settings";
 
@@ -295,6 +298,11 @@ describe("AgentSession retry fallback", () => {
 	let modelRegistry: ModelRegistry;
 	let session: AgentSession | undefined;
 
+	// Restored in afterEach after any test that redirects the agent dir.
+	const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+	const originalPiProfile = process.env.PI_PROFILE;
+	const originalOmpProfile = process.env.OMP_PROFILE;
+
 	// The model registry is an immutable fixture whose construction builds a
 	// canonical index over ~2.7k bundled models (~100ms). Build it (and the
 	// auth DB) once for the whole file instead of per-test; reset only the
@@ -333,6 +341,10 @@ describe("AgentSession retry fallback", () => {
 			session = undefined;
 		}
 		vi.restoreAllMocks();
+		restoreEnvValue("PI_CODING_AGENT_DIR", originalAgentDir);
+		restoreEnvValue("PI_PROFILE", originalPiProfile);
+		restoreEnvValue("OMP_PROFILE", originalOmpProfile);
+		__resetDirsFromEnvForTests();
 	});
 
 	it("advances through a role-keyed fallback chain across retries", async () => {
@@ -1166,6 +1178,7 @@ describe("AgentSession retry fallback", () => {
 			releaseDisplay(turn) {
 				releases.push(turn);
 			},
+			async reset() {},
 			async close() {},
 		});
 		let asked: { turn: number | undefined; releases: number[] } | undefined;
@@ -1643,6 +1656,59 @@ describe("AgentSession retry fallback", () => {
 			`${primaryModel.provider}/${primaryModel.id}`,
 			`${fallbackModel.provider}/${fallbackModel.id}`,
 		]);
+	});
+
+	it("answers queued steering after its usage preflight is interrupted", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled model");
+		const streamStarted = Promise.withResolvers<void>();
+		const firstResponse = Promise.withResolvers<{ content: string[] }>();
+		const probeStarted = Promise.withResolvers<void>();
+		const releaseProbe = Promise.withResolvers<void>();
+		const mock = createMockModel({
+			responses: [
+				async () => {
+					streamStarted.resolve();
+					return firstResponse.promise;
+				},
+				{ content: ["answered steering"] },
+			],
+		});
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: mock.stream,
+		});
+		const settings = Settings.isolated({ "compaction.enabled": false, "retry.usageAwareFallback": true });
+		let blockNextProbe = false;
+		vi.spyOn(modelRegistry.authStorage.health, "model").mockImplementation(async () => {
+			if (blockNextProbe) {
+				blockNextProbe = false;
+				probeStarted.resolve();
+				await releaseProbe.promise;
+			}
+			return { state: "healthy", accounts: [] };
+		});
+		session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+		const run = session.prompt("start");
+		try {
+			await withTimeout(streamStarted.promise, 2_000, "first stream did not start");
+			blockNextProbe = true;
+			await session.steer("change direction");
+			firstResponse.resolve({ content: ["first response"] });
+			await withTimeout(probeStarted.promise, 2_000, "queued usage preflight did not start");
+			const interrupt = session.abort({ reason: USER_INTERRUPT_LABEL, deliverQueuedMessages: true });
+			releaseProbe.resolve();
+			await withTimeout(interrupt, 2_000, "interrupt did not finish");
+			await withTimeout(session.waitForIdle(), 2_000, "steer did not finish");
+			await run;
+			expect(mock.calls).toHaveLength(2);
+			expect(JSON.stringify(mock.calls[1].context.messages)).toContain("change direction");
+			expect(getLastAssistantMessage(session).stopReason).toBe("stop");
+		} finally {
+			firstResponse.resolve({ content: ["first response"] });
+			releaseProbe.resolve();
+		}
 	});
 
 	it("cancels queued-turn usage confirmation when post-prompt work is disposed", async () => {
@@ -2134,7 +2200,10 @@ describe("AgentSession retry fallback", () => {
 			modelRegistry,
 		});
 
+		const dropped: string[] = [];
+		session.setPromptDropped(prompt => dropped.push(prompt.text));
 		await expect(session.prompt("No model configured")).rejects.toThrow("No model selected");
+		expect(dropped).toEqual(["No model configured"]);
 		expect(agent.state.isStreaming).toBe(false);
 	});
 
@@ -2302,7 +2371,6 @@ describe("AgentSession retry fallback", () => {
 			sessionManager: SessionManager.inMemory(),
 			settings,
 			modelRegistry,
-			advisorTools: [],
 			advisorConfigs: [{ name: "fallback-test", model: advisorRoleSelector }],
 			advisorStreamFn: (model, context, options) => {
 				const selector = `${model.provider}/${model.id}`;
@@ -2431,7 +2499,6 @@ describe("AgentSession retry fallback", () => {
 				sessionManager: SessionManager.inMemory(),
 				settings,
 				modelRegistry,
-				advisorTools: [],
 				advisorStreamFn: (model, context, options) => {
 					requestedModels.push(model);
 					advisorMock.push(
@@ -2506,7 +2573,6 @@ describe("AgentSession retry fallback", () => {
 				sessionManager: SessionManager.inMemory(),
 				settings,
 				modelRegistry,
-				advisorTools: [],
 				advisorStreamFn: (model, context, options) => {
 					requestedModels.push(`${model.provider}/${model.id}`);
 					advisorMock.push(
@@ -2594,7 +2660,6 @@ describe("AgentSession retry fallback", () => {
 			sessionManager: SessionManager.inMemory(),
 			settings,
 			modelRegistry,
-			advisorTools: [],
 			advisorConfigs: [{ name: "media-budget-test", model: advisorRoleSelector }],
 			advisorStreamFn: (model, context, options) => {
 				const selector = `${model.provider}/${model.id}`;
@@ -2675,7 +2740,6 @@ describe("AgentSession retry fallback", () => {
 			sessionManager: SessionManager.inMemory(),
 			settings,
 			modelRegistry,
-			advisorTools: [],
 			advisorConfigs: [{ name: "media-budget-test", model: advisorRoleSelector }],
 			advisorStreamFn: (model, context, options) => {
 				const selector = `${model.provider}/${model.id}`;
@@ -2752,7 +2816,6 @@ describe("AgentSession retry fallback", () => {
 			sessionManager: SessionManager.inMemory(),
 			settings,
 			modelRegistry,
-			advisorTools: [],
 			advisorConfigs: [{ name: "transient-test", model: advisorRoleSelector }],
 			advisorStreamFn: (model, context, options) => {
 				requestedAdvisorModels.push(`${model.provider}/${model.id}`);
@@ -2821,7 +2884,6 @@ describe("AgentSession retry fallback", () => {
 			sessionManager: SessionManager.inMemory(),
 			settings,
 			modelRegistry,
-			advisorTools: [],
 			advisorConfigs: [{ name: "quota-test", model: advisorRoleSelector }],
 			advisorStreamFn: (model, context, options) => {
 				requestedAdvisorModels.push(`${model.provider}/${model.id}`);
@@ -2889,7 +2951,6 @@ describe("AgentSession retry fallback", () => {
 			sessionManager: SessionManager.inMemory(),
 			settings,
 			modelRegistry,
-			advisorTools: [],
 			advisorConfigs: [{ name: "quota-switch-test", model: advisorSelector }],
 			advisorStreamFn: (model, context, options) => {
 				advisorRequests++;
@@ -2966,7 +3027,6 @@ describe("AgentSession retry fallback", () => {
 				sessionManager: SessionManager.inMemory(),
 				settings,
 				modelRegistry,
-				advisorTools: [],
 				advisorConfigs: [{ name: "capacity-test", model: advisorSelector }],
 				advisorStreamFn: model => {
 					advisorRequests++;
@@ -3090,7 +3150,6 @@ describe("AgentSession retry fallback", () => {
 			sessionManager: SessionManager.inMemory(),
 			settings,
 			modelRegistry,
-			advisorTools: [],
 			advisorConfigs: [{ name: "chain-hop-test", model: advisorRoleSelector }],
 			advisorStreamFn: (model, context, options) => {
 				const selector = `${model.provider}/${model.id}`;
@@ -3176,7 +3235,6 @@ describe("AgentSession retry fallback", () => {
 			sessionManager: SessionManager.inMemory(),
 			settings,
 			modelRegistry,
-			advisorTools: [],
 			advisorStreamFn: advisorMock.stream,
 		});
 		session.setAdvisorEnabled(true);
@@ -4118,6 +4176,26 @@ describe("AgentSession retry fallback", () => {
 			primaryAttempts: 1,
 		},
 		{
+			// "Too many tokens" on a 429 is a throttle, not overflow: it walks the chain.
+			name: "a Bedrock 429 token-cap body with retry.rateLimitWalksChain on",
+			failure: () =>
+				AIError.finalize(
+					Object.assign(
+						new Error(
+							"429 Too many tokens, please wait before trying again. (type=rate_limit_error param=rate_limit_exceeded) retry-after-ms=1",
+						),
+						{ status: 429 },
+					),
+					{
+						api: "anthropic-messages",
+						provider: "anthropic",
+						model: "claude-sonnet-4-5",
+					},
+				),
+			extraSettings: { "retry.rateLimitWalksChain": true },
+			primaryAttempts: 1,
+		},
+		{
 			// The default keeps the signed-thinking deferral for rate limits: the
 			// throttled model keeps its whole retry budget before the chain.
 			name: "a per-minute rate limit under the default settings",
@@ -4881,6 +4959,90 @@ describe("AgentSession retry fallback", () => {
 			`${fallbackModel.provider}/${fallbackModel.id}`,
 			`${fallbackModel.provider}/${fallbackModel.id}`,
 		]);
+	});
+
+	describe("reasoning_extraction refusal of other models' reasoning", () => {
+		const reasoningRefusal = (demotedReasoningBlocks: number | undefined): MockResponse => ({
+			content: [{ type: "thinking", thinking: "Classifier evaluation before refusal." }],
+			stopReason: "error",
+			stopDetails: { type: "refusal", category: "reasoning_extraction", explanation: null },
+			errorMessage: "Refusal (reasoning_extraction)",
+			demotedReasoningBlocks,
+		});
+
+		/**
+		 * Prompts Claude (GPT as its fallback) through scripted refusals. Returns each request's
+		 * model and whether it left other models' reasoning out, plus the final assistant turn.
+		 */
+		async function promptThroughRefusals(
+			primaryResponses: MockResponse[],
+			prompts = 1,
+		): Promise<{ requests: string[]; answer: AssistantMessage }> {
+			const primaryModel = getBundledModel("anthropic", "claude-sonnet-4-5");
+			const fallbackModel = getBundledModel("openai", "gpt-4o-mini");
+			if (!primaryModel || !fallbackModel) throw new Error("Expected bundled test models to exist");
+			const requests: string[] = [];
+			const mock = createMockModel();
+			const agent = new Agent({
+				getApiKey: model => `${model.provider}-test-key`,
+				initialState: { model: primaryModel, systemPrompt: ["Test"], tools: [], messages: [] },
+				streamFn: (model, context, options) => {
+					requests.push(`${model.provider}/${model.id} omit=${session?.omitsDemotedReasoning(model)}`);
+					const primary = model.provider === primaryModel.provider && model.id === primaryModel.id;
+					mock.push(
+						primary ? (primaryResponses.shift() ?? { content: ["Claude answer"] }) : { content: ["GPT answer"] },
+					);
+					return mock.stream(model, context, options);
+				},
+			});
+			const settings = Settings.isolated({
+				"compaction.enabled": false,
+				"retry.baseDelayMs": 5,
+				"retry.maxRetries": 1,
+				"retry.fallbackChains": { default: [`${fallbackModel.provider}/${fallbackModel.id}`] },
+			});
+			settings.setModelRole("default", `${primaryModel.provider}/${primaryModel.id}`);
+			const activeSession = new AgentSession({
+				agent,
+				sessionManager: SessionManager.inMemory(),
+				settings,
+				modelRegistry,
+			});
+			session = activeSession;
+			for (let index = 0; index < prompts; index++) {
+				await activeSession.prompt(`Prompt ${index}`);
+				await activeSession.waitForIdle();
+			}
+			return { requests, answer: getLastAssistantMessage(activeSession) };
+		}
+
+		it("retries once on the same model without the reasoning, before the fallback chain, and keeps it out", async () => {
+			const { requests, answer } = await promptThroughRefusals([reasoningRefusal(2)], 2);
+
+			expect(requests).toEqual([
+				"anthropic/claude-sonnet-4-5 omit=false",
+				"anthropic/claude-sonnet-4-5 omit=true",
+				"anthropic/claude-sonnet-4-5 omit=true",
+			]);
+			expect(answer.content).toEqual([{ type: "text", text: "Claude answer" }]);
+		});
+
+		it("walks the fallback chain without a same-model retry when the refused request carried no reasoning", async () => {
+			const { requests } = await promptThroughRefusals([reasoningRefusal(undefined)]);
+
+			expect(requests).toEqual(["anthropic/claude-sonnet-4-5 omit=false", "openai/gpt-4o-mini omit=false"]);
+		});
+
+		it("walks the fallback chain when the refusal outlives the strip", async () => {
+			const { requests, answer } = await promptThroughRefusals([reasoningRefusal(2), reasoningRefusal(2)]);
+
+			expect(requests).toEqual([
+				"anthropic/claude-sonnet-4-5 omit=false",
+				"anthropic/claude-sonnet-4-5 omit=true",
+				"openai/gpt-4o-mini omit=false",
+			]);
+			expect(answer.content).toEqual([{ type: "text", text: "GPT answer" }]);
+		});
 	});
 
 	it.each([
@@ -7755,6 +7917,8 @@ describe("AgentSession retry fallback", () => {
 		const descriptorAuthStorage = await AuthStorage.create(path.join(tempDir.path(), "descriptor-auth.db"));
 		try {
 			const coldRegistry = new ModelRegistry(descriptorAuthStorage, modelsConfigPath);
+			// LiteLLM's cache is keyed by credential, so its cold state is known only after hydration.
+			await coldRegistry.hydrateCredentialScopedModelCaches();
 			expect(coldRegistry.find("litellm", "Qwen3.8-27B")).toBeUndefined();
 			expect(coldRegistry.isProviderDiscoveryPending("litellm")).toBe(true);
 
@@ -7940,6 +8104,230 @@ describe("AgentSession retry fallback", () => {
 			await session?.dispose();
 			session = undefined;
 			await auth.close();
+		}
+	});
+
+	it("defers unknown-model warnings for an authenticated special provider on a cold cache and resolves or warns once after online discovery settles", async () => {
+		using dir = TempDir.createSync("@omp-fallback-codex-online-");
+		const auth = await AuthStorage.create(path.join(dir.path(), "auth.db"));
+		try {
+			auth.keys.setRuntime("openai-codex", "codex-startup-token");
+			const discoveredId = "codex-discovery-only-model";
+			const fetchMock: FetchImpl = async input => {
+				const url = String(input);
+				if (url.startsWith("https://chatgpt.com/backend-api") && url.includes("/models")) {
+					return Response.json({
+						models: [
+							{
+								slug: discoveredId,
+								display_name: "Codex Discovery Only",
+								context_window: 500_000,
+								supported_in_api: true,
+								input_modalities: ["text", "image"],
+							},
+						],
+					});
+				}
+				throw new Error(`Unexpected URL: ${url}`);
+			};
+			const registry = new ModelRegistry(auth, path.join(dir.path(), "models.yml"), { fetch: fetchMock });
+			await registry.hydrateCredentialScopedModelCaches();
+			expect(registry.find("openai-codex", discoveredId)).toBeUndefined();
+
+			const resolvedSelector = `openai-codex/${discoveredId}:xhigh`;
+			const unresolvedSelector = "openai-codex/no-such-codex-model";
+			const resolvedWarning = `Fallback chain for role 'default' references unknown model: ${resolvedSelector}`;
+			const unresolvedWarning = `Fallback chain for role 'default' references unknown model: ${unresolvedSelector}`;
+			session = createChainSession(registry, [resolvedSelector, unresolvedSelector]);
+			const { promise: warningsChanged, resolve } = Promise.withResolvers<void>();
+			session.subscribe(event => {
+				if (event.type === "config_warnings_changed") resolve();
+			});
+
+			registry.refreshInBackground("online-if-uncached");
+			expect(registry.isProviderDiscoveryPending("openai-codex")).toBe(true);
+			session.validateRetryFallbackChains();
+			expect(session.configWarnings).not.toContain(resolvedWarning);
+			expect(session.configWarnings).not.toContain(unresolvedWarning);
+
+			await Promise.race([
+				warningsChanged,
+				scheduler.wait(5_000).then(() => {
+					throw new Error("config_warnings_changed was not emitted after special-provider discovery settled");
+				}),
+			]);
+
+			expect(registry.find("openai-codex", discoveredId)).toBeDefined();
+			expect(registry.getProviderDiscoveryState("openai-codex")?.status).toBe("ok");
+			expect(session.configWarnings).not.toContain(resolvedWarning);
+			expect(session.configWarnings.filter(message => message === unresolvedWarning)).toHaveLength(1);
+		} finally {
+			await session?.dispose();
+			session = undefined;
+			auth.close();
+		}
+	});
+
+	it("does not overwrite completed special-provider discovery status during lazy composition", async () => {
+		using dir = TempDir.createSync("@omp-fallback-codex-lazy-");
+		const auth = await AuthStorage.create(path.join(dir.path(), "auth.db"));
+		try {
+			const baseCodex = getBundledModel("openai-codex", "gpt-6.1-sol");
+			if (!baseCodex) {
+				throw new Error("Expected bundled openai-codex gpt-6.1-sol model to exist");
+			}
+			const cacheDbPath = path.join(dir.path(), "models.db");
+			const cacheProviderId = resolveModelCacheProviderId("openai-codex", {
+				apiKey: JSON.stringify(["token:codex-startup-token"]),
+			});
+			const bundledCodex = getBundledModels("openai-codex");
+			writeModelCache(
+				cacheProviderId,
+				Date.now(),
+				[baseCodex],
+				true,
+				fingerprintStaticModels(bundledCodex, { authoritative: true }),
+				cacheDbPath,
+				bundledCodex,
+			);
+			auth.keys.setRuntime("openai-codex", "codex-startup-token");
+
+			const discoveredId = "codex-lazy-discovery-model";
+			const fetchMock: FetchImpl = async input => {
+				const url = String(input);
+				if (url.startsWith("https://chatgpt.com/backend-api") && url.includes("/models")) {
+					return Response.json({
+						models: [
+							{
+								slug: discoveredId,
+								display_name: "Codex Lazy Discovery",
+								context_window: 500_000,
+								supported_in_api: true,
+								input_modalities: ["text"],
+							},
+						],
+					});
+				}
+				throw new Error(`Unexpected URL: ${url}`);
+			};
+			// Construct without calling find("openai-codex", ...) first so startup cache stays lazy.
+			const registry = new ModelRegistry(auth, path.join(dir.path(), "models.yml"), { fetch: fetchMock });
+			await registry.refresh("online");
+
+			expect(registry.getProviderDiscoveryState("openai-codex")?.status).toBe("ok");
+			expect(registry.find("openai-codex", discoveredId)).toBeDefined();
+			expect(registry.getProviderDiscoveryState("openai-codex")?.status).toBe("ok");
+		} finally {
+			auth.close();
+		}
+	});
+
+	it("does not defer unknown-model warnings for unauthenticated or disabled special model-manager providers", async () => {
+		using dir = TempDir.createSync("@omp-fallback-codex-noauth-");
+		const auth = await AuthStorage.create(path.join(dir.path(), "auth.db"));
+		const previousCodexToken = process.env.OPENAI_CODEX_OAUTH_TOKEN;
+		delete process.env.OPENAI_CODEX_OAUTH_TOKEN;
+		try {
+			const unauthedRegistry = new ModelRegistry(auth, path.join(dir.path(), "models.yml"));
+			expect(unauthedRegistry.find("openai-codex", "codex-discovery-only-model")).toBeUndefined();
+			expect(unauthedRegistry.isProviderDiscoveryPending("openai-codex")).toBe(false);
+
+			const selector = "openai-codex/codex-discovery-only-model:xhigh";
+			const warning = `Fallback chain for role 'default' references unknown model: ${selector}`;
+			session = createChainSession(unauthedRegistry, [selector]);
+			unauthedRegistry.refreshInBackground("offline");
+			session.validateRetryFallbackChains();
+			expect(session.configWarnings).toContain(warning);
+			await unauthedRegistry.awaitInitialBackgroundRefresh();
+
+			auth.keys.setRuntime("openai-codex", "codex-startup-token");
+			const disabledRegistry = new ModelRegistry(auth, path.join(dir.path(), "disabled-models.yml"), {
+				settings: Settings.isolated({ disabledProviders: ["openai-codex"] }),
+			});
+			// Force standard-cache materialization before checking pending state.
+			disabledRegistry.getAll();
+			expect(disabledRegistry.getAvailable().some(model => model.provider === "openai-codex")).toBe(false);
+			expect(disabledRegistry.find("openai-codex", "codex-discovery-only-model")).toBeUndefined();
+			expect(disabledRegistry.isProviderDiscoveryPending("openai-codex")).toBe(false);
+		} finally {
+			await session?.dispose();
+			session = undefined;
+			if (previousCodexToken === undefined) {
+				delete process.env.OPENAI_CODEX_OAUTH_TOKEN;
+			} else {
+				process.env.OPENAI_CODEX_OAUTH_TOKEN = previousCodexToken;
+			}
+			auth.close();
+		}
+	});
+
+	it("defers unknown-model warnings for cached or empty-cached special providers during refresh and warns when no refresh runs", async () => {
+		using dir = TempDir.createSync("@omp-fallback-codex-cached-");
+		const auth = await AuthStorage.create(path.join(dir.path(), "auth.db"));
+		try {
+			const baseCodex = getBundledModel("openai-codex", "gpt-6.1-sol");
+			if (!baseCodex) {
+				throw new Error("Expected bundled openai-codex gpt-6.1-sol model to exist");
+			}
+			const discoveredCodex = buildModel({
+				...(baseCodex as ModelSpec<"openai-codex-responses">),
+				id: "codex-cached-later-model",
+				name: "Codex Cached Later",
+			});
+			const cacheDbPath = path.join(dir.path(), "models.db");
+			const cacheProviderId = resolveModelCacheProviderId("openai-codex", {
+				apiKey: JSON.stringify(["token:codex-startup-token"]),
+			});
+			const bundledCodex = getBundledModels("openai-codex");
+			const fingerprint = fingerprintStaticModels(bundledCodex, { authoritative: true });
+			auth.keys.setRuntime("openai-codex", "codex-startup-token");
+
+			// Empty endpoint snapshots cannot suppress the next refresh.
+			writeModelCache(cacheProviderId, Date.now(), [], false, fingerprint, cacheDbPath, bundledCodex);
+			const emptyCacheRegistry = new ModelRegistry(auth, path.join(dir.path(), "empty-models.yml"));
+			await emptyCacheRegistry.hydrateCredentialScopedModelCaches();
+			expect(emptyCacheRegistry.find("openai-codex", discoveredCodex.id)).toBeUndefined();
+			expect(emptyCacheRegistry.isProviderDiscoveryPending("openai-codex")).toBe(false);
+
+			const selector = `openai-codex/${discoveredCodex.id}:xhigh`;
+			const warning = `Fallback chain for role 'default' references unknown model: ${selector}`;
+			const embedderSession = createChainSession(emptyCacheRegistry, [selector], false);
+			try {
+				expect(embedderSession.configWarnings).toContain(warning);
+			} finally {
+				await embedderSession.dispose();
+			}
+
+			writeModelCache(cacheProviderId, Date.now(), [baseCodex], true, fingerprint, cacheDbPath, bundledCodex);
+			const registry = new ModelRegistry(auth, path.join(dir.path(), "models.yml"));
+			await registry.hydrateCredentialScopedModelCaches();
+			expect(registry.find("openai-codex", discoveredCodex.id)).toBeUndefined();
+			expect(registry.getProviderDiscoveryState("openai-codex")?.status).toBe("cached");
+
+			session = createChainSession(registry, [selector]);
+			writeModelCache(
+				cacheProviderId,
+				Date.now(),
+				[baseCodex, discoveredCodex],
+				true,
+				fingerprint,
+				cacheDbPath,
+				bundledCodex,
+			);
+			registry.refreshInBackground("offline");
+			expect(registry.isProviderDiscoveryPending("openai-codex")).toBe(true);
+			session.validateRetryFallbackChains();
+			expect(session.configWarnings).not.toContain(warning);
+
+			await registry.awaitInitialBackgroundRefresh();
+			await scheduler.wait(0);
+
+			expect(registry.find("openai-codex", discoveredCodex.id)).toBeDefined();
+			expect(session.configWarnings).not.toContain(warning);
+		} finally {
+			await session?.dispose();
+			session = undefined;
+			auth.close();
 		}
 	});
 
@@ -8833,43 +9221,54 @@ describe("AgentSession retry fallback", () => {
 
 	it("carries attribution across a fork, which continues the conversation under a new id", async () => {
 		using tempDir = TempDir.createSync("@omp-fallback-fork-");
-		const primaryModel = getBundledModel("anthropic", "claude-sonnet-4-5");
-		const fallbackModel = getBundledModel("openai", "gpt-4o-mini");
-		if (!primaryModel || !fallbackModel) {
-			throw new Error("Expected bundled test models to exist");
+		// Keep the fork's transcript registration inside the fork dir instead
+		// of the real custom-session-files registry.
+		setAgentDir(path.join(tempDir.path(), "agent"));
+		try {
+			const primaryModel = getBundledModel("anthropic", "claude-sonnet-4-5");
+			const fallbackModel = getBundledModel("openai", "gpt-4o-mini");
+			if (!primaryModel || !fallbackModel) {
+				throw new Error("Expected bundled test models to exist");
+			}
+
+			const requestedModels: string[] = [];
+			const agent = createFallbackAgent(primaryModel, requestedModels);
+			const settings = Settings.isolated({
+				"compaction.enabled": false,
+				"retry.baseDelayMs": 5,
+				"retry.fallbackChains": { default: [`${fallbackModel.provider}/${fallbackModel.id}`] },
+			});
+			settings.setModelRole("default", `${primaryModel.provider}/${primaryModel.id}`);
+
+			const sessionManager = SessionManager.create(tempDir.path(), tempDir.path());
+			session = new AgentSession({ agent, sessionManager, settings, modelRegistry });
+
+			await session.prompt("Fail over to the fallback");
+			await session.waitForIdle();
+			const served = {
+				selector: `${fallbackModel.provider}/${fallbackModel.id}`,
+				modelIdentity: `${fallbackModel.provider}/${fallbackModel.id}`,
+				thinkingLevel: undefined,
+				isFallback: true,
+				contextWindow: fallbackModel.contextWindow,
+			};
+			expect(session.servingModel).toEqual(served);
+
+			const sessionIdBeforeFork = sessionManager.getSessionId();
+			expect(await session.fork()).toBe(true);
+			expect(sessionManager.getSessionId()).not.toBe(sessionIdBeforeFork);
+
+			// A fork clones the transcript and keeps running the same session, so the
+			// work the fallback produced is still this session's — unlike a switch to
+			// an unrelated transcript, which expires it.
+			expect(session.servingModel).toEqual(served);
+		} finally {
+			// Dispose while the fork dir still exists. `using` removes the dir
+			// when this scope returns. A dispose from the suite afterEach would
+			// recreate the dir with a headerless session_exit stub.
+			await session?.dispose();
+			session = undefined;
 		}
-
-		const requestedModels: string[] = [];
-		const agent = createFallbackAgent(primaryModel, requestedModels);
-		const settings = Settings.isolated({
-			"compaction.enabled": false,
-			"retry.baseDelayMs": 5,
-			"retry.fallbackChains": { default: [`${fallbackModel.provider}/${fallbackModel.id}`] },
-		});
-		settings.setModelRole("default", `${primaryModel.provider}/${primaryModel.id}`);
-
-		const sessionManager = SessionManager.create(tempDir.path(), tempDir.path());
-		session = new AgentSession({ agent, sessionManager, settings, modelRegistry });
-
-		await session.prompt("Fail over to the fallback");
-		await session.waitForIdle();
-		const served = {
-			selector: `${fallbackModel.provider}/${fallbackModel.id}`,
-			modelIdentity: `${fallbackModel.provider}/${fallbackModel.id}`,
-			thinkingLevel: undefined,
-			isFallback: true,
-			contextWindow: fallbackModel.contextWindow,
-		};
-		expect(session.servingModel).toEqual(served);
-
-		const sessionIdBeforeFork = sessionManager.getSessionId();
-		expect(await session.fork()).toBe(true);
-		expect(sessionManager.getSessionId()).not.toBe(sessionIdBeforeFork);
-
-		// A fork clones the transcript and keeps running the same session, so the
-		// work the fallback produced is still this session's — unlike a switch to
-		// an unrelated transcript, which expires it.
-		expect(session.servingModel).toEqual(served);
 	});
 
 	it("keeps attribution on a served fallback while the next candidate is unproven", async () => {

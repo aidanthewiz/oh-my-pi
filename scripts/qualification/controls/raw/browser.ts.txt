@@ -113,10 +113,12 @@ async function probe(scenario: Scenario) {
  const acquisitionReturned = scenario.fault === "abort-acquire" ? Promise.withResolvers<void>() : undefined;
  const checks: string[] = [];
  let evaluationCalls = 0, disposalCalls = 0, disposalCompletions = 0, captured = 0, dispatches = 0;
+ let deliveryWatchStarted = false;
  let beforeClose: unknown;
  let beforeLateRelease: unknown;
  const check = (ok: unknown, message: string) => { if (!ok) checks.push(message); };
- const originalMouseClick = page.mouse.click.bind(page.mouse);
+ const originalMouseDown = page.mouse.down.bind(page.mouse);
+ const originalMouseUp = page.mouse.up.bind(page.mouse);
  let restoreEvaluateHandle: (() => void) | undefined;
  try {
   await page.goto(`${origin}/fixture?case=${scenario.id}`, { waitUntil: "load" });
@@ -146,8 +148,10 @@ async function probe(scenario: Scenario) {
    const evaluate = rawEvaluate!;
    watch.evaluate = (async (...evaluationArgs: Parameters<typeof watch.evaluate>) => {
     evaluationCalls++;
-    if (evaluationCalls === 1 && (scenario.fault === "watch-reject" || scenario.fault === "disable-watch-reject")) throw new Error("synthetic delivery-watch transport evaluation failure; page remains open");
-    if (evaluationCalls === 1 && scenario.fault === "abort-watch") {
+    const deliveryWatch = dispatches > 0 && !deliveryWatchStarted;
+    if (deliveryWatch) deliveryWatchStarted = true;
+    if (deliveryWatch && (scenario.fault === "watch-reject" || scenario.fault === "disable-watch-reject")) throw new Error("synthetic delivery-watch transport evaluation failure; page remains open");
+    if (deliveryWatch && scenario.fault === "abort-watch") {
      const held = new Promise<void>(resolve => { releaseHeld = resolve; });
      queueMicrotask(() => controller.abort(abortReason));
      await held;
@@ -164,10 +168,13 @@ async function probe(scenario: Scenario) {
    return real;
   }) as typeof handle.evaluateHandle;
   restoreEvaluateHandle = () => { handle!.evaluateHandle = originalEvaluateHandle; };
-  page.mouse.click = async (...args) => {
+  page.mouse.down = async (...args) => {
    dispatches++;
    if (scenario.fault === "disable-watch-reject") await handle!.evaluate(el => { (el as HTMLButtonElement).disabled = true; });
-   const result = await originalMouseClick(...args);
+   return await originalMouseDown(...args);
+  };
+  page.mouse.up = async (...args) => {
+   const result = await originalMouseUp(...args);
    if (scenario.navigation) await navigationWait;
    if (scenario.fault === "abort-dispatch") controller.abort(abortReason);
    if (scenario.fault === "close") { beforeClose = await snapshot(page); await page.close(); }
@@ -229,7 +236,7 @@ async function probe(scenario: Scenario) {
   if (!page.isClosed() && ["delivered", "real-navigation", "no-delivery-watch-failure"].includes(scenario.id)) await retain(`${scenario.id}.png`, await page.screenshot({ type: "png" }));
  } finally {
   controller.abort(new Error("Owned scenario cleanup"));
-  restoreEvaluateHandle?.(); page.mouse.click = originalMouseClick;
+  restoreEvaluateHandle?.(); page.mouse.down = originalMouseDown; page.mouse.up = originalMouseUp;
   if (rawEvaluate && !page.isClosed()) await bounded(rawEvaluate(state => state.stop()).catch(() => undefined), 1500, "harness watch stop").catch(() => undefined);
   releaseHeld?.();
   if (rawDispose) await bounded(rawDispose().catch(() => undefined), 1500, "harness watch disposal").catch(() => undefined);

@@ -517,7 +517,18 @@ async function runWorker() {
 					});
 				}
 				realConsumer = true;
-				return await ptree.exec(argv, options);
+				let retainedStdout = "";
+				return await ptree.exec(argv, {
+					...options,
+					onStdout(chunk) {
+						options?.onStdout?.(chunk);
+						if (!argv.includes("commit-hold")) return;
+						retainedStdout += chunk;
+						if (retainedStdout === "public action committed\n") {
+							control?.send({ kind: "consumer-output-retained", pid: process.pid });
+						}
+					},
+				});
 			} finally {
 				try {
 					if (producerCompletion) {

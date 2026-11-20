@@ -17,16 +17,11 @@ accepted = [
     "Zlib",
     "0BSD",
     "BSL-1.0",
+    "bzip2-1.0.6",
     "CC0-1.0",
     "MIT-0",
 ]
 
 # Package-scoped reviews. No copyleft license is globally accepted.
-[inferno]
-accepted = ["CDDL-1.0"]
-
 [uluru]
 accepted = ["MPL-2.0"]
-
-[terminfo]
-accepted = ["WTFPL"]

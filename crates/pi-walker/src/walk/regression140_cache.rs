@@ -41,10 +41,11 @@ async fn followed_ignore_source_requires_its_own_stable_filesystem() {
 	listing.push(b"drop", crate::FileType::File, None, None, 0);
 	listing.push(b"keep", crate::FileType::File, None, None, 0);
 	let mut names = Names::default();
-	names.record(b".gitignore", crate::FileType::Symlink);
-	let ignores = DirIgnores::load(&mut session, &dir, tmp.path(), names, true).await;
+	names.record(b".gitignore", crate::FileType::Symlink, None);
+	let ignores =
+		DirIgnores::load(&mut session, &dir, tmp.path(), names, CACHED_SOURCES, true).await;
 	assert_eq!(
-		ignores.files[1].as_ref().unwrap().matched(b"drop", false),
+		ignores.files[2].as_ref().unwrap().matched(b"drop", false),
 		crate::ignore::Match::Ignore
 	);
 	tokio::time::sleep(std::time::Duration::from_millis(120)).await;
@@ -74,8 +75,9 @@ async fn settled_local_ignore_sources_remain_cacheable() {
 	listing.push(b"drop", crate::FileType::File, None, None, 0);
 	listing.push(b"keep", crate::FileType::File, None, None, 0);
 	let mut names = Names::default();
-	names.record(b".gitignore", crate::FileType::File);
-	let ignores = DirIgnores::load(&mut session, &dir, tmp.path(), names, true).await;
+	names.record(b".gitignore", crate::FileType::File, None);
+	let ignores =
+		DirIgnores::load(&mut session, &dir, tmp.path(), names, CACHED_SOURCES, true).await;
 	tokio::time::sleep(std::time::Duration::from_millis(120)).await;
 	let cache = Cache::new(1 << 20);
 	cache.store(&mut session, tmp.path(), &dir, now_nanos(), stamp, &listing, names, Some(&ignores));
@@ -84,14 +86,14 @@ async fn settled_local_ignore_sources_remain_cacheable() {
 		.await
 		.expect("stable settled sources admit cached filtering");
 	assert_eq!(
-		admitted.ignores.as_ref().unwrap().files[1]
+		admitted.ignores.as_ref().unwrap().files[2]
 			.as_ref()
 			.unwrap()
 			.matched(b"drop", false),
 		crate::ignore::Match::Ignore
 	);
 	assert_eq!(
-		admitted.ignores.as_ref().unwrap().files[1]
+		admitted.ignores.as_ref().unwrap().files[2]
 			.as_ref()
 			.unwrap()
 			.matched(b"keep", false),

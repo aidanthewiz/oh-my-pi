@@ -722,6 +722,8 @@ describe.skipIf(process.platform === "win32")("AWS secret input real worker and 
 			expect(await fsp.readFile(path.join(boundary.root, "aws-secret-input-lifecycle-committed"), "utf8")).toBe(
 				"public committed action\n",
 			);
+			// The consumer control socket and the guardian stdout relay are unordered.
+			await boundary.control.waitForEvent("consumer-output-retained");
 			boundary.controller.abort();
 			const result = await operation;
 			expect(lifecycleContainsSensitive(result)).toBe(false);

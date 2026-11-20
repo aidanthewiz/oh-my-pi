@@ -15,7 +15,7 @@
  */
 import * as path from "node:path";
 import { isDeepStrictEqual } from "node:util";
-import { getMCPConfigPath, getProjectDir } from "@oh-my-pi/pi-utils";
+import { getMCPConfigPath, getProjectDir, toError } from "@oh-my-pi/pi-utils";
 import { getActiveProfile } from "@oh-my-pi/pi-utils/dirs";
 import type { OAuthController } from "@oh-my-pi/pi-ai/oauth/types";
 import { expandEnvVarsDeepForConfigLevel } from "../discovery/helpers";
@@ -533,7 +533,7 @@ export async function resolveMcpOAuthEndpointsFromServer(
 		});
 		connectionSucceeded = true;
 	} catch (error) {
-		connectionError = error instanceof Error ? error : new Error(String(error));
+		connectionError = toError(error);
 		assertMcpOAuthCurrent(opts);
 	}
 

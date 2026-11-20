@@ -115,10 +115,7 @@ async function withSkills(run: (harness: SkillHarness) => Promise<void>, exclude
 			});
 			sessions.push(child.session);
 			const transport = createMockModel({
-				responses: [
-					{ content: [{ type: "toolCall", name: "yield", arguments: { data: { ok: true } } }] },
-					{ content: ["done"] },
-				],
+				responses: [{ content: ["The skill-guided inspection is complete."] }],
 			});
 			child.session.agent.streamFn = (requestModel, context, options) => {
 				requests.push(JSON.stringify(context.messages));
@@ -181,7 +178,6 @@ describe("autoloadSkills in executor", () => {
 			});
 			expect(result.error).toBeUndefined();
 			expect(result.exitCode).toBe(0);
-			expect(JSON.parse(result.output)).toEqual({ ok: true });
 			const context = firstRequestText(requests);
 			for (const body of ["Synthetic skill A instructions.", "Synthetic skill B instructions."]) {
 				expect(context).toContain(body);
@@ -221,7 +217,6 @@ describe("autoloadSkills through task spawn", () => {
 					});
 					expect(result.error).toBeUndefined();
 					expect(result.exitCode).toBe(0);
-					expect(JSON.parse(result.output)).toEqual({ ok: true });
 					const context = firstRequestText(requests);
 					if (availability === "late") {
 						expect(parent.session.skills.some(skill => skill.name === "late-skill")).toBe(true);

@@ -109,6 +109,7 @@ function planReviewExtension(
 		tools: new Map(),
 		assistantThinkingRenderers: [],
 		assistantTextRenderers: [],
+		transcriptPresenters: [],
 		linkSchemes: [],
 		fileWriteFallbackHandlers: [],
 		fileDeleteFallbackHandlers: [],
@@ -299,7 +300,7 @@ describe("InteractiveMode plan review rendering", () => {
 
 		mode.planModeEnabled = true;
 		mode.planModePlanFilePath = planFilePath;
-		const review = vi.spyOn(mode, "showPlanReview").mockResolvedValue("Refine plan");
+		const review = vi.spyOn(mode, "showPlanReview").mockResolvedValue("refine");
 
 		await mode.handlePlanApproval({
 			planFilePath,
@@ -359,7 +360,7 @@ describe("InteractiveMode plan review rendering", () => {
 				{ id: "compact", label: "Approve and compact context", disabled: false },
 				{ id: "keep", label: "Approve and keep context (~7.3k / 10k)", disabled: false },
 				{ id: "refine", label: "Refine plan", disabled: false },
-				{ id: "save", label: "Save and quit", disabled: false },
+				{ id: "save", label: "Save", disabled: false },
 			],
 		});
 		expect(resolved).toMatchObject({
@@ -964,7 +965,7 @@ describe("InteractiveMode plan review rendering", () => {
 		expect(secondExtensionEvents).toEqual(["plan_review_requested", "plan_review_resolved"]);
 	});
 
-	it("saves a remotely chosen plan under the default name without a path prompt", async () => {
+	it("saves a remotely chosen plan under the default name without a path prompt, keeping the review open", async () => {
 		const planFilePath = "local://PLAN.md";
 		const planContent = "# Add hello txt\n\nWrite the file.";
 		const title = "Add hello txt";
@@ -977,10 +978,19 @@ describe("InteractiveMode plan review rendering", () => {
 		mode.planModeEnabled = true;
 		mode.planModePlanFilePath = planFilePath;
 		const pathPrompt = vi.spyOn(mode, "showHookCustom");
-		const clear = vi.spyOn(mode, "handleClearCommand").mockResolvedValue();
+		vi.spyOn(mode, "handleClearCommand").mockResolvedValue();
+		vi.spyOn(session, "prompt").mockResolvedValue(undefined as never);
+		const saved = Promise.withResolvers<void>();
+		vi.spyOn(mode, "showStatus").mockImplementation(message => {
+			if (message.startsWith("Saved plan to")) saved.resolve();
+		});
 		let answered: boolean | undefined;
+		let stillOpen = false;
 		const recorder = planReviewRecorder("remote", (event, ctx) => {
 			answered = ctx.resolvePlanReview(event.reviewId, "save");
+			stillOpen = ctx.getPendingPlanReview()?.reviewId === event.reviewId && mode.ui.hasOverlay();
+			// Saved, the review still takes an answer.
+			void saved.promise.then(() => ctx.resolvePlanReview(event.reviewId, "execute"));
 		});
 		await loadExtensions(recorder.extension);
 
@@ -989,10 +999,10 @@ describe("InteractiveMode plan review rendering", () => {
 
 		const destination = path.join(tempDir.path(), planSaveFileName(title));
 		expect(answered).toBe(true);
+		expect(stillOpen).toBe(true);
 		expect(pathPrompt).not.toHaveBeenCalled();
 		expect(await Bun.file(destination).text()).toBe(planContent);
-		expect(clear).toHaveBeenCalledTimes(1);
-		expect(resolved).toMatchObject({ choice: "save", by: "extension" });
+		expect(resolved).toMatchObject({ choice: "execute", by: "extension" });
 	});
 
 	it("reports a terminal plan-review pick as local", async () => {
@@ -1085,7 +1095,7 @@ describe("InteractiveMode plan review rendering", () => {
 			if (reviewCount === 1) {
 				dialogOptions?.onAnnotationStateChange?.(annotationState);
 				dialogOptions?.onFeedbackChange?.(feedback);
-				return "Refine plan";
+				return "refine";
 			}
 			expect(dialogOptions?.annotationState).toBeUndefined();
 			return undefined;
@@ -1125,7 +1135,7 @@ describe("InteractiveMode plan review rendering", () => {
 			if (reviewCount === 1) dialogOptions?.onAnnotationStateChange?.(annotationState);
 			if (reviewCount <= 2) {
 				dialogOptions?.onFeedbackChange?.(feedback);
-				return "Refine plan";
+				return "refine";
 			}
 			return undefined;
 		});
@@ -1160,7 +1170,7 @@ describe("InteractiveMode plan review rendering", () => {
 		// operator picks "Refine plan".
 		vi.spyOn(mode, "showPlanReview").mockImplementation(async (_plan, _title, _options, dialogOptions) => {
 			dialogOptions?.onFeedbackChange?.(feedback);
-			return "Refine plan";
+			return "refine";
 		});
 		const startSpy = vi
 			.spyOn(mode, "startPendingSubmission")
@@ -1197,7 +1207,7 @@ describe("InteractiveMode plan review rendering", () => {
 		const feedback = "Refinement feedback:\n- add more detail\n";
 		vi.spyOn(mode, "showPlanReview").mockImplementation(async (_plan, _title, _options, dialogOptions) => {
 			dialogOptions?.onFeedbackChange?.(feedback);
-			return "Refine plan";
+			return "refine";
 		});
 		vi.spyOn(session, "prompt").mockResolvedValue(undefined as never);
 
@@ -1238,8 +1248,9 @@ describe("InteractiveMode plan review rendering", () => {
 			const choice = mode.showPlanReview(
 				"# Plan\n\nIntro\n\n## Rollout\n\nSteps\n\n## Verify\n\nChecks\n",
 				"Plan mode - next step",
-				["Approve and execute", "Refine plan"],
+				[{ id: "execute", label: "Approve and execute" }],
 				{
+					refine: { id: "refine", label: "Refine plan" },
 					onFeedbackChange: value => {
 						feedback = value;
 					},
@@ -1259,10 +1270,9 @@ describe("InteractiveMode plan review rendering", () => {
 			expect(feedback).toContain("## Rollout\n```md\n- add rollback command\n- include smoke test\n```");
 
 			overlay.handleInput("\x1b[B"); // Rollout -> Verify
-			overlay.handleInput("\x1b[B"); // toc -> actions
-			overlay.handleInput("\x1b[B"); // select Refine plan
+			overlay.handleInput("\x1b[B"); // toc -> actions, where Refine now leads and is selected
 			overlay.handleInput("\r");
-			expect(await choice).toBe("Refine plan");
+			expect(await choice).toBe("refine");
 		} finally {
 			if (previousEditor === undefined) delete Bun.env.EDITOR;
 			else Bun.env.EDITOR = previousEditor;
@@ -1273,7 +1283,9 @@ describe("InteractiveMode plan review rendering", () => {
 
 	it("dismisses Plan Review and restores input when a provider error is pinned", async () => {
 		mode.ui.setFocus(mode.editor);
-		const choice = mode.showPlanReview("# Plan\n\nReady for approval.", "Plan mode - next step", ["Approve"]);
+		const choice = mode.showPlanReview("# Plan\n\nReady for approval.", "Plan mode - next step", [
+			{ id: "approve", label: "Approve" },
+		]);
 
 		expect(mode.ui.hasOverlay()).toBe(true);
 
@@ -1298,8 +1310,7 @@ describe("InteractiveMode plan review rendering", () => {
 		const editedPlan = "# Plan\n\nEdited in overlay.\n\n## Verify\n\n- run focused test\n";
 
 		const choice = mode.showPlanReview(constructorPlan, "Plan mode - next step", [
-			"Approve and execute",
-			"Refine plan",
+			{ id: "execute", label: "Approve and execute" },
 		]);
 
 		expect(capturedOverlay).toBeDefined();
@@ -1320,48 +1331,6 @@ describe("InteractiveMode plan review rendering", () => {
 		expect(overlayHandle.hide).not.toHaveBeenCalled();
 	});
 
-	it("Refine with no annotations silently aborts approval and returns to the editor", async () => {
-		const planFilePath = "local://PLAN.md";
-		const resolvedPlanPath = resolveLocalUrlToPath(planFilePath, {
-			getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
-			getSessionId: () => session.sessionManager.getSessionId(),
-		});
-		await Bun.write(resolvedPlanPath, "# Plan\n\nbody");
-
-		mode.planModeEnabled = true;
-		mode.planModePlanFilePath = planFilePath;
-		let streaming = false;
-		Object.defineProperty(session, "isStreaming", {
-			configurable: true,
-			get: () => streaming,
-		});
-		const abortSpy = vi.spyOn(session, "abort").mockImplementation(async () => {
-			streaming = false;
-		});
-		vi.spyOn(mode, "showPlanReview").mockImplementation(async () => {
-			streaming = true;
-			return "Refine plan";
-		});
-		const statusSpy = vi.spyOn(mode, "showStatus");
-		const errorSpy = vi.spyOn(mode, "showError");
-		const startSpy = vi.spyOn(mode, "startPendingSubmission");
-		const onInput = vi.fn();
-		mode.onInputCallback = onInput;
-
-		await mode.handlePlanApproval({
-			planFilePath,
-			planExists: true,
-			title: "PLAN",
-		});
-
-		expect(abortSpy).toHaveBeenCalledTimes(1);
-		expect(statusSpy).toHaveBeenCalledWith("Refine plan: enter a follow-up prompt.");
-		expect(errorSpy).not.toHaveBeenCalledWith(expect.stringContaining("Failed to refine plan"));
-		expect(startSpy).not.toHaveBeenCalled();
-		expect(onInput).not.toHaveBeenCalled();
-		expect(session.isPlanInternalAbortPending).toBe(false);
-	});
-
 	it("approves with in-overlay edits and mirrors them to the plan file", async () => {
 		const planFilePath = "local://PLAN.md";
 		const resolvedPlanPath = resolveLocalUrlToPath(planFilePath, {
@@ -1375,7 +1344,7 @@ describe("InteractiveMode plan review rendering", () => {
 		const edited = "# Plan\n\nedited body\n";
 		vi.spyOn(mode, "showPlanReview").mockImplementation(async (_plan, _title, _options, dialogOptions) => {
 			dialogOptions?.onPlanEdited?.(edited);
-			return "Approve and execute";
+			return "execute";
 		});
 		vi.spyOn(mode, "handleClearCommand").mockResolvedValue();
 		const promptSpy = vi.spyOn(session, "prompt").mockImplementation(async promptText => {
@@ -1402,7 +1371,7 @@ describe("InteractiveMode plan review rendering", () => {
 		expect(await Bun.file(resolvedPlanPath).text()).toContain("edited body");
 	});
 
-	it("saves the final plan to the chosen path and starts a new session", async () => {
+	it("saves the overlay's plan to the chosen path and keeps the review and plan mode", async () => {
 		const planFilePath = "local://PLAN.md";
 		const resolvedPlanPath = resolveLocalUrlToPath(planFilePath, {
 			getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
@@ -1413,9 +1382,15 @@ describe("InteractiveMode plan review rendering", () => {
 		mode.planModeEnabled = true;
 		mode.planModePlanFilePath = planFilePath;
 		const edited = "# Auto QA\n\nSave the final plan.\n\n## Verify\n\n- run focused tests\n";
+		const saved = Promise.withResolvers<string>();
+		vi.spyOn(mode, "showStatus").mockImplementation(message => {
+			if (message.startsWith("Saved plan to")) saved.resolve(message);
+		});
 		vi.spyOn(mode, "showPlanReview").mockImplementation(async (_plan, _title, _options, dialogOptions) => {
-			dialogOptions?.onPlanEdited?.(edited);
-			return "Save and quit";
+			// Save leaves the review up: the operator dismisses it afterwards.
+			dialogOptions?.onSave?.(edited);
+			await saved.promise;
+			return undefined;
 		});
 		const generateTitle = vi.spyOn(session, "generateTitle").mockResolvedValue("Auto QA");
 		const destination = path.join(tempDir.path(), "AUTO_QA_PLAN.md");
@@ -1433,8 +1408,9 @@ describe("InteractiveMode plan review rendering", () => {
 			expect.any(String),
 		);
 		expect(await Bun.file(destination).text()).toBe(edited);
-		expect(clear).toHaveBeenCalledTimes(1);
-		expect(mode.planModeEnabled).toBe(false);
+		expect(await saved.promise).toContain("Saved plan to");
+		expect(clear).not.toHaveBeenCalled();
+		expect(mode.planModeEnabled).toBe(true);
 	});
 
 	it("carries pre-approval local artifacts into the fresh approve-and-execute session", async () => {
@@ -1455,7 +1431,7 @@ describe("InteractiveMode plan review rendering", () => {
 		const planContent = "# Plan\n\nfinal approved body\n";
 		vi.spyOn(mode, "showPlanReview").mockImplementation(async (_plan, _title, _options, dialogOptions) => {
 			dialogOptions?.onPlanEdited?.(planContent);
-			return "Approve and execute";
+			return "execute";
 		});
 		vi.spyOn(mode, "handleClearCommand").mockImplementation(async () => {
 			await session.sessionManager.newSession();
@@ -1503,7 +1479,7 @@ describe("InteractiveMode plan review rendering", () => {
 		mode.planModeEnabled = true;
 		mode.planModePlanFilePath = planFilePath;
 		vi.spyOn(session, "getContextUsage").mockReturnValue({ tokens: 7320, contextWindow: 10000, percent: 73.2 });
-		const selector = vi.spyOn(mode, "showPlanReview").mockResolvedValue("Refine plan");
+		const selector = vi.spyOn(mode, "showPlanReview").mockResolvedValue("refine");
 
 		await mode.handlePlanApproval({
 			planFilePath,
@@ -1515,13 +1491,11 @@ describe("InteractiveMode plan review rendering", () => {
 			expect.any(String),
 			"Plan mode - next step",
 			[
-				"Approve and execute",
-				"Approve and compact context",
-				"Approve and keep context (~7.3k / 10k)",
-				"Refine plan",
-				"Save and quit",
+				expect.objectContaining({ id: "execute", label: "Approve and execute" }),
+				expect.objectContaining({ id: "compact", label: "Approve and compact context" }),
+				{ id: "keep", label: "Approve and keep context", meta: "~7.3k / 10k", disabled: undefined },
 			],
-			expect.any(Object),
+			expect.objectContaining({ refine: { id: "refine", label: "Refine plan" } }),
 			expect.any(Object),
 		);
 	});
@@ -1580,7 +1554,7 @@ describe("InteractiveMode plan review rendering", () => {
 				percent: (tokens / contextWindow) * 100,
 			};
 		});
-		const selector = vi.spyOn(mode, "showPlanReview").mockResolvedValue("Refine plan");
+		const selector = vi.spyOn(mode, "showPlanReview").mockResolvedValue("refine");
 
 		await mode.handlePlanApproval({
 			planFilePath,
@@ -1589,13 +1563,10 @@ describe("InteractiveMode plan review rendering", () => {
 		});
 
 		expect(contextSpy).toHaveBeenCalledWith({ contextWindow: executionModel.contextWindow });
-		expect(selector.mock.calls[0]?.[2]).toEqual([
-			"Approve and execute",
-			"Approve and compact context",
-			`Approve and keep context (~${compactNumber(tokens)} / ${compactNumber(executionModel.contextWindow)})`,
-			"Refine plan",
-			"Save and quit",
-		]);
+		expect(selector.mock.calls[0]?.[2][2]).toMatchObject({
+			id: "keep",
+			meta: `~${compactNumber(tokens)} / ${compactNumber(executionModel.contextWindow)}`,
+		});
 	});
 
 	it("disables keep-context approval when execution context usage is above ninety-five percent", async () => {
@@ -1609,7 +1580,7 @@ describe("InteractiveMode plan review rendering", () => {
 		mode.planModeEnabled = true;
 		mode.planModePlanFilePath = planFilePath;
 		vi.spyOn(session, "getContextUsage").mockReturnValue({ tokens: 9600, contextWindow: 10000, percent: 96 });
-		const selector = vi.spyOn(mode, "showPlanReview").mockResolvedValue("Refine plan");
+		const selector = vi.spyOn(mode, "showPlanReview").mockResolvedValue("refine");
 
 		await mode.handlePlanApproval({
 			planFilePath,
@@ -1617,11 +1588,7 @@ describe("InteractiveMode plan review rendering", () => {
 			title: "PLAN",
 		});
 
-		expect(selector.mock.calls[0]?.[3]).toEqual(
-			expect.objectContaining({
-				disabledIndices: [2],
-			}),
-		);
+		expect(selector.mock.calls[0]?.[2][2]).toMatchObject({ id: "keep", disabled: "Context is over 95% full" });
 	});
 
 	it("keeps keep-context approval enabled at exactly ninety-five percent", async () => {
@@ -1635,7 +1602,7 @@ describe("InteractiveMode plan review rendering", () => {
 		mode.planModeEnabled = true;
 		mode.planModePlanFilePath = planFilePath;
 		vi.spyOn(session, "getContextUsage").mockReturnValue({ tokens: 9500, contextWindow: 10000, percent: 95 });
-		const selector = vi.spyOn(mode, "showPlanReview").mockResolvedValue("Refine plan");
+		const selector = vi.spyOn(mode, "showPlanReview").mockResolvedValue("refine");
 
 		await mode.handlePlanApproval({
 			planFilePath,
@@ -1643,11 +1610,7 @@ describe("InteractiveMode plan review rendering", () => {
 			title: "PLAN",
 		});
 
-		expect(selector.mock.calls[0]?.[3]).toEqual(
-			expect.objectContaining({
-				disabledIndices: undefined,
-			}),
-		);
+		expect(selector.mock.calls[0]?.[2][2]?.disabled).toBeUndefined();
 	});
 
 	it("keeps the keep-context label plain when context usage is unknown", async () => {
@@ -1662,7 +1625,7 @@ describe("InteractiveMode plan review rendering", () => {
 		mode.planModePlanFilePath = planFilePath;
 		// Post-compaction: tokens unknown until the next LLM response.
 		vi.spyOn(session, "getContextUsage").mockReturnValue(undefined);
-		const selector = vi.spyOn(mode, "showPlanReview").mockResolvedValue("Refine plan");
+		const selector = vi.spyOn(mode, "showPlanReview").mockResolvedValue("refine");
 
 		await mode.handlePlanApproval({
 			planFilePath,
@@ -1670,19 +1633,12 @@ describe("InteractiveMode plan review rendering", () => {
 			title: "PLAN",
 		});
 
-		expect(selector).toHaveBeenCalledWith(
-			expect.any(String),
-			"Plan mode - next step",
-			[
-				"Approve and execute",
-				"Approve and compact context",
-				"Approve and keep context",
-				"Refine plan",
-				"Save and quit",
-			],
-			expect.any(Object),
-			expect.any(Object),
-		);
+		expect(selector.mock.calls[0]?.[2][2]).toEqual({
+			id: "keep",
+			label: "Approve and keep context",
+			meta: undefined,
+			disabled: undefined,
+		});
 	});
 
 	it("approves a plan without clearing the session when keeping context", async () => {
@@ -1700,7 +1656,7 @@ describe("InteractiveMode plan review rendering", () => {
 		mode.planModeEnabled = true;
 		mode.planModePlanFilePath = planFilePath;
 		vi.spyOn(session, "getContextUsage").mockReturnValue(undefined);
-		vi.spyOn(mode, "showPlanReview").mockResolvedValue("Approve and keep context");
+		vi.spyOn(mode, "showPlanReview").mockResolvedValue("keep");
 		const clear = vi.spyOn(mode, "handleClearCommand").mockResolvedValue();
 		const prompt = vi.spyOn(session, "prompt").mockResolvedValue(undefined as never);
 
@@ -1804,7 +1760,7 @@ describe("InteractiveMode plan review rendering", () => {
 		// instance the spies are on.
 		vi.spyOn(mode, "showPlanReview").mockImplementation(async (_plan, _title, options) => {
 			streaming = true;
-			return options[2];
+			return options[2]!.id;
 		});
 		const errorSpy = vi.spyOn(mode, "showError");
 
@@ -1844,7 +1800,7 @@ describe("InteractiveMode plan review rendering", () => {
 			throw new AgentBusyError();
 		});
 		const followUpSpy = vi.spyOn(session, "followUp").mockResolvedValue();
-		vi.spyOn(mode, "showPlanReview").mockImplementation(async (_plan, _title, options) => options[2]);
+		vi.spyOn(mode, "showPlanReview").mockImplementation(async (_plan, _title, options) => options[2]!.id);
 		const errorSpy = vi.spyOn(mode, "showError");
 
 		await mode.handlePlanApproval({ planFilePath, planExists: true, title: "PLAN" });
@@ -1906,7 +1862,7 @@ describe("InteractiveMode plan review rendering", () => {
 			mode.queueCompactionMessage("queued message", "followUp");
 			return undefined as never;
 		});
-		vi.spyOn(mode, "showPlanReview").mockImplementation(async (_plan, _title, options) => options[1]);
+		vi.spyOn(mode, "showPlanReview").mockImplementation(async (_plan, _title, options) => options[1]!.id);
 		const errorSpy = vi.spyOn(mode, "showError");
 
 		await mode.handlePlanApproval({ planFilePath, planExists: true, title: "PLAN" });
@@ -1938,7 +1894,7 @@ describe("InteractiveMode plan review rendering", () => {
 
 		mode.planModeEnabled = true;
 		mode.planModePlanFilePath = planFilePath;
-		vi.spyOn(mode, "showPlanReview").mockResolvedValue("Approve and execute");
+		vi.spyOn(mode, "showPlanReview").mockResolvedValue("execute");
 		const clear = vi.spyOn(mode, "handleClearCommand").mockResolvedValue();
 		const prompt = vi.spyOn(session, "prompt").mockResolvedValue(undefined as never);
 
@@ -1998,7 +1954,7 @@ describe("InteractiveMode plan review rendering", () => {
 				expect(slowIndex).toBeGreaterThanOrEqual(0);
 				// Simulate the operator sliding the tier to "slow" before approving.
 				slider!.onChange?.(slowIndex);
-				return "Approve and keep context";
+				return "keep";
 			},
 		);
 
@@ -2043,7 +1999,7 @@ describe("InteractiveMode plan review rendering", () => {
 				const slowIndex = slider!.segments.findIndex(segment => segment.label === "slow");
 				expect(slowIndex).toBeGreaterThanOrEqual(0);
 				slider!.onChange?.(slowIndex);
-				return "Approve and keep context";
+				return "keep";
 			},
 		);
 
@@ -2093,7 +2049,7 @@ describe("InteractiveMode plan review rendering", () => {
 				const defaultIndex = slider!.segments.findIndex(segment => segment.label === "default");
 				expect(defaultIndex).toBeGreaterThanOrEqual(0);
 				slider!.onChange?.(defaultIndex);
-				return "Approve and keep context";
+				return "keep";
 			},
 		);
 
@@ -2136,7 +2092,7 @@ describe("InteractiveMode plan review rendering", () => {
 				const defaultIndex = slider!.segments.findIndex(segment => segment.label === "default");
 				expect(defaultIndex).toBeGreaterThanOrEqual(0);
 				slider!.onChange?.(defaultIndex);
-				return "Approve and keep context";
+				return "keep";
 			},
 		);
 
@@ -2176,7 +2132,7 @@ describe("InteractiveMode plan review rendering", () => {
 		vi.spyOn(mode, "showPlanReview").mockImplementation(
 			async (_planContent, _title, _options, _dialogOptions, extra?: { slider?: HookSelectorSlider }) => {
 				sliderShown = extra?.slider;
-				return "Approve and keep context";
+				return "keep";
 			},
 		);
 
@@ -2205,7 +2161,7 @@ describe("InteractiveMode plan review rendering", () => {
 		expect(session.model?.id).toBe(planModel.id);
 
 		vi.spyOn(session, "getContextUsage").mockReturnValue(undefined);
-		vi.spyOn(mode, "showPlanReview").mockResolvedValue("Approve and compact context");
+		vi.spyOn(mode, "showPlanReview").mockResolvedValue("compact");
 		vi.spyOn(session, "prompt").mockResolvedValue(undefined as never);
 
 		let compactModelId: string | undefined;
@@ -2242,7 +2198,7 @@ describe("InteractiveMode plan review rendering", () => {
 		expect(session.model?.id).toBe(planModel.id);
 
 		vi.spyOn(session, "getContextUsage").mockReturnValue(undefined);
-		vi.spyOn(mode, "showPlanReview").mockResolvedValue("Approve and compact context");
+		vi.spyOn(mode, "showPlanReview").mockResolvedValue("compact");
 		const promptSpy = vi.spyOn(session, "prompt").mockResolvedValue(undefined as never);
 
 		let compactModelId: string | undefined;
@@ -2301,7 +2257,7 @@ describe("InteractiveMode plan review rendering", () => {
 				expect(defaultIndex).toBeGreaterThanOrEqual(0);
 				// Operator planned on opus but slides execution down to the default tier.
 				slider!.onChange?.(defaultIndex);
-				return "Approve and compact context";
+				return "compact";
 			},
 		);
 
@@ -2340,7 +2296,7 @@ describe("InteractiveMode plan review rendering", () => {
 		expect(session.model?.id).toBe(planModel.id);
 
 		vi.spyOn(session, "getContextUsage").mockReturnValue(undefined);
-		vi.spyOn(mode, "showPlanReview").mockResolvedValue("Approve and compact context");
+		vi.spyOn(mode, "showPlanReview").mockResolvedValue("compact");
 		const promptSpy = vi.spyOn(session, "prompt").mockResolvedValue(undefined as never);
 
 		let compactModelId: string | undefined;
@@ -2387,7 +2343,7 @@ describe("InteractiveMode plan review rendering", () => {
 		expect(session.model?.id).toBe(planModel.id);
 
 		vi.spyOn(session, "getContextUsage").mockReturnValue(undefined);
-		vi.spyOn(mode, "showPlanReview").mockResolvedValue("Approve and compact context");
+		vi.spyOn(mode, "showPlanReview").mockResolvedValue("compact");
 		vi.spyOn(session, "prompt").mockResolvedValue(undefined as never);
 
 		let hookWasFunction = false;
@@ -2423,7 +2379,7 @@ describe("InteractiveMode plan review rendering", () => {
 
 		await mode.handlePlanModeCommand();
 
-		vi.spyOn(mode, "showPlanReview").mockResolvedValue("Approve and execute");
+		vi.spyOn(mode, "showPlanReview").mockResolvedValue("execute");
 		vi.spyOn(mode, "handleClearCommand").mockResolvedValue();
 		vi.spyOn(session, "prompt").mockResolvedValue(undefined as never);
 
@@ -2443,6 +2399,39 @@ describe("InteractiveMode plan review rendering", () => {
 			reentry: true,
 		});
 	});
+
+	it.each([
+		{ noTitle: undefined, expected: "Release notes cleanup" },
+		{ noTitle: "1", expected: undefined },
+	])(
+		"seeds the session name from the approved plan title only when titling is enabled (PI_NO_TITLE=$noTitle)",
+		async ({ noTitle, expected }) => {
+			const previousNoTitle = Bun.env.PI_NO_TITLE;
+			if (noTitle === undefined) delete Bun.env.PI_NO_TITLE;
+			else Bun.env.PI_NO_TITLE = noTitle;
+			try {
+				const planFilePath = "local://PLAN.md";
+				const resolvedPlanPath = resolveLocalUrlToPath(planFilePath, {
+					getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+					getSessionId: () => session.sessionManager.getSessionId(),
+				});
+				await Bun.write(resolvedPlanPath, "# Plan\n\nClean up the release notes.");
+
+				await mode.handlePlanModeCommand();
+
+				vi.spyOn(mode, "showPlanReview").mockResolvedValue("execute");
+				vi.spyOn(mode, "handleClearCommand").mockResolvedValue();
+				vi.spyOn(session, "prompt").mockResolvedValue(undefined as never);
+
+				await mode.handlePlanApproval({ planFilePath, planExists: true, title: "release-notes-cleanup" });
+
+				expect(session.sessionManager.getSessionName()).toBe(expected);
+			} finally {
+				if (previousNoTitle === undefined) delete Bun.env.PI_NO_TITLE;
+				else Bun.env.PI_NO_TITLE = previousNoTitle;
+			}
+		},
+	);
 	it("autosaves the approved plan when plan.autosave is enabled", async () => {
 		const planFilePath = "local://PLAN.md";
 		const resolvedPlanPath = resolveLocalUrlToPath(planFilePath, {
@@ -2454,7 +2443,7 @@ describe("InteractiveMode plan review rendering", () => {
 		await mode.handlePlanModeCommand();
 		cfgPlanAutosave.set(session.settings, true);
 
-		vi.spyOn(mode, "showPlanReview").mockResolvedValue("Approve and execute");
+		vi.spyOn(mode, "showPlanReview").mockResolvedValue("execute");
 		vi.spyOn(mode, "handleClearCommand").mockResolvedValue();
 		vi.spyOn(session, "prompt").mockResolvedValue(undefined as never);
 		const status = vi.spyOn(mode, "showStatus");
@@ -2484,7 +2473,7 @@ describe("InteractiveMode plan review rendering", () => {
 		await Bun.write(blocker, "x");
 		cfgPlanAutosaveDir.set(session.settings, path.join(blocker, "sub"));
 
-		vi.spyOn(mode, "showPlanReview").mockResolvedValue("Approve and execute");
+		vi.spyOn(mode, "showPlanReview").mockResolvedValue("execute");
 		vi.spyOn(mode, "handleClearCommand").mockResolvedValue();
 		const promptSpy = vi.spyOn(session, "prompt").mockResolvedValue(undefined as never);
 		const warning = vi.spyOn(mode, "showWarning");
@@ -2509,7 +2498,7 @@ describe("InteractiveMode plan review rendering", () => {
 
 		mode.planModeEnabled = true;
 		mode.planModePlanFilePath = planFilePath;
-		vi.spyOn(mode, "showPlanReview").mockResolvedValue("Approve and compact context");
+		vi.spyOn(mode, "showPlanReview").mockResolvedValue("compact");
 		const compactSpy = vi.spyOn(mode, "handleCompactCommand").mockResolvedValue("ok");
 		const markSentSpy = vi.spyOn(session, "markPlanReferenceSent");
 		const promptSpy = vi.spyOn(session, "prompt").mockResolvedValue(undefined as never);
@@ -2525,12 +2514,12 @@ describe("InteractiveMode plan review rendering", () => {
 		// `customInstructions` channel of the `session_before_compact` hook —
 		// extensions there treat that field as user focus (issue #4359).
 		expect(compactSpy).toHaveBeenCalledTimes(1);
-		const [customInstructions, mode_, beforeFlush, internalGuidance] = compactSpy.mock.calls[0]!;
+		const [customInstructions, mode_, beforeFlush, options] = compactSpy.mock.calls[0]!;
 		expect(customInstructions).toBeUndefined();
 		expect(mode_).toBeUndefined();
 		expect(typeof beforeFlush).toBe("function");
-		expect(typeof internalGuidance).toBe("string");
-		expect(internalGuidance as string).toContain(planFilePath);
+		expect(typeof options?.internalGuidance).toBe("string");
+		expect(options?.internalGuidance).toContain(planFilePath);
 
 		// Plan-approved synthetic prompt was dispatched.
 		const planApprovedIdx = promptSpy.mock.calls.findIndex(isPlanApprovedCall);
@@ -2540,6 +2529,34 @@ describe("InteractiveMode plan review rendering", () => {
 		// turn doesn't double-inject the plan reference (it was just dispatched
 		// inside the synthetic prompt).
 		expect(markSentSpy).toHaveBeenCalledTimes(1);
+	});
+
+	it("Approve and compact context: compacts for the pre-plan model the approval restores", async () => {
+		authStorage.keys.setRuntime("anthropic", "test-key");
+		authStorage.keys.setRuntime("openai", "test-key");
+		const prePlanModel = session.modelRegistry.find("anthropic", "claude-sonnet-4-5");
+		const planModel = session.modelRegistry.find("openai", "gpt-5.4");
+		if (!prePlanModel || !planModel) throw new Error("Expected sonnet + gpt-5.4 to exist in registry");
+		session.settings.setModelRole("default", "anthropic/claude-sonnet-4-5");
+		session.settings.setModelRole("plan", "openai/gpt-5.4");
+
+		const planFilePath = "local://PLAN.md";
+		const resolvedPlanPath = resolveLocalUrlToPath(planFilePath, {
+			getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+			getSessionId: () => session.sessionManager.getSessionId(),
+		});
+		await Bun.write(resolvedPlanPath, "# Plan\n\nCompact, then execute on the pre-plan model.");
+
+		await mode.handlePlanModeCommand();
+		expect(session.model?.id).toBe(planModel.id);
+		vi.spyOn(mode, "showPlanReview").mockResolvedValue("compact");
+		const compactSpy = vi.spyOn(mode, "handleCompactCommand").mockResolvedValue("ok");
+		vi.spyOn(session, "prompt").mockResolvedValue(true);
+
+		await mode.handlePlanApproval({ planFilePath, planExists: true, title: "PLAN" });
+
+		// The summary is written for the model execution runs on, not the plan model.
+		expect(compactSpy.mock.calls[0]?.[3]?.readerModel?.id).toBe(prePlanModel.id);
 	});
 
 	it("Approve and compact context: cancelled outcome skips plan-approved dispatch", async () => {
@@ -2556,7 +2573,7 @@ describe("InteractiveMode plan review rendering", () => {
 
 		mode.planModeEnabled = true;
 		mode.planModePlanFilePath = planFilePath;
-		vi.spyOn(mode, "showPlanReview").mockResolvedValue("Approve and compact context");
+		vi.spyOn(mode, "showPlanReview").mockResolvedValue("compact");
 		vi.spyOn(mode, "handleCompactCommand").mockResolvedValue("cancelled");
 		const showWarningSpy = vi.spyOn(mode, "showWarning");
 		const setPlanRefSpy = vi.spyOn(session, "setPlanReferencePath");
@@ -2610,7 +2627,7 @@ describe("InteractiveMode plan review rendering", () => {
 			restoredStates.push(dialogOptions?.annotationState);
 			if (reviewCount === 1) {
 				dialogOptions?.onAnnotationStateChange?.(annotationState);
-				return "Approve and compact context";
+				return "compact";
 			}
 			return undefined;
 		});
@@ -2638,7 +2655,7 @@ describe("InteractiveMode plan review rendering", () => {
 
 		mode.planModeEnabled = true;
 		mode.planModePlanFilePath = planFilePath;
-		vi.spyOn(mode, "showPlanReview").mockResolvedValue("Approve and compact context");
+		vi.spyOn(mode, "showPlanReview").mockResolvedValue("compact");
 		vi.spyOn(mode, "handleCompactCommand").mockResolvedValue("failed");
 		const markSentSpy = vi.spyOn(session, "markPlanReferenceSent");
 		const promptSpy = vi.spyOn(session, "prompt").mockResolvedValue(undefined as never);
@@ -2669,7 +2686,7 @@ describe("InteractiveMode plan review rendering", () => {
 
 		mode.planModeEnabled = true;
 		mode.planModePlanFilePath = planFilePath;
-		vi.spyOn(mode, "showPlanReview").mockResolvedValue("Approve and compact context");
+		vi.spyOn(mode, "showPlanReview").mockResolvedValue("compact");
 		vi.spyOn(session, "prompt").mockResolvedValue(undefined as never);
 
 		const setPlanRefSpy = vi.spyOn(session, "setPlanReferencePath");
@@ -2719,7 +2736,7 @@ describe("InteractiveMode plan review rendering", () => {
 
 		mode.planModeEnabled = true;
 		mode.planModePlanFilePath = planFilePath;
-		vi.spyOn(mode, "showPlanReview").mockResolvedValue("Approve and compact context");
+		vi.spyOn(mode, "showPlanReview").mockResolvedValue("compact");
 		if (compactOutcome === "throw") {
 			vi.spyOn(mode, "handleCompactCommand").mockRejectedValue(throwError ?? new Error("compact boom"));
 		} else {
@@ -2769,7 +2786,7 @@ describe("InteractiveMode plan review rendering", () => {
 		await Bun.write(resolvedPlanPath, "# Plan\n\nBody.");
 		mode.planModeEnabled = true;
 		mode.planModePlanFilePath = planFilePath;
-		vi.spyOn(mode, "showPlanReview").mockResolvedValue("Approve and execute");
+		vi.spyOn(mode, "showPlanReview").mockResolvedValue("execute");
 		const markSpy = vi.spyOn(session, "markPlanInternalAbortPending");
 		vi.spyOn(session, "prompt").mockResolvedValue(undefined as never);
 
@@ -2795,7 +2812,7 @@ describe("InteractiveMode plan review rendering", () => {
 		expect(session.getPlanModeState()?.planFilePath).toBe(planFilePath);
 
 		vi.spyOn(session, "getContextUsage").mockReturnValue(undefined);
-		const selector = vi.spyOn(mode, "showPlanReview").mockResolvedValue("Approve and keep context");
+		const selector = vi.spyOn(mode, "showPlanReview").mockResolvedValue("keep");
 		const showError = vi.spyOn(mode, "showError");
 		vi.spyOn(session, "prompt").mockResolvedValue(undefined as never);
 

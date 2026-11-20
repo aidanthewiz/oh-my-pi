@@ -7,6 +7,7 @@ import { registerCustomApi, unregisterCustomApis } from "@oh-my-pi/pi-ai/api-reg
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { closeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
+import { toModelSpec } from "@oh-my-pi/pi-catalog/provider-models/bundled-references";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { callSessionTool } from "@oh-my-pi/pi-coding-agent/eval/js/tool-bridge";
@@ -27,6 +28,7 @@ import {
 	type SubagentRuntimeApprovalHandler,
 	type SubagentRuntimeApprovalRequest,
 } from "@oh-my-pi/pi-coding-agent/tools/subagent-runtime-approval";
+import * as runtimeApproval from "@oh-my-pi/pi-coding-agent/tools/subagent-runtime-approval";
 import { cfgToolsApproval, cfgToolsApprovalMode } from "@oh-my-pi/pi-coding-agent/tools/settings";
 import { Container, TUI } from "@oh-my-pi/pi-tui";
 import { CustomEditor } from "@oh-my-pi/pi-tui/prompt/custom-editor";
@@ -34,6 +36,8 @@ import { getEditorTheme, getThemeByName, setThemeInstance } from "@oh-my-pi/pi-t
 import { VirtualTerminal } from "../../../tui/test/virtual-terminal";
 import { removeSyncWithRetries } from "@oh-my-pi/pi-utils";
 import { AbortError } from "@oh-my-pi/pi-utils/abortable";
+import { RemoteAgentSession } from "../../src/thread/remote-agent-session";
+import { setSubagentWorkerPoolForTests, SubagentWorkerPool } from "../../src/thread/subagent-worker";
 
 const DCG_ENV = [
 	"OMP_DCG_PATH",
@@ -52,6 +56,8 @@ describe.skipIf(process.platform === "win32")("headless subagent runtime approva
 	const sessions: AgentSession[] = [];
 	const authStores: AuthStorage[] = [];
 	const displays: TUI[] = [];
+	let workerPool: SubagentWorkerPool | undefined;
+	let restoreRoute: (() => void) | undefined;
 
 	beforeAll(async () => {
 		const theme = await getThemeByName("dark");
@@ -82,11 +88,16 @@ describe.skipIf(process.platform === "win32")("headless subagent runtime approva
 	});
 
 	afterEach(async () => {
+		restoreRoute?.();
+		restoreRoute = undefined;
 		await AgentLifecycleManager.global().dispose();
 		AgentLifecycleManager.resetGlobalForTests();
 		for (const session of sessions.splice(0)) await session.dispose();
 		for (const display of displays.splice(0)) display.stop();
 		for (const auth of authStores.splice(0)) auth.close();
+		workerPool?.dispose();
+		workerPool = undefined;
+		setSubagentWorkerPoolForTests(undefined);
 		AgentRegistry.resetGlobalForTests();
 		unregisterCustomApis(MOCK_API_SOURCE);
 	});
@@ -186,13 +197,19 @@ describe.skipIf(process.platform === "win32")("headless subagent runtime approva
 			editorContainer,
 			session: fixture.session,
 			composer: { rowsBelow: () => undefined },
+			closeLinkBrowser: () => undefined,
 		} as unknown as InteractiveModeContext;
 		const controller = new ExtensionUiController(context);
+		const selectorRequested = Promise.withResolvers<void>();
 		const runner = fixture.session.extensionRunner;
 		if (!runner) throw new Error("Missing parent extension runner");
 		const uiContext: ExtensionUIContext = {
 			...runner.getUIContext(),
-			select: (title, options, dialogOptions) => controller.showCollabAwareSelector(title, options, dialogOptions),
+			select: (title, options, dialogOptions) => {
+				const selected = controller.showCollabAwareSelector(title, options, dialogOptions);
+				selectorRequested.resolve();
+				return selected;
+			},
 		};
 		await initializeExtensions(fixture.session, {
 			mode,
@@ -206,7 +223,7 @@ describe.skipIf(process.platform === "win32")("headless subagent runtime approva
 		});
 		display.start();
 		displays.push(display);
-		return { ...fixture, terminal, display, context, uiContext };
+		return { ...fixture, terminal, display, context, uiContext, selectorRequested: selectorRequested.promise };
 	}
 
 	async function reinitializeParent(owner: { session: AgentSession; uiContext: ExtensionUIContext }): Promise<void> {
@@ -796,113 +813,163 @@ describe.skipIf(process.platform === "win32")("headless subagent runtime approva
 		expect(fs.existsSync(marker)).toBeFalse();
 	});
 
-	it("carries the live route through an actual task spawn rather than a replacement executor", async () => {
-		const marker = path.join(root, "task-effect.txt");
-		const command = `printf task-reviewed > ${JSON.stringify(marker)}`;
-		const model = createMockModel({
-			id: "approval-fixture",
-			handler: context => {
-				const ranBash = context.messages.some(
-					message => message.role === "toolResult" && message.toolName === "bash",
-				);
-				return ranBash
-					? {
-							content: [
-								{ type: "toolCall", name: "yield", arguments: { type: "result", data: { reviewed: true } } },
-							],
-						}
-					: { content: [{ type: "toolCall", name: "bash", arguments: { command } }] };
-			},
-		});
-		const authStorage = await AuthStorage.create(":memory:");
-		authStores.push(authStorage);
-		authStorage.keys.setRuntime("mock", "owned-fixture");
-		const modelRegistry = new ModelRegistry(authStorage);
-		modelRegistry.registerProvider("mock", {
-			api: model.api,
-			baseUrl: model.baseUrl,
-			apiKey: "owned-fixture",
-			models: [model],
-		});
-		registerCustomApi(
-			model.api,
-			(candidate, context, options) => model.stream(candidate, context, options),
-			MOCK_API_SOURCE,
-		);
-		const owner = await parent("tui", {
-			model,
-			modelRegistry,
-			authStorage,
-			toolNames: ["bash", "task"],
-			inheritedSessionAgents: [
-				{
-					name: "owned-approval",
-					description: "One owned approval fixture",
-					source: "project",
-					systemPrompt: "Run the owned fixture command, then yield its result.",
-					tools: ["bash"],
-					model: ["mock/approval-fixture"],
+	it.each(["main", "worker", "mutated-worker"] as const)(
+		"carries the live route through an actual task spawn on %s",
+		async placement => {
+			const marker = path.join(root, `task-effect-${placement}.txt`);
+			const command = `printf task-reviewed > ${JSON.stringify(marker)}`;
+			let bashResultIsError = false;
+			let bashOutcome: unknown;
+			let mutations = 0;
+			const model = createMockModel({
+				id: "approval-fixture",
+				handler: context => {
+					const ranBash = context.messages.findLast(
+						message => message.role === "toolResult" && message.toolName === "bash",
+					);
+					if (ranBash?.role === "toolResult") bashResultIsError = ranBash.isError === true;
+					bashOutcome = ranBash;
+					return ranBash
+						? {
+								content: [
+									{ type: "toolCall", name: "yield", arguments: { type: "result", data: { reviewed: true } } },
+								],
+							}
+						: { content: [{ type: "toolCall", name: "bash", arguments: { command } }] };
 				},
-			],
-			settings: Settings.isolated({
-				"async.enabled": false,
-				"task.batch": false,
-				"task.structured": true,
-				"task.isolation.enabled": false,
-				"task.enableLsp": false,
-				"task.agentIdleTtlMs": 0,
-				"memory.backend": "off",
-				"compaction.enabled": false,
-				"retry.enabled": false,
-				"todo.enabled": false,
-				"advisor.enabled": false,
-				"bashInterceptor.enabled": false,
-				"bash.autoBackground.enabled": false,
-				"launch.enabled": false,
-				"approval.notify": "off",
-				"tools.approvalMode": "yolo",
-				modelRoles: {
-					default: "mock/approval-fixture",
-					task: "mock/approval-fixture",
-					smol: "mock/approval-fixture",
-				},
-			}),
-			enableIrc: false,
-			skipPythonPreflight: true,
-			cacheWarming: false,
-		});
-		let finished = false;
-		const settled = callSessionTool(
-			"task",
-			{
-				name: "OwnedSpawn",
-				agent: "owned-approval",
-				task: "Run the one owned command.",
-				solutionSpace: "One exact synthetic command.",
-				contextFilePolicy: "none",
-			},
-			{ session: owner.bridgeSession },
-		)
-			.then(
-				value => ({ value }),
-				(error: unknown) => ({ error }),
-			)
-			.finally(() => {
-				finished = true;
 			});
-		await owner.terminal.waitForRender(
-			() => owner.terminal.getScrollBuffer().join("\n").includes("OwnedSpawn") || finished,
-		);
-		if (!owner.context.hookSelector) throw new Error(`Task ended before approval: ${JSON.stringify(await settled)}`);
-		expect(owner.terminal.getScrollBuffer().join("\n")).toContain("OwnedSpawn");
-		expect(fs.existsSync(marker)).toBeFalse();
-		owner.terminal.sendInput("\x1b[B");
-		owner.terminal.sendInput("\r");
-		const result = await settled;
-		if ("error" in result) throw result.error;
-		expect(result.value).toMatchObject({ details: { results: [{ exitCode: 0 }] } });
-		expect(fs.readFileSync(marker, "utf8")).toBe("task-reviewed");
-	});
+			const authStorage = await AuthStorage.create(":memory:");
+			authStores.push(authStorage);
+			authStorage.keys.setRuntime("mock", "owned-fixture");
+			const modelRegistry = new ModelRegistry(authStorage);
+			modelRegistry.registerProvider("mock", {
+				api: model.api,
+				baseUrl: model.baseUrl,
+				apiKey: "owned-fixture",
+				streamSimple: (candidate, context, options) => model.stream(candidate, context, options),
+				models: [{ ...toModelSpec(model), contextWindow: model.contextWindow, maxTokens: model.maxTokens }],
+			});
+			registerCustomApi(
+				model.api,
+				(candidate, context, options) => model.stream(candidate, context, options),
+				MOCK_API_SOURCE,
+			);
+			const registeredModel = modelRegistry.find("mock", model.id);
+			if (!registeredModel) throw new Error("Missing registered approval fixture model");
+			if (placement !== "main") {
+				workerPool = new SubagentWorkerPool({ maxWorkers: () => 1, hostsOnMain: false });
+				setSubagentWorkerPoolForTests(workerPool);
+			}
+			if (placement === "mutated-worker") {
+				const createHandler = runtimeApproval.createSubagentRuntimeApprovalHandler;
+				const spy = spyOn(runtimeApproval, "createSubagentRuntimeApprovalHandler").mockImplementation(options => {
+					const route = createHandler(options);
+					return async (request, signal) => {
+						const result = await route(request, signal);
+						if (result.decision === "approved") {
+							Reflect.set(request, "toolCallId", `${request.toolCallId}-changed`);
+							mutations++;
+						}
+						return result;
+					};
+				});
+				restoreRoute = () => spy.mockRestore();
+			}
+			const owner = await parent("tui", {
+				model: registeredModel,
+				modelRegistry,
+				authStorage,
+				toolNames: ["bash", "task"],
+				inheritedSessionAgents: [
+					{
+						name: "owned-approval",
+						description: "One owned approval fixture",
+						source: "project",
+						systemPrompt: "Run the owned fixture command, then yield its result.",
+						tools: ["bash"],
+						model: ["mock/approval-fixture"],
+					},
+				],
+				settings: Settings.isolated({
+					"async.enabled": false,
+					"task.batch": false,
+					"task.structured": true,
+					"task.isolation.enabled": false,
+					"task.enableLsp": false,
+					"task.agentIdleTtlMs": 0,
+					"memory.backend": "off",
+					"compaction.enabled": false,
+					"retry.enabled": false,
+					"todo.enabled": false,
+					"advisor.enabled": false,
+					"bashInterceptor.enabled": false,
+					"bash.autoBackground.enabled": false,
+					"launch.enabled": false,
+					"approval.notify": "off",
+					"tools.approvalMode": "yolo",
+					modelRoles: {
+						default: "mock/approval-fixture",
+						task: "mock/approval-fixture",
+						smol: "mock/approval-fixture",
+					},
+				}),
+				enableIrc: false,
+				skipPythonPreflight: true,
+				cacheWarming: false,
+			});
+			let finished = false;
+			const settled = callSessionTool(
+				"task",
+				{
+					name: "OwnedSpawn",
+					agent: "owned-approval",
+					task: "Run the one owned command.",
+					solutionSpace: "One exact synthetic command.",
+					outputSchema: {
+						type: "object",
+						properties: { reviewed: { type: "boolean" } },
+						required: ["reviewed"],
+						additionalProperties: false,
+					},
+					contextFilePolicy: "none",
+				},
+				{ session: owner.bridgeSession },
+			)
+				.then(
+					value => ({ value }),
+					(error: unknown) => ({ error }),
+				)
+				.finally(() => {
+					finished = true;
+				});
+			const initial = await Promise.race([
+				owner.selectorRequested.then(() => ({ kind: "approval" as const })),
+				settled.then(task => ({ kind: "settled" as const, task })),
+			]);
+			if (initial.kind === "settled")
+				throw new Error(`Task ended before approval: ${JSON.stringify({ task: initial.task, bashOutcome })}`);
+			await owner.terminal.waitForRender(
+				() => owner.terminal.getScrollBuffer().join("\n").includes("OwnedSpawn") || finished,
+			);
+			if (finished)
+				throw new Error(`Task ended before approval: ${JSON.stringify({ task: await settled, bashOutcome })}`);
+			expect(owner.context.hookSelector).toBeDefined();
+			expect(owner.terminal.getScrollBuffer().join("\n")).toContain("OwnedSpawn");
+			const childSession = AgentRegistry.global().get("OwnedSpawn")?.session;
+			if (!childSession) throw new Error("Missing spawned approval child");
+			expect(childSession instanceof RemoteAgentSession).toBe(placement !== "main");
+			expect(fs.existsSync(marker)).toBeFalse();
+			owner.terminal.sendInput("\x1b[B");
+			owner.terminal.sendInput("\r");
+			const result = await settled;
+			if ("error" in result) throw result.error;
+			expect(result.value).toMatchObject({ details: { results: [{ exitCode: 0 }] } });
+			expect(mutations).toBe(placement === "mutated-worker" ? 1 : 0);
+			if (placement === "mutated-worker") expect(fs.existsSync(marker)).toBeFalse();
+			else expect(fs.readFileSync(marker, "utf8")).toBe("task-reviewed");
+			expect(bashResultIsError).toBe(placement === "mutated-worker");
+		},
+	);
 
 	it("preserves fail-closed refusal when no live parent approval route exists", async () => {
 		const fixture = await child();

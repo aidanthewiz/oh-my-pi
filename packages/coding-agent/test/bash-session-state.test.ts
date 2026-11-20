@@ -42,6 +42,23 @@ async function run(tool: BashTool, command: string) {
 	return { text, async: result.details?.async, exitCode: result.details?.exitCode, isError: result.isError };
 }
 
+it.each([
+	{ managed: false, settings: { "bash.autoBackground.enabled": false } },
+	{ managed: true, settings: { "bash.autoBackground.enabled": true } },
+])("does not stream or return a run trace when visualization is disabled (managed: $managed)", async ({ settings }) => {
+	const tool = bashTool({ ...settings, "display.shellVisualization": false });
+	let frames = 0;
+	let tracedFrames = 0;
+	const result = await tool.execute("trace-disabled", { command: "printf 'plain output\\n'" }, undefined, update => {
+		frames++;
+		if (update.details?.trace) tracedFrames++;
+	});
+	expect(frames).toBeGreaterThan(0);
+	expect(tracedFrames).toBe(0);
+	expect(result.details?.trace).toBeUndefined();
+	expect(result.content.find(block => block.type === "text")?.text).toContain("plain output");
+});
+
 it.skipIf(process.platform === "win32")("keeps a variable set by one call for the next call", async () => {
 	const tool = bashTool();
 	await run(tool, "PI_STATE_VAR=kept");
@@ -74,19 +91,46 @@ it.skipIf(process.platform === "win32")("keeps state and options after a call th
 });
 
 it.skipIf(process.platform === "win32")(
-	"isolates calls that overlap a backgrounded one and leaves the session shell intact",
+	"carries what calls overlapping a backgrounded one set back into the session shell",
 	async () => {
 		const tool = bashTool({ "bash.autoBackground.thresholdMs": 100 });
-		await run(tool, "PI_STATE_VAR=kept");
-		expect((await run(tool, "sleep 2")).async?.state).toBe("running");
+		await run(tool, "PI_STATE_VAR=kept; PI_BOTH_VAR=before");
+		expect((await run(tool, "PI_BOTH_VAR=owner; sleep 2")).async?.state).toBe("running");
 
-		const overlapping = await run(tool, 'printf "[%s]" "$PI_STATE_VAR"; PI_STATE_VAR=lost');
-		expect(overlapping.text).toStartWith("[]");
-		const promoted = await run(tool, "PI_STATE_VAR=lost-again; sleep 0.5");
+		const overlapping = await run(
+			tool,
+			'printf "[%s]" "$PI_STATE_VAR"; PI_STATE_VAR=carried; PI_BOTH_VAR=fork; pi_fork_fn() { printf fn; }',
+		);
+		expect(overlapping.text).toBe("[kept]");
+		// The next overlapping call sees it before the backgrounded one ends.
+		expect((await run(tool, 'printf "%s:" "$PI_STATE_VAR"; pi_fork_fn')).text).toBe("carried:fn");
+		const promoted = await run(tool, "PI_PROMOTED_VAR=promoted; sleep 0.5");
 		expect(promoted.async?.state).toBe("running");
 
 		await manager.waitForAll();
-		expect((await run(tool, 'printf "%s" "$PI_STATE_VAR"')).text).toBe("kept");
+		// The backgrounded call ended last, so it keeps the name both set.
+		expect(
+			(await run(tool, 'printf "%s %s %s:" "$PI_STATE_VAR" "$PI_BOTH_VAR" "$PI_PROMOTED_VAR"; pi_fork_fn')).text,
+		).toBe("carried owner promoted:fn");
+	},
+	10_000,
+);
+
+it.skipIf(process.platform === "win32")(
+	"keeps background jobs an overlapping call starts alive",
+	async () => {
+		const tool = bashTool({ "bash.autoBackground.thresholdMs": 100 });
+		expect((await run(tool, "sleep 2")).async?.state).toBe("running");
+
+		const overlapping = await run(tool, "/bin/sleep 30 & printf %s $!");
+		const pid = Number.parseInt(overlapping.text, 10);
+		try {
+			Bun.gc(true);
+			expect(() => process.kill(pid, 0)).not.toThrow();
+		} finally {
+			process.kill(pid, "SIGKILL");
+		}
+		await manager.waitForAll();
 	},
 	10_000,
 );
