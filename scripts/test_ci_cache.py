@@ -2,8 +2,10 @@ import contextlib
 import datetime as dt
 import importlib.util
 import io
+import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -143,6 +145,76 @@ class CacheTests(unittest.TestCase):
         self.assertFalse((disk / "sentinel").exists())
         self.assertEqual(output.read_text().splitlines()[-1], "hit=true")
         self.assertEqual(cache.read_json(fetched / "manifest.json"), manifest)
+
+    @unittest.skipUnless(sys.platform in ("linux", "darwin"), "Bazel cache builders run on Linux and macOS")
+    def test_workflow_shutdown_allows_packing_a_restorable_cache(self):
+        bazel = shutil.which("bazelisk") or shutil.which("bazel")
+        bun = shutil.which("bun")
+        self.assertIsNotNone(bazel, "workflow cache regression requires Bazel")
+        self.assertIsNotNone(bun, "workflow cache regression requires Bun")
+        repository = HELPER.resolve().parent.parent
+        for workflow, job in (("cf-release.yml", "build"), ("relay.yml", "validate")):
+            with self.subTest(workflow=workflow):
+                parsed = subprocess.run(
+                    [bun, "--no-env-file", "-e", "console.log(JSON.stringify(Bun.YAML.parse(await Bun.stdin.text())))"],
+                    input=(repository / ".github/workflows" / workflow).read_text(),
+                    capture_output=True, text=True, check=True, timeout=20,
+                )
+                steps = json.loads(parsed.stdout)["jobs"][job]["steps"]
+                build = next(step for step in steps if step.get("name") == "Build native addon from Coreforge sources")
+                pack = next(step for step in steps if step.get("id") == "cache-pack")
+                setup, separator, _ = build["run"].partition("export OMP_BAZEL_RC=")
+                self.assertTrue(separator, "native build must expose its generated Bazel configuration")
+                root = self.root / workflow
+                root.mkdir()
+                home, temporary = root / "home", root / "runner"
+                home.mkdir()
+                temporary.mkdir()
+                (root / "MODULE.bazel").write_text('module(name = "cache_shutdown_test")\n')
+                (root / ".bazelrc").write_text("build:ci --announce_rc\n")
+                (root / ".bazelversion").write_bytes((repository / ".bazelversion").read_bytes())
+                (root / "scripts").mkdir()
+                (root / "scripts/ci_cache.py").symlink_to(HELPER.resolve())
+                environment = {
+                    **os.environ, "HOME": str(home), "RUNNER_TEMP": str(temporary),
+                    "BAZELISK_HOME": str(self.root / "bazelisk"),
+                }
+                configured = subprocess.run(
+                    ["bash", "-e", "-c", setup], cwd=root, env=environment,
+                    capture_output=True, text=True, timeout=20,
+                )
+                self.assertEqual(configured.returncode, 0, configured.stderr)
+                rc = temporary / "coreforge-bazel.rc"
+                output_root = root / "bazel-output"
+                with rc.open("a") as stream:
+                    stream.write(f"startup --output_user_root={output_root}\n")
+                disk, repo = home / ".cache/omp-bazel-disk", home / ".cache/omp-bazel-repo"
+                self.write(disk / DISK_NAME, b"compiled action output")
+                self.write(repo / REPO_NAME, b"repository download")
+                self.write(repo / ID_NAME, b"")
+                cache.atomic_json(temporary / "cache-identity.json", self.identity)
+                try:
+                    started = subprocess.run(
+                        [bazel, "--nosystem_rc", "--nohome_rc", f"--bazelrc={rc}", "info", "release"],
+                        cwd=root, env=environment, capture_output=True, text=True, timeout=90,
+                    )
+                    self.assertEqual(started.returncode, 0, started.stderr)
+                    packed = subprocess.run(
+                        ["bash", "-e", "-c", pack["run"]], cwd=root, env=environment,
+                        capture_output=True, text=True, timeout=90,
+                    )
+                    self.assertEqual(packed.returncode, 0, packed.stdout + packed.stderr)
+                finally:
+                    closed = subprocess.run(
+                        [bazel, "--ignore_all_rc_files", f"--output_user_root={output_root}", "shutdown"],
+                        cwd=root, env=environment, capture_output=True, text=True, timeout=30,
+                    )
+                    self.assertEqual(closed.returncode, 0, closed.stderr)
+                restored_disk, restored_repo = root / "restored-disk", root / "restored-repo"
+                cache.restore(temporary / "cache-identity.json", temporary / "cache-snapshot", restored_disk, restored_repo)
+                self.assertEqual((restored_disk / DISK_NAME).read_bytes(), b"compiled action output")
+                self.assertEqual((restored_repo / REPO_NAME).read_bytes(), b"repository download")
+                self.assertEqual((restored_repo / ID_NAME).read_bytes(), b"")
 
     def test_cold_miss_keeps_roots_and_writes_no_fake_manifest(self):
         fetched = self.root / "cold"
