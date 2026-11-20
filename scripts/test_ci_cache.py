@@ -165,9 +165,9 @@ class CacheTests(unittest.TestCase):
                 pack = next(step for step in steps if step.get("id") == "cache-pack")
                 setup, separator, _ = build["run"].partition("export OMP_BAZEL_RC=")
                 self.assertTrue(separator, "native build must expose its generated Bazel configuration")
-                root = self.root / workflow
-                root.mkdir()
-                home, temporary = root / "home", root / "runner"
+                root = self.root / workflow / "workspace"
+                root.mkdir(parents=True)
+                home, temporary = root.parent / "home", root.parent / "runner"
                 home.mkdir()
                 temporary.mkdir()
                 (root / "MODULE.bazel").write_text('module(name = "cache_shutdown_test")\n')
@@ -185,7 +185,7 @@ class CacheTests(unittest.TestCase):
                 )
                 self.assertEqual(configured.returncode, 0, configured.stderr)
                 rc = temporary / "coreforge-bazel.rc"
-                output_root = root / "bazel-output"
+                output_root = root.parent / "bazel-output"
                 with rc.open("a") as stream:
                     stream.write(f"startup --output_user_root={output_root}\n")
                 disk, repo = home / ".cache/omp-bazel-disk", home / ".cache/omp-bazel-repo"
@@ -195,10 +195,14 @@ class CacheTests(unittest.TestCase):
                 cache.atomic_json(temporary / "cache-identity.json", self.identity)
                 try:
                     started = subprocess.run(
-                        [bazel, "--nosystem_rc", "--nohome_rc", f"--bazelrc={rc}", "info", "release"],
+                        [bazel, "--nosystem_rc", "--nohome_rc", f"--bazelrc={rc}", "info", "output_base"],
                         cwd=root, env=environment, capture_output=True, text=True, timeout=90,
                     )
                     self.assertEqual(started.returncode, 0, started.stderr)
+                    self.assertFalse(
+                        Path(started.stdout.strip()).resolve().is_relative_to(root.resolve()),
+                        "Bazel output must remain outside the source workspace",
+                    )
                     packed = subprocess.run(
                         ["bash", "-e", "-c", pack["run"]], cwd=root, env=environment,
                         capture_output=True, text=True, timeout=90,
