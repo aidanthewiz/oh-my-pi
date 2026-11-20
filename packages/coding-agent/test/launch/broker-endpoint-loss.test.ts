@@ -1,8 +1,9 @@
 // Integration test — real timers are required (ts-no-test-timers exception): native IPC, process
 // shutdown, and replacement broker startup cannot run on fake timers.
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { IpcConnection } from "@oh-my-pi/pi-natives";
 import { isEnoent, TempDir } from "@oh-my-pi/pi-utils";
 import { startDaemonBrokerFromEnvironment } from "../../src/launch/broker";
 import { createDaemonBrokerClient } from "../../src/launch/client";
@@ -94,7 +95,26 @@ describe.skipIf(process.platform === "win32")("daemon broker runtime dir loss", 
 					]),
 					5_000,
 				);
-				expect((await client.request({ op: "ping" })).op).toBe("ping");
+				const disconnected: Promise<void>[] = [];
+				const start = IpcConnection.prototype.start;
+				const startSpy = spyOn(IpcConnection.prototype, "start").mockImplementation(
+					function (this: IpcConnection, onLine, onClose) {
+						const closed = Promise.withResolvers<void>();
+						disconnected.push(closed.promise);
+						start.call(this, onLine, reason => {
+							try {
+								onClose(reason);
+							} finally {
+								closed.resolve();
+							}
+						});
+					},
+				);
+				try {
+					expect((await client.request({ op: "ping" })).op).toBe("ping");
+				} finally {
+					startSpy.mockRestore();
+				}
 
 				// The relocated socket survives deletion of this long private runtime path.
 				if (loss === "deleted") {
@@ -105,6 +125,8 @@ describe.skipIf(process.platform === "win32")("daemon broker runtime dir loss", 
 					await fs.writeFile(pidPath, successorLease);
 				}
 				await within(broker, 5_000);
+				// Server shutdown can finish before the peer's close callback is delivered.
+				await within(Promise.all(disconnected), 5_000);
 				if (loss === "replaced") {
 					expect(await fs.readFile(pidPath, "utf8")).toBe(successorLease);
 					await fs.rm(pidPath);

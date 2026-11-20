@@ -1,8 +1,11 @@
 // Deep import: the pi-utils barrel loads the host native addon, which is
 // absent on cross-compiling release runners.
 import { USER_AGENT } from "@oh-my-pi/pi-utils/dirs";
-import { embeddedAddonFiles } from "../../natives/scripts/embed-native";
-import type { NativeEmbedTarget } from "../../natives/scripts/embed-native";
+import {
+	type EmbeddedAddonFiles,
+	embeddedAddonFiles,
+	type NativeEmbedTarget,
+} from "../../natives/scripts/embed-native";
 import { buildDocsIndexPayload } from "./generate-docs-index";
 import { createJsonParsePlugin } from "./json-parse-plugin";
 import { createLegacyPiVirtualModulePlugin } from "./legacy-pi-virtual-module";
@@ -23,10 +26,11 @@ export interface CodingAgentCompileOptions {
 	/** Absolute standalone executable output path. */
 	readonly outfile: string;
 	/**
-	 * Native addon target embedded for the runtime loader to extract; `null`
-	 * compiles without one (probe builds that never load the addon).
+	 * Native addon target embedded for the runtime loader to extract, or exact
+	 * prepared files shared by multiple builds from one source snapshot. `null`
+	 * compiles without an addon (probe builds that never load it).
 	 */
-	readonly native: NativeEmbedTarget | null;
+	readonly native: NativeEmbedTarget | { readonly files: EmbeddedAddonFiles } | null;
 	/** Optional cross-compilation runtime target. */
 	readonly target?: Bun.Build.CompileTarget;
 	/** Optional unmodified Bun executable used as the standalone runtime template. */
@@ -47,11 +51,16 @@ export async function compileCodingAgent(options: CodingAgentCompileOptions): Pr
 		Bun.env.BUN_NO_CODESIGN_MACHO_BINARY = "1";
 	}
 	try {
+		const nativeFiles = options.native
+			? "files" in options.native
+				? options.native.files
+				: await embeddedAddonFiles(options.native)
+			: {};
 		const output = await Bun.build({
 			entrypoints: [options.entrypoint],
 			root: options.repoRoot,
 			external: [...COMPILED_EXTERNAL_DEPENDENCIES],
-			files: options.native ? await embeddedAddonFiles(options.native) : {},
+			files: nativeFiles,
 			define: {
 				"process.env.PI_COMPILED": JSON.stringify("true"),
 				"process.env.PI_DOCS_EMBED": JSON.stringify((await buildDocsIndexPayload()).payload),

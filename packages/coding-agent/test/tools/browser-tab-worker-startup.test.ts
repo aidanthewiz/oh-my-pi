@@ -25,6 +25,7 @@ import {
 	runInTab,
 } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools/index";
+import { registerLogSink } from "@oh-my-pi/pi-utils/logger";
 import type { CDPSession } from "puppeteer-core";
 import { chromiumAvailable, visibleBrowserAvailable } from "./chromium-probe";
 
@@ -38,6 +39,7 @@ const VISIBLE_BROWSER_AVAILABLE = process.env.OMP_TEST_VISIBLE_BROWSER === "1" &
 // One headless Chromium for the file, held for its whole run: every test opens and closes its own tabs, and none
 // changes the browser in a way another test reads.
 let sharedHeadless: PuppeteerBrowserHandle | undefined;
+let unregisterBrowserDiagnostics: (() => void) | undefined;
 
 beforeAll(async () => {
 	if (!CHROMIUM_AVAILABLE) return;
@@ -45,10 +47,29 @@ beforeAll(async () => {
 	if (!("browser" in launched)) throw new Error("Expected a Puppeteer browser");
 	holdBrowser(launched);
 	sharedHeadless = launched;
+	const child = launched.browser.process();
+	unregisterBrowserDiagnostics = registerLogSink(({ message, context }) => {
+		if (message !== "Failed to recycle browser tab worker; killing tab") return;
+		console.error(message, {
+			error: context?.error,
+			connected: launched.browser.connected,
+			refCount: launched.refCount,
+			pid: child?.pid,
+			exitCode: child?.exitCode,
+			signalCode: child?.signalCode,
+		});
+	});
+	child?.once("exit", (code, signal) => {
+		if (launched.refCount > 0) console.error("Shared test browser exited while held", { code, signal });
+	});
 });
 
 afterAll(async () => {
-	if (sharedHeadless) await releaseBrowser(sharedHeadless, { kill: true });
+	try {
+		if (sharedHeadless) await releaseBrowser(sharedHeadless, { kill: true });
+	} finally {
+		unregisterBrowserDiagnostics?.();
+	}
 });
 
 function headless(): PuppeteerBrowserHandle {
