@@ -19,6 +19,7 @@
 ### Fixed
 
 - Synchronize shell job-control fixtures with actual shell startup before starting their signal delays.
+- Wait for suspended-loop termination in job-control fixtures before checking the final notification.
 - Synchronize lifecycle fixtures with actual approval presentation, retained consumer output, and SIGTERM-handler readiness without relaxing their assertions or timeouts.
 - Scope cached Kiro model unions to all participating account routes, preserving cache reuse across token rotation without reusing removed-account entitlements.
 - Close owned headless browser processes even after their CDP connection is lost, before removing their profiles.
@@ -28,6 +29,8 @@
 - Preserve resolved merge parents and finish merge state, including merges whose trees do not change.
 - Restore automatic merge stashes. Preserve conflicted edits in a recovery stash and report the already-created commit when restoration fails.
 - Run `prepare-commit-msg` before validation even with `noVerify`, retaining per-call message ownership.
+- Run amend `post-rewrite` hooks in ordinary Git repositories with the replaced and new commit IDs.
+- Reject blank hook-edited commit messages before signing or publication, preserving HEAD and staged content.
 - Preserve priced usage from failed Responses requests, including the submitted accounting model and served service tier.
 - Publish physical run lifecycle events once and retain their ownership through collaboration replication, supersession, and logical pauses.
 - Snapshot committed eval-prelude guidance so backend changes produce hidden notices without rewriting the cached prompt prefix.

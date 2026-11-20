@@ -555,9 +555,10 @@ impl GitRepo {
 			.map_err(|err| Error::backend("git commit read commit-msg result", err))?;
 		// Match git commit's terminal whitespace cleanup, including its final LF.
 		message.truncate(message.trim_ascii_end().len());
-		if !message.is_empty() {
-			message.push('\n');
+		if message.is_empty() {
+			return Err(Error::backend("git commit", "empty commit message"));
 		}
+		message.push('\n');
 		let mut author_time = gix::date::parse::TimeBuf::default();
 		let mut committer_time = gix::date::parse::TimeBuf::default();
 		let author = author.to_ref(&mut author_time);
@@ -768,6 +769,10 @@ impl GitRepo {
 			cleanup?;
 		}
 		let _ = run_commit_hook(self, "post-commit", &[], &process).await;
+		if options.amend {
+			process.stdin = Some(format!("{} {id}\n", old_commit.unwrap()).into_bytes());
+			let _ = run_commit_hook(self, "post-rewrite", &[OsStr::new("amend")], &process).await;
+		}
 		if let Some(error) = autostash_error {
 			return Err(error);
 		}
@@ -4292,39 +4297,87 @@ mod tests {
 		assert_reftable_commit_cas(CommitRaceHead::Amend, true, true).await;
 	}
 
+	#[tokio::test]
+	async fn commit_contract_rejects_empty_messages_without_publication() {
+		for reftable in [false, true] {
+			for message in ["", " \t\n"] {
+				let Some((temp, repo)) = fixture_with_ref_format(reftable) else {
+					continue;
+				};
+				fs::write(temp.path().join("a"), "pending change\n").unwrap();
+				git(temp.path(), &["add", "a"]);
+				let head = repo.head_sha().unwrap();
+				let index = git_bytes(temp.path(), &["ls-files", "--stage", "-z"]);
+				let result = repo
+					.commit_create(message, &CommitOptions::default(), None)
+					.await;
+				assert!(result.is_err(), "empty message was published: {result:?}");
+				assert_eq!(repo.head_sha().unwrap(), head);
+				assert_eq!(git_bytes(temp.path(), &["ls-files", "--stage", "-z"]), index);
+			}
+		}
+	}
+
 	#[cfg(unix)]
 	#[tokio::test]
-	async fn reftable_amend_preserves_root_author_and_runs_post_rewrite() {
-		let Some((temp, repo)) = fixture_with_ref_format(true) else {
-			return;
-		};
-		git(temp.path(), &[
-			"commit",
-			"--amend",
-			"--no-edit",
-			"--date=@86400 +0130",
-			"--author=Root Author <root@example.com>",
-		]);
-		let old_head = repo.head_sha().unwrap().unwrap();
-		write_hook(
-			&temp.path().join(".git/hooks/post-rewrite"),
-			"printf '%s\\n' \"$1\" > .git/rewrite-kind\ncat > .git/rewrite-ids",
-			true,
-		);
-		let id = repo
-			.commit_create("amended root", &CommitOptions { amend: true, ..Default::default() }, None)
-			.await
-			.unwrap();
-		assert_eq!(git(temp.path(), &["show", "-s", "--format=%P", &id]), "");
-		assert_eq!(
-			git(temp.path(), &["show", "-s", "--format=%an <%ae> %aI", &id]),
-			"Root Author <root@example.com> 1970-01-02T01:30:00+01:30"
-		);
-		assert_eq!(fs::read_to_string(temp.path().join(".git/rewrite-kind")).unwrap(), "amend\n");
-		assert_eq!(
-			fs::read_to_string(temp.path().join(".git/rewrite-ids")).unwrap(),
-			format!("{old_head} {id}\n")
-		);
+	async fn commit_contract_rejects_hook_cleared_messages_without_publication() {
+		for reftable in [false, true] {
+			let Some((temp, repo)) = fixture_with_ref_format(reftable) else {
+				continue;
+			};
+			fs::write(temp.path().join("a"), "pending change\n").unwrap();
+			git(temp.path(), &["add", "a"]);
+			write_hook(&temp.path().join(".git/hooks/commit-msg"), ": > \"$1\"", true);
+			let head = repo.head_sha().unwrap();
+			let index = git_bytes(temp.path(), &["ls-files", "--stage", "-z"]);
+			let result = repo
+				.commit_create("cleared by hook", &CommitOptions::default(), None)
+				.await;
+			assert!(result.is_err(), "hook-cleared message was published: {result:?}");
+			assert_eq!(repo.head_sha().unwrap(), head);
+			assert_eq!(git_bytes(temp.path(), &["ls-files", "--stage", "-z"]), index);
+		}
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn commit_contract_amend_preserves_root_author_and_runs_post_rewrite() {
+		for reftable in [false, true] {
+			let Some((temp, repo)) = fixture_with_ref_format(reftable) else {
+				continue;
+			};
+			git(temp.path(), &[
+				"commit",
+				"--amend",
+				"--no-edit",
+				"--date=@86400 +0130",
+				"--author=Root Author <root@example.com>",
+			]);
+			let old_head = repo.head_sha().unwrap().unwrap();
+			write_hook(
+				&temp.path().join(".git/hooks/post-rewrite"),
+				"printf '%s\\n' \"$1\" > .git/rewrite-kind\ncat > .git/rewrite-ids",
+				true,
+			);
+			let id = repo
+				.commit_create(
+					"amended root",
+					&CommitOptions { amend: true, ..Default::default() },
+					None,
+				)
+				.await
+				.unwrap();
+			assert_eq!(git(temp.path(), &["show", "-s", "--format=%P", &id]), "");
+			assert_eq!(
+				git(temp.path(), &["show", "-s", "--format=%an <%ae> %aI", &id]),
+				"Root Author <root@example.com> 1970-01-02T01:30:00+01:30"
+			);
+			assert_eq!(fs::read_to_string(temp.path().join(".git/rewrite-kind")).unwrap(), "amend\n");
+			assert_eq!(
+				fs::read_to_string(temp.path().join(".git/rewrite-ids")).unwrap(),
+				format!("{old_head} {id}\n")
+			);
+		}
 	}
 
 	#[tokio::test]

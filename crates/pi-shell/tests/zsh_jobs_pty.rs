@@ -211,11 +211,33 @@ fn a_suspended_loop_takes_the_rest_of_the_loop_with_it() -> io::Result<()> {
 		pty.read_until("suspended  sleep 100", TIMEOUT)?;
 		line(pty, "jobs")?;
 		pty.read_until("[1]  + suspended  sleep 100", TIMEOUT)?;
-		line(pty, "kill -9 %1")?;
+		assert_eq!(job_lines(&pty.output()), [
+			"zsh: suspended  sleep 100",
+			"[1]  + suspended  sleep 100",
+		]);
+		line(pty, "kill -9 %1; wait %1")?;
 		line(pty, "echo done")?;
 		pty.read_until("killed", TIMEOUT)?;
-		pty.settle(Duration::from_millis(300), TIMEOUT)
+		pty.settle(Duration::from_millis(300), TIMEOUT)?;
+		let output = pty.output();
+		for unexpected in ["\r\nit1\r\n", "\r\nit2\r\n", "\r\nafter\r\n"] {
+			assert!(!output.contains(unexpected), "{output}");
+		}
+		Ok(())
 	})?;
+	// zsh's wait may announce its resumption of the killed job before reaping
+	// it.
+	let without_wait_notice = |mut lines: Vec<String>| {
+		if lines
+			.get(2)
+			.is_some_and(|line| line == "[1]  + running    sleep 100")
+		{
+			lines.remove(2);
+		}
+		lines
+	};
+	let ours = without_wait_notice(ours);
+	let real = real.map(without_wait_notice);
 	assert_eq!(ours, [
 		"zsh: suspended  sleep 100",
 		"[1]  + suspended  sleep 100",
