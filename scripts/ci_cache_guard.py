@@ -222,10 +222,13 @@ def authorize_write(env, api, helper_sha):
 
 def snapshots(root, slots, env):
     require(stat.S_ISDIR(root.lstat().st_mode), 'snapshot root is not a directory')
-    require({entry.name for entry in root.iterdir()} == {'snapshot-' + slot for slot in slots},
+    entries = {entry.name for entry in root.iterdir()}
+    # The pinned downloader flattens a single matching artifact.
+    flat = len(slots) == 1 and entries == {'manifest.json', 'snapshot.tar.gz'}
+    require(flat or entries == {'snapshot-' + slot for slot in slots},
             'unexpected snapshot directories')
     for slot in slots:
-        snapshot = root / ('snapshot-' + slot)
+        snapshot = root if flat else root / ('snapshot-' + slot)
         require(stat.S_ISDIR(snapshot.lstat().st_mode)
                 and {entry.name for entry in snapshot.iterdir()} == {'manifest.json', 'snapshot.tar.gz'},
                 'unexpected snapshot layout')
@@ -235,6 +238,11 @@ def snapshots(root, slots, env):
         require(manifest.get('slot') == slot and manifest.get('source_sha') == env['SOURCE_SHA']
                 and str(manifest.get('run_id')) == env['GITHUB_RUN_ID']
                 and str(manifest.get('run_attempt')) == env['GITHUB_RUN_ATTEMPT'], 'manifest provenance mismatch')
+        if flat:
+            destination = root / ('snapshot-' + slot)
+            destination.mkdir()
+            for name in ('manifest.json', 'snapshot.tar.gz'):
+                (root / name).rename(destination / name)
 
 
 def oidc_claims(token, env, broker):

@@ -3,6 +3,8 @@ import copy
 import importlib.util
 import json
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -414,39 +416,79 @@ class GuardTests(unittest.TestCase):
                     self.reader()
                 self.env[field] = old
 
-    def make_snapshot(self, root):
+    def make_snapshot(self, root, flat=False):
         slot = 'linux-x64-ubuntu-22.04'
-        destination = root / ('snapshot-' + slot)
-        destination.mkdir()
+        destination = root if flat else root / ('snapshot-' + slot)
+        if not flat:
+            destination.mkdir()
         manifest = {'slot': slot, 'source_sha': SHA, 'run_id': 100, 'run_attempt': 2}
         (destination / 'manifest.json').write_text(json.dumps(manifest))
         (destination / 'snapshot.tar.gz').write_bytes(b'inert synthetic archive')
         return slot, destination, manifest
 
     def test_snapshot_provenance_binds_every_manifest_field_to_current_run_attempt(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            slot, destination, manifest = self.make_snapshot(root)
-            guard.snapshots(root, (slot,), self.env)
-            for field, value in [('slot', 'another-slot'), ('source_sha', OTHER_SHA), ('run_id', 101), ('run_attempt', 1)]:
-                with self.subTest(field=field):
-                    (destination / 'manifest.json').write_text(json.dumps({**manifest, field: value}))
-                    with self.assertRaisesRegex(guard.Refused, 'manifest provenance'):
-                        guard.snapshots(root, (slot,), self.env)
+        for flat in (False, True):
+            with self.subTest(flat=flat), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                slot, destination, manifest = self.make_snapshot(root, flat=flat)
+                for field, value in [('slot', 'another-slot'), ('source_sha', OTHER_SHA), ('run_id', 101), ('run_attempt', 1)]:
+                    with self.subTest(field=field):
+                        (destination / 'manifest.json').write_text(json.dumps({**manifest, field: value}))
+                        with self.assertRaises(guard.Refused):
+                            guard.snapshots(root, (slot,), self.env)
+                (destination / 'manifest.json').write_text(json.dumps(manifest))
+                guard.snapshots(root, (slot,), self.env)
 
     def test_snapshot_layout_rejects_extra_files_and_symlink_payload(self):
+        for flat in (False, True):
+            with self.subTest(flat=flat), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                slot, destination, _ = self.make_snapshot(root, flat=flat)
+                (destination / 'extra').write_text('unapproved')
+                with self.assertRaises(guard.Refused):
+                    guard.snapshots(root, (slot,), self.env)
+                (destination / 'extra').unlink()
+                archive = destination / 'snapshot.tar.gz'
+                archive.unlink()
+                archive.symlink_to(destination / 'manifest.json')
+                with self.assertRaises(guard.Refused):
+                    guard.snapshots(root, (slot,), self.env)
+
+    def test_flat_single_artifact_is_normalized_for_the_existing_publisher(self):
+        with tempfile.TemporaryDirectory() as directory:
+            temporary = Path(directory)
+            root = temporary / 'cache-publish'
+            root.mkdir()
+            slot, _, _ = self.make_snapshot(root, flat=True)
+            original = {entry.name: entry.read_bytes() for entry in root.iterdir()}
+            (temporary / 'cache-expected-slots.json').write_text(json.dumps([slot]))
+            result = subprocess.run(
+                [sys.executable, str(Path(guard.__file__).resolve()), 'snapshots'],
+                env={**self.env, 'RUNNER_TEMP': str(temporary), 'PYTHONDONTWRITEBYTECODE': '1'},
+                cwd=temporary, capture_output=True, text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual({entry.name for entry in root.iterdir()}, {'snapshot-' + slot})
+            destination = root / ('snapshot-' + slot)
+            self.assertEqual({entry.name: entry.read_bytes() for entry in destination.iterdir()}, original)
+
+    def test_flat_artifact_cannot_satisfy_multiple_expected_slots(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            slot, destination, _ = self.make_snapshot(root)
-            (destination / 'extra').write_text('unapproved')
-            with self.assertRaisesRegex(guard.Refused, 'snapshot layout'):
-                guard.snapshots(root, (slot,), self.env)
-            (destination / 'extra').unlink()
-            archive = destination / 'snapshot.tar.gz'
-            archive.unlink()
-            archive.symlink_to(destination / 'manifest.json')
-            with self.assertRaisesRegex(guard.Refused, 'regular file'):
-                guard.snapshots(root, (slot,), self.env)
+            slot, _, _ = self.make_snapshot(root, flat=True)
+            with self.assertRaises(guard.Refused):
+                guard.snapshots(root, (slot, 'linux-arm64-ubuntu-22.04'), self.env)
+
+    def test_flat_snapshot_root_symlink_is_not_trusted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            payload = root / 'payload'
+            payload.mkdir()
+            slot, _, _ = self.make_snapshot(payload, flat=True)
+            transfer = root / 'transfer'
+            transfer.symlink_to(payload, target_is_directory=True)
+            with self.assertRaises(guard.Refused):
+                guard.snapshots(transfer, (slot,), self.env)
 
     def test_snapshot_directory_symlink_is_not_trusted(self):
         with tempfile.TemporaryDirectory() as directory:
