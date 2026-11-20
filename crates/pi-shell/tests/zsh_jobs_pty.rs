@@ -8,7 +8,10 @@
 
 mod pty_support;
 
-use std::{io, thread, time::Duration};
+use std::{
+	io, thread,
+	time::{Duration, Instant},
+};
 
 use pty_support::{Pty, Spawn, TIMEOUT, have_real_zsh};
 
@@ -215,9 +218,20 @@ fn a_suspended_loop_takes_the_rest_of_the_loop_with_it() -> io::Result<()> {
 			"zsh: suspended  sleep 100",
 			"[1]  + suspended  sleep 100",
 		]);
-		line(pty, "kill -9 %1; wait %1")?;
+		line(pty, "kill -9 %1")?;
 		line(pty, "echo done")?;
-		pty.read_until("killed", TIMEOUT)?;
+		// zsh reports asynchronous job changes at prompt boundaries.
+		// Unlike `wait`, an empty command does not resume a stopped compound job.
+		let deadline = Instant::now() + TIMEOUT;
+		while !pty.output().contains("killed") {
+			let remaining = deadline.saturating_duration_since(Instant::now());
+			if remaining.is_zero() {
+				break;
+			}
+			line(pty, "")?;
+			pty.settle(Duration::from_millis(100).min(remaining), remaining)?;
+		}
+		pty.read_until("killed", Duration::ZERO)?;
 		pty.settle(Duration::from_millis(300), TIMEOUT)?;
 		let output = pty.output();
 		for unexpected in ["\r\nit1\r\n", "\r\nit2\r\n", "\r\nafter\r\n"] {
@@ -225,19 +239,6 @@ fn a_suspended_loop_takes_the_rest_of_the_loop_with_it() -> io::Result<()> {
 		}
 		Ok(())
 	})?;
-	// zsh's wait may announce its resumption of the killed job before reaping
-	// it.
-	let without_wait_notice = |mut lines: Vec<String>| {
-		if lines
-			.get(2)
-			.is_some_and(|line| line == "[1]  + running    sleep 100")
-		{
-			lines.remove(2);
-		}
-		lines
-	};
-	let ours = without_wait_notice(ours);
-	let real = real.map(without_wait_notice);
 	assert_eq!(ours, [
 		"zsh: suspended  sleep 100",
 		"[1]  + suspended  sleep 100",

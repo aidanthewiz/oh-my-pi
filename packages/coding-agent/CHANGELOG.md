@@ -19,7 +19,7 @@
 ### Fixed
 
 - Synchronize shell job-control fixtures with actual shell startup before starting their signal delays.
-- Wait for suspended-loop termination in job-control fixtures before checking the final notification.
+- Await suspended-loop termination notifications without resuming the stopped job or filtering unexpected job states.
 - Synchronize lifecycle fixtures with actual approval presentation, retained consumer output, and SIGTERM-handler readiness without relaxing their assertions or timeouts.
 - Wait for native IPC disconnect delivery before testing broker recovery after its runtime directory disappears.
 - Reuse validated native embedding inputs across compiled secret-input test workers without changing their runtime checks or deadlines.
