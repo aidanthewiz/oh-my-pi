@@ -207,7 +207,7 @@ fn a_suspended_pipeline_is_one_job() -> io::Result<()> {
 /// command line is dropped, and the finished job is named by the loop.
 #[test]
 fn a_suspended_loop_takes_the_rest_of_the_loop_with_it() -> io::Result<()> {
-	let (ours, real) = both(|pty| {
+	let (mut ours, mut real) = both(|pty| {
 		line(pty, "for i in 1 2; do sleep 100; echo it$i; done; echo after")?;
 		thread::sleep(START);
 		pty.write("\x1a")?;
@@ -220,15 +220,15 @@ fn a_suspended_loop_takes_the_rest_of_the_loop_with_it() -> io::Result<()> {
 		]);
 		line(pty, "kill -9 %1")?;
 		line(pty, "echo done")?;
-		// zsh reports asynchronous job changes at prompt boundaries.
-		// Unlike `wait`, an empty command does not resume a stopped compound job.
+		// `jobs` refreshes child state even when zsh defers its asynchronous
+		// notice. Unlike `wait`, it does not resume a stopped compound job.
 		let deadline = Instant::now() + TIMEOUT;
 		while !pty.output().contains("killed") {
 			let remaining = deadline.saturating_duration_since(Instant::now());
 			if remaining.is_zero() {
 				break;
 			}
-			line(pty, "")?;
+			line(pty, "jobs -r")?;
 			pty.settle(Duration::from_millis(100).min(remaining), remaining)?;
 		}
 		pty.read_until("killed", Duration::ZERO)?;
@@ -239,6 +239,11 @@ fn a_suspended_loop_takes_the_rest_of_the_loop_with_it() -> io::Result<()> {
 		}
 		Ok(())
 	})?;
+	// Repeated status queries may report an unchanged state.
+	ours.dedup();
+	if let Some(real) = real.as_mut() {
+		real.dedup();
+	}
 	assert_eq!(ours, [
 		"zsh: suspended  sleep 100",
 		"[1]  + suspended  sleep 100",
