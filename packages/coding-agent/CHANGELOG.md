@@ -7,6 +7,8 @@
 - Sync upstream v18.22.2 while retaining Coreforce model, account, approval, and resource-ownership policies.
 - Preserve user outcomes, acceptance criteria, and authorization limits in delegated work; keep multi-area research aligned with the full requested scope.
 - Limit clarification questions to necessary current decisions and document native AWS parameter naming, output controls, and batching boundaries.
+- Decouple automatic engine releases from PR CI completion while retaining merged-source and release-artifact validation.
+- Cancel superseded first-attempt release jobs; isolate retries and recovery tags while allowing active publication to finish.
 
 ### Added
 
@@ -26,7 +28,13 @@
 - Preserve inferred HTTP transport, raw environment placeholders, and exact project trust during OAuth recovery, including default-enabled URL-only definitions. Replace stale Authorization headers without adding unrelated fields. Stop automatic reconnection retries for permission-only HTTP 403 failures.
 - Keep server-specific OAuth cancellation isolated from queued sibling sign-ins.
 - Refuse browser replacement of explicit read-only managed credentials without changing configuration or grants. Keep managed definitions authoritative over writable user shadows during in-session reauthorization.
+- Accept matching legacy and session SSO settings and valid AWS portal paths when delivering secrets through private stdin.
+- Show exact AWS approval bindings without duplicating inline consumer source; retain one-use approval and command-guard explanations.
 - Synchronize shell job-control fixtures with actual shell startup before starting their signal delays.
+- Use Nextest 0.9.131 for Cargo's current build-directory layout in CI, retaining compatible dependency caches while caching the updated runner under its versioned key.
+- Verify relay artifact roundtrips by the exact upload ID and SHA-256 instead of an immediate name lookup that can miss a finalized artifact.
+- Preserve browser target diagnostics when a retry crosses its action deadline, without masking earlier transport failures or extending timeouts.
+- Retain bounded Chromium stderr after unexpected browser exits in worker-recovery tests, without changing their assertions or deadlines.
 - Query terminated job state without status filters in PTY fixtures when zsh defers asynchronous notifications, without resuming stopped jobs.
 - Limit isolated-evaluator startup fixture cleanup to its own sessions, preserving unrelated in-progress workers and restoring test factories after owned cleanup.
 - Synchronize lifecycle fixtures with actual approval presentation, retained consumer output, and SIGTERM-handler readiness without relaxing their assertions or timeouts.

@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import * as os from "node:os";
 import { RunOutput } from "@oh-my-pi/pi-coding-agent/tools/browser/run-output";
 import { type DomQuery, domQueryFor } from "@oh-my-pi/pi-coding-agent/tools/browser/tern/dom";
@@ -235,6 +235,92 @@ describe("TernTab on native DOM reads", () => {
 		actionBudget(tab, 150);
 		await expect(tab.click("#x")).rejects.toThrow(why);
 		expect(trace(fake)).not.toContain("input");
+	});
+
+	it.each([
+		[true, "sleep"],
+		[false, "sleep"],
+		[true, "query"],
+		[true, "resolve"],
+		[false, "query"],
+	] as const)("keeps the target failure when a retry expires (native=%s, stage=%s)", async (native, stage) => {
+		let retrying = false;
+		let now = Date.now();
+		const started = now;
+		daemon = await startFakeDaemon(
+			(op): FakeAnswer => {
+				if (retrying && !(stage === "resolve" && op.read === "query")) {
+					now = started + 151;
+					return null;
+				}
+				if (op.op === "dom") {
+					return {
+						ok: op.read === "query" ? { nodes: [BUTTON], total: 1 } : { state: "detached", node: BUTTON },
+					};
+				}
+				if (op.op === "eval") {
+					return { ok: { value: { value: { ok: false, reason: "missing", count: 0 } } } };
+				}
+				return { ok: {} };
+			},
+			{ welcome: { ops: native ? ["dom"] : [] } },
+		);
+		const fake = daemon;
+		client = new TernSocketClient({ socketPath: fake.socketPath });
+		await client.connect();
+		const tab = new TernTab({ client, block: 7, name: "main", viewport: { width: 800, height: 600 } });
+		const clock = spyOn(Date, "now").mockImplementation(() => now);
+		const sleep = spyOn(Bun, "sleep").mockImplementation(async () => {
+			now += stage === "sleep" ? 151 : 100;
+			retrying = true;
+		});
+		try {
+			actionBudget(tab, 150);
+			await expect(tab.click("#x")).rejects.toThrow("no element matches (wrong page or selector?) (0 match(es))");
+			const reads = native ? ["query", "resolve"] : ["eval"];
+			if (stage !== "sleep") reads.push(native ? "query" : "eval");
+			if (stage === "resolve") reads.push("resolve");
+			expect(trace(fake)).toEqual(reads);
+		} finally {
+			sleep.mockRestore();
+			clock.mockRestore();
+		}
+	});
+
+	it.each(["invalid", "failed", "unresponsive"])("preserves a distinct daemon rejection (%s)", async kind => {
+		let retrying = false;
+		let now = Date.now();
+		daemon = await startFakeDaemon(
+			(op): FakeAnswer => {
+				if (retrying) {
+					now += 51;
+					return { error: { kind, message: "retry transport sentinel" } };
+				}
+				return {
+					ok: op.read === "query" ? { nodes: [BUTTON], total: 1 } : { state: "detached", node: BUTTON },
+				};
+			},
+			{ welcome: { ops: ["dom"] } },
+		);
+		client = new TernSocketClient({ socketPath: daemon.socketPath });
+		await client.connect();
+		const tab = new TernTab({ client, block: 7, name: "main", viewport: { width: 800, height: 600 } });
+		const clock = spyOn(Date, "now").mockImplementation(() => now);
+		const sleep = spyOn(Bun, "sleep").mockImplementation(async () => {
+			now += 100;
+			retrying = true;
+		});
+		try {
+			actionBudget(tab, 150);
+			const failure = await tab.click("#x").catch((error: unknown) => error);
+			expect(failure).toBeInstanceOf(Error);
+			expect(failure).toHaveProperty("kind", kind);
+			expect(String(failure)).toContain("retry transport sentinel");
+			expect(trace(daemon)).toEqual(["query", "resolve", "query"]);
+		} finally {
+			sleep.mockRestore();
+			clock.mockRestore();
+		}
 	});
 
 	it("waits natively and hands out a handle holding the matched node's ref", async () => {

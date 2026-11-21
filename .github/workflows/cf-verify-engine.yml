@@ -46,6 +46,7 @@ jobs:
             label: Rust - workspace
     env:
       SOURCE_SHA: ${{ inputs.source-sha }}
+      NEXTEST_VERSION: "0.9.131"
       CARGO_BUILD_JOBS: "2"
       CARGO_INCREMENTAL: "0"
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
@@ -99,7 +100,7 @@ jobs:
             ${{ runner.temp }}/qualification-cargo
             ${{ runner.temp }}/qualification-rustup
             target
-          key: qualification-cargo-v1-${{ inputs.target }}-${{ matrix.scope == 'rust' && 'rust' || 'typescript' }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', '.cargo/config.toml') }}
+          key: qualification-cargo-v1-${{ inputs.target }}-${{ matrix.scope == 'rust' && format('rust-nextest-{0}', env.NEXTEST_VERSION) || 'typescript' }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', '.cargo/config.toml') }}
           restore-keys: |
             qualification-cargo-v1-${{ inputs.target }}-${{ matrix.scope == 'rust' && 'rust' || 'typescript' }}-
       - name: Install pinned qualification tools
@@ -116,8 +117,8 @@ jobs:
       - name: Install Rust suite runner
         if: matrix.scope == 'rust'
         run: |
-          if ! cargo nextest --version | grep -F '0.9.114'; then
-            cargo install cargo-nextest --version 0.9.114 --locked
+          if ! cargo nextest --version | grep -F "cargo-nextest $NEXTEST_VERSION "; then
+            cargo install cargo-nextest --version "$NEXTEST_VERSION" --locked
           fi
       - name: Install pinned attribution tool
         if: matrix.scope == 'rust' && runner.os == 'Linux'
