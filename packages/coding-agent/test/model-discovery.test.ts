@@ -1,5 +1,6 @@
 import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
+import * as compatAuth from "@oh-my-pi/pi-catalog/compat/auth";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -11,7 +12,7 @@ import { resolveOpenAIRequestSetup } from "@oh-my-pi/pi-ai/providers/openai-shar
 import { streamOpenAICompletions } from "@oh-my-pi/pi-ai/providers/openai-completions";
 import { streamSimple } from "@oh-my-pi/pi-ai/stream";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
-import { Effort } from "@oh-my-pi/pi-catalog/effort";
+import { Effort, THINKING_EFFORTS } from "@oh-my-pi/pi-catalog/effort";
 import { writeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
 import { googleAntigravityModelManagerOptions } from "@oh-my-pi/pi-catalog/provider-models/google";
 import { fingerprintStaticModels } from "@oh-my-pi/pi-catalog/model-manager";
@@ -24,8 +25,12 @@ import {
 import type { ModelKind, ModelSpec, OpenAICompat } from "@oh-my-pi/pi-catalog/types";
 import { CODEX_CLIENT_VERSION } from "@oh-my-pi/pi-catalog/wire/codex";
 import {
+	type DiscoveryProviderConfig,
+	discoverLlamaCppModels,
 	discoverLiteLLMModels,
+	discoverOllamaModels,
 	discoverOpenAIModelsList,
+	discoverProxyModels,
 	discoveryProbeTimeoutMs,
 } from "@oh-my-pi/pi-coding-agent/config/model-discovery";
 import { resolveOAuthDiscoveryAccounts } from "@oh-my-pi/pi-coding-agent/config/model-provider-discovery";
@@ -114,6 +119,7 @@ describe("ModelRegistry runtime discovery", () => {
 	});
 
 	afterEach(async () => {
+		vi.restoreAllMocks();
 		resetSettingsForTest();
 		if (originalOllamaBaseUrl === undefined) {
 			delete Bun.env.OLLAMA_BASE_URL;
@@ -491,6 +497,7 @@ describe("ModelRegistry runtime discovery", () => {
 		expect(authStorage.credentials.getOAuth("anthropic")?.access).toBe("sk-ant-oat-expired-anthropic");
 	});
 	test("Antigravity startup hydrates only the current credential's model cache", async () => {
+		vi.spyOn(compatAuth, "providerDisabledReason").mockReturnValue(undefined);
 		const modelA = "gemini-2.5-account-a";
 		const modelB = "gemini-2.5-account-b";
 		const useAccount = (access: string) =>
@@ -526,6 +533,7 @@ describe("ModelRegistry runtime discovery", () => {
 	});
 
 	test("Antigravity cache follows the account union and explicit credential authority", async () => {
+		vi.spyOn(compatAuth, "providerDisabledReason").mockReturnValue(undefined);
 		const credential = (account: string, access = account): OAuthCredentials & { type: "oauth" } => ({
 			type: "oauth",
 			access,
@@ -956,6 +964,8 @@ describe("ModelRegistry runtime discovery", () => {
 	});
 
 	test("Antigravity discovery unions every account's roster and routes each model to an account serving it", async () => {
+		// Antigravity is paused in its auth rules; its discovery stays for when it is turned back on.
+		vi.spyOn(compatAuth, "providerDisabledReason").mockReturnValue(undefined);
 		// Account A's plan omits Claude 5.5; account B's serves it. Discovery is
 		// authoritative, so reading only one account's roster would prune Claude
 		// 5.5 for both whenever A is the account discovery happens to pick.
@@ -1015,6 +1025,7 @@ describe("ModelRegistry runtime discovery", () => {
 	});
 
 	test("Antigravity routing still works for an account whose login stored no email", async () => {
+		vi.spyOn(compatAuth, "providerDisabledReason").mockReturnValue(undefined);
 		// Google's userinfo lookup is optional at login; such a credential keeps
 		// only its project id, which must still tag and select the account.
 		await authStorage.credentials.set("google-antigravity", [
@@ -1063,6 +1074,7 @@ describe("ModelRegistry runtime discovery", () => {
 	});
 
 	test("Antigravity discovery retains the project identity of a token override matching a stored account", async () => {
+		vi.spyOn(compatAuth, "providerDisabledReason").mockReturnValue(undefined);
 		await authStorage.credentials.set("google-antigravity", [
 			{
 				type: "oauth",
@@ -1100,6 +1112,7 @@ describe("ModelRegistry runtime discovery", () => {
 	});
 
 	test("Antigravity discovery does not append a stale preflight token after its stored account refreshes", async () => {
+		vi.spyOn(compatAuth, "providerDisabledReason").mockReturnValue(undefined);
 		const { refreshCalls } = await useAuthStorageWithRefreshTracker();
 		await authStorage.credentials.set("google-antigravity", {
 			type: "oauth",
@@ -1116,8 +1129,11 @@ describe("ModelRegistry runtime discovery", () => {
 					"expired-antigravity",
 				);
 				return (
-					accounts?.map(account => ({ accessToken: account.accessToken, accountKey: oauthAccountKey(account) })) ??
-					null
+					accounts?.map(account => ({
+						accessToken: account.accessToken,
+						accountKey: oauthAccountKey(account),
+						projectId: account.projectId,
+					})) ?? null
 				);
 			},
 			endpoint: "https://antigravity.test",
@@ -1765,7 +1781,40 @@ describe("ModelRegistry runtime discovery", () => {
 		expect(gemma?.contextWindow).toBe(131072);
 		expect(gemma?.maxTokens).toBe(32_768);
 		expect(gemma?.input).toEqual(["text"]);
-		expect(gemma?.reasoning).toBe(false);
+	});
+
+	test("local discovery leaves models unverified when native metadata has no capability evidence", async () => {
+		const fetchMock: FetchImpl = async input => {
+			const url = String(input);
+			if (url.endsWith("/api/tags")) return Response.json({ models: [{ name: "unlisted-local" }] });
+			if (url.endsWith("/api/show") || url.endsWith("/props")) return Response.json({});
+			if (url.endsWith("/models")) return Response.json({ data: [{ id: "unlisted-local" }] });
+			throw new Error(`Unexpected URL: ${url}`);
+		};
+		const ctx = { fetch: fetchMock, getBearerApiKeyResolver: async () => undefined };
+		const ollama = await discoverOllamaModels(
+			{
+				provider: "ollama",
+				api: "openai-completions",
+				baseUrl: "http://127.0.0.1:11434",
+				discovery: { type: "ollama" },
+			},
+			ctx,
+		);
+		const llamaCpp = await discoverLlamaCppModels(
+			{
+				provider: "llama.cpp",
+				api: "openai-responses",
+				baseUrl: "http://127.0.0.1:8080",
+				discovery: { type: "llama.cpp" },
+			},
+			ctx,
+		);
+		for (const models of [ollama, llamaCpp]) {
+			expect(models).toHaveLength(1);
+			expect(models[0]?.reasoning).toBe(true);
+			expect(models[0]?.thinking).toMatchObject({ unverified: true, efforts: THINKING_EFFORTS });
+		}
 	});
 
 	test("discovery failure does not fail model registry refresh", async () => {
@@ -2110,7 +2159,6 @@ describe("ModelRegistry runtime discovery", () => {
 		expect(bonsai1?.compat).toMatchObject({ qwenTemplateReasoningEffort: false });
 
 		const plain = registry.find("llama.cpp", "llama-3.1-8b");
-		expect(plain?.reasoning).toBe(false);
 		expect(plain?.api).toBe("openai-responses");
 		expect(plain?.baseUrl).toBe("http://127.0.0.1:8080/v1");
 		expect(plain?.compat).not.toMatchObject({ reasoningDisableMode: "qwen-enable-thinking-false" });
@@ -3243,6 +3291,87 @@ describe("ModelRegistry runtime discovery", () => {
 		expect(maxTokensById["openai-test/no-limits"]).toBe(32_768);
 	});
 
+	test("openai-models-list skips a model whose id names two vendors instead of dropping the provider (#18770)", async () => {
+		const ctx = {
+			fetch: (async (input: unknown) => {
+				if (String(input) !== "http://127.0.0.1:9993/v3/models") {
+					throw new Error(`Unexpected URL: ${String(input)}`);
+				}
+				// Eden AI's gateway prefixes each id with the hosting vendor. Rows that
+				// advertise reasoning levels are classified while their spec is prepared.
+				const data = ["vertex/gemini-4-carbon@eu", "amazon/openai.gpt-6.1-sol", "mistral/mistral-large-latest"].map(
+					id => ({
+						id,
+						object: "model",
+						owned_by: id.split("/")[0],
+						...(id.startsWith("mistral/") ? {} : { supported_reasoning_levels: ["low", "high"] }),
+					}),
+				);
+				return new Response(JSON.stringify({ object: "list", data }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}) satisfies FetchImpl,
+			getBearerApiKeyResolver: async () => undefined,
+		};
+		const models = await discoverOpenAIModelsList(
+			{
+				provider: "eden-ai",
+				api: "openai-completions",
+				baseUrl: "http://127.0.0.1:9993/v3",
+				discovery: { type: "openai-models-list", injectV1: false },
+			},
+			ctx,
+		);
+		expect(models.map(model => model.id)).toEqual(["vertex/gemini-4-carbon@eu", "mistral/mistral-large-latest"]);
+	});
+
+	test("proxy discovery skips a model whose id names two vendors instead of dropping the provider (#18770)", async () => {
+		const fetchMock: FetchImpl = async input => {
+			if (String(input) !== "http://127.0.0.1:9992/v1/models") throw new Error(`Unexpected URL: ${String(input)}`);
+			return Response.json({
+				data: [
+					{ id: "amazon/openai.gpt-6.1-sol", supported_endpoint_types: ["openai"] },
+					{ id: "mistral/mistral-large-latest", supported_endpoint_types: ["openai"] },
+				],
+			});
+		};
+		const models = await discoverProxyModels(
+			{
+				provider: "proxy-test",
+				api: "openai-completions",
+				baseUrl: "http://127.0.0.1:9992/v1",
+				discovery: { type: "proxy" },
+			},
+			{ fetch: fetchMock, getBearerApiKeyResolver: async () => undefined },
+		);
+		expect(models.map(model => model.id)).toEqual(["mistral/mistral-large-latest"]);
+	});
+
+	test("litellm discovery skips a model group whose name names two vendors instead of dropping the provider (#18770)", async () => {
+		const fetchMock: FetchImpl = async input => {
+			if (String(input) !== "http://127.0.0.1:4001/model_group/info") {
+				throw new Error(`Unexpected URL: ${String(input)}`);
+			}
+			return Response.json({
+				data: [
+					{ model_group: "amazon/openai.gpt-6.1-sol", providers: ["bedrock"] },
+					{ model_group: "gpt-big", providers: ["openai"] },
+				],
+			});
+		};
+		const models = await discoverLiteLLMModels(
+			{
+				provider: "litellm-test",
+				baseUrl: "http://127.0.0.1:4001",
+				api: "openai-completions",
+				discovery: { type: "litellm" },
+			},
+			{ fetch: fetchMock, getBearerApiKeyResolver: async () => undefined },
+		);
+		expect(models.map(model => model.id)).toEqual(["gpt-big"]);
+	});
+
 	// Runs one `/v1/models` payload through the real `openai-models-list`
 	// discovery path and returns the output cap each row ended up with, so the
 	// precedence assertions below observe the boundary a user sees rather than
@@ -3421,8 +3550,50 @@ describe("ModelRegistry runtime discovery", () => {
 		// Unknown model ids stay on the default fallback path.
 		const unknown = registry.find("openai-test", "unknown-proxy-model");
 		expect(unknown?.contextWindow).toBe(128000);
-		expect(unknown?.reasoning).toBe(false);
+		expect(unknown?.reasoning).toBe(true);
+		expect(unknown?.thinking).toMatchObject({ unverified: true, efforts: THINKING_EFFORTS });
+		expect(unknown?.compatConfig).not.toMatchObject({ supportsReasoningEffort: false });
 	});
+
+	test.each(["openai-models-list", "proxy", "lm-studio"])(
+		"%s discovery distinguishes missing reasoning evidence from advertised true and false",
+		async type => {
+			const fetchMock: FetchImpl = async input => {
+				const url = String(input);
+				if (url.endsWith("/v1/models")) {
+					return Response.json({
+						data: [
+							{ id: "unlisted-silent" },
+							{ id: "unlisted-native", reasoning: true },
+							{ id: "unlisted-plain", reasoning: false },
+						],
+					});
+				}
+				return new Response(null, { status: 404 });
+			};
+			const ctx = { fetch: fetchMock, getBearerApiKeyResolver: async () => undefined };
+			const config: DiscoveryProviderConfig = {
+				provider: "custom-discovery",
+				api: "openai-completions",
+				baseUrl: "https://custom.example/v1",
+				discovery: {
+					type: type === "proxy" ? "proxy" : type === "lm-studio" ? "lm-studio" : "openai-models-list",
+				},
+			};
+			const models = await (type === "proxy"
+				? discoverProxyModels(config, ctx)
+				: discoverOpenAIModelsList(config, ctx));
+			const silent = models.find(model => model.id === "unlisted-silent");
+			expect(silent?.reasoning).toBe(true);
+			expect(silent?.thinking).toMatchObject({ unverified: true, efforts: THINKING_EFFORTS });
+			const native = models.find(model => model.id === "unlisted-native");
+			expect(native?.reasoning).toBe(true);
+			expect(native?.thinking?.unverified).not.toBe(true);
+			const plain = models.find(model => model.id === "unlisted-plain");
+			expect(plain?.reasoning).toBe(false);
+			expect(plain?.thinking).toBeUndefined();
+		},
+	);
 
 	test("openai-models-list discovery marks advertised reasoning ladders reasoning-capable (codex-lb metadata shape)", async () => {
 		writeRawModelsJson({
@@ -4102,10 +4273,11 @@ describe("ModelRegistry runtime discovery", () => {
 			{ apiKey: "TEST_KEY", fetch: chatFetch, disableReasoning: true },
 		).result();
 		expect(requestPayload?.reasoning_effort).toBe("none");
-		// A row that advertises nothing keeps the conservative non-reasoning default.
+		// A silent row remains eligible for request-time capability discovery.
 		const plain = registry.find("proxy-test", "acme-plain");
-		expect(plain?.reasoning).toBe(false);
-		expect(plain?.thinking).toBeUndefined();
+		expect(plain?.reasoning).toBe(true);
+		expect(plain?.thinking).toMatchObject({ unverified: true, efforts: THINKING_EFFORTS });
+		expect(plain?.compatConfig).not.toMatchObject({ supportsReasoningEffort: false });
 	});
 
 	test("proxy discovery pins an advertised ladder's default so catalog policy cannot inject a tier it omits", async () => {
@@ -4218,8 +4390,8 @@ describe("ModelRegistry runtime discovery", () => {
 		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
 		await registry.refresh();
 		const model = registry.find("proxy-test", "acme-think-1");
-		expect(model?.reasoning).toBe(false);
-		expect(model?.thinking).toBeUndefined();
+		expect(model?.reasoning).toBe(true);
+		expect(model?.thinking).toMatchObject({ unverified: true, efforts: THINKING_EFFORTS });
 	});
 
 	test("proxy discovery keeps a catalog default that the advertised ladder contains", async () => {
@@ -4511,10 +4683,14 @@ describe("ModelRegistry runtime discovery", () => {
 				supports_vision: false,
 			},
 		];
+		let scopedIds = ["keep-chat-a", "keep-chat-b"];
 		const fetchMock: FetchImpl = async input => {
 			const url = String(input);
 			if (url === "https://catalog.stencil.so/models.json.zstd") {
 				return Response.json({});
+			}
+			if (url === "http://127.0.0.1:4007/v1/models") {
+				return Response.json({ data: scopedIds.map(id => ({ id })) });
 			}
 			if (url === "http://127.0.0.1:4007/model_group/info") {
 				return Response.json({ data: modelGroups });
@@ -4526,7 +4702,7 @@ describe("ModelRegistry runtime discovery", () => {
 			) {
 				return new Response("Not Found", { status: 404 });
 			}
-			throw new Error(`/v1/models must not reintroduce the excluded model: ${url}`);
+			throw new Error(`Unexpected URL: ${url}`);
 		};
 
 		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
@@ -4541,6 +4717,7 @@ describe("ModelRegistry runtime discovery", () => {
 		await registry.refreshProvider("litellm", "online");
 		expect(getModelsForProvider(registry, "litellm").map(model => model.id)).toEqual(["keep-chat-a"]);
 
+		scopedIds = ["keep-chat-a"];
 		modelGroups = [{ model_group: "keep-chat-a", mode: "embedding" }];
 		await registry.refreshProvider("litellm", "online");
 		expect(getModelsForProvider(registry, "litellm")).toEqual([]);

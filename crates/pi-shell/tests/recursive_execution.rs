@@ -71,24 +71,32 @@ async fn cancellation_unwinds_nested_execution_and_closes_output() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dropping_suspended_recursion_releases_owned_pipe_descriptors() {
 	use std::io::{BufRead, Read};
+	#[cfg(unix)]
+	use std::os::fd::OwnedFd as Owned;
+	#[cfg(windows)]
+	use std::os::windows::io::OwnedHandle as Owned;
 
-	use brush_core::{ProfileLoadBehavior, RcLoadBehavior, Shell, SourceInfo, openfiles::OpenFiles};
-	use pi_builtins::{BuiltinSet, default_builtins, process_builtins, utility_builtins};
+	use pi_shell::{
+		session::{RunStdio, Session, SessionConfig},
+		sys::StdFs,
+	};
 
-	let mut shell = Shell::builder()
-		.do_not_inherit_env(true)
-		.profile(ProfileLoadBehavior::Skip)
-		.rc(RcLoadBehavior::Skip)
-		.builtins(default_builtins(BuiltinSet::BashMode))
-		.build()
-		.await
-		.expect("shell");
-	for (name, builtin) in process_builtins().into_iter().chain(utility_builtins()) {
-		shell.register_builtin(name, builtin);
-	}
+	let mut session = Session::new(SessionConfig {
+		env:             Vec::new(),
+		cwd:             std::env::current_dir()
+			.expect("cwd")
+			.as_os_str()
+			.as_encoded_bytes()
+			.into(),
+		fs:              Box::new(StdFs::default()),
+		vfs:             None,
+		runtime:         tokio::runtime::Handle::current(),
+		output_decoding: None,
+	})
+	.expect("session");
 	let (reader, writer) = std::io::pipe().expect("output pipe");
-	let mut params = shell.default_exec_params();
-	params.set_fd(OpenFiles::STDOUT_FD, writer.into());
+	let stdio =
+		RunStdio { stdout: Some(std::fs::File::from(Owned::from(writer))), ..Default::default() };
 	let (ready, reached) = tokio::sync::oneshot::channel();
 	let output = tokio::task::spawn_blocking(move || {
 		let mut reader = std::io::BufReader::new(reader);
@@ -100,12 +108,12 @@ async fn dropping_suspended_recursion_releases_owned_pipe_descriptors() {
 		rest
 	});
 	let task = tokio::spawn(async move {
-		shell
-			.run_string(
+		session
+			.run(
 				"f() { if [ \"$1\" -lt 200 ]; then f $(( $1 + 1 )); else echo ready; sleep 60; fi; }; \
 				 f 0; echo after",
-				&SourceInfo::from("nested-drop"),
-				&params,
+				stdio,
+				tokio_util::sync::CancellationToken::new(),
 			)
 			.await
 	});

@@ -61,6 +61,13 @@ export type MCPReconnect = (options?: {
 }) => Promise<MCPServerConnection | null>;
 
 /**
+ * Told about every MCP tool call when it starts, by tool-call id; returns the
+ * callback the call awaits before it returns its result. Lets the owning
+ * manager settle the tool-list changes the call provoked into the caller's view.
+ */
+export type MCPToolCallObserver = (toolCallId: string) => () => Promise<void>;
+
+/**
  * Network-level and stale-session errors that warrant a reconnect + single retry.
  * Conservative: only catches errors where the server is likely alive but the
  * connection object is stale (dead SSE, expired session, refused after restart).
@@ -131,9 +138,17 @@ function isRecoverableMCPConnection(error: unknown, replaySafe: boolean): boolea
 	return error.failure === "http_status" && (error.code === 404 || error.code === 502 || error.code === 503);
 }
 
-function assertMcpOwnerCurrent(context?: MCPHostCallContext, signal?: AbortSignal): void {
+function assertMcpLocalOwnerCurrent(context?: MCPHostCallContext, signal?: AbortSignal): void {
 	throwIfAborted(signal);
 	if (context?.mcpOwnerCurrent?.() === false) throw new ToolAbortError("MCP call owner changed");
+}
+
+async function assertMcpOwnerCurrent(context?: MCPHostCallContext, signal?: AbortSignal): Promise<void> {
+	assertMcpLocalOwnerCurrent(context, signal);
+	if (context?.mcpCheckOwner) {
+		await context.mcpCheckOwner();
+		assertMcpLocalOwnerCurrent(context, signal);
+	}
 }
 
 function normalizeToolArgs(value: unknown): MCPToolArgs {
@@ -310,11 +325,33 @@ function formatStructuredContent(structured: Record<string, unknown>): string {
 }
 
 /**
- * True when a text block already carries the structured payload verbatim. A
- * spec-compliant server duplicates `structuredContent` into a TextContent block
- * for back-compat; detecting that avoids emitting the JSON twice.
+ * True when a trimmed text block carries a value: a verbatim string echo, or a
+ * JSON block parsing to a deep-equal value. `parsed` is `undefined` when the
+ * block is not JSON (`JSON.parse` never yields `undefined` itself).
+ */
+function textCarries(trimmed: string, parsed: unknown, value: unknown): boolean {
+	return (typeof value === "string" && trimmed === value) || (parsed !== undefined && Bun.deepEquals(parsed, value));
+}
+
+/**
+ * True when text already carries the structured payload. Beyond a verbatim
+ * echo, this covers the MCP SDK's `{ result: value }` wrapper for non-object
+ * tool returns: the SDK auto-wraps list/string returns, so `structuredContent`
+ * never verbatim-matches the `content` text blocks that carry the same value.
+ *
+ * A partial match does NOT count: if content covers only part of the wrapped
+ * payload (extra items, extra keys), the rendering is kept so the model still
+ * sees the full structured result.
+ *
+ * Out of scope: the Python SDK's `_convert_to_content` flattens nested lists via
+ * `chain.from_iterable` (`[[1,2],[3]]` → 3 blocks vs 2), drops `None` items, and
+ * whitespace-padded item strings fail the verbatim comparison — those shapes still render.
  */
 function structuredContentAlreadyInText(structured: Record<string, unknown>, content: MCPContent[]): boolean {
+	const wrapped =
+		Object.hasOwn(structured, "result") && Object.keys(structured).length === 1 ? structured.result : undefined;
+	const wrappedItems = Array.isArray(wrapped) ? wrapped : undefined;
+	const blocks: Array<{ trimmed: string; parsed: unknown }> = [];
 	for (const item of content) {
 		if (item.type !== "text") continue;
 		const trimmed = item.text.trim();
@@ -323,11 +360,21 @@ function structuredContentAlreadyInText(structured: Record<string, unknown>, con
 		try {
 			parsed = JSON.parse(trimmed);
 		} catch {
-			continue;
+			parsed = undefined;
 		}
-		if (Bun.deepEquals(parsed, structured)) return true;
+		if (textCarries(trimmed, parsed, structured)) return true;
+		if (wrapped !== undefined && textCarries(trimmed, parsed, wrapped)) return true;
+		blocks.push({ trimmed, parsed });
 	}
-	return false;
+	return (
+		wrappedItems !== undefined &&
+		blocks.length > 0 &&
+		wrappedItems.length === blocks.length &&
+		wrappedItems.every((value, i) => {
+			const block = blocks[i];
+			return block !== undefined && value !== undefined && textCarries(block.trimmed, block.parsed, value);
+		})
+	);
 }
 
 /** Build a CustomToolResult from a callTool response. */
@@ -475,18 +522,22 @@ async function isAwsAuthenticationFailure(
 	signal?: AbortSignal,
 	context?: MCPHostCallContext,
 ): Promise<boolean> {
-	assertMcpOwnerCurrent(context, signal);
+	await assertMcpOwnerCurrent(context, signal);
 	if (awsFailureCode(message, false) === "AUTH_REQUIRED") return true;
 	// Proxy 1.6.5 maps both HTTP 401 and 403 to this ambiguous credential error.
 	if (!message.includes("expired or invalid AWS credentials")) return false;
-	const probe = new AwsTool({
-		cwd: os.tmpdir(),
-		hasUI: false,
-		settings: context?.settings ?? Settings.isolated(),
-		getSessionFile: () => null,
-		getSessionSpawns: () => null,
-	});
+	const probe = new AwsTool(
+		{
+			cwd: os.tmpdir(),
+			hasUI: false,
+			settings: context?.settings ?? Settings.isolated(),
+			getSessionFile: () => null,
+			getSessionSpawns: () => null,
+		},
+		{ attempted: true },
+	);
 	try {
+		assertMcpLocalOwnerCurrent(context, signal);
 		const result = await probe.execute(
 			"aws-mcp-authentication-check",
 			{
@@ -496,11 +547,13 @@ async function isAwsAuthenticationFailure(
 				timeout: 15,
 			},
 			signal,
+			undefined,
+			context,
 		);
-		assertMcpOwnerCurrent(context, signal);
-		if (result.details?.code === "AUTH_REQUIRED") return true;
+		await assertMcpOwnerCurrent(context, signal);
+		if (result.details && "code" in result.details && result.details.code === "AUTH_REQUIRED") return true;
 		const group = (await resolveTrustedAwsProfile(profile))?.ssoGroup;
-		assertMcpOwnerCurrent(context, signal);
+		await assertMcpOwnerCurrent(context, signal);
 		return (
 			!!group &&
 			awsSessionAuthGroups.generation(group) !== authenticationGeneration &&
@@ -508,7 +561,7 @@ async function isAwsAuthenticationFailure(
 		);
 	} catch (error) {
 		rethrowIfAborted(error, signal);
-		assertMcpOwnerCurrent(context, signal);
+		await assertMcpOwnerCurrent(context, signal);
 		return false;
 	}
 }
@@ -523,25 +576,26 @@ async function callProfileAwareTool(
 	context?: MCPHostCallContext,
 	onProgress?: MCPRequestOptions["onProgress"],
 ): Promise<MCPToolCallResult> {
-	assertMcpOwnerCurrent(context, signal);
+	await assertMcpOwnerCurrent(context, signal);
 	const profile = String(args.aws_profile);
 	const group =
 		replaySafe && isAuthenticatedAwsTool(connection.name, toolName)
 			? (await resolveTrustedAwsProfile(profile))?.ssoGroup
 			: undefined;
-	assertMcpOwnerCurrent(context, signal);
+	await assertMcpOwnerCurrent(context, signal);
 	let retried = false;
 	while (true) {
 		const authenticationGeneration = group ? awsSessionAuthGroups.generation(group) : 0;
 		try {
-			assertMcpOwnerCurrent(context, signal);
+			await assertMcpOwnerCurrent(context, signal);
 			const result = await callTool(connection, toolName, args, {
 				signal,
 				onProgress,
 				allowAuthRetry: replaySafe,
 				mcpOwnerCurrent: context?.mcpOwnerCurrent,
+				mcpCheckOwner: context?.mcpCheckOwner,
 			});
-			assertMcpOwnerCurrent(context, signal);
+			await assertMcpOwnerCurrent(context, signal);
 			if (
 				!replaySafe ||
 				!result.isError ||
@@ -560,7 +614,7 @@ async function callProfileAwareTool(
 				return result;
 		} catch (error) {
 			rethrowIfAborted(error, signal);
-			assertMcpOwnerCurrent(context, signal);
+			await assertMcpOwnerCurrent(context, signal);
 			if (!replaySafe) throw error;
 			if (error instanceof MCPTransportError && error.stage !== "protocol") throw error;
 			if (
@@ -577,13 +631,14 @@ async function callProfileAwareTool(
 		}
 		if (!retried && !authenticationRecovery.attempted) {
 			authenticationRecovery.attempted = true;
+			assertMcpLocalOwnerCurrent(context, signal);
 			const recovered = await recoverTrustedAwsAuthentication(
 				profile,
 				`managed AWS MCP: ${toolName}`,
 				context,
 				signal,
 			);
-			assertMcpOwnerCurrent(context, signal);
+			await assertMcpOwnerCurrent(context, signal);
 			if (recovered) {
 				retried = true;
 				continue;
@@ -619,7 +674,7 @@ async function callToolWithAuthRetry(
 		context,
 		onProgress,
 	);
-	assertMcpOwnerCurrent(context, signal);
+	await assertMcpOwnerCurrent(context, signal);
 	if (!replaySafe) return { connection, result };
 	const authChallenge = getMcpAuthChallenge(result);
 	if (!authChallenge || !reconnect) return { connection, result };
@@ -637,14 +692,14 @@ async function callToolWithAuthRetry(
 		);
 	} catch (error) {
 		rethrowIfAborted(error, signal);
-		assertMcpOwnerCurrent(context, signal);
+		await assertMcpOwnerCurrent(context, signal);
 		return { connection, error };
 	}
 	if (!newConnection) return { connection, result };
 
 	try {
 		const readyConnection = prepareConnection ? await prepareConnection(newConnection) : newConnection;
-		assertMcpOwnerCurrent(context, signal);
+		await assertMcpOwnerCurrent(context, signal);
 		return {
 			connection: readyConnection,
 			result: await callProfileAwareTool(
@@ -660,7 +715,7 @@ async function callToolWithAuthRetry(
 		};
 	} catch (error) {
 		rethrowIfAborted(error, signal);
-		assertMcpOwnerCurrent(context, signal);
+		await assertMcpOwnerCurrent(context, signal);
 		return { connection: newConnection, error };
 	}
 }
@@ -678,14 +733,17 @@ async function reconnectWithAbort(
 	options?: { authChallenge?: MCPAuthChallenge; awsProfile?: string },
 	context?: MCPHostCallContext,
 ): Promise<MCPServerConnection | null> {
-	assertMcpOwnerCurrent(context, signal);
+	await assertMcpOwnerCurrent(context, signal);
 	try {
-		const connection = await untilAborted(signal, () => reconnect(options));
-		assertMcpOwnerCurrent(context, signal);
+		const connection = await untilAborted(signal, () => {
+			assertMcpLocalOwnerCurrent(context, signal);
+			return reconnect(options);
+		});
+		await assertMcpOwnerCurrent(context, signal);
 		return connection;
 	} catch (error) {
 		rethrowIfAborted(error, signal);
-		assertMcpOwnerCurrent(context, signal);
+		await assertMcpOwnerCurrent(context, signal);
 		return null;
 	}
 }
@@ -1031,7 +1089,7 @@ async function proveAwsProfile(
 	signal?: AbortSignal,
 	context?: MCPHostCallContext,
 ): Promise<void> {
-	assertMcpOwnerCurrent(context, signal);
+	await assertMcpOwnerCurrent(context, signal);
 	if (provenAwsProfiles.get(connection)?.has(profile)) return;
 	const probe = new AwsTool(
 		{
@@ -1043,6 +1101,7 @@ async function proveAwsProfile(
 		},
 		authenticationRecovery,
 	);
+	assertMcpLocalOwnerCurrent(context, signal);
 	const identity = await probe.execute(
 		"aws-mcp-profile-identity",
 		{ profile, service: "sts", operation: "get-caller-identity", timeout: 15 },
@@ -1050,7 +1109,7 @@ async function proveAwsProfile(
 		undefined,
 		context,
 	);
-	assertMcpOwnerCurrent(context, signal);
+	await assertMcpOwnerCurrent(context, signal);
 	if (identity.isError) {
 		throw new Error(
 			identity.content
@@ -1073,13 +1132,13 @@ async function connectSignedAwsProxy(
 	signal?: AbortSignal,
 	context?: MCPHostCallContext,
 ): Promise<MCPServerConnection> {
-	assertMcpOwnerCurrent(context, signal);
+	await assertMcpOwnerCurrent(context, signal);
 	if (!isAuthenticatedAwsTool(connection.name, toolName)) return connection;
 	const profile = String(args.aws_profile);
 	if (!connection.awsAnonymousBootstrap) {
 		if (connection.awsPreferredProfile !== undefined || (connection.operationalAwsProfiles?.length ?? 0) > 1)
 			await proveAwsProfile(connection, profile, authenticationRecovery, signal, context);
-		assertMcpOwnerCurrent(context, signal);
+		await assertMcpOwnerCurrent(context, signal);
 		return connection;
 	}
 	if (!reconnect) throw new Error("AUTH_REQUIRED: no signed AWS MCP connection is available.");
@@ -1117,14 +1176,14 @@ export async function dispatchMCPTool(
 	context?: MCPHostCallContext,
 ): Promise<{ connection: MCPServerConnection; result: MCPToolCallResult }> {
 	const { signal, onProgress } = options;
-	assertMcpOwnerCurrent(context, signal);
+	await assertMcpOwnerCurrent(context, signal);
 	const managedAws = isAuthenticatedAwsTool(connection.name, tool.name);
 	const authenticationRecovery: AwsAuthenticationRecoveryBudget = { attempted: false };
 	await validateManagedAwsProfile(connection.name, tool, args);
-	assertMcpOwnerCurrent(context, signal);
+	await assertMcpOwnerCurrent(context, signal);
 	const originalConnection = connection;
 	const prepareConnection = async (candidate: MCPServerConnection): Promise<MCPServerConnection> => {
-		assertMcpOwnerCurrent(context, signal);
+		await assertMcpOwnerCurrent(context, signal);
 		if (!managedAws) return candidate;
 		const ready = await connectSignedAwsProxy(
 			candidate,
@@ -1135,20 +1194,20 @@ export async function dispatchMCPTool(
 			signal,
 			context,
 		);
-		assertMcpOwnerCurrent(context, signal);
+		await assertMcpOwnerCurrent(context, signal);
 		const liveTool = ready === originalConnection ? tool : await getLiveManagedAwsTool(ready, tool, signal);
-		assertMcpOwnerCurrent(context, signal);
+		await assertMcpOwnerCurrent(context, signal);
 		await validateManagedAwsProfile(ready.name, liveTool, args);
-		assertMcpOwnerCurrent(context, signal);
+		await assertMcpOwnerCurrent(context, signal);
 		return ready;
 	};
 	const reconnectOptions = managedAws ? { awsProfile: String(args.aws_profile) } : undefined;
 	if (!connection.transport.connected && reconnect) {
 		connection = (await reconnectWithAbort(reconnect, signal, reconnectOptions, context)) ?? connection;
-		assertMcpOwnerCurrent(context, signal);
+		await assertMcpOwnerCurrent(context, signal);
 	}
 	connection = await prepareConnection(connection);
-	assertMcpOwnerCurrent(context, signal);
+	await assertMcpOwnerCurrent(context, signal);
 	const replaySafe = options.retry === "read" || (options.retry !== "never" && canReplayMCPTool(tool));
 	try {
 		const attempt = await callToolWithAuthRetry(
@@ -1165,11 +1224,11 @@ export async function dispatchMCPTool(
 		);
 		if (attempt.error !== undefined) throw attempt.error;
 		if (!attempt.result) throw new Error("MCP tool call returned no result");
-		assertMcpOwnerCurrent(context, signal);
+		await assertMcpOwnerCurrent(context, signal);
 		return { connection: attempt.connection, result: attempt.result };
 	} catch (error) {
 		rethrowIfAborted(error, signal);
-		assertMcpOwnerCurrent(context, signal);
+		await assertMcpOwnerCurrent(context, signal);
 		if (
 			!reconnect ||
 			options.retry === "never" ||
@@ -1178,7 +1237,7 @@ export async function dispatchMCPTool(
 		)
 			throw error;
 		const reconnected = await reconnectWithAbort(reconnect, signal, reconnectOptions, context);
-		assertMcpOwnerCurrent(context, signal);
+		await assertMcpOwnerCurrent(context, signal);
 		if (!reconnected) throw error;
 		const ready = await prepareConnection(reconnected);
 		return {
@@ -1230,14 +1289,20 @@ export class MCPTool implements CustomTool<TSchema, MCPToolDetails> {
 	readonly formatApprovalDetails = formatApprovalArguments;
 
 	/** Create MCPTool instances for all tools from an MCP server connection */
-	static fromTools(connection: MCPServerConnection, tools: MCPToolDefinition[], reconnect?: MCPReconnect): MCPTool[] {
-		return tools.map(tool => new MCPTool(connection, tool, reconnect));
+	static fromTools(
+		connection: MCPServerConnection,
+		tools: MCPToolDefinition[],
+		reconnect?: MCPReconnect,
+		observeCall?: MCPToolCallObserver,
+	): MCPTool[] {
+		return tools.map(tool => new MCPTool(connection, tool, reconnect, observeCall));
 	}
 
 	constructor(
 		private connection: MCPServerConnection,
 		private readonly tool: MCPToolDefinition,
 		private readonly reconnect?: MCPReconnect,
+		private readonly observeCall?: MCPToolCallObserver,
 	) {
 		this.name = createMCPToolName(connection.name, tool.name);
 		this.legacyName = createLegacyMCPToolName(connection.name, tool.name);
@@ -1267,13 +1332,27 @@ export class MCPTool implements CustomTool<TSchema, MCPToolDetails> {
 	}
 
 	async execute(
-		_toolCallId: string,
+		toolCallId: string,
+		params: unknown,
+		onUpdate: AgentToolUpdateCallback<MCPToolDetails> | undefined,
+		ctx: CustomToolContext,
+		signal?: AbortSignal,
+	): Promise<CustomToolResult<MCPToolDetails>> {
+		const settle = this.observeCall?.(toolCallId);
+		try {
+			return await this.#call(params, onUpdate, ctx, signal);
+		} finally {
+			await settle?.();
+		}
+	}
+
+	async #call(
 		params: unknown,
 		onUpdate: AgentToolUpdateCallback<MCPToolDetails> | undefined,
 		_ctx: CustomToolContext,
 		signal?: AbortSignal,
 	): Promise<CustomToolResult<MCPToolDetails>> {
-		assertMcpOwnerCurrent(_ctx, signal);
+		await assertMcpOwnerCurrent(_ctx, signal);
 		const args = await prepareOutboundArgs(params, this.tool.inputSchema, _ctx);
 		const provider = this.connection._source?.provider;
 		const providerName = this.connection._source?.providerName;
@@ -1343,8 +1422,9 @@ export class DeferredMCPTool implements CustomTool<TSchema, MCPToolDetails> {
 		getConnection: () => Promise<MCPServerConnection>,
 		source?: SourceMeta,
 		reconnect?: MCPReconnect,
+		observeCall?: MCPToolCallObserver,
 	): DeferredMCPTool[] {
-		return tools.map(tool => new DeferredMCPTool(serverName, tool, getConnection, source, reconnect));
+		return tools.map(tool => new DeferredMCPTool(serverName, tool, getConnection, source, reconnect, observeCall));
 	}
 
 	constructor(
@@ -1353,6 +1433,7 @@ export class DeferredMCPTool implements CustomTool<TSchema, MCPToolDetails> {
 		private readonly getConnection: () => Promise<MCPServerConnection>,
 		source?: SourceMeta,
 		private readonly reconnect?: MCPReconnect,
+		private readonly observeCall?: MCPToolCallObserver,
 	) {
 		this.tool = addDeferredAwsProfileRequirement(serverName, tool);
 		this.name = createMCPToolName(serverName, this.tool.name);
@@ -1397,15 +1478,29 @@ export class DeferredMCPTool implements CustomTool<TSchema, MCPToolDetails> {
 	}
 
 	async execute(
-		_toolCallId: string,
+		toolCallId: string,
+		params: unknown,
+		onUpdate: AgentToolUpdateCallback<MCPToolDetails> | undefined,
+		ctx: CustomToolContext,
+		signal?: AbortSignal,
+	): Promise<CustomToolResult<MCPToolDetails>> {
+		const settle = this.observeCall?.(toolCallId);
+		try {
+			return await this.#call(params, onUpdate, ctx, signal);
+		} finally {
+			await settle?.();
+		}
+	}
+
+	async #call(
 		params: unknown,
 		onUpdate: AgentToolUpdateCallback<MCPToolDetails> | undefined,
 		_ctx: CustomToolContext,
 		signal?: AbortSignal,
 	): Promise<CustomToolResult<MCPToolDetails>> {
-		assertMcpOwnerCurrent(_ctx, signal);
+		await assertMcpOwnerCurrent(_ctx, signal);
 		const args = await prepareOutboundArgs(params, this.tool.inputSchema, _ctx);
-		assertMcpOwnerCurrent(_ctx, signal);
+		await assertMcpOwnerCurrent(_ctx, signal);
 		const provider = this.#fallbackProvider;
 		const providerName = this.#fallbackProviderName;
 		const progress = progressUpdater(onUpdate, this.serverName, this.tool.name, provider, providerName);
@@ -1419,15 +1514,15 @@ export class DeferredMCPTool implements CustomTool<TSchema, MCPToolDetails> {
 				await validateManagedAwsProfile(this.serverName, this.tool, args, {
 					checkExposedProfile: false,
 				});
-				assertMcpOwnerCurrent(_ctx, signal);
+				await assertMcpOwnerCurrent(_ctx, signal);
 			} catch (error) {
 				rethrowIfAborted(error, signal);
-				assertMcpOwnerCurrent(_ctx, signal);
+				await assertMcpOwnerCurrent(_ctx, signal);
 				return buildErrorResult(error, this.serverName, this.tool.name, provider, providerName);
 			}
 		}
 		const prepareConnection = async (candidate: MCPServerConnection): Promise<MCPServerConnection> => {
-			assertMcpOwnerCurrent(_ctx, signal);
+			await assertMcpOwnerCurrent(_ctx, signal);
 			if (!managedAws) return candidate;
 			const ready = await connectSignedAwsProxy(
 				candidate,
@@ -1439,12 +1534,12 @@ export class DeferredMCPTool implements CustomTool<TSchema, MCPToolDetails> {
 				_ctx,
 			);
 			await untilAborted(signal, () => this.#validateLiveManagedAwsProfile(ready, args));
-			assertMcpOwnerCurrent(_ctx, signal);
+			await assertMcpOwnerCurrent(_ctx, signal);
 			return ready;
 		};
 		try {
 			const discovered = await untilAborted(signal, () => this.getConnection());
-			assertMcpOwnerCurrent(_ctx, signal);
+			await assertMcpOwnerCurrent(_ctx, signal);
 			const connection = await prepareConnection(discovered);
 			try {
 				const attempt = await callToolWithAuthRetry(
@@ -1486,7 +1581,7 @@ export class DeferredMCPTool implements CustomTool<TSchema, MCPToolDetails> {
 				);
 			} catch (callError) {
 				rethrowIfAborted(callError, signal);
-				assertMcpOwnerCurrent(_ctx, signal);
+				await assertMcpOwnerCurrent(_ctx, signal);
 				if (
 					this.reconnect &&
 					isRecoverableMCPConnection(callError, replaySafe) &&
@@ -1533,7 +1628,7 @@ export class DeferredMCPTool implements CustomTool<TSchema, MCPToolDetails> {
 			// This is always worth a reconnect attempt for deferred tools, since the
 			// error ("MCP server not connected") isn't a network error from callTool.
 			rethrowIfAborted(connError, signal);
-			assertMcpOwnerCurrent(_ctx, signal);
+			await assertMcpOwnerCurrent(_ctx, signal);
 			if (this.reconnect) {
 				const newConn = await reconnectWithAbort(
 					this.reconnect,

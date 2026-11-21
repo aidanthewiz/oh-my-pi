@@ -1,35 +1,29 @@
 #[cfg(unix)]
 mod peer {
-	use std::io::{self, Write};
-
-	use brush_core::{
-		ExecutionContext, ProfileLoadBehavior, RcLoadBehavior, Shell,
-		commands::CommandArg,
-		extensions::DefaultShellExtensions,
-		openfiles::{OpenFile, OpenFiles},
+	use std::{
+		io::{self, Write},
+		os::fd::AsFd as _,
 	};
+
+	use pi_builtins::extras::{self, Fd, Invocation};
 	use tokio_util::sync::CancellationToken;
 
-	async fn run() -> Result<u8, Box<dyn std::error::Error>> {
+	async fn run() -> Result<i32, Box<dyn std::error::Error>> {
 		let args = std::env::args_os();
 		let mut argv = Vec::with_capacity(args.len());
-		argv.push(CommandArg::String("rsync".to_owned()));
+		argv.push("rsync".to_owned());
 		for arg in args.skip(1) {
-			argv.push(CommandArg::String(arg.into_string().map_err(|_| {
+			argv.push(arg.into_string().map_err(|_| {
 				io::Error::new(io::ErrorKind::InvalidInput, "builtin entrypoint requires UTF-8 argv")
-			})?));
+			})?);
 		}
-		let mut shell: Shell = Shell::builder()
-			.profile(ProfileLoadBehavior::Skip)
-			.rc(RcLoadBehavior::Skip)
-			.build()
-			.await?;
-		shell.set_working_dir(std::env::current_dir()?).await?;
-		let registration = pi_builtins::utility_builtins::<DefaultShellExtensions>()
-			.into_iter()
-			.find(|(name, _)| *name == "rsync")
-			.map(|(_, registration)| registration)
-			.ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "rsync builtin is unavailable"))?;
+		let mut invocation = Invocation::new(argv, std::env::current_dir()?, pi_vfs::Fs::native());
+		invocation.env = std::env::vars().collect();
+		invocation.stdio = [
+			Fd::File(std::fs::File::from(io::stdin().as_fd().try_clone_to_owned()?)),
+			Fd::File(std::fs::File::from(io::stdout().as_fd().try_clone_to_owned()?)),
+			Fd::File(std::fs::File::from(io::stderr().as_fd().try_clone_to_owned()?)),
+		];
 		let cancel = CancellationToken::new();
 		let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
 		let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -43,23 +37,15 @@ mod peer {
 			}
 			signal_cancel.cancel();
 		});
-		let mut params = shell.default_exec_params();
-		params.set_fd(OpenFiles::STDIN_FD, OpenFile::Stdin(io::stdin()));
-		params.set_fd(OpenFiles::STDOUT_FD, OpenFile::Stdout(io::stdout()));
-		params.set_fd(OpenFiles::STDERR_FD, OpenFile::Stderr(io::stderr()));
-		params.set_cancel_token(cancel);
-		let result = (registration.execute_func)(
-			ExecutionContext { shell: &mut shell, command_name: "rsync".to_owned(), params },
-			argv,
-		)
-		.await;
+		invocation.cancel = Some(cancel);
+		let result = extras::run(invocation).await;
 		signal_task.abort();
 		let _ = signal_task.await;
-		Ok(u8::from(result?.exit_code))
+		Ok(result)
 	}
 
 	pub fn main() {
-		let code = (|| -> Result<u8, Box<dyn std::error::Error>> {
+		let code = (|| -> Result<i32, Box<dyn std::error::Error>> {
 			let runtime = tokio::runtime::Builder::new_multi_thread()
 				.worker_threads(2)
 				.enable_all()
@@ -67,7 +53,7 @@ mod peer {
 			runtime.block_on(run())
 		})();
 		match code {
-			Ok(code) => std::process::exit(i32::from(code)),
+			Ok(code) => std::process::exit(code),
 			Err(error) => {
 				let _ = writeln!(io::stderr(), "rsync peer fixture: {error}");
 				std::process::exit(125);

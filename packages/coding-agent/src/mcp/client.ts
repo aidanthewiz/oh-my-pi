@@ -382,6 +382,11 @@ export async function callTool(
 ): Promise<MCPToolCallResult> {
 	options?.signal?.throwIfAborted();
 	if (options?.mcpOwnerCurrent?.() === false) throw new DOMException("MCP call owner changed", "AbortError");
+	if (options?.mcpCheckOwner) {
+		await options.mcpCheckOwner();
+		options.signal?.throwIfAborted();
+		if (options.mcpOwnerCurrent?.() === false) throw new DOMException("MCP call owner changed", "AbortError");
+	}
 	if (connection.awsAnonymousBootstrap && isAuthenticatedAwsTool(connection.name, toolName)) {
 		throw new Error("AUTH_REQUIRED: authenticated AWS calls require a signed proxy connection.");
 	}

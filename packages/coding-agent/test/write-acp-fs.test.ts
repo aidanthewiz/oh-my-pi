@@ -57,31 +57,25 @@ describe("write tool ACP fs routing", () => {
 		await removeWithRetries(tmpDir);
 	});
 
-	it("routes plain text writes through the bridge and does not call Bun.write", async () => {
+	it("persists bridge-routed text writes and returns the verified snapshot", async () => {
 		const filePath = path.join(tmpDir, "output.txt");
 
 		const bridge: ClientBridge = {
 			capabilities: { writeTextFile: true },
-			writeTextFile: async () => undefined,
+			writeTextFile: async ({ path: target, content }) => {
+				await fs.writeFile(target, content, "utf8");
+			},
 		};
 
-		const bridgeSpy = spyOn(bridge, "writeTextFile");
-		const bunWriteSpy = spyOn(Bun, "write");
+		const session = createSession(tmpDir, { bridge });
+		const tool = new WriteTool(session);
+		const result = await tool.execute("call-1", { path: filePath, content: FILE_CONTENT });
 
-		try {
-			const session = createSession(tmpDir, { bridge });
-			const tool = new WriteTool(session);
-
-			await tool.execute("call-1", { path: filePath, content: FILE_CONTENT });
-
-			// Bridge was called with the exact path and content
-			expect(bridgeSpy).toHaveBeenCalledTimes(1);
-			expect(bridgeSpy).toHaveBeenCalledWith({ path: filePath, content: FILE_CONTENT });
-			// Disk write must not have been called — bridge is the destination
-			expect(bunWriteSpy).not.toHaveBeenCalled();
-		} finally {
-			bunWriteSpy.mockRestore();
-		}
+		expect(await fs.readFile(filePath, "utf8")).toBe(FILE_CONTENT);
+		expect(resultText(result)).toContain(`[output.txt#${hashlineFileHash(FILE_CONTENT)}]`);
+		expect(resultText(result)).toContain(
+			`Successfully wrote ${Buffer.byteLength(FILE_CONTENT, "utf8")} bytes to output.txt`,
+		);
 	});
 
 	it("keys the returned snapshot header on bridge-transformed disk content", async () => {
@@ -163,7 +157,9 @@ describe("write tool ACP fs routing", () => {
 		const scratchContent = "scratch notes\n";
 		const bridge: ClientBridge = {
 			capabilities: { writeTextFile: true },
-			writeTextFile: async () => undefined,
+			writeTextFile: async ({ path: target, content }) => {
+				await fs.writeFile(target, content, "utf8");
+			},
 		};
 		const bridgeSpy = spyOn(bridge, "writeTextFile");
 		const session = createSession(tmpDir, {

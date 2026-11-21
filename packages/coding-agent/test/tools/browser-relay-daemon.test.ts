@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Process } from "@oh-my-pi/pi-natives";
+import { daemonBrokerRuntimeDir } from "../../src/launch/paths";
 import { readLiveDaemonBrokerPid } from "../../src/launch/presence";
 import { findFreeCdpPort } from "../../src/tools/browser/attach";
 import { probeRelayServer } from "../../src/tools/browser/relay/daemon";
@@ -169,6 +170,7 @@ try {
 						...process.env,
 						HOME: home,
 						USERPROFILE: home,
+						XDG_STATE_HOME: "",
 						PI_CONFIG_DIR: ".omp",
 						OMP_PROFILE: profile,
 						OMP_DAEMON_IDLE_GRACE_MS: "200",
@@ -242,6 +244,7 @@ try {
 					...process.env,
 					HOME: home,
 					USERPROFILE: home,
+					XDG_STATE_HOME: "",
 					PI_CONFIG_DIR: ".omp",
 					OMP_DAEMON_IDLE_GRACE_MS: "200",
 					OMP_TEST_FIRST_RELAY_URL: firstUrl,
@@ -805,6 +808,7 @@ async function runWithIsolatedBroker(
 			...process.env,
 			HOME: home,
 			USERPROFILE: home,
+			XDG_STATE_HOME: "",
 			PI_CONFIG_DIR: ".omp",
 			OMP_DAEMON_IDLE_GRACE_MS: "200",
 			...env,
@@ -835,7 +839,7 @@ async function runWithIsolatedBroker(
  * no `shutdown` request is sent because a client finding no broker would spawn a fresh one into HOME.
  */
 async function waitForIsolatedBrokerExit(runtimeDir: string): Promise<void> {
-	const pid = await readLiveDaemonBrokerPid(runtimeDir);
+	const pid = await readLiveDaemonBrokerPid(daemonBrokerRuntimeDir(runtimeDir));
 	const broker = pid === undefined ? null : Process.fromPid(pid);
 	if (!broker || (await broker.waitForExit({ timeoutMs: 10_000 }))) return;
 	await broker.terminate({ group: true, gracefulMs: 0, timeoutMs: 2_000 });

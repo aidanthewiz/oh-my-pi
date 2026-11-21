@@ -49,6 +49,8 @@ function createBrowserHost() {
 		getSessionFile: () => null,
 		getSessionSpawns: () => "*",
 		settings: Settings.isolated({
+			// Managed Chromium, whether or not omp's WebKit engine is installed on this machine.
+			"browser.webkit": false,
 			"browser.enabled": true,
 			"browser.headless": true,
 			"browser.cmux": false,
@@ -137,6 +139,7 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser WebMCP helpers", () => {
 			const page = await headless().browser.newPage();
 			const controller = new WebMcpController(page);
 			try {
+				await controller.initialize();
 				await page.goto(`http://localhost:${rootServer.port}/`, { waitUntil: "load" });
 				const leaf = page.frames().find(frame => frame.url() === `http://127.0.0.1:${leafServer.port}/tool`);
 				if (!leaf) throw new Error("Missing synthetic grandchild");
@@ -145,6 +148,14 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser WebMCP helpers", () => {
 				expect(middle.parentFrame()).toBe(page.mainFrame());
 				expect(middle.client).not.toBe(page.mainFrame().client);
 				expect(leaf.client).toBe(middle.client);
+				const nativeRegistration = `(() => {
+  const context = document.modelContext ?? navigator.modelContext;
+  return typeof ModelContext !== "undefined" && context instanceof ModelContext
+    && /\\[native code\\]/.test(Function.prototype.toString.call(context.registerTool));
+})()`;
+				expect(await Promise.all([middle.evaluate(nativeRegistration), leaf.evaluate(nativeRegistration)])).toEqual(
+					[true, true],
+				);
 				await Promise.all([
 					middle.waitForFunction(() => document.title === "registered"),
 					leaf.waitForFunction(() => document.title === "registered"),
@@ -200,6 +211,14 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser WebMCP helpers", () => {
 					["unregistered", "nested_constant", leafId],
 					["unregistered", "middle_constant", middleId],
 				]);
+
+				await page.goto(`http://127.0.0.1:${leafServer.port}/tool`, { waitUntil: "load" });
+				expect((await controller.list()).tools.map(tool => tool.name)).toEqual(["nested_constant"]);
+				expect(await controller.invoke("nested_constant", {})).toEqual({
+					ok: true,
+					result: { value: 42, calls: 1 },
+					untrusted: true,
+				});
 			} finally {
 				try {
 					await controller.dispose();

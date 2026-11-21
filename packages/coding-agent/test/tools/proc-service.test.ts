@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "bun:test";
+import { adaptSchemaForStrict, isJsonSchemaValueValid, toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { procmgr, setProcessName, TempDir } from "@oh-my-pi/pi-utils";
@@ -397,7 +398,7 @@ describe("proc:// background jobs", () => {
 					expect(message).toContain("stdin and persist/session/detached modes are services-only");
 					expect(message).toContain("Start long-lived work as a named service");
 					expect(message).toContain("lifetime controls");
-					expect(message).toContain(JSON.stringify({ path: `proc://${id}/kill` }));
+					expect(message).toContain(JSON.stringify({ path: `proc://${id}/kill`, content: "" }));
 					expect(message).not.toContain("not found");
 
 					const missing = await rejectionMessage(
@@ -448,7 +449,7 @@ describe("proc:// background jobs", () => {
 		try {
 			const kill = await rejectionMessage(protocol.resolve(parseInternalUrl(`proc://${id}/kill`), { session }));
 			expect(kill).toContain("call write with");
-			expect(kill).toContain(JSON.stringify({ path: "proc://bg_12/kill" }));
+			expect(kill).toContain(JSON.stringify({ path: "proc://bg_12/kill", content: "" }));
 			expect(kill).toContain("read proc://bg_12 for its status");
 			expect(manager.getJob(id)?.status).toBe("running");
 			const mode = await rejectionMessage(protocol.resolve(parseInternalUrl(`proc://${id}/mode`), { session }));
@@ -461,7 +462,7 @@ describe("proc:// background jobs", () => {
 		}
 	});
 
-	it("kills without content and never interprets bare job writes as cancellation", async () => {
+	it("kills via /kill and never interprets bare job writes as cancellation", async () => {
 		const manager = new AsyncJobManager({});
 		const pending = Promise.withResolvers<string>();
 		const id = manager.register(
@@ -484,11 +485,8 @@ describe("proc:// background jobs", () => {
 			await expect(write.execute("empty-stdin", { path: `proc://${id}`, content: "" })).rejects.toThrow(
 				"in-process job",
 			);
-			await expect(
-				write.execute("missing-stdin", write.parameters.assert({ path: `proc://${id}` })),
-			).rejects.toThrow("content is required");
 			expect(manager.getJob(id)?.status).toBe("running");
-			const result = await write.execute("kill", write.parameters.assert({ path: `proc://${id}/kill` }));
+			const result = await write.execute("kill", { path: `proc://${id}/kill`, content: "" });
 			await manager.getJob(id)?.promise;
 			expect(result.details?.proc).toMatchObject({ op: "cancel", cancelled: [{ id, status: "cancelled" }] });
 			expect(manager.getJob(id)?.status).toBe("cancelled");
@@ -532,13 +530,15 @@ describe("proc:// background jobs", () => {
 		session.deviceOnlyWrite = deviceOnlyWrite || undefined;
 		const write = new WriteTool(session);
 		try {
-			await expect(write.execute("foreign-kill", { path: `proc://${foreignId}/kill` })).rejects.toThrow("not found");
+			await expect(write.execute("foreign-kill", { path: `proc://${foreignId}/kill`, content: "" })).rejects.toThrow(
+				"not found",
+			);
 			expect(manager.getJob(foreignId)?.status).toBe("running");
 			await expect(write.execute("stdin", { path: `proc://${id}`, content: "go" })).rejects.toThrow(
 				deviceOnlyWrite ? "limited to the xd:// device transport" : "Plan mode",
 			);
 			expect(manager.getJob(id)?.status).toBe("running");
-			const result = await write.execute("kill", write.parameters.assert({ path: `proc://${id}/kill` }));
+			const result = await write.execute("kill", { path: `proc://${id}/kill`, content: "" });
 			await manager.getJob(id)?.promise;
 			expect(result.details?.proc).toMatchObject({ op: "cancel", cancelled: [{ id, status: "cancelled" }] });
 			expect(manager.getJob(id)?.status).toBe("cancelled");
@@ -607,10 +607,10 @@ describe("proc:// background jobs", () => {
 				await rejectionMessage(write.execute("service-only", { path: `proc://Worker${suffix}`, content }));
 				expect(registry.get("Worker")?.status).toBe(status);
 			}
-			const denied = await write.execute("foreign", { path: "proc://Foreign/kill" });
+			const denied = await write.execute("foreign", { path: "proc://Foreign/kill", content: "" });
 			expect(denied.details?.proc).toMatchObject({ cancelled: [{ id: "Foreign", status: "not_found" }] });
 			expect(registry.get("Foreign")?.status).toBe(status);
-			const killed = await write.execute("worker", { path: "proc://Worker/kill" });
+			const killed = await write.execute("worker", { path: "proc://Worker/kill", content: "" });
 			expect(killed.details?.proc).toMatchObject({ cancelled: [{ id: "Worker", status: "cancelled" }] });
 			expect(registry.get("Worker")).toBeUndefined();
 		} finally {
@@ -713,17 +713,13 @@ describe("proc:// background jobs", () => {
 		}
 	});
 
-	it("requires file content instead of silently truncating a file", async () => {
-		using temp = TempDir.createSync("@omp-proc-write-");
-		const file = path.join(temp.path(), "keep.txt");
-		await Bun.write(file, "keep this");
-		const write = new WriteTool(toolSession(temp.path(), undefined, { launch: false }));
-		await expect(write.execute("missing-content", write.parameters.assert({ path: file }))).rejects.toThrow(
-			"content is required",
-		);
-		expect(await Bun.file(file).text()).toBe("keep this");
-		await write.execute("empty-file", { path: file, content: "" });
-		expect(await Bun.file(file).text()).toBe("");
+	it("never offers strict-mode providers a nullable content", () => {
+		const write = new WriteTool(toolSession(process.cwd(), undefined, { launch: false }));
+		const strict = adaptSchemaForStrict(toolWireSchema(write), true);
+		expect(strict.strict).toBe(true);
+		expect(isJsonSchemaValueValid(strict.schema, { path: "proc://bg_1/kill", content: "" })).toBe(true);
+		// An optional `content` became `anyOf: [string, null]` here, and models filled the null.
+		expect(isJsonSchemaValueValid(strict.schema, { path: "keep.txt", content: null })).toBe(false);
 	});
 
 	it("shows a running task's progress in the proc:// listing and its own read, but not a bash job's", async () => {
@@ -822,6 +818,63 @@ describe("proc:// background jobs", () => {
 			await manager.dispose();
 		}
 	});
+
+	it("labels a kill of a job that settled during the call as delivered by that call", async () => {
+		// `write proc://<id>/kill` awaits the daemon-broker lookup before it
+		// cancels, so a job can settle inside that window. The call that hands
+		// the result over must say so — the same wording `wait` uses — instead
+		// of calling the result a lost completion push (#16052).
+		const gate = Promise.withResolvers<DaemonRpcResult>();
+		const broker = vi.spyOn(daemonClient, "daemonClientForProject").mockResolvedValue({
+			request: async () => gate.promise,
+			onCompletion: () => () => {},
+		} as unknown as daemonClient.DaemonBrokerClient);
+		const manager = new AsyncJobManager({});
+		const settled = Promise.withResolvers<string>();
+		const id = manager.register("bash", "late build", async () => settled.promise, { ownerId: "Main" });
+		const session = toolSession(process.cwd(), manager, { launch: true });
+		const proc = new ProcProtocolHandler();
+		try {
+			// The call is parked on the broker lookup, so the job settles during it.
+			const killing = proc.write(parseInternalUrl(`proc://${id}/kill`), "", { session });
+			settled.resolve("late result");
+			await manager.getJob(id)?.promise;
+			gate.resolve({ op: "list", daemons: [] });
+			const killed = await killing;
+			const text = killed.content[0]?.type === "text" ? killed.content[0].text : "";
+			expect(text).toContain("Delivery: delivered by this call");
+			expect(text).not.toContain("not auto-delivered");
+		} finally {
+			broker.mockRestore();
+			await manager.dispose();
+		}
+	});
+
+	it("keeps the missed-push wording for a job that settled before the kill call", async () => {
+		// The job was already done when the kill arrived and nothing was on the
+		// way, so the result is genuinely late — the line must stay honest and
+		// say how long before the call it had finished.
+		const broker = vi.spyOn(daemonClient, "daemonClientForProject").mockResolvedValue({
+			request: async () => ({ op: "list", daemons: [] }) as DaemonRpcResult,
+			onCompletion: () => () => {},
+		} as unknown as daemonClient.DaemonBrokerClient);
+		const manager = new AsyncJobManager({});
+		const id = manager.register("bash", "earlier build", async () => "done earlier", { ownerId: "Main" });
+		await manager.getJob(id)?.promise;
+		manager.getJob(id)!.endTime = Date.now() - 5_000;
+		const session = toolSession(process.cwd(), manager, { launch: true });
+		const proc = new ProcProtocolHandler();
+		try {
+			const killed = await proc.write(parseInternalUrl(`proc://${id}/kill`), "", { session });
+			const text = killed.content[0]?.type === "text" ? killed.content[0].text : "";
+			expect(text).toContain("Delivery: not auto-delivered; recovered by this snapshot");
+			expect(text).toMatch(/already finished \d+(ms|\.\ds) before this call/);
+			expect(text).not.toContain("delivered by this call");
+		} finally {
+			broker.mockRestore();
+			await manager.dispose();
+		}
+	});
 });
 
 describe("bash services via proc://", () => {
@@ -882,7 +935,10 @@ describe("bash services via proc://", () => {
 				});
 				expect(
 					await rejectionMessage(
-						new WriteTool(foreignSession).execute("foreign", { path: "proc://session-service/kill" }),
+						new WriteTool(foreignSession).execute("foreign", {
+							path: "proc://session-service/kill",
+							content: "",
+						}),
 					),
 				).toMatch(/another session/u);
 				const anonymousSession: ToolSession = {
@@ -892,14 +948,20 @@ describe("bash services via proc://", () => {
 				};
 				expect(
 					await rejectionMessage(
-						new WriteTool(anonymousSession).execute("anonymous", { path: "proc://session-service/kill" }),
+						new WriteTool(anonymousSession).execute("anonymous", {
+							path: "proc://session-service/kill",
+							content: "",
+						}),
 					),
 				).toMatch(/requires a session owner/u);
 				const alive = await client.request({ op: "describe", name: spec.name });
 				if (alive.op !== "describe") throw new Error("unexpected describe result");
 				expect(alive.daemon.id).toBe(started.daemon.id);
 				expect(alive.daemon.state).toBe("ready");
-				const stopped = await new WriteTool(session).execute("owned", { path: "proc://session-service/kill" });
+				const stopped = await new WriteTool(session).execute("owned", {
+					path: "proc://session-service/kill",
+					content: "",
+				});
 				expect(stopped.details?.proc).toMatchObject({
 					action: "stop",
 					daemon: { name: spec.name, owner: "owner-session", state: "exited" },
@@ -973,12 +1035,14 @@ describe("bash services via proc://", () => {
 			await manager.getJob(collisionId)?.promise;
 			await manager.dispose({ timeoutMs: 1_000 });
 			session.asyncJobManager = undefined;
-			const sent = await proc.write(parseInternalUrl("proc://echo-service"), "hello", { session });
+			// Through the real write tool: stdin feeds a process and touches no files,
+			// so the result must not read as implementation work to the prewalk gate.
+			const write = new WriteTool(session);
+			const sent = await write.execute("stdin", { path: "proc://echo-service", content: "hello" });
 			expect(sent.content[0]?.type === "text" ? sent.content[0].text : "").toContain("Sent input");
-			expect(sent.details?.proc).toMatchObject({
-				action: "stdin",
-				daemon: { name: "echo-service" },
-				input: "hello",
+			expect(sent.details).toMatchObject({
+				proc: { action: "stdin", daemon: { name: "echo-service" }, input: "hello" },
+				touchesNoFiles: true,
 			});
 			const observed = await client.request({
 				op: "wait",
@@ -1003,9 +1067,12 @@ describe("bash services via proc://", () => {
 				timeoutMs: 2_000,
 			});
 			expect(blank.op === "wait" && blank.matched).toBe("ACK:[]");
-			const persisted = await proc.write(parseInternalUrl("proc://echo-service/mode"), "persist", { session });
+			const persisted = await write.execute("mode", { path: "proc://echo-service/mode", content: "persist" });
 			expect(persisted.content[0]?.type === "text" ? persisted.content[0].text : "").toContain("persistent");
-			expect(persisted.details?.proc).toMatchObject({ action: "mode", mode: "persist", daemon: { persist: true } });
+			expect(persisted.details).toMatchObject({
+				proc: { action: "mode", mode: "persist", daemon: { persist: true } },
+				touchesNoFiles: true,
+			});
 			const spec: { persist: boolean } = await Bun.file(
 				path.join(brokerRuntimeDir, "daemons", "echo-service", "spec.json"),
 			).json();
@@ -1024,8 +1091,7 @@ describe("bash services via proc://", () => {
 				async: false,
 			});
 			expect(restarted.content[0]?.type === "text" ? restarted.content[0].text : "").toContain("REPLACED");
-			const write = new WriteTool(session);
-			const stopped = await write.execute("kill", write.parameters.assert({ path: "proc://echo-service/kill" }));
+			const stopped = await write.execute("kill", { path: "proc://echo-service/kill", content: "" });
 			expect(stopped.details?.proc).toMatchObject({ action: "stop", daemon: { name: "echo-service" } });
 			const background = await bash.execute("detach-candidate", {
 				command: "printf 'RUNNING\\n'; sleep 30",

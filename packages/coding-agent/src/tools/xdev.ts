@@ -6,7 +6,7 @@
  * tools the model already has:
  *
  *   read  xd://          → mounted tool listing (discovery)
- *   read  xd://<tool>    → tool docs + JSON parameter schema
+ *   read  xd://<tool>    → tool docs + TypeScript parameter summary
  *   write xd://<tool>    → execute: `content` is the JSON args object
  *
  * Direct and device dispatch share one canonical tool map. The mounted-name
@@ -34,14 +34,18 @@ import {
 	type AgentToolResult,
 	type AgentToolUpdateCallback,
 	type ToolLoadMode,
+	resolveToolCancellationBehavior,
 	validateAgentToolArguments,
 } from "@oh-my-pi/pi-agent-core";
 import { type Tool as AiTool, jsonSchemaToTypeScript, toolWireSchema } from "@oh-my-pi/pi-ai";
+import { untilAborted } from "@oh-my-pi/pi-utils";
+import { isEvalBridgeToolCall, isEvalBridgeToolCallable } from "../eval/tool-bridge-policy";
 import { schemaDeclaresIntentField } from "../utils/tool-schema";
+import { resolveToolWireName } from "../utils/tool-wire-name";
 import { stripXdUrlPrefix, XD_URL_PREFIX } from "@oh-my-pi/pi-tui/tools/xd-url";
 import { truncateHeadBytes } from "@oh-my-pi/pi-tui/tools/streaming-output";
 import { resolveToolTier, type ToolTier } from "./approval";
-import type { Tool } from "./index";
+import type { Tool, ToolSession } from "./index";
 import { renderError, ToolAbortError } from "./tool-errors";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 
@@ -87,6 +91,14 @@ export function isMountableUnderXdev(tool: { name: string; loadMode?: ToolLoadMo
 	return tool.loadMode === "discoverable";
 }
 
+/**
+ * Whether the session can open `xd://<tool>/<topic>` doc topics: `read` is their only
+ * transport. A tool whose description links a topic inlines it instead when this is false.
+ */
+export function docTopicsReadable(session: Pick<ToolSession, "isToolActive">): boolean {
+	return session.isToolActive?.("read") !== false;
+}
+
 /** Dispatch metadata carried on write-tool details for renderer delegation. */
 export interface XdevDispatch {
 	tool: string;
@@ -121,7 +133,7 @@ function renderDocs(inst: Tool, heading = "#", descriptionCap?: number): string 
 		"",
 		description,
 		"",
-		`${heading}# Schema`,
+		`${heading}# Schema summary (TypeScript, not full JSON Schema)`,
 		"```ts",
 		`type Args = ${schema};`,
 		"```",
@@ -142,7 +154,7 @@ function renderDocs(inst: Tool, heading = "#", descriptionCap?: number): string 
  * Content is a model-written payload, so lenience strips forged
  * `__parseError`/`__rawJson` sentinels (see `validateAgentToolArguments`).
  */
-function parseDeviceArgs(
+export function parseDeviceArgs(
 	device: Tool,
 	content: string,
 	toolCallId: string,
@@ -252,10 +264,27 @@ export const XDEV_DOCS_PER_DEVICE_CAP = 10_000;
 /** Description cap for external mounted tools; their full docs remain readable on demand. */
 export const XDEV_EXTERNAL_DESCRIPTION_CAP = 200;
 
-/** Resolve any enabled tool through the canonical session map. */
+/** Resolve enabled canonical names or unambiguous wire aliases through the session map. */
 export function resolveXdevTool(state: XdevState, name: string): Tool | undefined {
-	if (!state.mountedNames.has(name) && !state.isActive(name)) return undefined;
-	return state.tools.get(name);
+	const resolved = resolveToolWireName(state.tools, name);
+	if (!resolved || (!state.mountedNames.has(resolved.name) && !state.isActive(resolved.name))) return undefined;
+	return resolved;
+}
+
+/** Resolve cancellation from the enabled canonical tool and its validated execution input. */
+export function resolveXdevCancellationBehavior(
+	state: XdevState,
+	name: string,
+	content: string,
+): "await-cleanup" | undefined {
+	const tool = resolveXdevTool(state, name);
+	if (!tool || tool.cancellationBehavior === undefined || HELP_CONTENT_RE.test(content)) return undefined;
+	try {
+		const args = parseDeviceArgs(tool, content, "cancellation-policy", () => "");
+		return resolveToolCancellationBehavior(tool, args);
+	} catch {
+		return undefined;
+	}
 }
 
 /**
@@ -312,11 +341,11 @@ export function xdevListing(state: XdevState): string {
 		`${XD_URL_PREFIX} ${state.mountedNames.size} mounted tool devices.`,
 		...rows,
 		"",
-		`Read ${XD_URL_PREFIX}<tool> for docs + JSON schema; write the JSON args object to ${XD_URL_PREFIX}<tool> to execute. Active top-level tools accept the same dispatch.`,
+		`Read ${XD_URL_PREFIX}<tool> for docs + a TypeScript parameter summary; write the JSON args object to ${XD_URL_PREFIX}<tool> to execute. Active top-level tools accept the same dispatch.`,
 	].join("\n");
 }
 
-/** Docs + schema for any enabled tool. */
+/** Docs + TypeScript parameter summary for any enabled tool. */
 export function xdevDocs(state: XdevState, name: string): string {
 	return renderDocs(resolveRequiredXdevTool(state, name));
 }
@@ -364,7 +393,7 @@ export function planXdevPromptDocs(
 export function renderXdevPromptDocs(docs: XdevPromptDocs, listedElsewhere?: ReadonlySet<string>): string {
 	const lines: string[] = [];
 	for (const [name, summary] of docs.catalog) {
-		if (!listedElsewhere?.has(name)) lines.push(`- ${XD_URL_PREFIX}${name} — ${summary}`);
+		if (!listedElsewhere?.has(name)) lines.push(`- ${name} — ${summary}`);
 	}
 	if (lines.length === 0) return docs.sections.join("\n\n");
 	const catalogSection = [
@@ -450,6 +479,12 @@ export async function dispatchXdevTool(
 			};
 		}
 
+		if (isEvalBridgeToolCall(state) && !isEvalBridgeToolCallable(canonical)) {
+			throw new ToolError(
+				`\`${canonical.name}\` cannot run through the eval bridge; call the direct \`${canonical.name}\` tool.`,
+			);
+		}
+
 		const validated = parseDeviceArgs(canonical, content, toolCallId, () => renderDocs(canonical));
 		// Record the wrapped tool's approval tier so the prewalk coordinator can
 		// tell a read-only device call (e.g. `lsp` navigation) from a real
@@ -485,7 +520,12 @@ export async function dispatchXdevTool(
 					},
 				}
 			: undefined;
-		const result = await executable.execute(toolCallId, validated as never, signal, innerOnUpdate, executionContext);
+		if (signal?.aborted) throw new ToolAbortError("Tool execution was aborted");
+		const execute = () => executable.execute(toolCallId, validated as never, signal, innerOnUpdate, executionContext);
+		const result =
+			resolveToolCancellationBehavior(executable, validated) === "await-cleanup"
+				? await execute()
+				: await untilAborted(signal, execute);
 		return { result, xdev: { ...xdev, inner: result.details } };
 	} catch (error) {
 		if (

@@ -19,11 +19,13 @@ const TRUNKS = ["upstream/main", "origin/main"] as const satisfies readonly stri
 // Cranelift retains upstream lint policy but participates in the test tasks.
 const VENDORED_FORK_EXCLUDES = [
 	"--exclude",
-	"brush-core",
-	"--exclude",
-	"brush-parser",
-	"--exclude",
 	"cfg_aliases",
+	"--exclude",
+	"jaq-core",
+	"--exclude",
+	"jaq-json",
+	"--exclude",
+	"jaq-std",
 	"--exclude",
 	"napi",
 ] as const satisfies readonly string[];

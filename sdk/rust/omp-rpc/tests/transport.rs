@@ -324,6 +324,70 @@ fn failed_negotiation_fails_startup() {
 	assert!(matches!(handle.join().unwrap(), Err(Error::Protocol(_))));
 }
 
+#[test]
+fn bash_exclusion_requires_advertised_capability() {
+	let run = std::time::SystemTime::now()
+		.duration_since(std::time::UNIX_EPOCH)
+		.unwrap()
+		.as_nanos();
+	for (index, capability) in [None, Some(false), Some(true)].into_iter().enumerate() {
+		let dir = std::env::temp_dir().join(format!("omp-rpc-bash-{}-{run}-{index}", std::process::id()));
+		std::fs::create_dir(&dir).unwrap();
+		let private_marker = dir.join("private");
+		let shared_marker = dir.join("shared");
+		let mut ready = ready_v1();
+		if let Some(capability) = capability {
+			ready["supportsBashExcludeFromContext"] = json!(capability);
+		}
+		let (client, _events, mut server) = connect(ready, Vec::new());
+		let private_path = private_marker.clone();
+		let shared_path = shared_marker.clone();
+		let script = thread::spawn(move || {
+			loop {
+				let command = server.recv();
+				if command["type"] == "get_last_assistant_text" {
+					server.respond(&command, json!({"text": null}));
+					break;
+				}
+				assert_eq!(command["type"], "bash");
+				let marker = if command["excludeFromContext"] == true {
+					&private_path
+				} else {
+					&shared_path
+				};
+				std::fs::write(marker, "executed").unwrap();
+				server.respond(&command, json!({
+					"output": "", "cancelled": false, "truncated": false,
+					"totalLines": 0, "totalBytes": 0, "outputLines": 0, "outputBytes": 0
+				}));
+			}
+		});
+		let private_result = client.call(&BashCommand {
+			command: "private".into(),
+			exclude_from_context: Some(true),
+		});
+		let shared_result = client.call(&BashCommand {
+			command: "shared".into(),
+			exclude_from_context: Some(false),
+		});
+		let probe = client.call(&GetLastAssistantTextCommand {});
+		script.join().unwrap();
+		drop(client);
+		let private_executed = private_marker.exists();
+		let shared_executed = shared_marker.exists();
+		std::fs::remove_dir_all(&dir).unwrap();
+		if capability == Some(true) {
+			assert!(private_result.is_ok(), "{private_result:?}");
+		} else {
+			assert!(matches!(private_result, Err(Error::InvalidArgument(_))), "{private_result:?}");
+		}
+		assert!(shared_result.is_ok(), "{shared_result:?}");
+		assert!(probe.is_ok(), "{probe:?}");
+		assert_eq!(private_executed, capability == Some(true));
+		assert!(shared_executed);
+	}
+}
+
 // ---- prompt_and_wait ----
 
 fn prompt(message: &str) -> PromptCommand {

@@ -634,7 +634,8 @@ export async function discoverOAuthEndpoints(
 	): OAuthEndpoints | null => {
 		const metadataScopes = readMetadataScopes(metadata, scopeOptions);
 		if (metadata.authorization_endpoint && metadata.token_endpoint) {
-			const resource = typeof metadata.resource === "string" ? metadata.resource : protectedResource;
+			// RFC 9728 names this MCP server; an auth server's `resource` is its own default audience.
+			const resource = protectedResource ?? (typeof metadata.resource === "string" ? metadata.resource : undefined);
 
 			return {
 				authorizationUrl: String(metadata.authorization_endpoint),
@@ -660,7 +661,8 @@ export async function discoverOAuthEndpoints(
 		if (metadata.oauth || metadata.authorization || metadata.auth) {
 			const oauthData = (metadata.oauth || metadata.authorization || metadata.auth) as Record<string, unknown>;
 			if (typeof oauthData.authorization_url === "string" && typeof oauthData.token_url === "string") {
-				const resource = typeof oauthData.resource === "string" ? oauthData.resource : protectedResource;
+				const resource =
+					protectedResource ?? (typeof oauthData.resource === "string" ? oauthData.resource : undefined);
 
 				return {
 					authorizationUrl: oauthData.authorization_url || String(oauthData.authorizationUrl),
@@ -713,7 +715,8 @@ export async function discoverOAuthEndpoints(
 						const nested = metadata.oauth ?? metadata.authorization ?? metadata.auth;
 						const nestedMetadata =
 							typeof nested === "object" && nested !== null ? (nested as Record<string, unknown>) : undefined;
-						const declaredIssuers = [metadata, ...(nestedMetadata ? [nestedMetadata] : [])].flatMap(document =>
+						const documents = [metadata, ...(nestedMetadata ? [nestedMetadata] : [])];
+						const declaredIssuers = documents.flatMap(document =>
 							["issuer", "issuer_url", "issuerUrl"]
 								.filter(key => Object.hasOwn(document, key))
 								.map(key => document[key]),
@@ -730,12 +733,20 @@ export async function discoverOAuthEndpoints(
 								issuer: declaredIssuers.join(", ") || "(missing issuer at an unbound metadata URL)",
 							});
 						}
+						const isLegacyMetadata = path === "/oauth/metadata" || path === "/.mcp/auth" || path === "/authorize";
+						const resourceOk =
+							!isLegacyMetadata ||
+							protectedResource === undefined ||
+							documents.every(
+								document => !Object.hasOwn(document, "resource") || document.resource === protectedResource,
+							);
 						const isResourceMetadata =
 							path === "/.well-known/oauth-protected-resource" ||
 							(!base.issuerCandidate && (path === "/oauth/metadata" || path === "/.mcp/auth"));
-						const endpoints = issuerOk
-							? findEndpoints(metadata, { includeSupportedScopes: isResourceMetadata })
-							: null;
+						const endpoints =
+							issuerOk && resourceOk
+								? findEndpoints(metadata, { includeSupportedScopes: isResourceMetadata })
+								: null;
 						if (endpoints && (!endpoints.resource || endpoints.resource === (protectedResource ?? serverUrl)))
 							return endpoints;
 					}

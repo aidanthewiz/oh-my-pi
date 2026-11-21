@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, setDefaultTimeout } from "bun:test";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import {
-	disposeAllVmContexts,
+	disposeVmContextsByOwner,
 	executeInVmContext,
 	type JsEvalWorkerFactories,
 	type JsEvalWorkerHandle,
@@ -95,10 +95,13 @@ describe("JS eval isolated startup failures", () => {
 	let restoreFactories: (() => void) | undefined;
 
 	afterEach(async () => {
-		restoreFactories?.();
-		restoreFactories = undefined;
-		delete process.env[EXECUTION_MARKER];
-		await disposeAllVmContexts();
+		try {
+			await Promise.all([disposeVmContextsByOwner("owner:dual-spawn"), disposeVmContextsByOwner("owner:dual-init")]);
+		} finally {
+			restoreFactories?.();
+			restoreFactories = undefined;
+			delete process.env[EXECUTION_MARKER];
+		}
 	});
 
 	it("surfaces dual spawn failure without running synchronous cell code on the host", async () => {

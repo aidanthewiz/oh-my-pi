@@ -43,7 +43,7 @@
  */
 
 import type { SessionEntry as WireSessionEntry } from "@oh-my-pi/pi-wire";
-import type { AgentSessionEvent } from "../session/agent-session";
+import type { AgentSessionLifecycleEvent } from "../session/agent-session";
 import type { SessionEntry } from "../session/session-entries";
 
 /**
@@ -410,7 +410,7 @@ export function serializeReplicatedEntry(entry: ReplicatedEntry): SerializedRepl
  * was dropped (PR #11999 review) — notices never enter agent state and never
  * reach the model, so this is display-only.
  */
-export function oversizedEntryNotice(entryType: string): Extract<AgentSessionEvent, { type: "notice" }> {
+export function oversizedEntryNotice(entryType: string): Extract<AgentSessionLifecycleEvent, { type: "notice" }> {
 	return {
 		type: "notice",
 		level: "warning",
@@ -427,23 +427,25 @@ export function oversizedEntryNotice(entryType: string): Extract<AgentSessionEve
  * Oversized notifications become a notice. Loop completions retain ownership
  * and continuation state even when their message snapshot must be omitted.
  */
-export function serializeReplicatedEvent(event: AgentSessionEvent): SerializedReplication<AgentSessionEvent> {
+export function serializeReplicatedEvent(
+	event: AgentSessionLifecycleEvent,
+): SerializedReplication<AgentSessionLifecycleEvent> {
 	const shrunk = shrinkPayloadShape(event);
 	if (shrunk.json !== null) return { value: shrunk.value, json: shrunk.json };
 	if (event.type === "agent_end") {
-		const completion: Extract<AgentSessionEvent, { type: "agent_end" }> = {
+		const completion: Extract<AgentSessionLifecycleEvent, { type: "agent_end" }> = {
 			type: "agent_end",
 			messages: [],
 			isTerminal: event.isTerminal,
 			yielded: event.yielded,
-			awaitingAsyncWork: event.awaitingAsyncWork,
+			...(event.awaitingAsyncWork ? { awaitingAsyncWork: true } : {}),
 			outcome: event.outcome,
-			...("runId" in event ? { runId: event.runId } : {}),
+			runId: event.runId,
 		};
 		const json = jsonUnderCeiling(completion);
 		if (json !== null) return { value: completion, json };
 	}
-	const notice: Extract<AgentSessionEvent, { type: "notice" }> = {
+	const notice: Extract<AgentSessionLifecycleEvent, { type: "notice" }> = {
 		type: "notice",
 		level: "warning",
 		source: "collab",

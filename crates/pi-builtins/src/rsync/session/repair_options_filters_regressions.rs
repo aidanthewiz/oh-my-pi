@@ -68,24 +68,36 @@ fn multiple_source_roots_keep_ancestor_exclusions_and_local_precedence() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn shell_umask_controls_client_and_server_only_symbolic_chmod() {
+async fn invocation_umask_controls_client_and_server_only_symbolic_chmod() {
 	use std::os::unix::fs::PermissionsExt;
+	use crate::extras::{self, Fd, Invocation};
+
+	async fn run(mask: u32, args: &[&str], cwd: &std::path::Path) -> (i32, String) {
+		let error = tempfile::NamedTempFile::new().unwrap();
+		let mut invocation = Invocation::new(
+			args.iter().map(ToString::to_string).collect(),
+			cwd.to_path_buf(),
+			pi_vfs::Fs::native().with_creation_mask(Some(mask)),
+		);
+		invocation.stdio[2] = Fd::File(error.as_file().try_clone().unwrap());
+		let code = extras::run(invocation).await;
+		(code, fs::read_to_string(error.path()).unwrap())
+	}
 
 	let tree = tempfile::tempdir().unwrap();
 	fs::write(tree.path().join("src"), b"synthetic payload").unwrap();
 	fs::set_permissions(tree.path().join("src"), fs::Permissions::from_mode(0o400)).unwrap();
-	for (mask, expected) in [("077", 0o600), ("000", 0o666)] {
+	for (mask, expected) in [(0o077, 0o600), (0o000, 0o666)] {
 		for (kind, option) in [("client", "--chmod=+rw"), ("server", "-M--chmod=+rw")] {
-			let dest = format!("{kind}-{mask}");
-			let script = format!("umask {mask}; rsync -p {option} src {dest}");
-			let (code, _, err) = crate::host::run_script(&script, "", tree.path()).await;
+			let dest = format!("{kind}-{mask:o}");
+			let (code, err) = run(mask, &["rsync", "-p", option, "src", &dest], tree.path()).await;
 			assert_eq!(code, 0, "{err}");
 			assert_eq!(fs::metadata(tree.path().join(&dest)).unwrap().permissions().mode() & 0o777, expected);
 			assert_eq!(fs::read(tree.path().join(dest)).unwrap(), b"synthetic payload");
 		}
-		let dest = format!("explicit-{mask}");
-		let script = format!("umask {mask}; rsync -p --chmod=u=rw,g=r,o=r src {dest}");
-		let (code, _, err) = crate::host::run_script(&script, "", tree.path()).await;
+		let dest = format!("explicit-{mask:o}");
+		let (code, err) =
+			run(mask, &["rsync", "-p", "--chmod=u=rw,g=r,o=r", "src", &dest], tree.path()).await;
 		assert_eq!(code, 0, "{err}");
 		assert_eq!(fs::metadata(tree.path().join(&dest)).unwrap().permissions().mode() & 0o777, 0o644);
 		assert_eq!(fs::read(tree.path().join(dest)).unwrap(), b"synthetic payload");

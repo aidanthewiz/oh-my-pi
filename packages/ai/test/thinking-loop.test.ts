@@ -4,7 +4,15 @@ import { clearCustomApis, registerCustomApi } from "@oh-my-pi/pi-ai/api-registry
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { createMockModel, type MockContent, registerMockApi } from "@oh-my-pi/pi-ai/providers/mock";
 import { complete, completeSimple, stream, streamSimple } from "@oh-my-pi/pi-ai/stream";
-import type { Api, AssistantMessage, AssistantMessageEvent, Context, Model, ModelSpec } from "@oh-my-pi/pi-ai/types";
+import type {
+	Api,
+	AssistantMessage,
+	AssistantMessageEvent,
+	Context,
+	Model,
+	ModelSpec,
+	StreamOptions,
+} from "@oh-my-pi/pi-ai/types";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { wrapLeakedThinkingStream } from "@oh-my-pi/pi-ai/utils/leaked-thinking-stream";
 import {
@@ -682,6 +690,42 @@ describe("thinking-loop error accounting", () => {
 		usage: usage(0, 0, 0),
 		stopReason: "stop",
 		timestamp: Date.now(),
+	});
+
+	test("waits for an admitted looping attempt's final billed usage before exposing its retryable result", async () => {
+		const partial = attempt("resp-draining");
+		const inner = new AssistantMessageEventStream();
+		const cancelled = Promise.withResolvers<void>();
+		const guarded = withThinkingLoopGuard<StreamOptions>(
+			model,
+			{ loopGuard: { enabled: true }, waitForTerminalDrain: true },
+			options => {
+				options?.signal?.addEventListener("abort", () => cancelled.resolve(), { once: true });
+				queueMicrotask(() => {
+					inner.push({ type: "start", partial });
+					inner.push({ type: "thinking_delta", contentIndex: 0, delta: nearDuplicateLoop(12), partial });
+				});
+				return inner;
+			},
+		);
+		let completed = false;
+		const pending = guarded.result().then(result => {
+			completed = true;
+			return result;
+		});
+		const final = { ...partial, usage: usage(116_000, 2_400, 0.169), stopReason: "aborted" as const };
+		try {
+			await cancelled.promise;
+			expect(completed).toBe(false);
+			inner.push({ type: "error", reason: "aborted", error: final });
+			const result = await pending;
+			expect(result.usage).toEqual(usage(116_000, 2_400, 0.169));
+			expect(result.content).toEqual([]);
+			expect(AIError.is(result.errorId, AIError.Flag.ThinkingLoop)).toBe(true);
+		} finally {
+			inner.push({ type: "error", reason: "aborted", error: final });
+			await pending;
+		}
 	});
 
 	test("keeps the aborted attempt's usage, start time, response id and timing", async () => {

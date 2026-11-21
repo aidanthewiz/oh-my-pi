@@ -4,10 +4,10 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { CF_ENGINE_RELEASE_REPO } from "@oh-my-pi/pi-coding-agent/cli/cf-channel";
+import { managedInstallName } from "@oh-my-pi/pi-coding-agent/cli/managed-install";
 import {
 	downloadVerifiedBinary,
 	isMuslLinuxForTest,
-	managedInstallName,
 	parseReportedVersion,
 	parseUpdateArgs,
 	pruneBunInstallCache,

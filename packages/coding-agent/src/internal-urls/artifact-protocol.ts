@@ -93,7 +93,7 @@ class MissingArtifactError extends Error {}
  */
 function callerInMemoryArtifact(id: string, context?: ResolveContext): { content: string | null } | null {
 	if (context?.localProtocolOptions?.getArtifactsDir?.()) return null;
-	if (context?.session?.seanceSourceArtifactsDir) return null;
+	if (context?.session?.seanceSourceArtifactsDir ?? context?.seanceSourceArtifactsDir) return null;
 	const manager = context?.session?.sessionManager;
 	if (!manager?.getResidentArtifactContent) return null;
 	return { content: manager.getResidentArtifactContent(id) };
@@ -107,9 +107,7 @@ async function resolveArtifactFile(url: InternalUrl, context?: ResolveContext): 
 	// id exists in several dirs. Pin resolution to the calling session's
 	// artifacts dir first so `artifact://3` means *this* session's #3.
 	const pinnedDir = context?.localProtocolOptions?.getArtifactsDir?.() ?? null;
-	// A seance reads only its own artifacts plus the consulted source's, in
-	// place; its own ids are allocated past the source's, so neither shadows.
-	const seanceDir = context?.session?.seanceSourceArtifactsDir;
+	const seanceDir = context?.session?.seanceSourceArtifactsDir ?? context?.seanceSourceArtifactsDir;
 	const dirs = seanceDir ? [] : artifactsDirsFromRegistry();
 	if (seanceDir) dirs.push(...(pinnedDir ? [pinnedDir] : []), seanceDir);
 	else if (pinnedDir) {

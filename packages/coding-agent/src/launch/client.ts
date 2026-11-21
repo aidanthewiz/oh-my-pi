@@ -2,7 +2,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { IpcConnection } from "@oh-my-pi/pi-natives";
-import { getGlobalDaemonRuntimeDir, isEexist, isEnoent, logger, postmortem } from "@oh-my-pi/pi-utils";
+import { getGlobalDaemonRuntimeDir, isEexist, isEnoent, logger, postmortem, toError } from "@oh-my-pi/pi-utils";
 import { resolveWorkerSpawnCmd, workerEnvFromParent } from "../subprocess/worker-client";
 import { canonicalProjectDir, daemonBrokerEndpoint, daemonBrokerRuntimeDir, daemonRuntimeDir } from "./paths";
 import {
@@ -60,7 +60,7 @@ export interface DaemonBrokerClient {
 	): (options?: DaemonCompletionUnregisterOptions) => void;
 	/** Canonical project directory or synthetic directory identifying a global scope. */
 	readonly projectDir: string;
-	request(operation: DaemonOperation, signal?: AbortSignal): Promise<DaemonRpcResult>;
+	request(operation: DaemonOperation, signal?: AbortSignal, validate?: () => void): Promise<DaemonRpcResult>;
 	close(): void;
 }
 
@@ -139,11 +139,12 @@ class SocketDaemonClient implements DaemonBrokerClient {
 		this.#idleGraceMs = options.idleGraceMs;
 	}
 
-	async request(operation: DaemonOperation, signal?: AbortSignal): Promise<DaemonRpcResult> {
+	async request(operation: DaemonOperation, signal?: AbortSignal, validate?: () => void): Promise<DaemonRpcResult> {
 		if (this.#closed) throw new Error("Daemon broker client is closed");
 		if (signal?.aborted) throw new Error("Daemon broker request aborted");
 		await this.#connect();
 		if (signal?.aborted) throw new Error("Daemon broker request aborted");
+		validate?.();
 		const socket = this.#socket;
 		if (!socket || socket.closed) throw new Error("Daemon broker socket is unavailable");
 
@@ -296,7 +297,7 @@ class SocketDaemonClient implements DaemonBrokerClient {
 				this.#bindSocket(await IpcConnection.connect(this.#endpoint, { framing: "lines", timeoutMs: 250 }));
 				return;
 			} catch (error) {
-				lastError = error instanceof Error ? error : new Error(String(error));
+				lastError = toError(error);
 				await Bun.sleep(CONNECT_RETRY_MS);
 			}
 		}
@@ -343,14 +344,14 @@ class SocketDaemonClient implements DaemonBrokerClient {
 		try {
 			decoded = JSON.parse(line);
 		} catch (error) {
-			this.#rejectPending(error instanceof Error ? error : new Error(String(error)));
+			this.#rejectPending(toError(error));
 			return;
 		}
 		let message: DaemonWireMessage;
 		try {
 			message = parseDaemonWireMessage(decoded);
 		} catch (error) {
-			const parseError = error instanceof Error ? error : new Error(String(error));
+			const parseError = toError(error);
 			if (
 				typeof decoded === "object" &&
 				decoded !== null &&
@@ -380,7 +381,7 @@ class SocketDaemonClient implements DaemonBrokerClient {
 		try {
 			pending.resolve(parseDaemonRpcResult(pending.operation, response.result));
 		} catch (error) {
-			pending.reject(error instanceof Error ? error : new Error(String(error)));
+			pending.reject(toError(error));
 		}
 	}
 

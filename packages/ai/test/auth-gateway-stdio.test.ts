@@ -1,9 +1,9 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { scheduler } from "node:timers/promises";
-import { clearCustomApis } from "@oh-my-pi/pi-ai/api-registry";
+import { clearCustomApis, registerCustomApi } from "@oh-my-pi/pi-ai/api-registry";
 import {
 	AuthGatewayStdioResponseLimitError,
 	type AuthGatewayStdioOptions,
@@ -11,8 +11,11 @@ import {
 	readAuthGatewayStdioBody,
 	serveAuthGatewayStdio,
 } from "@oh-my-pi/pi-ai/auth-gateway";
-import { AuthStorage } from "@oh-my-pi/pi-ai/auth-storage";
+import { AuthStorage, type ObservedUsageInput } from "@oh-my-pi/pi-ai/auth-storage";
 import { createMockModel, registerMockApi } from "@oh-my-pi/pi-ai/providers/mock";
+import type { AssistantMessage } from "@oh-my-pi/pi-ai/types";
+import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
+import { buildModel } from "@oh-my-pi/pi-catalog/build";
 
 /** Serves `lines` through `route`; the parsed output lines. */
 async function serve(
@@ -34,10 +37,107 @@ async function serve(
 }
 
 afterEach(() => {
+	vi.restoreAllMocks();
 	clearCustomApis();
 });
 
 describe("auth-gateway stdio transport", () => {
+	it.each(["chat", "native"] as const)(
+		"drains %s requests and their late usage before closing provider state or credential storage",
+		async format => {
+			const api = `gateway-close-${format}`;
+			const model = buildModel({
+				id: "owned-model",
+				name: "Owned model",
+				api,
+				provider: api,
+				baseUrl: "https://example.invalid",
+				reasoning: false,
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 8192,
+				maxTokens: 1024,
+			});
+			const message: AssistantMessage = {
+				role: "assistant",
+				api,
+				provider: api,
+				model: model.id,
+				content: [],
+				usage: {
+					input: 17,
+					output: 5,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 22,
+					cost: { input: 0.17, output: 0.08, cacheRead: 0, cacheWrite: 0, total: 0.25 },
+				},
+				stopReason: "aborted",
+				timestamp: 1,
+			};
+			const storage = await AuthStorage.create(":memory:");
+			storage.keys.setRuntime(api, "synthetic-key");
+			const observed: ObservedUsageInput[] = [];
+			vi.spyOn(storage.usage, "observe").mockImplementation(entry => observed.push(entry));
+			const source = new AssistantMessageEventStream();
+			const entered = Promise.withResolvers<void>();
+			const cancelled = Promise.withResolvers<void>();
+			const stateClosedAfterUsage: number[] = [];
+			let sends = 0;
+			registerCustomApi(
+				api,
+				(_model, _context, options) => {
+					sends++;
+					if (!options?.signal || !options.providerSessionState) throw new Error("Missing request owner");
+					options.signal.addEventListener("abort", () => cancelled.resolve(), { once: true });
+					options.providerSessionState.set("owned-probe", {
+						close: () => stateClosedAfterUsage.push(observed.length),
+					});
+					source.push({ type: "start", partial: message });
+					entered.resolve();
+					return source;
+				},
+				api,
+			);
+			const router = createAuthGatewayRouter({ storage, resolveModel: () => model });
+			const request = () =>
+				new Request(format === "chat" ? "http://stdio/v1/chat/completions" : "http://stdio/v1/pi/stream", {
+					method: "POST",
+					body: JSON.stringify(
+						format === "chat"
+							? { model: model.id, messages: [{ role: "user", content: "hi" }], stream: true }
+							: { modelId: model.id, context: { messages: [] }, stream: true },
+					),
+				});
+			let close: Promise<void> | undefined;
+			try {
+				const response = await router.route(request(), "test");
+				await entered.promise;
+				close = router.close().then(() => storage.close());
+				await cancelled.promise;
+				await response.body?.cancel();
+				expect(storage.isClosed).toBe(false);
+				expect(observed).toEqual([]);
+				expect(stateClosedAfterUsage).toEqual([]);
+				const rejected = await router.route(request(), "test");
+				expect(rejected.status).toBe(503);
+				expect(sends).toBe(1);
+				source.push({ type: "error", reason: "aborted", error: message });
+				await close;
+				expect(storage.isClosed).toBe(true);
+				expect(observed).toMatchObject([
+					{ provider: api, model: model.id, usage: { input: 17, output: 5 }, costUsd: 0.25 },
+				]);
+				expect(stateClosedAfterUsage).toEqual([1]);
+			} finally {
+				source.push({ type: "error", reason: "aborted", error: message });
+				await router.close();
+				await close;
+				await storage.close();
+			}
+		},
+	);
+
 	it("answers a chat request line through the gateway routes", async () => {
 		registerMockApi();
 		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gw-stdio-"));
@@ -60,7 +160,57 @@ describe("auth-gateway stdio transport", () => {
 				body: { object: "chat.completion", choices: [{ message: { role: "assistant", content: "hello" } }] },
 			});
 		} finally {
-			router.close();
+			await router.close();
+			await storage.close();
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("serves Apple chat without a stored credential while rejecting credential-required providers", async () => {
+		registerMockApi();
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gw-stdio-keyless-"));
+		const storage = await AuthStorage.create(path.join(dir, "auth.db"));
+		const apple = createMockModel({ provider: "apple", id: "on-device" });
+		// Unregistered provider: no env-var fallback, so a host `~/.env` key cannot satisfy it.
+		const required = createMockModel({ provider: "keyed-test", id: "missing-key" });
+		const router = createAuthGatewayRouter({
+			storage,
+			resolveModel: id => (id === "apple/on-device" ? apple.model : required.model),
+		});
+		try {
+			apple.push({ content: ["ok"] });
+			const output = await serve(
+				["apple/on-device", "keyed-test/missing-key"].map((model, id) =>
+					JSON.stringify({
+						id,
+						path: "/v1/chat/completions",
+						body: { model, messages: [{ role: "user", content: "Reply with ok." }] },
+					}),
+				),
+				req => router.route(req, "test"),
+			);
+			expect(output).toContainEqual(
+				expect.objectContaining({
+					id: 0,
+					status: 200,
+					body: expect.objectContaining({
+						choices: [
+							expect.objectContaining({
+								message: expect.objectContaining({ role: "assistant", content: "ok" }),
+							}),
+						],
+					}),
+				}),
+			);
+			expect(output).toContainEqual(
+				expect.objectContaining({
+					id: 1,
+					status: 401,
+					body: { error: expect.objectContaining({ type: "authentication_error" }) },
+				}),
+			);
+		} finally {
+			await router.close();
 			await storage.close();
 			await fs.rm(dir, { recursive: true, force: true });
 		}
@@ -449,7 +599,7 @@ describe("auth-gateway stdio transport", () => {
 			const next = await router.route(request(), "test");
 			expect(next.status).toBe(400);
 		} finally {
-			router.close();
+			await router.close();
 			await storage.close();
 		}
 	});

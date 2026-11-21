@@ -5,6 +5,7 @@ import type { Api, AssistantMessage, Model } from "@oh-my-pi/pi-ai";
 import { registerCustomApi, unregisterCustomApis } from "@oh-my-pi/pi-ai/api-registry";
 import { resolveApiKeyOnce } from "@oh-my-pi/pi-ai/auth-retry";
 import { getOAuthProvider, registerOAuthProvider, unregisterOAuthProvider } from "@oh-my-pi/pi-ai/registry/oauth";
+import { streamSimple } from "@oh-my-pi/pi-ai/stream";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
@@ -20,6 +21,7 @@ import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensi
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { CacheWarmer } from "@oh-my-pi/pi-coding-agent/session/cache-warmer";
 import type { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import type { ModelUsageEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { createCodexAutoRedeemCoordinator } from "@oh-my-pi/pi-coding-agent/session/codex-auto-reset";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
@@ -74,10 +76,11 @@ describe("AgentSession account pools after a dispose deadline", () => {
 		stallUntil?: Promise<void>,
 		cacheWarmer?: CacheWarmer,
 		identityKey = "email:c@example.com|org:org-c",
+		sessionManager: SessionManager = SessionManager.inMemory(tempDir.path()),
 	): Promise<{ session: AgentSession; released: Promise<void> }> {
-		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
-		if (!model) throw new Error("expected bundled model");
-		const sessionManager = SessionManager.inMemory(tempDir.path());
+		const bundled = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!bundled) throw new Error("expected bundled model");
+		const model = { ...bundled, promptCache: { short: 10.05 } };
 		const accountPoolScope = new SessionAccountPoolScope(
 			authStorage,
 			{ anthropic: [identityKey] },
@@ -107,7 +110,9 @@ describe("AgentSession account pools after a dispose deadline", () => {
 		const codexResetCoordinator = createCodexAutoRedeemCoordinator();
 		codexResetCoordinator.resetLockPath = path.join(tempDir.path(), "reset-fences");
 		const session = new AgentSession({
-			agent: new Agent({ initialState: { model, systemPrompt: ["test"], tools: [] } }),
+			agent: new Agent({
+				initialState: { model, systemPrompt: ["test"], tools: [] },
+			}),
 			sessionManager,
 			settings: Settings.isolated(),
 			modelRegistry,
@@ -180,7 +185,12 @@ describe("AgentSession account pools after a dispose deadline", () => {
 		vi.spyOn(authStorage.resets, "redeem").mockImplementation(async () => {
 			entered.resolve();
 			await response.promise;
-			return { ok: true, code: "reset", provider: "anthropic", creditId: "synthetic-credit" };
+			return {
+				ok: true,
+				code: "reset",
+				provider: "anthropic",
+				creditId: "synthetic-credit",
+			};
 		});
 		const redemption = session.redeemResetCredit({
 			provider: "anthropic",
@@ -266,65 +276,118 @@ describe("AgentSession account pools after a dispose deadline", () => {
 		expect(await authStorage.keys.get("anthropic", PROVIDER_SESSION_ID)).toBe("runtime-key");
 	});
 
-	it("keeps the pool until an accepted cache replay finishes after the dispose deadline", async () => {
-		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
-		if (!model) throw new Error("expected bundled model");
+	it("keeps pool custody through deferred delivery of an accepted cache replay", async () => {
+		const journal = SessionManager.create(tempDir.path(), tempDir.join("sessions"));
 		const entered = Promise.withResolvers<void>();
 		const settle = Promise.withResolvers<void>();
+		const replayKeys: (string | null)[] = [];
 		let replayKey: string | undefined;
 		const warmer = new CacheWarmer({
 			getPromptTokens: () => 100_000,
 			getMode: () => "idle",
-			stream: async () => {
+			stream: async (requestModel, context, options) => {
+				const source = streamSimple(requestModel, context, {
+					...options,
+					apiKey: session.modelRegistry.resolver(requestModel, PROVIDER_SESSION_ID),
+					fetch: async (input, init) => {
+						const request =
+							input instanceof Request ? new Request(input, init) : new Request(input.toString(), init);
+						replayKeys.push(request.headers.get("x-api-key"));
+						const events = [
+							{
+								type: "message_start",
+								message: {
+									id: "msg_accepted_cache_replay",
+									type: "message",
+									role: "assistant",
+									content: [],
+									model: requestModel.id,
+									stop_reason: null,
+									stop_sequence: null,
+									usage: {
+										input_tokens: 5,
+										output_tokens: 0,
+										cache_read_input_tokens: 100_000,
+										cache_creation_input_tokens: 0,
+									},
+								},
+							},
+							{
+								type: "content_block_start",
+								index: 0,
+								content_block: { type: "text", text: "" },
+							},
+							{ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "warm" } },
+							{ type: "content_block_stop", index: 0 },
+							{
+								type: "message_delta",
+								delta: { stop_reason: "end_turn", stop_sequence: null },
+								usage: { output_tokens: 1 },
+							},
+							{ type: "message_stop" },
+						];
+						const body = events.map(event => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join("");
+						return new Response(body, { headers: { "content-type": "text/event-stream" } });
+					},
+				});
+				await source.result();
 				entered.resolve();
 				await settle.promise;
 				replayKey = await authStorage.keys.get("anthropic", PROVIDER_SESSION_ID);
-				const message: AssistantMessage = {
-					role: "assistant",
-					content: [],
-					api: model.api,
-					provider: model.provider,
-					model: model.id,
-					usage: {
-						input: 0,
-						output: 0,
-						cacheRead: 0,
-						cacheWrite: 0,
-						totalTokens: 0,
-						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-					},
-					stopReason: "stop",
-					timestamp: Date.now(),
-				};
-				return {
-					async *[Symbol.asyncIterator]() {},
-					result: async () => message,
-				};
+				return source;
 			},
 		});
-		const { session, released } = await createPooledSession(undefined, warmer);
+		const { session, released } = await createPooledSession(undefined, warmer, undefined, journal);
+		await journal.ensureOnDisk();
+		const replayModel = session.model!;
+		expect(session.sessionId).toBe(PROVIDER_SESSION_ID);
+		expect(session.sessionManager.getSessionId()).not.toBe(PROVIDER_SESSION_ID);
 		vi.useFakeTimers();
-		warmer.start(
-			{
-				model: { ...model, promptCache: { short: 10.05 } },
-				context: { messages: [] },
-				options: { cacheRetention: "short" },
-			},
-			() => true,
-		);
+		const context = { messages: [] };
+		session.startCacheWarming(replayModel, context, { cacheRetention: "short" });
+		session.markPromptCacheDispatched(context);
+		let disposal: Promise<void> | undefined;
 		try {
 			vi.advanceTimersByTime(50);
 			await entered.promise;
 			vi.useRealTimers();
-			await pastDisposeDeadline(() => session.dispose({ drainTimeoutMs: 20 }));
+			disposal = session.dispose({ drainTimeoutMs: 20 });
+			const tick = Promise.withResolvers<false>();
+			setImmediate(() => tick.resolve(false));
+			expect(await Promise.race([disposal.then(() => true), tick.promise])).toBe(false);
 			expect(await authStorage.keys.get("anthropic", PROVIDER_SESSION_ID)).toBe("access-c");
 		} finally {
 			vi.useRealTimers();
 			settle.resolve();
 			await warmer.drain();
+			await disposal;
 			await released;
 		}
 		expect(replayKey).toBe("access-c");
+		expect(replayKeys).toEqual(["access-c"]);
+		const persisted = await SessionManager.open(journal.getSessionFile()!);
+		try {
+			const entries = persisted
+				.getEntries()
+				.filter(
+					(entry): entry is ModelUsageEntry => entry.type === "model_usage" && entry.purpose === "cache-warm",
+				);
+			expect(entries).toHaveLength(1);
+			expect(entries[0]).toMatchObject({
+				provider: "anthropic",
+				model: replayModel.id,
+				stopReason: "aborted",
+				usage: { input: 5, output: 1, cacheRead: 100_000, cacheWrite: 0, totalTokens: 100_006 },
+			});
+			const cost = replayModel.cost;
+			expect(entries[0]?.usage.cost.total).toBeCloseTo(
+				(5 * cost.input + cost.output + 100_000 * cost.cacheRead) / 1e6,
+				10,
+			);
+			expect(persisted.getUsageStatistics().totalTokens).toBe(100_006);
+		} finally {
+			await persisted.close();
+		}
 		expect(await authStorage.keys.get("anthropic", PROVIDER_SESSION_ID)).toBe("runtime-key");
 	});
 
@@ -360,7 +423,10 @@ describe("AgentSession account pools after a dispose deadline", () => {
 						sessionManager: SessionManager.inMemory(tempDir.path()),
 						authStorage,
 						modelRegistry: new ModelRegistry(authStorage, tempDir.join("models.yml")),
-						settings: Settings.isolated({ "async.enabled": false, "compaction.enabled": false }),
+						settings: Settings.isolated({
+							"async.enabled": false,
+							"compaction.enabled": false,
+						}),
 						model,
 						providerSessionId: PROVIDER_SESSION_ID,
 						oauthAccountPools: { anthropic: ["email:c@example.com|org:org-c"] },
@@ -388,7 +454,10 @@ describe("SDK inherited account-pool lifetime", () => {
 	let model: Model<Api>;
 	let outsideCredentialId: number;
 	let sessions: AgentSession[];
-	let requests: Array<{ sessionId: string | undefined; key: string | undefined }>;
+	let requests: Array<{
+		sessionId: string | undefined;
+		key: string | undefined;
+	}>;
 
 	function registerModel(registry: ModelRegistry): void {
 		registry.registerProvider(provider, {
@@ -422,7 +491,10 @@ describe("SDK inherited account-pool lifetime", () => {
 			login: async () => {
 				throw new Error("Login is not used");
 			},
-			refreshToken: async credentials => ({ ...credentials, expires: Date.now() + 3_600_000 }),
+			refreshToken: async credentials => ({
+				...credentials,
+				expires: Date.now() + 3_600_000,
+			}),
 			getApiKey: credentials => credentials.access,
 		});
 		registerCustomApi(
@@ -530,9 +602,63 @@ describe("SDK inherited account-pool lifetime", () => {
 		expect(requests.slice(before)).toEqual([{ sessionId: session.agent.sessionId, key: `synthetic-${account}` }]);
 	}
 
+	it("keeps an unrelated adopted session usable after another SDK startup fails", async () => {
+		const peer = await createSession("StartupPeer", shared, {
+			[provider]: ["account:a"],
+		});
+		const registry = AgentRegistry.global();
+		registry.setStatus("StartupPeer", "idle");
+		const lifecycle = AgentLifecycleManager.global();
+		lifecycle.adopt("StartupPeer", { idleTtlMs: 0 });
+		const startupError = new Error("synthetic startup failure");
+		const registration = vi
+			.spyOn(AgentSession.prototype, "registerSessionChangeCallback")
+			.mockImplementationOnce(function (this: AgentSession) {
+				sessions.push(this);
+				throw startupError;
+			});
+		try {
+			await expect(
+				createAgentSession({
+					cwd: tempDir.path(),
+					agentDir: tempDir.path(),
+					authStorage,
+					modelRegistry: shared,
+					sessionManager: SessionManager.inMemory(tempDir.path()),
+					agentId: "FailedStartup",
+					providerSessionId: "failed-startup-peer",
+					model,
+					settings: Settings.isolated({
+						"async.enabled": false,
+						"compaction.enabled": false,
+						"retry.enabled": false,
+						"advisor.enabled": false,
+						"todo.enabled": false,
+					}),
+					cacheWarming: false,
+					toolNames: ["read"],
+					disableExtensionDiscovery: true,
+					enableLsp: false,
+					skills: [],
+					contextFiles: [],
+					promptTemplates: [],
+					slashCommands: [],
+					rules: [],
+				}),
+			).rejects.toBe(startupError);
+			expect(await lifecycle.ensureLive("StartupPeer")).toBe(peer);
+			await request(peer, "a");
+		} finally {
+			registration.mockRestore();
+			await lifecycle.release("StartupPeer");
+		}
+	});
+
 	it("keeps child requests and warm revival authorized after the parent parks, without affecting siblings", async () => {
 		const identities = ["account:a"];
-		const parent = await createSession("PoolParent", shared, { [provider]: identities });
+		const parent = await createSession("PoolParent", shared, {
+			[provider]: identities,
+		});
 		const inherited = parent.modelRegistry;
 		const manager = SessionManager.create(tempDir.path(), tempDir.join("sessions"));
 		const child = await createSession("PoolChild", inherited, undefined, manager);
@@ -543,20 +669,33 @@ describe("SDK inherited account-pool lifetime", () => {
 		AgentRegistry.global().setStatus("PoolParent", "idle");
 		lifecycle.adopt("PoolParent", { idleTtlMs: 0 });
 		await lifecycle.park("PoolParent");
-		expect(AgentRegistry.global().get("PoolParent")).toMatchObject({ status: "parked", session: null });
+		expect(AgentRegistry.global().get("PoolParent")).toMatchObject({
+			status: "parked",
+			session: null,
+		});
 		identities[0] = "account:b";
 		await request(child, "a");
 		await request(sibling, "a");
 		const retired = child.modelRegistry.resolver(model, child.agent.sessionId);
 		AgentRegistry.global().setStatus("PoolChild", "idle");
+		let revived: AgentSession | undefined;
 		lifecycle.adopt("PoolChild", {
 			idleTtlMs: 0,
-			revive: async expected =>
-				createSession("PoolChild", inherited, undefined, await SessionManager.open(childFile), expected),
+			revive: async expected => {
+				revived = await createSession(
+					"PoolChild",
+					inherited,
+					undefined,
+					await SessionManager.open(childFile),
+					expected,
+				);
+				return revived;
+			},
 		});
 		await lifecycle.park("PoolChild");
 		await expect(resolveApiKeyOnce(retired)).rejects.toThrow();
-		const revived = await lifecycle.ensureLive("PoolChild");
+		await lifecycle.ensureLive("PoolChild");
+		if (!revived) throw new Error("Expected a revived child fixture session");
 		await request(revived, "a");
 		const revivedSessionId = revived.agent.sessionId;
 		if (!revivedSessionId) throw new Error("Expected revived provider session ID");
@@ -569,8 +708,12 @@ describe("SDK inherited account-pool lifetime", () => {
 	});
 
 	it("uses explicit child authorization rather than the released inherited pool", async () => {
-		const parent = await createSession("ExplicitParent", shared, { [provider]: ["account:a"] });
-		const child = await createSession("ExplicitChild", parent.modelRegistry, { [provider]: ["account:b"] });
+		const parent = await createSession("ExplicitParent", shared, {
+			[provider]: ["account:a"],
+		});
+		const child = await createSession("ExplicitChild", parent.modelRegistry, {
+			[provider]: ["account:b"],
+		});
 		await parent.dispose();
 		await request(child, "b");
 		const inheritedChild = await createSession("ExplicitGrandchild", child.modelRegistry);
@@ -579,12 +722,19 @@ describe("SDK inherited account-pool lifetime", () => {
 	});
 
 	it("keeps inherited deny-all pools closed after parent disposal and rejects sibling rotation", async () => {
-		const parent = await createSession("DeniedParent", shared, { [provider]: [] });
+		const parent = await createSession("DeniedParent", shared, {
+			[provider]: [],
+		});
 		const child = await createSession("DeniedChild", parent.modelRegistry);
 		await parent.dispose();
 		const resolver = child.modelRegistry.resolver(model, child.agent.sessionId);
 		await expect(resolveApiKeyOnce(resolver)).rejects.toThrow();
-		await expect(resolver({ lastChance: true, error: new Error("synthetic unauthorized") })).rejects.toThrow();
+		await expect(
+			resolver({
+				lastChance: true,
+				error: new Error("synthetic unauthorized"),
+			}),
+		).rejects.toThrow();
 		expect(requests).toEqual([]);
 	});
 
@@ -596,7 +746,9 @@ describe("SDK inherited account-pool lifetime", () => {
 		);
 		const configuredRegistry = new ModelRegistry(authStorage, configPath);
 		registerModel(configuredRegistry);
-		const parent = await createSession("ConfiguredParent", configuredRegistry, { [provider]: ["account:a"] });
+		const parent = await createSession("ConfiguredParent", configuredRegistry, {
+			[provider]: ["account:a"],
+		});
 		const child = await createSession("ConfiguredChild", parent.modelRegistry);
 		await parent.dispose();
 		await expect(resolveApiKeyOnce(child.modelRegistry.resolver(model, child.agent.sessionId))).rejects.toThrow();

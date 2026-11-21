@@ -28,7 +28,7 @@
  * {@link MAX_REPLICATED_PAYLOAD_BYTES}, and preserves the entry's
  * `id`/`parentId` so the guest's branch chain stays connected.
  */
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { importRoomKey } from "@oh-my-pi/pi-coding-agent/collab/crypto";
 import { CollabHost } from "@oh-my-pi/pi-coding-agent/collab/host";
@@ -51,10 +51,11 @@ import {
 } from "@oh-my-pi/pi-coding-agent/collab/replication-shrink";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
-import type { AgentSessionEvent, AgentSessionLifecycleEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import type { AgentSessionLifecycleEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { runtimeIdentityHistory } from "@oh-my-pi/pi-coding-agent/session/runtime-identity";
+import { installTestCollabHome, uninstallTestCollabHome } from "./helpers/in-memory-relay";
 
 interface RelayData {
 	role: "host" | "guest";
@@ -303,7 +304,7 @@ function boundEntry(entry: ReplicatedEntry): ReplicatedEntry {
 }
 
 /** The bounded event, after checking its JSON is exactly what the frame would carry. */
-function boundEvent(event: AgentSessionEvent): AgentSessionEvent {
+function boundEvent(event: AgentSessionLifecycleEvent): AgentSessionLifecycleEvent {
 	const { value, json } = serializeReplicatedEvent(event);
 	expect(json).toBe(JSON.stringify(value));
 	return value;
@@ -324,8 +325,12 @@ const BIG_PAYLOAD_BYTES = 5 * 1024 * 1024;
 const RELAY_MAX_PAYLOAD = 8 * 1024 * 1024;
 
 const cleanups: (() => void | Promise<void>)[] = [];
+beforeEach(() => {
+	installTestCollabHome();
+});
 afterEach(async () => {
 	for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
+	uninstallTestCollabHome();
 });
 
 describe("collab replication shrinking (#3739)", () => {
@@ -668,26 +673,32 @@ describe("serializeReplicatedEntry (#11433)", () => {
 });
 
 describe("serializeReplicatedEvent (#11433)", () => {
-	it("retains completion ownership when an oversized message snapshot cannot be replicated", () => {
-		const giantKey = "k".repeat(2 * MAX_REPLICATED_PAYLOAD_BYTES);
-		const event: AgentSessionLifecycleEvent = {
-			type: "agent_end",
-			runId: "continuing-loop",
-			isTerminal: false,
-			awaitingAsyncWork: true,
-			messages: [{ role: "user", content: "", timestamp: 0 }],
-		};
-		Object.assign(event.messages[0], { [giantKey]: 1 });
-		Object.assign(event, { [giantKey]: true });
-		const shrunk = boundEvent(event);
-		expectBounded(shrunk);
-		expect(shrunk.type).toBe("agent_end");
-		if (shrunk.type !== "agent_end") throw new Error("Missing loop completion");
-		expect(shrunk).toMatchObject({ runId: "continuing-loop" });
-		expect(shrunk.isTerminal).toBe(false);
-		expect(shrunk.awaitingAsyncWork).toBe(true);
-		expect(shrunk.messages).toEqual([]);
-	});
+	it.each([false, true])(
+		"retains loop ownership with isTerminal=%s when an oversized message snapshot cannot be replicated",
+		isTerminal => {
+			const giantKey = "k".repeat(2 * MAX_REPLICATED_PAYLOAD_BYTES);
+			const event: AgentSessionLifecycleEvent = {
+				type: "agent_end",
+				runId: "continuing-loop",
+				isTerminal,
+				yielded: true,
+				...(isTerminal ? {} : { awaitingAsyncWork: true as const }),
+				outcome: "success",
+				messages: [{ role: "user", content: "", timestamp: 0 }],
+			};
+			Object.assign(event.messages[0], { [giantKey]: 1 });
+			Object.assign(event, { [giantKey]: true });
+			const shrunk = boundEvent(event);
+			expectBounded(shrunk);
+			expect(shrunk.type).toBe("agent_end");
+			if (shrunk.type !== "agent_end") throw new Error("Missing loop boundary");
+			expect(shrunk).toMatchObject({ runId: "continuing-loop", outcome: "success" });
+			expect(shrunk.isTerminal).toBe(isTerminal);
+			expect(shrunk.yielded).toBe(true);
+			expect(shrunk.awaitingAsyncWork).toBe(isTerminal ? undefined : true);
+			expect(shrunk.messages).toEqual([]);
+		},
+	);
 
 	it("still shrinks an event whose size lives in a string leaf", () => {
 		const event = {
@@ -695,7 +706,7 @@ describe("serializeReplicatedEvent (#11433)", () => {
 			toolCallId: "call-1",
 			toolName: "read",
 			result: { text: "x".repeat(8 * 1024 * 1024) },
-		} as unknown as AgentSessionEvent;
+		} as unknown as AgentSessionLifecycleEvent;
 
 		const shrunk = boundEvent(event);
 		expect(shrunk).not.toBe(event);
@@ -713,7 +724,7 @@ describe("serializeReplicatedEvent (#11433)", () => {
 			toolCallId: "call-2",
 			toolName: "read",
 			result: { [giantKey]: 1 },
-		} as unknown as AgentSessionEvent;
+		} as unknown as AgentSessionLifecycleEvent;
 
 		const shrunk = boundEvent(event);
 		expect(shrunk.type).toBe("notice");

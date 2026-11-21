@@ -17,6 +17,7 @@ import { completeSimple, retryTransientCompletion } from "@oh-my-pi/pi-ai";
 import { resolvedApiKeyBearer, seedApiKeyResolver } from "@oh-my-pi/pi-ai/auth-retry";
 import { diffLineRuns, editDiffString, parseCodeStatus } from "@oh-my-pi/pi-natives";
 import { logger, prompt } from "@oh-my-pi/pi-utils";
+import { cfgOffline } from "../config/auxiliary-model-policy";
 import { getAllowedAvailableModels, resolveRoleSelection } from "../config/model-resolver";
 import type { WritethroughCallback } from "../lsp";
 import type { ToolSession } from "../tools";
@@ -346,10 +347,14 @@ export async function attemptEditAutoRepair(options: {
 	if (!cfgEditAutoRepairEnabled.get(session.settings)) return undefined;
 	const registry = session.modelRegistry;
 	if (!registry) return undefined;
+	const offline = cfgOffline.get(session.settings);
+	const activeProvider = session.getActiveModel?.()?.provider;
+	if (offline && !activeProvider) return undefined;
+	const availableModels = getAllowedAvailableModels(registry, session.settings);
 	const model = resolveRoleSelection(
 		["smol"],
 		session.settings,
-		getAllowedAvailableModels(registry, session.settings),
+		offline ? availableModels.filter(candidate => candidate.provider === activeProvider) : availableModels,
 	)?.model;
 	if (!model) return undefined;
 	const sessionId = session.getCredentialSourceSessionId?.() ?? session.getSessionId?.() ?? undefined;
@@ -471,7 +476,8 @@ export async function attemptEditAutoRepair(options: {
 	signal.throwIfAborted();
 	if (!isCurrent()) return undefined;
 
-	await writethrough(snapshot.path, repair.content, options.signal, Bun.file(snapshot.path));
+	const written = await writethrough(snapshot.path, repair.content, options.signal, Bun.file(snapshot.path));
+	session.recordFileChange?.({ path: snapshot.path, tool: "edit", before: current, after: written.finalContent });
 	logger.debug("Edit auto-repair applied", {
 		path: snapshot.path,
 		attempts: repair.attempts,

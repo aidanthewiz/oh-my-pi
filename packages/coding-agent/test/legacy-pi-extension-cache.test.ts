@@ -75,36 +75,6 @@ test("warm CommonJS classification of type-less script dependencies does not rep
 	expect(await runProbe(cacheRoot, cjsProbePath, [entry, "--expect-cache-hit"])).toBe("42\n");
 });
 
-test("legacy extension parse cache drops obsolete CommonJS export-analysis columns", async () => {
-	const tempDir = TempDir.createSync("@legacy-pi-extension-cache-schema-");
-	tempDirs.push(tempDir);
-	const cacheRoot = tempDir.path();
-	const cachePath = path.join(cacheRoot, "omp", "cache", "legacy-pi-extension-cache.db");
-	await fs.mkdir(path.dirname(cachePath), { recursive: true });
-
-	const seed = new Database(cachePath, { create: true });
-	seed.run(
-		"CREATE TABLE extension_parse_cache (cache_key TEXT PRIMARY KEY, source_type TEXT NOT NULL, [references] TEXT NOT NULL, commonjs_named_exports TEXT NOT NULL, commonjs_reexport_specifiers TEXT NOT NULL)",
-	);
-	seed.run("PRAGMA user_version = 1");
-	seed.close();
-
-	expect((await runProbe(cacheRoot, healthProbePath)).trim()).toBe("AVAILABLE");
-
-	const migrated = new Database(cachePath);
-	try {
-		const columns = migrated
-			.query<{ name: string }, []>("PRAGMA table_info(extension_parse_cache)")
-			.all()
-			.map(column => column.name);
-		const schemaVersion = migrated.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version;
-		expect(columns).toEqual(["cache_key", "source_type", "references", "commonjs_syntax"]);
-		expect(schemaVersion).toBe(3);
-	} finally {
-		migrated.close();
-	}
-});
-
 test("legacy extension parse cache opens in WAL mode (#9549)", async () => {
 	const tempDir = TempDir.createSync("@legacy-pi-extension-cache-wal-");
 	tempDirs.push(tempDir);

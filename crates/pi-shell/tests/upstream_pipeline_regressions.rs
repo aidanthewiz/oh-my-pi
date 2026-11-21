@@ -2,7 +2,7 @@
 
 use std::{
 	io::Read as _,
-	os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _},
+	os::unix::{fs::PermissionsExt as _, prelude::OpenOptionsExt as _},
 	path::{Path, PathBuf},
 	time::Duration,
 };
@@ -148,6 +148,29 @@ async fn pipeline_status_tracks_stage_order_and_launch_policy() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn blocked_fifo_spawn_does_not_hold_another_jobs_pipe_open() {
+	let root = tempfile::tempdir().expect("independent pipe directory");
+	let external_cat = external_command(root.path(), "cat");
+	for name in ["producer-gate", "blocked"] {
+		pi_vfs::BlockingFs::native()
+			.make_node(root.path().join(name), pi_vfs::NodeKind::Fifo, 0o600)
+			.expect("owned FIFO");
+	}
+	let command = format!(
+		"{{ /bin/sh -c 'read -r token < producer-gate; printf \"hi\\n\"' | {external_cat} \
+		 >pipe.payload & reader=$!; /bin/sh -c 'printf retained >&7' <blocked & fifo=$!; printf \
+		 'release\\n' >producer-gate; wait \"$reader\"; reader_status=$?; : >blocked; wait \
+		 \"$fifo\"; fifo_status=$?; printf '%s|%s\\n' \"$reader_status\" \"$fifo_status\"; }} \
+		 7>extra.payload"
+	);
+	let (result, output) = run(&command, root.path()).await;
+	assert_eq!(result.exit_code, Some(0), "{output}");
+	assert_eq!(output, "0|0\n");
+	assert_eq!(std::fs::read(root.path().join("pipe.payload")).unwrap(), b"hi\n");
+	assert_eq!(std::fs::read(root.path().join("extra.payload")).unwrap(), b"retained");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn command_expansions_keep_ambient_descriptors_outside_own_redirects() {
 	let root = tempfile::tempdir().expect("expansion descriptor directory");
 	let external_printf = external_command(root.path(), "printf");
@@ -236,20 +259,55 @@ async fn background_fifo_redirect_preserves_command_substitution_stdout() {
 	);
 }
 
+async fn stopped_pipeline_pids(root: &Path) -> [i32; 2] {
+	tokio::time::timeout(Duration::from_secs(5), async {
+		loop {
+			let pids = ["first.pid", "last.pid"].map(|file| {
+				std::fs::read_to_string(root.join(file))
+					.ok()
+					.and_then(|text| text.parse::<i32>().ok())
+					.filter(|pid| *pid > 0)
+			});
+			if let [Some(first), Some(last)] = pids {
+				let processes = pi_builtins::ProcInfo::all();
+				if [first, last].iter().all(|pid| {
+					processes
+						.iter()
+						.any(|process| process.pid() == *pid && process.state() == 'T')
+				}) {
+					break [first, last];
+				}
+			}
+			tokio::time::sleep(Duration::from_millis(10)).await;
+		}
+	})
+	.await
+	.expect("both owned stages must stop before bg")
+}
+
+async fn isolated_stopped_job_test(name: &str) -> bool {
+	const MARKER: &str = "PI_SHELL_UPSTREAM_BG_PID_REGRESSION";
+	if std::env::var_os(MARKER).as_deref() == Some(std::ffi::OsStr::new(name)) {
+		return false;
+	}
+	let mut isolated = tokio::process::Command::new(std::env::current_exe().unwrap());
+	isolated
+		.args(["--exact", name])
+		.env(MARKER, name)
+		.kill_on_drop(true);
+	let status = tokio::time::timeout(Duration::from_secs(30), isolated.status())
+		.await
+		.expect("bounded isolated stopped-job test")
+		.expect("isolated stopped-job test");
+	assert!(status.success(), "isolated stopped-job test: {status}");
+	true
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn bg_resumed_foreground_pid_replaces_empty_or_older_background_pid() {
-	const MARKER: &str = "PI_SHELL_UPSTREAM_BG_PID_REGRESSION";
-	if std::env::var_os(MARKER).is_none() {
-		let mut isolated = tokio::process::Command::new(std::env::current_exe().unwrap());
-		isolated
-			.args(["--exact", "bg_resumed_foreground_pid_replaces_empty_or_older_background_pid"])
-			.env(MARKER, "1")
-			.kill_on_drop(true);
-		let status = tokio::time::timeout(Duration::from_secs(30), isolated.status())
-			.await
-			.expect("bounded isolated stopped-job test")
-			.expect("isolated stopped-job test");
-		assert!(status.success(), "isolated stopped-job test: {status}");
+	if isolated_stopped_job_test("bg_resumed_foreground_pid_replaces_empty_or_older_background_pid")
+		.await
+	{
 		return;
 	}
 
@@ -271,9 +329,9 @@ async fn bg_resumed_foreground_pid_replaces_empty_or_older_background_pid() {
 			""
 		};
 		let command = format!(
-			"{prefix}/bin/sh -c 'printf \"%s\" \"$$\" > stopped.pid; kill -STOP \"$$\"; exit 23'; bg \
-			 {jobspec}; resumed=$?; printf '%s' \"$!\" > resumed.pid; wait {jobspec}; waited=$?; \
-			 {cleanup}printf '%s|%s' \"$resumed\" \"$waited\" > statuses"
+			"set -m; {prefix}/bin/sh -c 'printf \"%s\" \"$$\" > stopped.pid; kill -STOP \"$$\"; exit \
+			 23'; bg {jobspec}; resumed=$?; printf '%s' \"$!\" > resumed.pid; wait {jobspec}; \
+			 waited=$?; {cleanup}printf '%s|%s' \"$resumed\" \"$waited\" > statuses"
 		);
 		let (result, output) = run(&command, root.path()).await;
 		assert_eq!(result.exit_code, Some(0), "{output}");
@@ -300,42 +358,21 @@ async fn bg_resumed_foreground_pid_replaces_empty_or_older_background_pid() {
 		("/bin/sh -c 'kill -STOP \"$$\"; exit 7' | ./missing-last", "+o", "-o", 127),
 	] {
 		let root = tempfile::tempdir().expect("stopped pipeline directory");
-		let command =
-			format!("set {launch} pipefail; {pipeline}; set {later} pipefail; bg %1; wait \"$!\"");
+		let command = format!(
+			"set -m; set {launch} pipefail; {pipeline}; set {later} pipefail; bg %1; wait \"$!\""
+		);
 		let (result, output) = run(&command, root.path()).await;
 		assert_eq!(result.exit_code, Some(expected), "{command}: {output}");
 	}
 
 	let root = tempfile::tempdir().expect("all-stopped pipeline directory");
 	let shell = Shell::new(Some(ShellOptions { clear_env: true, ..Default::default() }));
-	let command = "set +o pipefail; /bin/sh -c 'printf \"%s\" \"$$\" > first.pid; kill -STOP \
-	               \"$$\"; exit 0' | /bin/sh -c 'printf \"%s\" \"$$\" > last.pid; kill -STOP \
+	let command = "set -m; set +o pipefail; /bin/sh -c 'printf \"%s\" \"$$\" > first.pid; kill \
+	               -STOP \"$$\"; exit 0' | /bin/sh -c 'printf \"%s\" \"$$\" > last.pid; kill -STOP \
 	               \"$$\"; exit 23'";
 	let (stopped, output) = run_in_shell(&shell, command, root.path()).await;
-	assert_eq!(stopped.exit_code, Some(148), "{output}");
-	let pids = tokio::time::timeout(Duration::from_secs(5), async {
-		loop {
-			let pids = ["first.pid", "last.pid"].map(|file| {
-				std::fs::read_to_string(root.path().join(file))
-					.ok()
-					.and_then(|text| text.parse::<i32>().ok())
-					.filter(|pid| *pid > 0)
-			});
-			if let [Some(first), Some(last)] = pids {
-				let processes = pi_builtins::ProcInfo::all();
-				if [first, last].iter().all(|pid| {
-					processes
-						.iter()
-						.any(|process| process.pid() == *pid && process.state() == 'T')
-				}) {
-					break [first, last];
-				}
-			}
-			tokio::time::sleep(Duration::from_millis(10)).await;
-		}
-	})
-	.await
-	.expect("both owned stages must stop before bg");
+	assert_eq!(stopped.exit_code, Some(128 + libc::SIGSTOP), "{output}");
+	let pids = stopped_pipeline_pids(root.path()).await;
 	assert_ne!(pids[0], pids[1]);
 	let (result, output) = run_in_shell(
 		&shell,
@@ -348,6 +385,22 @@ async fn bg_resumed_foreground_pid_replaces_empty_or_older_background_pid() {
 		std::fs::read_to_string(root.path().join("resumed.pid")).unwrap(),
 		pids[1].to_string(),
 		"resumed pipeline retains its original last-stage PID",
+	);
+
+	let root = tempfile::tempdir().expect("completed-last-stage directory");
+	pi_vfs::BlockingFs::native()
+		.make_node(root.path().join("release"), pi_vfs::NodeKind::Fifo, 0o600)
+		.expect("create last-stage exit gate");
+	let command = "set -m; set +o pipefail; /bin/sh -c 'read -r last < release; while kill -0 \
+	               \"$last\" 2>/dev/null; do /bin/sleep 0.01; done; kill -STOP \"$$\"; exit 7' | \
+	               /bin/sh -c 'printf \"%s\" \"$$\" > last.pid; printf \"%s\\n\" \"$$\" > release; \
+	               exit 0'; set -o pipefail; bg %1; printf '%s' \"$!\" > resumed.pid; wait \"$!\"";
+	let (result, output) = run(command, root.path()).await;
+	assert_eq!(result.exit_code, Some(0), "{command}: {output}");
+	assert_eq!(
+		std::fs::read(root.path().join("resumed.pid")).unwrap(),
+		std::fs::read(root.path().join("last.pid")).unwrap(),
+		"bg retains the original last-stage PID after that stage was reaped",
 	);
 }
 

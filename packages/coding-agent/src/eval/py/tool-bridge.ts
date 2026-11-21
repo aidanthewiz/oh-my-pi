@@ -7,10 +7,12 @@
  * current execution and forwards to the same `callSessionTool` implementation
  * the JavaScript bridge uses.
  */
+import { withoutCleanupOwnedToolCall } from "@oh-my-pi/pi-agent-core/agent-loop";
 import { logger, postmortem } from "@oh-my-pi/pi-utils";
 import type { ToolSession } from "../../tools";
 import type { RuntimeCallIdentity } from "../js/shared/runtime";
-import { bridgeValueFromToolResult, callSessionTool, type JsStatusEvent } from "../js/tool-bridge";
+import { bridgeValueFromToolResult } from "../js/session-tool";
+import { callSessionTool, type JsStatusEvent } from "../js/tool-bridge";
 import type { EvalShadowCellSession } from "../speculation/cell-session";
 
 export interface PyToolBridgeEntry {
@@ -20,6 +22,8 @@ export interface PyToolBridgeEntry {
 	 * delegated work — above all the subagents `agent()` spawns — stops at once.
 	 */
 	signal?: AbortSignal;
+	/** The cell's `timeout` in ms, the budget of a prelude call that sets none (`EvalPreludeContext.cellTimeoutMs`). */
+	cellTimeoutMs?: number;
 	/**
 	 * Kernel-side abort, held back while a critical `agent()` phase (isolation
 	 * worktree setup, merge/cherry-pick) is in flight. Decides only when the host
@@ -30,7 +34,7 @@ export interface PyToolBridgeEntry {
 	shieldedSignal?: AbortSignal;
 	shadowCell?: EvalShadowCellSession;
 	emitStatus?: (event: JsStatusEvent) => void;
-	/** Shows the user `out://` replies of bridged calls (`ToolBridgeOptions.onReply`). */
+	/** Shows the user `out://` replies of bridged calls (`SessionToolCallOptions.onReply`). */
 	onReply?: (text: string) => void;
 	abortRequested?: () => boolean;
 }
@@ -124,13 +128,16 @@ async function callSessionToolPromptOnAbort(
 		}
 		if (claimed) return bridgeValueFromToolResult(name, args, claimed, entry.emitStatus);
 	}
-	const call = callSessionTool(name, args, {
-		session: entry.toolSession,
-		signal: entry.signal,
-		emitStatus: entry.emitStatus,
-		onReply: entry.onReply,
-		identity,
-	});
+	const call = withoutCleanupOwnedToolCall(() =>
+		callSessionTool(name, args, {
+			session: entry.toolSession,
+			signal: entry.signal,
+			cellTimeoutMs: entry.cellTimeoutMs,
+			emitStatus: entry.emitStatus,
+			onReply: entry.onReply,
+			identity,
+		}),
+	);
 	const signal = entry.shieldedSignal ?? entry.signal;
 	if (!signal) return await call;
 	if (signal.aborted) {

@@ -19,6 +19,15 @@ pub enum Error {
 		path: PathBuf,
 	},
 
+	/// HEAD no longer points at the commit the caller expected.
+	#[error("HEAD moved: expected {expected}, found {}", actual.as_deref().unwrap_or("unborn HEAD"))]
+	HeadMoved {
+		/// The expected commit id, or `unborn HEAD` when no commit was expected.
+		expected: String,
+		/// The current HEAD commit id; `None` for an unborn HEAD.
+		actual:   Option<String>,
+	},
+
 	/// A named ref (branch, tag, `refs/...`) does not exist.
 	#[error("reference not found: {name}")]
 	RefNotFound {
@@ -134,6 +143,7 @@ impl Error {
 		match self {
 			Self::NotARepository { .. } => "NotARepository",
 			Self::RefNotFound { .. } => "RefNotFound",
+			Self::HeadMoved { .. } => "HeadMoved",
 			Self::ObjectNotFound { .. } => "ObjectNotFound",
 			Self::EmptyCherryPick { .. } => "EmptyCherryPick",
 			Self::Conflict { .. } => "Conflict",

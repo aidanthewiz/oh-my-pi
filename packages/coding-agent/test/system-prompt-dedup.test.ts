@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -9,8 +9,8 @@ import {
 	type SystemPromptToolMetadata,
 } from "@oh-my-pi/pi-coding-agent/system-prompt";
 import { clearCache as clearFsCache } from "@oh-my-pi/pi-coding-agent/capability/fs";
-import { getAgentDir, setAgentDir } from "@oh-my-pi/pi-utils";
-import { cleanupTempHome } from "./helpers/temp-home-cleanup";
+import { __resetDirsFromEnvForTests, getAgentDir, removeSyncWithRetries, setAgentDir } from "@oh-my-pi/pi-utils";
+import { restoreEnvValue } from "./helpers/settings-test-state";
 
 function escapeRegExp(text: string): string {
 	return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -31,16 +31,36 @@ const READ_TOOL = new Map<string, SystemPromptToolMetadata>([
 describe("SYSTEM.md prompt assembly", () => {
 	let tempDir = "";
 	let tempHomeDir = "";
-	let originalHome: string | undefined;
+	const isolatedEnvKeys = [
+		"HOME",
+		"USERPROFILE",
+		"CLAUDE_CONFIG_DIR",
+		"PI_CODING_AGENT_DIR",
+		"OMP_PROFILE",
+		"PI_PROFILE",
+	] as const;
+	let originalEnv: Record<string, string | undefined>;
 
 	beforeEach(() => {
-		tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-system-prompt-"));
+		originalEnv = Object.fromEntries(isolatedEnvKeys.map(key => [key, process.env[key]]));
 		tempHomeDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-system-home-"));
-		originalHome = process.env.HOME;
+		tempDir = fs.mkdtempSync(path.join(tempHomeDir, "pi-system-prompt-"));
+		fs.mkdirSync(path.join(tempDir, ".git"));
 		process.env.HOME = tempHomeDir;
+		process.env.USERPROFILE = tempHomeDir;
+		delete process.env.CLAUDE_CONFIG_DIR;
+		spyOn(os, "homedir").mockReturnValue(tempHomeDir);
+		setAgentDir(path.join(tempHomeDir, ".omp", "agent"));
+		clearFsCache();
 	});
 
-	afterEach(cleanupTempHome(() => ({ tempDir, tempHomeDir, originalHome })));
+	afterEach(() => {
+		spyOn(os, "homedir").mockRestore();
+		for (const key of isolatedEnvKeys) restoreEnvValue(key, originalEnv[key]);
+		__resetDirsFromEnvForTests();
+		clearFsCache();
+		removeSyncWithRetries(tempHomeDir);
+	});
 
 	it("keeps per-request date/cwd out of the system prompt footer", async () => {
 		// The date/cwd line was moved out of the system prompt and onto the first

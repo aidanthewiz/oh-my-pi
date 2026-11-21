@@ -12,9 +12,20 @@
 //! non-interactive env (`GIT_TERMINAL_PROMPT=0`, askpass rejection, `LC_ALL`
 //! handling), `--no-optional-locks` for reads, fsmonitor/untracked-cache
 //! disabled for writes, ambient `GIT_DIR`-family vars stripped, bounded output
-//! capture, and deadline + SIGTERM→SIGKILL termination via tokio.
+//! capture, bounded post-exit pipe draining, and deadline + SIGTERM→SIGKILL
+//! termination via tokio.
 
-use std::{collections::BTreeMap, path::Path, process::Stdio, time::Duration};
+#[cfg(unix)]
+use std::os::fd::AsRawFd as AsRawPipe;
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle as AsRawPipe;
+use std::{
+	collections::BTreeMap,
+	path::{Path, PathBuf},
+	process::Stdio,
+	sync::{Arc, Mutex},
+	time::Duration,
+};
 
 use tokio::io::AsyncReadExt;
 use tokio_util::sync::CancellationToken;
@@ -37,7 +48,44 @@ pub const SYNC_TIMEOUT: Duration = Duration::from_secs(5);
 pub const OUTPUT_LIMIT_BYTES: usize = 8 * 1024 * 1024;
 
 const TERMINATE_GRACE: Duration = Duration::from_secs(5);
+/// Descendants can retain the pipes after git exits; do not wait for their EOF.
+const DRAIN_GRACE: Duration = Duration::from_secs(1);
+/// Idle synchronous readers must notice output collection without waiting for
+/// EOF.
+const READER_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const TRUNCATION_MARKER: &str = "\n[git subprocess output truncated at the capture limit]\n";
+
+/// Publish each chunk so a bounded drain can return the bytes already captured.
+#[derive(Default)]
+struct OutputCapture {
+	retained:  Vec<u8>,
+	truncated: bool,
+	closed:    bool,
+}
+
+impl OutputCapture {
+	/// Stop a reader once its caller has collected the output.
+	fn append(&mut self, bytes: &[u8], limit: usize) -> bool {
+		if self.closed {
+			return false;
+		}
+		if !self.truncated {
+			let keep = bytes.len().min(limit - self.retained.len());
+			self.retained.extend_from_slice(&bytes[..keep]);
+			self.truncated = keep < bytes.len();
+		}
+		true
+	}
+
+	fn take(&mut self) -> String {
+		self.closed = true;
+		let mut text = String::from_utf8_lossy_owned(std::mem::take(&mut self.retained));
+		if self.truncated {
+			text.push_str(TRUNCATION_MARKER);
+		}
+		text
+	}
+}
 
 /// Captured result of a completed git invocation.
 #[derive(Debug, Clone)]
@@ -70,16 +118,66 @@ impl CliOutput {
 pub(crate) struct RunOptions {
 	/// Prefix `--no-optional-locks` instead of pinning fsmonitor/untracked-cache
 	/// off.
-	pub read_only: bool,
+	pub read_only:  bool,
 	/// Deadline; [`COMMAND_TIMEOUT`] when unset.
-	pub timeout:   Option<Duration>,
+	pub timeout:    Option<Duration>,
 	/// Bytes piped to stdin (commit messages, `update-ref --stdin` scripts).
-	pub stdin:     Option<Vec<u8>>,
+	pub stdin:      Option<Vec<u8>>,
 	/// Cooperative cancellation: the child is terminated when triggered.
-	pub cancel:    Option<CancellationToken>,
+	pub cancel:     Option<CancellationToken>,
 	/// Complete environment for the child process. Inheritance is disabled when
 	/// set.
-	pub env:       Option<BTreeMap<String, String>>,
+	pub env:        Option<BTreeMap<String, String>>,
+	/// Explicit alternate index; installed after inherited overrides are
+	/// stripped.
+	pub index_path: Option<PathBuf>,
+}
+
+struct ChildGroup {
+	#[cfg(unix)]
+	pid: Option<libc::pid_t>,
+}
+
+impl ChildGroup {
+	fn new(pid: Option<u32>) -> Self {
+		#[cfg(unix)]
+		{
+			Self { pid: pid.and_then(|pid| libc::pid_t::try_from(pid).ok()) }
+		}
+		#[cfg(not(unix))]
+		{
+			let _ = pid;
+			Self {}
+		}
+	}
+
+	#[cfg(unix)]
+	fn signal(&self, signal: libc::c_int) {
+		if let Some(pid) = self.pid {
+			// SAFETY: the unreaped setsid leader pins this owned group's identity.
+			unsafe {
+				libc::kill(-pid, signal);
+			}
+		}
+	}
+
+	fn kill(&self) {
+		#[cfg(unix)]
+		self.signal(libc::SIGKILL);
+	}
+
+	const fn disarm(&mut self) {
+		#[cfg(unix)]
+		{
+			self.pid = None;
+		}
+	}
+}
+
+impl Drop for ChildGroup {
+	fn drop(&mut self) {
+		self.kill();
+	}
 }
 
 /// Build the hardened argv prefix.
@@ -205,9 +303,35 @@ fn is_utf8_locale(value: &str) -> bool {
 	})
 }
 
+/// Start `cmd` in a new session with no controlling terminal, the embedded
+/// shell's policy for externals. Without it git and everything it starts (ssh,
+/// credential helpers, signers, hooks) share the host's terminal: any of them
+/// can read the user's keystrokes and the terminal's protocol replies out from
+/// under the TUI, or prompt on it. Detached, a `/dev/tty` open fails
+/// (`ENXIO`), so a prompt errors out instead.
+#[cfg(unix)]
+pub(crate) fn detach_from_terminal(cmd: &mut std::process::Command) {
+	std::os::unix::process::CommandExt::setsid(cmd, true);
+}
+
+#[cfg(not(unix))]
+#[allow(
+	clippy::needless_pass_by_ref_mut,
+	reason = "no controlling terminal to detach from off unix; the signature matches the unix \
+	          variant"
+)]
+pub(crate) const fn detach_from_terminal(_cmd: &mut std::process::Command) {}
+
 /// Run `git` asynchronously with bounded capture and a deadline.
 /// Non-zero exits are returned in [`CliOutput`], not raised.
 pub(crate) async fn run(cwd: &Path, args: &[String], options: &RunOptions) -> Result<CliOutput> {
+	if options
+		.cancel
+		.as_ref()
+		.is_some_and(CancellationToken::is_cancelled)
+	{
+		return Err(Error::Canceled);
+	}
 	let argv = hardened_args(args, options.read_only);
 	let mut cmd = tokio::process::Command::new("git");
 	cmd.args(&argv)
@@ -221,7 +345,12 @@ pub(crate) async fn run(cwd: &Path, args: &[String], options: &RunOptions) -> Re
 		.stderr(Stdio::piped())
 		.kill_on_drop(true);
 	apply_env(&mut cmd, options.env.as_ref());
+	if let Some(index_path) = &options.index_path {
+		cmd.env("GIT_INDEX_FILE", index_path);
+	}
+	detach_from_terminal(cmd.as_std_mut());
 	let mut child = cmd.spawn().map_err(|err| spawn_error(cwd, err))?;
+	let mut group = ChildGroup::new(child.id());
 
 	let stdin_pipe = child.stdin.take();
 	let write_stdin = async {
@@ -237,38 +366,53 @@ pub(crate) async fn run(cwd: &Path, args: &[String], options: &RunOptions) -> Re
 
 	let stdout = child.stdout.take().expect("stdout piped");
 	let stderr = child.stderr.take().expect("stderr piped");
-	let stdout_task = tokio::spawn(read_capped(stdout));
-	let stderr_task = tokio::spawn(read_capped(stderr));
+	let stdout_capture = Arc::new(Mutex::new(OutputCapture::default()));
+	let stderr_capture = Arc::new(Mutex::new(OutputCapture::default()));
+	// TERM handlers may write to these pipes before publishing cleanup.
+	// Boxing bounds caller futures despite the two 8 KiB read buffers.
+	let mut drain = Box::pin(async {
+		tokio::join!(
+			read_capped(stdout, Arc::clone(&stdout_capture)),
+			read_capped(stderr, Arc::clone(&stderr_capture))
+		)
+	});
+	let mut drained = false;
+	let completion = async {
+		// Keep the leader unreaped while helpers can still hold captured pipes.
+		let ((), (stdout, stderr)) = tokio::join!(write_stdin, async {
+			let output = drain.as_mut().await;
+			drained = true;
+			output
+		});
+		let status = child.wait().await;
+		group.disarm();
+		stdout?;
+		stderr?;
+		Ok(CliOutput {
+			exit_code: status.map_err(Error::Io)?.code().unwrap_or(-1),
+			stdout:    stdout_capture.lock().unwrap().take(),
+			stderr:    stderr_capture.lock().unwrap().take(),
+		})
+	};
 
 	let timeout = options.timeout.unwrap_or(COMMAND_TIMEOUT);
 	let cancel = options.cancel.clone().unwrap_or_default();
-	let exit = tokio::select! {
-		status = tokio::time::timeout(timeout, async {
-			tokio::join!(write_stdin, child.wait()).1
-		}) => match status {
-			Ok(status) => status.map_err(Error::Io)?,
-			Err(_elapsed) => {
-				terminate(&mut child).await;
-				stdout_task.abort();
-				stderr_task.abort();
-				return Err(Error::CliTimeout { command: format!("git {}", argv.join(" ")) });
-			},
-		},
-		() = cancel.cancelled() => {
-			terminate(&mut child).await;
-			stdout_task.abort();
-			stderr_task.abort();
-			return Err(Error::Canceled);
-		},
+	let outcome = tokio::select! {
+		result = tokio::time::timeout(timeout, completion) => Some(result),
+		() = cancel.cancelled() => None,
 	};
-
-	let stdout = stdout_task
-		.await
-		.map_err(|err| Error::backend("git run", err))??;
-	let stderr = stderr_task
-		.await
-		.map_err(|err| Error::backend("git run", err))??;
-	Ok(CliOutput { exit_code: exit.code().unwrap_or(-1), stdout, stderr })
+	let error = match outcome {
+		Some(Ok(result)) => return result,
+		Some(Err(_elapsed)) => Error::CliTimeout { command: format!("git {}", argv.join(" ")) },
+		None => Error::Canceled,
+	};
+	let termination = terminate(&mut child, &mut group);
+	tokio::pin!(termination);
+	tokio::select! {
+		() = &mut termination => {},
+		_ = drain.as_mut(), if !drained => termination.await,
+	}
+	Err(error)
 }
 
 /// Run `git` asynchronously and map a non-zero exit to [`Error::Cli`].
@@ -348,29 +492,81 @@ pub(crate) fn run_sync_capped(
 		.stdout(Stdio::piped())
 		.stderr(Stdio::piped());
 	apply_env(&mut cmd, None);
+	detach_from_terminal(&mut cmd);
 	let mut child = cmd.spawn().map_err(|err| spawn_error(cwd, err))?;
 	let stdout = spawn_sync_reader("git-cli-stdout", child.stdout.take(), limit);
 	let stderr = spawn_sync_reader("git-cli-stderr", child.stderr.take(), limit);
+	wait_sync(&argv, child, stdout, stderr, timeout)
+}
+
+fn wait_sync(
+	argv: &[String],
+	mut child: std::process::Child,
+	stdout: Option<SyncReader>,
+	stderr: Option<SyncReader>,
+	timeout: Duration,
+) -> Result<CliOutput> {
+	let mut group = ChildGroup::new(Some(child.id()));
 	let deadline = std::time::Instant::now() + timeout;
-	let status = loop {
-		match child.try_wait()? {
-			Some(status) => break Some(status),
-			None if std::time::Instant::now() >= deadline => {
-				let _ = child.kill();
-				let _ = child.wait();
-				break None;
-			},
-			None => std::thread::sleep(Duration::from_millis(10)),
+	let status: std::io::Result<_> = loop {
+		let drained = stdout
+			.as_ref()
+			.is_none_or(|reader| reader.thread.is_finished())
+			&& stderr
+				.as_ref()
+				.is_none_or(|reader| reader.thread.is_finished());
+		if drained {
+			match child.try_wait() {
+				Ok(Some(status)) => {
+					group.disarm();
+					break Ok(Some(status));
+				},
+				Ok(None) => {},
+				Err(error) => {
+					group.kill();
+					group.disarm();
+					let _ = child.kill();
+					let _ = child.wait();
+					break Err(error);
+				},
+			}
 		}
+		if std::time::Instant::now() >= deadline {
+			group.kill();
+			group.disarm();
+			let _ = child.kill();
+			let _ = child.wait();
+			break Ok(None);
+		}
+		std::thread::sleep(Duration::from_millis(10));
 	};
-	// The child has exited (or been killed), so the pipes reach EOF and the
-	// readers terminate; join can only block briefly on the final drain.
-	let stdout = stdout.map_or_default(|h| h.join().unwrap_or_default());
-	let stderr = stderr.map_or_default(|h| h.join().unwrap_or_default());
-	let Some(status) = status else {
+	// Escaped descendants may retain pipes even after the owned group exits.
+	let readers = [stdout, stderr];
+	let drain_deadline = std::time::Instant::now() + DRAIN_GRACE;
+	while readers
+		.iter()
+		.flatten()
+		.any(|reader| !reader.thread.is_finished())
+		&& std::time::Instant::now() < drain_deadline
+	{
+		std::thread::sleep(Duration::from_millis(10));
+	}
+	let [stdout, stderr] = readers.map(|reader| {
+		reader.map_or_default(|reader| {
+			let output = reader.output.lock().unwrap().take();
+			let _ = reader.thread.join();
+			output
+		})
+	});
+	let Some(status) = status? else {
 		return Err(Error::CliTimeout { command: format!("git {}", argv.join(" ")) });
 	};
 	Ok(CliOutput { exit_code: status.code().unwrap_or(-1), stdout, stderr })
+}
+
+struct SyncReader {
+	thread: std::thread::JoinHandle<()>,
+	output: Arc<Mutex<OutputCapture>>,
 }
 
 /// Drain a child stream on a helper thread, mirroring [`read_capped`].
@@ -381,43 +577,83 @@ pub(crate) fn run_sync_capped(
 /// surfaces as a non-zero exit instead of a hang.
 fn spawn_sync_reader(
 	name: &'static str,
-	stream: Option<impl std::io::Read + Send + 'static>,
+	stream: Option<impl std::io::Read + AsRawPipe + Send + 'static>,
 	limit: usize,
-) -> Option<std::thread::JoinHandle<String>> {
+) -> Option<SyncReader> {
 	let stream = stream?;
-	std::thread::Builder::new()
+	let output = Arc::new(Mutex::new(OutputCapture::default()));
+	let capture = Arc::clone(&output);
+	let thread = std::thread::Builder::new()
 		.name(name.into())
-		.spawn(move || read_capped_sync(stream, limit))
-		.ok()
+		.spawn(move || read_capped_sync(stream, limit, &capture))
+		.ok()?;
+	Some(SyncReader { thread, output })
 }
 
-/// Synchronous mirror of [`read_capped`]: cap retention at `limit` while
-/// draining to EOF so the child never blocks.
-fn read_capped_sync(mut stream: impl std::io::Read, limit: usize) -> String {
-	let mut retained: Vec<u8> = Vec::new();
+/// Synchronous mirror of [`read_capped`]: drain without blocking the child,
+/// checking for collection between bounded waits even when the pipe stays open.
+fn read_capped_sync(
+	mut stream: impl std::io::Read + AsRawPipe,
+	limit: usize,
+	output: &Mutex<OutputCapture>,
+) {
 	let mut buf = [0u8; 8 * 1024];
-	let mut truncated = false;
-	loop {
+	while !output.lock().unwrap().closed {
+		match sync_pipe_ready(&stream) {
+			Ok(true) => {},
+			Ok(false) => continue,
+			Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+			Err(_) => break,
+		}
 		let n = match stream.read(&mut buf) {
+			Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
 			Ok(0) | Err(_) => break,
 			Ok(n) => n,
 		};
-		if truncated {
-			continue;
-		}
-		let remaining = limit - retained.len();
-		if n <= remaining {
-			retained.extend_from_slice(&buf[..n]);
-		} else {
-			retained.extend_from_slice(&buf[..remaining]);
-			truncated = true;
+		if !output.lock().unwrap().append(&buf[..n], limit) {
+			break;
 		}
 	}
-	let mut text = String::from_utf8_lossy_owned(retained);
-	if truncated {
-		text.push_str(TRUNCATION_MARKER);
+}
+
+/// Only this thread reads the pipe, so readable bytes cannot be consumed
+/// between the readiness check and `read`.
+#[cfg(unix)]
+fn sync_pipe_ready(stream: &impl AsRawPipe) -> std::io::Result<bool> {
+	let mut fd = libc::pollfd { fd: stream.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+	// SAFETY: fd points to one initialized pollfd; the stream owns its
+	// descriptor throughout this bounded wait.
+	let ready =
+		unsafe { libc::poll(&raw mut fd, 1, READER_POLL_INTERVAL.as_millis() as libc::c_int) };
+	if ready < 0 {
+		Err(std::io::Error::last_os_error())
+	} else {
+		Ok(ready > 0)
 	}
-	text
+}
+
+#[cfg(windows)]
+fn sync_pipe_ready(stream: &impl AsRawPipe) -> std::io::Result<bool> {
+	let mut available = 0;
+	// SAFETY: the stream owns this pipe handle. A zero-size peek writes only
+	// the byte count, without consuming data or waiting for a writer.
+	let ok = unsafe {
+		windows_sys::Win32::System::Pipes::PeekNamedPipe(
+			stream.as_raw_handle(),
+			std::ptr::null_mut(),
+			0,
+			std::ptr::null_mut(),
+			&raw mut available,
+			std::ptr::null_mut(),
+		)
+	};
+	if ok == 0 {
+		return Err(std::io::Error::last_os_error());
+	}
+	if available == 0 {
+		std::thread::sleep(READER_POLL_INTERVAL);
+	}
+	Ok(available > 0)
 }
 
 fn spawn_error(cwd: &Path, err: std::io::Error) -> Error {
@@ -436,50 +672,35 @@ fn spawn_error(cwd: &Path, err: std::io::Error) -> Error {
 
 /// Read a stream to completion, capping retention at [`OUTPUT_LIMIT_BYTES`]
 /// while continuing to drain so the child never blocks on a full pipe.
-async fn read_capped(mut stream: impl tokio::io::AsyncRead + Unpin) -> Result<String> {
-	let mut retained: Vec<u8> = Vec::new();
+async fn read_capped(
+	mut stream: impl tokio::io::AsyncRead + Unpin,
+	output: Arc<Mutex<OutputCapture>>,
+) -> Result<()> {
 	let mut buf = [0u8; 8 * 1024];
-	let mut truncated = false;
 	loop {
 		let n = stream.read(&mut buf).await.map_err(Error::Io)?;
 		if n == 0 {
 			break;
 		}
-		if truncated {
-			continue;
-		}
-		let remaining = OUTPUT_LIMIT_BYTES - retained.len();
-		if n <= remaining {
-			retained.extend_from_slice(&buf[..n]);
-		} else {
-			retained.extend_from_slice(&buf[..remaining]);
-			truncated = true;
+		if !output.lock().unwrap().append(&buf[..n], OUTPUT_LIMIT_BYTES) {
+			break;
 		}
 	}
-	let mut text = String::from_utf8_lossy_owned(retained);
-	if truncated {
-		text.push_str(TRUNCATION_MARKER);
-	}
-	Ok(text)
+	Ok(())
 }
 
-/// SIGTERM, grace period, then SIGKILL.
-async fn terminate(child: &mut tokio::process::Child) {
+/// Keep the session leader unreaped through TERM grace and group escalation.
+async fn terminate(child: &mut tokio::process::Child, group: &mut ChildGroup) {
 	#[cfg(unix)]
-	if let Some(pid) = child.id() {
-		// SAFETY: plain kill(2) on a pid we own; no memory is touched.
-		unsafe {
-			libc::kill(pid as i32, libc::SIGTERM);
-		}
-		if tokio::time::timeout(TERMINATE_GRACE, child.wait())
-			.await
-			.is_ok()
-		{
-			return;
-		}
+	{
+		group.signal(libc::SIGTERM);
+		tokio::time::sleep(TERMINATE_GRACE).await;
+		group.kill();
+		group.disarm();
 	}
 	let _ = child.kill().await;
 	let _ = tokio::time::timeout(TERMINATE_GRACE, child.wait()).await;
+	group.disarm();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -608,6 +829,210 @@ mod tests {
 	use super::*;
 
 	#[cfg(unix)]
+	struct PipeHolder(tempfile::TempDir);
+
+	#[cfg(unix)]
+	impl PipeHolder {
+		fn new() -> Self {
+			Self(tempfile::tempdir().expect("tempdir"))
+		}
+
+		fn args() -> [String; 3] {
+			[
+				"-c".to_owned(),
+				r#"alias.leak=!sh -c 'printf "out\n"; printf "err\n" >&2; sleep 20 & echo $! > sleep.pid'"#
+					.to_owned(),
+				"leak".to_owned(),
+			]
+		}
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn sync_runner_bounds_drain_when_a_descendant_holds_pipes() {
+		let fixture = PipeHolder::new();
+		let started = std::time::Instant::now();
+		let result = run_sync(fixture.0.path(), &PipeHolder::args(), SYNC_TIMEOUT);
+		assert!(started.elapsed() < Duration::from_secs(10), "drain outlived git");
+		assert!(matches!(result, Err(Error::CliTimeout { .. })), "{result:?}");
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn sync_readers_exit_after_repeated_calls_while_descendant_holds_pipes() {
+		let fixtures = [PipeHolder::new(), PipeHolder::new(), PipeHolder::new()];
+		let mut captures = Vec::new();
+		for fixture in &fixtures {
+			let args = PipeHolder::args();
+			let mut cmd = std::process::Command::new("git");
+			cmd.args(&args)
+				.current_dir(fixture.0.path())
+				.stdin(Stdio::null())
+				.stdout(Stdio::piped())
+				.stderr(Stdio::piped());
+			apply_env(&mut cmd, None);
+			detach_from_terminal(&mut cmd);
+			let mut child = cmd.spawn().expect("spawn alias");
+			let stdout = spawn_sync_reader("git-cli-stdout", child.stdout.take(), OUTPUT_LIMIT_BYTES)
+				.expect("stdout reader");
+			let stderr = spawn_sync_reader("git-cli-stderr", child.stderr.take(), OUTPUT_LIMIT_BYTES)
+				.expect("stderr reader");
+			captures.extend([Arc::clone(&stdout.output), Arc::clone(&stderr.output)]);
+			let result = wait_sync(&args, child, Some(stdout), Some(stderr), SYNC_TIMEOUT);
+			assert!(matches!(result, Err(Error::CliTimeout { .. })), "{result:?}");
+		}
+		let deadline = std::time::Instant::now() + Duration::from_secs(1);
+		while captures
+			.iter()
+			.any(|capture| Arc::strong_count(capture) > 1)
+			&& std::time::Instant::now() < deadline
+		{
+			std::thread::sleep(Duration::from_millis(10));
+		}
+		let live_readers = captures
+			.iter()
+			.filter(|capture| Arc::strong_count(capture) > 1)
+			.count();
+		assert_eq!(live_readers, 0, "reader threads survived output collection");
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn async_runner_bounds_drain_when_a_descendant_holds_pipes() {
+		let fixture = PipeHolder::new();
+		let started = std::time::Instant::now();
+		let cancel = CancellationToken::new();
+		let args = PipeHolder::args();
+		let options = RunOptions {
+			read_only: true,
+			timeout: Some(SYNC_TIMEOUT),
+			cancel: Some(cancel.clone()),
+			..RunOptions::default()
+		};
+		let trigger = async {
+			wait_for_fixture(&fixture.0.path().join("sleep.pid")).await;
+			cancel.cancel();
+		};
+		let (result, ()) = tokio::join!(run(fixture.0.path(), &args, &options), trigger);
+		assert!(started.elapsed() < Duration::from_secs(10), "drain outlived git");
+		assert!(matches!(result, Err(Error::Canceled)), "{result:?}");
+	}
+
+	#[tokio::test]
+	async fn cancelled_run_rejects_before_process_admission() {
+		let root = tempfile::tempdir().unwrap();
+		let cancel = CancellationToken::new();
+		cancel.cancel();
+		let result = run(&root.path().join("absent"), &["status".into()], &RunOptions {
+			cancel: Some(cancel),
+			..RunOptions::default()
+		})
+		.await;
+		assert!(matches!(result, Err(Error::Canceled)), "{result:?}");
+	}
+
+	#[cfg(unix)]
+	async fn wait_for_fixture(path: &Path) {
+		tokio::time::timeout(Duration::from_secs(5), async {
+			while !path.exists() {
+				tokio::time::sleep(Duration::from_millis(10)).await;
+			}
+		})
+		.await
+		.expect("git helper did not reach its fixture boundary");
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn cancellation_completes_owned_helper_term_cleanup() {
+		use std::os::unix::fs::PermissionsExt;
+
+		let root = tempfile::tempdir().unwrap();
+		let git = root.path().join("git");
+		std::fs::write(&git, "#!/bin/sh\n/bin/sh ./helper &\nwait\n").unwrap();
+		std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
+		std::fs::write(
+			root.path().join("helper"),
+			"trap '/bin/cat cleanup-output || exit 1; /bin/cat cleanup-output >&2 || exit 1; printf \
+			 cleaned > cleaned; printf done > done; exit 0' TERM\nprintf ready > ready\n/bin/sleep \
+			 2\nprintf late > late\nprintf done > done\n",
+		)
+		.unwrap();
+		std::fs::write(root.path().join("cleanup-output"), "output\n".repeat(32 * 1024)).unwrap();
+		let cancel = CancellationToken::new();
+		let args = ["custody".into()];
+		let options = RunOptions {
+			cancel: Some(cancel.clone()),
+			env: Some(BTreeMap::from([("PATH".into(), root.path().to_str().unwrap().to_owned())])),
+			..RunOptions::default()
+		};
+		let trigger = async {
+			wait_for_fixture(&root.path().join("ready")).await;
+			cancel.cancel();
+		};
+		let (result, ()) = tokio::join!(run(root.path(), &args, &options), trigger);
+		assert!(matches!(result, Err(Error::Canceled)), "{result:?}");
+		assert_eq!(std::fs::read(root.path().join("cleaned")).unwrap(), b"cleaned");
+		assert_eq!(std::fs::read(root.path().join("done")).unwrap(), b"done");
+		assert!(!root.path().join("late").exists());
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn sync_deadline_includes_inherited_output_pipes() {
+		let root = tempfile::tempdir().unwrap();
+		let ready = root.path().join("ready");
+		let observed_ready = ready.clone();
+		let release = root.path().join("release");
+		let releaser = std::thread::spawn(move || {
+			let deadline = std::time::Instant::now() + Duration::from_secs(5);
+			while !ready.exists() && std::time::Instant::now() < deadline {
+				std::thread::sleep(Duration::from_millis(10));
+			}
+			std::thread::sleep(Duration::from_secs(2));
+			std::fs::write(release, b"release").unwrap();
+		});
+		let result = run_sync(
+			root.path(),
+			&[
+				"-c".into(),
+				"alias.held=!{ printf ready > ready; while [ ! -f release ]; do sleep 0.01; done; \
+				 printf escaped > escaped; } &"
+					.into(),
+				"held".into(),
+			],
+			Duration::from_secs(1),
+		);
+		releaser.join().unwrap();
+		assert!(observed_ready.exists(), "git helper never started");
+		assert!(matches!(result, Err(Error::CliTimeout { .. })), "{result:?}");
+		assert!(!root.path().join("escaped").exists());
+	}
+
+	#[test]
+	fn sync_reader_exits_after_collection_while_pipe_stays_open() {
+		use std::io::Write;
+
+		let (read, mut write) = std::io::pipe().expect("pipe");
+		let reader =
+			spawn_sync_reader("git-cli-test", Some(read), OUTPUT_LIMIT_BYTES).expect("reader");
+		write.write_all(b"out\n").expect("write output");
+		let deadline = std::time::Instant::now() + Duration::from_secs(1);
+		while reader.output.lock().unwrap().retained.len() < 4 && std::time::Instant::now() < deadline
+		{
+			std::thread::sleep(Duration::from_millis(10));
+		}
+		assert_eq!(reader.output.lock().unwrap().take(), "out\n");
+		let deadline = std::time::Instant::now() + Duration::from_secs(1);
+		while !reader.thread.is_finished() && std::time::Instant::now() < deadline {
+			std::thread::sleep(Duration::from_millis(10));
+		}
+		assert!(reader.thread.is_finished(), "reader thread survived output collection");
+		reader.thread.join().expect("reader finished");
+		drop(write);
+	}
+
+	#[cfg(unix)]
 	#[tokio::test]
 	async fn async_runner_drains_output_while_delivering_stdin() {
 		let dir = tempfile::tempdir().unwrap();
@@ -647,6 +1072,28 @@ mod tests {
 	/// Asks git to report the ambient variables it was started with. A `!`-alias
 	/// is the only way to make git print its own environment.
 	const ENV_PROBE_ALIAS: &str = r#"!printf 'LC_ALL=[%s] LC_CTYPE=[%s] LC_MESSAGES=[%s] LITERAL=[%s] ICASE=[%s]' "$LC_ALL" "$LC_CTYPE" "$LC_MESSAGES" "$GIT_LITERAL_PATHSPECS" "$GIT_ICASE_PATHSPECS""#;
+
+	/// A git left in the host's process group shares its terminal and can read
+	/// the TUI's keystrokes and terminal replies (Tern TSP events leaked into
+	/// the composer with their leading bytes missing). Both runners must start
+	/// it in its own session.
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn runners_start_git_outside_the_host_process_group() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		let args = ["-c".to_owned(), "alias.pgid=!ps -o pgid= -p $$".to_owned(), "pgid".to_owned()];
+		// SAFETY: getpgrp has no preconditions.
+		let host = unsafe { libc::getpgrp() };
+		let sync = run_sync(dir.path(), &args, SYNC_TIMEOUT).expect("sync runner");
+		let spawned = run(dir.path(), &args, &RunOptions::default())
+			.await
+			.expect("async runner");
+		for out in [sync, spawned] {
+			assert_eq!(out.exit_code, 0, "alias failed: {out:?}");
+			let pgid: i32 = out.stdout.trim().parse().expect("pgid");
+			assert_ne!(pgid, host, "git shares the host's process group: {out:?}");
+		}
+	}
 
 	/// Two guarantees this crate builds on top of, both of which depend on what
 	/// the child process actually receives:

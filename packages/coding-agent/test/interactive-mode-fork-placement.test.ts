@@ -153,7 +153,7 @@ describe("InteractiveMode fork placement bridge", () => {
 			},
 		});
 		const composer = new Composer({ terminal: new VirtualTerminal(80, 24) });
-		mode = new InteractiveMode(session, "test", undefined, undefined, undefined, undefined, undefined, composer);
+		mode = new InteractiveMode(session, "test", undefined, undefined, undefined, undefined, composer);
 		vi.spyOn(ternKind, "resolveTernPane").mockReturnValue(null);
 		try {
 			await mode.handleBtwCommand("owned partial question");
@@ -305,7 +305,7 @@ describe("InteractiveMode fork placement bridge", () => {
 			const terminal = new VirtualTerminal(80, 24);
 			const scheduler = new VirtualRenderScheduler();
 			const composer = new Composer({ terminal, tuiOptions: { renderScheduler: scheduler } });
-			mode = new InteractiveMode(session, "test", undefined, undefined, undefined, undefined, undefined, composer);
+			mode = new InteractiveMode(session, "test", undefined, undefined, undefined, undefined, composer);
 			vi.spyOn(ternKind, "resolveTernPane").mockReturnValue(null);
 			const debugPath = process.env.OMP_TUI_DEBUG;
 			delete process.env.OMP_TUI_DEBUG;
@@ -413,7 +413,6 @@ describe("InteractiveMode fork placement bridge", () => {
 			undefined,
 			undefined,
 			undefined,
-			undefined,
 			new Composer({ terminal: new VirtualTerminal(80, 24) }),
 		);
 		let answer: FakeAnswer = { ok: { block: 9 } };
@@ -489,7 +488,6 @@ describe("InteractiveMode fork placement bridge", () => {
 			undefined,
 			undefined,
 			undefined,
-			undefined,
 			new Composer({ terminal: new VirtualTerminal(80, 24) }),
 		);
 		session.sessionManager.appendMessage({ role: "user", content: "idle-parent", timestamp: 1 });
@@ -548,7 +546,6 @@ describe("InteractiveMode fork placement bridge", () => {
 		const memoryMode = new InteractiveMode(
 			memory,
 			"test",
-			undefined,
 			undefined,
 			undefined,
 			undefined,
@@ -692,7 +689,6 @@ describe("InteractiveMode fork placement bridge", () => {
 			const forkMode = new InteractiveMode(
 				forkSession,
 				"test",
-				undefined,
 				undefined,
 				undefined,
 				undefined,

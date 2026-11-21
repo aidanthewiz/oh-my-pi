@@ -145,9 +145,18 @@ export class HttpTransport implements MCPTransport {
 		return signal ? AbortSignal.any([signal, this.#lifecycleController.signal]) : this.#lifecycleController.signal;
 	}
 
-	#assertRequestOwner(options?: MCPRequestOptions): void {
+	#assertLocalRequestOwner(options?: MCPRequestOptions): void {
+		options?.signal?.throwIfAborted();
 		if (options?.mcpOwnerCurrent?.() === false) {
 			throw new DOMException("MCP request owner changed", "AbortError");
+		}
+	}
+
+	async #assertRequestOwner(options?: MCPRequestOptions): Promise<void> {
+		this.#assertLocalRequestOwner(options);
+		if (options?.mcpCheckOwner) {
+			await options.mcpCheckOwner();
+			this.#assertLocalRequestOwner(options);
 		}
 	}
 
@@ -358,25 +367,30 @@ export class HttpTransport implements MCPTransport {
 			throw new SSEResumeError("SSE stream ended without a resumable event ID");
 		}
 		try {
-			this.#assertRequestOwner(options);
+			await this.#assertRequestOwner(options);
 			await waitForSSERetry(resume.retryMs, signal);
-			this.#assertRequestOwner(options);
+			await this.#assertRequestOwner(options);
 			const generated: Record<string, string> = {
 				Accept: "text/event-stream",
 				"Last-Event-ID": resume.lastEventId,
 			};
 			if (this.#sessionId) generated["Mcp-Session-Id"] = this.#sessionId;
+			this.#assertLocalRequestOwner(options);
 			let response = await this.#fetch({ method: "GET", signal }, generated);
 			const refreshAuth = this.onAuthError;
 			if (refreshAuth && (response.status === 401 || response.status === 403)) {
 				await response.body?.cancel();
-				this.#assertRequestOwner(options);
-				const newHeaders = await untilAborted(signal, () => refreshAuth.call(this));
-				this.#assertRequestOwner(options);
+				await this.#assertRequestOwner(options);
+				const newHeaders = await untilAborted(signal, () => {
+					this.#assertLocalRequestOwner(options);
+					return refreshAuth.call(this);
+				});
+				await this.#assertRequestOwner(options);
 				if (!newHeaders) {
 					throw new SSEResumeError(`HTTP ${response.status} resuming MCP SSE stream: auth refresh failed`);
 				}
 				this.config = { ...this.config, headers: newHeaders };
+				this.#assertLocalRequestOwner(options);
 				response = await this.#fetch({ method: "GET", signal }, generated);
 			}
 			if (!response.ok) {
@@ -428,10 +442,9 @@ export class HttpTransport implements MCPTransport {
 	): Promise<T> {
 		try {
 			const result = await this.#executeRequest<T>(method, params, options);
-			this.#assertRequestOwner(options);
+			await this.#assertRequestOwner(options);
 			return result;
 		} catch (error) {
-			this.#assertRequestOwner(options);
 			// Retry once on auth failure if onAuthError is wired. Never replay
 			// after an SSE resume failure: the server already accepted the
 			// original POST and may have executed it — replaying could run a
@@ -443,17 +456,19 @@ export class HttpTransport implements MCPTransport {
 				this.onAuthError &&
 				(status === 401 || status === 403)
 			) {
+				await this.#assertRequestOwner(options);
 				let newHeaders: Record<string, string> | null;
 				try {
+					this.#assertLocalRequestOwner(options);
 					newHeaders = await this.onAuthError();
 				} finally {
-					this.#assertRequestOwner(options);
+					await this.#assertRequestOwner(options);
 				}
 				if (newHeaders) {
 					// Persist refreshed headers so subsequent requests use them directly
 					this.config = { ...this.config, headers: newHeaders };
 					const result = await this.#executeRequest<T>(method, params, options);
-					this.#assertRequestOwner(options);
+					await this.#assertRequestOwner(options);
 					return result;
 				}
 			}
@@ -466,7 +481,7 @@ export class HttpTransport implements MCPTransport {
 		params: Record<string, unknown> | undefined,
 		options: MCPRequestOptions | undefined,
 	): Promise<T> {
-		this.#assertRequestOwner(options);
+		await this.#assertRequestOwner(options);
 		if (!this.#connected) {
 			throw new MCPTransportError({
 				transport: "http",
@@ -516,7 +531,8 @@ export class HttpTransport implements MCPTransport {
 
 		try {
 			if (options?.onProgress) this.#progressCallbacks.set(id, options.onProgress);
-			this.#assertRequestOwner(options);
+			await this.#assertRequestOwner(options);
+			this.#assertLocalRequestOwner(options);
 			const response = await this.#fetch(
 				{ method: "POST", body: JSON.stringify(body), signal: operation.signal },
 				generated,
@@ -582,6 +598,7 @@ export class HttpTransport implements MCPTransport {
 					cause: error,
 				});
 			}
+			operation.signal?.throwIfAborted();
 			if (error instanceof Error && error.name === "AbortError") throw error;
 			const diagnostic = normalizeMCPTransportError(error, { transport: "http", stage, traceId });
 			const refusedBeforeDispatch =
@@ -623,6 +640,7 @@ export class HttpTransport implements MCPTransport {
 		}
 
 		const signal = operation.signal ?? getNeverAbortSignal();
+		const transportSignal = this.#lifecycleController.signal;
 
 		const { promise, resolve, reject } = Promise.withResolvers<T>();
 		// The transport owns this promise until the physical stream drain exits.
@@ -642,7 +660,8 @@ export class HttpTransport implements MCPTransport {
 					if (!current.body) throw new Error("SSE response did not include a body");
 					try {
 						for await (const event of readSseEvents(current.body, signal)) {
-							this.#assertRequestOwner(options);
+							if (!captured) await this.#assertRequestOwner(options);
+							transportSignal.throwIfAborted();
 							if (event.id !== undefined) resume.lastEventId = event.id || null;
 							if (event.retry !== undefined) resume.retryMs = event.retry;
 							if (event.data === "") continue;
@@ -668,7 +687,7 @@ export class HttpTransport implements MCPTransport {
 									}
 									continue;
 								}
-								if (!this.#connected) continue;
+								if (!this.#connected || transportSignal.aborted) continue;
 								this.#dispatchSSEMessage(message);
 							}
 						}
@@ -678,7 +697,7 @@ export class HttpTransport implements MCPTransport {
 						// exists; the request timeout still bounds the total wait.
 						if (captured) return;
 						if (signal.aborted || resume.lastEventId === null) throw error;
-						this.#assertRequestOwner(options);
+						await this.#assertRequestOwner(options);
 						logger.debug("MCP SSE response stream dropped; resuming", {
 							url: this.config.url,
 							error: error instanceof Error ? error.message : String(error),

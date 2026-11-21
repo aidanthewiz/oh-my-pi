@@ -2,20 +2,28 @@ import { describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { setImmediate as waitForImmediate } from "node:timers/promises";
 import { type } from "@oh-my-pi/omptype";
-import type { AgentTool } from "@oh-my-pi/pi-agent-core";
+import type { AgentTool, AgentToolDocTopic, AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import type { HookRunner } from "@oh-my-pi/pi-coding-agent/extensibility/hooks/runner";
+import { HookToolWrapper } from "@oh-my-pi/pi-coding-agent/extensibility/hooks/tool-wrapper";
 import * as themeModule from "@oh-my-pi/pi-tui/theme";
 import { ToolChoiceQueue } from "@oh-my-pi/pi-coding-agent/session/tool-choice-queue";
 import { LocalProtocolHandler } from "@oh-my-pi/pi-coding-agent/internal-urls/local-protocol";
 import { ConflictProtocolHandler } from "@oh-my-pi/pi-coding-agent/internal-urls/conflict-protocol";
 import { createTools, type Tool, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { requiresApproval, resolveApproval } from "@oh-my-pi/pi-coding-agent/tools/approval";
+import { EvalTool } from "@oh-my-pi/pi-coding-agent/tools/eval";
+import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
 import { Text } from "@oh-my-pi/pi-tui";
 import { githubToolRenderer } from "@oh-my-pi/pi-tui/tools/github";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
+import { ToolAbortError } from "@oh-my-pi/pi-coding-agent/tools/tool-errors";
+import { DEFAULT_MAX_LINES } from "@oh-my-pi/pi-tui/tools/streaming-output";
+import { wrapToolWithMetaNotice } from "@oh-my-pi/pi-coding-agent/tools/output-meta";
 import { WriteTool } from "@oh-my-pi/pi-coding-agent/tools/write";
-import { type WriteRenderContext, writeToolRenderer } from "@oh-my-pi/pi-tui/tools/write";
+import { type WriteRenderContext, type WriteToolDetails, writeToolRenderer } from "@oh-my-pi/pi-tui/tools/write";
 import {
 	dispatchXdevTool,
 	listXdevTools,
@@ -73,6 +81,122 @@ function createTestXdevState(
 	};
 	return state;
 }
+
+describe("read xd:// documentation topics", () => {
+	function text(result: AgentToolResult<unknown>): string {
+		return result.content
+			.filter(block => block.type === "text")
+			.map(block => block.text)
+			.join("\n");
+	}
+
+	function topicFixture(topics: Record<string, AgentToolDocTopic>) {
+		let approvals = 0;
+		let executions = 0;
+		const tool: AgentTool = {
+			name: "topic_fixture",
+			label: "Topic Fixture",
+			description: "Documentation topic fixture",
+			parameters: type({}),
+			docTopics: () => topics,
+			approval: () => {
+				approvals++;
+				return "exec";
+			},
+			async execute() {
+				executions++;
+				throw new Error("Documentation must not execute its tool");
+			},
+		};
+		const session = xdevSession(import.meta.dir, {
+			getToolByName: name => (name === tool.name ? tool : undefined),
+		});
+		return {
+			read: new ReadTool(session),
+			calls: () => ({ approvals, executions }),
+		};
+	}
+
+	it("returns complete stable JSON values without document formatting or paging", async () => {
+		const value = {
+			z: { text: "complete JSON value\n".repeat(20_000) },
+			a: [{ pattern: "^[0-9]+$", minimum: 1, maximum: 9, additionalProperties: false }],
+		};
+		const topics: Record<string, AgentToolDocTopic> = { data: { format: "json", value } };
+		const fixture = topicFixture(topics);
+		const first = await fixture.read.execute("json-topic", { path: "xd://topic_fixture/data" });
+		expect(first.details).toMatchObject({ shape: "value", contentType: "application/json" });
+		expect(JSON.parse(text(first))).toEqual(value);
+		expect(first.details?.meta?.truncation).toBeUndefined();
+		topics.data = {
+			format: "json",
+			value: { a: [{ additionalProperties: false, maximum: 9, minimum: 1, pattern: "^[0-9]+$" }], z: value.z },
+		};
+		const reordered = await fixture.read.execute("reordered-json-topic", { path: "xd://topic_fixture/data" });
+		expect(text(reordered)).toBe(text(first));
+		expect(fixture.calls()).toEqual({ approvals: 0, executions: 0 });
+	});
+
+	it("retains string topics as bounded documents instead of JSON values", async () => {
+		const markdown = [
+			"# MARKDOWN_BEGIN",
+			...Array.from({ length: DEFAULT_MAX_LINES + 20 }, () => "x"),
+			"MARKDOWN_END",
+		].join("\n");
+		const fixture = topicFixture({ guide: markdown });
+		const result = await fixture.read.execute("markdown-topic", { path: "xd://topic_fixture/guide" });
+		expect(result.details?.shape).not.toBe("value");
+		expect(result.details?.contentType).toBe("text/plain");
+		expect(text(result)).toContain("MARKDOWN_BEGIN");
+		expect(text(result)).not.toContain("MARKDOWN_END");
+		expect(result.details?.meta?.truncation?.truncatedBy).toBe("lines");
+		expect(fixture.calls()).toEqual({ approvals: 0, executions: 0 });
+	});
+
+	it("withholds serialization failures and their causes without executing the tool", async () => {
+		const cyclic: Record<string, unknown> = {};
+		cyclic.self = cyclic;
+		const throwing = Object.defineProperty({}, "private", {
+			enumerable: true,
+			get() {
+				throw new Error("private schema serialization cause");
+			},
+		});
+		for (const value of [undefined, 1n, cyclic, throwing]) {
+			const fixture = topicFixture({ data: { format: "json", value } });
+			let failure: unknown;
+			try {
+				await fixture.read.execute("invalid-json-topic", { path: "xd://topic_fixture/data" });
+			} catch (error) {
+				failure = error;
+			}
+			expect(failure).toBeInstanceOf(ToolError);
+			expect((failure as Error).message).toBe("Cannot serialize xd:// JSON topic.");
+			expect(Object.hasOwn(failure as Error, "cause")).toBe(false);
+			expect(fixture.calls()).toEqual({ approvals: 0, executions: 0 });
+		}
+	});
+
+	it("keeps existing eval markdown topics readable without executing eval", async () => {
+		const session: ToolSession = xdevSession(import.meta.dir, {
+			getToolByName: name => session.toolRegistry?.get(name),
+		});
+		const tools = await createTools(session, ["read", "write", "eval"]);
+		const registered = session.toolRegistry?.get("eval");
+		const read = tools.find(tool => tool.name === "read");
+		if (!(registered instanceof EvalTool) || !read) throw new Error("Eval topic fixture is not registered");
+		const execute = spyOn(registered, "execute").mockRejectedValue(new Error("Documentation must not execute eval"));
+		try {
+			const result = await read.execute("eval-markdown-topic", { path: "xd://eval/helpers" });
+			expect(result.details?.shape).not.toBe("value");
+			expect(result.details?.contentType).toBe("text/plain");
+			expect(() => JSON.parse(text(result))).toThrow();
+			expect(execute).not.toHaveBeenCalled();
+		} finally {
+			execute.mockRestore();
+		}
+	});
+});
 
 describe("read and write route xd:// device URLs", () => {
 	it("lists, documents, and dispatches an ast_edit device", async () => {
@@ -577,7 +701,7 @@ describe("read and write route xd:// device URLs", () => {
 			expect(docs.length).toBeLessThan(XDEV_DOCS_TOTAL_BUDGET + XDEV_DOCS_PER_DEVICE_CAP);
 			expect(docs).toContain(`## ${mounted[0]!.name}`);
 			expect(docs).toContain("## Additional devices (docs on demand)");
-			expect(docs).toContain("- xd://giant_mcp_tool —");
+			expect(docs).toContain("- giant_mcp_tool —");
 			expect(docs).not.toContain("## giant_mcp_tool");
 		} finally {
 			await removeWithRetries(tempDir);
@@ -614,12 +738,11 @@ describe("read and write route xd:// device URLs", () => {
 			const builtinsDocs = xdevDocsAll(xdev, "builtins");
 			expect(builtinsDocs).toContain("## ");
 			expect(builtinsDocs).not.toContain("## mcp_external_tool");
-			expect(builtinsDocs).toContain("- xd://mcp_external_tool —");
+			expect(builtinsDocs).toContain("- mcp_external_tool —");
 			expect(builtinsDocs).not.toContain("TAIL");
 			const catalogDocs = xdevDocsAll(xdev, "catalog");
 			expect(catalogDocs).not.toContain(`## ${mounted[0]!.name}`);
-			expect(catalogDocs).toContain("- xd://");
-			expect(catalogDocs).toContain("- xd://mcp_external_tool —");
+			expect(catalogDocs).toContain("- mcp_external_tool —");
 			expect(xdevDocs(xdev, "mcp_external_tool")).toContain("TAIL");
 
 			const contextMode = Object.create(mounted[0]!) as (typeof mounted)[number];
@@ -634,7 +757,7 @@ describe("read and write route xd:// device URLs", () => {
 			const allowlistedDocs = xdevDocsAll(xdev, "builtins", ["mcp__context_mode_*"]);
 			expect(allowlistedDocs).toContain("## mcp__context_mode_ctx_execute");
 			expect(allowlistedDocs).not.toContain("## mcp__other_server_execute");
-			expect(allowlistedDocs).toContain("- xd://mcp__other_server_execute —");
+			expect(allowlistedDocs).toContain("- mcp__other_server_execute —");
 
 			const catalogWithAllowlistDocs = xdevDocsAll(xdev, "catalog", ["mcp__context_mode_*"]);
 			expect(catalogWithAllowlistDocs).not.toContain("## mcp__context_mode_ctx_execute");
@@ -643,9 +766,9 @@ describe("read and write route xd:// device URLs", () => {
 			// registry unvalidated) degrades to the catalog listing instead of
 			// throwing while the system prompt is built.
 			const scalarAllowlistDocs = xdevDocsAll(xdev, "builtins", "mcp__context_mode_*" as never);
-			expect(scalarAllowlistDocs).toContain("- xd://mcp__context_mode_ctx_execute —");
+			expect(scalarAllowlistDocs).toContain("- mcp__context_mode_ctx_execute —");
 			const nonStringAllowlistDocs = xdevDocsAll(xdev, "builtins", [123] as never);
-			expect(nonStringAllowlistDocs).toContain("- xd://mcp__context_mode_ctx_execute —");
+			expect(nonStringAllowlistDocs).toContain("- mcp__context_mode_ctx_execute —");
 		} finally {
 			await removeWithRetries(tempDir);
 		}
@@ -690,6 +813,91 @@ describe("web_search stays top-level under xdev", () => {
 });
 
 describe("xd:// and top-level calls share the canonical tool map", () => {
+	it("documents an active apply_patch wire alias with the canonical edit schema", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "read-xdev-wire-"));
+		try {
+			const session = xdevSession(tempDir, {
+				enableLsp: false,
+				settings: Settings.isolated({ "edit.mode": "apply_patch" }),
+			});
+			const tools = await createTools(session, ["read", "write", "edit"]);
+			const read = tools.find(tool => tool.name === "read");
+			if (!read) throw new Error("expected read tool");
+
+			const canonical = await read.execute("read-xdev-edit", { path: "xd://edit" });
+			const alias = await read.execute("read-xdev-wire", { path: "xd://apply_patch" });
+			expect(alias.content).toEqual(canonical.content);
+			expect(alias.content.find(entry => entry.type === "text")?.text).toContain("input: string");
+		} finally {
+			await removeWithRetries(tempDir);
+		}
+	});
+
+	it("applies a real patch through the active wire alias without writing a device path", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "write-xdev-wire-"));
+		try {
+			const target = path.join(tempDir, "target.txt");
+			await Bun.write(target, "before\n");
+			const session = xdevSession(tempDir, {
+				enableLsp: false,
+				settings: Settings.isolated({ "edit.mode": "apply_patch" }),
+			});
+			const tools = await createTools(session, ["read", "write", "edit"]);
+			const write = tools.find(tool => tool.name === "write");
+			if (!write) throw new Error("expected write tool");
+			const input = [
+				"*** Begin Patch",
+				"*** Update File: target.txt",
+				"@@",
+				"-before",
+				"+after",
+				"*** End Patch",
+			].join("\n");
+
+			const result = await write.execute("write-xdev-wire-patch", {
+				path: "xd://apply_patch",
+				content: JSON.stringify({ input }),
+			});
+
+			expect(result.isError).toBeUndefined();
+			expect(result.details?.xdev).toMatchObject({ tool: "apply_patch", mode: "execute", tier: "write" });
+			expect(await Bun.file(target).text()).toBe("after\n");
+			expect(await fs.readdir(tempDir)).toEqual(["target.txt"]);
+		} finally {
+			await removeWithRetries(tempDir);
+		}
+	});
+
+	it("makes a mounted wire alias unavailable when its canonical tool is disabled", async () => {
+		let calls = 0;
+		const device: Tool = {
+			name: "canonical",
+			customWireName: "wire",
+			label: "Device",
+			description: "Mounted wire-alias fixture",
+			parameters: type({}),
+			async execute() {
+				calls++;
+				return { content: [{ type: "text", text: "executed" }] };
+			},
+		};
+		const xdev = createTestXdevState([device]);
+		const write = new WriteTool(xdevSession(process.cwd(), { xdev }));
+
+		const enabled = await write.execute("wire-mounted", { path: "xd://wire", content: "{}" });
+		expect(enabled.isError).toBeUndefined();
+		expect(calls).toBe(1);
+
+		xdev.mountedNames.clear();
+		for (const name of ["canonical", "wire"]) {
+			expect(() => xdevDocs(xdev, name)).toThrow(`No such tool: xd://${name}`);
+			const disabled = await write.execute(`disabled-${name}`, { path: `xd://${name}`, content: "{}" });
+			expect(disabled.isError).toBe(true);
+			expect(disabled.content.find(entry => entry.type === "text")?.text).toContain(`No such tool: xd://${name}`);
+		}
+		expect(calls).toBe(1);
+	});
+
 	it("dispatches and documents an unmounted top-level tool, and still rejects unknown names", async () => {
 		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "write-xdev-fallback-"));
 		try {
@@ -1018,5 +1226,179 @@ describe("device writes honor lenientArgValidation", () => {
 			"Invalid args for xd://strict_dev",
 		);
 		expect(seen).toHaveLength(1);
+	});
+});
+
+describe("device cancellation lifecycle", () => {
+	function fixture(cancellationBehavior?: AgentTool["cancellationBehavior"]) {
+		const started = Promise.withResolvers<void>();
+		const aborted = Promise.withResolvers<void>();
+		const releaseCleanup = Promise.withResolvers<void>();
+		const closed = Promise.withResolvers<void>();
+		const schema = type({ mode: "'cleanup' | 'ordinary'", "cancellationBehavior?": "string" });
+		let openResources = 0;
+		let executions = 0;
+		const device: AgentTool<typeof schema, { openResources: number }> = {
+			name: "lifecycle",
+			label: "Lifecycle",
+			description: "Owns a resource until cancellation cleanup completes.",
+			parameters: schema,
+			approval: "read",
+			cancellationBehavior,
+			async execute(_id, _args, signal) {
+				executions++;
+				openResources++;
+				const onAbort = () => aborted.resolve();
+				signal?.addEventListener("abort", onAbort, { once: true });
+				if (signal?.aborted) onAbort();
+				started.resolve();
+				try {
+					await aborted.promise;
+					await releaseCleanup.promise;
+				} finally {
+					openResources--;
+					signal?.removeEventListener("abort", onAbort);
+					closed.resolve();
+				}
+				return {
+					content: [{ type: "text", text: "Cancelled after resource cleanup." }],
+					details: { openResources },
+					isError: true,
+				};
+			},
+		};
+		const hookRunner = {
+			hasHandlers: (event: string) => event === "tool_result",
+			emit: async () => ({
+				content: [{ type: "text", text: "PRIVATE-CANCELLATION-CAUSE" }],
+			}),
+		} as unknown as HookRunner;
+		const canonical = wrapToolWithMetaNotice(new HookToolWrapper(device, hookRunner));
+		const xdev = createTestXdevState([canonical]);
+		const write = wrapToolWithMetaNotice(
+			new HookToolWrapper<WriteTool["parameters"], WriteToolDetails>(
+				new WriteTool(xdevSession(process.cwd(), { xdev })),
+				hookRunner,
+			),
+		);
+		return {
+			write,
+			xdev,
+			started,
+			aborted,
+			releaseCleanup,
+			closed,
+			get openResources() {
+				return openResources;
+			},
+			get executions() {
+				return executions;
+			},
+		};
+	}
+
+	const perCall: AgentTool["cancellationBehavior"] = args =>
+		args !== null && typeof args === "object" && "mode" in args && args.mode === "cleanup"
+			? "await-cleanup"
+			: undefined;
+
+	for (const [name, behavior] of [
+		["intrinsic", "await-cleanup"],
+		["per-call", perCall],
+	] as const) {
+		it(`awaits ${name} cleanup through write, protocol, hook, and output wrappers`, async () => {
+			const test = fixture(behavior);
+			const controller = new AbortController();
+			let settled = false;
+			const execution = test.write.execute(
+				"cleanup",
+				{ path: "[xd://lifecycle#ABCD]", content: JSON.stringify({ mode: "cleanup" }) },
+				controller.signal,
+			);
+			void execution.then(
+				() => {
+					settled = true;
+				},
+				() => {
+					settled = true;
+				},
+			);
+			try {
+				await Promise.race([
+					test.started.promise,
+					execution.then(() => {
+						throw new Error("Device execution finished before starting.");
+					}),
+				]);
+				controller.abort(new Error("PRIVATE-CANCELLATION-CAUSE"));
+				await test.aborted.promise;
+				await waitForImmediate();
+				expect(test.openResources).toBe(1);
+				expect(settled).toBe(false);
+				test.releaseCleanup.resolve();
+				const result = await execution;
+				expect(test.openResources).toBe(0);
+				expect(result).toMatchObject({
+					content: [{ type: "text", text: "Cancelled after resource cleanup." }],
+					details: { xdev: { tool: "lifecycle", inner: { openResources: 0 } } },
+					isError: true,
+				});
+				expect(JSON.stringify(result)).not.toContain("PRIVATE-CANCELLATION-CAUSE");
+			} finally {
+				controller.abort();
+				test.releaseCleanup.resolve();
+				await execution.catch(() => {});
+				if (test.executions > 0) await test.closed.promise;
+			}
+		});
+	}
+
+	for (const [name, behavior] of [
+		["ordinary", undefined],
+		["per-call opt-out", perCall],
+	] as const) {
+		it(`keeps early cancellation for ${name} work despite a caller-supplied marker`, async () => {
+			const test = fixture(behavior);
+			const controller = new AbortController();
+			const execution = test.write.execute(
+				"ordinary",
+				{
+					path: "xd://lifecycle",
+					content: JSON.stringify({ mode: "ordinary", cancellationBehavior: "await-cleanup" }),
+				},
+				controller.signal,
+			);
+			try {
+				await Promise.race([
+					test.started.promise,
+					execution.then(() => {
+						throw new Error("Device execution finished before starting.");
+					}),
+				]);
+				controller.abort();
+				await expect(execution).rejects.toBeInstanceOf(Error);
+				expect(test.openResources).toBe(1);
+			} finally {
+				controller.abort();
+				test.releaseCleanup.resolve();
+				await execution.catch(() => {});
+				if (test.executions > 0) await test.closed.promise;
+			}
+			expect(test.openResources).toBe(0);
+		});
+	}
+
+	it("does not start opted-in write or direct device work after pre-cancellation", async () => {
+		const test = fixture("await-cleanup");
+		const signal = AbortSignal.abort(new Error("PRIVATE-CANCELLATION-CAUSE"));
+		const input = JSON.stringify({ mode: "cleanup" });
+		await expect(
+			test.write.execute("pre-cancelled", { path: "xd://lifecycle", content: input }, signal),
+		).rejects.toBe(signal.reason);
+		await expect(
+			dispatchXdevTool(test.xdev, "lifecycle", input, "pre-cancelled-direct", signal),
+		).rejects.toBeInstanceOf(ToolAbortError);
+		expect(test.executions).toBe(0);
+		expect(test.openResources).toBe(0);
 	});
 });

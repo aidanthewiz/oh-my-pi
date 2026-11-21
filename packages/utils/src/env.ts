@@ -149,12 +149,19 @@ const COREFORGE_MANAGED_CHILD_POLICY = {
 const projectEnvNamesLoadedByOmp = new Set<string>();
 const managedAgentEnvNames = new Set<string>();
 const managedAgentEnvValues = new Set<string>();
+const managedProfileEnvValues = new Map<string, string>();
 
 /** A Linux procfs launch snapshot exists even for ordinary CLI launches; only these captured markers require pinned AWS tools. */
 export function isCoreforgeManagedLaunch(): boolean {
 	const override = launchEnvValues?.get(managedEnvName("OMP_DOTENV_OVERRIDE"));
 	const productVersion = launchEnvValues?.get(managedEnvName("OMP_CF_PRODUCT_VERSION"));
 	return override === "1" && productVersion !== undefined && productVersion.trim() !== "";
+}
+
+/** Read captured launch or verified managed-profile authority, never project dotenv or later process mutations. */
+export function getTrustedEnvValue(name: string): string | undefined {
+	const normalized = managedEnvName(name);
+	return managedProfileEnvValues.get(normalized) ?? launchEnvValues?.get(normalized);
 }
 
 const coreforgeManagedLaunch = isCoreforgeManagedLaunch();
@@ -734,14 +741,7 @@ if (Bun.env.OMP_DOTENV_OVERRIDE === "1" && projectEnv.OMP_DOTENV_OVERRIDE === "1
 }
 const managedDotenv = coreforgeManagedLaunch;
 
-// Strip any ambient key whose value came from the launch-cwd `.env` (equality
-// match, the subtraction `filterChildShellEnv` uses) up front, so the project
-// file cannot linger as ambient fallback for a key the agent `.env` leaves
-// empty. The flag key is exempt: it is launcher-only (collision already
-// refused above), so stripping it could only erase a real launcher signal.
-// The default branch below re-applies projectEnv as its normal gap-fill layer,
-// so unmanaged precedence is unchanged; managed mode intentionally never
-// re-adds it.
+// Project dotenv values cannot become managed-mode ambient fallback.
 for (const key in projectEnv) {
 	if (key === "OMP_DOTENV_OVERRIDE") continue;
 	if (Bun.env[key] === projectEnv[key] && launchEnvValues?.get(managedEnvName(key)) !== Bun.env[key]) {
@@ -749,39 +749,80 @@ for (const key in projectEnv) {
 	}
 }
 
-// The agent/profile `.env` becomes the single authoritative credential source:
-//   1. its non-empty keys OVERRIDE the ambient environment, so a stale shell
-//      export (e.g. an old OPENAI_API_KEY in ~/.zshrc) can never shadow the
-//      org-managed value — "just put it in .env" always wins;
-//   2. the ambient environment only fills keys the profile `.env` leaves unset
-//      or empty, so a machine whose shell is already configured still starts
-//      with an empty .env (shell fallback);
-//   3. the project / config-root / $HOME `.env` layers are skipped entirely, so
-//      a random project's `.env` can never inject credentials.
-// Default (flag unset) preserves upstream precedence exactly: ambient wins,
-// then the file layers fill gaps in project > agent > config-root > home order.
+/** File-owned telemetry configuration stays out of child and extension environments. */
+const ompOtelEnvFileValues = new Map<string, string>();
+
+function foldOtelEnvName(name: string, platform: NodeJS.Platform): string {
+	return platform === "win32" ? name.toUpperCase() : name;
+}
+
+/**
+ * @internal Claims telemetry configuration from non-project dotenv files.
+ * Ordinary launches retain ambient-first precedence.
+ */
+export function claimOmpOtelEnvFileEntry(
+	name: string,
+	value: string,
+	platform: NodeJS.Platform = process.platform,
+): boolean {
+	const key = foldOtelEnvName(name, platform);
+	if (!key.startsWith("OTEL_")) return false;
+	if (!Bun.env[name] && !ompOtelEnvFileValues.get(key)) ompOtelEnvFileValues.set(key, value);
+	return true;
+}
+
+/** Resolve telemetry configuration without exposing file-owned values to the process environment. */
+export function $otelEnv(name: string): string | undefined {
+	const key = foldOtelEnvName(name, process.platform);
+	const fileValue = ompOtelEnvFileValues.get(key);
+	if (managedDotenv && fileValue) return fileValue;
+	const live = Bun.env[name];
+	if (live) return live;
+	return fileValue ?? live;
+}
+
+/**
+ * Expose file-owned telemetry configuration only during synchronous SDK construction.
+ * Restore ambient values even if construction throws.
+ */
+export function withOmpOtelEnv<T>(fn: () => T): T {
+	const previous = new Map<string, string | undefined>();
+	for (const [name, value] of ompOtelEnvFileValues) {
+		if (!managedDotenv && process.env[name]) continue;
+		previous.set(name, process.env[name]);
+		process.env[name] = value;
+	}
+	try {
+		return fn();
+	} finally {
+		for (const [name, prior] of previous) {
+			if (prior === undefined) delete process.env[name];
+			else process.env[name] = prior;
+		}
+	}
+}
 
 if (managedDotenv) {
-	// The agent/profile `.env` is authoritative. Non-empty values OVERRIDE the
-	// ambient env; an empty value defers to the ambient value so a shipped
-	// placeholder (`OPENAI_API_KEY=`) still allows shell fallback. Any key the
-	// agent `.env` omits falls back to the remaining real ambient env — the
-	// project `.env` was already evicted above, so the cwd cannot inject creds.
+	// Empty profile placeholders retain real shell fallback; other file layers have no authority.
 	for (const key in agentEnv) {
-		if (isMacosMallocStackLoggingEnvName(key)) continue;
-		if (key === "OMP_DOTENV_OVERRIDE") continue; // launcher-only — never file-sourced
+		if (isMacosMallocStackLoggingEnvName(key) || key === "OMP_DOTENV_OVERRIDE") continue;
 		const value = agentEnv[key];
-		if (value === "") continue; // placeholder — let the ambient value (if any) stand
-		Bun.env[key] = value;
+		if (value === "") continue;
 		managedAgentEnvNames.add(managedEnvName(key));
+		managedProfileEnvValues.set(managedEnvName(key), value);
+		if (foldOtelEnvName(key, process.platform).startsWith("OTEL_")) {
+			ompOtelEnvFileValues.set(foldOtelEnvName(key, process.platform), value);
+			continue;
+		}
+		Bun.env[key] = value;
 	}
 	applyLauncherCapturedChildPolicy(Bun.env);
 } else {
-	// Upstream default: ambient wins; files fill gaps, most-specific first.
 	for (const file of [projectEnv, agentEnv, piEnv, homeEnv]) {
 		for (const key in file) {
-			if (key === "OMP_DOTENV_OVERRIDE") continue; // launcher-only — never file-sourced
-			if (!isMacosMallocStackLoggingEnvName(key) && !Bun.env[key]) {
+			if (isMacosMallocStackLoggingEnvName(key) || key === "OMP_DOTENV_OVERRIDE") continue;
+			if (file !== projectEnv && claimOmpOtelEnvFileEntry(key, file[key])) continue;
+			if (!Bun.env[key]) {
 				Bun.env[key] = file[key];
 				if (file === projectEnv) projectEnvNamesLoadedByOmp.add(key);
 			}

@@ -78,7 +78,11 @@ describe("read URL: native rendering keeps only the head metadata a reader uses"
 				id: "test",
 				path: path.join(artifactsDir, `test.${toolType}.log`),
 			}),
-			settings: Settings.isolated({ "fetch.enabled": true, "providers.fetch": provider }),
+			settings: Settings.isolated({
+				"fetch.enabled": true,
+				"providers.fetch": provider,
+				"providers.webKeyless": provider === "jina",
+			}),
 			// Remote readers (Jina and the like) answer through here.
 			fetch: async input => {
 				readerCalls.push(String(input instanceof Request ? input.url : input));

@@ -55,6 +55,7 @@ function searchProvider(id: SearchProviderId, available = true): providers.Searc
 		label: `Synthetic ${id}`,
 		isAvailable: () => available,
 		isExplicitlyAvailable: () => available,
+		isKeyless: () => false,
 		search: async () => ({
 			provider: id,
 			sources: [{ title: "Synthetic search result", url: "https://x.com/synthetic/status/1" }],

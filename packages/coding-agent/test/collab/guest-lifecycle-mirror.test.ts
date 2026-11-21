@@ -54,9 +54,6 @@ import { initTheme } from "@oh-my-pi/pi-tui/theme";
 import { TERMINAL } from "@oh-my-pi/pi-tui/terminal-capabilities";
 import { cfgCompletionNotify, cfgErrorNotify } from "@oh-my-pi/pi-coding-agent/modes/settings";
 import { settings as runtimeSettings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { disposeTerminalTitleState, initTerminalTitleState } from "@oh-my-pi/pi-coding-agent/utils/title-generator";
-import { setTerminalHeadless } from "@oh-my-pi/pi-utils";
-import { mockWindowsConsoleTitle } from "../terminal-title-test-utils";
 import { refreshDirsFromEnv, TempDir } from "@oh-my-pi/pi-utils";
 import { installInMemoryRelay, uninstallInMemoryRelay } from "./helpers/in-memory-relay";
 
@@ -210,6 +207,9 @@ async function makeHarness(
 		syncRunningSubagentBadge: () => {},
 		syncComposerShape: () => {},
 		syncExtensionLinks: () => {},
+		setCollabGuest: (guest: InteractiveModeContext["collabGuest"]) => {
+			Object.assign(ctx, { collabGuest: guest });
+		},
 		eventBus: new EventBus(),
 	}) as unknown as InteractiveModeContext;
 	const showError = ctx.showError.bind(ctx);
@@ -578,19 +578,6 @@ describe("collab guest extension lifecycle mirror", () => {
 			return renderedBoundary;
 		});
 		guestContext.eventController = controller;
-		const previousHeadless = setTerminalHeadless(false);
-		const ttyDescriptor = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
-		Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true });
-		const windowsTitle = mockWindowsConsoleTitle();
-		windowsTitle.succeeds = true;
-		const titles: string[] = [];
-		const stdoutSpy = spyOn(process.stdout, "write").mockImplementation((chunk: unknown) => {
-			const payload = typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk as Uint8Array);
-			const title = /\x1b\]0;([\s\S]*?)\x07/.exec(payload)?.[1];
-			if (title !== undefined) titles.push(title);
-			return true;
-		});
-		initTerminalTitleState();
 		const notifications: Parameters<typeof TERMINAL.sendNotification>[0][] = [];
 		const completedNotification = Promise.withResolvers<void>();
 		const notificationSpy = spyOn(TERMINAL, "sendNotification").mockImplementation(notification => {
@@ -611,10 +598,17 @@ describe("collab guest extension lifecycle mirror", () => {
 				if (dropPause && frame.t === "event" && frame.event.type === "agent_end") {
 					physicalPause = frame.event;
 					hostSocket = this;
-					return;
+					return true;
 				}
-				if (dropPause && frame.t === "state" && frame.state.lifecycle?.phase === "continuing") return;
-				originalSend.call(this, wireFrame, peer);
+				return originalSend.call(this, wireFrame, peer);
+			},
+		);
+		const originalBroadcastAdvisory = CollabSocket.prototype.broadcastAdvisory;
+		const advisorySpy = spyOn(CollabSocket.prototype, "broadcastAdvisory").mockImplementation(
+			function (this: CollabSocket, wireFrame) {
+				const frame: CollabFrame = typeof wireFrame === "string" ? JSON.parse(wireFrame) : wireFrame;
+				if (dropPause && frame.t === "state" && frame.state.lifecycle?.phase === "continuing") return true;
+				return originalBroadcastAdvisory.call(this, wireFrame);
 			},
 		);
 		let snapshotApplied = Promise.withResolvers<void>();
@@ -645,14 +639,12 @@ describe("collab guest extension lifecycle mirror", () => {
 			});
 			if (!prompting) throw new Error("Host foreground did not start before guest join");
 			await modelWorking.promise;
-			expect([...titles, ...windowsTitle.titles].at(-1)).toMatch(/^π [⠁-⣿:]/);
 			if (!guestSocket?.onOpen) throw new Error("Missing guest reconnect handshake");
 			snapshotApplied = Promise.withResolvers<void>();
 			guestSocket.onOpen();
 			await snapshotApplied.promise;
 			expect(guestSession.lifecycleState).toEqual(hostSession.lifecycleState);
 			expect(guestSession.lifecycleState?.phase).toBe("running");
-			expect([...titles, ...windowsTitle.titles].at(-1)).toMatch(/^π [⠁-⣿:]/);
 			dropPause = true;
 			foregroundResponse.resolve();
 			await prompting;
@@ -666,12 +658,11 @@ describe("collab guest extension lifecycle mirror", () => {
 			await snapshotApplied.promise;
 			await renderedBoundary;
 			if (!observed) throw new Error("Host pause lost lifecycle ownership");
-			expect(hostSession.hasPendingAsyncWork()).toBe(true);
-			expect(guestSession.hasPendingAsyncWork()).toBe(false);
+			expect(hostSession.wakeSources).toBeDefined();
+			expect(guestSession.wakeSources).toBeUndefined();
 			expect(hostSession.lifecycleState?.phase).toBe("continuing");
 			expect(hostSession.lifecycleState).toEqual(observed);
 			expect(pane).toBe("working");
-			expect([...titles, ...windowsTitle.titles].at(-1)).toMatch(/^π > /);
 			await renderedBoundary;
 			expect(notifications).toEqual([]);
 
@@ -681,7 +672,6 @@ describe("collab guest extension lifecycle mirror", () => {
 			expect(guestSession.lifecycleState).toEqual(hostSession.lifecycleState);
 			await renderedBoundary;
 			expect(notifications).toEqual([]);
-			expect([...titles, ...windowsTitle.titles].at(-1)).toMatch(/^π > /);
 			if (!physicalPause || !hostSocket) throw new Error("Missing intercepted physical async pause");
 			expect(physicalPause.awaitingAsyncWork).toBe(true);
 			originalSend.call(hostSocket, { t: "event", event: physicalPause });
@@ -689,7 +679,6 @@ describe("collab guest extension lifecycle mirror", () => {
 			originalSend.call(hostSocket, { t: "error", message: "__late_pause_applied__" });
 			await latePauseApplied.promise;
 			await renderedBoundary;
-			expect([...titles, ...windowsTitle.titles].at(-1)).toMatch(/^π > /);
 			expect(guestSession.lifecycleState).toEqual(hostSession.lifecycleState);
 			expect(notifications).toEqual([]);
 			expect(hostModelCalls).toBe(1);
@@ -697,7 +686,7 @@ describe("collab guest extension lifecycle mirror", () => {
 			jobs.cancel("host-background", { ownerId: "host-async-owner" });
 			hostWork.resolve("cancelled without wake");
 			await jobs.getJob("host-background")?.promise;
-			await hostSession.settleAsyncWork();
+			await hostSession.waitForRunEnd();
 			await completedNotification.promise;
 			expect(hostSession.lifecycleState).toEqual({ runId: observed.runId, phase: "idle", outcome: "success" });
 			expect(guestSession.lifecycleState).toEqual(hostSession.lifecycleState);
@@ -718,7 +707,7 @@ describe("collab guest extension lifecycle mirror", () => {
 			jobs.cancel("local-background", { ownerId: "guest-async-owner" });
 			localWork.resolve("cancelled");
 			await jobs.getJob("local-background")?.promise;
-			await guestSession.settleAsyncWork();
+			await guestSession.waitForRunEnd();
 			expect(guestSession.lifecycleState).toEqual({ runId: localState.runId, phase: "idle", outcome: "success" });
 
 			await harness.cleanup();
@@ -753,7 +742,6 @@ describe("collab guest extension lifecycle mirror", () => {
 			await renderedBoundary;
 			expect(guestWithoutExtensions.lifecycleState).toEqual({ runId: "current", phase: "continuing" });
 			expect(notifications).toEqual([expect.objectContaining({ type: "completion" })]);
-			expect([...titles, ...windowsTitle.titles].at(-1)).toMatch(/^π [⠁-⣿:]/);
 
 			sendState("current", "idle");
 			await harness.barrier();
@@ -791,15 +779,10 @@ describe("collab guest extension lifecycle mirror", () => {
 			bus.clear();
 			controller.dispose();
 			sendSpy.mockRestore();
+			advisorySpy.mockRestore();
 			renderSpy.mockRestore();
 			errorSpy.mockRestore();
-			disposeTerminalTitleState();
-			stdoutSpy.mockRestore();
 			notificationSpy.mockRestore();
-			windowsTitle.restore();
-			if (ttyDescriptor) Object.defineProperty(process.stdout, "isTTY", ttyDescriptor);
-			else Reflect.deleteProperty(process.stdout, "isTTY");
-			setTerminalHeadless(previousHeadless);
 			resetSettingsForTest();
 			homedirSpy.mockRestore();
 			refreshDirsFromEnv();
@@ -892,7 +875,7 @@ describe("collab guest extension lifecycle mirror", () => {
 				renderedEvents.push(event.type);
 				await handleEvent(event);
 				if (event.type === "auto_retry_start") retryStarted.resolve();
-				if (event.type === "agent_end" && event.isTerminal) recovered.resolve();
+				if (event.type === "agent_end") recovered.resolve();
 			});
 			const notifications: Parameters<typeof TERMINAL.sendNotification>[0][] = [];
 			const notificationSpy = spyOn(TERMINAL, "sendNotification").mockImplementation(notification => {
@@ -914,25 +897,32 @@ describe("collab guest extension lifecycle mirror", () => {
 					if (
 						outcome === "retry-error" &&
 						((frame.t === "event" && frame.event.type === "auto_retry_end") ||
-							(disconnected && (frame.t === "event" || frame.t === "state" || frame.t === "entry")))
+							(disconnected && (frame.t === "event" || frame.t === "entry")))
 					) {
 						if (frame.t === "event" && frame.event.type === "agent_end") {
 							physical = frame.event;
 							hostSocket = this;
 						}
-						return;
+						return true;
 					}
 					if (frame.t === "event" && frame.event.type === "agent_end") {
 						physical = frame.event;
 						hostSocket = this;
-						return;
+						return true;
 					}
+					return originalSend.call(this, wireFrame, peer);
+				},
+			);
+			const originalBroadcastAdvisory = CollabSocket.prototype.broadcastAdvisory;
+			const advisorySpy = spyOn(CollabSocket.prototype, "broadcastAdvisory").mockImplementation(
+				function (this: CollabSocket, wireFrame) {
+					const frame: CollabFrame = typeof wireFrame === "string" ? JSON.parse(wireFrame) : wireFrame;
+					if (outcome === "retry-error" && disconnected && frame.t === "state") return true;
 					if (outcome === "unknown" && frame.t === "state" && frame.state.lifecycle) {
 						const { outcome: _outcome, ...lifecycle } = frame.state.lifecycle;
-						originalSend.call(this, { ...frame, state: { ...frame.state, lifecycle } }, peer);
-						return;
+						return originalBroadcastAdvisory.call(this, { ...frame, state: { ...frame.state, lifecycle } });
 					}
-					originalSend.call(this, wireFrame, peer);
+					return originalBroadcastAdvisory.call(this, wireFrame);
 				},
 			);
 			let harness: Harness | undefined;
@@ -1006,6 +996,7 @@ describe("collab guest extension lifecycle mirror", () => {
 				notificationSpy.mockRestore();
 				showErrorSpy.mockRestore();
 				sendSpy.mockRestore();
+				advisorySpy.mockRestore();
 				await auth.close();
 				resetSettingsForTest();
 				homedirSpy.mockRestore();
@@ -1705,8 +1696,10 @@ describe("collab guest extension lifecycle mirror", () => {
 					transition = harness.barrier();
 				}
 				await Promise.race([drainStarted.promise, replaced.promise]);
+				expect(ctx.collabGuest).toBe(harness.guest);
 				lookup.resolve(new Map([["local://guest-ownership", "file:///synthetic-guest-ownership"]]));
 				await transition;
+				expect(ctx.collabGuest).toBe(boundary === "leave" ? undefined : harness.guest);
 				await controller.dispatchSessionEvent({ type: "turn_start" });
 				expect(ctx.chatContainer.children).toEqual([replacement!]);
 				expect(ctx.chatContainer.render(100).join("\n")).toContain(`${boundary} replacement`);

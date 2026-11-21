@@ -68,7 +68,7 @@ describe("cached approval protects executed content and effects", () => {
 		runner.initialize(
 			{
 				sendMessage: () => {},
-				sendUserMessage: () => {},
+				sendUserMessage: async () => {},
 				appendEntry: () => {},
 				setLabel: () => {},
 				getActiveTools: () => [],
@@ -104,6 +104,7 @@ describe("cached approval protects executed content and effects", () => {
 				notify: () => {},
 				onTerminalInput: () => () => {},
 				rerenderMessage: () => {},
+				refreshTranscript: () => {},
 				getLinkClicksAvailable: () => false,
 				setStatus: () => {},
 				setWorkingMessage: () => {},

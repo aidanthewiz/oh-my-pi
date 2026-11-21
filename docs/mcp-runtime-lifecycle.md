@@ -128,6 +128,14 @@ For each discovered server in `connectServers()`:
 - records the server's negotiated protocol revision; Streamable HTTP carries it on subsequent requests in `MCP-Protocol-Version`,
 - closes transport on init failure.
 
+### Streamable HTTP response ownership
+
+- Before result capture, SSE events enforce the caller's cancellation signal and current-owner checks.
+- Capturing a result transfers trailing notifications and server requests to transport ownership. Later caller cancellation or retirement does not end that drain.
+- The captured transport lifecycle still controls dispatch and cancellation. Closing the transport cancels the drain and suppresses obsolete messages.
+- Between the request deadline and caller cancellation, the first abort source wins. A winning deadline retains its structured timeout diagnostic. A winning caller cancellation preserves its original abort reason despite a later body-decoder failure.
+- Terminal operation failures retain their diagnostics. Authentication recovery still checks ownership before credential work or replay.
+
 ### Fast startup gate + deferred fallback
 
 `connectServers()` waits on a race between:
@@ -176,6 +184,19 @@ Connected manager tools become enabled immediately. Presentation is reconciled w
 
 Both preserve MCP content and metadata; `structuredContent` is retained in `details.structuredContent` and rendered as text when not already duplicated in a text block. Server `isError` results propagate the error flag. Remaining exceptions become an `MCP failure` diagnostic with server/tool, transport, stage, failure class, retryability, message, optional code/trace/data, and next-step guidance; abort remains abort. Structured transport errors drive retry classification.
 
+Extension MCP calls use their captured manager and canonical session owner. Worker calls without that owner are rejected before dispatch.
+Disposal or registry retirement prevents the caller's later authentication, connection dispatch, and result release.
+The direct main-thread manager API still permits calls without a session context.
+
+Call ownership follows reconnects and OAuth queue admission. A retired caller cannot start queued authentication or cancel another caller's authentication.
+An admitted credential refresh can finish storing a rotated token without permitting a retired caller to reconnect.
+An independently admitted parent reconnect can finish after a joining child retires. The retired child still cannot dispatch its tool action.
+AWS authentication probes retain the host context through asynchronous preparation and final execution admission.
+Validation probes cannot start authentication recovery. The surrounding operation retains control of user-approved recovery and avoids joining its own recovery promise.
+Validation probes do not own the shared authentication attempt merely because their recovery budget is exhausted.
+Legacy discovery documents must agree with the protected resource captured from exact challenge metadata.
+Authorization-server default audiences do not replace that resource.
+
 ## Refresh/reload paths (startup vs live reload)
 
 ### Initial startup path
@@ -185,12 +206,14 @@ Both preserve MCP content and metadata; `structuredContent` is retained in `deta
 
 ### Interactive reload and live-change paths
 
-`/mcp reload` (`src/modes/controllers/mcp-command-controller.ts`) does:
+`/mcp reload` (`src/modes/controllers/mcp-command-controller.ts`) runs `reconnectMCPServers` (`src/mcp/reload.ts`), which:
 
 1. `mcpManager.disconnectAll()`,
 2. clears stale MCP prompt commands,
 3. calls `mcpManager.discoverAndConnect()` with the same project/Exa/browser filters as startup,
 4. calls `session.refreshMCPTools(mcpManager.getTools())`.
+
+A working-directory change (`/move`, resuming a session from another project) re-scopes the session-owned manager: `session.refreshProjectScope()` calls `mcpManager.setCwd(newCwd)`, which re-points project config discovery and the advertised `roots/list`, and then runs the same reconnect for every server, since roots are advertised without `listChanged`. The reconnect runs in the background, and the next turn waits for it, bounded, as it does for startup discovery. Reloads are serialized, and the first one waits for startup-deferred discovery to finish.
 
 `session.refreshMCPTools()` delegates to `src/session/session-tools.ts`, which serializes registry mutations, reconciles manager and extension-owned MCP tools, re-wraps the latest tools, and reapplies availability/presentation without restarting. Connected manager tools become enabled; extension-owned MCP tools preserve their previous selection. A failed refresh restores the previous MCP registry. The owning SDK session also installs `setOnToolsChanged`, so late initial connections, server `tools/list_changed` notifications, reconnects, and disconnects can trigger the same rebinding. Explicit `/mcp reconnect <name>` performs one final refresh after the manager reconnect completes.
 
@@ -210,6 +233,9 @@ MCP servers may push JSON-RPC notification frames at any point after `initialize
 2. **Listener fanout**: every notification (known and server-custom) is delivered after any internal refresh. `MCPManager.addNotificationListener(listener)` returns an unsubscribe function; multiple listeners have independent error isolation.
 
 If no listener is attached, the manager buffers up to 100 frames, dropping the oldest on overflow, then drains the FIFO into the first listener that attaches. `sdk.ts` registers a per-session listener that bridges to the extension runner's `mcp_notification` event with `{ server, method, params }`; the extension runner has its own bounded startup buffer. The listener and debounce timers are released through session postmortem cleanup.
+
+A `tools/list_changed` notification received during a tool or extension call scopes new tools to that call's completed owner.
+Completion waits for notification refresh settlement before granting visibility. Sibling scopes retain their existing catalogs.
 
 ## Health, reconnect, and partial failure behavior
 

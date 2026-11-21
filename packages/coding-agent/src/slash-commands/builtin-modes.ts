@@ -27,6 +27,7 @@ import { describeLoopLimitRuntime } from "../modes/loop-limit";
 import type { InteractiveModeContext } from "../modes/types";
 import ratchetKickoffPrompt from "../prompts/ratchet-kickoff.md" with { type: "text" };
 import type { AgentSession } from "../session/agent-session";
+import type { AgentViewSession } from "../session/agent-session-handle";
 import { CLI_THINKING_LEVELS, getConfiguredThinkingLevelMetadata } from "@oh-my-pi/pi-tui/thinking";
 import { noThinkingMessage, resolveThinkingArgument } from "./helpers/effort";
 import { commandConsumed, errorMessage, usage } from "./helpers/parse";
@@ -60,7 +61,7 @@ export function refreshStatusLine(ctx: InteractiveModeContext): void {
  */
 function resolveSessionModelSelector(
 	selector: string,
-	session: AgentSession,
+	session: Pick<AgentViewSession, "scopedModels" | "modelRegistry">,
 	settings: Settings,
 ): ResolveCliModelResult {
 	const scoped = session.scopedModels.map(entry => entry.model);
@@ -528,7 +529,8 @@ export const BUILTIN_MODE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 				runtime.ctx.showModelSelector({ temporaryOnly: true });
 				return;
 			}
-			const resolved = resolveSessionModelSelector(selector, runtime.ctx.viewSession, runtime.ctx.settings);
+			const target = runtime.ctx.viewSession;
+			const resolved = resolveSessionModelSelector(selector, target, target.settings);
 			if (!resolved.model) {
 				runtime.ctx.showError(`Unknown model: ${selector}`);
 				return;

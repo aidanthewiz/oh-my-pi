@@ -194,9 +194,10 @@ export function startCompletionProbe(options: CompletionProbeOptions): void {
 		const session = options.session();
 		if (!session?.isStreaming || signal.aborted) return;
 		try {
+			const sessionManager = session.sessionManager;
 			const usageOwner = {
-				sessionId: session.sessionManager.getSessionId(),
-				parentId: session.sessionManager.getLeafId(),
+				sessionId: sessionManager.getSessionId(),
+				parentId: sessionManager.getLeafId(),
 			};
 			const { replyText, assistantMessage } = await session.runEphemeralTurn({
 				promptText: prompt.render(completionProbePrompt, {
@@ -208,20 +209,22 @@ export function startCompletionProbe(options: CompletionProbeOptions): void {
 					},
 				}),
 				signal,
+				onUsage: message => {
+					if (!message.usage) return;
+					sessionManager.appendModelUsage(
+						{
+							purpose: "task-completion-probe",
+							api: message.api,
+							provider: message.provider,
+							model: message.model,
+							usage: message.usage,
+							stopReason: message.stopReason,
+							errorMessage: message.errorMessage,
+						},
+						usageOwner,
+					);
+				},
 			});
-			if (assistantMessage.usage) {
-				session.sessionManager.appendModelUsage(
-					{
-						purpose: "task-completion-probe",
-						api: assistantMessage.api,
-						provider: assistantMessage.provider,
-						model: assistantMessage.model,
-						usage: assistantMessage.usage,
-						stopReason: assistantMessage.stopReason,
-					},
-					usageOwner,
-				);
-			}
 			const estimate = parseCompletionEstimate(replyText);
 			if (signal.aborted) return;
 			if (estimate === undefined) {

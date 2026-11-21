@@ -93,7 +93,7 @@ describe("Skill URI reader capability", () => {
 			});
 			const text = systemPrompt.join("\n\n");
 			expect(text).toContain("bridge-skill");
-			expect(text).toContain("`skill://<name>`");
+			expect(text).toContain("skill://<name>");
 		} finally {
 			await fs.rm(tempDir, { recursive: true, force: true });
 		}
@@ -118,7 +118,7 @@ describe("Task MCP proxy parity", () => {
 		const manager = new MCPManager(process.cwd());
 		vi.spyOn(manager, "getTools").mockReturnValue([new MCPTool(createCapturedConnection(calls), STRICT_TOOL)]);
 
-		const [proxy] = createMCPProxyTools(manager);
+		const [proxy] = createMCPProxyTools(manager, "child");
 		if (!proxy?.execute) {
 			expect.unreachable("proxy tool missing execute");
 			return;
@@ -140,7 +140,7 @@ describe("Task MCP proxy parity", () => {
 		const manager = new MCPManager(process.cwd());
 		vi.spyOn(manager, "getTools").mockReturnValue([new MCPTool(createCapturedConnection(calls), definition)]);
 
-		const [proxy] = createMCPProxyTools(manager);
+		const [proxy] = createMCPProxyTools(manager, "child");
 		if (!proxy?.execute) {
 			expect.unreachable("proxy tool missing execute");
 			return;
@@ -160,7 +160,7 @@ describe("Task MCP proxy parity", () => {
 		const freshTool = new MCPTool(createCapturedConnection(freshCalls), STRICT_TOOL);
 
 		const getTools = vi.spyOn(manager, "getTools").mockReturnValue([staleTool]);
-		const [proxy] = createMCPProxyTools(manager); // captured while stale tool is current
+		const [proxy] = createMCPProxyTools(manager, "child"); // captured while stale tool is current
 
 		// Reconnect swaps the instance in getTools() before the proxy executes.
 		getTools.mockReturnValue([freshTool]);
@@ -217,7 +217,7 @@ function createChildMCPTool(
 		vi.spyOn(runner, "hasUI").mockReturnValue(true);
 		vi.spyOn(runner, "getUIContext").mockReturnValue({ ...runner.getUIContext(), select });
 	}
-	const [proxy] = createMCPProxyTools(manager);
+	const [proxy] = createMCPProxyTools(manager, "child");
 	if (!proxy) throw new Error("Expected an MCP child proxy");
 	const definition = customToolToDefinition(proxy);
 	const registered = wrapRegisteredTool(

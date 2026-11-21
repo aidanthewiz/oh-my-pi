@@ -48,6 +48,22 @@ export type PrepareQueuedMessages = (
 	queue: QueuedMessageQueue,
 ) => QueuedMessagePreparation | undefined | Promise<QueuedMessagePreparation | undefined>;
 
+/**
+ * Synchronous arbiter over queued messages leaving a queue for delivery, for a
+ * queue whose messages someone else may withdraw concurrently (a session homed
+ * on another thread whose view pops them).
+ */
+export interface QueuedMessageGate {
+	/**
+	 * Called with the batch about to be removed from `queue` for delivery; returns
+	 * the candidates that must be dropped from the queue instead. The others are
+	 * claimed for delivery.
+	 */
+	claim(queue: QueuedMessageQueue, candidates: readonly AgentMessage[]): readonly AgentMessage[];
+	/** Called with claimed messages that left delivery undelivered (requeued, withdrawn, or cancelled). */
+	release(messages: readonly AgentMessage[]): void;
+}
+
 /** Called once an aside has been inserted into the agent's live context. */
 export const ASIDE_MESSAGE_COMMIT = Symbol("aside-message-commit");
 /** Symbol-keyed handoff for one finalized, tool-owned stream speculation session. */
@@ -278,6 +294,9 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 */
 	getSteeringMessages?: (signal?: AbortSignal) => Promise<AgentMessage[]>;
 
+	/** Whether input is still owned by a queue and must be restored if a model call is aborted before it starts. */
+	isUndeliveredQueuedMessage?: (message: AgentMessage) => boolean;
+
 	/**
 	 * Peeks whether steering messages are queued, without consuming them.
 	 *
@@ -457,6 +476,8 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * then strips from arguments before executing tools.
 	 */
 	intentTracing?: boolean;
+	/** Schema description of the injected intent field; `PI_INTENT_DESC` overrides it. Default `concise intent`. */
+	intentDescription?: string;
 	/**
 	 * Strip tool descriptions (top-level + nested schema annotations) from the
 	 * provider-bound tool specs. Use when the full catalog is rendered into the
@@ -670,6 +691,15 @@ export interface ToolCallContext {
 	toolCalls: Array<{ id: string; name: string }>;
 	/** Provider-native metadata for the current call, when present. */
 	providerMetadata?: ToolCallProviderMetadata;
+	/**
+	 * Settles once every earlier call of this batch that runs alongside this one
+	 * and may change files (its approval, asked with its arguments and no context,
+	 * is not "read", e.g. `bash`) has
+	 * finished; absent when there is none. The model sees the batch's results only
+	 * after the whole batch, so a read-only tool can check its target again here
+	 * and redo a read those calls changed instead of returning stale content.
+	 */
+	earlierEffectsSettled?: Promise<void>;
 	/**
 	 * Cooperative steering signal: aborted when a queued user/steering message
 	 * (or an interrupting peer IRC) is detected while this tool batch runs. Its
@@ -1110,6 +1140,12 @@ export interface AgentToolContext {
 	 * calls dispatched outside the loop); absent when the host has no sink.
 	 */
 	addAdditionalContext?(context: string): void;
+	/**
+	 * Report the actual terminal result of work whose execution returned a running result.
+	 * Capture before returning; invoke once, never for previews. Observers cannot rewrite
+	 * the execution outcome or inject additional model context.
+	 */
+	onDeferredResult?(result: AgentToolResult<unknown>): void;
 	/** Present only while the matching outer tool owns its finalized stream session. */
 	[SPECULATIVE_STREAM_SESSION]?: ToolSpeculationStreamSession;
 }
@@ -1142,6 +1178,9 @@ export interface AgentToolArgStreamInit {
 	emit(update: unknown): void;
 }
 
+/** On-demand tool documentation: markdown text or an opt-in, unpaged JSON value. */
+export type AgentToolDocTopic = string | { readonly format: "json"; readonly value: unknown };
+
 // AgentTool extends Tool but adds the execute function
 export interface AgentTool<
 	TParameters extends TSchema = TSchema,
@@ -1169,11 +1208,11 @@ export interface AgentTool<
 	 */
 	readonly delegationGuidance?: string;
 	/**
-	 * On-demand documentation topics (`topic → markdown`), readable as
-	 * `xd://<tool>/<topic>`. Lets a tool keep large sub-surfaces out of its
-	 * description and advertise only a one-line pointer per topic.
+	 * On-demand documentation topics, readable as `xd://<tool>/<topic>`.
+	 * Strings are markdown documents; JSON topics return their complete value.
+	 * Advertise large sub-surfaces with a one-line pointer in the description.
 	 */
-	docTopics?(): Readonly<Record<string, string>>;
+	docTopics?(): Readonly<Record<string, AgentToolDocTopic>>;
 	/**
 	 * Concurrency mode for tool scheduling when multiple calls are in one turn.
 	 * - "shared": can run alongside other shared tools (default)
@@ -1208,6 +1247,14 @@ export interface AgentTool<
 	 * still prevents execution. Omitted tools keep the usual pre-start skip.
 	 */
 	handlesToolInterrupt?: boolean;
+	/**
+	 * Intrinsic execution policy, never model arguments or remote tool annotations.
+	 * `await-cleanup` keeps an executing call pending through bounded cancellation
+	 * teardown and preserves its safe result. Omission retains ordinary abort races.
+	 * A function resolves the policy for the arguments this call executes.
+	 * Pre-start cancellation and permission denial still prevent execution.
+	 */
+	readonly cancellationBehavior?: "await-cleanup" | ((args: unknown) => "await-cleanup" | undefined);
 	/**
 	 * Controls how the INTENT_FIELD (`i`) is handled for this tool.
 	 * - `"require"` (default): `i` is injected and required in the parameter schema.
@@ -1265,8 +1312,16 @@ export interface AgentTool<
 	) => readonly ToolApprovalCacheIdentity[] | Promise<readonly ToolApprovalCacheIdentity[]>;
 
 	/**
-	 * Paths a call reads beyond its working directory, matched against restricted folders when it
-	 * reports no `approvalCacheTargets`. Unlike cache targets they never key a remembered grant.
+	 * Capture per-invocation targets after extension preflight, before final approval and execution.
+	 * The coding-agent wrapper calls this once with the final approval args, even without a prompt
+	 * or restricted folders. Restriction queries and approval details may then read the binding.
+	 */
+	bindApprovalTargets?: (args: unknown) => void;
+
+	/**
+	 * Query paths a call reads beyond its working directory, matched against restricted folders when
+	 * it reports no `approvalCacheTargets`. Never capture bindings here: this also runs before preflight.
+	 * Unlike cache targets these paths never key a remembered grant.
 	 */
 	approvalRestrictionPaths?: (args: unknown) => readonly string[] | undefined;
 

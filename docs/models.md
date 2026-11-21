@@ -114,8 +114,107 @@ An unscoped OpenRouter `baseUrl` names the `/api/v1` chat root, so OpenRouter De
 models use its `/api/alpha` sibling on the same host, e.g. a `.../api/v1` relay serves judges at
 `.../api/alpha/decisions`.
 
-`preferWebsockets` (on a model or `modelOverrides` entry) controls whether Codex requests prefer
-the WebSocket transport. `omitMaxOutputTokens` omits the model-derived output cap.
+`omitMaxOutputTokens` omits the model-derived output cap.
+
+`compat.base64SkipThoughtSignature` (Google APIs, default `false`): sends the unsigned-tool-call bypass sentinel base64-encoded. Set it on a `google-generative-ai` model behind a gateway that decodes `thoughtSignature` as base64 and answers the raw `skip_thought_signature_validator` literal with a 400, for example when Gemini replays another model's tool-call history:
+
+```yaml
+providers:
+   my-gemini-gateway:
+      baseUrl: https://gateway.example.com/gemini/v1beta
+      api: google-generative-ai
+      models:
+         - id: gemini-3.8-flash
+           compat:
+              base64SkipThoughtSignature: true
+```
+
+### Standard Responses WebSockets
+
+Standard Responses uses HTTP/SSE by default, including at the official OpenAI
+endpoint. To opt in from OMP, set this in `config.yml`:
+
+```yaml
+providers:
+  openaiResponsesWebsockets: true
+```
+
+The catalog's `supports-websockets` KDL rule marks capability, not enablement.
+It covers OpenAI `openai-responses`, including custom providers that inherit that
+provider type. Copilot, OpenRouter and other unmarked provider/API combinations
+remain on HTTP/SSE. The independent `providers.openaiWebsockets: auto|off|on` setting
+and `PI_CODEX_WEBSOCKET` continue to govern Codex only.
+
+Model and request `preferWebsockets` can only narrow OMP's setting: **either explicit
+`false` disables WS**, even if the other is `true`. Turning the setting off cannot
+be overridden. Standalone pi-ai SDK callers have no OMP settings dependency: they
+must explicitly opt in with a request or model `true`; either `false` still vetoes it.
+
+For a gateway with uneven support, keep the existing provider entry in `models.yml`
+and disable WS for the affected model:
+
+```yaml
+providers:
+  openai:
+    api: openai-responses
+    baseUrl: https://gateway.example.com/v1
+    modelOverrides:
+      gpt-5:
+        preferWebsockets: false
+```
+
+Custom `models` entries accept the same boolean. WS uses the existing `/responses`
+endpoint and authentication; the gateway must implement `response.create`.
+SDK `fetch` overrides affect HTTP/SSE, not sockets. Explicit WS opt-in bypasses that
+HTTP override for the socket; an HTTP fallback still uses it.
+
+Payload construction and `onPayload` precede connecting, including for cancelled
+requests. A pre-send handshake network failure, connect timeout, or upgrade
+404/405/426/501 rebuilds the full HTTP candidate with its normal storage/chaining
+rules and calls `onPayload` again. The hook may replace each candidate; it does not
+see the final socket-local delta. Other upgrade statuses retain normal error
+classification. Diagnostics preserve status and available headers, not a buffered
+rejected-upgrade body.
+
+When handshake headers are available, `onResponse` reports the physical WS
+handshake once, marked with `metadata.transport="websocket"` and
+`metadata.phase="handshake"`. Reusing the socket does not emit another handshake.
+These are not per-generation headers; no generation request ID is invented.
+`omp bench --json` includes the transport when response metadata makes it
+observable. Standard WS cache benchmarks still measure generation usage, but
+cannot claim per-generation request IDs or HTTP response-cache headers.
+
+A healthy retained socket can send incremental `previous_response_id` turns,
+including with `store: false`. Changed history/options, credentials, concurrent
+temporary sockets, or a replacement after the **30-second idle limit** require
+full input without an old socket's anchor. Continuation follows the same opt-outs
+as HTTP chaining: `statefulResponses: false`, `PI_OPENAI_STATEFUL=0`, or a model's
+`compat.statefulResponses: false` sends full history on every WS turn, so set the
+compat flag for gateways that ignore `previous_response_id`. Three consecutive
+stale-anchor rejections stop sending anchors for the logical session. Official HTTP
+can already use stored stateful chaining independently of that socket lifetime; WS
+is not guaranteed to save traffic or latency there.
+
+Injected `previous_response_id` and `background: true` are rejected. A definite
+first-frame stale-anchor rejection permits one full-history resend on the same
+healthy socket before generation evidence. WS does not inherit HTTP transient,
+resume, or empty-completion retries; a successful empty WS response submits once.
+
+After an uncertain send, a transport failure or stream timeout fails the call
+without hidden HTTP replay. Partial output remains available; existing Agent
+recovery may start an SSE continuation under its own rules, retaining completed
+tool results and never executing incomplete arguments. Caller abort and protocol/
+queue errors do not mark transport incompatibility.
+
+An upgrade rejection (404/405/426/501) or a post-send transport failure makes the
+SSE downgrade sticky for the logical session, endpoint and model until
+`releaseSession`/provider-state `close` or a new scope. A pre-send network failure or
+connect timeout falls back for that request only; a second consecutive one becomes
+sticky, and a completed WS exchange resets the count. Embedders retaining provider
+state must release finished sessions. Calls without a logical session ID do not
+share sticky state; without `providerSessionState`, it lasts only for that call.
+Normal idle retirement is not a downgrade. Codex's protocol and recovery remain
+independent.
 
 ### Bedrock request options
 
@@ -144,20 +243,34 @@ override matching model tags. These fields do not configure the Anthropic Messag
 - `typesafe`
 - `openrouter-decisions`
 - `openai-decisions`
+- `google-decisions`
 - `workers-ai-systemone`
 
-`typesafe`, `openrouter-decisions`, `openai-decisions`, and `workers-ai-systemone` are judgment APIs, not chat transports. Select these models through the `judge` role:
+`typesafe`, `openrouter-decisions`, `openai-decisions`, `google-decisions`, and `workers-ai-systemone` are judgment APIs, not chat transports. Select these models through the `judge` role:
 
 - `typesafe` posts the System One body to `{baseUrl}/v1/systemone`.
 - `openrouter-decisions` posts the same body to `{baseUrl}/decisions`.
-- `openai-decisions` translates questions and answers for `{baseUrl}/decisions`. The authored `openai/gpt-6-luna-decisions` model requests wire ID `gpt-6-luna`. The current frozen bundle does not contain this row; successful OpenAI discovery adds it when absent.
+- `openai-decisions` translates questions and answers for `{baseUrl}/decisions`. The authored `openai/gpt-6-luna-decisions` model requests wire ID `gpt-6-luna`.
+- `google-decisions` translates questions and answers for `{baseUrl}/decisions` with the key in `x-goog-api-key`, including `google/gemini-decision-1`.
 - `workers-ai-systemone` posts the System One body to `{baseUrl}/{model id}`. The stored account ID or `CLOUDFLARE_ACCOUNT_ID` replaces `<account>` in the base URL. Its runtime factory supplies the authored Clef models.
 
 Model `headers` carry routing or custom authentication headers. Model metadata does not grant account access or bypass configured model scope.
 
-Judgment requests can share image attachments with vision-chat requests. Native OpenAI Decisions, TypeSafe Jev, OpenRouter Jev, and Workers AI judges, plus prompted vision-chat models, support images; text-only candidates are skipped for image requests. `Judge.supportsImages` identifies compatible candidates, and a judge chain with no image-capable model fails explicitly rather than dropping images. Prompted judgments normalize images for the selected candidate, including upscaling undersized rasters and converting WebP for models with STB-backed decoders. The native judge chain fits images into the selected wire and model bounds before credential lookup or cache access; images already within bounds retain their original bytes. When constructing a `NativeJudge` directly for System One, set `supportsImages: true`; `createNativeJudge` derives this flag from the catalog.
+Judgment requests can share image attachments with vision-chat requests. Native OpenAI Decisions, Gemini Decisions, TypeSafe Jev, OpenRouter Jev, and Workers AI judges, plus prompted vision-chat models, support images; text-only candidates are skipped for image requests. `Judge.supportsImages` identifies compatible candidates, and a judge chain with no image-capable model fails explicitly rather than dropping images. Prompted judgments normalize images for the selected candidate, including upscaling undersized rasters and converting WebP for models with STB-backed decoders. The native judge chain fits images into the selected wire and model bounds before credential lookup or cache access; images already within bounds retain their original bytes. When constructing a `NativeJudge` directly for System One, set `supportsImages: true`; `createNativeJudge` derives this flag from the catalog.
 
 Catalog-backed native judges apply the selected model's image bounds. Direct `NativeJudge` constructors can supply `imageInput` bounds explicitly; opting into images does not inherit Jev's size limits for unrelated System One models.
+
+`openrouter-decisions` judges honor the model's `compat.openRouterRouting` and `compat.extraBody` as OpenRouter chat models do, under any base URL: routing (including an `@provider` selector pin) becomes the request's `provider` field, then `extraBody` is merged over the body. `openRouterRouting` accepts only `only` and `order`; for other [provider preferences](https://openrouter.ai/docs/provider-routing) such as `allow_fallbacks` or `data_collection`, set the whole `provider` object in `extraBody`, which replaces the routing block. Other judgment APIs ignore both keys.
+
+```yaml
+providers:
+   openrouter:
+      modelOverrides:
+         typesafe/jev-1.14:
+            compat:
+               extraBody:
+                  provider: { only: [typesafe], allow_fallbacks: false, data_collection: deny }
+```
 
 OpenAI Decisions forwards embedded `ImageContent.detail`, and different explicit fidelity settings retain separate native image-judgment cache entries. TypeSafe Jev has no image-detail equivalent: detail is ignored on the wire and in cache identity, so requests that differ only by detail can reuse an answer. Omitted detail and explicit `auto` share the default setting.
 
@@ -167,7 +280,7 @@ After image filtering, the same native-only tail policy used for text judgments 
 
 #### Jev images (experimental)
 
-Native image judgments for Jev are experimental. Direct TypeSafe Jev supports `jev-latest`, `jev-preview`, `jev-1.13.0`, and `jev-1.14.0` (the default `judge` role uses `typesafe/jev-1.14.0`; `jev-latest` is TypeSafe's stable alias, currently `jev-1.13.0`). OpenRouter supports `typesafe/jev-1.13`, `typesafe/jev-1.14`, and `~typesafe/jev-latest`.
+Native image judgments for Jev are experimental. Direct TypeSafe Jev supports `jev-latest`, `jev-preview`, `jev-1.13.0`, and `jev-1.14.0` (the default `judge` role uses `typesafe/jev-1.14.0`; `jev-latest` is TypeSafe's stable alias and has served `jev-1.14.0` since 2026-10-22). OpenRouter supports `typesafe/jev-1.13`, `typesafe/jev-1.14`, and `~typesafe/jev-latest`.
 
 Images join `state` without replacing it: an object root keeps its fields and gains them under a collision-safe `__omp_judgment_images` key (with a numeric suffix if the key is taken), an array root gains them at the end, and a string root becomes `[original, ...images]`. Direct TypeSafe requests add each image as a referenced `assets` entry and put its reference in `state`, setting `TypeSafe-Danger-Zone-Images: true` only when images are attached; caller-supplied assets (auth gateway) must each be referenced in `state`, `instructions`, or `criteria`, and each split request carries only the assets it references. OpenRouter encodes each image as an `image_url` data URL part and uses neither the TypeSafe header nor a top-level `images` field.
 
@@ -223,8 +336,8 @@ Loading models.yml checks a `modelOverrides` `kind` only against an api the file
 - `discovery.advertisedReasoning`: optional boolean, default `true`, for `openai-models-list`, `lm-studio`, and `proxy`. Discovery reads what a `/v1/models` row states about its own reasoning surface (`supported_reasoning_levels` / `default_reasoning_level` / `reasoning`, top-level or under `metadata`) and lets it outrank the bundled-reference guess, so a gateway that dispatches with its own catalog offers exactly the tiers its route accepts. A row that lists `none` gets `reasoningDisableMode: none-effort`, so a thinking-off request sends the off-switch instead of being clamped to the lowest tier. An advertised ladder also pins `defaultLevel` inside itself, so catalog policy cannot inject a tier the row omits. A row reporting `reasoning: false` overrides a reasoning-enabled reference for that id. Set the flag to `false` when an endpoint advertises levels its route rejects: discovery then builds each model's thinking surface from the bundled reference alone. A row that says nothing about reasoning is unaffected either way. Explicit `modelOverrides.<id>.thinking` and `compat.supportsReasoningEffort` still win over both. `litellm` does not accept the flag: its authoritative reasoning metadata comes from `/model_group/info`, so the setting would only apply to its `/v1/models` fallback.
 - `transport`: `pi-native` only. When set, every model under that provider is sent to an `omp auth-gateway` compatible `baseUrl` via `POST /v1/pi/stream`; `apiKey` is the gateway bearer.
 - `imageInputDecoder`: `stb` only. Set this on a custom model or `modelOverrides` entry when the serving backend uses an STB-compatible image decoder that cannot accept WebP; OMP converts attached and historical WebP images before provider dispatch.
-- `imageCountBudget`: positive integer. Set this on a custom model or `modelOverrides` entry to state how many images one request to its host may carry. It replaces the catalog budget, which is 5 for a provider no catalog rule names. A gateway in front of a vendor with a higher limit needs it: once a session holds more images than the budget, Coreforge drops the oldest ones, which changes the cached prompt prefix. This metadata does not change model admission, credentials, or routing policy.
-- `tokenizer`: opt into a specific embedded local tokenizer when a proxy's model id is ambiguous or noncanonical. Allowed values: `claude-v3`, `claude-v47`, `claude-v5`, `claude-v5-sonnet`, `qwen3`, `deepseek-v3`, `kimi-k2`, `glm5`, and `o200k` (OpenAI GPT-5 and later). Omit it to use catalog identity policy; unknown models retain the fast local estimate.
+- `imageCountBudget`: positive integer. Set this on a custom model or `modelOverrides` entry to state how many images one request to its host may carry. It replaces the catalog budget, which is 5 for a provider no catalog rule names. Once a session holds more images than the budget, Coreforge drops the oldest ones, changing the cached prompt prefix. This metadata does not change model admission, credentials, or routing policy.
+- `tokenizer`: opt into a specific embedded local tokenizer when a proxy's model id is ambiguous or noncanonical. Allowed values: `claude-v3`, `claude-v47`, `claude-v5`, `claude-v5-sonnet`, `qwen3`, `deepseek-v3`, `kimi-k2`, `glm5`, `cl100k` (OpenAI GPT-3.5 and GPT-4), and `o200k` (OpenAI GPT-5 and later). Omit it to use catalog identity policy; models without a tokenizer count in o200k.
 
 ## Validation rules (current)
 
@@ -505,6 +618,10 @@ Runtime discovery probes LiteLLM management metadata in order: `GET /model_group
 
 If every metadata route is unavailable, discovery falls back to the OpenAI-compatible `GET /models` list. A forbidden or failed metadata request is logged once with its endpoint and status; `404` is treated as an absent route. Both paths exclude models explicitly marked with known task-specific LiteLLM modes: `audio_speech`, `audio_transcription`, `batch`, `embedding`, `guardrail`, `image_edit`, `image_generation`, `moderation`, `ocr`, `rerank`, `search`, `vector_store`, and `video_generation`. Missing, null, and unrecognized modes remain selectable so router aliases continue to work. Rich metadata maps per-model context, capability, and upstream-provider fields. OpenAI-backed models use LiteLLM's Responses route so reasoning summaries remain available; mixed-provider groups stay on Chat Completions. Bare fallback ids use the known OpenAI model families for routing and bundled reference metadata when available. Fallback pricing remains unknown (represented by zero); configured generic discovery uses a 128,000-token context default when neither the endpoint nor a bundled reference supplies a limit. Rich management metadata can supply provider-specific prices. Later probes fill or override reported metadata for models in the first usable roster rather than unioning every endpoint's roster.
 
+### Bifrost provider discovery
+
+When `bifrost` has a credential (`BIFROST_API_KEY` or stored `/login bifrost` auth), runtime discovery reads the gateway's `GET /models` roster from the provider `baseUrl` / `models.yml` config, otherwise `BIFROST_BASE_URL`, otherwise `http://localhost:8080/v1`. Model ids keep Bifrost's `<bifrost-provider>/<model>` form. Chat models use `openai-completions`; decision models become `openai-decisions` judges on `POST {baseUrl}/decisions`. The roster is authoritative and cached per key and base URL. Row mapping, decision-model detection, and judge retry guidance are in [Bifrost](provider-quirks.md#bifrost-bifrost).
+
 ### Generic OpenAI-compatible discovery
 
 `openai-models-list` reads `{baseUrl}/v1/models` by default (without adding a second `/v1`).
@@ -521,6 +638,21 @@ existing native/reference/default fallback.
 Silent endpoints can inherit bundled-reference limits, reasoning, and input modalities; unknown models
 use 128,000 context and 32,768 output as generic chat defaults. Output caps are bounded by the resolved context;
 Anthropic-routed models use an 8,192-token fallback output cap.
+
+When neither configuration, discovery nor the catalog establishes reasoning support, thinking is
+**unverified**, not disabled. Selecting a thinking level does not authorize separate inference requests.
+Normal sessions and admitted or frozen requests never run capability probes.
+
+Low-level SDK callers can explicitly set `StreamOptions.allowThinkingCapabilityProbe: true` to authorize
+small, potentially billed probes. Requests with `beforeDispatch`, `onPayload`, or terminal-drain admission
+still skip probing. The auth gateway never accepts this option from a client.
+
+Opted-in probes contain a fixed arithmetic question, never the caller's conversation or tools.
+They test supported levels and request formats, and can add several requests before the requested turn.
+Accepted levels, request format and observed reasoning are saved in `models.db` for the provider,
+API, endpoint and wire model ID. Positive results expire after 30 days; negative results expire after one day.
+Auth failures, rate limits, outages and timeouts remain inconclusive. Explicit capability settings,
+including `reasoning: false`, take precedence.
 
 A row advertising only image output becomes an image-generation runner; embedding-only output
 becomes an embedding runner. Mixed outputs remain chat models. These runners are visible with
@@ -776,6 +908,7 @@ Related settings:
 - `modelProviderOrder` (provider precedence when equivalent concrete choices share an id)
 - `providers.kimiApiFormat` (`auto|openai|anthropic`; `auto` follows server-declared model metadata)
 - `providers.openaiWebsockets` (`auto|off|on` websocket preference for OpenAI Codex transport)
+- `providers.openaiResponsesWebsockets` (opt-in standard Responses transport; see [Standard Responses WebSockets](#standard-responses-websockets))
 - `providers.openaiLiveSteering` (deliver mid-response user messages into GPT-6 responses over the Codex WebSocket)
 
 `modelRoles` stores selectors such as `provider/modelId`. `enabledModels` accepts
@@ -1030,7 +1163,8 @@ An explicit per-request region or a model ARN's region wins. Otherwise an ambien
 `AWS_REGION`/`AWS_DEFAULT_REGION`/the AWS profile is used when compatible with the inference
 profile's geo prefix; a compatible guardrail ARN region or the geo's default region is the
 fallback. Models without a recognized geo prefix use the ambient region, then the guardrail ARN
-region, then `us-east-1`. Set `baseUrl` on `providers.amazon-bedrock` (or on a custom provider using
+region, then a regional `baseUrl` region, then `us-east-1`. Set `baseUrl` on `providers.amazon-bedrock`
+(or on a custom provider using
 `api: bedrock-converse-stream`) to send requests somewhere else instead — a VPC/PrivateLink
 endpoint, a FIPS host, or a gateway. Any path or query string on the `baseUrl` is kept — the path
 as a prefix, the query appended to the final URL (and included in SigV4's canonical request when
@@ -1049,9 +1183,10 @@ with the resolved region — signing has to match the region it sends to, and ev
 model already carries such a `baseUrl`. Use a distinct host (VPC endpoint, `-fips`, gateway) to
 pin an origin exactly.
 
-Region resolution itself is unaffected by `baseUrl`, because SigV4 still signs with a real AWS
-region — set `AWS_REGION` or use a region-scoped model id/ARN if the endpoint expects a specific
-one. A gateway that accepts a bearer token instead of SigV4 needs no AWS signing credentials: set the
+For models without a recognized geo prefix, a regional `baseUrl` sets the region when the ambient
+and guardrail ARN regions are unset. SigV4 signs with that region instead of the `us-east-1` default.
+An ambient region or region-scoped model id/ARN overrides it. A gateway that accepts a bearer token
+instead of SigV4 needs no AWS signing credentials: set the
 provider's `apiKey` (or `AWS_BEARER_TOKEN_BEDROCK`) and signing is skipped. Region resolution still
 controls AWS's default host.
 

@@ -13,6 +13,7 @@ fn dropping_an_unpolled_worker_retains_published_path_storage() {
 		ignorer: None,
 		cache: None,
 		root_dev: None,
+		fences: Fences::default(),
 		retained: Arc::new(AtomicUsize::new(0)),
 		jobs,
 		workers: 1,
@@ -56,6 +57,7 @@ async fn worker_completion_publishes_entries_before_waking_the_collector() {
 		ignorer: None,
 		cache: None,
 		root_dev: None,
+		fences: Fences::default(),
 		retained: Arc::new(AtomicUsize::new(0)),
 		jobs,
 		workers: 1,
@@ -124,8 +126,8 @@ fn sorted_slots_release_deep_and_shared_subtrees_iteratively() {
 		.spawn(|| {
 			let mut arena = Arena::default();
 			let path = arena.push(&[b"leaf"]);
-			let mut root = Arc::new(Slot::new());
-			let _ = root.set(vec![Item {
+			let mut root = Arc::new(Slot::default());
+			let _ = root.items.set(vec![Item {
 				name: path,
 				kind: ItemKind::Entry(Stored {
 					path,
@@ -137,8 +139,10 @@ fn sorted_slots_release_deep_and_shared_subtrees_iteratively() {
 			}]);
 			let shared = root.clone();
 			for _ in 0..4096 {
-				let parent = Arc::new(Slot::new());
-				let _ = parent.set(vec![Item { name: path, kind: ItemKind::Dir(root) }]);
+				let parent = Arc::new(Slot::default());
+				let _ = parent
+					.items
+					.set(vec![Item { name: path, kind: ItemKind::Dir(root) }]);
 				root = parent;
 			}
 			let mut out = Vec::new();

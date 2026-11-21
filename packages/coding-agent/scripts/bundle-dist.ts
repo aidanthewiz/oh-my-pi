@@ -14,7 +14,7 @@ const shebang = "#!/usr/bin/env bun\n";
 const obsoleteHtmlExportAssetPattern =
 	/^(?:template-[^.]+\.(?:css|html|js)|tool-views\.generated-[^.]+\.js|(?:marked|highlight)\.min-[^.]+\.js)$/;
 
-// Native / optional / platform-specific deps are loaded from installed files.
+// Native/platform dependencies and on-demand model runtimes stay outside the bundle.
 const ALWAYS_EXTERNAL = ["@oh-my-pi/pi-natives", "@huggingface/transformers", "fastembed", "onnxruntime-node"];
 
 /**
@@ -35,10 +35,9 @@ const inlineNativeNoticesPlugin: Bun.BunPlugin = {
 // published package resolves it from node_modules at runtime; bundling only embeds a
 // redundant copy that bloats dist/cli.js. NEVER add a patched dependency here — the
 // bundle is where a root `patchedDependencies` patch is baked in, so an externalized
-// import would load the unpatched npm package in users' installs (currently
-// @ark/schema is patched, so it — and arktype, which pulls @ark/schema — stay
-// bundled).
-const RUNTIME_EXTERNAL = ["puppeteer-core", "@babel/parser"];
+// import would load the unpatched npm package in users' installs.
+// @ark/schema and puppeteer-core are patched, so they stay bundled.
+const RUNTIME_EXTERNAL = ["@babel/parser"];
 
 async function runCommand(command: string[]): Promise<void> {
 	const proc = Bun.spawn(command, {

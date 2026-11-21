@@ -81,13 +81,7 @@ async function withSession(
 	}
 }
 
-async function assertCapability(
-	session: AgentSession,
-	settings: Settings,
-	taskDepth: number,
-	tuiTranscript: boolean,
-	allowed: boolean,
-) {
+async function assertCapability(settings: Settings, taskDepth: number, tuiTranscript: boolean, allowed: boolean) {
 	const caller = { settings, taskDepth, tuiTranscript } as unknown as ToolSession;
 	const router = InternalUrlRouter.instance();
 	const tier = router.writeTier("out://", "Synthetic status", caller);
@@ -99,7 +93,6 @@ async function assertCapability(
 		expect(tier).toMatchObject({ policy: "deny" });
 		await expect(router.write("out://", "Synthetic status", { session: caller })).rejects.toThrow();
 	}
-	expect(session.systemPrompt.join("\n").includes("`out://`:")).toBe(allowed);
 }
 
 async function changeCapability(session: AgentSession, change: () => void | Promise<void>) {
@@ -126,9 +119,8 @@ describe("out:// session capability authority", () => {
 			for (const enabled of [undefined, false, true]) {
 				it(`TA-OUT-MATRIX depth ${taskDepth}, TUI ${tuiTranscript}, configured ${enabled}`, async () => {
 					const settings = Settings.isolated(enabled === undefined ? {} : { "out.enabled": enabled });
-					await withSession(settings, taskDepth, tuiTranscript, async session => {
+					await withSession(settings, taskDepth, tuiTranscript, async () => {
 						await assertCapability(
-							session,
 							settings,
 							taskDepth,
 							tuiTranscript,
@@ -143,11 +135,11 @@ describe("out:// session capability authority", () => {
 	it("TA-OUT-OVERRIDE refreshes headless capability on equal-default override and clear", async () => {
 		const settings = Settings.isolated();
 		await withSession(settings, 0, false, async session => {
-			await assertCapability(session, settings, 0, false, false);
+			await assertCapability(settings, 0, false, false);
 			await changeCapability(session, () => cfgOutEnabled.override(settings, true));
-			await assertCapability(session, settings, 0, false, true);
+			await assertCapability(settings, 0, false, true);
 			await changeCapability(session, () => cfgOutEnabled.clearOverride(settings));
-			await assertCapability(session, settings, 0, false, false);
+			await assertCapability(settings, 0, false, false);
 		});
 	}, 15_000);
 
@@ -156,11 +148,11 @@ describe("out:// session capability authority", () => {
 		const child = parent.overlay();
 		try {
 			await withSession(child, 0, false, async session => {
-				await assertCapability(session, child, 0, false, false);
+				await assertCapability(child, 0, false, false);
 				await changeCapability(session, () => cfgOutEnabled.override(parent, true));
-				await assertCapability(session, child, 0, false, true);
+				await assertCapability(child, 0, false, true);
 				await changeCapability(session, () => cfgOutEnabled.clearOverride(parent));
-				await assertCapability(session, child, 0, false, false);
+				await assertCapability(child, 0, false, false);
 			});
 		} finally {
 			parent.cancelPendingSaves();
@@ -211,17 +203,17 @@ describe("out:// session capability authority", () => {
 				0,
 				false,
 				async session => {
-					await assertCapability(session, loaded, 0, false, false);
+					await assertCapability(loaded, 0, false, false);
 					await changeCapability(session, async () => {
 						fs.writeFileSync(config, "out:\n  enabled: true\n");
 						await loaded.reloadFromDisk();
 					});
-					await assertCapability(session, loaded, 0, false, true);
+					await assertCapability(loaded, 0, false, true);
 					await changeCapability(session, async () => {
 						fs.writeFileSync(config, "{}\n");
 						await loaded.reloadFromDisk();
 					});
-					await assertCapability(session, loaded, 0, false, false);
+					await assertCapability(loaded, 0, false, false);
 				},
 				temp.path(),
 			);

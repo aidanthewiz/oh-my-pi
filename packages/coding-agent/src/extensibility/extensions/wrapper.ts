@@ -7,11 +7,12 @@ import {
 	type AgentToolResult,
 	type AgentToolUpdateCallback,
 	isNonBlankContext,
+	resolveToolCancellationBehavior,
 	type ToolLoadMode,
 } from "@oh-my-pi/pi-agent-core";
 import type { ComputerSafetyCheck, ImageContent, Static, TextContent, TSchema } from "@oh-my-pi/pi-ai";
 import { TERMINAL } from "@oh-my-pi/pi-tui";
-import { prompt, sanitizeText, untilAborted } from "@oh-my-pi/pi-utils";
+import { logger, prompt, sanitizeText, untilAborted, toError } from "@oh-my-pi/pi-utils";
 import type { Theme } from "@oh-my-pi/pi-tui/theme";
 import nativeDelegationTemplate from "../../prompts/tools/native-delegation.md" with { type: "text" };
 import { cfgApprovalNotify } from "../../tools/settings";
@@ -29,13 +30,21 @@ import {
 	resolveApprovalFromContext,
 	sessionApprovalScope,
 } from "../../tools/approval";
+import { ParentRuntimeApprovalError, type SubagentRuntimeApprovalResult } from "../../tools/subagent-runtime-approval";
 import { getApprovalGrants } from "../../tools/approval-cache";
+import { withToolApprovalScope } from "../../tools/approval-scope";
 import { defaultLoadModeForToolName } from "../../tools/essential-tools";
 import { withFileMutationSession } from "../../tools/file-write-fallback";
 import { mcpToolEventIdentity, normalizeToolEventInput, resolveToolEventInput } from "../tool-event-input";
 import { applyToolProxy } from "../tool-proxy";
 import type { ExtensionRunner } from "./runner";
-import type { ExtensionAgentIdentity, RegisteredTool, ToolCallEventResult } from "./types";
+import type {
+	ExtensionAgentIdentity,
+	RegisteredTool,
+	ToolCallEventResult,
+	ToolResultEvent,
+	ToolResultEventResult,
+} from "./types";
 
 /**
  * Second `renderCall` argument that satisfies both the omp and the upstream-pi
@@ -82,6 +91,7 @@ export class RegisteredToolAdapter implements AgentTool<any, any, any> {
 	declare parameters: any;
 	declare label: string;
 	declare strict: boolean;
+	declare readonly cancellationBehavior?: AgentTool["cancellationBehavior"];
 
 	renderCall?: (args: any, options: any, theme: any) => any;
 	renderResult?: (result: any, options: any, theme: any, args?: any) => any;
@@ -229,6 +239,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 	declare parameters: TParameters;
 	declare label: string;
 	declare strict: boolean;
+	declare readonly cancellationBehavior?: AgentTool["cancellationBehavior"];
 	readonly #agent: ExtensionAgentIdentity | undefined;
 
 	constructor(
@@ -251,6 +262,16 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 	}
 
 	async execute(
+		toolCallId: string,
+		params: Static<TParameters>,
+		signal?: AbortSignal,
+		onUpdate?: AgentToolUpdateCallback<TDetails, TParameters>,
+		context?: AgentToolContext,
+	): Promise<AgentToolResult<TDetails, TParameters>> {
+		return withToolApprovalScope(() => this.#execute(toolCallId, params, signal, onUpdate, context));
+	}
+
+	async #execute(
 		toolCallId: string,
 		params: Static<TParameters>,
 		signal?: AbortSignal,
@@ -483,6 +504,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				let approveSession = false;
 				let approveModeSession = false;
 				let targetGrant: { grant: "folder" | "target"; always: boolean } | undefined;
+				let validateParentApproval: (() => void) | undefined;
 				if (required) {
 					const scheduledCall = context?.toolCall?.toolCalls[context.toolCall.index];
 					if (
@@ -516,7 +538,37 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 							});
 						}
 					};
-					if (!this.runner.hasUI()) {
+					let parentDecision: SubagentRuntimeApprovalResult | undefined;
+					if (
+						!this.runner.hasUI() &&
+						runtimeApproval?.allowParentApproval === true &&
+						sessionApproval === undefined &&
+						safetySnapshot.length === 0 &&
+						resolved.policy === "allow"
+					) {
+						try {
+							const agent = this.#agent ?? this.runner.createContext?.().agent;
+							if (agent?.kind === "sub") {
+								parentDecision = await this.runner.requestParentRuntimeApproval?.(
+									{
+										agentId: agent.id,
+										sessionId: approvalSessionId,
+										cwd: this.runner.cwd,
+										toolName: this.tool.name,
+										toolCallId,
+										args: inputSnapshot,
+										approval: runtimeApproval,
+										policyReason: resolved.reason,
+									},
+									signal,
+								);
+							}
+						} catch (error) {
+							await emitResolved(false, error instanceof Error ? error.message : "parent approval aborted");
+							throw error;
+						}
+					}
+					if (!this.runner.hasUI() && parentDecision === undefined) {
 						await emitResolved(false, "no interactive UI available");
 						if (runtimeApproval) {
 							throw new Error(
@@ -543,59 +595,77 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 								`  3. Use an interactive UI to approve the tool call`,
 						);
 					}
-					const ui = this.runner.getUIContext();
-					if (approvalContext?.settings && cfgApprovalNotify.get(approvalContext.settings) === "on") {
-						TERMINAL.sendNotification({
-							title: context?.sessionManager?.getSessionName() || "Coreforge",
-							body: "Tool approval required",
-							type: "approval",
-							urgency: "normal",
-							actions: "focus",
-						});
-					}
-					let approved = false;
-					try {
-						if (runtimeApproval) {
-							const safetySuffix = safetySnapshot.length
-								? `\n\nProvider safety checks:\n${safetyCheckLines(safetySnapshot).join("\n")}`
-								: "";
-							const choice = await ui.select(
-								`Approve ${this.tool.name}?\nReason: ${runtimeApproval.reason}\n${runtimeApproval.prompt}${safetySuffix}`,
-								sessionApproval ? ["Deny", "Approve once", sessionApproval.label] : ["Deny", "Approve once"],
-								{ tuiStyle: runtimeApproval.tuiStyle },
-							);
-							approveSession = sessionApproval !== undefined && choice === sessionApproval.label;
-							approved = choice === "Approve once" || approveSession;
-						} else if (sessionApproval || safetySnapshot.length) {
-							const base = formatApprovalPrompt(this.tool, resolvedArgs, reason);
-							const choice = await ui.select(
-								safetySnapshot.length
-									? `${base}\nProvider safety checks:\n${safetyCheckLines(safetySnapshot).join("\n")}`
-									: base,
-								sessionApproval ? ["Approve", "Deny", sessionApproval.label] : ["Deny", "Approve"],
-							);
-							approveSession = sessionApproval !== undefined && choice === sessionApproval.label;
-							approved = choice === "Approve" || approveSession;
-						} else {
-							const answer = await requestApproval(ui, this.tool, resolvedArgs, {
-								reason,
-								sessionSubject: sessionScope?.subject,
-								grants: cacheTargets,
-								targets,
-								allowPersistentGrants,
-							});
-							approveModeSession = answer === "session" && sessionScope !== undefined;
-							targetGrant = typeof answer === "object" ? answer : undefined;
-							approved = answer === "once" || approveModeSession || targetGrant !== undefined;
-						}
+					if (parentDecision !== undefined) {
 						signal?.throwIfAborted();
 						if (this.runner.sessionId !== approvalSessionId) throw new Error("Approval session changed");
-					} catch (error) {
-						await emitResolved(false, error instanceof Error ? error.message : "approval aborted");
-						throw error;
+						if (parentDecision.decision === "approved") {
+							validateParentApproval = parentDecision.validate;
+							validateParentApproval();
+						}
+						const refusal =
+							parentDecision.decision === "approved"
+								? undefined
+								: new ParentRuntimeApprovalError(this.tool.name, parentDecision);
+						await emitResolved(refusal === undefined, refusal?.message);
+						if (refusal) throw refusal;
+						validateParentApproval?.();
+					} else {
+						const ui = this.runner.getUIContext();
+						if (approvalContext?.settings && cfgApprovalNotify.get(approvalContext.settings) === "on") {
+							TERMINAL.sendNotification({
+								title: context?.sessionManager?.getSessionName() || "Coreforge",
+								body: "Tool approval required",
+								type: "approval",
+								urgency: "normal",
+								actions: "focus",
+							});
+						}
+						let approved = false;
+						try {
+							if (runtimeApproval) {
+								const safetySuffix = safetySnapshot.length
+									? `\n\nProvider safety checks:\n${safetyCheckLines(safetySnapshot).join("\n")}`
+									: "";
+								const choice = await ui.select(
+									`Approve ${this.tool.name}?\nReason: ${runtimeApproval.reason}\n${runtimeApproval.prompt}${safetySuffix}`,
+									sessionApproval ? ["Deny", "Approve once", sessionApproval.label] : ["Deny", "Approve once"],
+									{ tuiStyle: runtimeApproval.tuiStyle, signal },
+								);
+								approveSession = sessionApproval !== undefined && choice === sessionApproval.label;
+								approved = choice === "Approve once" || approveSession;
+							} else if (sessionApproval || safetySnapshot.length) {
+								const base = formatApprovalPrompt(this.tool, resolvedArgs, reason);
+								const choice = await ui.select(
+									safetySnapshot.length
+										? `${base}\nProvider safety checks:\n${safetyCheckLines(safetySnapshot).join("\n")}`
+										: base,
+									sessionApproval ? ["Approve", "Deny", sessionApproval.label] : ["Deny", "Approve"],
+									{ signal },
+								);
+								approveSession = sessionApproval !== undefined && choice === sessionApproval.label;
+								approved = choice === "Approve" || approveSession;
+							} else {
+								const answer = await requestApproval(ui, this.tool, resolvedArgs, {
+									reason,
+									sessionSubject: sessionScope?.subject,
+									grants: cacheTargets,
+									targets,
+									allowPersistentGrants,
+									signal,
+								});
+								approveModeSession = answer === "session" && sessionScope !== undefined;
+								targetGrant = typeof answer === "object" ? answer : undefined;
+								approved = answer === "once" || approveModeSession || targetGrant !== undefined;
+							}
+							signal?.throwIfAborted();
+							if (this.runner.sessionId !== approvalSessionId) throw new Error("Approval session changed");
+						} catch (error) {
+							await emitResolved(false, error instanceof Error ? error.message : "approval aborted");
+							throw error;
+						}
+						await emitResolved(approved, approved ? undefined : "denied by user");
+						if (!approved) throw new Error(`Tool call denied by user: ${this.tool.name}`);
 					}
-					await emitResolved(approved, approved ? undefined : "denied by user");
-					if (!approved) throw new Error(`Tool call denied by user: ${this.tool.name}`);
 				}
 				const finalTargets = await captureApprovalTargets(
 					this.tool,
@@ -603,6 +673,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 					this.runner.cwd,
 				);
 				signal?.throwIfAborted();
+				validateParentApproval?.();
 				if (
 					(approvalMode === "always-ask-cached" || resolved.source === "restriction") &&
 					targets.failed &&
@@ -611,33 +682,56 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 					throw new Error(`Tool "${this.tool.name}" approval target identity is unavailable; execution refused.`);
 				}
 				if (this.runner.sessionId !== approvalSessionId) throw new Error("Approval session changed");
-				const finalPolicy = resolveApprovalFromContext(approvalContext);
-				if (
-					!Bun.deepEquals(inputSnapshot, effectiveParams) ||
-					!Bun.deepEquals(resolvedArgs, approvalArgs(effectiveParams, context)) ||
-					!Bun.deepEquals(targets, finalTargets) ||
-					!sameApprovalAuthority(authority, captureAuthority()) ||
-					!Bun.deepEquals(safetySnapshot, computerSafetyChecks(context)) ||
-					!Bun.deepEquals({ approvalMode, userPolicies }, finalPolicy) ||
-					!Bun.deepEquals(
-						resolved,
-						resolveApproval(
-							this.tool,
-							approvalArgs(effectiveParams, context),
-							finalPolicy.approvalMode,
-							finalPolicy.userPolicies,
-							approvalGrants,
-							approvalRestrictions(approvalContext?.settings, this.runner.cwd),
-							finalTargets,
-							context,
-						),
-					)
-				) {
+				const isApprovalCurrent = (): boolean => {
+					const currentPolicy = resolveApprovalFromContext(approvalContext);
+					return (
+						this.runner.sessionId === approvalSessionId &&
+						Bun.deepEquals(inputSnapshot, effectiveParams) &&
+						Bun.deepEquals(resolvedArgs, approvalArgs(effectiveParams, context)) &&
+						sameApprovalAuthority(authority, captureAuthority()) &&
+						Bun.deepEquals(safetySnapshot, computerSafetyChecks(context)) &&
+						Bun.deepEquals({ approvalMode, userPolicies }, currentPolicy) &&
+						Bun.deepEquals(
+							resolved,
+							resolveApproval(
+								this.tool,
+								approvalArgs(effectiveParams, context),
+								currentPolicy.approvalMode,
+								currentPolicy.userPolicies,
+								approvalGrants,
+								approvalRestrictions(approvalContext?.settings, this.runner.cwd),
+								finalTargets,
+								context,
+							),
+						)
+					);
+				};
+				if (!Bun.deepEquals(targets, finalTargets) || !isApprovalCurrent()) {
 					runtimeApprovalTool.denyRuntimeApproval?.(toolCallId, effectiveParams);
+					if (validateParentApproval)
+						throw new ParentRuntimeApprovalError(this.tool.name, {
+							decision: "unavailable",
+							reason: "state-changed",
+							detail: "The tool input or approval authority changed after parent approval.",
+						});
 					recheckPreflight = true;
 					continue;
 				}
-				if (runtimeApproval && required) runtimeApprovalTool.approveRuntimeApproval!(toolCallId, effectiveParams);
+				if (validateParentApproval) {
+					const validateRootApproval = validateParentApproval;
+					validateParentApproval = () => {
+						signal?.throwIfAborted();
+						validateRootApproval();
+						if (!isApprovalCurrent())
+							throw new ParentRuntimeApprovalError(this.tool.name, {
+								decision: "unavailable",
+								reason: "state-changed",
+								detail: "The tool input or approval authority changed after parent approval.",
+							});
+					};
+				}
+				if (runtimeApproval && required)
+					runtimeApprovalTool.approveRuntimeApproval!(toolCallId, effectiveParams, validateParentApproval);
 				if (safetySnapshot.length) {
 					if (!context) throw new Error("Provider safety approval context is unavailable");
 					context.providerSafetyApproved = true;
@@ -659,10 +753,73 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		const resultMcpIdentity = this.runner.hasHandlers("tool_result")
 			? mcpToolEventIdentity(this.tool, toolEventArgs(effectiveParams, context), this.resolveToolByName)
 			: null;
+		const resultOrigin = { sessionId: approvalSessionId, cwd: this.runner.cwd };
+		const deferredIdentity = resultMcpIdentity
+			? {
+					toolName: this.tool.name,
+					toolCallId,
+					...resultMcpIdentity,
+					...resultOrigin,
+					input: structuredClone(
+						normalizeToolEventInput(
+							this.tool.name,
+							resolveToolEventInput(this.tool, toolEventArgs(effectiveParams, context)),
+						),
+					),
+				}
+			: undefined;
+		let resultDispatched = false;
+		let deferredReceived = false;
+		let deferredEvent: ToolResultEvent | undefined;
+		const dispatchDeferredResult = (): void => {
+			if (!resultDispatched || !deferredEvent) return;
+			const event = deferredEvent;
+			deferredEvent = undefined;
+			void this.runner.emitToolResult(event, this.#agent).catch(error => {
+				logger.warn("Deferred tool result observer failed", {
+					toolName: event.toolName,
+					toolCallId,
+					sessionId: resultOrigin.sessionId,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			});
+		};
+		let toolContext = context;
+		if (deferredIdentity && !toolContext) {
+			const host = this.runner.createContext(undefined, undefined, this.#agent);
+			toolContext = {
+				sessionManager: host.sessionManager,
+				modelRegistry: host.modelRegistry,
+				model: host.model,
+				isIdle: host.isIdle,
+				hasQueuedMessages: host.hasPendingMessages,
+				abort: host.abort,
+			};
+		}
+		const executionContext: AgentToolContext | undefined =
+			deferredIdentity && toolContext
+				? {
+						...toolContext,
+						onDeferredResult: result => {
+							if (deferredReceived) return;
+							deferredReceived = true;
+							deferredEvent = structuredClone({
+								type: "tool_result",
+								...deferredIdentity,
+								completion: "deferred",
+								content: result.content,
+								details: result.details,
+								isError: result.isError === true,
+							});
+							dispatchDeferredResult();
+						},
+					}
+				: context;
 
 		// Execute the actual tool
 		let result: AgentToolResult<TDetails, TParameters>;
 		let executionError: Error | undefined;
+		const awaitCleanup = resolveToolCancellationBehavior(this.tool, effectiveParams) === "await-cleanup";
 
 		try {
 			// Name the owning session for process-wide file-mutation fallbacks and
@@ -671,83 +828,105 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			// a runner exists.
 			result = await this.runner.runScoped(() =>
 				withFileMutationSession(this.runner.sessionId, () =>
-					this.tool.execute(toolCallId, effectiveParams, signal, onUpdate, context),
+					this.tool.execute(toolCallId, effectiveParams, signal, onUpdate, executionContext),
 				),
 			);
 		} catch (err) {
-			executionError = err instanceof Error ? err : new Error(String(err));
+			executionError = toError(err);
 			result = {
 				content: [{ type: "text", text: executionError.message }],
 				details: undefined as TDetails,
 			};
 		}
-		if (!loopDispatchedToolCall) {
-			const postflight = await this.runner.runToolCallPreflightAfter?.(toolCallId, result, context);
-			if (postflight) result = postflight as AgentToolResult<TDetails, TParameters>;
-		}
-
-		// Emit tool_result event - extensions can modify the result and error status
-		if (resultMcpIdentity) {
-			const resultResult = await this.runner.emitToolResult(
-				{
-					type: "tool_result",
-					toolName: this.tool.name,
-					toolCallId,
-					...resultMcpIdentity,
-					input: normalizeToolEventInput(
-						this.tool.name,
-						resolveToolEventInput(this.tool, toolEventArgs(effectiveParams, context)),
-					),
-					content: result.content,
-					details: result.details,
-					isError: !!executionError || result.isError === true,
-				},
-				this.#agent,
-			);
-
-			// Handler context reports into this call's sink like tool-authored
-			// context: it is delivered even for a failed call (the handler saw
-			// `isError`), and precedes any pending `tool_call` context.
-			if (resultResult?.additionalContext !== undefined) {
-				context?.addAdditionalContext?.(resultResult.additionalContext);
+		const executionResult = result;
+		const retainsCleanupResult = !executionError && awaitCleanup;
+		try {
+			if (retainsCleanupResult && signal?.aborted) return executionResult;
+			if (!loopDispatchedToolCall) {
+				try {
+					const postflight = await this.runner.runToolCallPreflightAfter?.(toolCallId, result, context);
+					if (retainsCleanupResult && signal?.aborted) return executionResult;
+					if (postflight) result = postflight as AgentToolResult<TDetails, TParameters>;
+				} catch (error) {
+					if (retainsCleanupResult && signal?.aborted) return executionResult;
+					throw error;
+				}
 			}
 
-			// `content` is present only when a handler modified the result.
-			if (resultResult?.content !== undefined) {
-				const modifiedContent: (TextContent | ImageContent)[] = resultResult.content;
-				const modifiedDetails = (resultResult.details ?? result.details) as TDetails;
+			// Emit tool_result event - extensions can modify the result and error status
+			if (resultMcpIdentity) {
+				let resultResult: ToolResultEventResult | undefined;
+				try {
+					resultResult = await this.runner.emitToolResult(
+						{
+							type: "tool_result",
+							toolName: this.tool.name,
+							toolCallId,
+							...resultMcpIdentity,
+							...resultOrigin,
+							input: normalizeToolEventInput(
+								this.tool.name,
+								resolveToolEventInput(this.tool, toolEventArgs(effectiveParams, context)),
+							),
+							content: result.content,
+							details: result.details,
+							isError: !!executionError || result.isError === true,
+						},
+						this.#agent,
+					);
+				} catch (error) {
+					if (retainsCleanupResult && signal?.aborted) return executionResult;
+					throw error;
+				}
+				if (retainsCleanupResult && signal?.aborted) return executionResult;
 
-				// Effective error state: an explicit handler override wins; otherwise the
-				// original execution outcome stands. This lets a handler rewrite a failed
-				// call's model-visible content/details while keeping it an error, flip a
-				// failure to success, or flag a success as an error.
-				const effectiveError = resultResult.isError ?? !!executionError;
-				if (!effectiveError && pendingAdditionalContext !== undefined) {
-					context?.addAdditionalContext?.(pendingAdditionalContext);
+				// Handler context reports into this call's sink like tool-authored
+				// context: it is delivered even for a failed call (the handler saw
+				// `isError`), and precedes any pending `tool_call` context.
+				if (resultResult?.additionalContext !== undefined) {
+					context?.addAdditionalContext?.(resultResult.additionalContext);
 				}
 
-				// Return the (possibly modified) result carrying the error flag rather than
-				// rethrowing the original exception. The agent loop honors
-				// `AgentToolResult.isError` and surfaces it as a tool error on the wire (see
-				// `coerceToolResult` in agent-loop), so replacement failure content reaches
-				// the model while the call remains an error — the original exception text is
-				// no longer forced through, which previously discarded the replacement.
-				return {
-					content: modifiedContent,
-					details: modifiedDetails,
-					providerMetadata: result.providerMetadata,
-					...(effectiveError ? { isError: true } : {}),
-				};
-			}
-		}
+				// `content` is present only when a handler modified the result.
+				if (resultResult?.content !== undefined) {
+					const modifiedContent: (TextContent | ImageContent)[] = resultResult.content;
+					const modifiedDetails = (resultResult.details ?? result.details) as TDetails;
 
-		// No extension modification
-		if (executionError) {
-			throw executionError;
+					// Effective error state: an explicit handler override wins; otherwise the
+					// original execution outcome stands. This lets a handler rewrite a failed
+					// call's model-visible content/details while keeping it an error, flip a
+					// failure to success, or flag a success as an error.
+					const effectiveError = resultResult.isError ?? !!executionError;
+					if (!effectiveError && pendingAdditionalContext !== undefined) {
+						context?.addAdditionalContext?.(pendingAdditionalContext);
+					}
+
+					// Return the (possibly modified) result carrying the error flag rather than
+					// rethrowing the original exception. The agent loop honors
+					// `AgentToolResult.isError` and surfaces it as a tool error on the wire (see
+					// `coerceToolResult` in agent-loop), so replacement failure content reaches
+					// the model while the call remains an error — the original exception text is
+					// no longer forced through, which previously discarded the replacement.
+					return {
+						content: modifiedContent,
+						details: modifiedDetails,
+						providerMetadata: result.providerMetadata,
+						...(effectiveError ? { isError: true } : {}),
+					};
+				}
+			}
+
+			// No extension modification
+			if (executionError) {
+				throw executionError;
+			}
+			if (result.isError !== true && pendingAdditionalContext !== undefined) {
+				context?.addAdditionalContext?.(pendingAdditionalContext);
+			}
+			return result;
+		} finally {
+			resultDispatched = true;
+			dispatchDeferredResult();
 		}
-		if (result.isError !== true && pendingAdditionalContext !== undefined) {
-			context?.addAdditionalContext?.(pendingAdditionalContext);
-		}
-		return result;
 	}
 }

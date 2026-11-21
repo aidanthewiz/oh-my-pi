@@ -97,6 +97,7 @@ function createMode(options?: { pendingStart?: boolean; skillCommands?: Map<stri
 		optimisticSkillMessagePending: false,
 		renderOptimisticSkillMessage: vi.fn(),
 		clearOptimisticSkillMessage: vi.fn(),
+		restoreDroppedPrompt: vi.fn(),
 	};
 }
 

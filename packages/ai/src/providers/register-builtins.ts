@@ -161,7 +161,25 @@ function forwardStream<TApi extends Api>(
 			}
 		} catch (error) {
 			const stopReason = abortTracker.wasCallerAbort() ? "aborted" : "error";
-			const message = createProviderStreamError(model, error, stopReason);
+			let message = createProviderStreamError(model, error, stopReason);
+			if (options.waitForTerminalDrain) {
+				if (!hasFinalResult(source)) {
+					target.fail(error);
+					return;
+				}
+				try {
+					const settled = await source.result();
+					message = {
+						...settled,
+						stopReason,
+						errorId: message.errorId,
+						errorMessage: message.errorMessage,
+					};
+				} catch {
+					target.fail(error);
+					return;
+				}
+			}
 			target.push({ type: "error", reason: stopReason, error: message });
 			target.end(message);
 		}
@@ -265,6 +283,17 @@ export const streamGoogleVertex = createLazyProviderStream(
 	mod => mod.streamGoogleVertex,
 );
 
+/**
+ * Stream Kiro with provider-owned timeout handling. Loaded on first use like
+ * every other built-in provider in this table (see `createLazyProviderStream`):
+ * a static import would pull the Kiro transport into every process's startup.
+ */
+export const streamKiro = createLazyProviderStream(
+	() => import("./kiro/stream"),
+	(mod): ProviderStream<"kiro-api"> => mod.streamKiro,
+	PROVIDER_HANDLED_STREAM_TIMEOUTS,
+);
+
 /** Stream Codex with provider-owned timeout handling. */
 export const streamOpenAICodexResponses = createLazyProviderStream(
 	() => import("./openai-codex-responses"),
@@ -298,6 +327,12 @@ export const streamCursor = createLazyProviderStream(
 export const streamDevin = createLazyProviderStream(
 	() => import("./devin"),
 	mod => mod.streamDevin,
+);
+
+/** Stream the Antigravity CLI (`agy acp`) through the shared watchdog. */
+export const streamAntigravityCli = createLazyProviderStream(
+	() => import("./antigravity-cli"),
+	mod => mod.streamAntigravityCli,
 );
 
 /** Stream Apple's on-device Foundation Model through the shared watchdog. */

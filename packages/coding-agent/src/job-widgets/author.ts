@@ -4,13 +4,19 @@
  * schema, fed the job's brief and redacted output samples.
  */
 import { type AgentTelemetryConfig, instrumentedCompleteSimple, resolveTelemetry } from "@oh-my-pi/pi-agent-core";
-import type { Api, AssistantMessage, Model, SimpleStreamOptions, UserMessage } from "@oh-my-pi/pi-ai";
+import type {
+	Api,
+	AssistantMessage,
+	Context,
+	Model,
+	SimpleStreamOptions,
+	ToolChoice,
+	UserMessage,
+} from "@oh-my-pi/pi-ai";
 import { markPerCallContextMessage } from "@oh-my-pi/pi-ai/utils/block-symbols";
-import { roleDefaultModels } from "@oh-my-pi/pi-catalog/compat/behavior";
 import { formatBytes, prompt, truncate } from "@oh-my-pi/pi-utils";
 import type { ModelRegistry } from "../config/model-registry";
-import { getModelMatchPreferences, parseModelPattern, resolveModelRoleValue } from "../config/model-resolver";
-import { formatModelRoleAlias } from "../config/model-roles";
+import { resolveRoleChain, roleCandidatePool } from "../config/model-resolver";
 import type { Settings } from "../config/settings";
 import { extractTextContent, extractToolCall, parseJsonPayload } from "../commit/utils";
 import systemPrompt from "../prompts/system/job-widget-system.md" with { type: "text" };
@@ -202,37 +208,67 @@ export interface ModelJobWidgetAuthorOptions {
 	obfuscate?: () => ((text: string) => string) | undefined;
 }
 
-export function resolveWidgetModel(settings: Settings, registry: ModelRegistry): Model<Api> | undefined {
-	const available = registry.getAvailable();
-	const matchPreferences = getModelMatchPreferences(settings);
-	const role = resolveModelRoleValue(formatModelRoleAlias("widget"), available, { settings, matchPreferences }).model;
-	if (role) return role;
-	for (const pattern of roleDefaultModels().smol ?? []) {
-		const model = parseModelPattern(pattern, available, matchPreferences).model;
-		if (model) return model;
+/** One admitted `widget`-role operation owned by a running job. */
+export interface WidgetRequest {
+	context: Context;
+	maxTokens: number;
+	toolChoice?: ToolChoice;
+	oneshotKind: string;
+	owner: JobWidgetAuthorRequest;
+}
+
+/** Every fallback candidate requires a fresh lease from the owning session. */
+export async function completeWidgetRequest(
+	options: ModelJobWidgetAuthorOptions,
+	request: WidgetRequest,
+	signal: AbortSignal,
+): Promise<AssistantMessage | undefined> {
+	signal = AbortSignal.any([signal, AbortSignal.timeout(15_000)]);
+	const canAuthor = (): boolean =>
+		!signal.aborted && options.isEnabled?.() !== false && request.owner.canAuthor?.() === true;
+	if (!options.admit || !canAuthor()) return undefined;
+	const { settings, modelRegistry } = options;
+	let failure: AssistantMessage | undefined;
+	for (const { model } of resolveRoleChain("widget", settings, roleCandidatePool("widget", settings, modelRegistry))) {
+		if (!canAuthor()) return undefined;
+		const lease = await options.admit(model, signal, request.owner);
+		if (!lease) continue;
+		const requestSignal = lease.signal ? AbortSignal.any([signal, lease.signal]) : signal;
+		const current = (): boolean => !requestSignal.aborted && canAuthor() && lease.isCurrent();
+		if (!current()) return undefined;
+		const streamOptions: SimpleStreamOptions & { onAttempt(message: AssistantMessage): void } = {
+			apiKey: lease.apiKey,
+			sessionId: lease.sessionId,
+			signal: requestSignal,
+			onPayload: (_payload, _model, activeSignal) => {
+				(activeSignal ?? requestSignal).throwIfAborted();
+				if (!current()) throw new Error("Widget request owner changed before dispatch");
+				lease.admit();
+			},
+			onAttempt: lease.onUsage,
+			disableReasoning: true,
+			maxTokens: request.maxTokens,
+			toolChoice: request.toolChoice,
+		};
+		const response = await instrumentedCompleteSimple(model, request.context, streamOptions, {
+			telemetry: resolveTelemetry(options.telemetry?.(), lease.sessionId),
+			oneshotKind: request.oneshotKind,
+		});
+		if (!current()) return undefined;
+		if (response.stopReason === "aborted") {
+			throw new Error(response.errorMessage ?? `${request.oneshotKind} request aborted`);
+		}
+		if (response.stopReason !== "error") return response;
+		failure = response;
 	}
+	if (failure) throw new Error(failure.errorMessage ?? `${request.oneshotKind} request failed`);
 	return undefined;
 }
 
 /** A {@link JobWidgetAuthor} backed by the `widget` model role. */
 export function createModelJobWidgetAuthor(options: ModelJobWidgetAuthorOptions): JobWidgetAuthor {
 	return async (request, signal) => {
-		signal = AbortSignal.any([signal, AbortSignal.timeout(15_000)]);
-		if (!options.admit || signal.aborted || options.isEnabled?.() === false || request.canAuthor?.() !== true)
-			return undefined;
 		const obfuscate = options.obfuscate?.();
-		const telemetry = options.telemetry?.();
-		const model = resolveWidgetModel(options.settings, options.modelRegistry);
-		if (!model) return undefined;
-		const lease = await options.admit(model, signal, request);
-		if (!lease) return undefined;
-		const requestSignal = lease.signal ? AbortSignal.any([signal, lease.signal]) : signal;
-		const current = (): boolean =>
-			!requestSignal.aborted &&
-			options.isEnabled?.() !== false &&
-			request.canAuthor?.() === true &&
-			lease.isCurrent();
-		if (!current()) return undefined;
 		const redact = (text: string): string => redactWidgetSample(text, obfuscate);
 		const content = { type: "text" as const, text: renderJobWidgetPrompt(request, redact) };
 		const message: UserMessage = {
@@ -270,28 +306,18 @@ export function createModelJobWidgetAuthor(options: ModelJobWidgetAuthorOptions)
 			if (low > 0 && /[\uD800-\uDBFF]/.test(text[low - 1])) low--;
 			content.text = text.slice(0, low);
 		}
-		if (!current()) return undefined;
-		const streamOptions: SimpleStreamOptions & { onAttempt(message: AssistantMessage): void } = {
-			apiKey: lease.apiKey,
-			signal: requestSignal,
-			onPayload: (_payload, _model, signal) => {
-				(signal ?? requestSignal).throwIfAborted();
-				lease.admit();
+		const response = await completeWidgetRequest(
+			options,
+			{
+				context,
+				maxTokens: MAX_SPEC_TOKENS,
+				toolChoice: { type: "tool", name: RESPOND_TOOL },
+				oneshotKind: "job_widget",
+				owner: request,
 			},
-			onAttempt: lease.onUsage,
-			// Spec writing is formatting work; a forced tool call also rules out thinking on some providers.
-			disableReasoning: true,
-			maxTokens: MAX_SPEC_TOKENS,
-			toolChoice: { type: "tool", name: RESPOND_TOOL },
-		};
-		const response = await instrumentedCompleteSimple(model, context, streamOptions, {
-			telemetry: resolveTelemetry(telemetry, lease.sessionId),
-			oneshotKind: "job_widget",
-		});
-		if (!current()) return undefined;
-		if (response.stopReason === "error" || response.stopReason === "aborted") {
-			throw new Error(response.errorMessage ?? `widget spec request ${response.stopReason}`);
-		}
+			signal,
+		);
+		if (!response) return undefined;
 		const call = extractToolCall(response, RESPOND_TOOL);
 		if (call) return call.arguments;
 		const text = extractTextContent(response);

@@ -1,14 +1,16 @@
 import type { ToolTier } from "@oh-my-pi/pi-agent-core";
 import { extractUriScheme } from "../internal-urls/parse";
+import { repairCollapsedScheme } from "@oh-my-pi/pi-tui/tools/fetch";
 import { type LineRange } from "@oh-my-pi/pi-tui/tools/line-ranges";
 import { splitPathAndSel, isReadableUrlPath } from "@oh-my-pi/pi-tui/tools/read";
+import { splitUrlScheme } from "@oh-my-pi/pi-tui/tools/url-scheme-host";
 import { toPathList } from "@oh-my-pi/pi-tui/render/render-utils";
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 import * as url from "node:url";
 import { glob } from "@oh-my-pi/pi-natives";
 import {
+	expandTilde,
 	hasFsCode,
 	isEnoent,
 	isEnotdir,
@@ -104,17 +106,7 @@ function stripFileUrl(filePath: string): string {
 	}
 }
 
-export function expandTilde(filePath: string, home?: string): string {
-	const h = home ?? os.homedir();
-	if (filePath === "~") return h;
-	if (filePath.startsWith("~/") || filePath.startsWith("~\\")) {
-		return h + filePath.slice(1);
-	}
-	if (filePath.startsWith("~")) {
-		return path.join(h, filePath.slice(1));
-	}
-	return filePath;
-}
+export { expandTilde };
 
 export function expandPath(filePath: string): string {
 	// Some models intermittently prefix an otherwise-valid path with a stray
@@ -327,19 +319,28 @@ function isInternalUrlPath(filePath: string): boolean {
  *
  * A bare root slash is treated as a workspace-root alias for tool inputs. Users
  * often pass `/` to mean “search from here”, and letting tools escape to the
- * filesystem root is almost never what they intended.
+ * filesystem root is almost never what they intended. A shell `cd` target is
+ * not a tool input: use {@link resolveShellDirectory}.
  */
 export function resolveToCwd(filePath: string, cwd: string): string {
+	return resolveDirectory(filePath, cwd, true);
+}
+
+/**
+ * Resolve a directory a shell command named (`cd <path>`), relative to `cwd`.
+ *
+ * Same expansion as {@link resolveToCwd}, except a bare root (`/`, `//`, `///`)
+ * is the filesystem root. Explicit tool path inputs keep the workspace alias.
+ */
+export function resolveShellDirectory(filePath: string, cwd: string): string {
+	return resolveDirectory(filePath, cwd, false);
+}
+
+function resolveDirectory(filePath: string, cwd: string, aliasWorkspaceRoot: boolean): string {
 	const expanded = normalizeWindowsDriveAliasPath(expandPath(filePath));
-
 	assertNotInternalUrl(expanded, filePath);
-
-	if (/^\/+$/.test(expanded)) {
-		return cwd;
-	}
-	if (path.isAbsolute(expanded)) {
-		return expanded;
-	}
+	if (aliasWorkspaceRoot && /^\/+$/.test(expanded)) return cwd;
+	if (path.isAbsolute(expanded)) return expanded;
 	return path.resolve(cwd, expanded);
 }
 
@@ -725,6 +726,46 @@ function isOpaquePathListUri(entry: string, parts: readonly string[]): boolean {
 	);
 }
 
+const MISSING_OR_INVALID_URL_CODES = new Set(["ENOENT", "ENOTDIR", "ENAMETOOLONG", "EINVAL"]);
+
+async function probeInternalUrlTarget(
+	url: string,
+	filesystem: InternalUrlFilesystem,
+	requireDirectory = false,
+): Promise<boolean> {
+	try {
+		const stat = await filesystem.stat(url);
+		// A missing JSON field stats as a file of the "null" sentinel. Readers keep
+		// that sentinel; only this probe treats it as not found.
+		if (stat.absent === true) return false;
+		return !requireDirectory || stat.type === "directory";
+	} catch (err) {
+		return !(err instanceof UrlFsError && MISSING_OR_INVALID_URL_CODES.has(err.code));
+	}
+}
+
+async function internalUrlEntryResolves(entry: string, filesystem: InternalUrlFilesystem): Promise<boolean> {
+	const router = InternalUrlRouter.instance();
+	const peeledUrl = router.split(expandPath(entry)).path;
+	if (router.isGlob(peeledUrl)) {
+		let parsedUrl: ParsedSearchPath | undefined;
+		try {
+			parsedUrl = parseUrlSearchPath(peeledUrl);
+		} catch {
+			return false;
+		}
+		if (parsedUrl?.glob !== undefined) {
+			const rawGlobTail = peeledUrl.slice(parsedUrl.basePath.length);
+			if (
+				(await splitTopLevelDelimitedPath(rawGlobTail, "semicolon", part => router.canResolve(part))).length === 1
+			) {
+				return probeInternalUrlTarget(parsedUrl.basePath, filesystem, true);
+			}
+		}
+	}
+	return probeInternalUrlTarget(peeledUrl, filesystem);
+}
+
 export async function splitDelimitedPathEntry(
 	entry: string,
 	cwd: string,
@@ -733,6 +774,13 @@ export async function splitDelimitedPathEntry(
 		routedUrlPredicate?: (entry: string) => boolean;
 		queryOwner?: (part: string) => Promise<boolean>;
 		exclusionParts?: boolean;
+		/**
+		 * Filesystem that probes a `;` list starting with an internal URL and also
+		 * naming local paths or globs (`artifact://1;src/*.ts`). Search tools pass
+		 * the filesystem they search with. Omit it so a `;` inside one internal
+		 * URL cannot select an extra file.
+		 */
+		mixedLocalPaths?: InternalUrlFilesystem;
 	} = {},
 ): Promise<string[] | null> {
 	const normalizedEntry = normalizePathLikeInput(entry);
@@ -743,8 +791,37 @@ export async function splitDelimitedPathEntry(
 		((part: string) =>
 			isReadableUrlPath(part) || /^(?:ftp|wss?):\/\//i.test(part) || InternalUrlRouter.instance().canResolve(part));
 	const isBoundary = (part: string) => isUrl(part) || (options.exclusionParts === true && isExclusionPart(part));
+	if (isInternalUrlPath(normalizedEntry)) {
+		const rawParts = await tryDelimitedPathSplit(
+			normalizedEntry,
+			cwd,
+			splitter,
+			"semicolon",
+			"none",
+			isUrl,
+			false,
+			options.queryOwner,
+		);
+		if (!rawParts || rawParts.length <= 1) return null;
+		const parts = await splitMixedUrlPathList(normalizedEntry, cwd, isBoundary, options.queryOwner);
+		if (parts?.every(isBoundary)) return parts;
+		if (!options.mixedLocalPaths) return null;
+		if (await internalUrlEntryResolves(normalizedEntry, options.mixedLocalPaths)) return null;
+		if (parts) return parts;
+		// Opaque URI fragments belong to the preceding resource, not a new target.
+		if (
+			rawParts.some(
+				part =>
+					extractUriScheme(part) !== undefined &&
+					splitUrlScheme(repairCollapsedScheme(InternalUrlRouter.instance().normalize(part))) === undefined,
+			)
+		) {
+			return null;
+		}
+		return rawParts;
+	}
 	const urlParts = await splitMixedUrlPathList(normalizedEntry, cwd, isBoundary, options.queryOwner);
-	if (urlParts || isInternalUrlPath(normalizedEntry)) return urlParts;
+	if (urlParts) return urlParts;
 	const semicolonParts = await splitTopLevelDelimitedPath(normalizedEntry, "semicolon", isUrl, options.queryOwner);
 	const opaqueUrl = isUrl(normalizedEntry) || isOpaquePathListUri(normalizedEntry, semicolonParts);
 	// A real POSIX file may contain a delimiter and a selector-shaped tail
@@ -813,7 +890,7 @@ export async function splitDelimitedPathEntry(
 
 /**
  * Split a `;` list at recognized URL or existing literal-path boundaries.
- * Unrecognized segments after a URL remain part of that URL. Literal paths
+ * Opaque fallback URI fragments do not split a hierarchical URL. Literal paths
  * and their selectors take precedence over delimiter recovery.
  */
 export async function splitMixedUrlPathList(
@@ -839,6 +916,11 @@ export async function splitMixedUrlPathList(
 			return null;
 		}
 	}
+	const router = InternalUrlRouter.instance();
+	const isHierarchicalBoundary = (part: string) =>
+		isUrl(part) &&
+		(extractUriScheme(part) === undefined ||
+			splitUrlScheme(repairCollapsedScheme(router.normalize(part))) !== undefined);
 	const parts: string[] = [];
 	let hasResolvedTarget = false;
 	let index = 0;
@@ -849,10 +931,14 @@ export async function splitMixedUrlPathList(
 			index === 0 && opaqueUri && !isUrl(part) && !(await findLiteralPathListPart(rawParts, index, cwd, isUrl));
 		if (isUrl(part) || opaquePrefix) {
 			hasResolvedTarget = true;
+			const isBoundary =
+				splitUrlScheme(repairCollapsedScheme(router.normalize(part))) !== undefined
+					? isHierarchicalBoundary
+					: isUrl;
 			let end = index + 1;
 			while (end < rawParts.length) {
-				if (isUrl(normalizePathLikeInput(rawParts[end]))) break;
-				pendingLiteral = await findLiteralPathListPart(rawParts, end, cwd, isUrl);
+				if (isBoundary(normalizePathLikeInput(rawParts[end]))) break;
+				pendingLiteral = await findLiteralPathListPart(rawParts, end, cwd, isBoundary);
 				if (pendingLiteral) break;
 				end++;
 			}
@@ -898,7 +984,11 @@ async function findLiteralPathListPart(
 export async function expandDelimitedPathEntries(
 	entries: readonly string[],
 	cwd: string,
-	options: { splitter?: PathEntrySplitter; exclusionParts?: boolean } = {},
+	options: {
+		splitter?: PathEntrySplitter;
+		exclusionParts?: boolean;
+		mixedLocalPaths?: InternalUrlFilesystem;
+	} = {},
 ): Promise<string[]> {
 	const expanded: string[] = [];
 	for (const entry of entries) {

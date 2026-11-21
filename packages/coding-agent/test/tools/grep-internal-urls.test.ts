@@ -12,11 +12,15 @@ import {
 	InternalUrlRouter,
 	LocalProtocolHandler,
 	type ProtocolHandler,
+	sessionResolveContext,
 } from "@oh-my-pi/pi-coding-agent/internal-urls";
+import { InternalUrlFilesystem } from "@oh-my-pi/pi-coding-agent/internal-urls/url-filesystem";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import * as sshFileTransfer from "@oh-my-pi/pi-coding-agent/ssh/file-transfer";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import * as scrapers from "@oh-my-pi/pi-coding-agent/web/scrapers/types";
+import { ShellFsOp } from "@oh-my-pi/pi-natives";
 import { formatOutputNotice } from "@oh-my-pi/pi-tui/tools/output-meta";
 import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
@@ -383,7 +387,86 @@ describe("GrepTool internal URL resolution", () => {
 		expect(result.details?.matchCount).toBe(1);
 	});
 
-	it("keeps a single internal URL whose name ends in a semicolon whole", async () => {
+	it("searches a mixed internal URL and local path semicolon list", async () => {
+		await Bun.write(path.join(artifactsDir, "1.python.log"), "artifact needle\n");
+		await Bun.write(path.join(tmpDir, "notes.txt"), "local needle\n");
+
+		const text = getResultText(
+			await new GrepTool(createSession()).execute("mixed-url-local", {
+				pattern: "needle",
+				path: "artifact://1;notes.txt",
+			}),
+		);
+
+		// Both targets are searched — the list is not one artifact URI.
+		expect(text).toContain("artifact://1");
+		expect(text).toContain("artifact needle");
+		expect(text).toContain("notes.txt");
+		expect(text).toContain("local needle");
+		expect(text).not.toContain("artifact://1;notes.txt");
+	});
+
+	it("globs a mixed internal URL and local path semicolon list", async () => {
+		const localRoot = path.join(artifactsDir, "local");
+		await fs.mkdir(localRoot, { recursive: true });
+		await Bun.write(path.join(localRoot, "PLAN.md"), "# Plan\n");
+		await Bun.write(path.join(tmpDir, "notes.txt"), "local\n");
+		LocalProtocolHandler.setOverride({ getArtifactsDir: () => artifactsDir, getSessionId: () => "session" });
+
+		const text = getResultText(
+			await new GlobTool(createSession()).execute("glob-mixed-url-local", {
+				path: "local://PLAN.md;notes.txt",
+			}),
+		);
+
+		expect(text).toContain("PLAN.md");
+		expect(text).toContain("notes.txt");
+		expect(text).not.toContain("local://PLAN.md;notes.txt");
+	});
+
+	it("splits a URL-first semicolon list followed by a host glob for find and search", async () => {
+		const localRoot = path.join(artifactsDir, "local");
+		await fs.mkdir(localRoot, { recursive: true });
+		await Bun.write(path.join(localRoot, "notes.md"), "local needle\n");
+		await fs.mkdir(path.join(tmpDir, "src"));
+		await Bun.write(path.join(tmpDir, "src", "example.ts"), "host needle\n");
+		LocalProtocolHandler.setOverride({ getArtifactsDir: () => artifactsDir, getSessionId: () => "session" });
+		const session = createSession();
+
+		const globText = getResultText(
+			await new GlobTool(session).execute("glob-url-first-host-glob", {
+				path: "local://notes.md;src/*.ts",
+			}),
+		);
+		const grepText = getResultText(
+			await new GrepTool(session).execute("grep-url-first-host-glob", {
+				pattern: "needle",
+				path: "local://notes.md;src/*.ts",
+			}),
+		);
+
+		expect(globText).toContain("notes.md");
+		expect(globText).toContain("example.ts");
+		expect(grepText).toContain("local needle");
+		expect(grepText).toContain("host needle");
+	});
+
+	it("reports a missing host path after a URL-first semicolon entry", async () => {
+		const localRoot = path.join(artifactsDir, "local");
+		await fs.mkdir(localRoot, { recursive: true });
+		await Bun.write(path.join(localRoot, "notes.md"), "# Notes\n");
+		LocalProtocolHandler.setOverride({ getArtifactsDir: () => artifactsDir, getSessionId: () => "session" });
+
+		const result = await new GlobTool(createSession()).execute("glob-url-first-missing-host", {
+			path: "local://notes.md;missing",
+		});
+
+		expect(getResultText(result)).toContain("notes.md");
+		expect(getResultText(result)).toContain("Skipped missing paths: missing");
+		expect(result.details?.missingPaths).toEqual(["missing"]);
+	});
+
+	it("keeps a single internal URL with a semicolon in its path whole", async () => {
 		const localRoot = path.join(artifactsDir, "local");
 		await fs.mkdir(localRoot, { recursive: true });
 		await Bun.write(path.join(localRoot, "report;"), "semicolon needle\n");
@@ -395,6 +478,284 @@ describe("GrepTool internal URL resolution", () => {
 		);
 		expect(text).toContain("semicolon needle");
 		expect(text).not.toContain("plain needle");
+
+		registerVirtualDocs(
+			new Map([
+				["report;version:abc", "opaque needle\n"],
+				["report", "plain needle\n"],
+			]),
+		);
+		const opaqueTailResult = await new GrepTool(createSession()).execute("semicolon-opaque-tail", {
+			pattern: "needle",
+			path: "virtual://report;version:abc",
+		});
+		const opaqueTailText = getResultText(opaqueTailResult);
+		expect(opaqueTailText).toContain("opaque needle");
+		expect(opaqueTailText).not.toContain("plain needle");
+		expect(opaqueTailResult.details?.files).toEqual(["virtual://report;version:abc"]);
+		expect(opaqueTailResult.details?.missingPaths ?? []).toEqual([]);
+	});
+
+	it("keeps opaque URI tails while splitting later local and URL targets with selectors", async () => {
+		registerVirtualDocs(
+			new Map([
+				["report;revision:xyz", "needle excluded opaque\nneedle selected opaque\n"],
+				["second.md", "needle selected second start\nneedle excluded second\nneedle selected second end\n"],
+			]),
+		);
+		await Bun.write(path.join(tmpDir, "notes.txt"), "needle selected local\nneedle excluded local\n");
+
+		const result = await new GrepTool(createSession()).execute("opaque-tail-list", {
+			pattern: "needle",
+			path: "virtual://report;revision:xyz:2-2;notes.txt:1-1;virtual://second.md:raw:1,3",
+		});
+
+		const text = getResultText(result);
+		expect(text).toContain("needle selected opaque");
+		expect(text).toContain("needle selected local");
+		expect(text).toContain("needle selected second start");
+		expect(text).toContain("needle selected second end");
+		expect(text).not.toContain("needle excluded");
+		expect(result.details?.files?.slice().sort()).toEqual([
+			"notes.txt",
+			"virtual://report;revision:xyz",
+			"virtual://second.md",
+		]);
+		expect(result.details?.matchCount).toBe(4);
+		expect(result.details?.missingPaths ?? []).toEqual([]);
+	});
+
+	it("preserves opaque URI identity in quoted JSON path lists with escaped URL separators", async () => {
+		registerVirtualDocs(
+			new Map([
+				["report;revision:xyz", "needle excluded opaque\nneedle selected opaque\n"],
+				["second.md", "needle selected second\nneedle excluded second\n"],
+			]),
+		);
+
+		const result = await new GrepTool(createSession()).execute("opaque-json-list", {
+			pattern: "needle",
+			path: String.raw`["virtual:\/\/report;revision:xyz:raw:2-2","virtual:\/\/second.md:1-1"]`,
+		});
+
+		const text = getResultText(result);
+		expect(text).toContain("needle selected opaque");
+		expect(text).toContain("needle selected second");
+		expect(text).not.toContain("needle excluded");
+		expect(result.details?.files?.slice().sort()).toEqual(["virtual://report;revision:xyz", "virtual://second.md"]);
+		expect(result.details?.matchCount).toBe(2);
+		expect(result.details?.missingPaths ?? []).toEqual([]);
+	});
+
+	it("keeps opaque URI tails and collapsed HTTP targets as separate search paths", async () => {
+		registerVirtualDocs(
+			new Map([
+				["report;version:abc", "needle exact opaque resource\n"],
+				["report", "needle wrong opaque prefix\n"],
+			]),
+		);
+		const externalContents: Readonly<Record<string, string>> = {
+			"https://a.example/doc": "needle first external resource\n",
+			"https://b.example/doc": "needle second external resource\n",
+		};
+		vi.spyOn(scrapers, "loadPage").mockImplementation(async requestedUrl => ({
+			ok: true,
+			status: 200,
+			finalUrl: requestedUrl,
+			contentType: "text/plain",
+			content: externalContents[requestedUrl] ?? "unexpected external target\n",
+		}));
+		const session = createSession({
+			getArtifactsDir: () => artifactsDir,
+			settings: Settings.isolated({
+				"fetch.enabled": true,
+				"grep.contextBefore": 0,
+				"grep.contextAfter": 0,
+			}),
+		});
+
+		const result = await new GrepTool(session).execute("opaque-collapsed-http-list", {
+			pattern: "needle",
+			path: "virtual://report;version:abc;https://a.example/doc;https:/b.example/doc",
+		});
+
+		const text = getResultText(result);
+		expect(text).toContain("needle exact opaque resource");
+		expect(text).toContain("needle first external resource");
+		expect(text).toContain("needle second external resource");
+		expect(text).not.toContain("needle wrong opaque prefix");
+		expect(result.details?.files).toContain("virtual://report;version:abc");
+		expect(result.details?.fileCount).toBe(3);
+		expect(result.details?.matchCount).toBe(3);
+		expect(result.details?.missingPaths ?? []).toEqual([]);
+	});
+
+	it("retains line-range selectors on a semicolon-containing URL in search", async () => {
+		const localRoot = path.join(artifactsDir, "local");
+		await fs.mkdir(localRoot, { recursive: true });
+		await Bun.write(path.join(localRoot, "report;version.md"), "first needle\nsecond needle\nthird needle\n");
+		await Bun.write(path.join(localRoot, "report"), "wrong report needle\n");
+		await Bun.write(path.join(tmpDir, "version.md"), "wrong line 1\nwrong host needle\n");
+		LocalProtocolHandler.setOverride({ getArtifactsDir: () => artifactsDir, getSessionId: () => "session" });
+
+		const text = getResultText(
+			await new GrepTool(createSession()).execute("semicolon-url-range", {
+				pattern: "needle",
+				path: "local://report;version.md:2-2",
+			}),
+		);
+
+		expect(text).toContain("second needle");
+		expect(text).not.toContain("first needle");
+		expect(text).not.toContain("third needle");
+		expect(text).not.toContain("wrong report needle");
+		expect(text).not.toContain("wrong host needle");
+	});
+
+	it("preserves globs rooted in an existing semicolon-containing URL directory for find and search", async () => {
+		const localRoot = path.join(artifactsDir, "local");
+		await fs.mkdir(path.join(localRoot, "reports;old"), { recursive: true });
+		await fs.mkdir(path.join(localRoot, "reports"), { recursive: true });
+		await fs.mkdir(path.join(tmpDir, "old"), { recursive: true });
+		await Bun.write(path.join(localRoot, "reports;old", "archived.md"), "archived needle\n");
+		await Bun.write(path.join(localRoot, "reports;old", "notes.txt"), "ignored text needle\n");
+		await Bun.write(path.join(localRoot, "reports", "decoy.md"), "decoy report needle\n");
+		await Bun.write(path.join(tmpDir, "old", "decoy.md"), "decoy host needle\n");
+		LocalProtocolHandler.setOverride({ getArtifactsDir: () => artifactsDir, getSessionId: () => "session" });
+		const session = createSession();
+
+		const globResult = await new GlobTool(session).execute("glob-semicolon-dir", {
+			path: "local://reports;old/*.md",
+		});
+		const grepResult = await new GrepTool(session).execute("grep-semicolon-dir", {
+			pattern: "needle",
+			path: "local://reports;old/*.md",
+		});
+
+		expect(globResult.details?.files).toEqual(["local://reports;old/archived.md"]);
+		expect(grepResult.details?.files).toEqual(["local://reports;old/archived.md"]);
+		const grepText = getResultText(grepResult);
+		expect(grepText).toContain("archived needle");
+		expect(grepText).not.toContain("ignored text needle");
+		expect(grepText).not.toContain("decoy");
+	});
+
+	it("preserves ssh:// permission and file-size errors instead of splitting on a semicolon", async () => {
+		vi.spyOn(capability, "loadCapability").mockResolvedValue({
+			items: [],
+			all: [],
+			warnings: [],
+			providers: [],
+		} as CapabilityResult<unknown>);
+		await Bun.write(path.join(tmpDir, "version.md"), "wrong host needle\n");
+		vi.spyOn(sshFileTransfer, "statRemotePath").mockResolvedValue("file");
+		const readSpy = vi.spyOn(sshFileTransfer, "readRemoteFile").mockImplementation(async (_target, remotePath) => {
+			if (remotePath === "/report;version.md") {
+				throw new Error("head: cannot open '/report;version.md' for reading: Permission denied");
+			}
+			return { bytes: new TextEncoder().encode("wrong remote needle\n"), truncated: false };
+		});
+		const session = createSession();
+
+		await expect(
+			new GrepTool(session).execute("ssh-semicolon-perm-grep", {
+				pattern: "needle",
+				path: "ssh://h/report;version.md",
+			}),
+		).rejects.toThrow(/Permission denied/i);
+		await expect(
+			new GlobTool(session).execute("ssh-semicolon-perm-glob", {
+				path: "ssh://h/report;version.md",
+			}),
+		).rejects.toThrow(/Permission denied/i);
+		expect(readSpy).not.toHaveBeenCalledWith(expect.anything(), "/report", expect.anything());
+
+		readSpy.mockImplementation(async (_target, remotePath) => {
+			if (remotePath === "/report;version.md") {
+				return { bytes: new Uint8Array(1024 * 1024), truncated: true };
+			}
+			return { bytes: new TextEncoder().encode("wrong remote needle\n"), truncated: false };
+		});
+		await expect(
+			new GrepTool(session).execute("ssh-semicolon-size-grep", {
+				pattern: "needle",
+				path: "ssh://h/report;version.md",
+			}),
+		).rejects.toThrow(/1 MiB/);
+		await expect(
+			new GlobTool(session).execute("ssh-semicolon-size-glob", {
+				path: "ssh://h/report;version.md",
+			}),
+		).rejects.toThrow(/1 MiB/);
+		expect(readSpy).not.toHaveBeenCalledWith(expect.anything(), "/report", expect.anything());
+	});
+
+	it("splits a missing agent result field from a following local file instead of searching null", async () => {
+		await Bun.write(
+			path.join(artifactsDir, "worker.md"),
+			JSON.stringify({ report: "agent report needle", "report;version": "kept semicolon needle", empty: null }),
+		);
+		await Bun.write(path.join(tmpDir, "README.md"), "readme needle\n");
+		const session = createSession();
+
+		const listed = getResultText(
+			await new GrepTool(session).execute("agent-field-list", {
+				pattern: "needle",
+				path: "agent://worker/report;README.md",
+			}),
+		);
+		expect(listed).toContain("agent report needle");
+		expect(listed).toContain("readme needle");
+
+		const kept = getResultText(
+			await new GrepTool(session).execute("agent-semicolon-field", {
+				pattern: "needle",
+				path: "agent://worker/report;version",
+			}),
+		);
+		expect(kept).toContain("kept semicolon needle");
+		expect(kept).not.toContain("agent report needle");
+
+		const realNull = getResultText(
+			await new GrepTool(session).execute("agent-null-field", {
+				pattern: "null",
+				path: "agent://worker/empty",
+			}),
+		);
+		expect(realNull).toContain("null");
+	});
+
+	it("reads and searches a missing agent field as the null sentinel", async () => {
+		await Bun.write(path.join(artifactsDir, "worker.md"), JSON.stringify({ report: "agent report needle" }));
+		const session = createSession();
+		const filesystem = new InternalUrlFilesystem({
+			context: sessionResolveContext(session),
+			tier: "read",
+		});
+		const opened = await filesystem.handle({
+			op: ShellFsOp.Open,
+			path: "agent://worker/missing",
+			open: { read: true, write: false, append: false, truncate: false, create: false, createNew: false },
+		});
+		expect(opened.error).toBeUndefined();
+		if (opened.handle === undefined) throw new Error("open returned no handle");
+		const read = await filesystem.handle({
+			op: ShellFsOp.Read,
+			handle: opened.handle,
+			offset: 0n,
+			length: 16,
+		});
+		await filesystem.handle({ op: ShellFsOp.Close, handle: opened.handle });
+		expect(new TextDecoder().decode(read.data)).toBe("null");
+
+		const text = getResultText(
+			await new GrepTool(session).execute("agent-missing-field", {
+				pattern: "null",
+				path: "agent://worker/missing",
+			}),
+		);
+		expect(text).toContain("null");
+		expect(text).not.toContain("JSON path not found");
 	});
 
 	it("searches virtual internal URL content without a backing file", async () => {

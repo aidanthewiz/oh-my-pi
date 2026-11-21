@@ -5,7 +5,7 @@
  * `<jobId>:<sourceId>`, and a brief read live from the job's progress.
  */
 import type { AgentProgress } from "@oh-my-pi/pi-tui/tools/task";
-import type { AsyncJobManager } from "../async/job-manager";
+import type { AsyncJobManagerApi } from "../async/job-manager";
 import type { TextTap } from "../job-widgets/text-tap";
 import { AgentRegistry, type AgentRef } from "../registry/agent-registry";
 import {
@@ -13,6 +13,7 @@ import {
 	type JobTextSource,
 	type JobWidgetBrief,
 	type JobWidgetInputs,
+	type JobWidgetProducer,
 	TOOL_CALL_MARK,
 } from "../job-widgets/types";
 import type { SubagentToolResult } from "./executor";
@@ -56,12 +57,13 @@ class ChildJobSource implements JobTextSource {
 /** Inputs for {@link createTaskWidgetInputs}. */
 export interface TaskWidgetInputsOptions {
 	/** The root's shared manager, where the subagent's own jobs are registered. */
-	manager: AsyncJobManager;
+	manager: AsyncJobManagerApi;
 	/** Registry id of the subagent: the `ownerId` of the jobs it starts. */
 	agentId: string;
 	/** Exact originating registry generation, captured by the executor. */
 	owner: () => AgentRef | undefined;
 	widgetOwnerCurrent?: () => boolean;
+	producer?: JobWidgetProducer;
 	/** The run's tool tap, once the run exists; a queued job has none yet. */
 	tools: () => TextTap | undefined;
 	/** The job's live progress record (stage, watch and assignment are read from it on every call). */
@@ -79,6 +81,7 @@ export function createTaskWidgetInputs(options: TaskWidgetInputsOptions): JobWid
 	const previousJobs = new WeakSet(manager.getAllJobs({ ownerId: agentId }));
 	let reading = false;
 	return {
+		producer: options.producer,
 		canAuthor: () => {
 			const owner = options.owner();
 			return (

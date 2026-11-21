@@ -348,7 +348,8 @@ FAKE_SERVER = textwrap.dedent(
 
         if command_type == "extension_ui_response":
             last_ui_response = command
-            emit_prompt_turn("ui acknowledged")
+            incomplete = any(answer.get("timedOut") is True for answer in command.get("answers", []))
+            emit_prompt_turn("ui incomplete" if incomplete else "ui acknowledged")
             settle_pending_prompt()
             continue
 
@@ -1133,6 +1134,41 @@ FORWARD_COMPAT_SERVER = textwrap.dedent(
     """
 )
 
+BASH_EXCLUSION_SERVER = textwrap.dedent(
+    """
+    import json
+    import os
+    import sys
+    from pathlib import Path
+
+    ready = {"type": "ready"}
+    capability = os.environ["BASH_EXCLUSION_CAPABILITY"]
+    if capability != "missing":
+        ready["supportsBashExcludeFromContext"] = capability == "true"
+    print(json.dumps(ready), flush=True)
+
+    for line in sys.stdin:
+        command = json.loads(line)
+        kind = command["type"]
+        if kind == "bash":
+            marker = "private" if command.get("excludeFromContext") is True else "shared"
+            Path(os.environ["BASH_EXCLUSION_DIR"], marker).write_text("executed")
+            data = {
+                "output": "", "cancelled": False, "truncated": False,
+                "totalLines": 0, "totalBytes": 0, "outputLines": 0, "outputBytes": 0,
+            }
+        elif kind == "get_last_assistant_text":
+            data = {"text": None}
+        else:
+            raise RuntimeError(f"Unexpected command: {kind}")
+        print(json.dumps({
+            "type": "response", "id": command["id"], "command": kind,
+            "success": True, "data": data,
+        }), flush=True)
+    """
+)
+
+
 
 class RpcClientTests(unittest.TestCase):
     def make_client(self, server: str = FAKE_SERVER, **kwargs: object) -> RpcClient:
@@ -1143,31 +1179,20 @@ class RpcClientTests(unittest.TestCase):
         }
         return RpcClient(command=[sys.executable, "-u", "-c", server], **options)
 
-    def test_ask_answers_reach_the_wire_in_question_order(self) -> None:
+    def test_timed_out_ask_selections_remain_incomplete(self) -> None:
         with self.make_client() as client:
             client.prompt("needs ask")
             request = client.next_ui_request(timeout=2.0)
-            self.assertTrue(request.requires_response())
             questions = request.questions or ()
             client.send_ui_answers(
                 request.id,
                 [
-                    AskAnswer(id=questions[0].id, selected_options=(), custom_input="DuckDB"),
-                    AskAnswer(id=questions[1].id, selected_options=("Auth", "Search")),
+                    AskAnswer(id=questions[0].id, selected_options=("Postgres",), timed_out=True),
+                    AskAnswer(id=questions[1].id, selected_options=(), custom_input="Export", timed_out=True),
                 ],
             )
             client.wait_for_idle(timeout=2.0)
-            self.assertEqual(
-                client.request_raw("debug_last_ui_response"),
-                {
-                    "type": "extension_ui_response",
-                    "id": "ui-ask",
-                    "answers": [
-                        {"id": "db", "selectedOptions": [], "customInput": "DuckDB"},
-                        {"id": "features", "selectedOptions": ["Auth", "Search"]},
-                    ],
-                },
-            )
+            self.assertEqual(client.get_last_assistant_text(), "ui incomplete")
 
     def test_headless_ui_cancels_ask_so_the_prompt_completes(self) -> None:
         with self.make_client() as client:
@@ -1211,11 +1236,27 @@ class RpcClientTests(unittest.TestCase):
             {"available_commands_update", "subagent_lifecycle", "live_phase"} & {event.type for event in turn.events}
         )
 
-    def test_set_todos_accepts_blocked_tasks(self) -> None:
+    def test_set_todos_rejects_unknown_status(self) -> None:
         with self.make_client() as client:
-            phases = client.set_todos([{"content": "Ship", "status": "blocked", "blocker": "waiting on review"}])
-        task = phases[0].tasks[0]
-        self.assertEqual((task.status, task.blocker), ("blocked", "waiting on review"))
+            with self.assertRaises(RpcError):
+                client.set_todos([{"content": "Ship", "status": "blocked"}])
+
+    def test_bash_exclusion_requires_advertised_capability(self) -> None:
+        for capability in ("missing", "false", "true"):
+            with self.subTest(capability=capability), tempfile.TemporaryDirectory() as directory:
+                with self.make_client(
+                    server=BASH_EXCLUSION_SERVER,
+                    env={"BASH_EXCLUSION_CAPABILITY": capability, "BASH_EXCLUSION_DIR": directory},
+                ) as client:
+                    if capability == "true":
+                        client.bash("private", exclude_from_context=True)
+                    else:
+                        with self.assertRaisesRegex(RpcError, "does not support bash context exclusion"):
+                            client.bash("private", exclude_from_context=True)
+                    client.bash("shared", exclude_from_context=False)
+                    client.get_last_assistant_text()
+                self.assertEqual(Path(directory, "private").exists(), capability == "true")
+                self.assertTrue(Path(directory, "shared").exists())
 
     def test_predict_word_outlasts_request_timeout(self) -> None:
         with self.make_client(request_timeout=0.3) as client:

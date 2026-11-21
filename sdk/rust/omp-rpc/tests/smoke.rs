@@ -148,9 +148,8 @@ fn smoke_real_server() {
 			phases: vec![TodoPhase {
 				name:  "Smoke".into(),
 				tasks: vec![TodoItem {
-					content: "blocked task".into(),
-					status:  TodoStatus::Blocked,
-					blocker: Some("waiting".into()),
+					content: "active task".into(),
+					status:  TodoStatus::InProgress,
 					details: None,
 					notes:   None,
 				}],
@@ -168,7 +167,7 @@ fn smoke_real_server() {
 				.collect::<Vec<_>>())
 			.collect::<Vec<_>>()
 	);
-	assert_eq!(phases[0].tasks[0].status, TodoStatus::Blocked);
+	assert_eq!(phases[0].tasks[0].status, TodoStatus::InProgress);
 
 	let filter = client
 		.call(&SetEventFilterCommand { events: None })
@@ -196,10 +195,24 @@ fn smoke_real_server() {
 	println!("predict_word: {suffix:?}");
 
 	let bash = client
-		.call(&BashCommand { command: "echo hi".into() })
+		.call(&BashCommand { command: "echo hi".into(), exclude_from_context: None })
 		.unwrap();
 	println!("bash: exit {:?} output {:?}", bash.exit_code, bash.output);
 	assert_eq!(bash.output.trim(), "hi");
+	let private = client
+		.call(&BashCommand {
+			command: "echo sdk-private-marker".into(),
+			exclude_from_context: Some(true),
+		})
+		.unwrap();
+	assert_eq!(private.output.trim(), "sdk-private-marker");
+	let history = client.get_messages().unwrap();
+	assert!(history.iter().any(|message| matches!(
+		message,
+		AgentMessage::BashExecution(execution)
+			if execution.output.as_deref().map(str::trim) == Some("sdk-private-marker")
+				&& execution.exclude_from_context == Some(true)
+	)), "excluded shell output lost its context exclusion in session history");
 
 	// The server leads its own process group; dropping the client must empty it.
 	let pgid = libc::pid_t::try_from(client.pid().unwrap()).unwrap();

@@ -8,7 +8,8 @@
 import { afterAll, afterEach, beforeAll, expect, it, spyOn } from "bun:test";
 import { type } from "@oh-my-pi/omptype";
 import * as fs from "node:fs";
-import { Agent, type AgentTool, type AgentToolContext } from "@oh-my-pi/pi-agent-core";
+import { setImmediate as waitForImmediate } from "node:timers/promises";
+import { Agent, type AgentTool, type AgentToolContext, type AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import { AnthropicConnectionError } from "@oh-my-pi/pi-ai/error";
 import { createMockModel, type MockModelOptions } from "@oh-my-pi/pi-ai/providers/mock";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
@@ -34,6 +35,8 @@ import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { BashTool } from "@oh-my-pi/pi-coding-agent/tools/bash";
 import { EvalTool } from "@oh-my-pi/pi-coding-agent/tools/eval";
 import { computerTurnInFlight, registerComputerController } from "@oh-my-pi/pi-coding-agent/tools/computer/supervisor";
+import { wrapToolWithMetaNotice } from "@oh-my-pi/pi-coding-agent/tools/output-meta";
+import { WriteTool } from "@oh-my-pi/pi-coding-agent/tools/write";
 import { dispatchXdevTool, resolveMountedXdevExecutable, type XdevState } from "@oh-my-pi/pi-coding-agent/tools/xdev";
 import { TempDir, withTimeout } from "@oh-my-pi/pi-utils";
 
@@ -197,7 +200,7 @@ it("eval applies a custom-wire patch exactly once through the canonical tool's A
 		"tools.approval": { edit: "prompt" },
 	});
 	toolSession.getToolForEvalBridge = name => session!.getToolForEvalBridge(name);
-	toolSession.getEvalBridgeToolNames = () => session!.getEvalBridgeToolNames();
+	toolSession.getAdvertisedEvalToolNames = () => session!.getAdvertisedEvalToolNames();
 	await Bun.write(tempDir.join("eval-wire-old.txt"), "old\n");
 	const input =
 		"*** Begin Patch\n*** Add File: eval-wire.txt\n+ok\n*** Delete File: eval-wire-old.txt\n*** End Patch\n";
@@ -211,7 +214,7 @@ it("eval applies a custom-wire patch exactly once through the canonical tool's A
 	expect(permissionSpy).toHaveBeenCalledTimes(1);
 	expect(session.getToolForEvalBridge("edit")?.name).toBe("edit");
 	expect(session.getEvalBridgeToolNames()).toEqual(["edit", "apply_patch"]);
-	expect(new EvalTool(toolSession).description).toContain("`edit`, `apply_patch`");
+	expect(new EvalTool(toolSession).description).toContain("edit, apply_patch");
 });
 
 it("eval refuses both canonical and wire names after their tool is disabled", async () => {
@@ -378,7 +381,7 @@ function createRunner(
 	runner.initialize(
 		{
 			sendMessage: () => {},
-			sendUserMessage: () => {},
+			sendUserMessage: async () => {},
 			appendEntry: () => {},
 			setLabel: () => {},
 			getActiveTools: () => [],
@@ -679,6 +682,44 @@ it("startup-mounted destructive tools gain the ACP permission gate when the brid
 	expect(permissionSpy).toHaveBeenCalledTimes(1);
 	expect(deleteTool.executeCalls).toBe(1);
 });
+
+it("xd wire aliases cannot bypass ACP rejection", async () => {
+	const requests: ClientBridgePermissionToolCall[] = [];
+	const bridge: ClientBridge = {
+		capabilities: { requestPermission: true },
+		async requestPermission(toolCall) {
+			requests.push(toolCall);
+			return { outcome: "selected", optionId: "reject_once", kind: "reject_once" };
+		},
+	};
+	const toolSession = makeToolSession(bridge);
+	const edit = new EditTool(toolSession);
+	const xdev: XdevState = {
+		tools: new Map([[edit.name, edit as AgentTool]]),
+		mountedNames: new Set(),
+		builtInNames: new Set(["edit"]),
+		isActive: name => session?.getActiveToolNames().includes(name) ?? false,
+	};
+	toolSession.xdev = xdev;
+	const write = new WriteTool(toolSession);
+	session = await createSession([edit as AgentTool, write as AgentTool], bridge, {}, { xdev });
+	const target = tempDir.join("xd-wire-permission.txt");
+	await Bun.write(target, "keep\n");
+	const input = ["*** Begin Patch", `*** Delete File: ${target}`, "*** End Patch"].join("\n");
+	const content = JSON.stringify({ input });
+
+	for (const name of ["edit", "apply_patch"]) {
+		const result = await write.execute(`xd-permission-${name}`, { path: `xd://${name}`, content });
+		expect(result.isError).toBe(true);
+		expect(result.content.find(entry => entry.type === "text")?.text).toContain("rejected by user");
+		expect(await Bun.file(target).text()).toBe("keep\n");
+	}
+	expect(requests.map(({ toolName, title, locations }) => ({ toolName, title, locations }))).toEqual([
+		{ toolName: "edit", title: `Delete ${target}`, locations: [{ path: target }] },
+		{ toolName: "edit", title: `Delete ${target}`, locations: [{ path: target }] },
+	]);
+});
+
 it("edit, write, and ast_edit do not request ACP permission", async () => {
 	const editTool = makeFakeTool("edit");
 	const writeTool = makeFakeTool("write");
@@ -884,6 +925,7 @@ it("lets the computer display sleep while the ACP client asks the user for permi
 		releaseDisplay(turn) {
 			releases.push(turn);
 		},
+		async reset() {},
 		async close() {},
 	});
 	try {
@@ -1105,8 +1147,121 @@ it("setClientBridge wraps tools that were already active", async () => {
 	expect(bashTool.executeCalls).toBe(1);
 });
 
-it("aborting an open permission request rejects without executing the tool", async () => {
+for (const wrap of [false, true]) {
+	it(`awaits cancellation cleanup through ACP${wrap ? " and extension" : ""} execution`, async () => {
+		const started = Promise.withResolvers<void>();
+		const aborted = Promise.withResolvers<void>();
+		const releaseCleanup = Promise.withResolvers<void>();
+		const closed = Promise.withResolvers<void>();
+		const controller = new AbortController();
+		const parameters = type({ path: "string" });
+		let resourceOpen = false;
+		let executionStarted = false;
+		class CleanupDelete implements AgentTool<typeof parameters, { closed: boolean }> {
+			readonly name = "delete";
+			readonly label = "Delete";
+			readonly description = "Closes a caller-owned resource.";
+			readonly parameters = parameters;
+			readonly approval = "write";
+			readonly #policy = "await-cleanup";
+			cancellationBehavior(_args: unknown): "await-cleanup" {
+				return this.#policy;
+			}
+			async execute(
+				_id: string,
+				_args: unknown,
+				signal?: AbortSignal,
+			): Promise<AgentToolResult<{ closed: boolean }, typeof parameters>> {
+				const onAbort = () => aborted.resolve();
+				signal?.addEventListener("abort", onAbort, { once: true });
+				if (signal?.aborted) onAbort();
+				executionStarted = true;
+				resourceOpen = true;
+				started.resolve();
+				try {
+					await aborted.promise;
+					await releaseCleanup.promise;
+				} finally {
+					resourceOpen = false;
+					signal?.removeEventListener("abort", onAbort);
+					closed.resolve();
+				}
+				return {
+					content: [{ type: "text", text: "Resource closed safely." }],
+					details: { closed: true },
+					isError: true,
+				};
+			}
+		}
+		const bridge = makeBridge({ outcome: "selected", optionId: "allow_once", kind: "allow_once" });
+		const permissionSpy = spyOn(bridge, "requestPermission");
+		session = await createSession([wrapToolWithMetaNotice(new CleanupDelete())], bridge, {}, { wrap });
+		await session.setActiveToolsByName(["delete"]);
+		const gated = session.getToolForEvalBridge("delete");
+		if (!gated) throw new Error("Expected the ACP-gated delete tool");
+		const xdev: XdevState = {
+			tools: new Map([[gated.name, gated]]),
+			mountedNames: new Set([gated.name]),
+			builtInNames: new Set([gated.name]),
+			isActive: () => false,
+		};
+		const write = wrapToolWithMetaNotice(new WriteTool({ ...makeToolSession(bridge), xdev }));
+		const postflightSpy = wrap
+			? spyOn(session.extensionRunner!, "runToolCallPreflightAfter").mockImplementation(async () => {
+					throw new Error("PRIVATE-CANCELLATION-CAUSE");
+				})
+			: undefined;
+		let settled = false;
+		const execution = write.execute(
+			"acp-cleanup",
+			{ path: "xd://delete", content: JSON.stringify({ path: "/synthetic/resource" }) },
+			controller.signal,
+			undefined,
+			makeToolContext(session),
+		);
+		void execution.then(
+			() => {
+				settled = true;
+			},
+			() => {
+				settled = true;
+			},
+		);
+		try {
+			await Promise.race([
+				started.promise,
+				execution.then(() => {
+					throw new Error("ACP-gated execution finished before starting.");
+				}),
+			]);
+			controller.abort(new Error("PRIVATE-CANCELLATION-CAUSE"));
+			await aborted.promise;
+			await waitForImmediate();
+			expect(resourceOpen).toBe(true);
+			expect(settled).toBe(false);
+			releaseCleanup.resolve();
+			const result = await execution;
+			expect(resourceOpen).toBe(false);
+			expect(result).toMatchObject({
+				content: [{ type: "text", text: "Resource closed safely." }],
+				details: { xdev: { inner: { closed: true } } },
+				isError: true,
+			});
+			expect(JSON.stringify(result)).not.toContain("PRIVATE-CANCELLATION-CAUSE");
+			expect(permissionSpy).toHaveBeenCalledTimes(1);
+		} finally {
+			controller.abort();
+			releaseCleanup.resolve();
+			await execution.catch(() => {});
+			if (executionStarted) await closed.promise;
+			postflightSpy?.mockRestore();
+		}
+	});
+}
+
+it("aborting an open permission request does not start a cleanup-owned tool", async () => {
 	const bashTool = makeFakeTool("bash");
+	Object.defineProperty(bashTool, "cancellationBehavior", { value: "await-cleanup" });
 	const pending = Promise.withResolvers<ClientBridgePermissionOutcome>();
 	const requested = Promise.withResolvers<void>();
 	const bridge: ClientBridge = {
@@ -1140,8 +1295,9 @@ it("aborting an open permission request rejects without executing the tool", asy
 // 2. Reject once: throws, underlying execute never called
 // ---------------------------------------------------------------------------
 
-it("reject_once: throws ToolError and never calls underlying execute", async () => {
+it("reject_once: refuses a cleanup-owned tool before execution", async () => {
 	const bashTool = makeFakeTool("bash");
+	Object.defineProperty(bashTool, "cancellationBehavior", { value: "await-cleanup" });
 	const bridge = makeBridge({ outcome: "selected", optionId: "reject_once", kind: "reject_once" });
 	session = await createSession([bashTool], bridge);
 
@@ -1613,7 +1769,7 @@ async function createSessionWithMockModel(
 	const getApiKey = options?.getApiKey ?? (() => "test-key");
 	const registry = new ModelRegistry(auth);
 	registry.getApiKey = async () => getApiKey();
-	const agent = new Agent({
+	const agent: Agent = new Agent({
 		getApiKey,
 		getToolContext: context => ({
 			sessionManager,

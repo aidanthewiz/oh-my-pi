@@ -23,28 +23,30 @@
 
 use std::path::{Path, PathBuf};
 
-use brush_core::{Error, ErrorKind, Shell, ShellExtensions};
 use pi_vcs::git::GitRepo;
 
-use crate::shell::is_git_repo_location_var;
+use super::is_git_repo_location_var;
 
 /// Exit status of a refused command; git's own for a refused operation.
-pub(super) const REFUSED_EXIT: u8 = 1;
+pub const REFUSED_EXIT: u8 = 1;
 
 /// A judged `git` invocation, detached from the shell so its repository reads
-/// can run off the async workers.
-pub(super) struct Review(Judgment);
+/// can run off the shell's thread.
+pub struct Review(Judgment);
 
 /// What the builtin does with a judged command.
-pub(super) enum Decision {
+#[derive(Debug, PartialEq, Eq)]
+pub enum Decision {
+	/// Run git.
 	Run,
 	/// Print this message instead of running git.
 	Refuse(String),
 }
 
 impl Review {
-	/// Judges `args` (git's arguments, without `git`) as `shell` would run them.
-	pub(super) fn of<SE: ShellExtensions>(shell: &Shell<SE>, args: &[String]) -> Self {
+	/// Judges `args` (git's arguments, without `git`) as git would run them
+	/// in `cwd` with the exported variables named by `exported`.
+	pub fn of<'a>(cwd: &Path, mut exported: impl Iterator<Item = &'a str>, args: &[String]) -> Self {
 		let Some(invocation) = Invocation::parse(args) else {
 			return Self(Judgment::Allow);
 		};
@@ -56,35 +58,25 @@ impl Review {
 			dir:        invocation
 				.dirs
 				.iter()
-				.fold(shell.working_dir().to_owned(), |dir, next| dir.join(next)),
+				.fold(cwd.to_owned(), |dir, next| dir.join(next)),
 			// GIT_DIR, GIT_WORK_TREE, GIT_INDEX_FILE, … retarget git as
 			// `--git-dir` does.
-			redirected: invocation.redirected
-				|| shell
-					.env()
-					.iter_exported()
-					.any(|(name, _)| is_git_repo_location_var(name)),
+			redirected: invocation.redirected || exported.any(is_git_repo_location_var),
 		}))
 	}
 
 	/// Whether git runs after reading the repository state the verdict needs.
-	///
-	/// # Errors
-	/// [`ErrorKind::ThreadingError`] when the repository work cannot finish.
-	pub(super) async fn decide(self) -> Result<Decision, Error> {
+	/// Blocks on repository I/O: run it off the shell's thread.
+	pub fn decide(self) -> Decision {
 		let Judgment::Check(sub, verdict, site) = self.0 else {
-			return Ok(Decision::Run);
+			return Decision::Run;
 		};
-		tokio::task::spawn_blocking(move || {
-			if site.redirected {
-				return Decision::Refuse(Refusal::Redirected(sub).message());
-			}
-			let repository = GitRepo::discover(&site.dir);
-			in_shared(&repository, sub, verdict, &site.dir)
-				.map_or(Decision::Run, |refusal| Decision::Refuse(refusal.message()))
-		})
-		.await
-		.map_err(|err| Error::from(ErrorKind::ThreadingError(err)))
+		if site.redirected {
+			return Decision::Refuse(Refusal::Redirected(sub).message());
+		}
+		let repository = GitRepo::discover(&site.dir);
+		in_shared(&repository, sub, verdict, &site.dir)
+			.map_or(Decision::Run, |refusal| Decision::Refuse(refusal.message()))
 	}
 }
 

@@ -5,9 +5,9 @@ import * as path from "node:path";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { disposeAllVmContexts } from "@oh-my-pi/pi-coding-agent/eval/js/context-manager";
 import { createBrowserPrelude } from "@oh-my-pi/pi-coding-agent/tools/browser";
-import { findFreeCdpPort, waitForCdp } from "@oh-my-pi/pi-coding-agent/tools/browser/attach";
+import { findFreeCdpPort, gracefulKillTreeOnce, waitForCdp } from "@oh-my-pi/pi-coding-agent/tools/browser/attach";
 import { prepareElementUpload } from "@oh-my-pi/pi-coding-agent/tools/browser/interactions";
-import { ensureChromiumExecutable } from "@oh-my-pi/pi-coding-agent/tools/browser/launch";
+import { ensureChromiumExecutable, RENDERER_PRIORITY_ARGS } from "@oh-my-pi/pi-coding-agent/tools/browser/launch";
 import { getTab, releaseAllTabs } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
 import {
 	openUploadSource,
@@ -163,6 +163,8 @@ function makeSession(): ToolSession {
 		getSessionFile: () => null,
 		getSessionSpawns: () => "*",
 		settings: Settings.isolated({
+			// Managed Chromium, whether or not omp's WebKit engine is installed on this machine.
+			"browser.webkit": false,
 			"browser.enabled": true,
 			"browser.headless": true,
 			"browser.cmux": false,
@@ -178,7 +180,7 @@ function routeProxy(route: UploadRoute, options: ProxyOptions = {}): ProxyOption
 }
 
 /**
- * Launch a Chrome omp did not start, open a fixture page in it over `app.cdp_url` through a CDP proxy, and run cells
+ * Launch a Chrome omp did not start, open a fixture page in it over an `app` CDP URL through a CDP proxy, and run cells
  * there.
  */
 async function openConnectedTab(toolCallId: string, options: { page?: string; proxy?: ProxyOptions } = {}) {
@@ -193,6 +195,7 @@ async function openConnectedTab(toolCallId: string, options: { page?: string; pr
 			"--no-sandbox",
 			"--no-first-run",
 			"--use-mock-keychain",
+			...RENDERER_PRIORITY_ARGS,
 			`--user-data-dir=${root}`,
 			`--remote-debugging-port=${port}`,
 		],
@@ -206,7 +209,7 @@ async function openConnectedTab(toolCallId: string, options: { page?: string; pr
 	const close = async () => {
 		await prelude.invoke({ action: "close", name }, context).catch(() => undefined);
 		proxy.stop();
-		child.kill();
+		await gracefulKillTreeOnce(child.pid);
 		await child.exited;
 		await fs.rm(root, { recursive: true, force: true });
 	};
@@ -217,7 +220,7 @@ async function openConnectedTab(toolCallId: string, options: { page?: string; pr
 				action: "open",
 				name,
 				url: `${url}${options.page ?? ""}`,
-				app: { cdp_url: `http://127.0.0.1:${proxy.port}` },
+				app: `http://127.0.0.1:${proxy.port}`,
 			},
 			context,
 		);
@@ -448,6 +451,31 @@ return { errors, dropped: await tab.evaluate(() => window.dropped.map(file => fi
 		}
 	}, 60_000);
 
+	test("settles empty and populated folder selections when delegated change handlers stop propagation", async () => {
+		const { run, close } = await openConnectedTab("browser-upload-folder-empty", { proxy: routeProxy("paths") });
+		try {
+			await fs.mkdir(path.join(tempDir, "empty-selection-album"), { recursive: true });
+			const folder = path.join(tempDir, "populated-selection-album");
+			await fs.mkdir(path.join(folder, "nested"), { recursive: true });
+			await Bun.write(path.join(folder, "nested", "after-empty.txt"), "after empty");
+			const received = await run(`
+await tab.evaluate(() => document.addEventListener("change", event => event.stopPropagation(), true));
+await tab.uploadFile("#folder", "empty-selection-album");
+const empty = await tab.evaluate(() => [...document.querySelector("#folder").files].map(file => file.name));
+await tab.uploadFile("#folder", "populated-selection-album");
+const populated = await tab.evaluate(() => Promise.all(
+	[...document.querySelector("#folder").files].map(async file => [file.webkitRelativePath, await file.text()]),
+));
+return { empty, populated };`);
+			expect(received).toEqual({
+				empty: [],
+				populated: [["populated-selection-album/nested/after-empty.txt", "after empty"]],
+			});
+		} finally {
+			await close();
+		}
+	}, 60_000);
+
 	test("refuses a folder by name where the browser takes only contents", async () => {
 		const { run, close } = await openConnectedTab("browser-upload-folder-contents", {
 			proxy: routeProxy("contents"),
@@ -497,8 +525,11 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser uploadFile into a browser omp laun
 			result.details && typeof result.details === "object" && "value" in result.details
 				? result.details.value
 				: undefined;
-		const before = await stagingFolders();
 		await prelude.invoke({ action: "open", name, url }, context);
+		const tab = getTab(name);
+		if (tab?.backend !== "worker") throw new Error("Expected the launched tab's upload owner");
+		const staging = tab.uploadDir;
+		ownedStaging.add(staging);
 		try {
 			const file = path.join(tempDir, "recycled.txt");
 			await Bun.write(file, "outlives its worker");
@@ -513,11 +544,14 @@ return "done";`);
 			expect(JSON.stringify(recycled.content)).toContain("reattached to a new worker");
 			const read = await run(`return await tab.evaluate(() => document.querySelector("#direct").files[0].text());`);
 			expect(valueOf(read)).toBe("outlives its worker");
+			const staged = (await fs.readdir(staging, { recursive: true })).filter(file => file.endsWith("recycled.txt"));
+			expect(staged).toHaveLength(1);
+			expect(await fs.readFile(path.join(staging, staged[0]!), "utf8")).toBe("outlives its worker");
 		} finally {
 			await prelude.invoke({ action: "close", name }, context);
 		}
 		// omp closed the page it launched, the last reader of the copies.
-		expect([...(await stagingFolders())].filter(folder => !before.has(folder))).toEqual([]);
+		await expect(fs.stat(staging)).rejects.toMatchObject({ code: "ENOENT" });
 	}, 60_000);
 });
 

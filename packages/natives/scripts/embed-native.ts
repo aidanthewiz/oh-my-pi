@@ -30,6 +30,9 @@ export interface EmbedOptions extends NativeEmbedTarget {
 	readonly version?: string;
 }
 
+/** In-memory native manifests and compressed addon bytes supplied to Bun.build. */
+export type EmbeddedAddonFiles = Record<string, string | Uint8Array>;
+
 /**
  * Build the in-memory `Bun.build({ files })` overrides that embed one target's
  * addons into a standalone binary: one `<addon>.node.zst` zstd frame per addon
@@ -50,7 +53,7 @@ export async function embeddedAddonFiles({
 	arch,
 	nativeDir = defaultNativeDir,
 	version = packageJson.version,
-}: EmbedOptions): Promise<Record<string, string | Uint8Array>> {
+}: EmbedOptions): Promise<EmbeddedAddonFiles> {
 	const platformTag = `${platform}-${arch}`;
 	const candidates =
 		arch === "x64"
@@ -108,7 +111,7 @@ export const embeddedAddon = {
 };
 `;
 
-	const overrides: Record<string, string | Uint8Array> = {};
+	const overrides: EmbeddedAddonFiles = {};
 	for (const sourceDir of lexicalDir === dir ? [dir] : [dir, lexicalDir]) {
 		available.forEach(({ filename }, index) => {
 			overrides[path.join(sourceDir, `${filename}.zst`)] = frames[index];

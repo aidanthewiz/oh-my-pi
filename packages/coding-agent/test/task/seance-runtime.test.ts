@@ -22,6 +22,7 @@ import type { PreparedSeanceSession } from "@oh-my-pi/pi-coding-agent/task/seanc
 import { seanceIsolationOptions } from "@oh-my-pi/pi-coding-agent/task/seance-policy";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { getAgentDir, prompt, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
+import { localSession } from "../helpers/local-session";
 
 function preparedSourceSession(sourceFile: string, sourceSessionId: string): PreparedSeanceSession {
 	return {
@@ -355,6 +356,7 @@ describe("seance startup contracts", () => {
 				taskDepth: 1,
 				toolNames: ["read", "grep", "glob"],
 				requireYieldTool: true,
+				outputSchema: {},
 				...seanceIsolationOptions(cwd),
 				systemPrompt: defaultPrompt => {
 					defaultPromptBlocks = [...defaultPrompt];
@@ -372,6 +374,7 @@ describe("seance startup contracts", () => {
 				resolvedModel,
 				restrictToolNames: true,
 				spawns: "",
+				outputSchema: {},
 			});
 			await liveSession.sessionManager.ensureOnDisk();
 			const warmPrompt = [...liveSession.systemPrompt];
@@ -410,7 +413,7 @@ describe("seance startup contracts", () => {
 			});
 			const revive = await createReviver(ref);
 			if (!revive) throw new Error("Expected a cold seance reviver");
-			revived = await revive(ref);
+			revived = localSession(await revive(ref));
 			expect(revived.sessionManager.getAdditionalDirectories()).toEqual([]);
 
 			expect(revived.systemPrompt).toEqual(warmPrompt);
@@ -462,6 +465,7 @@ describe("seance startup contracts", () => {
 			status: "parked",
 			session: null,
 			sessionFile,
+			generation: 0,
 			createdAt: 0,
 			lastActivity: 0,
 		});

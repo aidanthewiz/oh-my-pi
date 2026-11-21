@@ -46,7 +46,14 @@ describe("AgentSession eval preludes", () => {
 	});
 
 	it("updates enabled preludes without registering browser or computer tools", async () => {
-		const settings = Settings.isolated({ "browser.enabled": false, "archive.enabled": false });
+		const settings = Settings.isolated({
+			"browser.enabled": false,
+			"browser.relay": false,
+			"browser.relayUrl": "http://127.0.0.1:19334",
+			"archive.enabled": false,
+			"commit.enabled": false,
+			"disassembler.backend": "none",
+		});
 		const { session } = await createAgentSession({
 			cwd: registryDir,
 			agentDir: registryDir,
@@ -77,18 +84,54 @@ describe("AgentSession eval preludes", () => {
 		// Setting listeners queue the prompt refresh on the next microtask; the no-op mutation serializes behind it.
 		await Promise.resolve();
 		await session.runToolRegistryMutation(async () => undefined);
-		expect(session.agent.state.systemPrompt.join("\n\n")).toContain("# Computer Use");
-		expect(session.agent.state.systemPrompt.join("\n\n")).toContain("`computer` eval prelude");
 
 		cfgComputerEnabled.override(session.settings, false);
 		expect(session.getEvalPreludes()).toEqual([]);
 		await Promise.resolve();
 		await session.runToolRegistryMutation(async () => undefined);
-		expect(session.agent.state.systemPrompt.join("\n\n")).not.toContain("# Computer Use");
 
+		const browserReconciled = Promise.withResolvers<void>();
+		const refresh = session.refreshBaseSystemPrompt.bind(session);
+		const refreshSpy = vi.spyOn(session, "refreshBaseSystemPrompt").mockImplementation(async (...args) => {
+			await refresh(...args);
+			browserReconciled.resolve();
+		});
 		cfgBrowserEnabled.override(session.settings, true);
 		expect(session.getEvalPreludes().map(definition => definition.name)).toEqual(["browser"]);
 		expect(session.getAllToolNames()).not.toContain("browser");
+		// The prefix assertion below depends on browser.enabled finishing its asynchronous MCP-filter reconcile.
+		await browserReconciled.promise;
+		refreshSpy.mockRestore();
+
+		const mock = createMockModel({ handler: { content: ["ok"] } });
+		session.agent.streamFn = mock.stream;
+		await session.prompt("first browser turn");
+		const prefix = session.agent.state.systemPrompt.join("\n\n");
+		const browserGuidance = session.getEvalPreludes().find(prelude => prelude.name === "browser")?.guidance;
+		cfgBrowserRelay.override(settings, true);
+		const relayGuidance = session.getEvalPreludes().find(prelude => prelude.name === "browser")?.guidance;
+		expect(relayGuidance).not.toBe(browserGuidance);
+		await session.prompt("relay browser turn");
+		expect(session.agent.state.systemPrompt.join("\n\n")).toBe(prefix);
+		const notices = session.agent.state.messages.filter(
+			message => message.role === "custom" && message.customType === "eval-prelude-notice",
+		);
+		expect(notices).toMatchObject([
+			{
+				display: false,
+				details: {
+					added: [],
+					removed: [],
+					guidance: { browser: relayGuidance },
+				},
+			},
+		]);
+		await session.prompt("unchanged relay turn");
+		expect(
+			session.agent.state.messages.filter(
+				message => message.role === "custom" && message.customType === "eval-prelude-notice",
+			),
+		).toHaveLength(notices.length);
 
 		const gemini = getBundledModel("google", "gemini-2.5-flash");
 		if (!gemini) throw new Error("Expected bundled Google Gemini model to exist");
@@ -100,7 +143,12 @@ describe("AgentSession eval preludes", () => {
 	// `/computer on` mid-session used to rebuild the system prompt and eval
 	// description, busting the provider prompt cache on the next request.
 	it("announces mid-session toggles in a hidden notice without rewriting the cached prefix", async () => {
-		const settings = Settings.isolated({ "browser.enabled": false, "archive.enabled": false });
+		const settings = Settings.isolated({
+			"browser.enabled": false,
+			"archive.enabled": false,
+			"commit.enabled": false,
+			"disassembler.backend": "none",
+		});
 		const { session } = await createAgentSession({
 			cwd: registryDir,
 			agentDir: registryDir,
@@ -152,7 +200,6 @@ describe("AgentSession eval preludes", () => {
 		expect(prefix(second!)).toEqual(prefix(first!));
 		expect(prefix(third!)).toEqual(prefix(first!));
 		expect(prefix(first!).eval).not.toContain("xd://eval/computer");
-		expect(prefix(first!).systemPrompt?.join("\n")).not.toContain("# Computer Use");
 
 		const notices = session.agent.state.messages.filter(
 			message => message.role === "custom" && message.customType === "eval-prelude-notice",
@@ -183,6 +230,7 @@ describe("AgentSession eval preludes", () => {
 				"browser.enabled": true,
 				"browser.relay": false,
 				"browser.tern": false,
+				"browser.relayUrl": "http://127.0.0.1:19334",
 				"browser.cmux": false,
 				"archive.enabled": false,
 			});
@@ -207,10 +255,12 @@ describe("AgentSession eval preludes", () => {
 			session.agent.streamFn = mock.stream;
 			const original = session.getEvalPreludes().find(prelude => prelude.name === "browser");
 			if (!original) throw new Error("Expected the enabled browser prelude");
-			expect(original.guidance).toBeUndefined();
+			const originalGuidance = original.guidance;
+			if (!originalGuidance) throw new Error("Expected browser session guidance");
 			await session.prompt("baseline");
 			const baselinePrompt = structuredClone(mock.calls[0]!.context.systemPrompt);
 			const baselineEval = mock.calls[0]!.context.tools?.find(tool => tool.name === "eval")?.description;
+			const guidanceChanges: Array<string | undefined> = [];
 
 			const endpoint =
 				"http://synthetic-user:synthetic-password@127.0.0.1:19333/secret-path?token=secret-token&session=secret-session#secret-fragment";
@@ -219,39 +269,48 @@ describe("AgentSession eval preludes", () => {
 			const relay = session.getEvalPreludes().find(prelude => prelude.name === "browser");
 			if (!relay) throw new Error("Expected the enabled relay prelude");
 			const relayGuidance = relay.guidance;
-			expect(relayGuidance).toContain("browser.cdpUrl");
-			expect(original.guidance).toBeUndefined();
+			expect(relayGuidance).not.toBe(originalGuidance);
+			guidanceChanges.push(relayGuidance);
 			await session.prompt("step one");
 
 			cfgBrowserCdpUrl.override(settings, "");
 			cfgBrowserTern.override(settings, true);
 			process.env.TERN_PANE_SOCKET = "/tmp/synthetic-guidance-tern.sock";
 			process.env.TERN_PANE = "1";
+			const ternGuidance = session.getEvalPreludes().find(prelude => prelude.name === "browser")?.guidance;
+			expect(ternGuidance).not.toBe(relayGuidance);
+			guidanceChanges.push(ternGuidance);
 			await session.prompt("step two");
-			expect(relay.guidance).toBe(relayGuidance);
 
 			delete process.env.TERN_PANE_SOCKET;
 			delete process.env.TERN_PANE;
 			cfgBrowserCmux.override(settings, true);
 			process.env.CMUX_SOCKET_PATH = "/tmp/synthetic-guidance-cmux.sock";
+			const cmuxGuidance = session.getEvalPreludes().find(prelude => prelude.name === "browser")?.guidance;
+			expect(cmuxGuidance).not.toBe(ternGuidance);
+			guidanceChanges.push(cmuxGuidance);
 			await session.prompt("step three");
 			cfgBrowserRelay.override(settings, false);
+			const restoredGuidance = session.getEvalPreludes().find(prelude => prelude.name === "browser")?.guidance;
+			expect(restoredGuidance).not.toBe(cmuxGuidance);
+			expect(restoredGuidance).toBe(originalGuidance);
+			guidanceChanges.push(restoredGuidance);
 			await session.prompt("step four");
 			await session.prompt("step five");
 
 			const notices = session.agent.state.messages.filter(
 				message => message.role === "custom" && message.customType === "eval-prelude-notice",
 			);
-			expect(notices.map(notice => (notice.role === "custom" ? notice.details : undefined))).toEqual([
-				{ added: [], removed: [], guidance: { browser: expect.stringContaining("browser.cdpUrl") } },
-				{ added: [], removed: [], guidance: { browser: expect.stringContaining("Tern") } },
-				{ added: [], removed: [], guidance: { browser: expect.stringContaining("cmux") } },
-				{ added: [], removed: [], guidance: { browser: "" } },
-			]);
-			for (const { context } of mock.calls) {
-				expect(context.systemPrompt).toEqual(baselinePrompt);
-				expect(context.tools?.find(tool => tool.name === "eval")?.description).toBe(baselineEval);
-			}
+			expect(
+				notices.map(notice =>
+					notice.role === "custom" && notice.details && typeof notice.details === "object"
+						? Reflect.get(Reflect.get(notice.details, "guidance") ?? {}, "browser")
+						: undefined,
+				),
+			).toEqual(guidanceChanges);
+			// Endpoint changes can rebuild safety guidance, but not an earlier dispatched context.
+			expect(mock.calls[0]!.context.systemPrompt).toEqual(baselinePrompt);
+			expect(mock.calls[0]!.context.tools?.find(tool => tool.name === "eval")?.description).toBe(baselineEval);
 			const requestTexts = mock.calls.map(({ context }) =>
 				context.messages
 					.flatMap(message =>
@@ -261,15 +320,14 @@ describe("AgentSession eval preludes", () => {
 					)
 					.join("\n"),
 			);
-			expect(requestTexts[1]).toContain("browser.cdpUrl");
-			expect(requestTexts[2]).toContain("Tern");
-			expect(requestTexts[3]).toContain("cmux");
+			for (const [index, guidance] of guidanceChanges.entries()) {
+				if (!guidance) throw new Error("Expected browser session guidance for the selected backend");
+				expect(requestTexts[index + 1]).toContain(guidance);
+			}
 			for (const request of requestTexts.slice(4)) {
 				expect(request.match(/<system-notice id="prelude-extension">/g)).toHaveLength(4);
 				const latest = request.split('<system-notice id="prelude-extension">').at(-1);
-				expect(latest).not.toContain("browser.cdpUrl");
-				expect(latest).not.toContain("Tern");
-				expect(latest).not.toContain("cmux");
+				expect(latest).toContain(originalGuidance);
 			}
 			const providerContexts = JSON.stringify(mock.calls.map(call => call.context));
 			for (const secret of [

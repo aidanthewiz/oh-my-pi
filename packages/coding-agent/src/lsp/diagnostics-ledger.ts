@@ -1,4 +1,6 @@
 import type { FileDiagnosticsResult } from "@oh-my-pi/pi-tui/tools/lsp";
+import type { ToolSession } from "../tools";
+import { getToolConversationState } from "../tools/tool-state";
 import { unreportedSummary } from "./diagnostics";
 import { summarizeDiagnosticMessages } from "./utils";
 
@@ -49,11 +51,8 @@ export class DiagnosticsLedger {
 	}
 }
 
-export interface DiagnosticsLedgerOwner {
-	diagnosticsLedger?: DiagnosticsLedger;
-}
-
-export function getDiagnosticsLedger(owner: DiagnosticsLedgerOwner): DiagnosticsLedger {
-	owner.diagnosticsLedger ??= new DiagnosticsLedger();
-	return owner.diagnosticsLedger;
+export function getDiagnosticsLedger(session: ToolSession): DiagnosticsLedger {
+	const state = getToolConversationState(session);
+	state.diagnosticsLedger ??= new DiagnosticsLedger();
+	return state.diagnosticsLedger;
 }

@@ -13,11 +13,11 @@ import {
 } from "../../../src/extensibility/custom-commands/bundled/annotate/draft-store";
 import { createResolvedReviewTarget } from "../../../src/extensibility/custom-commands/bundled/review/target";
 import {
-	filterSessionsForPicker,
 	findMostRecentNonEmptySession,
 	isEmptySession,
-	listAllSessions,
+	listAllSessionsForPicker,
 	listSessions,
+	listSessionsForPicker,
 } from "../../../src/session/session-listing";
 import { SessionManager } from "../../../src/session/session-manager";
 import { FileSessionStorage } from "../../../src/session/session-storage";
@@ -133,9 +133,11 @@ describe("annotation drafts", () => {
 			const transcript = await fs.readFile(file, "utf8");
 			const local = await listSessions(bucket, storage);
 			expect(local[0]?.messageCount).toBe(0);
-			expect(filterSessionsForPicker(local, new Set()).map(row => row.id)).toEqual([session.getSessionId()]);
+			expect((await (await listSessionsForPicker(bucket, storage, new Set())).complete).map(row => row.id)).toEqual([
+				session.getSessionId(),
+			]);
 			expect(
-				filterSessionsForPicker(await listAllSessions(storage, tempDir.path()), new Set()).map(row => row.id),
+				(await (await listAllSessionsForPicker(storage, new Set(), tempDir.path())).complete).map(row => row.id),
 			).toEqual([session.getSessionId()]);
 			expect(await findMostRecentNonEmptySession(bucket, storage)).toBe(file);
 
@@ -156,7 +158,7 @@ describe("annotation drafts", () => {
 			} finally {
 				await resumed.close({ action: "review" });
 			}
-			expect(filterSessionsForPicker(local, new Set())).toEqual([]);
+			expect(await (await listSessionsForPicker(bucket, storage, new Set())).complete).toEqual([]);
 			expect(await findMostRecentNonEmptySession(bucket, storage)).toBeNull();
 			expect(await fs.readFile(file, "utf8")).toBe(transcript);
 		} finally {

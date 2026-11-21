@@ -50,6 +50,7 @@ export function sessionResolveContext(
 		settings: session.settings,
 		signal: options.signal,
 		sessionFile: session.getSessionFile() ?? undefined,
+		seanceSourceArtifactsDir: session.seanceSourceArtifactsDir,
 		experimentalContextManagement: cfgCompactionExperimentalContextManagement.get(session.settings) === true,
 		getSessionBranch: () => getExperimentalContextSession(session).getBranch(),
 		sessionId: session.sessionManager?.getSessionId?.() ?? session.getSessionId?.() ?? undefined,

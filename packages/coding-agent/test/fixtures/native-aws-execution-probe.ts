@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Settings } from "../../src/config/settings";
-import { AwsTool, listTrustedAwsProfiles } from "../../src/tools/aws";
+import { AwsTool, awsSessionAuthGroups, listTrustedAwsProfiles } from "../../src/tools/aws";
 import { WriteTool } from "../../src/tools/write";
 import type { XdevState } from "../../src/tools/xdev";
 import { DeferredMCPTool, MCPTool } from "../../src/mcp/tool-bridge";
@@ -562,12 +562,64 @@ const managedRead = new MCPTool(connection, {
 	annotations: { readOnlyHint: true },
 	inputSchema: { type: "object", properties: { aws_profile: { type: "string", enum: ["parallel-peer"] } } },
 });
-const [nativeShared, managedShared] = await Promise.all([
-	tool.execute("parallel-native", { ...read, profile: "parallel" }, undefined, undefined, context),
-	managedRead.execute("parallel-managed", { aws_profile: "parallel-peer" }, undefined, context),
-]);
-assert.notEqual(nativeShared.isError, true);
-assert.notEqual(managedShared.isError, true);
+const [nativeShared, managedShared] = await (async () => {
+	const ui = context.ui;
+	assert(ui, "AWS approval fixture requires its real UI");
+	const approvalEntered = Promise.withResolvers<void>();
+	const nativeRecoveryEntered = Promise.withResolvers<void>();
+	const releaseApproval = Promise.withResolvers<void>();
+	const recoverOnce = awsSessionAuthGroups.recoverOnce;
+	let waitingForNative = false;
+	awsSessionAuthGroups.recoverOnce = (group, recover) => {
+		const pending = recoverOnce.call(awsSessionAuthGroups, group, recover);
+		if (waitingForNative) nativeRecoveryEntered.resolve();
+		return pending;
+	};
+	const managedContext: AgentToolContext = {
+		...context,
+		ui: {
+			...ui,
+			confirm: async (title, message, options) => {
+				approvalEntered.resolve();
+				await releaseApproval.promise;
+				return ui.confirm(title, message, options);
+			},
+		},
+	};
+	const managedPending = managedRead.execute(
+		"parallel-managed",
+		{ aws_profile: "parallel-peer" },
+		undefined,
+		managedContext,
+	);
+	let nativeDrain: Promise<unknown> | undefined;
+	try {
+		await Promise.race([approvalEntered.promise, managedPending]);
+		waitingForNative = true;
+		const nativePending = tool.execute(
+			"parallel-native",
+			{ ...read, profile: "parallel" },
+			undefined,
+			undefined,
+			context,
+		);
+		nativeDrain = nativePending;
+		await Promise.race([
+			nativeRecoveryEntered.promise,
+			nativePending.then(result => {
+				if (!result.isError) throw new Error("Native call completed before joining pending authentication");
+			}),
+		]);
+		releaseApproval.resolve();
+		return await Promise.all([nativePending, managedPending]);
+	} finally {
+		releaseApproval.resolve();
+		await Promise.allSettled([managedPending, ...(nativeDrain ? [nativeDrain] : [])]);
+		awsSessionAuthGroups.recoverOnce = recoverOnce;
+	}
+})();
+assert.notEqual(nativeShared.isError, true, text(nativeShared));
+assert.notEqual(managedShared.isError, true, text(managedShared));
 assert.equal(confirmations, 2);
 assert.deepEqual(managedRequests, ["parallel-peer", "parallel-peer"]);
 assert.equal(
@@ -1169,7 +1221,6 @@ const batchSession: ToolSession = {
 	xdev: batchXdev,
 	getToolContext: () => batchContext,
 	getToolForEvalBridge: name => batchTools.getToolForEvalBridge(name),
-	getEvalBridgeToolNames: () => batchTools.getEvalBridgeToolNames(),
 };
 const batchWrite = new ExtensionToolWrapper(new WriteTool(batchSession) as unknown as AgentTool, sessionRunner);
 batchRegistry.set("write", batchWrite);
@@ -1546,12 +1597,10 @@ sessionId = "native-approval-owner";
 
 const beforeReservation = (await listTrustedAwsProfiles()).map(profile => profile.name);
 assert.ok(beforeReservation.includes("adopted-model") && beforeReservation.includes("adopted-alias"));
-void tool.parameters;
 reserveManagedAwsProfile("adopted-model");
 const afterReservation = (await listTrustedAwsProfiles()).map(profile => profile.name);
 assert.ok(!afterReservation.includes("adopted-model") && !afterReservation.includes("adopted-alias"));
 assert.ok(afterReservation.includes("coreforge-admin"));
-assert.throws(() => tool.parameters.assert({ ...read, profile: "adopted-model" }));
 const beforeRejectedHelpers = (await calls()).length;
 const repositoryHelper = path.join(repository, process.platform === "win32" ? "native-helper.exe" : "native-helper");
 await fs.copyFile(process.execPath, repositoryHelper);
@@ -1560,7 +1609,9 @@ await fs.writeFile(scriptHelper, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
 for (const profile of ["repository-helper", "script-helper"]) {
 	await assert.rejects(() => tool.execute(profile, { ...read, profile }), /AUTH_REQUIRED/);
 }
-await assert.rejects(() => tool.execute("reserved-alias", { ...read, profile: "adopted-alias" }), /PROFILE_NOT_FOUND/);
+for (const profile of ["adopted-model", "adopted-alias"]) {
+	await assert.rejects(() => tool.execute(`reserved-${profile}`, { ...read, profile }), /PROFILE_NOT_FOUND/);
+}
 assert.equal((await calls()).length, beforeRejectedHelpers);
 for (const prefix of ["malformed-json", "prefixed-json", "truncated-json"]) {
 	const result = await tool.execute(prefix, { ...read, parameters: { Prefix: prefix } });
@@ -1655,8 +1706,9 @@ for (const [service, operation] of [
 	tool.approveRuntimeApproval(failedId, failedArgs);
 	const failed = await tool.execute(failedId, failedArgs);
 	assert.equal(failed.isError, true);
-	assert.equal(failed.details?.code, "AWS_ERROR");
-	assert.equal(failed.details?.exitCode, 23);
+	assert.ok(failed.details && "code" in failed.details && "exitCode" in failed.details);
+	assert.equal(failed.details.code, "AWS_ERROR");
+	assert.equal(failed.details.exitCode, 23);
 	assert.match(text(failed), /fixture helper failure/);
 	assert.ok(!text(failed).includes("REMOTE_COMMAND_OK"));
 
@@ -1666,7 +1718,8 @@ for (const [service, operation] of [
 	tool.approveRuntimeApproval(logId, logArgs);
 	const logResult = await tool.execute(logId, logArgs);
 	assert.notEqual(logResult.isError, true, text(logResult));
-	assert.equal(logResult.details?.exitCode, 0);
+	assert.ok(logResult.details && "exitCode" in logResult.details);
+	assert.equal(logResult.details.exitCode, 0);
 	assert.match(text(logResult), /Cannot perform start session: historical application log entry/);
 	assert.match(text(logResult), /REMOTE_COMMAND_OK/);
 
@@ -1676,7 +1729,8 @@ for (const [service, operation] of [
 	tool.approveRuntimeApproval(zeroId, zeroArgs);
 	const zeroResult = await tool.execute(zeroId, zeroArgs);
 	assert.notEqual(zeroResult.isError, true, text(zeroResult));
-	assert.equal(zeroResult.details?.exitCode, 0);
+	assert.ok(zeroResult.details && "exitCode" in zeroResult.details);
+	assert.equal(zeroResult.details.exitCode, 0);
 	assert.match(text(zeroResult), /Cannot perform start session: fixture helper failure/);
 	assert.ok(!text(zeroResult).includes("REMOTE_COMMAND_OK"));
 	const hangingArgs = { ...args, parameters: { ...parameters, [modeParameter]: "fixture-hang" } };

@@ -112,7 +112,7 @@ describe("git native", () => {
 		streamContents: async changed => ({
 			kind: "text",
 			oldText: `// ${changed.path}\nconst a = 1;\n`,
-			newText: `// ${changed.path}\nconst a = 2;\n`,
+			newText: `// ${changed.path}\nconst a = 2; // ${"context ".repeat(40)}WRAP_TAIL\n`,
 			streamResult: undefined as never, // the synchronous differ runs without a streamed result
 		}),
 		stage: async () => {},
@@ -122,7 +122,7 @@ describe("git native", () => {
 		applyPatch: async () => {},
 	};
 
-	it("switches the diff layout from the segmented control and opens a clicked file", async () => {
+	it("wraps visible diff lines, switches the layout, and opens a clicked file", async () => {
 		await initTheme();
 		const h = await TspHarness.start(undefined, { cols: 150, rows: 40 });
 		const settle = async (): Promise<void> => {
@@ -144,6 +144,24 @@ describe("git native", () => {
 			await settle();
 			const sf = h.terminal.surface ?? "";
 			const path = () => h.find(n => (n.p as { role?: string } | undefined)?.role === "omp.app.git.path");
+			const diffText = (): string => {
+				const viewport = h.find(n => n.k === "rows" && n.id.endsWith("/viewport"));
+				if (viewport?.k !== "rows") throw new Error("Missing painted diff viewport");
+				const lines = viewport.p?.lines;
+				if (!Array.isArray(lines)) throw new Error("Missing painted diff viewport");
+				return lines.join("\n");
+			};
+
+			const wrap = h.find(n => n.id.endsWith("/wrap"));
+			if (!wrap) throw new Error("Missing wrap control");
+			if (diffText().includes("WRAP_TAIL")) {
+				h.event({ ev: "action", sf, id: wrap.id, act: "wrap" });
+				await settle();
+			}
+			expect(diffText()).not.toContain("WRAP_TAIL");
+			h.event({ ev: "action", sf, id: wrap.id, act: "wrap" });
+			await settle();
+			expect(diffText()).toContain("WRAP_TAIL");
 
 			const views = h.find(n => n.k === "tabs" && (n.p as { active?: string }).active === "split");
 			h.event({ ev: "select", sf, id: views?.id ?? "", item: "inline" });

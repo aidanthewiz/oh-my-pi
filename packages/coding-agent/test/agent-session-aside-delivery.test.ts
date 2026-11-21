@@ -3,7 +3,7 @@ import * as path from "node:path";
 import { setImmediate } from "node:timers/promises";
 import { type } from "@oh-my-pi/omptype";
 import { Agent, type AgentMessage, type AgentTool } from "@oh-my-pi/pi-agent-core";
-import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
+import { AsyncJobManager, type AsyncJobManagerApi } from "@oh-my-pi/pi-coding-agent/async";
 import type { AssistantMessage, Context, ImageContent } from "@oh-my-pi/pi-ai";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
@@ -12,7 +12,7 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { ExtensionRuntime, loadExtensionFromFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
-import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { AgentSession, PromptDroppedError } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { IrcBridge, type IrcBridgeHost } from "@oh-my-pi/pi-coding-agent/session/irc-bridge";
 import { convertToLlm, USER_INTERRUPT_LABEL } from "@oh-my-pi/pi-coding-agent/session/messages";
@@ -159,7 +159,7 @@ describe("AgentSession aside delivery", () => {
 			const nextCall = Promise.withResolvers<void>();
 			const waitStarted = Promise.withResolvers<void>();
 			const job = Promise.withResolvers<string>();
-			const manager = new AsyncJobManager({});
+			const manager: AsyncJobManagerApi = new AsyncJobManager({});
 			const settings = Settings.isolated({
 				"compaction.enabled": false,
 				"todo.enabled": false,
@@ -243,7 +243,7 @@ describe("AgentSession aside delivery", () => {
 			} finally {
 				job.resolve("JOB_RESULT_AFTER_ASIDE");
 				await run;
-				await session.settleAsyncWork();
+				await session.waitForRunEnd();
 			}
 			expect(
 				session.agent.state.messages.filter(
@@ -1209,9 +1209,13 @@ describe("AgentSession aside delivery", () => {
 			return images;
 		});
 		let asideSettled = false;
-		const asidePromise = session.sendUserMessage("GENERATION_RACE_ASIDE", { deliverAs: "aside" }).then(() => {
-			asideSettled = true;
-		});
+		const asidePromise = session.sendUserMessage("GENERATION_RACE_ASIDE", { deliverAs: "aside" }).then(
+			() => undefined,
+			(error: unknown) => {
+				asideSettled = true;
+				return error;
+			},
+		);
 		let newSessionPromise: Promise<boolean> | undefined;
 		try {
 			await normalizeStarted.promise;
@@ -1229,6 +1233,7 @@ describe("AgentSession aside delivery", () => {
 			releaseNormalize.resolve();
 			await setImmediate();
 			expect(asideSettled).toBe(true);
+			expect(await asidePromise).toBeInstanceOf(PromptDroppedError);
 			expect(session.isSessionTransitioning).toBe(true);
 			expect(ready).toBe(false);
 			expect(JSON.stringify(session.agent.state.messages)).not.toContain("GENERATION_RACE_ASIDE");
@@ -1246,6 +1251,164 @@ describe("AgentSession aside delivery", () => {
 			await asidePromise;
 			await run.catch(() => {});
 			normalizeSpy.mockRestore();
+		}
+	});
+
+	it.each([
+		["cleanup throw", new Error("Synthetic session cleanup failure")],
+		["cleanup rejection", undefined],
+		["transcript setup", new Error("Synthetic session setup failure")],
+	] as const)(
+		"keeps events and recording connected when committed newSession() fails during %s",
+		async (failurePoint, transitionError) => {
+			const mock = createMockModel({
+				provider: "openai",
+				id: "gpt-test",
+				responses: [{ content: ["NEW_SESSION_REPLY"] }],
+			});
+			const agent = new Agent({
+				getApiKey: () => "test-key",
+				initialState: { model: mock.model, systemPrompt: ["Test"], tools: [], messages: [] },
+				convertToLlm,
+				streamFn: mock.stream,
+			});
+			const settings = Settings.isolated({ "compaction.enabled": false, "todo.enabled": false });
+			settings.setModelRole("default", `${mock.model.provider}/${mock.model.id}`);
+			session = new AgentSession({
+				agent,
+				sessionManager: SessionManager.inMemory(tempDir.path()),
+				settings,
+				modelRegistry: new ModelRegistry(authStorage, path.join(tempDir.path(), "models.yml")),
+				toolRegistry: new Map(),
+			});
+			const endedMessages: AgentMessage[] = [];
+			const unsubscribe = session.subscribe(event => {
+				if (event.type === "message_end") endedMessages.push(event.message);
+			});
+			const setupSpy =
+				failurePoint === "transcript setup"
+					? spyOn(session.sessionManager, "appendThinkingLevelChange").mockImplementationOnce(() => {
+							throw transitionError;
+						})
+					: undefined;
+			const unregister =
+				failurePoint === "transcript setup"
+					? undefined
+					: session.registerSessionChangeCallback(() => {
+							if (failurePoint === "cleanup throw") throw transitionError;
+							return Promise.reject(transitionError);
+						});
+			const previousId = session.sessionId;
+			try {
+				await expect(session.newSession()).rejects.toBe(transitionError);
+				expect(session.sessionId).not.toBe(previousId);
+				expect(session.isSessionTransitioning).toBe(false);
+				unregister?.();
+				setupSpy?.mockRestore();
+
+				await session.prompt("NEW_SESSION_PROMPT");
+				await session.waitForIdle();
+
+				expect(JSON.stringify(session.agent.state.messages)).toContain("NEW_SESSION_REPLY");
+				const entries = JSON.stringify(session.sessionManager.getEntries());
+				const events = JSON.stringify(endedMessages);
+				expect({
+					recordedPrompt: entries.includes("NEW_SESSION_PROMPT"),
+					recordedReply: entries.includes("NEW_SESSION_REPLY"),
+					emittedPrompt: events.includes("NEW_SESSION_PROMPT"),
+					emittedReply: events.includes("NEW_SESSION_REPLY"),
+				}).toEqual({
+					recordedPrompt: true,
+					recordedReply: true,
+					emittedPrompt: true,
+					emittedReply: true,
+				});
+			} finally {
+				unregister?.();
+				setupSpy?.mockRestore();
+				unsubscribe();
+				await session.abort();
+			}
+		},
+	);
+
+	it("drops an outgoing aside when committed newSession() cleanup fails", async () => {
+		const started = Promise.withResolvers<void>();
+		const contexts: Context[] = [];
+		const mock = createMockModel({
+			provider: "openai",
+			id: "gpt-test",
+			responses: [
+				() => {
+					started.resolve();
+					return { content: ["working"], delayMs: 60_000 };
+				},
+				context => {
+					contexts.push(context);
+					return { content: ["NEW_SESSION_REPLY"] };
+				},
+			],
+		});
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model: mock.model, systemPrompt: ["Test"], tools: [], messages: [] },
+			convertToLlm,
+			streamFn: mock.stream,
+		});
+		const settings = Settings.isolated({ "compaction.enabled": false, "todo.enabled": false });
+		settings.setModelRole("default", `${mock.model.provider}/${mock.model.id}`);
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(tempDir.path()),
+			settings,
+			modelRegistry: new ModelRegistry(authStorage, path.join(tempDir.path(), "models.yml")),
+			toolRegistry: new Map(),
+		});
+		const cleanupError = new Error("Synthetic session cleanup failure");
+		const unregister = session.registerSessionChangeCallback(() => {
+			throw cleanupError;
+		});
+		const run = session.prompt("OUTGOING_PROMPT");
+		await started.promise;
+		const normalizeStarted = Promise.withResolvers<void>();
+		const releaseNormalize = Promise.withResolvers<void>();
+		const normalizeSpy = spyOn(imageLoading, "normalizeModelContextImages").mockImplementation(async images => {
+			normalizeStarted.resolve();
+			await releaseNormalize.promise;
+			return images;
+		});
+		const aside = session
+			.sendUserMessage("OUTGOING_SESSION_ASIDE", { deliverAs: "aside" })
+			.catch((error: unknown) => error);
+		try {
+			await normalizeStarted.promise;
+			const previousId = session.sessionId;
+			await expect(session.newSession()).rejects.toBe(cleanupError);
+			expect(session.sessionId).not.toBe(previousId);
+			expect(session.isSessionTransitioning).toBe(false);
+			unregister();
+			releaseNormalize.resolve();
+			expect(await aside).toBeInstanceOf(PromptDroppedError);
+			await run.catch(() => {});
+
+			await session.prompt("NEW_SESSION_PROMPT");
+			await session.waitForIdle();
+
+			const messages = JSON.stringify(contexts.at(-1)?.messages);
+			expect(messages).toContain("NEW_SESSION_PROMPT");
+			expect(messages).not.toContain("OUTGOING_SESSION_ASIDE");
+			expect(JSON.stringify(session.agent.state.messages)).not.toContain("OUTGOING_SESSION_ASIDE");
+			expect(JSON.stringify(session.sessionManager.getEntries())).not.toContain("OUTGOING_SESSION_ASIDE");
+		} finally {
+			unregister();
+			releaseNormalize.resolve();
+			try {
+				await session.abort();
+				await aside;
+				await run.catch(() => {});
+			} finally {
+				normalizeSpy.mockRestore();
+			}
 		}
 	});
 

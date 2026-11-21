@@ -266,7 +266,8 @@ coreforge engine mcp reauth server-name
 ```
 
 `auth` verifies enabled HTTP/SSE servers under the current profile and discovery
-policy. Optional server names restrict the selection. Healthy grants are reused;
+policy. Optional server names restrict the selection. URL-only native definitions
+do not require explicit `type` or `enabled` fields. Healthy grants are reused;
 normal refresh remains available. Missing or rejected authorization requests
 browser consent only in an interactive terminal.
 
@@ -276,6 +277,10 @@ as `/mcp reauth`; the identity provider controls its consent and SSO behavior.
 Neither command enables a disabled server or grants project trust.
 Coreforge's `coreforge mcp auth` wrapper also checks selected CLI-backed integrations.
 Native hosted authentication does not sign in stdio servers.
+
+For HTTP 403, native `auth` requires a Bearer `insufficient_scope` challenge
+before requesting consent. It reads the retained challenge even when the error
+body is shortened. Permission-only HTTP 403 responses do not request consent.
 
 Trusted `.coreforge/mcp.json` definitions remain unchanged during authentication.
 Their explicit Authorization headers and API keys are not replaced by browser
@@ -507,7 +512,7 @@ Portable Agent Plugins use different secret semantics: only `${PLUGIN_ROOT}` and
 
 Before OMP launches a stdio server or makes an HTTP/SSE request, it resolves stdio `env` values and HTTP/SSE `headers` values like this:
 
-1. If a value starts with `!`, OMP runs the rest as a shell command in the project directory with a 10s timeout and uses trimmed stdout. Successful results are process-cached until invalidated; concurrent resolutions share the same command execution.
+1. If a value starts with `!`, OMP runs the rest as a shell command in the project directory with a 10s timeout and uses trimmed stdout. Successful results are process-cached; concurrent resolutions share the same command execution. A server's commands run again when it reconnects (`/mcp reconnect`, an automatic reconnect, `/mcp reload`) and, for HTTP/SSE `headers`, when the server answers 401/403 — the request is then retried once with the new values. This keeps commands that mint short-lived tokens working past expiry.
 2. If the command fails, times out, or prints only whitespace, that `env`/`headers` entry is omitted. Failed commands are retried on a later resolution after a 30s backoff.
 3. Otherwise OMP checks whether the whole value names an environment variable.
 4. If that environment variable is set to a non-empty value, OMP uses the environment value; otherwise it uses the string literally.

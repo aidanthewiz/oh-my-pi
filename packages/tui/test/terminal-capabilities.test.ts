@@ -125,6 +125,10 @@ describe("detectTerminalId", () => {
 		expect(detectTerminalId({ TERM_PROGRAM: "rio", COLORTERM: "truecolor" })).toBe("rio");
 	});
 
+	it("recognizes tern via TERM_PROGRAM despite its plain xterm TERM", () => {
+		expect(detectTerminalId({ TERM_PROGRAM: "tern", TERM: "xterm-256color", COLORTERM: "truecolor" })).toBe("tern");
+	});
+
 	it("maps rio to kitty graphics with verified hyperlink capability", () => {
 		// Reporter-verified (#12205): kitty graphics + true color. Hyperlinks
 		// verified against rio 0.5.28's published escape sequence support plus a
@@ -153,6 +157,14 @@ describe("detectTerminalId", () => {
 		expect(getTerminalInfo(id).notifyProtocol).toBe(NotifyProtocol.Osc9);
 	});
 
+	it("does not treat an inherited REX_SESSION as Rex", () => {
+		// Any program launched from a Rex pane inherits REX_SESSION, including
+		// emulators omp does not recognize (VTE, Zed, JetBrains). Rex itself
+		// sets TERM_PROGRAM=rex, so the session ID must not pick the profile.
+		const env = { REX_SESSION: "s1", TERM: "xterm-256color", COLORTERM: "truecolor", VTE_VERSION: "8400" };
+		expect(detectTerminalId(env)).toBe("trueColor");
+	});
+
 	it("falls back to trueColor on VTE/Ptyxis environments — VTE OSC 9 is ConEmu progress, not a notification protocol", () => {
 		const env = { TERM: "xterm-256color", TERM_PROGRAM: "", COLORTERM: "truecolor", VTE_VERSION: "8400" };
 
@@ -168,6 +180,10 @@ it("selects Kitty graphics for Rex via TERM_PROGRAM or TERM=xterm-rex (over SSH)
 		const id = detectTerminalId(env);
 		expect(id).toBe("rex");
 		expect(resolveImageProtocol(id, env, true)).toBe(ImageProtocol.Kitty);
+		// Rex renders OSC 8 and opens the link on command-click. With the
+		// hyperlink capability off, every path and URL in the transcript is
+		// plain text instead of a link the terminal would open.
+		expect(shouldEnableHyperlinksByDefault(env, id)).toBe(true);
 	}
 });
 
@@ -260,7 +276,6 @@ describe("tmux client terminal resolution", () => {
 		return withFakeTmux(
 			{ [CLIENT_QUERY]: clientReport, [PASSTHROUGH_QUERY]: "on" },
 			async binDir => {
-				const tmux = path.join(binDir, "tmux");
 				const env = subprocessEnv({
 					PI_TEST_RUNTIME: undefined,
 					BUN_ENV: undefined,
@@ -274,14 +289,6 @@ describe("tmux client terminal resolution", () => {
 					SSH_CONNECTION: "client 1 server 22",
 					PATH: `${binDir}${path.delimiter}${Bun.env.PATH ?? ""}`,
 				});
-				const fixtureWarmup = Bun.spawn([tmux, "display-message", "-p", "#{client_termtype}\t#{client_termname}"], {
-					env,
-					stdout: "ignore",
-					stderr: "ignore",
-					timeout: 5_000,
-					killSignal: "SIGKILL",
-				});
-				if ((await fixtureWarmup.exited) !== 0) throw new Error("Owned tmux profile fixture could not start");
 				const proc = Bun.spawn({
 					cmd: [
 						process.execPath,
@@ -323,14 +330,26 @@ esac
 `,
 				);
 				const tmux = `/tmp/coreforge-sxl-${crypto.randomUUID()},4244,0`;
+				const fixtureEnv = {
+					PATH: `${binDir}${path.delimiter}${Bun.env.PATH ?? ""}`,
+					TMUX: tmux,
+					TMUX_EXPECTED: tmux,
+					TMUX_PANE: "%19",
+				};
+				const ready = Bun.spawn([path.join(binDir, "tmux"), "display-message", "-p", "#{client_name}"], {
+					env: fixtureEnv,
+					stdin: "ignore",
+					stdout: "ignore",
+					stderr: "ignore",
+					timeout: 5_000,
+					killSignal: "SIGKILL",
+				});
+				if ((await ready.exited) !== 0) throw new Error("Owned tmux profile fixture could not start");
 				const secret = `synthetic-secret-${crypto.randomUUID()}`;
 				expect(
 					tmuxClientRendersSixel({
 						...subprocessEnv({}),
-						PATH: `${binDir}${path.delimiter}${Bun.env.PATH ?? ""}`,
-						TMUX: tmux,
-						TMUX_EXPECTED: tmux,
-						TMUX_PANE: "%19",
+						...fixtureEnv,
 						OPENAI_API_KEY: secret,
 						BORROWED_VALUE: secret,
 						AWS_ACCESS_KEY_ID: "synthetic-access-key",

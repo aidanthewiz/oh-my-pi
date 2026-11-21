@@ -9,7 +9,11 @@ import { type ModelKind, servedKinds } from "@oh-my-pi/pi-catalog/types";
 import { isRecord, once } from "@oh-my-pi/pi-utils";
 import { ConfigFile } from "./config-file";
 import type { ModelsConfig, ProviderAuthMode, ProviderDiscovery } from "./models-config-schema";
-import { getModelsConfigSchema, getModelsConfigSchemaBundle } from "./models-config-schema-bundle";
+import {
+	getModelsConfigSchema,
+	getModelsConfigSchemaBundle,
+	supportedInputModalities,
+} from "./models-config-schema-bundle";
 
 export type ProviderValidationMode = "models-config" | "runtime-register";
 
@@ -40,6 +44,80 @@ export interface ProviderValidationConfig {
 }
 
 const KIND_LIST = new Intl.ListFormat("en", { type: "disjunction" });
+
+/**
+ * Drop the input modalities the catalog cannot honour and report each one.
+ * A modality the catalog does not know (a `video` entry written against a
+ * future-capable model) must not take the whole file down: the file loads
+ * without it and the operator learns what was ignored. Non-string entries are
+ * left alone so the schema still rejects a genuinely malformed list. The
+ * accepted set is the catalog axis, the same list the schema enumerates.
+ */
+function normalizeModelInputModalities(
+	model: Record<string, unknown>,
+	owner: string,
+	supportedModalities: ReadonlySet<string>,
+	allowedLabel: string,
+	report: (message: string) => void,
+): void {
+	const input = model.input;
+	if (!Array.isArray(input)) return;
+	const supported = input.filter(entry => typeof entry !== "string" || supportedModalities.has(entry)) as unknown[];
+	if (supported.length === input.length) return;
+	for (const entry of input) {
+		if (typeof entry !== "string" || supportedModalities.has(entry)) continue;
+		report(`${owner}: input modality "${entry}" is not supported yet (allowed: ${allowedLabel}) — ignoring`);
+	}
+	// An empty list would leave the model with no input modality at all: drop
+	// the key so the catalog's own default applies.
+	if (supported.length > 0) model.input = supported;
+	else delete model.input;
+}
+
+/**
+ * Normalize a parsed models.yml before schema validation: an input modality
+ * the catalog cannot express is dropped with a warning instead of failing the
+ * file (issue #16342).
+ */
+export function normalizeModelsConfig(value: unknown, report: (message: string) => void): unknown {
+	if (!isRecord(value)) return value;
+	const providers = value.providers;
+	if (!isRecord(providers)) return value;
+	const modalities = supportedInputModalities();
+	const supportedModalities = new Set(modalities);
+	const allowedLabel = modalities.join(", ");
+	for (const [providerName, providerConfig] of Object.entries(providers)) {
+		if (!isRecord(providerConfig)) continue;
+		const models = providerConfig.models;
+		if (Array.isArray(models)) {
+			for (const model of models) {
+				if (!isRecord(model)) continue;
+				const id = typeof model.id === "string" ? model.id : "<unnamed>";
+				normalizeModelInputModalities(
+					model,
+					`provider "${providerName}", model "${id}"`,
+					supportedModalities,
+					allowedLabel,
+					report,
+				);
+			}
+		}
+		const overrides = providerConfig.modelOverrides;
+		if (isRecord(overrides)) {
+			for (const [modelId, override] of Object.entries(overrides)) {
+				if (!isRecord(override)) continue;
+				normalizeModelInputModalities(
+					override,
+					`provider "${providerName}", model override "${modelId}"`,
+					supportedModalities,
+					allowedLabel,
+					report,
+				);
+			}
+		}
+	}
+	return value;
+}
 
 export function validateProviderConfiguration(
 	providerName: string,
@@ -271,7 +349,9 @@ const validateModelsConfig = (config: ModelsConfig): void => {
 export const ModelsConfigFile = new ConfigFile<ModelsConfig>("models", {
 	kind: "deferred",
 	resolve: getModelsConfigSchema,
-}).withValidation("models", validateModelsConfig);
+})
+	.withNormalization("models", normalizeModelsConfig)
+	.withValidation("models", validateModelsConfig);
 
 // Org-managed overlay (see MANAGED_MODELS_FILENAME). A distinct id ("models.managed")
 // gives it its own default path `<agentDir>/models.managed.yml` and its own
@@ -279,4 +359,6 @@ export const ModelsConfigFile = new ConfigFile<ModelsConfig>("models", {
 export const ManagedModelsConfigFile = new ConfigFile<ModelsConfig>("models.managed", {
 	kind: "deferred",
 	resolve: getModelsConfigSchema,
-}).withValidation("models.managed", validateModelsConfig);
+})
+	.withNormalization("models.managed", normalizeModelsConfig)
+	.withValidation("models.managed", validateModelsConfig);

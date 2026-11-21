@@ -33,12 +33,13 @@ describe("ModelRegistry lazy bundled composition", () => {
 		await Promise.all(tempDirs.splice(0).map(tempDir => tempDir.remove().catch(() => {})));
 	});
 
-	test("loads the default LiteLLM namespaced cache", async () => {
+	test("hydrates only the current LiteLLM credential's cached roster", async () => {
 		const tempDir = TempDir.createSync("@model-registry-lazy-litellm-cache-");
 		tempDirs.push(tempDir);
 		const authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
 		authStorages.push(authStorage);
-		const cacheProviderId = litellmModelManagerOptions().cacheProviderId;
+		authStorage.keys.setRuntime("litellm", "sk-team-a");
+		const cacheProviderId = litellmModelManagerOptions({ apiKey: "sk-team-a" }).cacheProviderId;
 		if (!cacheProviderId) throw new Error("LiteLLM must define a cache namespace");
 		writeModelCache(
 			cacheProviderId,
@@ -63,7 +64,13 @@ describe("ModelRegistry lazy bundled composition", () => {
 		);
 
 		const registry = new ModelRegistry(authStorage, path.join(tempDir.path(), "models.yml"));
+		expect(registry.find("litellm", "cached-fixture")).toBeUndefined();
+		await registry.hydrateCredentialScopedModelCaches();
 		expect(registry.find("litellm", "cached-fixture")?.name).toBe("Cached Fixture");
+		const otherRegistry = new ModelRegistry(authStorage, path.join(tempDir.path(), "models.yml"));
+		authStorage.keys.setRuntime("litellm", "sk-team-b");
+		await otherRegistry.hydrateCredentialScopedModelCaches();
+		expect(otherRegistry.find("litellm", "cached-fixture")).toBeUndefined();
 	});
 
 	test("scoped snapshots retain live availability and cannot be mutated through returned arrays", async () => {

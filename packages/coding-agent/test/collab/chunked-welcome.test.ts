@@ -131,6 +131,9 @@ function makeFailingGuestContext(failure: Error): InteractiveModeContext {
 		renderInitialMessages: () => {},
 		reloadTodos: () => Promise.resolve(),
 		syncRunningSubagentBadge: () => {},
+		setCollabGuest: (guest: InteractiveModeContext["collabGuest"]) => {
+			Object.assign(ctx, { collabGuest: guest });
+		},
 		showStatus: () => {},
 		updateEditorTopBorder: () => {},
 		updateEditorBorderColor: () => {},
@@ -142,7 +145,7 @@ function makeCancelledSwitchGuestContext(
 	switchSession: () => Promise<boolean>,
 	events: string[],
 ): InteractiveModeContext {
-	return {
+	const ctx = {
 		settings: Settings.isolated(),
 		sessionManager: {
 			getSessionFile: () => null,
@@ -190,12 +193,16 @@ function makeCancelledSwitchGuestContext(
 		resetObserverRegistry: () => {},
 		renderInitialMessages: () => {},
 		syncRunningSubagentBadge: () => {},
+		setCollabGuest: (guest: InteractiveModeContext["collabGuest"]) => {
+			Object.assign(ctx, { collabGuest: guest });
+		},
 		reloadTodos: () => Promise.resolve(),
 		showStatus: (status: string) => events.push(`status:${status}`),
 		updateEditorTopBorder: () => {},
 		updateEditorBorderColor: () => {},
 		collabGuest: undefined,
 	} as unknown as InteractiveModeContext;
+	return ctx;
 }
 
 // ── Shared host/relay ───────────────────────────────────────────────────────
@@ -210,8 +217,11 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
-	uninstallInMemoryRelay();
-	await host.stop("test done");
+	try {
+		await host.stop("test done");
+	} finally {
+		uninstallInMemoryRelay();
+	}
 });
 
 const guestCleanups: (() => void)[] = [];

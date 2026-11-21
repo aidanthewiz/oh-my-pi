@@ -62,6 +62,8 @@ export interface RuntimeToolApprovalRequest {
 	tuiStyle?: "destructive";
 	/** Only explicitly eligible runtime requests may grant session access. */
 	allowSessionApproval?: boolean;
+	/** Only exact, per-call runtime requests may reach the owning parent's TUI. */
+	allowParentApproval?: boolean;
 }
 
 export interface RuntimeApprovalCapableTool {
@@ -75,7 +77,7 @@ export interface RuntimeApprovalCapableTool {
 		signal?: AbortSignal,
 		context?: AgentToolContext,
 	): Promise<RuntimeToolApprovalRequest | undefined>;
-	approveRuntimeApproval?(toolCallId: string, args: unknown): void;
+	approveRuntimeApproval?(toolCallId: string, args: unknown, validate?: () => void): void;
 	denyRuntimeApproval?(toolCallId: string, args: unknown): void;
 }
 
@@ -945,13 +947,43 @@ export function formatApprovalPrompt(tool: ApprovalSubject, args: unknown, reaso
 	return [...approvalHeader(tool, reason), ...approvalDetails(tool, args)].join("\n");
 }
 
+const COMPOUND_COMMAND_COMPACT_MAX_SEGMENTS = 6;
+
+function summarizeCompoundCommandDetails(details: readonly string[]): string {
+	const segments = details.slice(1);
+	if (segments.length <= COMPOUND_COMMAND_COMPACT_MAX_SEGMENTS) {
+		return details.join("\n");
+	}
+	const firstPromptIndex = segments.findIndex(line => line.trimStart().startsWith("? "));
+	const elidedLeading = firstPromptIndex >= 5 ? firstPromptIndex - 3 : 0;
+	const rows: string[] = ["Command:"];
+	if (elidedLeading > 0) {
+		rows.push(`  ✓ … (${elidedLeading} allowed ${elidedLeading === 1 ? "segment" : "segments"})`);
+	}
+	const remaining = segments.slice(elidedLeading);
+	const slots = COMPOUND_COMMAND_COMPACT_MAX_SEGMENTS - (elidedLeading > 0 ? 1 : 0);
+	if (remaining.length <= slots) {
+		rows.push(...remaining);
+	} else {
+		const kept = Math.max(1, slots - 1);
+		const hidden = remaining.length - kept;
+		rows.push(...remaining.slice(0, kept), `  … (${hidden} more ${hidden === 1 ? "segment" : "segments"})`);
+	}
+	return rows.join("\n");
+}
+
 /**
  * The details as one row for a prompt that must stay small: each detail's first line, joined
  * by ` · `, ending in `…` when any detail has more lines. A label alone (`Code:`, its body on
- * the following lines) takes the body's first line after it.
+ * the following lines) takes the body's first line after it. Compound bash `Command:` segment
+ * rows stay on their own lines (with excess leading allowed rows elided so the first prompted
+ * segment is visible on mount).
  */
 function approvalSummary(details: readonly string[]): string | undefined {
 	if (details.length === 0) return undefined;
+	if (details[0] === "Command:" && details.length > 1) {
+		return summarizeCompoundCommandDetails(details);
+	}
 	let omitted = false;
 	const heads = details.map(detail => {
 		const lines = detail.split("\n", 3);
@@ -1037,8 +1069,9 @@ function approvalGrantChoices(
  * keeps its room), else a select with the full prompt (RPC, ACP, extension hosts). `appendix`
  * lines follow the prompt on both. With a `sessionSubject`, both also offer to approve that
  * subject for the rest of the session; with `grants`, both offer the `always-ask-cached` grants
- * the call can record, and the prompt lists the folder a directory grant would cover. Anything
- * but an explicit approval is `deny`.
+ * the call can record, and the prompt lists the folder a directory grant would cover. `signal`
+ * (the call's abort signal) closes the prompt, so aborting the turn never waits on a prompt
+ * nobody can see or answer. Anything but an explicit approval is `deny`.
  */
 export async function requestApproval(
 	ui: Pick<ExtensionUIContext, "select" | "approve">,
@@ -1051,9 +1084,10 @@ export async function requestApproval(
 		grants?: boolean;
 		targets?: CapturedApprovalTargets;
 		allowPersistentGrants?: boolean;
+		signal?: AbortSignal;
 	} = {},
 ): Promise<ExtensionApprovalAnswer> {
-	const { reason, appendix = [], sessionSubject } = options;
+	const { reason, appendix = [], sessionSubject, signal } = options;
 	const header = approvalHeader(tool, reason);
 	const details = approvalDetails(tool, args);
 	const session = sessionSubject === undefined ? undefined : `Approve ${sessionSubject} for this session`;
@@ -1064,6 +1098,7 @@ export async function requestApproval(
 	const listing = folder ? await approvalFolderListing(folder.key, APPROVAL_FOLDER_FULL_LISTING) : undefined;
 	const folderBlock = approvalFolderPromptBlock(folder?.label, listing, APPROVAL_FOLDER_FULL_LISTING);
 	const full = [...header, ...details, ...(folderBlock ? [folderBlock] : []), ...appendix].join("\n");
+	const dialogOptions = signal ? { signal } : undefined;
 	if (ui.approve) {
 		const summary = approvalSummary(details);
 		const compactBlock = approvalFolderPromptBlock(folder?.label, listing, APPROVAL_FOLDER_COMPACT_LISTING);
@@ -1073,13 +1108,16 @@ export async function requestApproval(
 			...(compactBlock ? [compactBlock] : []),
 			...appendix,
 		].join("\n");
-		const answer = await ui.approve({
-			full,
-			compact,
-			...(session ? { session } : {}),
-			...(grants.length > 0 ? { grants } : {}),
-			allowPersistentGrants: options.allowPersistentGrants,
-		});
+		const answer = await ui.approve(
+			{
+				full,
+				compact,
+				...(session ? { session } : {}),
+				...(grants.length > 0 ? { grants } : {}),
+				allowPersistentGrants: options.allowPersistentGrants,
+			},
+			dialogOptions,
+		);
 		if (answer === "once" || (answer === "session" && session)) return answer;
 		if (
 			typeof answer === "object" &&
@@ -1096,7 +1134,7 @@ export async function requestApproval(
 		...(grants.length > 0 ? { grants } : {}),
 		allowPersistentGrants: options.allowPersistentGrants,
 	};
-	return approvalAnswerForChoice(choices, await ui.select(full, approvalChoiceLabels(choices)));
+	return approvalAnswerForChoice(choices, await ui.select(full, approvalChoiceLabels(choices), dialogOptions));
 }
 
 /** The approve-this-call-only label: "Approve", or "Approve Once" beside grants that remember more. */
