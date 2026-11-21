@@ -184,8 +184,7 @@ class GitFixture:
 
     def prepare(self, shell, source, *, ref_type='branch', ref_name='coreforge', merged=1,
                 published=('v1.2.3.1',), tip=None, records=None, metadata_failure=False,
-                qualified_head=None, check_status='completed', check_conclusion='success',
-                admission_failure=False):
+                pr_head=None, admission_failure=False):
         self.publish_tip(tip or source)
         gh = self.bin / 'gh'
         gh.write_text('''#!/usr/bin/env python3
@@ -198,7 +197,7 @@ args = sys.argv[1:]
 with Path(os.environ['GH_CALLS']).open('a') as stream:
     stream.write(json.dumps(args) + '\\n')
 source = os.environ['EVENT_SHA']
-head = os.environ['QUALIFIED_HEAD']
+head = os.environ['PR_HEAD']
 prefix = 'repos/fixture/repo'
 if args == ['api', prefix + '/commits/' + source + '/pulls?per_page=100', '--paginate', '--slurp']:
     if os.environ['ADMISSION_FAILURE'] == 'true':
@@ -207,12 +206,6 @@ if args == ['api', prefix + '/commits/' + source + '/pulls?per_page=100', '--pag
             'base': {'ref': 'coreforge', 'repo': {'full_name': 'fixture/repo'}},
             'head': {'sha': head, 'repo': {'full_name': 'fixture/repo'}}}
     print(json.dumps([[pull] * int(os.environ['MERGED_COUNT'])]))
-    sys.exit(0)
-if args == ['api', prefix + '/commits/' + head + '/check-runs?check_name=required%20CI&filter=latest&per_page=100',
-            '--paginate', '--slurp']:
-    print(json.dumps([{'check_runs': [{'id': 1, 'name': 'required CI', 'app': {'slug': 'github-actions'},
-                                     'head_sha': head, 'status': os.environ['CHECK_STATUS'],
-                                     'conclusion': json.loads(os.environ['CHECK_CONCLUSION'])}]}]))
     sys.exit(0)
 if len(args) == 2 and args[0] == 'api' and args[1].startswith(prefix + '/git/commits/'):
     commit = args[1].rsplit('/', 1)[1]
@@ -243,8 +236,7 @@ sys.exit(97)
                                              [{'tagName': tag, 'isDraft': False} for tag in published]),
                'METADATA_FAILURE': 'true' if metadata_failure else 'false'}
         env.update({
-            'QUALIFIED_HEAD': qualified_head or source, 'CHECK_STATUS': check_status,
-            'CHECK_CONCLUSION': json.dumps(check_conclusion),
+            'PR_HEAD': pr_head or source,
             'ADMISSION_FAILURE': 'true' if admission_failure else 'false',
         })
         result = self.run(['bash', '--noprofile', '--norc', '-e', '-o', 'pipefail', '-c', shell], env=env)
@@ -408,11 +400,10 @@ class PrepareWorkflowTests(unittest.TestCase):
         self.assertEqual([call[:2] for call in calls if call[0] == 'release'], [['release', 'list']])
         self.assertFalse(any(call[0] == 'api' for call in calls))
 
-    def test_non_artifact_changes_skip_pending_or_stale_qualification(self):
+    def test_non_artifact_changes_skip_source_admission(self):
         source = self.fixture.changed({'README.md': b'public guidance'})
         result, outputs, calls = self.fixture.prepare(
-            self.shell, source, qualified_head=self.fixture.base,
-            check_status='in_progress', check_conclusion=None,
+            self.shell, source, pr_head=self.fixture.base, admission_failure=True,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(outputs, {'should_release': 'false'})
@@ -468,18 +459,16 @@ class PrepareWorkflowTests(unittest.TestCase):
                 self.assertEqual(outputs, {})
                 self.assertEqual(calls, [])
 
-    def test_automatic_release_accepts_distinct_commits_with_identical_qualified_trees(self):
+    def test_automatic_release_accepts_identical_source_without_ci_metadata(self):
         files = {**self.fixture.files, 'crates/runtime.rs': b'qualified artifact'}
         head = self.fixture.commit(files, [self.fixture.base])
         source = self.fixture.commit(files, [self.fixture.base, head])
-        self.assert_release(source, qualified_head=head)
+        self.assert_release(source, pr_head=head)
 
-    def test_automatic_release_rejects_missing_qualification_and_unqualified_merge_content(self):
+    def test_automatic_release_rejects_unmatched_pr_content_and_admission_errors(self):
         source = self.fixture.changed({'crates/runtime.rs': b'new artifact'})
         for kwargs in [
-            {'check_status': 'in_progress', 'check_conclusion': None},
-            {'check_conclusion': 'failure'},
-            {'qualified_head': self.fixture.base},
+            {'pr_head': self.fixture.base},
             {'admission_failure': True},
         ]:
             with self.subTest(kwargs=kwargs):

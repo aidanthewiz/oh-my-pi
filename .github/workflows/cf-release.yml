@@ -49,7 +49,6 @@ jobs:
     permissions:
       contents: read
       pull-requests: read
-      checks: read
     outputs:
       release_tag: ${{ steps.release.outputs.release_tag }}
       should_release: ${{ steps.release.outputs.should_release }}
