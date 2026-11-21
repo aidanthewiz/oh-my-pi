@@ -25,6 +25,7 @@
 - Respect effective opt-in overlays during hosted OAuth while preserving raw managed definitions, profile bindings, and credential persistence.
 - Preserve inferred HTTP transport, raw environment placeholders, and exact project trust during OAuth recovery, including default-enabled URL-only definitions. Replace stale Authorization headers without adding unrelated fields. Stop automatic reconnection retries for permission-only HTTP 403 failures.
 - Keep server-specific OAuth cancellation isolated from queued sibling sign-ins.
+- Refuse browser replacement of explicit read-only managed credentials without changing configuration or grants. Keep managed definitions authoritative over writable user shadows during in-session reauthorization.
 - Synchronize shell job-control fixtures with actual shell startup before starting their signal delays.
 - Query terminated job state without status filters in PTY fixtures when zsh defers asynchronous notifications, without resuming stopped jobs.
 - Limit isolated-evaluator startup fixture cleanup to its own sessions, preserving unrelated in-progress workers and restoring test factories after owned cleanup.

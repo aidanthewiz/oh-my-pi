@@ -21,6 +21,7 @@ import type { OAuthController } from "@oh-my-pi/pi-ai/oauth/types";
 import { expandEnvVarsDeepForConfigLevel } from "../discovery/helpers";
 import type { SourceMeta } from "../capability/types";
 import { COREFORGE_MCP_PROVIDER_ID } from "../discovery/coreforge";
+import { MANAGED_MCP_PROVIDER_ID } from "../discovery/mcp-managed";
 import { connectToServer, disconnectServer } from "./client";
 import { readMCPConfigFile, updateMCPServer } from "./config-writer";
 import { loadAllMCPConfigs, resolveMCPChildCredentialPolicy } from "./config";
@@ -202,9 +203,9 @@ export interface FoundMcpServer {
  * surfaces marketplace/Claude-Code-plugin entries that live in no writable
  * config). For a discovered server, persisted changes are written into the
  * user config under the same namespaced name; the native provider
- * (priority 100) shadows the discovered entry after the next reload.
+ * (priority 100) shadows lower-priority discovered entries after the next reload.
  *
- * Selected Coreforge project entries reuse the loader's exact-byte trust exception without writing the project definition.
+ * Managed and trusted Coreforge project sources remain authoritative over writable user shadows.
  *
  * `preferManager` flips the first step — but only for ACP-isolated managers:
  * ACP declares servers at `session/new` (source `provider: "acp"`), and
@@ -250,10 +251,14 @@ export async function findMcpServerForAuth(
 	if ((getActiveProfile() ?? "default") !== profileIdentity) throw new MCPOAuthCancelledError();
 
 	const runtimeSource = mcpManager?.getSource(name);
-	if (runtimeSource?.provider === COREFORGE_MCP_PROVIDER_ID && runtimeSource.level === "project") {
+	if (
+		runtimeSource &&
+		(runtimeSource.provider === MANAGED_MCP_PROVIDER_ID ||
+			(runtimeSource.provider === COREFORGE_MCP_PROVIDER_ID && runtimeSource.level === "project"))
+	) {
 		const selected = await loadAllMCPConfigs(cwd, {
 			enableProjectConfig,
-			discoveryProviders: [COREFORGE_MCP_PROVIDER_ID],
+			discoveryProviders: [runtimeSource.provider],
 			filterExa: false,
 		});
 		if ((getActiveProfile() ?? "default") !== profileIdentity) throw new MCPOAuthCancelledError();
@@ -1001,14 +1006,16 @@ export async function reauthorizeMcpServer(
 	const runtimeBaseConfig = opts.effectiveTransport
 		? ({ ...expandedBaseConfig, type: opts.effectiveTransport } as MCPServerConfig)
 		: expandedBaseConfig;
+	const immutableManagedSource = found.source?.provider === MANAGED_MCP_PROVIDER_ID;
 	if (
-		found.discovered &&
 		found.acpOwned !== true &&
-		configLevel === "project" &&
+		(immutableManagedSource || (found.discovered && configLevel === "project")) &&
 		(currentAuth?.type === "apikey" || hasMcpAuthorizationHeader(runtimeBaseConfig))
 	) {
 		throw new McpReauthRefusalError(
-			`Server "${name}" supplies explicit project authentication. Update its source and approve it again; browser sign-in cannot replace immutable project credentials.`,
+			immutableManagedSource
+				? `Server "${name}" supplies explicit managed authentication. Update its managed credential or environment; browser sign-in cannot replace read-only managed credentials.`
+				: `Server "${name}" supplies explicit project authentication. Update its source and approve it again; browser sign-in cannot replace immutable project credentials.`,
 		);
 	}
 	// Resolve endpoints first: this fails fast for stdio transports and

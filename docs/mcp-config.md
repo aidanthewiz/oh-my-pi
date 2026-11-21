@@ -286,6 +286,11 @@ Trusted `.coreforge/mcp.json` definitions remain unchanged during authentication
 Their explicit Authorization headers and API keys are not replaced by browser
 grants. Update the source and approve the changed definition before using OAuth.
 
+`mcp.managed.json` is a read-only distribution artifact. Its explicit Authorization
+headers and API keys remain authoritative over same-named user definitions.
+Browser sign-in refuses to replace these credentials. Update the managed
+credential or its environment instead; refusal preserves configuration and grants.
+
 Results distinguish verified connections from saved grants whose connection
 could not be verified. Exit codes are `0` for ready, `1` for unresolved readiness,
 `2` for invalid arguments or selection, and `130` for cancellation.

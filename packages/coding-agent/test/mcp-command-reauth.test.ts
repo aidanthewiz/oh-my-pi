@@ -11,6 +11,7 @@ import * as mcpClient from "@oh-my-pi/pi-coding-agent/mcp/client";
 import { loadAllMCPConfigs } from "@oh-my-pi/pi-coding-agent/mcp/config";
 import { MCPManager } from "@oh-my-pi/pi-coding-agent/mcp/manager";
 import * as oauthFlow from "@oh-my-pi/pi-coding-agent/mcp/oauth-flow";
+import { findMcpServerForAuth } from "@oh-my-pi/pi-coding-agent/mcp/oauth-reauth";
 import { cfgMcpEnableProjectConfig } from "@oh-my-pi/pi-coding-agent/mcp/settings";
 import type { SourceMeta } from "@oh-my-pi/pi-coding-agent/capability/types";
 import type { MCPHttpServerConfig, MCPServerConfig } from "@oh-my-pi/pi-coding-agent/mcp/types";
@@ -443,6 +444,82 @@ describe("/mcp auth commands", () => {
 		expect(probe).not.toHaveBeenCalled();
 		expect(await Bun.file(configPath).text()).toBe(before);
 		expect(authStorage.credentials.get(oauthFlow.mcpOAuthCredentialId(EXPANDED_SERVER_URL))).toBeUndefined();
+	});
+
+	test("does not replace immutable managed authorization through a writable user shadow", async () => {
+		const authStorage = freshAuthStorage();
+		await authStorage.credentials.reload();
+		const managedPath = path.join(agentDir, "mcp.managed.json");
+		const managedText = JSON.stringify({
+			mcpServers: {
+				envserver: { type: "http", url: RAW_SERVER_URL, headers: { Authorization: "stale-managed-token" } },
+			},
+		});
+		await Bun.write(managedPath, managedText);
+		clearFsCache();
+		const { configs, sources } = await loadAllMCPConfigs(projectDir, {
+			discoveryProviders: ["native", "mcp-managed"],
+			enableProjectConfig: false,
+		});
+		const before = await Bun.file(configPath).text();
+		const probe = vi.spyOn(mcpClient, "connectToServer").mockRejectedValue(AUTH_ERROR);
+		const login = vi
+			.spyOn(oauthFlow.MCPOAuthFlow.prototype, "login")
+			.mockRejectedValue(new Error("Unexpected consent"));
+		const { controller } = createController(authStorage, {
+			getServerConfig: vi.fn(() => configs.envserver),
+			getSource: vi.fn(() => sources.envserver),
+		});
+		await controller.handle("/mcp reauth envserver");
+		expect(login).not.toHaveBeenCalled();
+		expect(probe).not.toHaveBeenCalled();
+		expect(await Bun.file(configPath).text()).toBe(before);
+		expect(await Bun.file(managedPath).text()).toBe(managedText);
+		expect(authStorage.credentials.get(oauthFlow.mcpOAuthCredentialId(EXPANDED_SERVER_URL))).toBeUndefined();
+	});
+
+	test("reauthenticates a headerless managed server instead of its writable user shadow", async () => {
+		const authStorage = freshAuthStorage();
+		await authStorage.credentials.reload();
+		const managedPath = path.join(agentDir, "mcp.managed.json");
+		const managedText = JSON.stringify({
+			mcpServers: { envserver: { type: "http", url: RAW_SERVER_URL } },
+		});
+		await Bun.write(managedPath, managedText);
+		await Bun.write(
+			configPath,
+			JSON.stringify({
+				mcpServers: { envserver: { type: "http", url: "https://shadow.example.com/mcp" } },
+			}),
+		);
+		clearFsCache();
+		const { configs, sources } = await loadAllMCPConfigs(projectDir, {
+			discoveryProviders: ["native", "mcp-managed"],
+			enableProjectConfig: false,
+		});
+		const before = await Bun.file(configPath).text();
+		vi.spyOn(mcpClient, "connectToServer").mockRejectedValue(AUTH_ERROR);
+		vi.spyOn(oauthFlow.MCPOAuthFlow.prototype, "login").mockResolvedValue({
+			access: "managed-access",
+			refresh: "managed-refresh",
+			expires: Date.now() + 3_600_000,
+		});
+		const { controller, mcpManager, showError } = createController(authStorage, {
+			getServerConfig: vi.fn(() => configs.envserver),
+			getSource: vi.fn(() => sources.envserver),
+		});
+		const selected = await findMcpServerForAuth("envserver", projectDir, mcpManager, { enableProjectConfig: false });
+		expect(selected?.config).toMatchObject({ url: EXPANDED_SERVER_URL });
+		await controller.handle("/mcp reauth envserver");
+		expect(showError).not.toHaveBeenCalled();
+		expect(authStorage.credentials.get(oauthFlow.mcpOAuthCredentialId(EXPANDED_SERVER_URL))).toMatchObject({
+			access: "managed-access",
+		});
+		expect(
+			authStorage.credentials.get(oauthFlow.mcpOAuthCredentialId("https://shadow.example.com/mcp")),
+		).toBeUndefined();
+		expect(await Bun.file(configPath).text()).toBe(before);
+		expect(await Bun.file(managedPath).text()).toBe(managedText);
 	});
 
 	test("stores definition-only OAuth credentials under the expanded URL key", async () => {

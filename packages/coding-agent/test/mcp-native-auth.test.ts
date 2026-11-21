@@ -644,6 +644,35 @@ describe.skipIf(process.platform === "win32")("native MCP auth command", () => {
 		expect(fixture.handshakes).toEqual([""]);
 	}, 30_000);
 
+	test.each([
+		{ action: "auth", shadow: false },
+		{ action: "reauth", shadow: false },
+		{ action: "auth", shadow: true },
+		{ action: "reauth", shadow: true },
+	])(
+		"$action refuses immutable managed authorization (user shadow=$shadow)",
+		async ({ action, shadow }) => {
+			fixture = oauthServer();
+			const managedPath = path.join(agentDir, "mcp.managed.json");
+			const managedText = JSON.stringify({
+				mcpServers: { synthetic: { ...fixture.config, headers: { Authorization: "stale-managed-token" } } },
+			});
+			await fs.writeFile(managedPath, managedText);
+			await configure({ mcpServers: shadow ? { synthetic: fixture.config } : {} });
+			const userText = await fs.readFile(path.join(agentDir, "mcp.json"), "utf8");
+			const previousGrant = await credential(grant({ access: "existing-private-grant" }));
+			const result = await run([action, "synthetic"], { tty: true });
+			expect(result.exitCode, result.stderr + result.stdout).toBe(1);
+			expect(fixture.authorizations).toEqual([]);
+			expect(fixture.tokenRequests).toEqual([]);
+			expect(await credential()).toEqual(previousGrant);
+			expect(await fs.readFile(managedPath, "utf8")).toBe(managedText);
+			expect(await fs.readFile(path.join(agentDir, "mcp.json"), "utf8")).toBe(userText);
+			expect(await Bun.file(browserLog).exists()).toBe(false);
+		},
+		30_000,
+	);
+
 	test.each(["auth", "reauth"] as const)(
 		"%s preserves exact project trust when replacing stale client authentication",
 		async action => {
