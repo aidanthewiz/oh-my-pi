@@ -390,6 +390,21 @@ function targetTimeout(label: string, elapsedMs: number, failure: TargetFailure)
 	return new ToolError(`${label} timed out after ${elapsedMs}ms: ${why} (${failure.count} match(es))`);
 }
 
+function targetReadFailure(
+	error: unknown,
+	label: string,
+	elapsedMs: number,
+	timeoutMs: number,
+	last: TargetFailure | undefined,
+): unknown {
+	if (last && elapsedMs >= timeoutMs && error instanceof TernError && error.kind === "timeout") {
+		const timeout = targetTimeout(label, elapsedMs, last);
+		timeout.cause = error;
+		return timeout;
+	}
+	return error;
+}
+
 /** The error of an observation id whose element left the page. */
 function staleId(id: number): ToolError {
 	return new ToolError(`Element id ${id} is stale. Run tab.observe() again.`);
@@ -1825,22 +1840,29 @@ export class TernTab implements InProcessRunTab {
 				: resolveWaitTimeout(this.#cellMs, explicitTimeout);
 		const started = Date.now();
 		let delay = 30;
-		let last: TernTarget;
+		let last: TargetFailure | undefined;
 		for (;;) {
-			last = await this.#kit<TernTarget>("target", [spec, action], frame);
-			if (last.ok) {
-				const offset = await this.#frameOffset(frame);
-				return { x: last.x + offset.x, y: last.y + offset.y, width: last.width, height: last.height };
+			let target: TernTarget;
+			try {
+				target = await this.#kit<TernTarget>("target", [spec, action], frame);
+			} catch (error) {
+				throw targetReadFailure(error, label, Date.now() - started, timeoutMs, last);
 			}
+			if (target.ok) {
+				const offset = await this.#frameOffset(frame);
+				return { x: target.x + offset.x, y: target.y + offset.y, width: target.width, height: target.height };
+			}
+			last = target;
 			const elapsed = Date.now() - started;
 			// A round starting at the deadline has no budget left for its reads: under a
 			// binding cell budget they time out and mask the diagnosis below.
 			if (elapsed + delay >= timeoutMs) break;
 			if (last.reason === "missing" && explicitTimeout === undefined && elapsed >= ZERO_MATCH_FAIL_FAST_MS) break;
 			await untilAborted(this.#signal, () => Bun.sleep(delay));
+			if (Date.now() - started >= timeoutMs) break;
 			delay = Math.min(250, Math.round(delay * 1.5));
 		}
-		throw targetTimeout(label, Date.now() - started, last);
+		throw targetTimeout(label, Date.now() - started, last!);
 	}
 
 	// ─── Native reads ─────────────────────────────────────────────────────
@@ -1969,20 +1991,30 @@ export class TernTab implements InProcessRunTab {
 		let delay = 30;
 		let wheels = 0;
 		let recentred = false;
-		let last: TargetFailure;
+		let last: TargetFailure | undefined;
 		for (;;) {
-			const found = await this.#locate(spec, frame);
+			let found: { ref: DomRef; count: number } | null;
+			try {
+				found = await this.#locate(spec, frame);
+			} catch (error) {
+				throw targetReadFailure(error, label, Date.now() - started, timeoutMs, last);
+			}
 			if (!found) {
 				last = { reason: "missing", count: 0 };
 			} else {
-				const resolved = await this.#dom({
-					read: "resolve",
-					ref: found.ref,
-					action: resolveAction,
-					// A wheel omp just sent may still be moving the page under a read that checks nothing else.
-					stable: resolveAction !== "none" || wheels > 0 ? RESOLVE_STABLE_UPDATES : 0,
-					timeout: Math.max(1, Math.min(RESOLVE_SETTLE_MS, timeoutMs - (Date.now() - started))),
-				});
+				let resolved: DomReply<Extract<DomRequest, { read: "resolve" }>>;
+				try {
+					resolved = await this.#dom({
+						read: "resolve",
+						ref: found.ref,
+						action: resolveAction,
+						// A wheel omp just sent may still be moving the page under a read that checks nothing else.
+						stable: resolveAction !== "none" || wheels > 0 ? RESOLVE_STABLE_UPDATES : 0,
+						timeout: Math.max(1, Math.min(RESOLVE_SETTLE_MS, timeoutMs - (Date.now() - started))),
+					});
+				} catch (error) {
+					throw targetReadFailure(error, label, Date.now() - started, timeoutMs, last);
+				}
 				if (resolved.state === "ok") {
 					if (!resolved.point || !resolved.node) {
 						throw new TernError(
@@ -2033,9 +2065,10 @@ export class TernTab implements InProcessRunTab {
 			if (elapsed + delay >= timeoutMs) break;
 			if (last.reason === "missing" && explicitTimeout === undefined && elapsed >= ZERO_MATCH_FAIL_FAST_MS) break;
 			await untilAborted(this.#signal, () => Bun.sleep(delay));
+			if (Date.now() - started >= timeoutMs) break;
 			delay = Math.min(250, Math.round(delay * 1.5));
 		}
-		throw targetTimeout(label, Date.now() - started, last);
+		throw targetTimeout(label, Date.now() - started, last!);
 	}
 
 	/**
