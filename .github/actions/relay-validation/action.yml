@@ -44,6 +44,7 @@ runs:
         platforms: linux/amd64
 
     - name: Retain validated native addons for publication
+      id: native-artifact
       uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
       with:
         name: relay-native-linux-x64
@@ -53,10 +54,19 @@ runs:
         overwrite: true
 
     - name: Download retained native addons for verification
-      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-      with:
-        name: relay-native-linux-x64
-        path: ${{ runner.temp }}/relay-native-roundtrip
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        ARTIFACT_ID: ${{ steps.native-artifact.outputs.artifact-id }}
+        ARTIFACT_SHA256: ${{ steps.native-artifact.outputs.artifact-digest }}
+      run: |
+        set -euo pipefail
+        [[ "$ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
+        [[ "$ARTIFACT_SHA256" =~ ^[0-9a-f]{64}$ ]]
+        archive="$RUNNER_TEMP/relay-native-roundtrip.zip"
+        gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID/zip" > "$archive"
+        printf '%s  %s\n' "$ARTIFACT_SHA256" "$archive" | shasum -a 256 --check
+        unzip -q "$archive" -d "$RUNNER_TEMP/relay-native-roundtrip"
 
     - name: Verify native artifact contents
       shell: bash
