@@ -16,7 +16,7 @@ import { connectToServer, disconnectServer, listTools } from "./client";
 import { loadAllMCPConfigs, resolveMCPChildCredentialPolicy, validateServerConfig } from "./config";
 import { readMCPConfigFile, validateServerName } from "./config-writer";
 import { MCPManager } from "./manager";
-import { analyzeAuthError } from "./oauth-discovery";
+import { analyzeAuthError, extractOAuthChallengeHeader } from "./oauth-discovery";
 import {
 	lookupMcpOAuthCredential,
 	lookupProjectMcpOAuthCredential,
@@ -49,7 +49,12 @@ function needsAuthentication(error: unknown, config: MCPServerConfig): boolean {
 	if (error instanceof McpRefreshUnavailableError) return false;
 	const failure = error instanceof Error ? error : new Error(message(error));
 	const status = AIError.status(failure);
-	if (status === 403 && !/\berror\s*=\s*"insufficient_scope"/i.test(failure.message)) return false;
+	if (status === 403) {
+		const challenge = extractOAuthChallengeHeader(failure);
+		if (!challenge || !/\bBearer\b/i.test(challenge) || !/\berror\s*=\s*"insufficient_scope"/i.test(challenge)) {
+			return false;
+		}
+	}
 	return analyzeAuthError(failure, "url" in config ? config.url : undefined).requiresAuth;
 }
 

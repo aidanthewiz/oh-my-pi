@@ -13,10 +13,12 @@ const managerPath = path.resolve(import.meta.dir, "../src/mcp/manager.ts");
 const loaderPath = path.resolve(import.meta.dir, "../src/mcp/config.ts");
 const storagePath = path.resolve(import.meta.dir, "../src/sdk.ts");
 const settingsPath = path.resolve(import.meta.dir, "../src/config/settings.ts");
+const authChallenges = ["unauthorized", "short-scope", "long-scope"] as const;
 
 type FixtureOptions = {
 	anonymous?: boolean;
-	permissionDenied?: boolean;
+	challenge?: (typeof authChallenges)[number];
+	permissionDenied?: "plain" | "body-scope" | "basic-scope" | "bearer";
 	rejectRefresh?: boolean;
 	transientRefresh?: boolean;
 	toolsDenied?: boolean;
@@ -46,19 +48,34 @@ function oauthServer(options: FixtureOptions = {}): OAuthFixture {
 			if (url.pathname === "/mcp") {
 				if (request.method === "DELETE") return new Response(null, { status: 204 });
 				if (request.method !== "POST") return new Response(null, { status: 405 });
-				if (options.permissionDenied)
-					return new Response("\x1b]52;c;dHJ1c3Q=\x07tenant permission denied\x1b[31m", { status: 403 });
+				if (options.permissionDenied) {
+					const challenge =
+						options.permissionDenied === "basic-scope"
+							? 'Basic realm="tenant", error="insufficient_scope"'
+							: options.permissionDenied === "bearer"
+								? 'Bearer realm="tenant"'
+								: undefined;
+					const body =
+						"\x1b]52;c;dHJ1c3Q=\x07tenant permission denied\x1b[31m" +
+						(options.permissionDenied === "body-scope" ? ' error="insufficient_scope"' : "");
+					return new Response(body, {
+						status: 403,
+						headers: challenge ? { "WWW-Authenticate": challenge } : undefined,
+					});
+				}
 				const authorization = request.headers.get("authorization") ?? "";
 				if (!options.anonymous && authorization !== `Bearer ${access}`) {
-					return Response.json(
-						{ error: "unauthorized" },
-						{
-							status: 401,
-							headers: {
-								"WWW-Authenticate": `Bearer resource_metadata="${url.origin}/.well-known/oauth-protected-resource/mcp", scope="mcp.read"`,
-							},
+					const insufficientScope = options.challenge === "short-scope" || options.challenge === "long-scope";
+					const body =
+						options.challenge === "long-scope"
+							? "scope denied; ".repeat(2048)
+							: JSON.stringify({ error: insufficientScope ? "insufficient_scope" : "unauthorized" });
+					return new Response(body, {
+						status: insufficientScope ? 403 : 401,
+						headers: {
+							"WWW-Authenticate": `Bearer ${insufficientScope ? 'error="insufficient_scope", ' : ""}resource_metadata="${url.origin}/.well-known/oauth-protected-resource/mcp", scope="mcp.read"`,
 						},
-					);
+					});
 				}
 				const rpc = (await request.json()) as { id?: number | string; method: string };
 				if (rpc.id === undefined) return new Response(null, { status: 202 });
@@ -316,26 +333,32 @@ describe.skipIf(process.platform === "win32")("native MCP auth command", () => {
 		}
 	}
 
-	test("saves an exact URL/profile grant and a fresh manager uses it", async () => {
-		fixture = oauthServer();
-		await configure({ mcpServers: { synthetic: fixture.config } });
-		await credential(grant({ access: "other-profile-access" }), "other-profile");
-		const result = await run(["auth", "synthetic"], { tty: true, freshManager: true });
-		expect(result.exitCode).toBe(0);
-		expect(result.stdout).toContain("connection-verified");
-		expect(result.stdout).toContain('FRESH_CONNECTION=[{"type":"text","text":"native-grant-1"}]');
-		expect(fixture.authorizations.map(url => url.searchParams.get("scope"))).toEqual(["mcp.read"]);
-		expect(await credential()).toMatchObject({
-			access: "native-grant-1",
-			resource: fixture.url,
-			clientId: "native-client",
-			tokenUrl: fixture.url.replace("/mcp", "/token"),
-		});
-		expect(await credential(undefined, "other-profile")).toMatchObject({ access: "other-profile-access" });
-		expect(JSON.parse(await fs.readFile(path.join(agentDir, "mcp.json"), "utf8"))).toEqual({
-			mcpServers: { synthetic: fixture.config },
-		});
-	}, 30_000);
+	test.each([...authChallenges])(
+		"%s saves an exact URL/profile grant and a fresh manager uses it",
+		async challenge => {
+			fixture = oauthServer({ challenge });
+			await configure({ mcpServers: { synthetic: fixture.config } });
+			await credential(grant({ access: "other-profile-access" }), "other-profile");
+			if (challenge !== "unauthorized") await credential(grant({ access: "under-scoped-access" }));
+			const result = await run(["auth", "synthetic"], { tty: true, freshManager: true });
+			expect(result.exitCode, result.stderr + result.stdout).toBe(0);
+			expect(result.stdout).toContain("grant-saved; connection-verified");
+			expect(result.stdout).toContain('FRESH_CONNECTION=[{"type":"text","text":"native-grant-1"}]');
+			expect(fixture.authorizations.map(url => url.searchParams.get("scope"))).toEqual(["mcp.read"]);
+			expect(fixture.tokenRequests.map(params => params.get("grant_type"))).toEqual(["authorization_code"]);
+			expect(await credential()).toMatchObject({
+				access: "native-grant-1",
+				resource: fixture.url,
+				clientId: "native-client",
+				tokenUrl: fixture.url.replace("/mcp", "/token"),
+			});
+			expect(await credential(undefined, "other-profile")).toMatchObject({ access: "other-profile-access" });
+			expect(JSON.parse(await fs.readFile(path.join(agentDir, "mcp.json"), "utf8"))).toEqual({
+				mcpServers: { synthetic: fixture.config },
+			});
+		},
+		30_000,
+	);
 
 	test("healthy grants are idempotent and explicit reauth starts a new grant", async () => {
 		fixture = oauthServer();
@@ -445,10 +468,10 @@ describe.skipIf(process.platform === "win32")("native MCP auth command", () => {
 		30_000,
 	);
 
-	test.each([true, false])(
-		"missing grant is actionable and passive with check=%s",
-		async check => {
-			fixture = oauthServer();
+	test.each(authChallenges.flatMap(challenge => [true, false].map(check => [challenge, check] as const)))(
+		"%s missing grant is actionable and passive with check=%s",
+		async (challenge, check) => {
+			fixture = oauthServer({ challenge });
 			await configure({ mcpServers: { synthetic: fixture.config } });
 			const result = await run(["auth", "synthetic", ...(check ? ["--check"] : [])], { tty: check });
 			expect(result.exitCode).toBe(1);
@@ -457,6 +480,7 @@ describe.skipIf(process.platform === "win32")("native MCP auth command", () => {
 			expect(fixture.tokenRequests).toEqual([]);
 			expect(fixture.authorizations).toEqual([]);
 			expect(await Bun.file(browserLog).exists()).toBe(false);
+			expect(await credential()).toBeUndefined();
 		},
 		30_000,
 	);
@@ -522,19 +546,32 @@ describe.skipIf(process.platform === "win32")("native MCP auth command", () => {
 		expect(await Bun.file(browserLog).exists()).toBe(false);
 	}, 30_000);
 
-	test("permission failures do not trigger consent", async () => {
-		fixture = oauthServer({ permissionDenied: true });
-		await configure({ mcpServers: { synthetic: fixture.config } });
-		const result = await run(["auth", "synthetic"], { tty: true });
-		expect(result.exitCode).toBe(1);
-		expect(result.stderr).toContain("connection-failed");
-		expect(result.stderr).toContain("403");
-		expect(result.stderr).toContain("tenant permission denied");
-		expect(result.stderr).not.toContain("\x1b");
-		expect(result.stderr).not.toContain("\x07");
-		expect(fixture.authorizations).toEqual([]);
-		expect(await Bun.file(browserLog).exists()).toBe(false);
-	}, 30_000);
+	test.each(["plain", "body-scope", "basic-scope", "bearer"] as const)(
+		"%s permission failures do not trigger consent or change a saved grant",
+		async permissionDenied => {
+			fixture = oauthServer({ permissionDenied });
+			await configure({ mcpServers: { synthetic: fixture.config } });
+			const existingGrant = grant({ access: "under-scoped-access" });
+			await credential(existingGrant);
+			for (const mode of ["interactive", "check", "unattended"] as const) {
+				const result = await run(["auth", "synthetic", ...(mode === "check" ? ["--check"] : [])], {
+					tty: mode !== "unattended",
+				});
+				expect(result.exitCode).toBe(1);
+				expect(result.stderr).toContain("connection-failed");
+				expect(result.stderr).not.toContain("authentication-required");
+				expect(result.stderr).toContain("403");
+				expect(result.stderr).toContain("tenant permission denied");
+				expect(result.stderr).not.toContain("\x1b");
+				expect(result.stderr).not.toContain("\x07");
+				expect(fixture.authorizations).toEqual([]);
+				expect(fixture.tokenRequests).toEqual([]);
+				expect(await Bun.file(browserLog).exists()).toBe(false);
+				expect(await credential()).toEqual(existingGrant);
+			}
+		},
+		30_000,
+	);
 
 	test("a saved grant does not imply a verified connection", async () => {
 		fixture = oauthServer({ toolsDenied: true });

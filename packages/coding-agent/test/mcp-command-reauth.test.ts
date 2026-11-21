@@ -205,6 +205,28 @@ describe("/mcp auth commands", () => {
 	});
 
 	test.each([
+		{
+			scenario: "a default-enabled URL-only user",
+			project: false,
+			invalidation: "none",
+			inferred: true,
+			defaultEnabled: true,
+		},
+		{
+			scenario: "a default-enabled URL-only user through direct reauth",
+			project: false,
+			invalidation: "none",
+			inferred: true,
+			defaultEnabled: true,
+			direct: true,
+		},
+		{
+			scenario: "a denylisted default-enabled URL-only user",
+			project: false,
+			invalidation: "disabled",
+			inferred: true,
+			defaultEnabled: true,
+		},
 		{ scenario: "user placeholders and force-enable", project: false, invalidation: "none" },
 		{ scenario: "URL-only user placeholders and force-enable", project: false, invalidation: "none", inferred: true },
 		{ scenario: "an approved URL-only project", project: true, invalidation: "none", inferred: true },
@@ -263,6 +285,9 @@ describe("/mcp auth commands", () => {
 					});
 				}
 				if (body.method === "tools/call") {
+					if (request.headers.get("authorization") !== "Bearer fresh-access") {
+						return new Response("Permission denied", { status: 403 });
+					}
 					return Response.json({
 						jsonrpc: "2.0",
 						id: body.id,
@@ -278,31 +303,34 @@ describe("/mcp auth commands", () => {
 		const config = {
 			...("inferred" in row ? {} : { type: "http" as const }),
 			url: row.project ? runtimeUrl : `http://\${MCP_HOST}/mcp`,
-			enabled: false,
+			...("defaultEnabled" in row ? {} : { enabled: false }),
 			oauth: { clientId: "test-client" },
 		};
 		const sourcePath = row.project ? path.join(projectDir, ".coreforge", "mcp.json") : configPath;
-		let configs: Record<string, MCPServerConfig>;
-		let sources: Record<string, SourceMeta>;
 		if (row.project) {
 			await fs.mkdir(path.dirname(sourcePath), { recursive: true });
 			await Bun.write(sourcePath, JSON.stringify({ mcpServers: { envserver: config } }));
 			await Bun.write(configPath, JSON.stringify({ enabledServers: ["envserver"] }));
-			clearFsCache();
-			({ configs, sources } = await loadAllMCPConfigs(projectDir, {
-				enableProjectConfig: false,
-				discoveryProviders: ["coreforge"],
-				requestProjectTrust: async () => true,
-			}));
 		} else {
 			await Bun.write(
 				configPath,
-				JSON.stringify({ mcpServers: { envserver: config }, enabledServers: ["envserver"] }),
+				JSON.stringify({
+					mcpServers: { envserver: config },
+					...("defaultEnabled" in row ? {} : { enabledServers: ["envserver"] }),
+				}),
 			);
-			configs = { envserver: { ...config, type: "http", url: runtimeUrl, enabled: true } };
-			sources = { envserver: { provider: "native", providerName: "OMP", path: configPath, level: "user" } };
 		}
-		const manager = new MCPManager(projectDir);
+		clearFsCache();
+		const loadConfigs = (cwd: string, options?: Parameters<typeof loadAllMCPConfigs>[1]) =>
+			loadAllMCPConfigs(cwd, {
+				...options,
+				discoveryProviders: [row.project ? "coreforge" : "native"],
+			});
+		const { configs, sources } = await loadConfigs(projectDir, {
+			enableProjectConfig: !row.project,
+			requestProjectTrust: async () => true,
+		});
+		const manager = new MCPManager(projectDir, undefined, loadConfigs);
 		manager.setAuthStorage(authStorage);
 		const ctx = createInteractiveModeContext({
 			session: { modelRegistry: { authStorage } },
@@ -318,6 +346,11 @@ describe("/mcp auth commands", () => {
 			await manager.connectServers(configs, sources, undefined, 0);
 			await manager.waitForStartup(0);
 			expect(manager.getTools()).toEqual([]);
+			expect(manager.getPendingAuthServers()).toEqual(["envserver"]);
+			expect(manager.getConnectionStatusSnapshot()).toMatchObject({
+				connectedServers: [],
+				failedServers: [{ serverName: "envserver", authRequired: true }],
+			});
 			expect(login).not.toHaveBeenCalled();
 			if (row.invalidation === "changed" || row.invalidation === "reapproved") {
 				await Bun.write(
@@ -335,12 +368,16 @@ describe("/mcp auth commands", () => {
 			} else if (row.invalidation === "disabled") {
 				await Bun.write(
 					configPath,
-					JSON.stringify({ enabledServers: ["envserver"], disabledServers: ["envserver"] }),
+					JSON.stringify({
+						mcpServers: row.project ? undefined : { envserver: config },
+						enabledServers: "defaultEnabled" in row ? undefined : ["envserver"],
+						disabledServers: ["envserver"],
+					}),
 				);
 			}
 			const before = await Bun.file(configPath).text();
 			const sourceBefore = await Bun.file(sourcePath).text();
-			await controller.handle("/mcp");
+			await controller.handle("direct" in row ? "/mcp reauth envserver" : "/mcp");
 			if (row.invalidation !== "none") {
 				expect(ctx.showError).toHaveBeenCalledWith(expect.stringMatching(/trusted configuration|disabled/));
 				expect(ctx.showStatus).not.toHaveBeenCalledWith(expect.stringMatching(/^Connected to MCP/));
@@ -355,8 +392,13 @@ describe("/mcp auth commands", () => {
 			expect(ctx.showError).not.toHaveBeenCalled();
 			expect(login).toHaveBeenCalledTimes(1);
 			expect(manager.getPendingAuthServers()).toEqual([]);
-			expect(manager.getServerConfig("envserver")?.enabled).toBe(true);
-			expect(manager.getServerConfig("envserver")).toMatchObject({ url: runtimeUrl });
+			expect(manager.getConnectionStatusSnapshot()).toEqual({
+				pendingServers: [],
+				connectedServers: ["envserver"],
+				failedServers: [],
+			});
+			if (!("defaultEnabled" in row)) expect(manager.getServerConfig("envserver")?.enabled).toBe(true);
+			expect(manager.getServerConfig("envserver")).toMatchObject({ type: "http", url: runtimeUrl });
 			expect(manager.getTools().map(tool => tool.name)).toEqual(["mcp__envserver_lookup"]);
 			expect((await manager.callTool("envserver", "lookup")).content).toEqual([
 				{ type: "text", text: "authorized-result" },
