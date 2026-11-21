@@ -40,6 +40,7 @@ import {
 	rejectedPointerCases,
 	SSO_PROFILE_CONFIG,
 	SSO_SESSION_NAME,
+	SSO_START_URL,
 	STATIC_PROFILE_CONFIG,
 	STATIC_PROFILE_CREDENTIALS,
 	STATIC_PROFILE_WITH_UNRELATED_SERVICES,
@@ -330,17 +331,29 @@ function useInMemorySdk(f: Fixture, retryableService?: AwsSecretInputService): H
 	return attempts;
 }
 
-function configureSso(f: Fixture, expiresAt = FIXTURE_NOW + 60_000): string {
-	f.files.set(f.launch.configFile!, SSO_PROFILE_CONFIG);
+function configureSso(
+	f: Fixture,
+	expiresAt = FIXTURE_NOW + 60_000,
+	options: { startUrl?: string; legacy?: boolean } = {},
+): string {
+	const startUrl = options.startUrl ?? SSO_START_URL;
+	let config = SSO_PROFILE_CONFIG.replace(SSO_START_URL, startUrl);
+	if (options.legacy) {
+		config = config.replace(`sso_session = ${SSO_SESSION_NAME}\n`, "");
+		config = config.replace(`[sso-session ${SSO_SESSION_NAME}]\n`, "");
+	}
+	f.files.set(f.launch.configFile!, config);
 	f.files.set(f.launch.sharedCredentialsFile!, "");
 	const cache = join(
 		f.launch.homeDir,
 		".aws",
 		"sso",
 		"cache",
-		`${createHash("sha1").update(SSO_SESSION_NAME).digest("hex")}.json`,
+		`${createHash("sha1")
+			.update(options.legacy ? startUrl : SSO_SESSION_NAME)
+			.digest("hex")}.json`,
 	);
-	f.files.set(cache, syntheticSsoToken(expiresAt));
+	f.files.set(cache, syntheticSsoToken(expiresAt, startUrl));
 	return cache;
 }
 
@@ -969,6 +982,161 @@ test("private scope rejects expired SSO before any SDK request without refresh o
 	expect(f.state.consumerCalls).toBe(0);
 	expect(f.state.readPaths).toEqual([f.launch.configFile!, f.launch.sharedCredentialsFile!, cache]);
 });
+
+const opaqueSsoStartUrl = "https://scope-fixture.awsapps.com/access-portal/../launch/%7eoperator";
+
+for (const [name, startUrl, overlap] of [
+	["portal", SSO_START_URL, `sso_start_url = ${SSO_START_URL}`],
+	["region", SSO_START_URL, "sso_region = us-east-1"],
+	["portal and region", SSO_START_URL, `sso_start_url = ${SSO_START_URL}\nsso_region = us-east-1`],
+	["opaque portal and region", opaqueSsoStartUrl, `sso_start_url = ${opaqueSsoStartUrl}\nsso_region = us-east-1`],
+] as const) {
+	test(`private scope delivers input when legacy ${name} settings exactly match the SSO session`, async () => {
+		const f = fixture();
+		const cache = configureSso(f, FIXTURE_NOW + 60_000, { startUrl });
+		f.files.set(
+			f.launch.configFile!,
+			f.files.get(f.launch.configFile!)!.replace("[profile scope-fixture]", `[profile scope-fixture]\n${overlap}`),
+		);
+		const attempts = useInMemorySdk(f);
+		await runSuccessfully(f);
+		expect(attempts.map(attempt => attempt.service)).toEqual(["sso", "sts", "secretsmanager"]);
+		expect(attempts.every(attempt => attempt.fixtureCredentials)).toBe(true);
+		expect(f.state.readPaths).toEqual([f.launch.configFile!, f.launch.sharedCredentialsFile!, cache]);
+		expectInput(f, new TextEncoder().encode(SYNTHETIC_SECRET_TEXT));
+		expect(f.state.consumerCalls).toBe(1);
+		expectReleased(f);
+	});
+}
+
+for (const legacy of [false, true]) {
+	const provider = legacy ? "legacy" : "session";
+	test(`private scope preserves the opaque ${provider} portal and cache identity through stdin delivery`, async () => {
+		const f = fixture();
+		const cache = configureSso(f, FIXTURE_NOW + 60_000, { startUrl: opaqueSsoStartUrl, legacy });
+		const attempts = useInMemorySdk(f);
+		await runSuccessfully(f);
+		expect(attempts.map(attempt => [attempt.service, attempt.hostname, attempt.protocol])).toEqual([
+			["sso", "portal.sso.us-east-1.amazonaws.com", "https:"],
+			["sts", "sts.us-east-1.amazonaws.com", "https:"],
+			["secretsmanager", "secretsmanager.us-east-1.amazonaws.com", "https:"],
+		]);
+		expect(attempts.every(attempt => attempt.fixtureCredentials)).toBe(true);
+		expect(f.state.readPaths).toEqual([f.launch.configFile!, f.launch.sharedCredentialsFile!, cache]);
+		expectInput(f, new TextEncoder().encode(SYNTHETIC_SECRET_TEXT));
+		expect(f.state.consumerCalls).toBe(1);
+		expectReleased(f);
+	});
+
+	test(`private scope rejects a normalized cached portal for the raw ${provider} portal before SDK access`, async () => {
+		const f = fixture();
+		const cache = configureSso(f, FIXTURE_NOW + 60_000, { startUrl: opaqueSsoStartUrl, legacy });
+		f.files.set(cache, syntheticSsoToken(FIXTURE_NOW + 60_000, new URL(opaqueSsoStartUrl).href));
+		const attempts = useInMemorySdk(f);
+		await rejectsSafely(f, "AUTH_REQUIRED");
+		expect(attempts).toEqual([]);
+		expect(f.state.readPaths).toEqual([f.launch.configFile!, f.launch.sharedCredentialsFile!, cache]);
+		expect(f.state.admissionCalls).toBe(0);
+		expect(f.state.consumerCalls).toBe(0);
+	});
+}
+
+for (const [name, overlap] of [
+	["portal authority", "sso_start_url = https://other-fixture.awsapps.com/start"],
+	["normalized-equivalent portal", "sso_start_url = https://SCOPE-FIXTURE.awsapps.com/start"],
+	["portal path", `sso_start_url = ${SSO_START_URL}/`],
+	["region", "sso_region = us-west-2"],
+] as const) {
+	test(`private scope rejects conflicting legacy SSO ${name} before credentials or SDK access`, async () => {
+		const f = fixture();
+		configureSso(f);
+		f.files.set(
+			f.launch.configFile!,
+			SSO_PROFILE_CONFIG.replace("[profile scope-fixture]", `[profile scope-fixture]\n${overlap}`),
+		);
+		const attempts = useInMemorySdk(f);
+		await rejectsSafely(f, "PROFILE_UNSUPPORTED");
+		expect(attempts).toEqual([]);
+		expect(f.state.readPaths).toEqual([f.launch.configFile!]);
+		expect(f.state.admissionCalls).toBe(0);
+		expect(f.state.consumerCalls).toBe(0);
+	});
+}
+
+for (const [name, startUrl] of [
+	["HTTP scheme", "http://scope-fixture.awsapps.com/access-portal"],
+	["non-HTTP scheme", "file://scope-fixture.awsapps.com/access-portal"],
+	["non-AWS authority", "https://scope-fixture.invalid/access-portal"],
+	["suffix lookalike", "https://scope-fixture.awsapps.com.invalid/access-portal"],
+	["bare suffix", "https://awsapps.com/access-portal"],
+	["other partition authority", "https://scope-fixture.awsapps.cn/access-portal"],
+	["username", "https://operator@scope-fixture.awsapps.com/access-portal"],
+	["password", "https://:synthetic@scope-fixture.awsapps.com/access-portal"],
+	["port", "https://scope-fixture.awsapps.com:8443/access-portal"],
+	["query", "https://scope-fixture.awsapps.com/access-portal?redirect=invalid"],
+	["fragment", "https://scope-fixture.awsapps.com/access-portal#invalid"],
+] as const) {
+	test(`private scope rejects an unsafe SSO portal ${name} despite matching overlap`, async () => {
+		const f = fixture();
+		configureSso(f, FIXTURE_NOW + 60_000, { startUrl });
+		const config = f.files.get(f.launch.configFile!)!;
+		f.files.set(
+			f.launch.configFile!,
+			config.replace(
+				"[profile scope-fixture]",
+				`[profile scope-fixture]\nsso_start_url = ${startUrl}\nsso_region = us-east-1`,
+			),
+		);
+		const attempts = useInMemorySdk(f);
+		await rejectsSafely(f, "PROFILE_UNSUPPORTED");
+		expect(attempts).toEqual([]);
+		expect(f.state.readPaths).toEqual([f.launch.configFile!]);
+		expect(f.state.admissionCalls).toBe(0);
+		expect(f.state.consumerCalls).toBe(0);
+	});
+}
+
+const rejectedSsoSettings: readonly [string, (config: string) => string][] = [
+	["missing session", config => config.replace(`sso_session = ${SSO_SESSION_NAME}`, "sso_session = absent-session")],
+	["unknown session setting", config => `${config}endpoint_url = https://never-connect.invalid\n`],
+	["unsupported session scope", config => `${config}sso_registration_scopes = sso:unsupported\n`],
+	[
+		"missing session portal with a legacy value",
+		config =>
+			config
+				.replace(`sso_start_url = ${SSO_START_URL}\n`, "")
+				.replace("[profile scope-fixture]", `[profile scope-fixture]\nsso_start_url = ${SSO_START_URL}`),
+	],
+	[
+		"missing session region with a legacy value",
+		config =>
+			config
+				.replace("sso_region = us-east-1\n", "")
+				.replace("[profile scope-fixture]", "[profile scope-fixture]\nsso_region = us-east-1"),
+	],
+	[
+		"static credential mixing",
+		config =>
+			config.replace(
+				"[profile scope-fixture]",
+				`[profile scope-fixture]\naws_access_key_id = ${SYNTHETIC_ACCESS_KEY_ID}`,
+			),
+	],
+];
+
+for (const [name, change] of rejectedSsoSettings) {
+	test(`private scope rejects ${name} before credentials or SDK access`, async () => {
+		const f = fixture();
+		configureSso(f);
+		f.files.set(f.launch.configFile!, change(SSO_PROFILE_CONFIG));
+		const attempts = useInMemorySdk(f);
+		await rejectsSafely(f, "PROFILE_UNSUPPORTED");
+		expect(attempts).toEqual([]);
+		expect(f.state.readPaths).toEqual([f.launch.configFile!]);
+		expect(f.state.admissionCalls).toBe(0);
+		expect(f.state.consumerCalls).toBe(0);
+	});
+}
 
 test("private scope accepts an explicit profile with unrelated standard service configuration", async () => {
 	const f = fixture();

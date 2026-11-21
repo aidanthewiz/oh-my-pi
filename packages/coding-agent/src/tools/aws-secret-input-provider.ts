@@ -474,8 +474,8 @@ export class AwsSecretInputProvider {
 		if (
 			session &&
 			([...session.keys()].some(key => !Object.hasOwn(SESSION_KEYS, key)) ||
-				settings.has("sso_start_url") ||
-				settings.has("sso_region") ||
+				(settings.has("sso_start_url") && settings.get("sso_start_url") !== session.get("sso_start_url")) ||
+				(settings.has("sso_region") && settings.get("sso_region") !== session.get("sso_region")) ||
 				(session.has("sso_registration_scopes") && session.get("sso_registration_scopes") !== "sso:account:access"))
 		)
 			throw new AwsSecretInputFailure("PROFILE_UNSUPPORTED");
@@ -500,10 +500,7 @@ export class AwsSecretInputProvider {
 				url.port ||
 				url.search ||
 				url.hash ||
-				!url.hostname.endsWith(suffix) ||
-				(url.pathname !== "/start" &&
-					url.pathname !== "/start/" &&
-					!/^\/directory\/d-[a-z0-9]+$/u.test(url.pathname))
+				!url.hostname.endsWith(suffix)
 			)
 				throw 0;
 		} catch {

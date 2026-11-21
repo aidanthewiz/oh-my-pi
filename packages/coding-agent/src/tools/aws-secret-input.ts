@@ -164,7 +164,19 @@ export class AwsSecretInput {
 		return [
 			"Private delivery only. Consumer stdout/stderr is raw and agent-visible; interruption can leave committed writes.",
 			`Request fingerprint: ${awsSecretInputRequestFingerprint(request)}`,
-			`Request: ${JSON.stringify(request)}`,
+			`Protocol: ${request.secretInput.protocol}`,
+			`Capability: ${request.secretInput.capability}`,
+			`AWS profile: ${JSON.stringify(request.profile)}; region: ${JSON.stringify(request.region)}`,
+			`Expected caller account: ${request.secretInput.expectedIdentity.account}; partition: ${request.secretInput.expectedIdentity.partition}`,
+			`Expected caller ARN: ${JSON.stringify(request.secretInput.expectedIdentity.arn)}`,
+			`Secret ARN: ${JSON.stringify(request.parameters.SecretId)}`,
+			`Secret version ID: ${JSON.stringify(request.parameters.VersionId)}; stage: ${request.parameters.VersionStage === undefined ? "not specified" : JSON.stringify(request.parameters.VersionStage)}`,
+			`Input selection: ${
+				request.secretInput.jsonPointer === undefined
+					? "exact SecretString UTF-8 or SecretBinary bytes"
+					: `RFC 6901 pointer ${JSON.stringify(request.secretInput.jsonPointer)} to a JSON SecretString string leaf`
+			}`,
+			`Append newline: ${request.secretInput.appendNewline === true}`,
 			`Input limit: ${AWS_SECRET_INPUT_LIMITS.maxInputBytes} bytes; stdout limit: ${AWS_SECRET_INPUT_LIMITS.maxStdoutBytes} bytes; stderr limit: ${AWS_SECRET_INPUT_LIMITS.maxStderrBytes} bytes; combined retained output limit: ${AWS_SECRET_INPUT_LIMITS.maxStdoutBytes + AWS_SECRET_INPUT_LIMITS.maxStderrBytes} bytes; timeout: ${awsSecretInputTimeoutMs(request)}ms`,
 		];
 	}

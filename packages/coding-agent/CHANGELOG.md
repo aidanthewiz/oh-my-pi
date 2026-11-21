@@ -20,6 +20,8 @@
 
 ### Fixed
 
+- Accept matching legacy and session SSO settings and valid AWS portal paths when delivering secrets through private stdin.
+- Show exact AWS approval bindings without duplicating inline consumer source; retain one-use approval and command-guard explanations.
 - Synchronize shell job-control fixtures with actual shell startup before starting their signal delays.
 - Use Nextest 0.9.131 for Cargo's current build-directory layout in CI, retaining compatible dependency caches while caching the updated runner under its versioned key.
 - Verify relay artifact roundtrips by the exact upload ID and SHA-256 instead of an immediate name lookup that can miss a finalized artifact.
