@@ -1315,6 +1315,7 @@ describe("MCP Streamable HTTP transport timeouts", () => {
 		const sendNotification = Promise.withResolvers<void>();
 		server = Bun.serve({
 			port: 0,
+			idleTimeout: 0,
 			fetch() {
 				let cancelled = false;
 				return new Response(

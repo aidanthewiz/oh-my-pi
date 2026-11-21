@@ -12,6 +12,7 @@
 
 ### Added
 
+- Authenticate selected hosted MCP servers from a sessionless terminal command with `mcp auth [server ...]`, passive `--check`, and deliberate `mcp reauth <server>`.
 - Add generic `xd://aws` secret delivery through finite stdin to an exact-approved local process on Darwin and Linux. Pin the AWS identity and secret version, verify live host/worker capabilities, preserve AWS and receiver guards, and return bounded raw consumer output. The native route supports existing static profiles and unexpired SSO without automatic sign-in or retry; cancellation reports uncertain writes and reaps owned processes.
 - Emit observation-only deferred tool results for final Bash job outcomes, including eval calls and completion after an agent abort. Retain the original conversation, input and MCP identity without starting model continuations.
 - Native AWS approvals offer **Allow for the rest of this session** for later commands, profiles, and SSO renewal without saving a configuration grant.
@@ -22,6 +23,12 @@
 
 ### Fixed
 
+- Preserve actionable MCP authentication readiness across asynchronous startup, late subscriptions, native CLI checks, and truncated HTTP diagnostics. Offer Authenticate / Not now without cached tools, startup browsers, or editor focus changes.
+- Respect effective opt-in overlays during hosted OAuth while preserving raw managed definitions, profile bindings, and credential persistence.
+- Preserve inferred HTTP transport, raw environment placeholders, and exact project trust during OAuth recovery, including default-enabled URL-only definitions. Replace stale Authorization headers without adding unrelated fields. Stop automatic reconnection retries for permission-only HTTP 403 failures.
+- Keep server-specific OAuth cancellation isolated from queued sibling sign-ins.
+- Refuse browser replacement of explicit read-only managed credentials without changing configuration or grants. Keep managed definitions authoritative over writable user shadows during in-session reauthorization.
+- Test authoritative managed stdio servers without falling back to same-named user definitions. Keep browser reauthorization restricted to HTTP/SSE.
 - Accept matching legacy and session SSO settings and valid AWS portal paths when delivering secrets through private stdin.
 - Show exact AWS approval bindings without duplicating inline consumer source; retain one-use approval and command-guard explanations.
 - Synchronize shell job-control fixtures with actual shell startup before starting their signal delays.

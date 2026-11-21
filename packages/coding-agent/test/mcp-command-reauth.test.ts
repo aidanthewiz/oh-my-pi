@@ -5,10 +5,16 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { AuthStorage, SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai";
 import type { OAuthCredentials } from "@oh-my-pi/pi-ai/oauth/types";
+import { clearCache as clearFsCache } from "@oh-my-pi/pi-coding-agent/capability/fs";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import * as mcpClient from "@oh-my-pi/pi-coding-agent/mcp/client";
+import { loadAllMCPConfigs } from "@oh-my-pi/pi-coding-agent/mcp/config";
+import { MCPManager } from "@oh-my-pi/pi-coding-agent/mcp/manager";
 import * as oauthFlow from "@oh-my-pi/pi-coding-agent/mcp/oauth-flow";
+import { findMcpServerForAuth } from "@oh-my-pi/pi-coding-agent/mcp/oauth-reauth";
+import { cfgMcpEnableProjectConfig } from "@oh-my-pi/pi-coding-agent/mcp/settings";
 import type { SourceMeta } from "@oh-my-pi/pi-coding-agent/capability/types";
-import type { MCPServerConfig } from "@oh-my-pi/pi-coding-agent/mcp/types";
+import type { MCPHttpServerConfig, MCPServerConfig } from "@oh-my-pi/pi-coding-agent/mcp/types";
 import { MCPCommandController } from "@oh-my-pi/pi-coding-agent/modes/controllers/mcp-command-controller";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
 import {
@@ -24,6 +30,7 @@ import {
 	createMcpManagerStub,
 	type McpManagerOverrides,
 } from "./helpers/interactive-mode-context";
+import { startFlakyHttpMcpServer } from "./fixtures/flaky-http-mcp";
 
 const RAW_SERVER_URL = `https://\${MCP_HOST}/mcp`;
 const EXPANDED_SERVER_URL = "https://mcp.example.com/mcp";
@@ -197,6 +204,405 @@ describe("/mcp auth commands", () => {
 		}
 		await removeWithRetries(projectDir);
 		await removeWithRetries(agentDir);
+	});
+
+	test.each([
+		{ transport: "stdio", changed: false },
+		{ transport: "http", changed: false },
+		{ transport: "stdio", changed: true },
+	] as const)("managed $transport connection test honors source ownership (changed=$changed)", async row => {
+		const authStorage = freshAuthStorage();
+		await authStorage.credentials.reload();
+		const http = row.transport === "http" ? startFlakyHttpMcpServer() : undefined;
+		const effectsPath = path.join(projectDir, "effects");
+		const managedPath = path.join(agentDir, "mcp.managed.json");
+		const managed: MCPServerConfig = http
+			? { type: "http", url: http.url }
+			: {
+					type: "stdio",
+					command: process.execPath,
+					args: [path.join(import.meta.dir, "fixtures/side-effect-mcp.ts"), effectsPath],
+				};
+		const managedText = JSON.stringify({ mcpServers: { envserver: managed } });
+		const userText = JSON.stringify({
+			mcpServers: { envserver: { type: "stdio", command: process.execPath, args: ["-e", "process.exit(27)"] } },
+		});
+		await Bun.write(managedPath, managedText);
+		await Bun.write(configPath, userText);
+		clearFsCache();
+		const loadConfigs = (cwd: string, options?: Parameters<typeof loadAllMCPConfigs>[1]) =>
+			loadAllMCPConfigs(cwd, {
+				...options,
+				discoveryProviders: ["native", "mcp-managed"],
+				enableProjectConfig: false,
+			});
+		const loaded = await loadConfigs(projectDir);
+		const manager = new MCPManager(projectDir, undefined, loadConfigs);
+		manager.setAuthStorage(authStorage);
+		const ctx = createInteractiveModeContext({
+			session: { modelRegistry: { authStorage } },
+			mcpManager: manager,
+			settings: Settings.isolated(),
+		});
+		cfgMcpEnableProjectConfig.set(ctx.settings, false);
+		const controller = new MCPCommandController(ctx);
+		try {
+			await manager.connectServers(loaded.configs, loaded.sources, undefined, 0);
+			await manager.waitForStartup(0);
+			const toolName = http ? "ping" : "record_effect";
+			expect((await manager.callTool("envserver", toolName)).content).toEqual([
+				{ type: "text", text: http ? http.pong : "effect recorded" },
+			]);
+			const selectedText = row.changed
+				? JSON.stringify({ mcpServers: { envserver: { ...managed, args: ["-e", "process.exit(28)"] } } })
+				: managedText;
+			if (row.changed) {
+				await Bun.write(managedPath, selectedText);
+				clearFsCache();
+			}
+			const probe = vi.spyOn(mcpClient, "connectToServer");
+			const login = vi.spyOn(oauthFlow.MCPOAuthFlow.prototype, "login");
+			await controller.handle("/mcp test envserver");
+			if (row.changed) {
+				expect(ctx.showError).toHaveBeenCalled();
+				expect(probe).not.toHaveBeenCalled();
+			} else {
+				expect(ctx.showError).not.toHaveBeenCalled();
+				expect(ctx.chatContainer.render(160).join("\n")).toContain(toolName);
+				if (!http) {
+					const probes = probe.mock.calls.length;
+					await controller.handle("/mcp reauth envserver");
+					expect(ctx.showError).toHaveBeenCalled();
+					expect(probe).toHaveBeenCalledTimes(probes);
+				}
+			}
+			expect(login).not.toHaveBeenCalled();
+			expect(await Bun.file(managedPath).text()).toBe(selectedText);
+			expect(await Bun.file(configPath).text()).toBe(userText);
+			expect((await manager.callTool("envserver", toolName)).content).toEqual([
+				{ type: "text", text: http ? http.pong : "effect recorded" },
+			]);
+		} finally {
+			await manager.disconnectAll();
+			http?.stop();
+		}
+	});
+
+	test.each([
+		{
+			scenario: "a default-enabled URL-only user",
+			project: false,
+			invalidation: "none",
+			inferred: true,
+			defaultEnabled: true,
+		},
+		{
+			scenario: "a default-enabled URL-only user through direct reauth",
+			project: false,
+			invalidation: "none",
+			inferred: true,
+			defaultEnabled: true,
+			direct: true,
+		},
+		{
+			scenario: "a denylisted default-enabled URL-only user",
+			project: false,
+			invalidation: "disabled",
+			inferred: true,
+			defaultEnabled: true,
+		},
+		{ scenario: "user placeholders and force-enable", project: false, invalidation: "none" },
+		{ scenario: "URL-only user placeholders and force-enable", project: false, invalidation: "none", inferred: true },
+		{ scenario: "an approved URL-only project", project: true, invalidation: "none", inferred: true },
+		{
+			scenario: "an exactly approved project with general project loading disabled",
+			project: true,
+			invalidation: "none",
+		},
+		{ scenario: "a project definition changed after approval", project: true, invalidation: "changed" },
+		{
+			scenario: "a replacement project definition approved after startup",
+			project: true,
+			invalidation: "reapproved",
+		},
+		{ scenario: "a denylisted approved project", project: true, invalidation: "disabled" },
+	] as const)("cold-cache Authenticate honors $scenario", async row => {
+		const authStorage = freshAuthStorage();
+		await authStorage.credentials.reload();
+		const login = vi.spyOn(oauthFlow.MCPOAuthFlow.prototype, "login").mockResolvedValue({
+			access: "fresh-access",
+			refresh: "fresh-refresh",
+			expires: Date.now() + 3_600_000,
+		});
+		const server = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			async fetch(request) {
+				if (request.method === "DELETE") return new Response(null, { status: 202 });
+				if (request.method !== "POST") return new Response(null, { status: 405 });
+				const body = (await request.json()) as { id?: number; method?: string };
+				if (body.method === "initialize") {
+					if (request.headers.get("authorization") !== "Bearer fresh-access") {
+						return Response.json(
+							{
+								authorization_url: "https://auth.example.com/authorize",
+								token_url: "https://auth.example.com/token",
+							},
+							{ status: 401, headers: { "WWW-Authenticate": 'Bearer realm="test"' } },
+						);
+					}
+					return Response.json({
+						jsonrpc: "2.0",
+						id: body.id,
+						result: {
+							protocolVersion: "2025-03-26",
+							capabilities: { tools: {} },
+							serverInfo: { name: "hosted", version: "1" },
+						},
+					});
+				}
+				if (body.method === "tools/list") {
+					return Response.json({
+						jsonrpc: "2.0",
+						id: body.id,
+						result: { tools: [{ name: "lookup", inputSchema: { type: "object", properties: {} } }] },
+					});
+				}
+				if (body.method === "tools/call") {
+					if (request.headers.get("authorization") !== "Bearer fresh-access") {
+						return new Response("Permission denied", { status: 403 });
+					}
+					return Response.json({
+						jsonrpc: "2.0",
+						id: body.id,
+						result: { content: [{ type: "text", text: "authorized-result" }] },
+					});
+				}
+				return new Response(null, { status: 202 });
+			},
+		});
+		const runtimeUrl = `${server.url}mcp`;
+		Bun.env.MCP_HOST = server.url.host;
+		process.env.MCP_HOST = server.url.host;
+		const config = {
+			...("inferred" in row ? {} : { type: "http" as const }),
+			url: row.project ? runtimeUrl : `http://\${MCP_HOST}/mcp`,
+			...("defaultEnabled" in row ? {} : { enabled: false }),
+			oauth: { clientId: "test-client" },
+		};
+		const sourcePath = row.project ? path.join(projectDir, ".coreforge", "mcp.json") : configPath;
+		if (row.project) {
+			await fs.mkdir(path.dirname(sourcePath), { recursive: true });
+			await Bun.write(sourcePath, JSON.stringify({ mcpServers: { envserver: config } }));
+			await Bun.write(configPath, JSON.stringify({ enabledServers: ["envserver"] }));
+		} else {
+			await Bun.write(
+				configPath,
+				JSON.stringify({
+					mcpServers: { envserver: config },
+					...("defaultEnabled" in row ? {} : { enabledServers: ["envserver"] }),
+				}),
+			);
+		}
+		clearFsCache();
+		const loadConfigs = (cwd: string, options?: Parameters<typeof loadAllMCPConfigs>[1]) =>
+			loadAllMCPConfigs(cwd, {
+				...options,
+				discoveryProviders: [row.project ? "coreforge" : "native"],
+			});
+		const { configs, sources } = await loadConfigs(projectDir, {
+			enableProjectConfig: !row.project,
+			requestProjectTrust: async () => true,
+		});
+		const manager = new MCPManager(projectDir, undefined, loadConfigs);
+		manager.setAuthStorage(authStorage);
+		const ctx = createInteractiveModeContext({
+			session: { modelRegistry: { authStorage } },
+			mcpManager: manager,
+			settings: Settings.isolated(),
+		});
+		cfgMcpEnableProjectConfig.set(ctx.settings, !row.project);
+		const controller = new MCPCommandController(ctx);
+		manager.setAuthHandler((name, challenge, context) => controller.handleMCPAuthChallenge(name, challenge, context));
+		vi.spyOn(ctx, "showHookSelector").mockResolvedValue("Authenticate envserver");
+
+		try {
+			await manager.connectServers(configs, sources, undefined, 0);
+			await manager.waitForStartup(0);
+			expect(manager.getTools()).toEqual([]);
+			expect(manager.getPendingAuthServers()).toEqual(["envserver"]);
+			expect(manager.getConnectionStatusSnapshot()).toMatchObject({
+				connectedServers: [],
+				failedServers: [{ serverName: "envserver", authRequired: true }],
+			});
+			expect(login).not.toHaveBeenCalled();
+			if (row.invalidation === "changed" || row.invalidation === "reapproved") {
+				await Bun.write(
+					sourcePath,
+					JSON.stringify({ mcpServers: { envserver: { ...config, oauth: { clientId: "replacement-client" } } } }),
+				);
+				clearFsCache();
+				if (row.invalidation === "reapproved") {
+					await loadAllMCPConfigs(projectDir, {
+						enableProjectConfig: false,
+						discoveryProviders: ["coreforge"],
+						requestProjectTrust: async () => true,
+					});
+				}
+			} else if (row.invalidation === "disabled") {
+				await Bun.write(
+					configPath,
+					JSON.stringify({
+						mcpServers: row.project ? undefined : { envserver: config },
+						enabledServers: "defaultEnabled" in row ? undefined : ["envserver"],
+						disabledServers: ["envserver"],
+					}),
+				);
+			}
+			const before = await Bun.file(configPath).text();
+			const sourceBefore = await Bun.file(sourcePath).text();
+			await controller.handle("direct" in row ? "/mcp reauth envserver" : "/mcp");
+			if (row.invalidation !== "none") {
+				expect(ctx.showError).toHaveBeenCalledWith(expect.stringMatching(/trusted configuration|disabled/));
+				expect(ctx.showStatus).not.toHaveBeenCalledWith(expect.stringMatching(/^Connected to MCP/));
+				expect(login).not.toHaveBeenCalled();
+				expect(manager.getTools()).toEqual([]);
+				expect(manager.getPendingAuthServers()).toEqual(["envserver"]);
+				expect(authStorage.credentials.get(oauthFlow.mcpOAuthCredentialId(runtimeUrl))).toBeUndefined();
+				expect(await Bun.file(configPath).text()).toBe(before);
+				expect(await Bun.file(sourcePath).text()).toBe(sourceBefore);
+				return;
+			}
+			expect(ctx.showError).not.toHaveBeenCalled();
+			expect(login).toHaveBeenCalledTimes(1);
+			expect(manager.getPendingAuthServers()).toEqual([]);
+			expect(manager.getConnectionStatusSnapshot()).toEqual({
+				pendingServers: [],
+				connectedServers: ["envserver"],
+				failedServers: [],
+			});
+			if (!("defaultEnabled" in row)) expect(manager.getServerConfig("envserver")?.enabled).toBe(true);
+			expect(manager.getServerConfig("envserver")).toMatchObject({ type: "http", url: runtimeUrl });
+			expect(manager.getTools().map(tool => tool.name)).toEqual(["mcp__envserver_lookup"]);
+			expect((await manager.callTool("envserver", "lookup")).content).toEqual([
+				{ type: "text", text: "authorized-result" },
+			]);
+			expect(await Bun.file(configPath).text()).toBe(before);
+			expect(await Bun.file(sourcePath).text()).toBe(sourceBefore);
+			expect(authStorage.credentials.get(oauthFlow.mcpOAuthCredentialId(runtimeUrl))).toMatchObject({
+				access: "fresh-access",
+			});
+		} finally {
+			clearFsCache();
+			await manager.disconnectAll();
+			server.stop(true);
+		}
+	});
+
+	test.each([
+		{ label: "source path", source: { path: "/tmp/another-owner.json" }, url: EXPANDED_SERVER_URL, disabled: [] },
+		{ label: "source trust level", source: { level: "project" as const }, url: EXPANDED_SERVER_URL, disabled: [] },
+		{ label: "source provider", source: { provider: "other" }, url: EXPANDED_SERVER_URL, disabled: [] },
+		{ label: "routing target", source: {}, url: "https://different.example.com/mcp", disabled: [] },
+		{ label: "disabled selection", source: {}, url: EXPANDED_SERVER_URL, disabled: ["envserver"] },
+	])("does not authorize a raw-disabled definition through a mismatched $label", async row => {
+		const raw: MCPHttpServerConfig = {
+			type: "http",
+			url: RAW_SERVER_URL,
+			enabled: false,
+			oauth: { clientName: "Coreforge" },
+		};
+		await Bun.write(configPath, JSON.stringify({ mcpServers: { envserver: raw }, disabledServers: row.disabled }));
+		const before = await Bun.file(configPath).text();
+		const authStorage = freshAuthStorage();
+		const login = vi.spyOn(oauthFlow.MCPOAuthFlow.prototype, "login");
+		const probe = vi.spyOn(mcpClient, "connectToServer");
+		const { controller, showError } = createController(authStorage, {
+			getServerConfig: () => ({ ...raw, url: row.url, enabled: true }),
+			getSource: () => ({ provider: "native", providerName: "OMP", path: configPath, level: "user", ...row.source }),
+		});
+		await controller.handle("/mcp reauth envserver");
+		expect(showError).toHaveBeenCalledWith(expect.stringMatching(/disabled/i));
+		expect(login).not.toHaveBeenCalled();
+		expect(probe).not.toHaveBeenCalled();
+		expect(await Bun.file(configPath).text()).toBe(before);
+		expect(authStorage.credentials.get(oauthFlow.mcpOAuthCredentialId(EXPANDED_SERVER_URL))).toBeUndefined();
+	});
+
+	test("does not replace immutable managed authorization through a writable user shadow", async () => {
+		const authStorage = freshAuthStorage();
+		await authStorage.credentials.reload();
+		const managedPath = path.join(agentDir, "mcp.managed.json");
+		const managedText = JSON.stringify({
+			mcpServers: {
+				envserver: { type: "http", url: RAW_SERVER_URL, headers: { Authorization: "stale-managed-token" } },
+			},
+		});
+		await Bun.write(managedPath, managedText);
+		clearFsCache();
+		const { configs, sources } = await loadAllMCPConfigs(projectDir, {
+			discoveryProviders: ["native", "mcp-managed"],
+			enableProjectConfig: false,
+		});
+		const before = await Bun.file(configPath).text();
+		const probe = vi.spyOn(mcpClient, "connectToServer").mockRejectedValue(AUTH_ERROR);
+		const login = vi
+			.spyOn(oauthFlow.MCPOAuthFlow.prototype, "login")
+			.mockRejectedValue(new Error("Unexpected consent"));
+		const { controller } = createController(authStorage, {
+			getServerConfig: vi.fn(() => configs.envserver),
+			getSource: vi.fn(() => sources.envserver),
+		});
+		await controller.handle("/mcp reauth envserver");
+		expect(login).not.toHaveBeenCalled();
+		expect(probe).not.toHaveBeenCalled();
+		expect(await Bun.file(configPath).text()).toBe(before);
+		expect(await Bun.file(managedPath).text()).toBe(managedText);
+		expect(authStorage.credentials.get(oauthFlow.mcpOAuthCredentialId(EXPANDED_SERVER_URL))).toBeUndefined();
+	});
+
+	test("reauthenticates a headerless managed server instead of its writable user shadow", async () => {
+		const authStorage = freshAuthStorage();
+		await authStorage.credentials.reload();
+		const managedPath = path.join(agentDir, "mcp.managed.json");
+		const managedText = JSON.stringify({
+			mcpServers: { envserver: { type: "http", url: RAW_SERVER_URL } },
+		});
+		await Bun.write(managedPath, managedText);
+		await Bun.write(
+			configPath,
+			JSON.stringify({
+				mcpServers: { envserver: { type: "http", url: "https://shadow.example.com/mcp" } },
+			}),
+		);
+		clearFsCache();
+		const { configs, sources } = await loadAllMCPConfigs(projectDir, {
+			discoveryProviders: ["native", "mcp-managed"],
+			enableProjectConfig: false,
+		});
+		const before = await Bun.file(configPath).text();
+		vi.spyOn(mcpClient, "connectToServer").mockRejectedValue(AUTH_ERROR);
+		vi.spyOn(oauthFlow.MCPOAuthFlow.prototype, "login").mockResolvedValue({
+			access: "managed-access",
+			refresh: "managed-refresh",
+			expires: Date.now() + 3_600_000,
+		});
+		const { controller, mcpManager, showError } = createController(authStorage, {
+			getServerConfig: vi.fn(() => configs.envserver),
+			getSource: vi.fn(() => sources.envserver),
+		});
+		const selected = await findMcpServerForAuth("envserver", projectDir, mcpManager, { enableProjectConfig: false });
+		expect(selected?.config).toMatchObject({ url: EXPANDED_SERVER_URL });
+		await controller.handle("/mcp reauth envserver");
+		expect(showError).not.toHaveBeenCalled();
+		expect(authStorage.credentials.get(oauthFlow.mcpOAuthCredentialId(EXPANDED_SERVER_URL))).toMatchObject({
+			access: "managed-access",
+		});
+		expect(
+			authStorage.credentials.get(oauthFlow.mcpOAuthCredentialId("https://shadow.example.com/mcp")),
+		).toBeUndefined();
+		expect(await Bun.file(configPath).text()).toBe(before);
+		expect(await Bun.file(managedPath).text()).toBe(managedText);
 	});
 
 	test("stores definition-only OAuth credentials under the expanded URL key", async () => {
@@ -437,10 +843,9 @@ describe("/mcp auth commands", () => {
 		);
 
 		const { controller, showError } = createController(authStorage);
-		const updated = await controller.handleMCPAuthChallenge("envserver", {
+		await controller.handleMCPAuthChallenge("envserver", {
 			wwwAuthenticate: [`Bearer resource_metadata="${resourceMetadataUrl}" scope="orders.read"`],
 		});
-		expect(updated).toEqual(expect.objectContaining({ type: "http", url: RAW_SERVER_URL }));
 		expect(showError).not.toHaveBeenCalled();
 		expect(new URL(authorizationUrl).searchParams.get("scope")).toBe("orders.read");
 		expect(new URL(authorizationUrl).searchParams.get("resource")).toBe("https://gateway.example.com/mcp");
@@ -489,11 +894,13 @@ describe("/mcp auth commands", () => {
 		});
 
 		const { controller, showError } = createController(authStorage);
-		const updated = await controller.handleMCPAuthChallenge("envserver", {
+		await controller.handleMCPAuthChallenge("envserver", {
 			wwwAuthenticate: [`Bearer resource_metadata="${resourceMetadataUrl}" scope="orders.read"`],
 		});
-		expect(updated).toEqual(expect.objectContaining({ type: "http", url: RAW_SERVER_URL }));
 		expect(showError).not.toHaveBeenCalled();
+		expect(authStorage.credentials.get(oauthFlow.mcpOAuthCredentialId(EXPANDED_SERVER_URL))).toMatchObject({
+			access: "fresh-access",
+		});
 	});
 
 	test("/mcp reauth acquires a credential when the handshake succeeds but tools need OAuth", async () => {

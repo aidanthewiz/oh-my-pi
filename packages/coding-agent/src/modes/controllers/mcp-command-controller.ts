@@ -23,6 +23,7 @@ import {
 } from "../../mcp";
 import {
 	findMcpServerForAuth,
+	matchingManagerServerConfig,
 	MCPOAuthCancelledError,
 	persistMcpOAuthResult,
 	probeMcpConnection,
@@ -343,7 +344,11 @@ export class MCPCommandController {
 		const subcommand = parts[1]?.toLowerCase();
 		const serverName = parts.slice(2).join(" ") || undefined;
 
-		if (!subcommand || subcommand === "help") {
+		if (!subcommand) {
+			await this.#handleManage();
+			return;
+		}
+		if (subcommand === "help") {
 			this.#showHelp();
 			return;
 		}
@@ -394,6 +399,39 @@ export class MCPCommandController {
 		}
 	}
 
+	async #handleManage(): Promise<void> {
+		const manager = this.ctx.mcpManager;
+		const names = manager?.getPendingAuthServers() ?? [];
+		if (!manager || names.length === 0) {
+			this.#showHelp();
+			return;
+		}
+		const choices = names.map(name => `Authenticate ${name}`);
+		const selected = await this.ctx.showHookSelector("MCP integrations need sign-in", [...choices, "Not now"]);
+		if (!this.#isCurrentOwner()) return;
+		const index = selected === undefined ? -1 : choices.indexOf(selected);
+		if (index < 0) {
+			for (const name of names) manager.deferAuthentication(name);
+			return;
+		}
+		const name = names[index];
+		try {
+			const connection = await manager.authenticateServer(name);
+			if (!this.#isCurrentOwner()) return;
+			if (connection) this.ctx.showStatus(`Connected to MCP server "${name}".`);
+			else this.ctx.showStatus(`Sign-in deferred for "${name}". Run /mcp to retry.`);
+		} catch (error) {
+			if (!this.#isCurrentOwner()) return;
+			if (error instanceof MCPOAuthCancelledError) {
+				this.ctx.showStatus(`Sign-in cancelled for "${name}". Run /mcp to retry.`);
+			} else {
+				this.ctx.showError(
+					`Failed to authenticate "${name}": ${error instanceof Error ? error.message : String(error)}`,
+				);
+			}
+		}
+	}
+
 	/**
 	 * Show help text
 	 */
@@ -402,6 +440,7 @@ export class MCPCommandController {
 			"Manage Model Context Protocol (MCP) servers for external tool integrations.",
 			"",
 			theme.fg("accent", "Commands:"),
+			"  /mcp                  Authenticate integrations that need sign-in",
 			"  /mcp add              Add a new MCP server (interactive wizard)",
 			"  /mcp add <name> [--scope project|user] [--url <url> --transport http|sse] [--token <token>] [-- <command...>]",
 			"  /mcp list             List all configured MCP servers",
@@ -1651,8 +1690,8 @@ export class MCPCommandController {
 			reload: false,
 			authChallenge: challenge,
 			abortSignal: context?.signal,
+			rethrowErrors: true,
 			isCurrent: context?.isCurrent,
-			rethrowCancellation: true,
 		});
 	}
 
@@ -1663,8 +1702,8 @@ export class MCPCommandController {
 			reload?: boolean;
 			authChallenge?: MCPAuthChallenge;
 			abortSignal?: AbortSignal;
+			rethrowErrors?: boolean;
 			isCurrent?: () => boolean;
-			rethrowCancellation?: boolean;
 		} = {},
 	): Promise<MCPServerConfig | undefined> {
 		if (!name) {
@@ -1681,12 +1720,27 @@ export class MCPCommandController {
 				enableProjectConfig: cfgMcpEnableProjectConfig.get(this.ctx.settings),
 			});
 			if (!found) {
-				if (!options.silent) this.ctx.showError(`Server "${name}" not found.`);
-				return;
+				throw new Error(
+					`Server "${name}" is not available from its enabled or trusted configuration. Reload MCP servers and retry.`,
+				);
 			}
-			if (found.config.enabled === false) {
-				if (!options.silent) this.ctx.showError(`Server "${name}" is disabled. Run /mcp enable ${name} first.`);
-				return;
+			const source = manager?.getSource(name);
+			const matchingSource =
+				source !== undefined &&
+				found.source !== undefined &&
+				source.provider === found.source.provider &&
+				source.path === found.source.path &&
+				source.level === found.source.level;
+			const effectiveConfig = matchingSource ? matchingManagerServerConfig(manager, name, found.config) : undefined;
+			const forceEnabledConfig = matchingSource
+				? matchingManagerServerConfig(manager, name, { ...found.config, enabled: true })
+				: undefined;
+			const effectiveEnabled = forceEnabledConfig?.enabled === true;
+			const effectiveTransport = effectiveConfig?.type ?? forceEnabledConfig?.type;
+			const disabled = await readDisabledServers(getMCPConfigPath("user", getProjectDir()));
+			this.#assertCurrentOwner();
+			if (disabled.includes(name) || (found.config.enabled === false && !effectiveEnabled)) {
+				throw new Error(`Server "${name}" is disabled. Run /mcp enable ${name} first.`);
 			}
 
 			const { callbacks, release } = this.#oauthFlowCallbacks(isCurrent);
@@ -1695,6 +1749,8 @@ export class MCPCommandController {
 					reauthorizeMcpServer(name, found, {
 						authStorage: session.modelRegistry.authStorage,
 						authChallenge: options.authChallenge,
+						effectiveEnabled: effectiveEnabled || undefined,
+						effectiveTransport,
 						mcpManager: manager,
 						isCurrent,
 						silent: options.silent,
@@ -1740,13 +1796,24 @@ export class MCPCommandController {
 					];
 					this.#showMessage(lines.join("\n"));
 				}
-				return outcome.config;
+				const runtimeConfig = expandEnvVarsDeepForConfigLevel(
+					outcome.config,
+					(found.sourceLevel ?? found.scope) === "project" ? "project" : "user",
+				);
+				const transport = runtimeConfig.type ?? effectiveTransport;
+				return effectiveEnabled || transport !== runtimeConfig.type
+					? ({
+							...runtimeConfig,
+							type: transport,
+							enabled: effectiveEnabled ? true : runtimeConfig.enabled,
+						} as MCPServerConfig)
+					: runtimeConfig;
 			} finally {
 				release();
 			}
 		} catch (error) {
+			if (options.rethrowErrors) throw error;
 			if (error instanceof MCPOAuthCancelledError) {
-				if (options.rethrowCancellation) throw error;
 				if (!options.silent) this.ctx.showStatus(`Reauthorization cancelled for "${name}"`);
 				return;
 			}

@@ -16,6 +16,28 @@ This document describes how MCP servers are discovered, connected, exposed as to
 7. **Live session** receives late tool changes through the manager callback; `/mcp reload` does `disconnectAll` + rediscovery + `session.refreshMCPTools`, while transport close and `/mcp reconnect` use the per-server reconnect path.
 8. **Teardown** happens on explicit manager disconnects and automatically when an owning `AgentSession` is disposed; borrowed parent managers are not disconnected by subagents.
 
+## Authentication readiness
+
+Background HTTP/SSE initialization and tool-catalog challenges retain
+`authRequired` separately from the bounded transport diagnostic.
+The manager's `getConnectionStatusSnapshot()` preserves current readiness for
+hosts that subscribe after an early connection result.
+`getPendingAuthServers()` exposes sign-ins that remain unresolved.
+
+Interactive startup shows a persistent notice without opening a browser or
+taking editor focus. `/mcp` offers Authenticate and Not now.
+Authenticate calls `authenticateServer()` through the existing host-owned OAuth
+handler and reconnects the affected server. This also works without cached tools.
+`deferAuthentication()` changes session readiness only; it does not change
+configuration or credentials. Explicit retry remains available.
+Successful connection clears the pending sign-in state.
+Permission-only HTTP 403 failures do not request authorization or schedule
+automatic reconnection retries. Explicit manual reconnection remains available.
+
+The native `mcp auth` command checks selected hosted servers without creating
+an agent session. It shares credential refresh, discovery, and reauthorization
+with in-session flows. Passive checks and unattended invocations never prompt.
+
 ## Discovery and load phase
 
 ### Entry path from SDK

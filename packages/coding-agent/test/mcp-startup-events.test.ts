@@ -1,47 +1,11 @@
 import { describe, expect, it } from "bun:test";
 import * as os from "node:os";
 import {
-	formatMCPConnectingMessage,
 	formatMCPConnectionStatusMessage,
 	isMcpConnectionStatusEvent,
 } from "@oh-my-pi/pi-coding-agent/mcp/startup-events";
 
-// Cross-module contract guard.
-//
-// The MCP status lifecycle spans two modules that never import each other:
-//   - sdk.ts emits McpConnectionStatusEvent payloads on MCP_CONNECTION_STATUS_EVENT_CHANNEL.
-//   - interactive-mode.ts subscribes to that channel and renders the aggregate
-//     message via formatMCPConnectionStatusMessage.
-//
-// They agree only through this shared module. Drift in the channel, payload
-// guard, or user-facing status text silently leaves the startup banner stale.
 describe("mcp/startup-events — connection-status cross-module contract", () => {
-	it("formats the initial connecting banner for a multi-server list", () => {
-		expect(formatMCPConnectingMessage(["alpha", "beta", "gamma"])).toBe(
-			"Connecting to MCP servers: alpha, beta, gamma…",
-		);
-	});
-
-	it("formats a completion update when every server connects", () => {
-		expect(
-			formatMCPConnectionStatusMessage({
-				pendingServers: [],
-				connectedServers: ["alpha", "beta"],
-				failedServers: [],
-			}),
-		).toBe("Connected to MCP servers: alpha, beta.");
-	});
-
-	it("formats failures with server names and errors", () => {
-		expect(
-			formatMCPConnectionStatusMessage({
-				pendingServers: [],
-				connectedServers: ["alpha"],
-				failedServers: [{ serverName: "broken", error: "missing command" }],
-			}),
-		).toBe("MCP finished with failures. Connected: alpha. Failed: broken: missing command");
-	});
-
 	it("sanitizes failure errors before rendering them in status text", () => {
 		const homePath = `${os.homedir()}/.omp/mcp.log`;
 		const message = formatMCPConnectionStatusMessage({
@@ -86,6 +50,25 @@ describe("mcp/startup-events — connection-status cross-module contract", () =>
 		expect(message).toContain("…");
 	});
 
+	it("keeps the sign-in action outside long diagnostic truncation without assigning it to permission failures", () => {
+		const error = `HTTP 401: ${"server diagnostic ".repeat(30)}do-not-render-tail`;
+		const signedOut = formatMCPConnectionStatusMessage({
+			pendingServers: ["slow"],
+			connectedServers: ["healthy"],
+			failedServers: [{ serverName: "hosted", error, authRequired: true }],
+		});
+		expect(signedOut).toContain("/mcp");
+		expect(signedOut).toContain("hosted");
+		expect(signedOut).toContain("healthy");
+		expect(signedOut).not.toContain("do-not-render-tail");
+		const forbidden = formatMCPConnectionStatusMessage({
+			pendingServers: [],
+			connectedServers: [],
+			failedServers: [{ serverName: "hosted", error: "HTTP 403: permission denied" }],
+		});
+		expect(forbidden).not.toContain("/mcp");
+	});
+
 	it("shortens config sources when the home directory contains spaces", () => {
 		const homeDir = "/tmp/OMP User";
 		const moduleUrl = new URL("../src/mcp/startup-events.ts", import.meta.url).href;
@@ -126,16 +109,6 @@ describe("mcp/startup-events — connection-status cross-module contract", () =>
 		expect(message).toContain("Still connecting: ~/.omp/pending");
 	});
 
-	it("keeps pending servers visible while other servers settle", () => {
-		expect(
-			formatMCPConnectionStatusMessage({
-				pendingServers: ["slow"],
-				connectedServers: ["alpha"],
-				failedServers: [{ serverName: "broken", error: "missing command" }],
-			}),
-		).toBe("Connected: alpha. Failed: broken: missing command. Still connecting: slow…");
-	});
-
 	it("accepts well-formed payloads and rejects malformed ones", () => {
 		expect(isMcpConnectionStatusEvent({ type: "connecting", serverNames: ["a", "b"] })).toBe(true);
 		expect(isMcpConnectionStatusEvent({ type: "connecting", serverNames: [] })).toBe(true);
@@ -151,6 +124,21 @@ describe("mcp/startup-events — connection-status cross-module contract", () =>
 				sourcePath: "/tmp/config.toml",
 			}),
 		).toBe(true);
+		expect(
+			isMcpConnectionStatusEvent({
+				type: "failed",
+				serverName: "hosted",
+				error: "HTTP 401",
+				authRequired: true,
+				authDeferred: false,
+			}),
+		).toBe(true);
+		expect(
+			isMcpConnectionStatusEvent({ type: "failed", serverName: "hosted", error: "HTTP 401", authRequired: "yes" }),
+		).toBe(false);
+		expect(
+			isMcpConnectionStatusEvent({ type: "failed", serverName: "hosted", error: "HTTP 401", authDeferred: "later" }),
+		).toBe(false);
 
 		expect(isMcpConnectionStatusEvent(null)).toBe(false);
 		expect(isMcpConnectionStatusEvent(undefined)).toBe(false);

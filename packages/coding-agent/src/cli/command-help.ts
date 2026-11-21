@@ -102,7 +102,9 @@ export const installHelp = {
 
 export const joinHelp = { description: "Join a shared collab session (same as /join)" } satisfies CommandMetadata;
 
-export const mcpHelp = { description: "Configure MCP server selections" } satisfies CommandMetadata;
+export const mcpHelp = {
+	description: "Configure MCP selections, authenticate hosted servers, or verify sign-in with auth --check",
+} satisfies CommandMetadata;
 
 export const modelsHelp = { description: "List, search, and refresh available models" } satisfies CommandMetadata;
 

@@ -43,8 +43,9 @@ import {
 	refreshStoredManagedMcpOAuthCredential,
 } from "./oauth-credentials";
 import type { MCPStoredOAuthCredential } from "./oauth-flow";
+import { extractMcpAuthServerUrl, extractOAuthChallengeHeader, extractOAuthEndpoints } from "./oauth-discovery";
 import type { MCPProjectTrustHandler } from "./project-trust";
-import type { McpConnectionStatusEvent } from "./startup-events";
+import type { McpConnectionFailure, McpConnectionStatusEvent, McpConnectionStatusSnapshot } from "./startup-events";
 import { resolveMCPStartupTimeoutMs } from "./timeout";
 
 import type { MCPToolDetails } from "@oh-my-pi/pi-tui/tools/mcp";
@@ -104,11 +105,19 @@ function getInitialAuthChallenge(error: unknown, config: MCPServerConfig): MCPAu
 	if (config.enabled === false || (config.type !== "http" && config.type !== "sse")) return undefined;
 
 	const message = error instanceof Error ? error.message : String(error);
-	if (!/^HTTP (?:401|403):/i.test(message)) return undefined;
-
-	const wwwAuthenticate = message
-		.match(/\[WWW-Authenticate:\s*([\s\S]*?)(?:;\s*Mcp-Auth-Server:|\]\s*$)/i)?.[1]
-		?.trim();
+	const status = message.match(/^HTTP (401|403):/i)?.[1];
+	if (!status) return undefined;
+	const authError = error instanceof Error ? error : new Error(message);
+	const wwwAuthenticate = extractOAuthChallengeHeader(authError);
+	const bearerChallenge = wwwAuthenticate !== undefined && /\bBearer\b/i.test(wwwAuthenticate);
+	const oauthHint = extractOAuthEndpoints(authError) || extractMcpAuthServerUrl(authError, config.url);
+	const configuredOAuth = config.oauth !== undefined || config.auth?.type === "oauth";
+	if (
+		(status === "401" && !bearerChallenge && !oauthHint && !configuredOAuth) ||
+		(status === "403" && (!bearerChallenge || !/\berror\s*=\s*"insufficient_scope"/i.test(wwwAuthenticate ?? "")))
+	) {
+		return undefined;
+	}
 	return { wwwAuthenticate: wwwAuthenticate ? [wwwAuthenticate] : [] };
 }
 
@@ -174,10 +183,20 @@ export type MCPToolScope = string;
 /** Scope of the session that owns the manager. */
 const OWNER_TOOL_SCOPE: MCPToolScope = "owner";
 
-function createMcpStartupFailure(serverName: string, error: string, source?: SourceMeta): McpConnectionStatusEvent {
-	return source
-		? { type: "failed", serverName, error, sourcePath: source.path }
-		: { type: "failed", serverName, error };
+function createMcpStartupFailure(
+	serverName: string,
+	error: string,
+	source?: SourceMeta,
+	authRequired = false,
+	authDeferred = false,
+): McpConnectionStatusEvent {
+	return {
+		type: "failed",
+		serverName,
+		error,
+		...(source ? { sourcePath: source.path } : {}),
+		...(authRequired ? { authRequired: true, authDeferred } : {}),
+	};
 }
 
 /**
@@ -505,6 +524,7 @@ export class MCPManager implements MCPManagerApi {
 	#authQueueHandler?: MCPAuthQueueHandler;
 	#notificationListeners = new Set<(serverName: string, method: string, params: unknown) => void>();
 	#connectionStatusListeners = new Set<(event: McpConnectionStatusEvent) => void>();
+	#connectionStatuses = new Map<string, Exclude<McpConnectionStatusEvent, { type: "connecting" | "cancelled" }>>();
 	#catalogChangeListeners = new Set<(event: McpCatalogChangeEvent) => void>();
 	#toolsChangedListeners = new Set<() => void>();
 	/**
@@ -596,11 +616,74 @@ export class MCPManager implements MCPManagerApi {
 		};
 	}
 
+	/** Current readiness, including failures emitted before a host subscribed. */
+	getConnectionStatusSnapshot(): McpConnectionStatusSnapshot {
+		const pendingServers: string[] = [];
+		const connectedServers: string[] = [];
+		const failedServers: McpConnectionFailure[] = [];
+		for (const event of this.#connectionStatuses.values()) {
+			if (event.type === "reconnecting") pendingServers.push(event.serverName);
+			else if (event.type === "connected") connectedServers.push(event.serverName);
+			else {
+				failedServers.push({
+					serverName: event.serverName,
+					error: event.error,
+					sourcePath: event.sourcePath,
+					authRequired: event.authRequired,
+					authDeferred: event.authDeferred,
+				});
+			}
+		}
+		return { pendingServers, connectedServers, failedServers };
+	}
+
+	getPendingAuthServers(): string[] {
+		return [...this.#pendingAuthChallenges.keys()];
+	}
+
+	/** Defer sign-in for this session without changing configuration or credentials. */
+	deferAuthentication(name: string): void {
+		if (!this.#pendingAuthChallenges.has(name)) return;
+		this.#declinedAuthServers.add(name);
+		const previous = this.#connectionStatuses.get(name);
+		this.#emitConnectionStatus(
+			createMcpStartupFailure(
+				name,
+				previous?.type === "failed" ? previous.error : "Authentication required",
+				this.#sources.get(name),
+				true,
+				true,
+			),
+		);
+	}
+
+	/** User-selected sign-in uses the same host-owned authorization as deferred tool calls. */
+	async authenticateServer(name: string): Promise<MCPServerConnection | null> {
+		const config = this.getServerConfig(name);
+		if (!config || config.enabled === false) throw new Error(`MCP server is not enabled in this session: ${name}`);
+		if (!this.#pendingAuthChallenges.has(name)) return this.#connections.get(name) ?? null;
+		this.#declinedAuthServers.delete(name);
+		return this.#reconnectServerForTool(name);
+	}
+
 	#emitConnectionStatus(event: McpConnectionStatusEvent): void {
+		if (event.type === "connecting") {
+			for (const serverName of event.serverNames) {
+				if (!this.#connectionStatuses.has(serverName)) {
+					this.#connectionStatuses.set(serverName, { type: "reconnecting", serverName });
+				}
+			}
+		} else if (event.type === "cancelled") {
+			this.#connectionStatuses.delete(event.serverName);
+		} else {
+			this.#connectionStatuses.set(event.serverName, event);
+		}
 		if (event.type === "failed" && this.#startupServers.has(event.serverName)) {
 			this.#startupFailures.set(event.serverName, event.error);
 		} else if (event.type === "connected") {
 			this.#startupFailures.delete(event.serverName);
+			this.#pendingAuthChallenges.delete(event.serverName);
+			this.#declinedAuthServers.delete(event.serverName);
 		}
 		for (const listener of this.#connectionStatusListeners) {
 			try {
@@ -945,6 +1028,7 @@ export class MCPManager implements MCPManagerApi {
 		owner?: MCPConnectionOwner,
 	): Promise<MCPServerConfig | undefined> {
 		if (!this.#authHandler) return Promise.resolve(undefined);
+		const serverSignal = this.#connectionAbortControllers.get(name)?.signal;
 		const isOwnerCurrent = () => owner?.signal?.aborted !== true && owner?.isCurrent?.() !== false;
 		if (!isOwnerCurrent()) return Promise.reject(new ToolAbortError("MCP call owner changed"));
 
@@ -952,7 +1036,9 @@ export class MCPManager implements MCPManagerApi {
 			id: ++this.#nextAuthQueueId,
 			serverName: name,
 			generation: this.#authQueueGeneration,
-			signal: this.#authQueueAbortController.signal,
+			signal: serverSignal
+				? AbortSignal.any([this.#authQueueAbortController.signal, serverSignal])
+				: this.#authQueueAbortController.signal,
 		};
 		const signal = owner?.signal ? AbortSignal.any([entry.signal, owner.signal]) : entry.signal;
 		const isCurrent = () => entry.generation === this.#authQueueGeneration && !signal.aborted && isOwnerCurrent();
@@ -990,17 +1076,11 @@ export class MCPManager implements MCPManagerApi {
 				return refreshedConfig;
 			} catch (error) {
 				const ownerRetired = !isOwnerCurrent();
-				cancelled =
-					ownerRetired ||
-					error instanceof MCPOAuthCancelledError ||
-					entry.generation !== this.#authQueueGeneration ||
-					entry.signal.aborted;
+				const flowCancelled = entry.generation !== this.#authQueueGeneration || entry.signal.aborted;
+				cancelled = flowCancelled || ownerRetired || error instanceof MCPOAuthCancelledError;
+				if (flowCancelled) throw new MCPOAuthCancelledError();
 				if (ownerRetired) throw new ToolAbortError("MCP call owner changed");
-				if (error instanceof MCPOAuthCancelledError) {
-					this.#cancelAuthQueue();
-				} else if (cancelled) {
-					throw new MCPOAuthCancelledError();
-				}
+				if (error instanceof MCPOAuthCancelledError) this.#cancelAuthQueue();
 				throw error;
 			} finally {
 				this.#finishAuthQueueEntry(entry, cancelled ? "cancelled" : "completed");
@@ -1046,8 +1126,8 @@ export class MCPManager implements MCPManagerApi {
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
 			this.#startupServers.add(".mcp.json");
-			options?.onStatus?.({ type: "failed", serverName: ".mcp.json", error: message });
 			this.#emitConnectionStatus({ type: "failed", serverName: ".mcp.json", error: message });
+			options?.onStatus?.({ type: "failed", serverName: ".mcp.json", error: message });
 			throw error;
 		}
 		const { configs, exaApiKeys, sources } = loadedConfigs;
@@ -1184,8 +1264,8 @@ export class MCPManager implements MCPManagerApi {
 				if (reportedFailureStatuses.has(event.serverName)) return;
 				reportedFailureStatuses.add(event.serverName);
 			}
-			onStatus?.(event);
 			this.#emitConnectionStatus(event);
+			onStatus?.(event);
 		};
 		type ConnectionTask = {
 			name: string;
@@ -1245,6 +1325,7 @@ export class MCPManager implements MCPManagerApi {
 			// retry schedule still trying to bring back the old one.
 			this.#forgetLostServer(name);
 			this.#serverConfigs.set(name, config);
+			this.#connectionStatuses.set(name, { type: "reconnecting", serverName: name });
 			const connectionEpoch = this.#epoch;
 			const connectionAbortController = new AbortController();
 			this.#connectionAbortControllers.set(name, connectionAbortController);
@@ -1305,9 +1386,12 @@ export class MCPManager implements MCPManagerApi {
 					return await connectWithConfig(connectionConfig);
 				} catch (error) {
 					const authChallenge = getInitialAuthChallenge(error, connectionConfig);
-					if (authChallenge) {
-						// Startup must remain non-interactive. Remember the challenge
-						// for a cached/deferred tool's first actual invocation.
+					if (
+						authChallenge &&
+						!connectSignal.aborted &&
+						this.#epoch === connectionEpoch &&
+						this.#serverConfigs.get(name) === connectionConfig
+					) {
 						this.#pendingAuthChallenges.set(name, authChallenge);
 					}
 					throw error;
@@ -1334,8 +1418,6 @@ export class MCPManager implements MCPManagerApi {
 					this.#pendingConnections.delete(name);
 					this.#connections.set(name, connection);
 					this.#serverConfigs.set(name, connectionConfig);
-					this.#pendingAuthChallenges.delete(name);
-					this.#declinedAuthServers.delete(name);
 
 					this.#wireAuthRefresh(connection, connectionConfig, sourceLevel, connectSignal);
 
@@ -1424,11 +1506,27 @@ export class MCPManager implements MCPManagerApi {
 						return;
 					this.#pendingToolLoads.delete(name);
 					if (error instanceof MCPOAuthCancelledError) {
-						onStatus?.({ type: "cancelled", serverName: name });
+						notify({ type: "cancelled", serverName: name });
 						return;
 					}
+					const authChallenge = getInitialAuthChallenge(error, connectionConfig);
+					if (
+						authChallenge &&
+						this.#epoch === connectionEpoch &&
+						this.#serverConfigs.get(name) === connectionConfig
+					) {
+						this.#pendingAuthChallenges.set(name, authChallenge);
+					}
 					const message = error instanceof Error ? error.message : String(error);
-					notify(createMcpStartupFailure(name, message, sources[name]));
+					notify(
+						createMcpStartupFailure(
+							name,
+							message,
+							sources[name],
+							this.#pendingAuthChallenges.has(name),
+							this.#declinedAuthServers.has(name),
+						),
+					);
 					if (allowBackgroundLogging && !reportedErrors.has(name)) {
 						logger.error("MCP tool load failed", { path: `mcp:${name}`, error: message });
 					}
@@ -1941,7 +2039,7 @@ export class MCPManager implements MCPManagerApi {
 			});
 			if (!isCurrent()) return null;
 			if (!authorizedConfig) {
-				this.#declinedAuthServers.add(name);
+				this.deferAuthentication(name);
 				return null;
 			}
 			return this.reconnectServer(name, {
@@ -1950,7 +2048,7 @@ export class MCPManager implements MCPManagerApi {
 				isCurrent: options?.isCurrent,
 			});
 		} catch (error) {
-			if (isCurrent()) this.#declinedAuthServers.add(name);
+			if (isCurrent()) this.deferAuthentication(name);
 			throw error;
 		}
 	}
@@ -2129,6 +2227,7 @@ export class MCPManager implements MCPManagerApi {
 		this.#pendingResourceRefresh.delete(name);
 		this.#reconnectHistory.delete(name);
 		this.#forgetLostServer(name);
+		this.#emitConnectionStatus({ type: "cancelled", serverName: name });
 		this.#callProvokedToolRefreshes.delete(name);
 		this.#scopedTools.delete(name);
 
@@ -2189,6 +2288,9 @@ export class MCPManager implements MCPManagerApi {
 		// The next connect (`/mcp reload` rediscovery) runs every `!command` again.
 		for (const config of this.#serverConfigs.values()) invalidateCommandValues(config);
 		this.#serverConfigs.clear();
+		for (const name of this.#connectionStatuses.keys()) {
+			this.#emitConnectionStatus({ type: "cancelled", serverName: name });
+		}
 		this.#callProvokedToolRefreshes.clear();
 		this.#scopedTools.clear();
 		const hadTools = this.#tools.length > 0;
@@ -2205,9 +2307,9 @@ export class MCPManager implements MCPManagerApi {
 	 * connection, reloads tools, and notifies consumers. Concurrent calls for
 	 * the same server share one reconnection attempt. Returns the new
 	 * connection, or `null` if reconnection failed or the per-server crash
-	 * burst limit (see {@link RECONNECT_BURST_LIMIT}) is exceeded. A failed
-	 * reconnect of a remote server that was connected keeps being retried in
-	 * the background (see {@link MCPReconnectPolicy}).
+	 * burst limit (see {@link RECONNECT_BURST_LIMIT}) is exceeded. Retryable
+	 * failures of previously connected remote servers continue in the
+	 * background (see {@link MCPReconnectPolicy}).
 	 * @param options.manual - When `true`, resets the crash-burst window so a
 	 *   user-driven retry (e.g. `/mcp reconnect`) is never blocked by an
 	 *   earlier storm. Defaults to `false`; the transport `onClose` callback
@@ -2252,8 +2354,8 @@ export class MCPManager implements MCPManagerApi {
 
 	/**
 	 * Register an in-flight reconnect so concurrent callers share it, and
-	 * settle the lost-server schedule on its outcome: a new connection or an
-	 * interactive auth challenge ends the schedule; other failures retry.
+	 * settle the lost-server schedule on its outcome. Recovery, interactive
+	 * authentication, and permission denial end the schedule.
 	 */
 	#trackReconnect(name: string, attempt: Promise<MCPServerConnection | null>): Promise<MCPServerConnection | null> {
 		this.#pendingReconnections.set(name, attempt);
@@ -2297,7 +2399,7 @@ export class MCPManager implements MCPManagerApi {
 		logger.debug("MCP reconnect scheduled", { path: `mcp:${name}`, delayMs });
 	}
 
-	/** End a lost server's retry schedule: it reconnected, or it was disconnected or reconfigured. */
+	/** End a lost server's schedule after recovery, terminal rejection, disconnect, or reconfiguration. */
 	#forgetLostServer(name: string): void {
 		const state = this.#lostRemoteServers.get(name);
 		if (!state) return;
@@ -2372,9 +2474,9 @@ export class MCPManager implements MCPManagerApi {
 		if (authorizedConfig) {
 			config = authorizedConfig;
 			this.#serverConfigs.set(name, config);
-			this.#pendingAuthChallenges.delete(name);
-			this.#declinedAuthServers.delete(name);
 		} else if (authChallenge) {
+			this.#pendingAuthChallenges.set(name, authChallenge);
+			if (this.#declinedAuthServers.has(name)) return null;
 			if (!this.#authHandler) {
 				logger.debug("MCP auth challenge deferred until an interactive integration use", {
 					path: `mcp:${name}`,
@@ -2393,24 +2495,28 @@ export class MCPManager implements MCPManagerApi {
 				)
 					return null;
 				if (!refreshedConfig) {
-					this.#declinedAuthServers.add(name);
+					this.deferAuthentication(name);
 					return null;
 				}
 				config = refreshedConfig;
 				this.#serverConfigs.set(name, config);
-				this.#pendingAuthChallenges.delete(name);
-				this.#declinedAuthServers.delete(name);
 			} catch (error) {
-				if (error instanceof MCPOAuthCancelledError) {
-					this.#declinedAuthServers.add(name);
-					return null;
+				if (
+					this.#epoch === authEpoch &&
+					this.#serverConfigs.get(name) === config &&
+					this.#sources.get(name) === source
+				) {
+					this.deferAuthentication(name);
 				}
-				logger.error("MCP auth challenge handling failed", { path: `mcp:${name}`, error });
+				if (!(error instanceof MCPOAuthCancelledError)) {
+					logger.error("MCP auth challenge handling failed", { path: `mcp:${name}`, error });
+				}
 				return null;
 			}
 		}
 
 		logger.debug("MCP reconnecting", { path: `mcp:${name}` });
+		this.#emitConnectionStatus({ type: "reconnecting", serverName: name });
 		// A reconnect follows a lost or rejected connection; a cached `!command`
 		// token may be what the server rejected, so mint fresh values once.
 		invalidateCommandValues(config);
@@ -2484,7 +2590,15 @@ export class MCPManager implements MCPManagerApi {
 				const challenge = getInitialAuthChallenge(error, config);
 				if (challenge) {
 					this.#pendingAuthChallenges.set(name, challenge);
-					this.#emitConnectionStatus({ type: "failed", serverName: name, error: msg });
+					this.#emitConnectionStatus(
+						createMcpStartupFailure(name, msg, source, true, this.#declinedAuthServers.has(name)),
+					);
+					return null;
+				}
+				this.#pendingAuthChallenges.delete(name);
+				if ((config.type === "http" || config.type === "sse") && /^HTTP 403:/i.test(msg)) {
+					this.#forgetLostServer(name);
+					this.#emitConnectionStatus(createMcpStartupFailure(name, msg, source));
 					return null;
 				}
 				if (attempt < delays.length) {
