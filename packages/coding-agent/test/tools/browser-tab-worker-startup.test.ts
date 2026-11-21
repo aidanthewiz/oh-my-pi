@@ -48,6 +48,11 @@ beforeAll(async () => {
 	holdBrowser(launched);
 	sharedHeadless = launched;
 	const child = launched.browser.process();
+	let stderrTail = "";
+	child?.stderr?.on("data", (chunk: Buffer | string) => {
+		stderrTail = `${stderrTail}${chunk}`.slice(-32_768);
+	});
+	let exitedWhileHeld = false;
 	unregisterBrowserDiagnostics = registerLogSink(({ message, context }) => {
 		if (message !== "Failed to recycle browser tab worker; killing tab") return;
 		console.error(message, {
@@ -60,7 +65,11 @@ beforeAll(async () => {
 		});
 	});
 	child?.once("exit", (code, signal) => {
-		if (launched.refCount > 0) console.error("Shared test browser exited while held", { code, signal });
+		exitedWhileHeld = launched.refCount > 0;
+		if (exitedWhileHeld) console.error("Shared test browser exited while held", { code, signal });
+	});
+	child?.once("close", () => {
+		if (exitedWhileHeld && stderrTail) console.error(`Shared test browser stderr:\n${stderrTail}`);
 	});
 });
 
