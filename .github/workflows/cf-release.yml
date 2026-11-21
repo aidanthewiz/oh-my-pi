@@ -42,12 +42,14 @@ permissions:
 
 # Cancel superseded preparation, cache restores, builds, and smoke jobs.
 # Serialize publication so later merges cannot interrupt tags or asset uploads.
+# Only initial branch runs share cancellation lanes. Isolate retries and
+# recovery tags so stale work cannot cancel current pre-publication jobs.
 
 jobs:
   prepare:
     runs-on: ubuntu-24.04
     concurrency:
-      group: cf-release-prepare
+      group: cf-release-prepare-${{ github.ref_type == 'branch' && github.run_attempt == 1 && 'latest' || github.run_id }}
       cancel-in-progress: true
     permissions:
       contents: read
@@ -167,7 +169,7 @@ jobs:
 
   cache_restore:
     concurrency:
-      group: cf-release-cache-restore
+      group: cf-release-cache-restore-${{ github.ref_type == 'branch' && github.run_attempt == 1 && 'latest' || github.run_id }}
       cancel-in-progress: true
     needs: prepare
     if: vars.CI_CACHE_ENABLED == 'true' && needs.prepare.outputs.should_release == 'true'
@@ -185,7 +187,7 @@ jobs:
     needs: [prepare, cache_restore]
     if: ${{ !cancelled() && needs.prepare.result == 'success' && needs.prepare.outputs.should_release == 'true' }}
     concurrency:
-      group: cf-release-build-${{ matrix.target }}
+      group: cf-release-build-${{ matrix.target }}-${{ github.ref_type == 'branch' && github.run_attempt == 1 && 'latest' || github.run_id }}
       cancel-in-progress: true
     env:
       RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
@@ -523,7 +525,7 @@ jobs:
     needs: [prepare, build]
     if: ${{ !cancelled() && needs.prepare.result == 'success' && needs.prepare.outputs.should_release == 'true' && needs.build.result == 'success' }}
     concurrency:
-      group: cf-release-smoke-${{ matrix.target }}
+      group: cf-release-smoke-${{ matrix.target }}-${{ github.ref_type == 'branch' && github.run_attempt == 1 && 'latest' || github.run_id }}
       cancel-in-progress: true
     permissions:
       contents: read
