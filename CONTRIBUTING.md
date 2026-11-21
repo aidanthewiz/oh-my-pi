@@ -116,12 +116,17 @@ A verified artifact-changing pull request merged into `coreforge` triggers an en
 Non-shipping root documentation and proven cache-only changes do not allocate an engine tag.
 Unreleased runtime changes and embedded `docs/` changes retain the release path.
 Changes to native build commands, signing, matrices, or release admission retain the release path, even inside the release workflow.
-Automatic publication requires the exact merged PR's latest successful GitHub Actions `required CI` check.
-The qualified PR head and release commit must have identical Git trees; stale or unqualified content is rejected before builds.
+Automatic publication does not wait for PR CI; PR checks and branch protection remain independent.
+The release commit must exactly match the source tree of a merged pull request from this repository.
+Stale or mismatched source is rejected before builds.
 Manual four-part recovery tags retain their separately authorized tip, package-version, and roll safeguards.
 Their source must also match the immutable triggering event, including annotated tags.
 Coreforge installers use the exact release and checksums recorded in `engine.lock`.
 Do not use upstream's `bun run release` for this fork's dependency channel.
+
+Only first-attempt branch runs share latest-wins cancellation groups for preparation, cache restoration, builds, and smoke tests.
+Retries and recovery-tag runs use isolated pre-publication groups so they cannot cancel current preparation, cache restoration, builds, or smoke tests.
+Publication stays serialized and is not canceled by newer runs.
 
 Before publication, all eight final binaries run `--version` and `--smoke-test` on matching execution platforms.
 Musl binaries use the repository's pinned Alpine runtime image.

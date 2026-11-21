@@ -7,6 +7,8 @@
 - Sync upstream v18.22.2 while retaining Coreforce model, account, approval, and resource-ownership policies.
 - Preserve user outcomes, acceptance criteria, and authorization limits in delegated work; keep multi-area research aligned with the full requested scope.
 - Limit clarification questions to necessary current decisions and document native AWS parameter naming, output controls, and batching boundaries.
+- Decouple automatic engine releases from PR CI completion while retaining merged-source and release-artifact validation.
+- Cancel superseded first-attempt release jobs; isolate retries and recovery tags while allowing active publication to finish.
 
 ### Added
 

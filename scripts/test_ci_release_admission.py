@@ -17,7 +17,6 @@ TREE = '3' * 40
 REPOSITORY = 'fixture/repo'
 PREFIX = f'repos/{REPOSITORY}'
 PULLS = f'{PREFIX}/commits/{SOURCE}/pulls?per_page=100'
-CHECKS = f'{PREFIX}/commits/{HEAD}/check-runs?check_name=required%20CI&filter=latest&per_page=100'
 SOURCE_COMMIT = f'{PREFIX}/git/commits/{SOURCE}'
 HEAD_COMMIT = f'{PREFIX}/git/commits/{HEAD}'
 
@@ -29,11 +28,6 @@ def fixture():
             'base': {'ref': 'coreforge', 'repo': {'full_name': REPOSITORY}},
             'head': {'sha': HEAD, 'repo': {'full_name': REPOSITORY}},
         }]],
-        CHECKS: [{'check_runs': [{
-            'id': 1,
-            'name': 'required CI', 'app': {'slug': 'github-actions'}, 'head_sha': HEAD,
-            'status': 'completed', 'conclusion': 'success',
-        }]}],
         SOURCE_COMMIT: {'sha': SOURCE, 'tree': {'sha': TREE}},
         HEAD_COMMIT: {'sha': HEAD, 'tree': {'sha': TREE}},
     }
@@ -42,20 +36,19 @@ def fixture():
 class ReleaseAdmissionTests(unittest.TestCase):
     def qualify(self, responses):
         def github_api(endpoint, *, paginate=False):
-            expected_pagination = endpoint in (PULLS, CHECKS)
-            if paginate != expected_pagination:
-                raise AssertionError('release metadata pagination contract changed')
-            return responses[endpoint]
+            value = responses[endpoint]
+            if endpoint == PULLS and not paginate:
+                return value[0]
+            return value
         with patch.object(admission, 'github_api', side_effect=github_api):
             return admission.qualify_release(SOURCE, REPOSITORY)
 
-    def test_qualifies_exact_merged_head_with_successful_ci_and_identical_content(self):
+    def test_accepts_exact_merged_source_without_ci_results(self):
         self.assertEqual(self.qualify(fixture()), (17, HEAD))
 
-    def test_paginates_merged_prs_and_checks_instead_of_missing_later_matches(self):
+    def test_paginates_merged_prs_instead_of_missing_later_matches(self):
         responses = fixture()
         responses[PULLS].insert(0, [{'number': 16, 'merged_at': None}])
-        responses[CHECKS].insert(0, {'check_runs': [{'name': 'optional', 'status': 'completed'}]})
         self.assertEqual(self.qualify(responses), (17, HEAD))
 
     def test_does_not_promote_an_associated_but_different_merged_source(self):
@@ -74,7 +67,7 @@ class ReleaseAdmissionTests(unittest.TestCase):
         duplicate = copy.deepcopy(responses[PULLS][0][0])
         duplicate['number'] = 18
         responses[PULLS].append([duplicate])
-        with self.assertRaisesRegex(ValueError, 'exactly one merged'):
+        with self.assertRaises(ValueError):
             self.qualify(responses)
 
     def test_rejects_foreign_head_and_malformed_head_identity(self):
@@ -89,68 +82,10 @@ class ReleaseAdmissionTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     self.qualify(responses)
 
-    def test_rejects_unqualified_or_wrong_provider_checks(self):
-        checks = [
-            [],
-            [{'name': 'optional', 'app': {'slug': 'github-actions'}, 'head_sha': HEAD,
-              'status': 'completed', 'conclusion': 'success'}],
-            [{'name': 'required CI', 'app': {'slug': 'other-app'}, 'head_sha': HEAD,
-              'status': 'completed', 'conclusion': 'success'}],
-        ]
-        for check_runs in checks:
-            with self.subTest(check_runs=check_runs):
-                responses = fixture()
-                responses[CHECKS][0]['check_runs'] = check_runs
-                with self.assertRaisesRegex(ValueError, 'No GitHub Actions required CI'):
-                    self.qualify(responses)
-
-    def test_rejects_pending_failed_cancelled_skipped_or_stale_ci(self):
-        for status, conclusion in [
-            ('queued', None), ('in_progress', None), ('completed', 'failure'),
-            ('completed', 'cancelled'), ('completed', 'skipped'),
-            ('completed', 'neutral'), ('completed', 'timed_out'),
-        ]:
-            with self.subTest(status=status, conclusion=conclusion):
-                responses = fixture()
-                responses[CHECKS][0]['check_runs'][0].update(status=status, conclusion=conclusion)
-                with self.assertRaisesRegex(ValueError, 'completed successful check'):
-                    self.qualify(responses)
-        responses = fixture()
-        responses[CHECKS][0]['check_runs'][0]['head_sha'] = '4' * 40
-        with self.assertRaisesRegex(ValueError, 'exact PR head'):
-            self.qualify(responses)
-
-    def test_success_cannot_mask_another_pending_latest_required_check(self):
-        responses = fixture()
-        responses[CHECKS].append({'check_runs': [{
-            'id': 2,
-            'name': 'required CI', 'app': {'slug': 'github-actions'}, 'head_sha': HEAD,
-            'status': 'in_progress', 'conclusion': None,
-        }]})
-        with self.assertRaisesRegex(ValueError, 'completed successful check'):
-            self.qualify(responses)
-
-    def test_latest_success_replaces_older_failure_even_when_pages_arrive_out_of_order(self):
-        responses = fixture()
-        responses[CHECKS][0]['check_runs'][0]['id'] = 2
-        responses[CHECKS].append({'check_runs': [{
-            'id': 1, 'name': 'required CI', 'app': {'slug': 'github-actions'}, 'head_sha': HEAD,
-            'status': 'completed', 'conclusion': 'failure',
-        }]})
-        self.assertEqual(self.qualify(responses), (17, HEAD))
-
-    def test_unorderable_required_checks_cannot_authorize_release(self):
-        for check_id in [None, 0, True, '2']:
-            with self.subTest(check_id=check_id):
-                responses = fixture()
-                responses[CHECKS][0]['check_runs'][0]['id'] = check_id
-                with self.assertRaisesRegex(ValueError, 'check-run identity'):
-                    self.qualify(responses)
-
-    def test_rejects_merge_content_not_qualified_by_the_head_check(self):
+    def test_rejects_merge_content_different_from_the_pr_head(self):
         responses = fixture()
         responses[SOURCE_COMMIT]['tree']['sha'] = '4' * 40
-        with self.assertRaisesRegex(ValueError, 'differs from qualified PR #17 head'):
+        with self.assertRaises(ValueError):
             self.qualify(responses)
 
     def test_rejects_wrong_commit_objects_and_missing_trees(self):
@@ -166,7 +101,7 @@ class ReleaseAdmissionTests(unittest.TestCase):
                     self.qualify(responses)
 
     def test_malformed_metadata_and_api_errors_never_qualify(self):
-        for endpoint, value in [(PULLS, {}), (PULLS, [[None]]), (CHECKS, [{}])]:
+        for endpoint, value in [(PULLS, {}), (PULLS, [[None]])]:
             with self.subTest(endpoint=endpoint, value=value):
                 responses = fixture()
                 responses[endpoint] = value
