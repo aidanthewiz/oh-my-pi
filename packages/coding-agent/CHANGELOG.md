@@ -24,6 +24,7 @@
 - Use Nextest 0.9.131 for Cargo's current build-directory layout in CI, retaining compatible dependency caches while caching the updated runner under its versioned key.
 - Verify relay artifact roundtrips by the exact upload ID and SHA-256 instead of an immediate name lookup that can miss a finalized artifact.
 - Preserve browser target diagnostics when a retry crosses its action deadline, without masking earlier transport failures or extending timeouts.
+- Retain bounded Chromium stderr after unexpected browser exits in worker-recovery tests, without changing their assertions or deadlines.
 - Query terminated job state without status filters in PTY fixtures when zsh defers asynchronous notifications, without resuming stopped jobs.
 - Limit isolated-evaluator startup fixture cleanup to its own sessions, preserving unrelated in-progress workers and restoring test factories after owned cleanup.
 - Synchronize lifecycle fixtures with actual approval presentation, retained consumer output, and SIGTERM-handler readiness without relaxing their assertions or timeouts.
