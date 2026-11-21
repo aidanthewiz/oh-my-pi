@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -117,6 +119,77 @@ func TestNegotiationNeedsTheStandardLimits(t *testing.T) {
 	}()
 	if _, err := NewClient(context.Background(), r, w); !errors.Is(err, ErrProtocol) {
 		t.Fatalf("negotiation answered with v1: err = %v", err)
+	}
+}
+
+func TestBashExclusionRequiresAdvertisedCapability(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		ready   string
+		allowed bool
+		raw     bool
+	}{
+		{"missing", readyV1, false, false},
+		{"false", `{"type":"ready","supportsBashExcludeFromContext":false}`, false, true},
+		{"true", `{"type":"ready","supportsBashExcludeFromContext":true}`, true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			privateMarker := filepath.Join(dir, "private")
+			sharedMarker := filepath.Join(dir, "shared")
+			c, s := startFake(t, tc.ready, nil)
+			served := make(chan struct{})
+			go func() {
+				defer close(served)
+				for {
+					command := s.recv()
+					if command.str("type") == "get_last_assistant_text" {
+						s.respond(command, `{"text":null}`)
+						return
+					}
+					if command.str("type") != "bash" {
+						t.Errorf("unexpected command: %s", command.raw)
+						return
+					}
+					marker := sharedMarker
+					if string(command.fields["excludeFromContext"]) == "true" {
+						marker = privateMarker
+					}
+					if err := os.WriteFile(marker, []byte("executed"), 0600); err != nil {
+						t.Errorf("bash side effect: %v", err)
+					}
+					s.respond(command, `{"output":"","cancelled":false,"truncated":false,"totalLines":0,"totalBytes":0,"outputLines":0,"outputBytes":0}`)
+				}
+			}()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			var err error
+			if tc.raw {
+				_, err = c.Call(ctx, "bash", map[string]any{"command": "private", "excludeFromContext": true}, 0)
+			} else {
+				_, err = c.Bash(ctx, BashCommand{Command: "private", ExcludeFromContext: Ptr(true)})
+			}
+			if tc.allowed {
+				if err != nil {
+					t.Errorf("advertised exclusion: %v", err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), "does not support bash context exclusion") {
+				t.Errorf("unadvertised exclusion: %v", err)
+			}
+			if _, err := c.Bash(ctx, BashCommand{Command: "shared", ExcludeFromContext: Ptr(false)}); err != nil {
+				t.Errorf("shared command: %v", err)
+			}
+			if _, err := c.GetLastAssistantText(ctx); err != nil {
+				t.Errorf("probe: %v", err)
+			}
+			<-served
+			if _, err := os.Stat(privateMarker); tc.allowed && err != nil || !tc.allowed && !os.IsNotExist(err) {
+				t.Errorf("private command delivery allowed=%v: %v", tc.allowed, err)
+			}
+			if _, err := os.Stat(sharedMarker); err != nil {
+				t.Errorf("shared command did not execute: %v", err)
+			}
+		})
 	}
 }
 

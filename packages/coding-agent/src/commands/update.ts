@@ -2,6 +2,7 @@
  * Check for and install updates.
  */
 
+import chalk from "@oh-my-pi/pi-utils/chalk";
 import { Command, Flags } from "@oh-my-pi/pi-utils/cli";
 import { CF_COMMAND } from "../cli/cf-version";
 import { updateHelp as commandHelp } from "../cli/command-help";
@@ -29,10 +30,15 @@ export default class Update extends Command {
 		if (flags.plugins) {
 			await pluginCli.runPluginCommand({ action: "upgrade", args: [], flags: flags.check ? { dryRun: true } : {} });
 		} else {
-			await updateCli.runUpdateCommand({
-				force: flags.force,
-				check: flags.check,
-			});
+			try {
+				await updateCli.runUpdateCommand({
+					force: flags.force,
+					check: flags.check,
+				});
+			} catch (err) {
+				console.error(chalk.red(err instanceof Error ? err.message : String(err)));
+				process.exit(1);
+			}
 		}
 	}
 }

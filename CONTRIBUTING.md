@@ -62,6 +62,7 @@ Activate the branch rule in this order:
 4. Preserve independent review, latest-push approval, thread resolution, and history protections.
 
 Do not require the new check before its workflow exists on the protected branch.
+Check workflow edits locally with Actionlint and ShellCheck. Pinned toolchain lookups must succeed before compilation.
 Local workflow tests do not replace hosted native, browser, SDK, database, or visual qualification.
 
 
@@ -83,6 +84,7 @@ Cache-only failures produce warnings; they never skip required work or turn a fa
 Build jobs receive verified snapshot data through one-day GitHub transfer artifacts, never AWS credentials.
 Immutable reusable brokers execute only protected `coreforge` helper code.
 The writer verifies the actual source, run attempt, successful predecessor graph, and same-run snapshot provenance before OIDC.
+The writer normalizes a single-artifact download into its slot directory before OIDC, preserving the multi-artifact layout and all provenance checks.
 Engine publication waits for all eight platform builds, release publication, and `verify_release`.
 Relay cache publication waits for successful validation and the existing guarded relay publication.
 PR, `pull_request_target`, and `workflow_run` execution cannot publish shared snapshots.
@@ -103,6 +105,7 @@ The token travels through stdin via `--web-identity-token`, never through a comm
 AWS CLI 2.40/2.41 loads `--cli-input-json` twice; do not use a one-shot pipe for that argument.
 
 Run `python3 -m unittest discover -s scripts -p 'test_ci_cache*.py'` for cache and real broker-guard boundaries.
+The canary scopes its `ci` preset to build commands so administrative shutdown remains valid before snapshot packing.
 Local qualification exercised a real Bazel 9.2.0 C build with isolated output bases and a loopback repository download.
 Warm restore produced a disk-cache hit with repository downloads disabled; changed inputs rebuilt correctly, and a miss ran a real cold build.
 These checks do not qualify live S3/OIDC, the native-addon matrix, or deployed performance.

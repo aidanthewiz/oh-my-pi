@@ -1,8 +1,8 @@
 import { expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
-import { createRequire } from "node:module";
 import * as os from "node:os";
 import * as path from "node:path";
+import { type EmbeddedAddonFiles, embeddedAddonFiles } from "../../natives/scripts/embed-native";
 import { compileCodingAgent } from "../scripts/compile-binary";
 import { createAwsSecretInputNativeGuardLauncher } from "./fixtures/aws-secret-input-native-dcg";
 import {
@@ -125,14 +125,12 @@ function safeReceipt(value: unknown): boolean {
 	});
 }
 
-async function compileSyntheticWorker(entry: string, outfile: string): Promise<void> {
-	const transformers = createRequire(import.meta.url)("@huggingface/transformers/package.json") as { version: string };
+async function compileSyntheticWorker(entry: string, outfile: string, nativeFiles: EmbeddedAddonFiles): Promise<void> {
 	await compileCodingAgent({
 		repoRoot: path.resolve(import.meta.dir, "../../.."),
 		entrypoint: path.resolve(import.meta.dir, "fixtures", entry),
 		outfile,
-		transformersVersion: transformers.version,
-		native: { platform: process.platform, arch: process.arch },
+		native: { files: nativeFiles },
 	});
 }
 
@@ -191,8 +189,13 @@ for (const mode of ["source", "compiled"] as const) {
 					await fs.mkdir(buildRoot);
 					compiledWorker = path.join(buildRoot, "worker");
 					compiledMalformedWorker = path.join(buildRoot, "malformed-worker");
-					await compileSyntheticWorker("aws-secret-input-lifecycle-worker.ts", compiledWorker);
-					await compileSyntheticWorker("aws-secret-input-lifecycle-malformed-worker.ts", compiledMalformedWorker);
+					const nativeFiles = await embeddedAddonFiles({ platform: process.platform, arch: process.arch });
+					await compileSyntheticWorker("aws-secret-input-lifecycle-worker.ts", compiledWorker, nativeFiles);
+					await compileSyntheticWorker(
+						"aws-secret-input-lifecycle-malformed-worker.ts",
+						compiledMalformedWorker,
+						nativeFiles,
+					);
 				}
 				const guardPath = path.join(root, "native-dcg");
 				const guard = createAwsSecretInputNativeGuardLauncher(root);

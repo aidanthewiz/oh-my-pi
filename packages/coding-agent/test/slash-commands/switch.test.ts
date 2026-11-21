@@ -109,4 +109,37 @@ describe("/switch session role transitions", () => {
 		expect(settings.getModelRole("smol")).toBe(`${selector}:low`);
 		expect(settings.getModelRole("default")).toBe(selector);
 	});
+
+	it("resolves a focused session's role without changing the main model or either saved role", async () => {
+		const childSettings = Settings.isolated({
+			"compaction.enabled": false,
+			modelRoles: { default: selector, smol: `${selector}:high` },
+		});
+		const childManager = SessionManager.inMemory();
+		const child = new AgentSession({
+			agent: new Agent({
+				initialState: { model, tools: [], messages: [], systemPrompt: ["Child"], thinkingLevel: Effort.Low },
+			}),
+			sessionManager: childManager,
+			settings: childSettings,
+			modelRegistry: session.modelRegistry,
+			scopedModels: [{ model, thinkingLevel: Effort.High }],
+		});
+		try {
+			const focused = { ...context, viewSession: child, focusedAgentId: "child" };
+			const controller = new SelectorController(focused);
+			focused.switchSessionModel = controller.switchSessionModel.bind(controller);
+
+			await executeBuiltinSlashCommand("/switch @smol", { ctx: focused });
+
+			expect(child.thinkingLevel).toBe(Effort.High);
+			expect(childManager.getLastModelChangeRole()).toBe("smol");
+			expect(session.model?.id).toBe(model.id);
+			expect(manager.getLastModelChangeRole()).toBe("default");
+			expect(childSettings.getModelRole("smol")).toBe(`${selector}:high`);
+			expect(settings.getModelRole("smol")).toBe(`${selector}:low`);
+		} finally {
+			await child.dispose();
+		}
+	});
 });

@@ -1,7 +1,7 @@
 /**
- * `omp --restore` end to end for a subagent: a transcript a crash cut off mid tool
- * call is revived from disk, its cut-off call runs again, the agent answers, and the
- * parent receives the answer as the subagent's job.
+ * `omp --restore` revives an interrupted child and continues the model with its
+ * outcome-unknown tool result. It never directly replays an uncertain tool effect.
+ * The parent receives the continuation as the subagent's job.
  */
 import { afterEach, beforeEach, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
@@ -24,8 +24,10 @@ import { hasRestorableTurn } from "@oh-my-pi/pi-coding-agent/session/exit-diagno
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { createPersistedSubagentReviverFactory } from "@oh-my-pi/pi-coding-agent/task/persisted-revive";
 import { type RestoreOutcome, restoreSession } from "@oh-my-pi/pi-coding-agent/task/restore";
+import { recordStepsSent } from "@oh-my-pi/pi-coding-agent/task/steps";
 import { __resetDirsFromEnvForTests, removeWithRetries, setAgentDir } from "@oh-my-pi/pi-utils";
 import { createInMemoryAuthStorage } from "../helpers/agent-session-setup";
+import { localSession } from "../helpers/local-session";
 import { type } from "@oh-my-pi/omptype";
 
 const AGENT_ID = "Restored";
@@ -74,18 +76,18 @@ afterEach(async () => {
 
 const SPAWN_MODEL = "mock-model";
 const HANDOFF_MODEL = "mock-handoff";
+const STEP_PROMPTS = ["COMPLETED-STAGE", "INTERRUPTED-STAGE", "FINAL-STAGE"];
 
 /** The mock carries no effort ladder; without one every configured effort clamps away. */
 const thinking = { mode: "effort", efforts: [Effort.Medium, Effort.High] } as const;
 
 /**
- * Writes a main session whose subagent died inside its `read` call (no tool result, no
- * exit record), restores the session, and returns the answer the parent received with
- * the `read` results and efforts each model saw when the cut-off call ran again.
+ * Writes an interrupted `read` with no result or exit record, then restores the child.
+ * Returns the unknown-result context and effort each continuation model received.
  * `handoff` records a prewalk handoff to `high` effort before the cut-off call;
  * `fallback` follows that handoff with a retry fallback hop back to the spawn model.
  */
-async function restoreInterruptedChild(options: { transcript?: "handoff" | "fallback" } = {}) {
+async function restoreInterruptedChild(options: { transcript?: "handoff" | "fallback"; steps?: boolean } = {}) {
 	const cwd = path.join(root, "home", "work");
 	await fs.mkdir(cwd, { recursive: true });
 	const notes = path.join(cwd, "notes.txt");
@@ -113,7 +115,12 @@ async function restoreInterruptedChild(options: { transcript?: "handoff" | "fall
 		agent: "task",
 		resolvedModel: `mock/${SPAWN_MODEL}`,
 	});
-	child.appendMessage({ role: "user", content: "report what notes.txt says", timestamp: Date.now() });
+	child.appendMessage({
+		role: "user",
+		content: options.steps ? STEP_PROMPTS[1]! : "report what notes.txt says",
+		timestamp: Date.now(),
+	});
+	if (options.steps) recordStepsSent(child, 2, STEP_PROMPTS);
 	if (options.transcript) {
 		child.appendModelChange(`mock/${HANDOFF_MODEL}`, "prewalk");
 		child.appendThinkingLevelChange(Effort.High, Effort.High);
@@ -144,17 +151,32 @@ async function restoreInterruptedChild(options: { transcript?: "handoff" | "fall
 	const modelRegistry = new ModelRegistry(authStorage);
 	const readResults: Record<string, string[]> = { [SPAWN_MODEL]: [], [HANDOFF_MODEL]: [] };
 	const readEfforts: Record<string, (string | undefined)[]> = { [SPAWN_MODEL]: [], [HANDOFF_MODEL]: [] };
+	const completedStages: string[] = [];
 	const mocks = [SPAWN_MODEL, HANDOFF_MODEL].map(id =>
 		Object.assign(
 			createMockModel({
 				id,
 				reasoning: true,
 				handler: (context, streamOptions) => {
-					const last = context.messages.at(-1);
-					if (last?.role !== "toolResult" || last.toolName !== "read") return { content: ["label"] };
+					const user = context.messages.findLast(message => message.role === "user");
+					const text =
+						typeof user?.content === "string"
+							? user.content
+							: user?.content
+									.filter(part => part.type === "text")
+									.map(part => part.text)
+									.join("\n");
+					if (options.steps && text === STEP_PROMPTS[2]) {
+						completedStages.push(text);
+						return { content: ["final stage completed"] };
+					}
+					const last = context.messages.findLast(
+						message => message.role === "toolResult" && message.toolName === "read",
+					);
+					if (last?.role !== "toolResult") return { content: ["label"] };
 					readResults[id]!.push(JSON.stringify(last.content));
 					readEfforts[id]!.push(streamOptions?.reasoning);
-					return { content: [`restored: 42 (${id})`] };
+					return { content: [`restored after unknown read (${id})`] };
 				},
 			}),
 			{ thinking },
@@ -220,12 +242,12 @@ async function restoreInterruptedChild(options: { transcript?: "handoff" | "fall
 		const outcome = await restoreSession(session);
 		expect(outcome.subagents).toEqual([AGENT_ID]);
 		await manager.getJob(AGENT_ID)?.promise;
-		await session.settleAsyncWork();
+		await session.waitForRunEnd();
 		await session.waitForIdle();
 		const delivered = session.messages.filter(
 			message => message.role === "custom" && message.customType === "async-result",
 		);
-		return { delivered: JSON.stringify(delivered), readResults, readEfforts };
+		return { delivered: JSON.stringify(delivered), readResults, readEfforts, completedStages };
 	} finally {
 		try {
 			await session.dispose();
@@ -425,9 +447,10 @@ it("does not replay interrupted child effects when /new cancels its registered j
 		release.resolve();
 		expect(await attempt).toEqual({ turn: false, subagents: [childId] });
 		await originalJob.promise;
-		const revived = AgentRegistry.global().get(childId)?.session;
+		const revivedHandle = AgentRegistry.global().get(childId)?.session;
+		const revived = revivedHandle ? localSession(revivedHandle) : undefined;
 		await revived?.waitForIdle();
-		await session.settleAsyncWork();
+		await session.waitForRunEnd();
 		await session.waitForIdle();
 		const probeAppends = await fs.readFile(probeFile, "utf8").then(
 			bytes =>
@@ -453,7 +476,8 @@ it("does not replay interrupted child effects when /new cancels its registered j
 		await lifecycle.dispose();
 		expect(lifecycle.has(childId)).toBe(false);
 		expect(revived?.isDisposed ?? true).toBe(true);
-		expect(await manager.dispose({ timeoutMs: 1_000 })).toBe(true);
+		await session.dispose();
+		expect(session.isDisposed).toBe(true);
 		expect(manager.getAllJobs()).toEqual([]);
 	} finally {
 		release.resolve();
@@ -477,18 +501,19 @@ it("does not replay interrupted child effects when /new cancels its registered j
 	}
 }, 20_000);
 
-it("revives a subagent a crash cut off mid tool call, runs the call again, and delivers its answer to the parent", async () => {
+it("continues an interrupted child with the unknown outcome instead of replaying its tool call", async () => {
 	const { delivered, readResults } = await restoreInterruptedChild();
 
-	expect(delivered).toContain(`restored: 42 (${SPAWN_MODEL})`);
+	expect(delivered).toContain(`restored after unknown read (${SPAWN_MODEL})`);
 	expect(readResults[SPAWN_MODEL]).toHaveLength(1);
-	expect(readResults[SPAWN_MODEL]![0]).toContain("the answer is 42");
+	expect(readResults[SPAWN_MODEL]![0]).toMatch(/unknown/i);
+	expect(readResults[SPAWN_MODEL]![0]).not.toContain("the answer is 42");
 }, 20_000);
 
 it("revives a subagent on the model and effort a prewalk handoff switched it to, not its spawn model", async () => {
 	const { delivered, readResults, readEfforts } = await restoreInterruptedChild({ transcript: "handoff" });
 
-	expect(delivered).toContain(`restored: 42 (${HANDOFF_MODEL})`);
+	expect(delivered).toContain(`restored after unknown read (${HANDOFF_MODEL})`);
 	expect(readResults[HANDOFF_MODEL]).toHaveLength(1);
 	expect(readResults[SPAWN_MODEL]).toEqual([]);
 	expect(readEfforts[HANDOFF_MODEL]).toEqual([Effort.High]);
@@ -497,7 +522,16 @@ it("revives a subagent on the model and effort a prewalk handoff switched it to,
 it("revives a subagent whose handoff target failed over on the spawn model, not the failed target", async () => {
 	const { delivered, readResults } = await restoreInterruptedChild({ transcript: "fallback" });
 
-	expect(delivered).toContain(`restored: 42 (${SPAWN_MODEL})`);
+	expect(delivered).toContain(`restored after unknown read (${SPAWN_MODEL})`);
 	expect(readResults[SPAWN_MODEL]).toHaveLength(1);
 	expect(readResults[HANDOFF_MODEL]).toEqual([]);
+}, 20_000);
+
+it("resumes the interrupted step and sends only its not-yet-dispatched successor", async () => {
+	const { delivered, readResults, completedStages } = await restoreInterruptedChild({ steps: true });
+
+	expect(readResults[SPAWN_MODEL]).toHaveLength(1);
+	expect(readResults[SPAWN_MODEL]![0]).toMatch(/unknown/i);
+	expect(completedStages).toEqual([STEP_PROMPTS[2]!]);
+	expect(delivered).toContain("final stage completed");
 }, 20_000);

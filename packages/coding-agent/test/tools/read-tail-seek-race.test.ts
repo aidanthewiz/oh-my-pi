@@ -4,6 +4,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { getEditStore } from "@oh-my-pi/pi-coding-agent/edit/store";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { ReadTool, SNAPSHOT_MAX_BYTES } from "@oh-my-pi/pi-coding-agent/tools/read";
 
@@ -100,6 +101,6 @@ describe("read :-N tail on a file edited between the count and the window read",
 		const result = await new ReadTool(session).execute("growth", { path: `${filePath}:1-1` });
 		expect(grown).toBe(true);
 		expect(result.details?.displayContent?.text.split("\n")[0]).toBe("first");
-		expect(session.editStore?.headText(filePath) ?? null).toBeNull();
+		expect(getEditStore(session).headText(filePath)).toBeNull();
 	});
 });

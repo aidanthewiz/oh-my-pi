@@ -176,7 +176,7 @@ jobs:
           if [ "$(ulimit -Sn)" != unlimited ] && [ "$(ulimit -Sn)" -lt 65536 ]; then ulimit -Sn 65536 || true; fi
           mkdir -p "$HOME/.cache/omp-bazel-disk" "$HOME/.cache/omp-bazel-repo"
           {
-            echo "common --config=ci"
+            echo "build --config=ci"
             echo "common --disk_cache=$HOME/.cache/omp-bazel-disk"
             echo "common --repository_cache=$HOME/.cache/omp-bazel-repo"
           } > "$RUNNER_TEMP/coreforge-bazel.rc"
@@ -201,10 +201,10 @@ jobs:
         env:
           CARGO_TERM_COLOR: never
         run: |
-          cargo test --locked --profile ci --target aarch64-pc-windows-msvc -p brush-core --lib pipetap::tests:: -- --nocapture 2>&1 | Tee-Object -Variable relayOutput
+          cargo test --locked --profile ci --target aarch64-pc-windows-msvc -p pi-shell --lib pipe_contracts:: -- --nocapture 2>&1 | Tee-Object -Variable relayOutput
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          foreach ($name in @("idle_producer_is_released_when_consumer_exits", "producer_eof_preserves_every_byte_and_closes_the_mirror", "windows_query_failure_is_not_eof")) {
-            if (-not ($relayOutput -match "^test pipetap::tests::$name \.\.\. ok$")) {
+          foreach ($name in @("bash::mem::pipe_contracts::idle_producer_is_released_when_consumer_exits", "bash::mem::pipe_contracts::producer_eof_preserves_every_byte_and_closes_the_mirror", "sys::pump::os::imp::pipe_contracts::windows_query_failure_is_not_eof")) {
+            if (-not ($relayOutput -match "^test $name \.\.\. ok$")) {
               throw "Windows pipe relay case did not pass: $name"
             }
           }
@@ -260,18 +260,19 @@ jobs:
               for (let i = start + 1; i < lines.length && /^\s/.test(lines[i]); i++) {
                 for (const value of lines[i].trim().split(/\s+/)) values.add(value);
               }
-              for (const value of required) assert(values.has(value), `${header} ${value}`);
+              for (const value of required) assert(values.has(value), header + " " + value);
             }
             for (const feature of ["ACLs", "xattrs", "iconv"]) {
-              assert(text.includes(feature) && !text.includes(`no ${feature}`), feature);
+              assert(text.includes(feature) && !text.includes("no " + feature), feature);
             }
           ' "$work/version.txt"
           channel="$(bun -e 'console.log(Bun.TOML.parse(await Bun.file("rust-toolchain.toml").text()).toolchain.channel)')"
           rustup toolchain install "$channel" --profile minimal --no-self-update
           export RUSTUP_TOOLCHAIN="$channel" RUSTUP_AUTO_INSTALL=0
           export CARGO_TARGET_DIR="$PWD/target"
-          export RUSTC="$(rustup which --toolchain "$channel" rustc)"
-          export RUSTDOC="$(rustup which --toolchain "$channel" rustdoc)"
+          RUSTC="$(rustup which --toolchain "$channel" rustc)"
+          RUSTDOC="$(rustup which --toolchain "$channel" rustdoc)"
+          export RUSTC RUSTDOC
           cargo="$(rustup which --toolchain "$channel" cargo)"
           unset RSYNC_CONFORMANCE_FILTER
           "$cargo" test --locked --profile ci --target x86_64-unknown-linux-gnu -p pi-builtins --lib -- --test-threads=2 --nocapture

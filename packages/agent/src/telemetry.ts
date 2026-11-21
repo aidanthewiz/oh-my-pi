@@ -39,6 +39,7 @@ import {
 	type ToolChoice,
 	type Usage,
 } from "@oh-my-pi/pi-ai";
+import { $otelEnv } from "@oh-my-pi/pi-utils";
 import {
 	type Attributes,
 	type AttributeValue,
@@ -453,7 +454,7 @@ export function resolveTelemetry(
 let contentCaptureEnvCache: ResolvedTelemetryContentCapture | undefined;
 function readContentCaptureEnv(): ResolvedTelemetryContentCapture {
 	if (contentCaptureEnvCache !== undefined) return contentCaptureEnvCache;
-	const raw = process.env[CONTENT_CAPTURE_ENV];
+	const raw = $otelEnv(CONTENT_CAPTURE_ENV);
 	if (!raw) {
 		contentCaptureEnvCache = "none";
 		return "none";
@@ -1686,7 +1687,7 @@ export interface JudgmentTelemetryOptions {
 	readonly provider: string;
 	/** Requested model id. */
 	readonly model: string;
-	/** Model that answered, when the provider resolves an alias (`jev-latest` → `jev-1.13.0`). */
+	/** Model that answered, when the provider resolves an alias (`jev-latest` → `jev-1.14.0`). */
 	readonly responseModel?: string;
 	/** Caller-level reason the judgment ran; stamped as {@link OmpGenAIAttr.JudgmentPurpose}. */
 	readonly purpose: string;
@@ -1836,7 +1837,7 @@ export interface InstrumentedChatSpanOptions {
 export async function instrumentedCompleteSimple<TApi extends Api>(
 	model: Model<TApi>,
 	ctx: Context,
-	options: SimpleStreamOptions,
+	options: SimpleStreamOptions & { onAttempt?: (message: AssistantMessage) => void },
 	span: InstrumentedChatSpanOptions,
 ): Promise<AssistantMessage> {
 	const { telemetry, parent, oneshotKind } = span;
@@ -1868,9 +1869,9 @@ export async function instrumentedCompleteSimple<TApi extends Api>(
 	// for the cost / gateway hooks without stealing them from the caller.
 	let capturedHeaders: Readonly<Record<string, string>> | undefined;
 	const userOnResponse = options.onResponse;
-	const captureOnResponse: NonNullable<SimpleStreamOptions["onResponse"]> = (response, modelInfo) => {
+	const captureOnResponse: NonNullable<SimpleStreamOptions["onResponse"]> = (response, modelInfo, signal) => {
 		capturedHeaders = response.headers;
-		return userOnResponse?.(response, modelInfo);
+		return userOnResponse?.(response, modelInfo, signal);
 	};
 
 	try {
@@ -1891,6 +1892,7 @@ export async function instrumentedCompleteSimple<TApi extends Api>(
 				? await retryTransientCompletion(runOnce, {
 						...span.retry,
 						provider: model.provider,
+						baseUrl: model.baseUrl,
 						// Framework-owned: the caller must not be able to detach the
 						// abort signal or the header source by passing them itself.
 						signal: options.signal,

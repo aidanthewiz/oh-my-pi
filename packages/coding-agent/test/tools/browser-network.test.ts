@@ -43,6 +43,8 @@ function createHost() {
 		getSessionFile: () => null,
 		getSessionSpawns: () => "*",
 		settings: Settings.isolated({
+			// Managed Chromium, whether or not omp's WebKit engine is installed on this machine.
+			"browser.webkit": false,
 			"browser.enabled": true,
 			"browser.headless": true,
 			"browser.cmux": false,
@@ -259,6 +261,7 @@ ${STALL_FETCH_DISABLE}
 return "done";`,
 		});
 		expect(valueOf(completed)).toBe("done");
+
 		const next = valueOf(
 			await invoke({
 				action: "run",

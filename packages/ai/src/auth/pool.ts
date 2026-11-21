@@ -1,3 +1,7 @@
+import { authPolicyFor } from "@oh-my-pi/pi-catalog/compat/auth";
+import { providerPauseReason, providerPauseRevision } from "../registry/oauth";
+import { agyCredentialKey, readmitAgyCredentials } from "../providers/antigravity-cli/credentials";
+import { drainAgyAccountHosts } from "../providers/antigravity-cli/host";
 import { logger } from "@oh-my-pi/pi-utils";
 import { resolveCredentialIdentityKey, serializeCredential } from "./sqlite-credential-store";
 import type { BlockStoreHealth } from "./blocks";
@@ -26,6 +30,16 @@ const MAX_PENDING_DISABLED_EVENTS = 32;
 /** SHA-256 bearer fingerprint, so superseded OAuth token bytes never enter the identity cache. */
 function fingerprintOAuthBearer(bearer: string): string {
 	return Bun.SHA256.hash(bearer, "base64url");
+}
+/**
+ * Strip broker-invisible secrets before a credential crosses the wire: the
+ * refresh token becomes the sentinel and the Kiro OIDC client secret is
+ * dropped. Every broker-bound path (snapshot, upsert, refresh reply) uses this.
+ */
+export function redactCredentialForWire(credential: AuthCredential): SnapshotCredential {
+	if (credential.type === "api_key") return credential;
+	const { kiroClientSecret: _kiroClientSecret, ...withoutSecrets } = credential;
+	return { ...withoutSecrets, refresh: REMOTE_REFRESH_SENTINEL };
 }
 
 /** One stored credential row as cached in memory. */
@@ -88,8 +102,12 @@ export interface CredentialPoolOptions {
 
 /** In-memory credential snapshot over an AuthCredentialStore: CRUD, change detection, events. */
 export class CredentialPool implements CredentialsApi {
-	/** Provider -> credentials cache, populated from store on reload(). */
+	/** Provider -> credentials cache, populated from store on reload(), minus paused providers. */
 	#data: Map<string, StoredCredential[]> = new Map();
+	/** Every loaded row, paused providers included, so a pause change refilters without a reload. */
+	#loaded: Map<string, StoredCredential[]> = new Map();
+	/** {@link providerPauseRevision} `#data` was filtered against. */
+	#pauseRevision = providerPauseRevision();
 	/** Recent bearer fingerprints resolved for each durable OAuth row; used only for delayed usage-limit attribution. */
 	#oauthBearerFingerprints: Map<string, Map<number, string[]>> = new Map();
 	#credentialDisabledListeners: Set<(event: CredentialDisabledEvent) => void | Promise<void>> = new Set();
@@ -118,11 +136,14 @@ export class CredentialPool implements CredentialsApi {
 		return this.#closed;
 	}
 
+	/** Snapshot generation; refilters first so a pause change shows as a new generation. */
 	get generation(): number {
+		this.#syncPause();
 		return this.#generation;
 	}
 
 	providers(): IterableIterator<string> {
+		this.#syncPause();
 		return this.#data.keys();
 	}
 
@@ -307,7 +328,7 @@ export class CredentialPool implements CredentialsApi {
 			}
 		}
 
-		const removedProviders = new Set(this.#data.keys());
+		const removedProviders = new Set(this.#loaded.keys());
 		for (const [provider, entries] of dedupedGrouped) {
 			this.replace(provider, entries);
 			removedProviders.delete(provider);
@@ -323,16 +344,44 @@ export class CredentialPool implements CredentialsApi {
 	 * @returns Array of stored credentials, empty if none exist
 	 */
 	entries(provider: string): StoredCredential[] {
+		this.#syncPause();
 		return this.#data.get(provider) ?? [];
 	}
 
 	/**
 	 * Updates in-memory credential cache for a provider.
 	 * Removes the provider entry entirely if credentials array is empty.
+	 * A provider turned off in its auth rules (`disabled "<reason>"`) is kept
+	 * out of the cache: its stored rows stay on disk untouched, but no read,
+	 * selection, refresh, usage probe or broker snapshot sees them until it is
+	 * turned back on (see {@link CredentialPool.#syncPause}).
 	 * @param provider - Provider name (e.g., "anthropic", "openai")
-	 * @param credentials - Array of stored credentials to cache
+	 * @param stored - Array of stored credentials to cache
 	 */
-	replace(provider: string, credentials: StoredCredential[]): void {
+	replace(provider: string, stored: StoredCredential[]): void {
+		if (stored.length === 0) {
+			this.#loaded.delete(provider);
+		} else {
+			this.#loaded.set(provider, stored);
+		}
+		this.#cache(provider, stored);
+	}
+
+	/**
+	 * Refilters every loaded provider when which providers are paused changed since the
+	 * last filter (an unpaused list edit, an extension login taking a paused id), so the
+	 * change reaches a loaded pool on its next read without a store reload.
+	 */
+	#syncPause(): void {
+		const revision = providerPauseRevision();
+		if (revision === this.#pauseRevision) return;
+		this.#pauseRevision = revision;
+		for (const [provider, stored] of this.#loaded) this.#cache(provider, stored);
+	}
+
+	/** Caches `stored` for `provider` unless it is paused, bumping the generation on change. */
+	#cache(provider: string, stored: StoredCredential[]): void {
+		const credentials = providerPauseReason(provider) === undefined ? stored : [];
 		const current = this.#data.get(provider) ?? [];
 		if (storedCredentialArraysEqual(current, credentials)) return;
 		const trackedBearerFingerprints = this.#oauthBearerFingerprints.get(provider);
@@ -605,6 +654,7 @@ export class CredentialPool implements CredentialsApi {
 				disabledCause: null,
 			}));
 		}
+		this.#syncPause();
 		const rows: StoredAuthCredential[] = [];
 		for (const [storedProvider, entries] of this.#data) {
 			for (const entry of entries) {
@@ -625,40 +675,89 @@ export class CredentialPool implements CredentialsApi {
 			credential,
 		]);
 		this.#options.policies.validateFor(provider, prospectiveCredentials);
-		const stored = await this.#store.upsertAuthCredential(provider, credential);
+		const store = this.#store;
+		const stored = await store.upsertAuthCredential(provider, credential);
 		this.#options.policies.validateFor(
 			provider,
 			stored.map(entry => entry.credential),
 		);
-		this.replace(
-			provider,
-			stored.map(entry => ({ id: entry.id, credential: entry.credential })),
-		);
-		this.reset(provider);
+		if (provider === "antigravity-cli") {
+			const redacted = { ...credential, refresh: REMOTE_REFRESH_SENTINEL };
+			const matchesLogin = (current: AuthCredential) =>
+				current.type === "oauth" &&
+				authCredentialEquals(current, current.refresh === REMOTE_REFRESH_SENTINEL ? redacted : credential) &&
+				current.authorizedAt === credential.authorizedAt;
+			const signedIn = stored.find(entry => matchesLogin(entry.credential));
+			await readmitAgyCredentials(credential, () => {
+				if (this.#closed || this.#store !== store || !signedIn) return false;
+				const current = this.reloadProvider(provider).find(entry => entry.id === signedIn.id)?.credential;
+				this.reset(provider);
+				return current !== undefined && matchesLogin(current);
+			});
+		} else {
+			this.replace(
+				provider,
+				stored.map(entry => ({ id: entry.id, credential: entry.credential })),
+			);
+			this.reset(provider);
+		}
 	}
 
 	/**
 	 * Remove credential for a provider.
 	 */
 	async remove(provider: string): Promise<void> {
-		await this.#store.deleteAuthCredentials(provider, "deleted by user");
-		this.replace(provider, []);
-		this.reset(provider);
+		if (provider !== "antigravity-cli") {
+			await this.#store.deleteAuthCredentials(provider, "deleted by user");
+			this.replace(provider, []);
+			this.reset(provider);
+			return;
+		}
+		const entries = this.#store.listAuthCredentials(provider);
+		const accounts = new Map<string, OAuthCredential>();
+		for (const { credential } of entries) {
+			if (credential.type === "oauth" && (credential.email || credential.accountId)) {
+				accounts.set(agyCredentialKey(credential), credential);
+			}
+		}
+		const releases: (() => void)[] = [];
+		try {
+			for (const [, credential] of [...accounts].sort(([left], [right]) => left.localeCompare(right))) {
+				const release = await drainAgyAccountHosts(credential);
+				if (release) releases.push(release);
+			}
+			for (const entry of entries) await this.#store.deleteAuthCredential(entry.id, "deleted by user");
+			this.reloadProvider(provider);
+			this.reset(provider);
+		} finally {
+			for (const release of releases.reverse()) release();
+		}
 	}
 
 	/**
 	 * Remove one stored credential for a provider.
 	 */
 	async removeById(provider: string, credentialId: number): Promise<boolean> {
-		const entries = this.entries(provider);
+		const entries =
+			provider === "antigravity-cli" ? this.#store.listAuthCredentials(provider) : this.entries(provider);
 		const index = entries.findIndex(entry => entry.id === credentialId);
 		if (index === -1) return false;
+		const credential = entries[index].credential;
 		const remainingEntries = entries.filter((_entry, entryIndex) => entryIndex !== index);
-		const deleted = await this.#store.deleteAuthCredential(credentialId, "deleted by user");
-		if (!deleted) return false;
-		this.replace(provider, remainingEntries);
-		this.reset(provider);
-		return true;
+		const release =
+			provider === "antigravity-cli" && credential.type === "oauth"
+				? await drainAgyAccountHosts(credential)
+				: undefined;
+		try {
+			const deleted = await this.#store.deleteAuthCredential(credentialId, "deleted by user");
+			if (!deleted) return false;
+			if (provider === "antigravity-cli") this.reloadProvider(provider);
+			else this.replace(provider, remainingEntries);
+			this.reset(provider);
+			return true;
+		} finally {
+			release?.();
+		}
 	}
 
 	/**
@@ -675,6 +774,16 @@ export class CredentialPool implements CredentialsApi {
 		return this.credentials(provider).some(credential => credential.type === "oauth");
 	}
 
+	/** OAuth and provider-opted-in login API keys use subscription billing. */
+	hasSubscription(provider: string): boolean {
+		const credentials = this.credentials(provider);
+		if (credentials.some(credential => credential.type === "oauth")) return true;
+		return (
+			authPolicyFor(provider)?.loginSubscription === true &&
+			credentials.some(credential => credential.type === "api_key" && credential.source === "login")
+		);
+	}
+
 	/**
 	 * Get OAuth credentials for a provider.
 	 */
@@ -688,6 +797,7 @@ export class CredentialPool implements CredentialsApi {
 	 * Get all credentials.
 	 */
 	all(): AuthStorageData {
+		this.#syncPause();
 		const result: AuthStorageData = {};
 		for (const [provider, entries] of this.#data.entries()) {
 			const credentials = entries.map(entry => entry.credential);
@@ -709,12 +819,12 @@ export class CredentialPool implements CredentialsApi {
 	 * (the broker server's HTTP handler does this).
 	 */
 	snapshot(): AuthCredentialSnapshot {
+		this.#syncPause();
 		const entries: AuthCredentialSnapshotEntry[] = [];
 		for (const [provider, stored] of this.#data) {
 			for (const entry of stored) {
 				const credential = entry.credential;
-				const redacted: SnapshotCredential =
-					credential.type === "api_key" ? credential : { ...credential, refresh: REMOTE_REFRESH_SENTINEL };
+				const redacted = redactCredentialForWire(credential);
 				entries.push({
 					id: entry.id,
 					provider,
@@ -758,6 +868,7 @@ export class CredentialPool implements CredentialsApi {
 	 * `POST /v1/credential/:id/disable`. Returns `false` when no such row exists.
 	 */
 	async disable(id: number, disabledCause: string): Promise<boolean> {
+		this.#syncPause();
 		for (const [provider, entries] of this.#data) {
 			const index = entries.findIndex(entry => entry.id === id);
 			if (index === -1) continue;
@@ -789,8 +900,7 @@ export class CredentialPool implements CredentialsApi {
 		this.reset(provider);
 		return stored.map(entry => {
 			const persisted = entry.credential;
-			const redacted: SnapshotCredential =
-				persisted.type === "api_key" ? persisted : { ...persisted, refresh: REMOTE_REFRESH_SENTINEL };
+			const redacted = redactCredentialForWire(persisted);
 			return {
 				id: entry.id,
 				provider: entry.provider,

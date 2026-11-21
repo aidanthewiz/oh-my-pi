@@ -285,7 +285,7 @@ console.log(JSON.stringify({
 				settings,
 			} as AgentToolContext,
 		);
-		expect(textOf(result)).toContain("(no output)");
+		expect(textOf(result)).toContain("(no output, exit code 0)");
 	});
 
 	it("attributes bash pattern denies to tool policy", async () => {
@@ -321,7 +321,7 @@ console.log(JSON.stringify({
 				autoApprove: true,
 			} as AgentToolContext,
 		);
-		expect(textOf(result)).toContain("(no output)");
+		expect(textOf(result)).toContain("(no output, exit code 0)");
 	});
 
 	it("xd:// dispatch approval (xdevPolicyKey) suppresses the tier-only re-prompt", async () => {

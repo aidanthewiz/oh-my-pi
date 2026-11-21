@@ -41,7 +41,7 @@ describe("auth broker usage-probe refresh", () => {
 
 	afterEach(async () => {
 		await handle?.close();
-		storage?.close();
+		await storage?.close();
 		store?.close();
 		if (tempDir) await removeWithRetries(tempDir);
 	});

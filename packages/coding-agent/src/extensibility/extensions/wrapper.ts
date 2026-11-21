@@ -12,7 +12,7 @@ import {
 } from "@oh-my-pi/pi-agent-core";
 import type { ComputerSafetyCheck, ImageContent, Static, TextContent, TSchema } from "@oh-my-pi/pi-ai";
 import { TERMINAL } from "@oh-my-pi/pi-tui";
-import { logger, prompt, sanitizeText, untilAborted } from "@oh-my-pi/pi-utils";
+import { logger, prompt, sanitizeText, untilAborted, toError } from "@oh-my-pi/pi-utils";
 import type { Theme } from "@oh-my-pi/pi-tui/theme";
 import nativeDelegationTemplate from "../../prompts/tools/native-delegation.md" with { type: "text" };
 import { cfgApprovalNotify } from "../../tools/settings";
@@ -32,6 +32,7 @@ import {
 } from "../../tools/approval";
 import { ParentRuntimeApprovalError, type SubagentRuntimeApprovalResult } from "../../tools/subagent-runtime-approval";
 import { getApprovalGrants } from "../../tools/approval-cache";
+import { withToolApprovalScope } from "../../tools/approval-scope";
 import { defaultLoadModeForToolName } from "../../tools/essential-tools";
 import { withFileMutationSession } from "../../tools/file-write-fallback";
 import { mcpToolEventIdentity, normalizeToolEventInput, resolveToolEventInput } from "../tool-event-input";
@@ -261,6 +262,16 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 	}
 
 	async execute(
+		toolCallId: string,
+		params: Static<TParameters>,
+		signal?: AbortSignal,
+		onUpdate?: AgentToolUpdateCallback<TDetails, TParameters>,
+		context?: AgentToolContext,
+	): Promise<AgentToolResult<TDetails, TParameters>> {
+		return withToolApprovalScope(() => this.#execute(toolCallId, params, signal, onUpdate, context));
+	}
+
+	async #execute(
 		toolCallId: string,
 		params: Static<TParameters>,
 		signal?: AbortSignal,
@@ -618,7 +629,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 								const choice = await ui.select(
 									`Approve ${this.tool.name}?\nReason: ${runtimeApproval.reason}\n${runtimeApproval.prompt}${safetySuffix}`,
 									sessionApproval ? ["Deny", "Approve once", sessionApproval.label] : ["Deny", "Approve once"],
-									{ tuiStyle: runtimeApproval.tuiStyle },
+									{ tuiStyle: runtimeApproval.tuiStyle, signal },
 								);
 								approveSession = sessionApproval !== undefined && choice === sessionApproval.label;
 								approved = choice === "Approve once" || approveSession;
@@ -629,6 +640,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 										? `${base}\nProvider safety checks:\n${safetyCheckLines(safetySnapshot).join("\n")}`
 										: base,
 									sessionApproval ? ["Approve", "Deny", sessionApproval.label] : ["Deny", "Approve"],
+									{ signal },
 								);
 								approveSession = sessionApproval !== undefined && choice === sessionApproval.label;
 								approved = choice === "Approve" || approveSession;
@@ -639,6 +651,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 									grants: cacheTargets,
 									targets,
 									allowPersistentGrants,
+									signal,
 								});
 								approveModeSession = answer === "session" && sessionScope !== undefined;
 								targetGrant = typeof answer === "object" ? answer : undefined;
@@ -819,7 +832,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				),
 			);
 		} catch (err) {
-			executionError = err instanceof Error ? err : new Error(String(err));
+			executionError = toError(err);
 			result = {
 				content: [{ type: "text", text: executionError.message }],
 				details: undefined as TDetails,

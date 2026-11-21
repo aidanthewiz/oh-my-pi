@@ -115,6 +115,7 @@ describe("AgentSession auto-maintenance controls and cache-warming retention", (
 	afterEach(async () => {
 		warmer.cancel();
 		vi.useRealTimers();
+		await session.dispose();
 		await authStorage.close();
 		try {
 			await tempDir.remove();
@@ -160,7 +161,9 @@ describe("AgentSession auto-maintenance controls and cache-warming retention", (
 		session.agent.setModel(model);
 		cfgProvidersCacheRetention.override(settings, "long");
 
-		session.startCacheWarming(model, { messages: [] }, {});
+		const context = { messages: [] };
+		session.startCacheWarming(model, context, {});
+		session.markPromptCacheDispatched(context);
 
 		expect(warmer.status.state).toBe("scheduled");
 		expect(warmer.status.nextWarmAt! - Date.now()).toBe(54 * 60_000);
@@ -172,7 +175,9 @@ describe("AgentSession auto-maintenance controls and cache-warming retention", (
 		session.agent.setModel(model);
 		cfgProvidersCacheRetention.override(settings, "none");
 
-		session.startCacheWarming(model, { messages: [] }, {});
+		const context = { messages: [] };
+		session.startCacheWarming(model, context, {});
+		session.markPromptCacheDispatched(context);
 		expect(warmer.status).toMatchObject({ state: "inactive", reason: "request disabled prompt caching" });
 
 		vi.advanceTimersByTime(60 * 60_000);
@@ -186,7 +191,9 @@ describe("AgentSession auto-maintenance controls and cache-warming retention", (
 		session.agent.setModel(model);
 		cfgProvidersCacheRetention.override(settings, "long");
 
-		session.startCacheWarming(model, { messages: [] }, { cacheRetention: "short" });
+		const context = { messages: [] };
+		session.startCacheWarming(model, context, { cacheRetention: "short" });
+		session.markPromptCacheDispatched(context);
 
 		expect(warmer.status.state).toBe("scheduled");
 		expect(warmer.status.nextWarmAt! - Date.now()).toBe(4.5 * 60_000);
@@ -201,7 +208,9 @@ describe("AgentSession auto-maintenance controls and cache-warming retention", (
 			session.agent.setModel(model);
 			cfgProvidersCacheRetention.override(settings, "auto");
 
-			session.startCacheWarming(model, { messages: [] }, {});
+			const context = { messages: [] };
+			session.startCacheWarming(model, context, {});
+			session.markPromptCacheDispatched(context);
 
 			expect(warmer.status.state).toBe("scheduled");
 			expect(warmer.status.nextWarmAt! - Date.now()).toBe(54 * 60_000);
@@ -213,7 +222,9 @@ describe("AgentSession auto-maintenance controls and cache-warming retention", (
 
 	it("disabling cache warming cancels the live timer through the settings override", async () => {
 		vi.useFakeTimers();
-		warmer.start({ model, context: { messages: [] }, options: { cacheRetention: "short" } }, () => true);
+		const context = { messages: [] };
+		session.startCacheWarming(model, context, { cacheRetention: "short" });
+		session.markPromptCacheDispatched(context);
 		session.setCacheWarmingMode("off");
 		expect(warmer.status).toMatchObject({ state: "inactive", reason: "cache warming disabled" });
 		vi.advanceTimersByTime(2_000);
@@ -225,7 +236,9 @@ describe("AgentSession auto-maintenance controls and cache-warming retention", (
 		vi.useFakeTimers();
 		const events: AgentSessionEvent[] = [];
 		session.subscribe(event => events.push(event));
-		session.startCacheWarming(model, { messages: [] }, { cacheRetention: "short" });
+		const context = { messages: [] };
+		session.startCacheWarming(model, context, { cacheRetention: "short" });
+		session.markPromptCacheDispatched(context);
 		vi.advanceTimersByTime(1_000);
 		for (let i = 0; i < 100; i++) await Promise.resolve();
 		const entries = session.sessionManager.getEntries().filter(entry => entry.type === "model_usage");

@@ -346,10 +346,10 @@ export class WelcomeComponent implements Component {
 		if (this.greetingName) mark.push(theme.fg("muted", this.#welcomeText()));
 		const markWidth = Math.max(...mark.map(line => visibleWidth(line)));
 		const lockupWidth = LOGO_WIDTH + LOCKUP_GAP + markWidth;
-		const art =
-			room >= lockupWidth
-				? lockup(logo, mark)
-				: [...(room >= LOGO_WIDTH ? logo : []), ...mark.map(line => truncateToWidth(line, room))];
+		const hasLockup = room >= lockupWidth;
+		const art = hasLockup
+			? lockup(logo, mark)
+			: [...(room >= LOGO_WIDTH ? logo : []), ...mark.map(line => truncateToWidth(line, room))];
 		const lines = centerBlock(art, termWidth);
 		const tip = termWidth >= TIP_MIN_COLUMNS ? this.#renderTip(room) : [];
 		if (tip.length > 0) lines.push("", ...tip.flatMap(line => centerBlock([line], termWidth)));
@@ -448,6 +448,8 @@ export function lockupNode(
 
 const LOGO_WIDTH = Math.max(...COREFORGE_LOGO.map(line => visibleWidth(line)));
 const LOCKUP_GAP = 4;
+
+/** Widest a welcome tip wraps, so a long one stays a centered paragraph. */
 const TIP_MEASURE = 72;
 const TIP_MIN_COLUMNS = 50;
 

@@ -3141,8 +3141,8 @@ test("an authenticated later override route wins before the parent's model", asy
 		"route-proxy/parent",
 		{
 			getAvailable: () => models,
-			getApiKeyForProvider: async (_provider, _sessionId, options) =>
-				options?.baseUrl === "https://candidate-primary.example.test/v1" ? undefined : "route-key",
+			getApiKey: async model =>
+				model.baseUrl === "https://candidate-primary.example.test/v1" ? undefined : "route-key",
 		},
 	);
 	expect(result.model?.id).toBe("candidate-authorized");

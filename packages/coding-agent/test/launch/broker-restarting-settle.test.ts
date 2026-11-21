@@ -3,7 +3,7 @@
 // `setTimeout` in #settle that resurrects a stopped daemon. Fake timers cannot control the OS
 // process-exit promise or the unix-socket RPC the broker relies on. The embedded broker uses a
 // shorter real backoff here; proving the absence of resurrection still requires crossing it.
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Process } from "@oh-my-pi/pi-natives";
@@ -13,6 +13,7 @@ import { createDaemonBrokerClient, type DaemonBrokerClient } from "../../src/lau
 import { daemonBrokerRuntimeDir } from "../../src/launch/paths";
 import { DAEMON_IDLE_GRACE_ENV, DAEMON_PROJECT_DIR_ENV, DAEMON_RUNTIME_DIR_ENV } from "../../src/launch/protocol";
 import { type DaemonSnapshot } from "@oh-my-pi/pi-tui/tools/daemon";
+import * as atomicFile from "../../src/utils/atomic-file";
 
 const RESTART_BACKOFF_BASE_MS = 250;
 const INITIAL_RESTART_DELAY_MS = RESTART_BACKOFF_BASE_MS * 2;
@@ -117,6 +118,70 @@ describe("daemon broker restart settling", () => {
 			expect(afterStop.restartCount).toBe(baseline);
 		} finally {
 			await client.request({ op: "stop", name, timeoutMs: 2_000 }).catch(() => undefined);
+			await client.request({ op: "shutdown" }).catch(() => undefined);
+			client.close();
+			await broker;
+			process.title = previousTitle;
+		}
+	}, 20_000);
+
+	it("does not answer exit waits until stopping a restarting daemon is published", async () => {
+		using tempDir = TempDir.createSync("@omp-restart-stop-wait-");
+		const projectDir = path.join(tempDir.path(), "project");
+		const runtimeDir = path.join(tempDir.path(), "runtime");
+		await fs.mkdir(projectDir);
+		const client = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 5_000 });
+		const previousTitle = process.title;
+		const broker = startBroker(projectDir, runtimeDir, { restartBackoffBaseMs: 5_000 });
+		const name = "stopped-during-backoff";
+		const metadataPath = path.join(daemonBrokerRuntimeDir(runtimeDir), "daemons", name, "meta.json");
+		const writingExit = Promise.withResolvers<void>();
+		const releaseWrite = Promise.withResolvers<void>();
+		const replaceFileWithRetry = atomicFile.replaceFileWithRetry;
+		let blocked = false;
+		let restorePublication: (() => void) | undefined;
+		try {
+			await client.request({
+				op: "start",
+				spec: {
+					name,
+					application: process.execPath,
+					args: ["-e", "process.exit(1)"],
+					env: {},
+					cwd: projectDir,
+					pty: false,
+					restart: "always",
+					persist: false,
+					detached: true,
+				},
+			});
+			await waitForState(client, name, "restarting", 5_000);
+			const publicationSpy = spyOn(atomicFile, "replaceFileWithRetry").mockImplementation(async (from, to) => {
+				if (to === metadataPath && !blocked && (await fs.readFile(from, "utf8")).includes('"state":"exited"')) {
+					blocked = true;
+					writingExit.resolve();
+					await releaseWrite.promise;
+				}
+				return replaceFileWithRetry(from, to);
+			});
+			restorePublication = () => publicationSpy.mockRestore();
+			const stopping = client.request({ op: "stop", name, timeoutMs: 2_000 });
+			await writingExit.promise;
+			const waiting = client.request({ op: "wait", name, for: "exit", timeoutMs: 5_000 });
+			// Real socket polling must get a full interval while metadata publication stays blocked.
+			expect(await Promise.race([waiting.then(() => "returned"), Bun.sleep(150).then(() => "pending")])).toBe(
+				"pending",
+			);
+			releaseWrite.resolve();
+			await stopping;
+			const waited = await waiting;
+			if (waited.op !== "wait") throw new Error(`unexpected result: ${waited.op}`);
+			expect(waited.daemon.state).toBe("exited");
+			const metadata = await Bun.file(metadataPath).json();
+			expect(metadata.daemon.state).toBe("exited");
+		} finally {
+			releaseWrite.resolve();
+			restorePublication?.();
 			await client.request({ op: "shutdown" }).catch(() => undefined);
 			client.close();
 			await broker;

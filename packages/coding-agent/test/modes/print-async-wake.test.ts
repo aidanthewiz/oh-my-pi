@@ -1,9 +1,10 @@
 /**
  * Contract (issue #10363): print mode is single-shot by default — it disposes
  * after its prompts, so a background job the run started never reaches the
- * model. With `async.printWake` the run stays alive while owned async work is
- * pending, each job result wakes the same session for another turn (a turn may
- * start further jobs), and the text output is the answer of the last turn.
+ * model. With `async.printWake` print mode waits for the run to end: each job
+ * result resumes the same run for another loop (a loop may start further jobs),
+ * the session ends the run once nothing can resume it, and the text output is
+ * the answer of the last loop.
  */
 import { afterEach, describe, expect, test, vi } from "bun:test";
 import { Agent } from "@oh-my-pi/pi-agent-core";
@@ -167,15 +168,15 @@ async function sessionWithJobs(
 			retryStarts++;
 			retryStarted.resolve(Date.now());
 		}
-		if (event.type === "agent_end" && settling && session.getLastAssistantMessage()?.stopReason === "stop") {
+		if (event.type === "agent_pause" && settling && session.getLastAssistantMessage()?.stopReason === "stop") {
 			releaseNext();
 		}
 	});
-	const settle = session.settleAsyncWork.bind(session);
-	vi.spyOn(session, "settleAsyncWork").mockImplementation(async () => {
+	const waitForRunEnd = session.waitForRunEnd.bind(session);
+	vi.spyOn(session, "waitForRunEnd").mockImplementation(async () => {
 		settling = true;
 		releaseNext();
-		await settle();
+		await waitForRunEnd();
 	});
 	return {
 		session,
@@ -250,7 +251,7 @@ describe("print mode async-result wake", () => {
 		expect(session.isDisposed).toBe(true);
 	});
 
-	test("with async.printWake, a job started by a follow-up turn is waited for and answers last", async () => {
+	test("with async.printWake, a job started by a resumed loop is waited for and answers last", async () => {
 		const { lines } = captureStdout();
 		const settings = Settings.isolated();
 		cfgAsyncPrintWake.override(settings, true);
@@ -312,7 +313,7 @@ describe("print mode async-result wake", () => {
 		expect(mock.calls).toHaveLength(1);
 		expect(session.isDisposed).toBe(true);
 		expect(lines.join("")).toBe("");
-		expect(stderr.join("")).toContain("--max-time reached before background work settled");
+		expect(stderr.join("")).toContain("--max-time reached before the run ended");
 	});
 
 	test("with async.printWake, an expired deadline admits no model or background work", async () => {
@@ -329,7 +330,7 @@ describe("print mode async-result wake", () => {
 		expect(lines.join("")).toBe("");
 	});
 
-	test("with async.printWake, --max-time during a follow-up turn's retry backoff still disposes and fails the run", async () => {
+	test("with async.printWake, --max-time during a resumed loop's retry backoff still disposes and fails the run", async () => {
 		const { lines } = captureStdout();
 		const settings = Settings.isolated();
 		cfgAsyncPrintWake.override(settings, true);
@@ -513,10 +514,10 @@ describe("print mode async-result wake with a real session", () => {
 		sessions.push(session);
 		// Without the wake the job must still be running at dispose: keep its gate shut.
 		if (printWake) {
-			const waitForIdle = session.waitForIdle.bind(session);
-			vi.spyOn(session, "waitForIdle").mockImplementation(async () => {
-				await waitForIdle();
+			const waitForRunEnd = session.waitForRunEnd.bind(session);
+			vi.spyOn(session, "waitForRunEnd").mockImplementation(async () => {
 				firstRunIdle.resolve();
+				await waitForRunEnd();
 			});
 		}
 		return { session, mock, manager };

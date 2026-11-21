@@ -122,6 +122,20 @@ The addon loads only when a helper is called on Windows; other platforms preserv
 the input path without loading it. These helpers change long/8.3 spellings without
 resolving symlinks or junctions.
 
+### Git commits
+
+`VcsGitRepo.commitCreate(message, options)` honors configured signing and commit hooks.
+With `files`, it commits the selected tracked working copies, not stale staged bytes.
+Unrelated staged entries remain staged.
+Selected paths staged concurrently during hooks keep their newer staged content.
+With `indexPath`, it instead reads the caller's index and leaves the shared index untouched.
+
+Set `expectedHead` to a revision to reject a stale parent.
+Set it to `null` to require an unborn HEAD.
+Omit it to disable this caller guard; final ref publication still compares the captured HEAD.
+Handle `HeadMoved` by rebuilding a private index from the new HEAD before retrying.
+Each `commit-msg` hook receives an owned temporary message path through its first argument.
+
 ### File locks
 
 `FileLock.tryAcquire(path, create = true)` returns a non-blocking ownership handle.

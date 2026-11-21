@@ -9,6 +9,7 @@ export interface GoalRuntimeHost {
 	getState(): GoalModeState | undefined;
 	setState(state: GoalModeState | undefined): void;
 	getCurrentUsage(): GoalTokenUsage;
+	isWaitingForUser(): boolean;
 	emit(event: GoalRuntimeEvent): void | Promise<void>;
 	persist(mode: "goal" | "goal_paused" | "none", state?: GoalModeState): void;
 	sendHiddenMessage(message: {
@@ -463,9 +464,12 @@ export class GoalRuntime {
 		});
 	}
 
-	async pauseGoal(): Promise<GoalModeState | undefined> {
+	/** Implicit pauses validate their owner after queueing and usage notifications; explicit operator pauses omit the guard. */
+	async pauseGoal(options?: { isCurrent?: () => boolean }): Promise<GoalModeState | undefined> {
 		return await this.#withAccounting(async () => {
-			await this.#flushUsageLocked("suppressed");
+			if (options?.isCurrent?.() === false) return undefined;
+			await this.#flushUsageLocked("suppressed", undefined, false, options?.isCurrent);
+			if (options?.isCurrent?.() === false) return undefined;
 			const state = this.#getStateClone();
 			if (!state?.goal) return undefined;
 			state.enabled = false;
@@ -534,7 +538,7 @@ export class GoalRuntime {
 
 	buildContinuationPrompt(): string | undefined {
 		const state = this.#host.getState();
-		return state?.enabled && state.goal.status === "active"
+		return state?.enabled && state.goal.status === "active" && !this.#host.isWaitingForUser()
 			? renderGoalPrompt("continuation", state.goal)
 			: undefined;
 	}

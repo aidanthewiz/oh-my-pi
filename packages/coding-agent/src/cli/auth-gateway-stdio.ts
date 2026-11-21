@@ -11,7 +11,7 @@
  * permitted candidate. Serving ends when stdin does.
  */
 import { Console } from "node:console";
-import { writeSync } from "node:fs";
+import * as fs from "node:fs";
 import type { Api, AuthStorage, Model } from "@oh-my-pi/pi-ai";
 import {
 	AuthGatewayStdioResponseLimitError,
@@ -23,6 +23,7 @@ import {
 import { isTransientStatus } from "@oh-my-pi/pi-ai/error";
 import { classifyGatewayError, type GatewayErrorClassification } from "@oh-my-pi/pi-ai/error/gateway";
 import { getProjectDir, isRecord, logger, postmortem, readSseEvents, VERSION } from "@oh-my-pi/pi-utils";
+import type { ModelKind } from "@oh-my-pi/pi-catalog/types";
 import { ModelRegistry } from "../config/model-registry";
 import {
 	disabledProviderIds,
@@ -34,37 +35,65 @@ import {
 import { Settings } from "../config/settings";
 import { claimRpcInput } from "../modes/rpc/rpc-input";
 import { discoverAuthStorage, loadCliExtensionProviders } from "../sdk";
-import { collectOnlineTinyCandidates, expandOnlineTinyModelFallbacks } from "../tiny/online-candidates";
+import { expandOnlineTinyModelFallbacks } from "../tiny/online-candidates";
 
 /** Names the caller in the gateway's logs. */
 const STDIO_PEER = "stdio";
 
-function gatewayModels(settings: Settings, registry: Pick<ModelRegistry, "getAvailable">): Model<Api>[] {
+function gatewayModels(
+	settings: Settings,
+	registry: Pick<ModelRegistry, "getAvailable">,
+	kind: ModelKind | "all" = "all",
+): Model<Api>[] {
 	const disabled = disabledProviderIds(settings);
-	return filterModelsByConfiguredScope(registry.getAvailable("all"), settings).filter(
+	return filterModelsByConfiguredScope(registry.getAvailable(kind), settings).filter(
 		model => !disabled.has(model.provider),
 	);
 }
 
+/** Model kind each non-chat route serves; other paths are chat routes. */
+const ROUTE_KINDS: Record<string, ModelKind> = {
+	"/v1/systemone": "judge",
+	"/alpha/decisions": "judge",
+	"/v1/images/generations": "image",
+	"/v1/images": "image",
+	"/v1/images/edits": "image",
+	"/v1/audio/speech": "tts",
+	"/v1/audio/transcriptions": "stt",
+	"/v1/embeddings": "embedding",
+	"/v1/rerank": "rerank",
+	"/v1/videos": "video",
+};
+
+/**
+ * Catalog kinds the gateway has a route for. Other kinds (tiny, search) have no
+ * wire, so `/v1/models` never advertises them.
+ */
+export const GATEWAY_MODEL_KINDS: readonly ModelKind[] = ["chat", ...new Set(Object.values(ROUTE_KINDS))];
+
 /**
  * The models a request naming `selector` may run on, in order: the model
- * `--model` would pick (the first entry of a comma list that resolves), then
- * that model's `retry.fallbackChains` (its role's chain when the entry named a
- * role). Empty when no entry resolves.
+ * `--model` would pick among models of `kind` (the first entry of a comma
+ * list that resolves), then that model's configured `retry.fallbackChains`
+ * (its role's chain when the entry named a role; never the role's built-in
+ * priority list). Empty when no entry resolves.
  */
 export function selectorCandidates(
 	selector: string,
 	settings: Settings,
-	registry: Pick<ModelRegistry, "getAll" | "getAvailable">,
+	registry: Pick<ModelRegistry, "getAll" | "getAvailable"> & Partial<Pick<ModelRegistry, "hasProvider">>,
+	kind: ModelKind = "chat",
 ): Model<Api>[] {
-	const available = gatewayModels(settings, registry);
-	const scopedRegistry = { getAll: () => registry.getAll("all"), getAvailable: () => available };
+	const available = gatewayModels(settings, registry, kind);
+	const scoped = {
+		getAll: () => registry.getAll(kind),
+		getAvailable: () => available,
+		hasProvider: registry.hasProvider?.bind(registry),
+	};
 	for (const pattern of normalizeModelPatternList(selector)) {
-		const { model, configuredRole } = resolveCliModel({ cliModel: pattern, modelRegistry: scopedRegistry, settings });
+		const { model, configuredRole } = resolveCliModel({ cliModel: pattern, modelRegistry: scoped, settings });
 		if (!model) continue;
-		const chain = configuredRole
-			? collectOnlineTinyCandidates([configuredRole], settings, available).map(candidate => candidate.model)
-			: expandOnlineTinyModelFallbacks(model, settings, available);
+		const chain = expandOnlineTinyModelFallbacks(model, settings, available, configuredRole);
 		const seen = new Set<string>();
 		return [model, ...chain].filter(candidate => {
 			const key = formatModelStringWithRouting(candidate);
@@ -139,11 +168,12 @@ export function createAuthGatewayStdioRouter(
 	storage: AuthStorage,
 	settings: Settings,
 	registry: Pick<ModelRegistry, "getAll" | "getAvailable">,
-): { route(req: Request): Promise<Response>; close(): void } {
+): { route(req: Request): Promise<Response>; close(): Promise<void> } {
 	const router = createAuthGatewayRouter({
 		storage,
-		resolveModel: id => gatewayModels(settings, registry).find(model => `${model.provider}/${model.id}` === id),
-		listModels: () => gatewayModels(settings, registry),
+		resolveModel: id =>
+			gatewayModels(settings, registry, "video").find(model => `${model.provider}/${model.id}` === id),
+		listModels: () => GATEWAY_MODEL_KINDS.flatMap(kind => gatewayModels(settings, registry, kind)),
 	});
 	const route = async (req: Request): Promise<Response> => {
 		if (!router.isModelRequest(req)) return router.route(req, STDIO_PEER);
@@ -166,7 +196,8 @@ export function createAuthGatewayStdioRouter(
 						? body.model.id
 						: undefined;
 		if (selector === undefined || (native && selector.length === 0)) return router.route(req, STDIO_PEER);
-		const candidates = selectorCandidates(selector, settings, registry);
+		const kind = ROUTE_KINDS[pathname] ?? "chat";
+		const candidates = selectorCandidates(selector, settings, registry, kind);
 		let response = Response.json(
 			{ error: { message: `No available model matches "${selector}"`, type: "invalid_request_error" } },
 			{ status: 404 },
@@ -236,8 +267,8 @@ export async function runAuthGatewayStdio(): Promise<void> {
 			for (const item of data) {
 				written +=
 					typeof item === "string"
-						? writeSync(process.stderr.fd, item)
-						: writeSync(
+						? fs.writeSync(process.stderr.fd, item)
+						: fs.writeSync(
 								process.stderr.fd,
 								ArrayBuffer.isView(item)
 									? new Uint8Array(item.buffer, item.byteOffset, item.byteLength)
@@ -250,10 +281,10 @@ export async function runAuthGatewayStdio(): Promise<void> {
 	const controller = new AbortController();
 	let storage: AuthStorage | undefined;
 	let router: Pick<AuthGatewayRouter, "close"> | undefined;
-	const unregister = postmortem.register("auth-gateway-stdio", () => {
+	const unregister = postmortem.register("auth-gateway-stdio", async () => {
 		controller.abort();
-		router?.close();
-		return storage?.close();
+		await router?.close();
+		await storage?.close();
 	});
 	try {
 		const cwd = getProjectDir();
@@ -266,17 +297,18 @@ export async function runAuthGatewayStdio(): Promise<void> {
 		router = stdioRouter;
 		await serveAuthGatewayStdio({
 			input,
-			write: line =>
-				new Promise<void>((resolve, reject) => {
-					protocolStdout.write(line, error => (error ? reject(error) : resolve()));
-				}),
+			write: line => {
+				const flushed = Promise.withResolvers<void>();
+				protocolStdout.write(line, error => (error ? flushed.reject(error) : flushed.resolve()));
+				return flushed.promise;
+			},
 			route: req => stdioRouter.route(req),
 			version: VERSION,
 			signal: controller.signal,
 		});
 	} finally {
 		controller.abort();
-		router?.close();
+		await router?.close();
 		await storage?.close();
 		await input.cancel().catch(() => {});
 		unregister();

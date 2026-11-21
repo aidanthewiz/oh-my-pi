@@ -4,7 +4,7 @@ import { sanitizeErrorLine } from "@oh-my-pi/pi-tui/chrome/error-block";
 import type { SingleResult } from "@oh-my-pi/pi-tui/tools/task";
 import { formatTaskResultSummary } from "@oh-my-pi/pi-coding-agent/task/result-summary";
 import type { TaskParams, TaskToolDetails } from "@oh-my-pi/pi-coding-agent/task";
-import { BUILTIN_LIFECYCLE_SLASH_COMMANDS } from "@oh-my-pi/pi-coding-agent/slash-commands/builtin-lifecycle";
+import { lookupBuiltinSlashCommand } from "@oh-my-pi/pi-coding-agent/slash-commands/builtin-registry";
 import * as seanceResolver from "@oh-my-pi/pi-coding-agent/task/seance";
 import * as discoveryModule from "@oh-my-pi/pi-coding-agent/task/discovery";
 import { getBundledAgent } from "@oh-my-pi/pi-coding-agent/task/agents";
@@ -12,7 +12,7 @@ import type { SessionInfo } from "@oh-my-pi/pi-coding-agent/session/session-list
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import { createInteractiveModeContext } from "../helpers/interactive-mode-context";
 
-const command = BUILTIN_LIFECYCLE_SLASH_COMMANDS.find(candidate => candidate.name === "seance");
+const command = lookupBuiltinSlashCommand("seance");
 
 async function runSeanceCommand(ctx: InteractiveModeContext, args: string): Promise<void> {
 	if (!command?.handleTui) throw new Error("/seance TUI handler is not registered");

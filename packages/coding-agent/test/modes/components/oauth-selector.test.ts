@@ -1,4 +1,9 @@
 import { afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
+import { Agent } from "@oh-my-pi/pi-agent-core";
+import { parseArgs } from "@oh-my-pi/pi-coding-agent/cli/args";
+import { rebuildScopedModels } from "@oh-my-pi/pi-coding-agent/main";
+import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import { filterOAuthLoginProviders } from "@oh-my-pi/pi-coding-agent/config/oauth-login-gate";
 import { resetSettingsForTest, Settings, settings } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -276,6 +281,16 @@ describe("OAuthSelectorComponent", () => {
 				cacheDbPath: directory.join("models.db"),
 				fetch: transport,
 			});
+			const manager = SessionManager.inMemory(directory.path());
+			const session = new AgentSession({
+				agent: new Agent(),
+				sessionManager: manager,
+				settings: sessionSettings,
+				modelRegistry: registry,
+			});
+			session.setScopedModelsRefresher(async () => {
+				await rebuildScopedModels(session, parseArgs([]), registry, sessionSettings);
+			});
 			const getApiKey = vi.spyOn(registry, "getApiKeyForProvider");
 			const login = vi.spyOn(store.oauth, "login");
 			const accountReady = Promise.withResolvers<LogoutAccountSelectorComponent | undefined>();
@@ -283,7 +298,8 @@ describe("OAuthSelectorComponent", () => {
 			let focused: Component | null = null;
 			const ctx = createInteractiveModeContext({
 				settings: sessionSettings,
-				session: { settings: sessionSettings, modelRegistry: registry, sessionId: "excluded-logout" },
+				session,
+				sessionManager: manager,
 				ui: {
 					getFocused: () => focused,
 					setFocus: component => {
@@ -318,6 +334,7 @@ describe("OAuthSelectorComponent", () => {
 			} finally {
 				getApiKey.mockRestore();
 				login.mockRestore();
+				await session.dispose();
 				await store.close();
 			}
 		});

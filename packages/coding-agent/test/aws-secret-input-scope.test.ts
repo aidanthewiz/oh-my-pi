@@ -1071,7 +1071,7 @@ for (const [name, startUrl] of [
 	["bare suffix", "https://awsapps.com/access-portal"],
 	["other partition authority", "https://scope-fixture.awsapps.cn/access-portal"],
 	["username", "https://operator@scope-fixture.awsapps.com/access-portal"],
-	["password", "https://operator:synthetic@scope-fixture.awsapps.com/access-portal"],
+	["password", "https://:synthetic@scope-fixture.awsapps.com/access-portal"],
 	["port", "https://scope-fixture.awsapps.com:8443/access-portal"],
 	["query", "https://scope-fixture.awsapps.com/access-portal?redirect=invalid"],
 	["fragment", "https://scope-fixture.awsapps.com/access-portal#invalid"],

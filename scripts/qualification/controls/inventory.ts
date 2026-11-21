@@ -35,7 +35,7 @@ export const fixtures = [
 	{
 		id: "browser",
 		file: "browser.ts",
-		sha256: "83fc9975e7c92b2f858a5e3aa0d32453cfd9c529ee553357e3a984a2f07d4e5b",
+		sha256: "7b36766d45ea6816e2d1ff19fe07f6294ebf079382dcc709806b9db11f3f3814",
 		cases: [
 			"delivered",
 			"overlay",

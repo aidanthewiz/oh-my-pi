@@ -135,13 +135,16 @@ async fn transitive_overlap_preserves_a_deleted_block_reemitted_by_the_last_oper
 }
 
 #[tokio::test]
-async fn later_transitive_rematch_failure_prevents_every_file_write() {
+async fn later_transitive_rematch_failure_reports_partial_result_and_preserves_failed_target() {
 	let workspace = Workspace::new(EditMode::Sloppy);
 	let path = workspace.write("a.txt", BEFORE);
 	let sibling = workspace.write("sibling.txt", "sibling_before\n");
+	let untouched = workspace.write("untouched.txt", "untouched_before\n");
 	let chain = replacements(&[FIRST, (MIDDLE.0, "block_start\nmiddle_new\n"), LAST]);
 	let input = format!(
-		"*** Edit File: sibling.txt\n*** Find\nsibling_before\n*** Replace\nsibling_after\n{chain}"
+		"*** Edit File: sibling.txt\n*** Find\nsibling_before\n*** \
+		 Replace\nsibling_after\n{chain}*** Edit File: untouched.txt\n*** \
+		 Find\nthis_anchor_was_never_present\n*** Replace\nmust_not_appear\n"
 	);
 	let mut session = workspace.session();
 	session.set_args_json(&json!({ "input": input }).to_string());
@@ -151,17 +154,44 @@ async fn later_transitive_rematch_failure_prevents_every_file_write() {
 	assert_eq!(std::fs::read(&sibling).unwrap(), b"sibling_before\n");
 
 	let writer = DiskWriter::default();
-	let result = session.apply(ApplyRequest::default(), &writer).await;
-	assert!(writer.requests.lock().is_empty(), "staged sibling/earlier operations must not leak");
-	assert_eq!(std::fs::read(&path).unwrap(), BEFORE.as_bytes());
-	assert_eq!(std::fs::read(&sibling).unwrap(), b"sibling_before\n");
-	let error =
-		result.expect_err("operation three cannot match after operation two removes its anchor");
-	assert_eq!(error.kind(), "no_match", "{error}");
-	let failed = preview
+	let result = session
+		.apply(ApplyRequest::default(), &writer)
+		.await
+		.expect("successful independent operations persist with explicit partial results");
+	let expected = "alpha_header\nkeep_one\nblock_start\nmiddle_new\nfile_tail\n";
+	assert_eq!(std::fs::read(&path).unwrap(), expected.as_bytes());
+	assert_eq!(std::fs::read(&sibling).unwrap(), b"sibling_after\n");
+	assert_eq!(std::fs::read(&untouched).unwrap(), b"untouched_before\n");
+	let requests = writer.requests.lock();
+	assert_eq!(requests.len(), 2);
+	assert!(requests.iter().all(|request| request.absolute != untouched));
+	let partial = result
+		.files
+		.iter()
+		.find(|file| file.absolute == path)
+		.unwrap();
+	assert_eq!(partial.op, FileOp::Update);
+	assert_eq!(partial.new_text.as_deref(), Some(expected));
+	assert!(partial.text.contains("Operation 3"), "failed operation missing: {}", partial.text);
+	let failed = result
+		.files
+		.iter()
+		.find(|file| file.absolute == untouched)
+		.unwrap();
+	assert_eq!(failed.op, FileOp::Noop);
+	assert_eq!(failed.old_text, failed.new_text);
+	assert!(failed.text.contains("Operation 1"), "failed target missing: {}", failed.text);
+	let changed = result
+		.files
+		.iter()
+		.find(|file| file.absolute == sibling)
+		.unwrap();
+	assert_eq!(changed.op, FileOp::Update);
+	assert_eq!(changed.new_text.as_deref(), Some("sibling_after\n"));
+	let preview = preview
 		.files
 		.iter()
 		.find(|file| file.display == "a.txt")
 		.unwrap();
-	assert!(failed.error.is_some(), "preview must expose the failed rematch");
+	assert_eq!(preview.diff.as_deref(), Some(partial.diff.as_str()));
 }

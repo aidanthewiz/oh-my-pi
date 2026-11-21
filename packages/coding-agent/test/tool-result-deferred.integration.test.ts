@@ -249,7 +249,11 @@ process.stdout.write("final:" + id + "\\n");
 				isError: true,
 			});
 			expect(details(cancelled).async?.state).toBe("cancelled");
-			await bounded(session.settleAsyncWork(), "deferred delivery drain");
+			const jobs = session.asyncJobManager!;
+			await bounded(
+				jobs.waitForAll().then(() => jobs.drainDeliveries()),
+				"deferred delivery drain",
+			);
 			expect(results.filter(event => event.completion === "deferred").map(event => event.toolCallId)).toEqual([
 				"early",
 				aborted.returned.toolCallId,

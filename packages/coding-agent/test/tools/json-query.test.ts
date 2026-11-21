@@ -75,7 +75,7 @@ describe("JSON query in read tool", () => {
 
 		await fs.writeFile(jsonFile, JSON.stringify(testData, null, 2), "utf-8");
 		await fs.writeFile(jsonlFile, testLines.join("\n") + "\n", "utf-8");
-		// Literals JS numbers cannot hold; jaq prints them verbatim.
+		// Literals JS numbers cannot hold; jq prints them verbatim.
 		await fs.writeFile(numbersFile, '{"ids":[12345678901234567890,1.0,3]}', "utf-8");
 		// `.name` fails on the third element.
 		await fs.writeFile(mixedFile, '[{"name":"a"},{"name":"b"},3]', "utf-8");
@@ -275,8 +275,7 @@ describe("JSON query in read tool", () => {
 			error => error,
 		);
 		const message = String(error);
-		expect(message).toContain("cannot index");
-		expect(message).toContain('with "changedFiles"');
+		expect(message).toContain("changedFiles");
 		expect(Buffer.byteLength(message)).toBeLessThan(debug ? 8 * 1024 + 100 : 1000);
 	});
 

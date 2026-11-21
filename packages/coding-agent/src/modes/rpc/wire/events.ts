@@ -7,6 +7,10 @@ import { absentAs, doc, type WireDefs } from "./dsl";
 
 const JSON_OBJECT = "Record<string, unknown>";
 const MESSAGE_ID = doc("string", "Shared by the start, updates, and end of one message; unique per process.");
+const RUN_OWNERSHIP = {
+	"runId?": "string",
+	"outcome?": "AgentLifecycleOutcome",
+} as const;
 
 export const eventDefs = {
 	AutoCompactionReason: "'threshold' | 'overflow' | 'idle' | 'incomplete'",
@@ -18,6 +22,7 @@ export const eventDefs = {
 
 	AgentStartEvent: {
 		type: "'agent_start'",
+		...RUN_OWNERSHIP,
 		"resumedToolCallIds?": doc(
 			"string[]",
 			"Calls of an unpaired assistant tail a continued run executes before its first model request.",
@@ -25,6 +30,7 @@ export const eventDefs = {
 	},
 	AgentEndEvent: {
 		type: "'agent_end'",
+		...RUN_OWNERSHIP,
 		messages: doc(
 			"AgentMessage[]",
 			"Messages of the run; an oversized frame drops a prefix already delivered by `message_end` (see `messageCount`).",
@@ -40,18 +46,20 @@ export const eventDefs = {
 		"telemetry?": JSON_OBJECT,
 		"coverage?": JSON_OBJECT,
 	},
-	TurnStartEvent: { type: "'turn_start'" },
-	TurnEndEvent: { type: "'turn_end'", message: "AgentMessage", toolResults: "ToolResultMessage[]" },
-	MessageStartEvent: { type: "'message_start'", message: "AgentMessage", "messageId?": MESSAGE_ID },
+	TurnStartEvent: { type: "'turn_start'", ...RUN_OWNERSHIP },
+	TurnEndEvent: { type: "'turn_end'", ...RUN_OWNERSHIP, message: "AgentMessage", toolResults: "ToolResultMessage[]" },
+	MessageStartEvent: { type: "'message_start'", ...RUN_OWNERSHIP, message: "AgentMessage", "messageId?": MESSAGE_ID },
 	MessageUpdateEvent: {
 		type: "'message_update'",
+		...RUN_OWNERSHIP,
 		message: "AgentMessage",
 		assistantMessageEvent: "AssistantMessageEvent",
 		"messageId?": MESSAGE_ID,
 	},
-	MessageEndEvent: { type: "'message_end'", message: "AgentMessage", "messageId?": MESSAGE_ID },
+	MessageEndEvent: { type: "'message_end'", ...RUN_OWNERSHIP, message: "AgentMessage", "messageId?": MESSAGE_ID },
 	ToolExecutionStartEvent: {
 		type: "'tool_execution_start'",
+		...RUN_OWNERSHIP,
 		toolCallId: "string",
 		toolName: "string",
 		"args?": "unknown",
@@ -59,6 +67,7 @@ export const eventDefs = {
 	},
 	ToolExecutionUpdateEvent: {
 		type: "'tool_execution_update'",
+		...RUN_OWNERSHIP,
 		toolCallId: "string",
 		toolName: "string",
 		"args?": "unknown",
@@ -66,12 +75,14 @@ export const eventDefs = {
 	},
 	ToolStreamUpdateEvent: {
 		type: "'tool_stream_update'",
+		...RUN_OWNERSHIP,
 		toolCallId: "string",
 		toolName: "string",
 		"update?": "unknown",
 	},
 	ToolExecutionEndEvent: {
 		type: "'tool_execution_end'",
+		...RUN_OWNERSHIP,
 		toolCallId: "string",
 		toolName: "string",
 		"result?": "unknown",

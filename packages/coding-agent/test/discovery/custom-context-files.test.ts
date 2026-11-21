@@ -35,25 +35,30 @@ function linkWorktree(project: string, worktreeRoot: string): Promise<void> {
 describe("contextFiles.extra", () => {
 	let tempDir = "";
 	let tempHome = "";
-	let originalHome: string | undefined;
-	let originalUserProfile: string | undefined;
-	let originalAgentDir: string | undefined;
-	const dirs: string[] = [];
+	const isolatedEnvKeys = [
+		"HOME",
+		"USERPROFILE",
+		"PI_CODING_AGENT_DIR",
+		"OMP_PROFILE",
+		"PI_PROFILE",
+		"CLAUDE_CONFIG_DIR",
+		"OMP_MANAGED_CONFIG_FILE",
+	] as const;
+	let originalEnv: Record<string, string | undefined>;
 
 	beforeEach(async () => {
 		resetSettingsForTest();
 		resetCapabilityForTests();
-		originalHome = process.env.HOME;
-		originalUserProfile = process.env.USERPROFILE;
-		originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+		originalEnv = Object.fromEntries(isolatedEnvKeys.map(key => [key, process.env[key]]));
 		tempHome = await fs.mkdtemp(path.join(os.tmpdir(), "omp-extra-ctx-home-"));
-		dirs.push(tempHome);
 		process.env.HOME = tempHome;
 		process.env.USERPROFILE = tempHome;
+		restoreEnv("CLAUDE_CONFIG_DIR", undefined);
+		restoreEnv("OMP_MANAGED_CONFIG_FILE", undefined);
 		vi.spyOn(os, "homedir").mockReturnValue(tempHome);
 		setAgentDir(path.join(tempHome, ".omp", "agent"));
-		tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-extra-ctx-"));
-		dirs.push(tempDir);
+		tempDir = await fs.mkdtemp(path.join(tempHome, "omp-extra-ctx-"));
+		await fs.mkdir(path.join(tempDir, ".git"));
 	});
 
 	afterEach(async () => {
@@ -61,11 +66,9 @@ describe("contextFiles.extra", () => {
 		resetCapabilityForTests();
 		AgentStorage.close();
 		vi.restoreAllMocks();
-		restoreEnv("HOME", originalHome);
-		restoreEnv("USERPROFILE", originalUserProfile);
-		restoreEnv("PI_CODING_AGENT_DIR", originalAgentDir);
+		for (const key of isolatedEnvKeys) restoreEnv(key, originalEnv[key]);
 		__resetDirsFromEnvForTests();
-		await Promise.all(dirs.splice(0).map(dir => removeWithRetries(dir)));
+		await removeWithRetries(tempHome);
 	});
 
 	async function bind(extra: string[], cwd = tempDir): Promise<void> {

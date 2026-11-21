@@ -24,14 +24,14 @@
     "v18102-task-lifecycle-runtime-proof.ts": { "file": "post95-domain-v18122-r1-v18102-task-lifecycle-runtime-proof.ts.txt", "sha256": "9813722ec596e3bae94c0ec0d2cbf45beb82da351a3546af728104efad44cab3" },
     "v18102-presentation-runtime-proof.ts": { "file": "post95-domain-v18122-r1-v18102-presentation-runtime-proof.ts.txt", "sha256": "d0d64b3a981b851de988b8757ea64c9889269682a83a4c717d5489b71fc48044" },
     "v18102-async-media-runtime-proof.ts": { "file": "post95-domain-v18122-r1-v18102-async-media-runtime-proof.ts.txt", "sha256": "c10a8662cdf483a46583b60787fa4eb2b28c1226156191004a2e9eb231ca029a" },
-    "v18102-early-replay-runtime-proof.ts": { "file": "post95-domain-v18122-r1-v18102-early-replay-runtime-proof.ts.txt", "sha256": "9fb4f2f3bb8e53d75a0d962cb9da2d4ef41de357e240a0981901cbbbfd800861" },
+    "v18102-early-replay-runtime-proof.ts": { "file": "post95-domain-v18122-r1-v18102-early-replay-runtime-proof.ts.txt", "sha256": "c8ee829d227be0627da896ae6f6a757eb66a01557f07e96de730d126617f1c51" },
     "task-dispatch-runtime-proof.ts": { "file": "post95-domain-v18122-r1-task-dispatch-runtime-proof.ts.txt", "sha256": "a7f8681621d086a1cf6d6c73ed04ca38ada00898ce0af1a21d953390f0591d88" },
     "final-portable-title-runtime-proof.ts": { "file": "post95-domain-v18122-r1-final-portable-title-runtime-proof.ts.txt", "sha256": "9f1404305e27598e1040d6faf98c27d0119308f33dfd21c3231b9dbbb904a6e8" },
     "final-portable-title-database-proof.ts": { "file": "post95-domain-v18122-r1-final-portable-title-database-proof.ts.txt", "sha256": "590d6a76e11ca932ffb05a6517cae4119378c35436544f4051e9889e986de160" },
     "final-sol-ultrafast-runtime-proof.ts": { "file": "post95-domain-v18122-r1-final-sol-ultrafast-runtime-proof.ts.txt", "sha256": "a4afaf9b2bf0831f062f92abd9a9d2e5641b26e848fb0ddff5d1a1c2ff22dc67" },
     "v18102-provider-beta-corrected-runtime-proof.ts": { "file": "post95-domain-v18122-r1-v18102-provider-beta-corrected-runtime-proof.ts.txt", "sha256": "15e03a5e32440a15bb92a4d3f6df27cf456f0e32de0e7625676763cd07322b74" },
     "v18103-accounting-runtime-proof.ts": { "file": "post95-domain-v18122-r1-v18103-accounting-runtime-proof.ts.txt", "sha256": "1af85f62ea3ee9d64d0cdd1e6c376a0531c777170ce10e0448a3f0a7917cf222" },
-    "v18103-restore-runtime-proof.ts": { "file": "post95-domain-v18122-r1-v18103-restore-runtime-proof.ts.txt", "sha256": "2e4c6ba44394936174e58661008ce070b07da8a701ef1533363b377e8f08b17f" },
+    "v18103-restore-runtime-proof.ts": { "file": "post95-domain-v18122-r1-v18103-restore-runtime-proof.ts.txt", "sha256": "335268ea23200b24d4fde7f873ce44249ebc8d5ce51c362ff447bd84c8d2ab11" },
     "v18104-approval-runtime-proof.ts": { "file": "post95-domain-v18122-r1-v18104-approval-runtime-proof.ts.txt", "sha256": "60aeb28c96add67328a8d0bf95de0c5948eb025386cac5ee9c4ff63280b62f60" }
   },
   "adaptations": [
@@ -45,6 +45,7 @@
     "Resolve the accounting omptype package through its engine source entrypoint.",
     "Import the Responses replay policy from openai-responses-state, matching the current Agent owner.",
     "Replace machine-home inequalities with filesystem-root and isolated-HOME assertions.",
+    "Wait for the root manager's actual jobs, delivery drain, and result-driven run within the existing restore settlement deadline before both persistence awaits.",
     "Compile through the canonical parent compiler and execute with parent-enforced checkout-read denial.",
     "Copy actual ANSI, protocol, and image artifacts to output; expose title observations as six ANSI captures per mode."
   ],

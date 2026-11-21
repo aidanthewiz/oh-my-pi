@@ -1,3 +1,4 @@
+import { isRecord } from "@oh-my-pi/pi-utils";
 import {
 	type DaemonState,
 	type DaemonRestartPolicy,
@@ -18,6 +19,9 @@ export { DAEMON_BROKER_WORKER_ARG } from "../cli/worker-selectors";
 /** Fixed dimensions negotiated with every supervised PTY. */
 export const DAEMON_PTY_COLUMNS = 120;
 export const DAEMON_PTY_ROWS = 40;
+
+/** Readiness and wait regexes match line anchors within accumulated process output. */
+export const DAEMON_OUTPUT_PATTERN_FLAGS = "mu";
 
 /** Environment key carrying the broker's canonical project or synthetic global scope directory. */
 export const DAEMON_PROJECT_DIR_ENV = "OMP_DAEMON_PROJECT_DIR";
@@ -135,10 +139,6 @@ export interface DaemonCompletionNotification {
 }
 
 export type DaemonWireMessage = DaemonWireResponse | DaemonCompletionNotification;
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 function record(value: unknown, label: string): Record<string, unknown> {
 	if (!isRecord(value)) throw new Error(`${label} must be an object`);

@@ -11,7 +11,7 @@ import { shadowPlanIfPresent, snapshotVmContext } from "../js/context-manager";
 import type { RuntimeCallIdentity } from "../js/shared/runtime";
 import { shadowSnapshotDigest } from "../js/shared/runtime";
 import type { JsStatusEvent } from "../js/shared/types";
-import { bridgeValueFromToolResult } from "../js/tool-bridge";
+import { bridgeValueFromToolResult } from "../js/session-tool";
 import { namespaceSessionId as namespacePythonSessionId } from "../py";
 import { shadowPlanPythonIfPresent, snapshotPythonNamespaceIfPresent } from "../py/executor";
 import { type ShadowClaimKey, ShadowClaimStore } from "./claim-store";

@@ -364,15 +364,17 @@ describe("native IPC", () => {
 			child.exited.then(code => {
 				throw new Error(`IPC client exited with ${code} before server acceptance`);
 			}),
+			Bun.sleep(45_000).then(() => {
+				throw new Error("the child never connected");
+			}),
 		]);
 		const peer = record(connection);
 		expect(connection.send("unref")).toBe(true);
-		// Real time is the subject here: a leaked loop ref means the child never
-		// exits, so the only observable failure is the deadline expiring.
-		const exited = await Promise.race([child.exited, Bun.sleep(10_000).then(() => "timeout" as const)]);
-		expect(exited).toBe(0);
+		// Real time is the subject here: a leaked loop ref means the child never exits.
+		const deadline = Bun.sleep(10_000).then(() => "timeout" as const);
+		expect(await Promise.race([child.exited, deadline])).toBe(0);
 		expect(await stdout).toContain("connected");
-		await peer.closed;
+		expect(await Promise.race([peer.closed.then(() => "closed" as const), deadline])).toBe("closed");
 		expect(peer.reason).toBeNull();
-	});
+	}, 60_000);
 });

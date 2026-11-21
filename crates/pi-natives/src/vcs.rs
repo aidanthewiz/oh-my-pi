@@ -162,6 +162,14 @@ pub struct VcsNumstatEntry {
 	pub added:   Option<u32>,
 	pub removed: Option<u32>,
 }
+/// One blob or symlink of a tree listing.
+#[napi(object)]
+pub struct VcsTreeEntry {
+	pub path: String,
+	/// Octal git mode as `git ls-tree` prints it: `100644`, `100755`, or
+	/// `120000`.
+	pub mode: String,
+}
 /// Bounded object contents.
 #[napi(object)]
 pub struct VcsShowResult {
@@ -196,11 +204,20 @@ pub struct VcsStatusOptions {
 #[napi(object)]
 #[derive(Default)]
 pub struct VcsCommitOptions {
-	pub author:      Option<VcsCommitAuthor>,
-	pub allow_empty: Option<bool>,
-	pub amend:       Option<bool>,
-	pub files:       Option<Vec<String>>,
-	pub env:         Option<HashMap<String, String>>,
+	pub author:        Option<VcsCommitAuthor>,
+	pub allow_empty:   Option<bool>,
+	pub amend:         Option<bool>,
+	/// Commit working copies of tracked paths, or entries from `indexPath`.
+	/// Keep any newer content staged concurrently during hooks.
+	pub files:         Option<Vec<String>>,
+	/// Build the commit from this index file instead of the repository's.
+	pub index_path:    Option<String>,
+	/// Fail with `HeadMoved` unless HEAD matches this revision; `null` requires
+	/// an unborn HEAD. Omit to disable the caller guard.
+	pub expected_head: Option<Either<String, Null>>,
+	/// Skip the `pre-commit` and `commit-msg` hooks (`git commit --no-verify`).
+	pub no_verify:     Option<bool>,
+	pub env:           Option<HashMap<String, String>>,
 }
 /// Patch application options.
 #[napi(object)]
@@ -321,6 +338,11 @@ impl From<core::CommitDetails> for VcsCommitDetails {
 		Self { sha: v.sha, parents: v.parents, author: v.author.into(), message: v.message }
 	}
 }
+impl From<core::TreeEntry> for VcsTreeEntry {
+	fn from(v: core::TreeEntry) -> Self {
+		Self { path: v.path, mode: format!("{:06o}", v.mode) }
+	}
+}
 impl From<core::NumstatEntry> for VcsNumstatEntry {
 	fn from(v: core::NumstatEntry) -> Self {
 		Self { path: v.path, added: v.added, removed: v.removed }
@@ -364,11 +386,17 @@ impl TryFrom<VcsStatusOptions> for core::StatusOptions {
 impl From<VcsCommitOptions> for core::CommitOptions {
 	fn from(v: VcsCommitOptions) -> Self {
 		Self {
-			author:      v.author.map(Into::into),
-			allow_empty: v.allow_empty.unwrap_or(false),
-			amend:       v.amend.unwrap_or(false),
-			files:       v.files.unwrap_or_default(),
-			env:         v.env.map(|values| values.into_iter().collect()),
+			author:        v.author.map(Into::into),
+			allow_empty:   v.allow_empty.unwrap_or(false),
+			amend:         v.amend.unwrap_or(false),
+			files:         v.files.unwrap_or_default(),
+			index_path:    v.index_path.map(PathBuf::from),
+			expected_head: v.expected_head.map(|expected| match expected {
+				Either::A(revision) => Some(revision),
+				Either::B(_) => None,
+			}),
+			no_verify:     v.no_verify.unwrap_or(false),
+			env:           v.env.map(|values| values.into_iter().collect()),
 		}
 	}
 }
@@ -818,6 +846,16 @@ impl VcsGitRepo {
 		blocking("vcs.isDirty", self.inner.clone(), signal, |repo| repo.is_dirty())
 	}
 
+	/// Operation underway, including unresolved index conflicts without state
+	/// files.
+	#[napi(ts_return_type = "Promise<\"merge\" | \"cherry-pick\" | \"revert\" | \"rebase\" | \
+	                         \"am\" | \"unmerged-index\" | null>")]
+	pub fn operation_kind(&self, signal: Option<Unknown>) -> Promise<Option<String>> {
+		blocking("vcs.operationKind", self.inner.clone(), signal, |repo| {
+			repo.operation_kind().map(|kind| kind.map(str::to_owned))
+		})
+	}
+
 	/// Porcelain status.
 	#[napi]
 	pub fn status_porcelain(
@@ -1004,15 +1042,18 @@ impl VcsGitRepo {
 		})
 	}
 
-	/// List tree paths.
+	/// List a tree's blobs and symlinks recursively with their modes.
 	#[napi]
 	pub fn ls_tree(
 		&self,
 		rev: String,
 		paths: Vec<String>,
 		signal: Option<Unknown>,
-	) -> Promise<Vec<String>> {
-		blocking("vcs.lsTree", self.inner.clone(), signal, move |r| r.ls_tree(&rev, &paths))
+	) -> Promise<Vec<VcsTreeEntry>> {
+		blocking("vcs.lsTree", self.inner.clone(), signal, move |r| {
+			r.ls_tree(&rev, &paths)
+				.map(|v| v.into_iter().map(Into::into).collect())
+		})
 	}
 
 	/// List submodule paths.
@@ -1280,6 +1321,20 @@ impl VcsGitRepo {
 	) -> Promise<()> {
 		blocking("vcs.readTree", self.inner.clone(), signal, move |r| {
 			r.read_tree(&treeish, index_path.as_deref().map(Path::new))
+		})
+	}
+
+	/// Read a tree into a private index while preserving sparse-checkout
+	/// exclusions.
+	#[napi]
+	pub fn read_tree_keeping_sparse(
+		&self,
+		treeish: String,
+		index_path: String,
+		signal: Option<Unknown>,
+	) -> Promise<()> {
+		blocking("vcs.readTreeKeepingSparse", self.inner.clone(), signal, move |r| {
+			r.read_tree_keeping_sparse(&treeish, Path::new(&index_path))
 		})
 	}
 

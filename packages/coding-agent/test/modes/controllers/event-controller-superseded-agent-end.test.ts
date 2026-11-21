@@ -56,10 +56,16 @@ function createContext(): FocusHarness {
 			get isStreaming() {
 				return state.mainStreaming;
 			},
+			get isRunActive() {
+				return state.mainStreaming;
+			},
 		},
 		viewSession: {
 			get isStreaming() {
 				return state.viewStreaming;
+			},
+			get isRunActive() {
+				return state.phase !== "idle";
 			},
 			get lifecycleState() {
 				return { runId: state.runId, phase: state.phase };
@@ -166,17 +172,31 @@ describe("focused agent_end ownership", () => {
 	});
 
 	for (const phase of ["idle", "continuing"] as const) {
-		it(`retires a ${phase} viewed loader while main streams and the viewed prompt unwinds`, async () => {
+		it(`preserves continuing work and retires an idle viewed loader while main runs (${phase})`, async () => {
 			const h = createContext();
 			const loader = await beginFocusedRun(h);
 			h.state.mainStreaming = true;
 			h.state.phase = phase;
-			await h.controller.handleEvent({ ...AGENT_END, isTerminal: phase === "idle" } as AgentSessionEvent);
+			await h.controller.handleEvent(
+				phase === "idle"
+					? AGENT_END
+					: {
+							type: "agent_pause",
+							messages: [],
+							yielded: false,
+							awaiting: false,
+						},
+			);
 			await h.scheduler.advance(h.terminal, 300);
-			expect(h.ctx.loadingAnimation).toBeUndefined();
-			expect(h.ctx.statusContainer.children).not.toContain(loader);
-			expect(loader.debugState().running).toBe(false);
-			expect(h.terminal.getViewport().some(row => row.includes("WORKING"))).toBe(false);
+			if (phase === "idle") {
+				expect(h.ctx.loadingAnimation).toBeUndefined();
+				expect(h.ctx.statusContainer.children).not.toContain(loader);
+				expect(loader.debugState().running).toBe(false);
+				expect(h.terminal.getViewport().some(row => row.includes("WORKING"))).toBe(false);
+			} else {
+				expect(h.ctx.loadingAnimation).toBe(loader);
+				expect(loader.debugState().running).toBe(true);
+			}
 		});
 	}
 
@@ -257,7 +277,7 @@ describe("focused agent_end ownership", () => {
 		const pending = Promise.withResolvers<void>();
 		h.ctx.viewSession.waitForIdle = () => pending.promise;
 		h.ctx.flushPendingCommandOutput = () => h.ctx.chatContainer.addChild(new Text("COMMAND", 0, 0));
-		await h.controller.handleEvent({ ...AGENT_END, isTerminal: false } as AgentSessionEvent);
+		await h.controller.handleEvent({ type: "agent_pause", messages: [], yielded: false, awaiting: false });
 		expect(h.ctx.loadingAnimation).toBe(loader);
 		expect(h.ctx.chatContainer.children.some(child => child.render(100).some(row => row.includes("COMMAND")))).toBe(
 			true,

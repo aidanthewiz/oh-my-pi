@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Settings } from "../../src/config/settings";
-import { AwsTool, listTrustedAwsProfiles } from "../../src/tools/aws";
+import { AwsTool, awsSessionAuthGroups, listTrustedAwsProfiles } from "../../src/tools/aws";
 import { WriteTool } from "../../src/tools/write";
 import type { XdevState } from "../../src/tools/xdev";
 import { DeferredMCPTool, MCPTool } from "../../src/mcp/tool-bridge";
@@ -562,12 +562,64 @@ const managedRead = new MCPTool(connection, {
 	annotations: { readOnlyHint: true },
 	inputSchema: { type: "object", properties: { aws_profile: { type: "string", enum: ["parallel-peer"] } } },
 });
-const [nativeShared, managedShared] = await Promise.all([
-	tool.execute("parallel-native", { ...read, profile: "parallel" }, undefined, undefined, context),
-	managedRead.execute("parallel-managed", { aws_profile: "parallel-peer" }, undefined, context),
-]);
-assert.notEqual(nativeShared.isError, true);
-assert.notEqual(managedShared.isError, true);
+const [nativeShared, managedShared] = await (async () => {
+	const ui = context.ui;
+	assert(ui, "AWS approval fixture requires its real UI");
+	const approvalEntered = Promise.withResolvers<void>();
+	const nativeRecoveryEntered = Promise.withResolvers<void>();
+	const releaseApproval = Promise.withResolvers<void>();
+	const recoverOnce = awsSessionAuthGroups.recoverOnce;
+	let waitingForNative = false;
+	awsSessionAuthGroups.recoverOnce = (group, recover) => {
+		const pending = recoverOnce.call(awsSessionAuthGroups, group, recover);
+		if (waitingForNative) nativeRecoveryEntered.resolve();
+		return pending;
+	};
+	const managedContext: AgentToolContext = {
+		...context,
+		ui: {
+			...ui,
+			confirm: async (title, message, options) => {
+				approvalEntered.resolve();
+				await releaseApproval.promise;
+				return ui.confirm(title, message, options);
+			},
+		},
+	};
+	const managedPending = managedRead.execute(
+		"parallel-managed",
+		{ aws_profile: "parallel-peer" },
+		undefined,
+		managedContext,
+	);
+	let nativeDrain: Promise<unknown> | undefined;
+	try {
+		await Promise.race([approvalEntered.promise, managedPending]);
+		waitingForNative = true;
+		const nativePending = tool.execute(
+			"parallel-native",
+			{ ...read, profile: "parallel" },
+			undefined,
+			undefined,
+			context,
+		);
+		nativeDrain = nativePending;
+		await Promise.race([
+			nativeRecoveryEntered.promise,
+			nativePending.then(result => {
+				if (!result.isError) throw new Error("Native call completed before joining pending authentication");
+			}),
+		]);
+		releaseApproval.resolve();
+		return await Promise.all([nativePending, managedPending]);
+	} finally {
+		releaseApproval.resolve();
+		await Promise.allSettled([managedPending, ...(nativeDrain ? [nativeDrain] : [])]);
+		awsSessionAuthGroups.recoverOnce = recoverOnce;
+	}
+})();
+assert.notEqual(nativeShared.isError, true, text(nativeShared));
+assert.notEqual(managedShared.isError, true, text(managedShared));
 assert.equal(confirmations, 2);
 assert.deepEqual(managedRequests, ["parallel-peer", "parallel-peer"]);
 assert.equal(
@@ -1169,7 +1221,6 @@ const batchSession: ToolSession = {
 	xdev: batchXdev,
 	getToolContext: () => batchContext,
 	getToolForEvalBridge: name => batchTools.getToolForEvalBridge(name),
-	getEvalBridgeToolNames: () => batchTools.getEvalBridgeToolNames(),
 };
 const batchWrite = new ExtensionToolWrapper(new WriteTool(batchSession) as unknown as AgentTool, sessionRunner);
 batchRegistry.set("write", batchWrite);

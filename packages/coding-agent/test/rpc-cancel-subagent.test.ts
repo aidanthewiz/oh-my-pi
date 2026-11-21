@@ -226,6 +226,7 @@ describe("handleRpcCancelSubagent", () => {
 			sessionManager: { appendSessionInit: () => {} },
 			getActiveToolNames: () => ["read", "yield"],
 			getEnabledToolNames: () => ["read", "yield"],
+			getMountedXdevToolNames: () => [],
 			getToolByName: () => undefined,
 			setActiveToolsByName: async () => {},
 			setWorkPoolYieldItems: () => {},
@@ -242,9 +243,10 @@ describe("handleRpcCancelSubagent", () => {
 			prepareForHeadlessAdvisorDrain: () => {},
 			waitForAdvisorCatchup: async () => true,
 			getLastAssistantMessage: () => undefined,
-			hasPendingAsyncWork: () => false,
+			isRunActive: false,
+			wakeSources: undefined,
+			waitForRunEnd: async () => {},
 			getAsyncJobSnapshot: () => ({ running: [], recent: [] }),
-			settleAsyncWork: async () => {},
 			abort: async () => {},
 			dispose: async () => {
 				disposed = true;

@@ -51,7 +51,8 @@ The initial ready frame uses protocol v1 and advertises the opt-in lossless tran
   "supportedProtocolVersions": [1, 2],
   "supportedEventSubscriptionLevels": ["control", "full"],
   "maxFrameBytes": 1048576,
-  "maxReassembledFrameBytes": 67108864
+  "maxReassembledFrameBytes": 67108864,
+  "supportsBashExcludeFromContext": true
 }
 ```
 
@@ -223,8 +224,17 @@ The TypeScript client exposes `setCacheWarming(mode): Promise<CacheWarmingMode>`
 
 ### Bash
 
-- `{ id?, type: "bash", command: string }`
+- `{ id?, type: "bash", command: string, excludeFromContext?: boolean }`
 - `{ id?, type: "abort_bash" }`
+
+`excludeFromContext: true` keeps the run out of model context, like terminal
+`!!`: the output is still returned and recorded in the transcript, where
+extensions and `get_messages` see it. Non-boolean values are rejected.
+
+Older runtimes ignore unknown fields and would share the output, so send
+`excludeFromContext: true` only when the `ready` frame has
+`supportsBashExcludeFromContext: true`. `RpcClient.bash()` enforces this; with
+the Python, Go and Rust SDKs, check `client.ready` / `Ready()` / `ready()`.
 
 `bash` is dispatched concurrently: the RPC server continues reading commands
 while the shell command runs, so `abort_bash` (or any other command) sent
@@ -607,8 +617,8 @@ contains `"rpc"`; this covers both `--mode rpc` and `--mode rpc-ui`. When enable
 turn, sent as a hidden `goal-continuation` message.
 
 - The turn starts once the yielding run has fully unwound. At that moment the goal
-  must still be active, the session idle with nothing queued, plan mode off, open
-  todos not all blocked, and the session not being disposed.
+  must still be active, the session idle with nothing queued, plan mode off, and
+  the session not being disposed.
 - While the turn is decided but not yet started, `get_state.isSettled`,
   `prompt_result.sessionSettled` and `session_settled` treat the session as busy.
   `session_settled` follows if the continuation is abandoned.
@@ -758,9 +768,9 @@ fallback when enabling fails.
 ### `set_todos` payload
 
 Replaces the todo state for the current session and returns `{ todoPhases }`. The list is recorded on the current session branch and restored when that branch is reloaded, compacted, or resumed, like an interactive `/todo` edit.
-Phases use `{ name, tasks }`; tasks retain `{ content, status, blocker? }`. There
+Phases use `{ name, tasks }`; tasks retain `{ content, status }`. There
 are no phase or task IDs. Status is `"pending"`, `"in_progress"`, `"completed"`,
-`"abandoned"`, or `"blocked"`. Snapshot cloning drops extra fields, including
+or `"abandoned"`. Snapshot cloning drops extra fields, including
 task `details` and `notes`.
 
 ```json
@@ -961,13 +971,14 @@ Each command replaces the whole filter state: omitting `messageUpdates` resets i
 
 `yielded` is `true` when the agent finished its turn: the end is terminal, or the session resumes only for queued input or background-job results. It is `false` while the agent continues its own work (retry, compaction continuation, stop-time reminders). Frames from older runtimes omit it; treat those as yielded only when terminal.
 
-`isTerminal: false` means a continuation or possible async delivery remains.
-`awaitingAsyncWork: true` identifies a non-terminal end whose only possible
-resume is a background-job result; cancelled or suppressed delivery may mean
-no follow-up run occurs. The optional fields keep older frames terminal-compatible
-when `isTerminal` is absent. Use `yielded` for a prompt's yield and
-`session_settled` for quiescence, rather than assuming every non-terminal end
-guarantees another turn.
+`isTerminal: false` means the run goes on: a continuation, queued input or
+outside work resumes it. `awaitingAsyncWork: true` identifies a non-terminal end
+whose only possible resume is outside work: a background-job result, a message
+from a child agent still running, or a queued peer message. Every run ends with
+exactly one terminal `agent_end`, also when that outside work goes away without
+resuming it (a cancelled job, a child that finishes without writing back). The
+optional fields keep older frames terminal-compatible when `isTerminal` is
+absent. Use `yielded` for a prompt's yield and `session_settled` for quiescence.
 
 ### Progress events
 
@@ -1316,7 +1327,7 @@ Extensions in RPC mode use request/response UI frames. `--no-ui` disables the ex
 
 `--mode rpc-ui` independently enables the tool UI context, including with `--no-ui`:
 
-- `ask` still sends `select` requests. Free-text answers use `editor` with `promptStyle: true`; `ask` does not send `input` requests. Dialog cancellation can send `cancel`.
+- `ask` still sends `select` requests. Free-text answers use `editor` with `promptStyle: true`; `ask` does not send `input` requests. Dialog cancellation can send `cancel`. Each `ask` prompt's `title` can span several lines: the form's context text for that field (paragraphs, lists, `<pre>` blocks, tables) separated by blank lines, then the field's question on the last line.
 - Other callers using the tool UI context retain its supported dialog methods (`select`, `confirm`, `input`, `editor`, and cancellation) and presentation methods (`notify`, `setStatus`, string-array `setWidget`, `set_editor_text`, and opt-in `setTitle`). `--no-ui` is not a transport-level filter on these methods.
 - Tool approval prompts use the extension runner, not the tool UI context. Under `--no-ui`, tools requiring approval fail closed with a no-interactive-UI error rather than sending an approval dialog, just as with `--mode rpc --no-ui`.
 - MCP authentication challenges do not gain an RPC UI handler in either mode; the interactive-mode MCP auth handler is not installed.
@@ -1333,12 +1344,24 @@ Use `--mode rpc --no-ui` for a host without a tool UI surface; use `--mode rpc-u
      description, emits a positionally aligned
      `optionDetails: Array<{ description?: string }>` array. Hosts that do not
      render descriptions can continue using `options` alone.
+     When the caller supplies them, it also carries `initialIndex?: number`
+     (option to focus first), `selectionMarker?: "radio" | "checkbox"`,
+     `checkedIndices?: number[]` (options currently checked in a checkbox
+     list) and `markableCount?: number` (leading options that get a marker;
+     trailing ones are actions, such as the `ask` tool's "Done selecting";
+     absent means every option when `selectionMarker` is set). The `ask`
+     tool's "Other" row is marked and appears in `checkedIndices` once a custom
+     answer is entered.
+     The `ask` tool's checkbox fallback re-sends `select` after
+     every toggle, so `checkedIndices` is the authoritative checked state; a
+     host that ignores it cannot show which options are already checked.
    - `input` carries `title: string` and optional `placeholder?: string`,
      `timeout?: number`, and `secret?: boolean`. `secret` is an unnegotiated
      host hint from `ExtensionUIDialogOptions.secret`; hosts that support
      masked input should hide typed characters when `secret: true`.
    - `ask` is emitted only after `set_ask_dialog` enables it. It carries every
-     question of one `ask` tool call:
+     question of one extension `ui.askDialog` call (the `ask` tool instead walks
+     its HTML form field by field through `select`, `input` and `editor`):
      `questions: Array<{ id: string, question: string, header?: string, options: Array<{ label: string, description?: string, preview?: string }>, multi?: boolean, recommended?: number }>`
      plus `timeout?: number`. `options` never include an "Other" entry; hosts
      always offer free text.
@@ -1372,22 +1395,21 @@ Example:
 - `{ type: "extension_ui_response", id: string, value: string }`
 - `{ type: "extension_ui_response", id: string, confirmed: boolean }`
 - `{ type: "extension_ui_response", id: string, cancelled: true, timedOut?: boolean }`
-- `{ type: "extension_ui_response", id: string, answers: Array<{ id: string, selectedOptions: string[], customInput?: string }> }` (answers an `ask` request)
+- `{ type: "extension_ui_response", id: string, answers: Array<{ id: string, selectedOptions: string[], customInput?: string, timedOut?: boolean }> }` (answers an `ask` request)
 
 `select` and `input` resolve to `undefined`, and `confirm` to `false`, on
 cancellation, timeout, or signal abort. Signal abort emits a `cancel` request
 with `targetId`. `editor` supports cancellation and signal abort but has no wire timeout.
 Presentation methods and `open_url` are fire-and-forget and require no response.
 
-If a dialog has a timeout, RPC mode resolves to a default value when timeout/abort fires, and emits
-`{ method: "cancel", targetId }` so the host closes the dialog; a later answer to it is ignored. For `ask`, a timeout
-(omp's timer or a host `cancelled: true, timedOut: true` reply) answers every question with its recommended
-option, else its first.
+If a dialog times out or aborts, RPC emits `{ method: "cancel", targetId }` so the host closes it; late answers are ignored. An `ask` timeout, whether from the server timer or a host `cancelled: true, timedOut: true` reply, returns incomplete timeout evidence rather than selecting recommended or first options. Explicit user selections can remain in a timed-out form result, but timeout is never consent or authorization.
 
 `answers` must list one entry per question in request order, with each `id` equal to that question's `id`.
 `selectedOptions` holds exact option labels without duplicates; a multi-select may be empty. A single-select
 (`multi` absent or false) takes at most one option and not both an option and `customInput`. `customInput`
 is trimmed and ignored when empty. Any other shape fails the `ask` tool call instead of guessing.
+
+An answer's optional `timedOut` must be boolean. `true` preserves explicit selections or custom input as incomplete evidence and signals timeout once. A server timer or cancelled timeout returns empty selections, never a recommended/first answer.
 
 ```json
 {
@@ -1549,6 +1571,35 @@ an active live session before disposal or identity replacement. This includes
 new-session, switch/open, fork, branch, and `/btw` transitions. It does not stop
 voice during speculative handoff generation or same-session compaction. Start
 voice again explicitly in the replacement session.
+
+### Custom live endpoint
+
+Live sessions signal Codex with the session's ChatGPT (Codex) sign-in. Set
+`live.endpoint` to a server's base URL (for example `http://127.0.0.1:8080/v1`)
+to run every live session (`/live`, `live_start`, `live_connect`, extension
+`startLive`) on that server instead; no Codex sign-in is needed, and offline mode
+(`models.offline`) allows it. Empty uses Codex. The server speaks the public
+OpenAI Realtime WebRTC API relative to the base:
+
+1. `POST {base}/realtime/calls` with the SDP offer as the body
+   (`Content-Type: application/sdp`); the response body is the SDP answer and
+   its `Location` header names the call, whose last path segment is the call ID
+   (`/v1/realtime/calls/rtc_123` → `rtc_123`). Only 307/308 redirects to the same
+   origin are followed.
+2. A WebSocket at `{base}/realtime?call_id=<id>` (`http` → `ws`, `https` → `wss`;
+   a trailing slash and any query on the base are kept). omp's first message there is
+   `{ "type": "session.update", "session": { "type": "realtime", "instructions", "audio": { "output": { "voice" } }, "delegation": { "type": "client" } } }`;
+   the server picks the model. The session then runs the same events as on Codex:
+   `session.started`/`session.updated`, `input_transcript.added`,
+   `output_transcript.added`, `turn.done`, `delegation.created` and `error` from the
+   server, `delegation.context.append`, `session.context.append` and `session.close`
+   from omp.
+
+`live.apiKey`, when set, is sent as `Authorization: Bearer <key>` on both
+requests and only to this endpoint; Codex credentials and attestation are never
+sent there. Like provider API keys in `models.yml`, it is a literal, the name of
+an environment variable, or `!command` whose output is the key. `live.voice` is
+passed through unchanged, so set it to a voice the server accepts.
 
 ## Dictation Sub-Protocol
 

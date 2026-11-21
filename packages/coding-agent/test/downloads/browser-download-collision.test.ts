@@ -30,7 +30,7 @@ it("retains unrelated files and each sequential and overlapping download's bytes
 			};
 			const browser = { target: () => ({ createCDPSession: async () => session }) } as unknown as Browser;
 			const page = { frames: () => [{ _id: frame }], browserContext: () => ({}) } as unknown as Page;
-			const manager = new DownloadManager(browser, page, frame, { perTab: true });
+			const manager = new DownloadManager(browser, page, frame, { perTab: true, pageEvents: false });
 			managers.push(manager);
 			await manager.enable(directory);
 		}

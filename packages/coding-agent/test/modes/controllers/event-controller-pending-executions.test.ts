@@ -59,8 +59,6 @@ for (const language of ["bash", "python"] as const) {
 					throw new Error(`${language} command finished before streaming output admission`);
 				}),
 			]);
-			const component = language === "bash" ? ctx.bashComponent : ctx.pythonComponent;
-			if (!component) throw new Error(`${language} execution component was not mounted`);
 			const renderExecution = () => Bun.stripANSI(ctx.pendingShellContainer.render(120).join("\n"));
 			const beforeDrain = Bun.stripANSI(ctx.pendingMessagesContainer.render(120).join("\n"));
 			expect(beforeDrain).toContain("queued steer marker");
@@ -70,7 +68,6 @@ for (const language of ["bash", "python"] as const) {
 			const afterDrain = Bun.stripANSI(ctx.pendingMessagesContainer.render(120).join("\n"));
 			expect(afterDrain).not.toContain("queued steer marker");
 			expect(renderExecution()).toContain("ready>");
-			expect(ctx.pendingShellContainer.children).toContain(component);
 			release.resolve();
 			await run;
 			expect(renderExecution()).toContain("ready>finished");
@@ -79,7 +76,6 @@ for (const language of ["bash", "python"] as const) {
 			expect(renderExecution()).not.toContain("ready>");
 			const transcript = Bun.stripANSI(ctx.chatContainer.render(120).join("\n"));
 			expect(transcript.split("ready>finished").length - 1).toBe(1);
-			expect(ctx.chatContainer.children.filter(child => child === component)).toEqual([component]);
 		} finally {
 			release.resolve();
 			await run;

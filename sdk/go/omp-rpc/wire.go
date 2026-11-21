@@ -535,9 +535,43 @@ func (v Usage) MarshalJSON() ([]byte, error) {
 	return encodeObject(plain(v), "", v.Extra)
 }
 
+// Parent-agent IRC message carried by a steer; render it instead of the model-facing `content` envelope.
+type ParentIrc struct {
+	// Sending parent agent id.
+	From string `json:"from"`
+	// Message body as the parent wrote it.
+	Body string `json:"body"`
+	// Extra holds undeclared keys and declared keys whose value did not decode (that field stays zero).
+	// Encoding writes them back, over a declared field with the same key.
+	Extra map[string]json.RawMessage `json:"-"`
+}
+
+func (v *ParentIrc) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "ParentIrc", v.decodeFrom)
+}
+
+func (v *ParentIrc) decodeFrom(raw map[string]json.RawMessage) error {
+	var out ParentIrc
+	d := fieldDecoder{raw: raw, owner: "ParentIrc", open: true}
+	d.required("from", &out.From)
+	d.required("body", &out.Body)
+	out.Extra = d.rest()
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
+func (v ParentIrc) MarshalJSON() ([]byte, error) {
+	type plain ParentIrc
+	return encodeObject(plain(v), "", v.Extra)
+}
+
 type UserMessage struct {
 	Content          MessageContent             `json:"content"`
 	Timestamp        float64                    `json:"timestamp"`
+	ParentIrc        *ParentIrc                 `json:"parentIrc,omitempty"`
 	Synthetic        *bool                      `json:"synthetic,omitempty"`
 	Steering         *bool                      `json:"steering,omitempty"`
 	LiveSteered      *bool                      `json:"liveSteered,omitempty"`
@@ -559,6 +593,7 @@ func (v *UserMessage) decodeFrom(raw map[string]json.RawMessage) error {
 	d.constant("role", "user")
 	d.required("content", &out.Content)
 	d.required("timestamp", &out.Timestamp)
+	d.optional("parentIrc", &out.ParentIrc)
 	d.optional("synthetic", &out.Synthetic)
 	d.optional("steering", &out.Steering)
 	d.optional("liveSteered", &out.LiveSteered)
@@ -1980,7 +2015,6 @@ const (
 	TodoStatusInProgress TodoStatus = "in_progress"
 	TodoStatusCompleted  TodoStatus = "completed"
 	TodoStatusAbandoned  TodoStatus = "abandoned"
-	TodoStatusBlocked    TodoStatus = "blocked"
 )
 
 func (v *TodoStatus) UnmarshalJSON(data []byte) error {
@@ -1989,7 +2023,7 @@ func (v *TodoStatus) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	switch value := TodoStatus(s); value {
-	case TodoStatusPending, TodoStatusInProgress, TodoStatusCompleted, TodoStatusAbandoned, TodoStatusBlocked:
+	case TodoStatusPending, TodoStatusInProgress, TodoStatusCompleted, TodoStatusAbandoned:
 		*v = value
 		return nil
 	}
@@ -2135,10 +2169,8 @@ func (v *SubagentStatus) UnmarshalJSON(data []byte) error {
 type TodoItem struct {
 	Content string     `json:"content"`
 	Status  TodoStatus `json:"status"`
-	// What a `blocked` task is waiting on.
-	Blocker *string  `json:"blocker,omitempty"`
-	Details *string  `json:"details,omitempty"`
-	Notes   []string `json:"notes,omitempty"`
+	Details *string    `json:"details,omitempty"`
+	Notes   []string   `json:"notes,omitempty"`
 }
 
 func (v *TodoItem) UnmarshalJSON(data []byte) error {
@@ -2150,7 +2182,6 @@ func (v *TodoItem) decodeFrom(raw map[string]json.RawMessage) error {
 	d := fieldDecoder{raw: raw, owner: "TodoItem"}
 	d.required("content", &out.Content)
 	d.required("status", &out.Status)
-	d.optional("blocker", &out.Blocker)
 	d.optional("details", &out.Details)
 	d.optional("notes", &out.Notes)
 	if d.err != nil {
@@ -2524,7 +2555,7 @@ type SessionState struct {
 	TokensPerSecond    *float64         `json:"tokensPerSecond"`
 	MessageCount       int64            `json:"messageCount"`
 	QueuedMessageCount int64            `json:"queuedMessageCount"`
-	// Background jobs or deliveries can still inject a follow-up and wake the session.
+	// Background jobs, their deliveries, child agents or queued peer messages can still wake the session.
 	HasPendingAsyncWork bool `json:"hasPendingAsyncWork"`
 	// Idle with nothing queued or pending; same predicate as `session_settled`.
 	IsSettled      bool                `json:"isSettled"`
@@ -2625,26 +2656,37 @@ func (v *ColumnTruncatedRange) decodeFrom(raw map[string]json.RawMessage) error 
 }
 
 type BashResult struct {
-	Output               string                `json:"output"`
-	Cancelled            bool                  `json:"cancelled"`
-	Truncated            bool                  `json:"truncated"`
-	TotalLines           int64                 `json:"totalLines"`
-	TotalBytes           int64                 `json:"totalBytes"`
-	OutputLines          int64                 `json:"outputLines"`
-	OutputBytes          int64                 `json:"outputBytes"`
-	ExitCode             *int64                `json:"exitCode,omitempty"`
-	TimedOut             *bool                 `json:"timedOut,omitempty"`
-	ElidedBytes          *int64                `json:"elidedBytes,omitempty"`
-	ElidedLines          *int64                `json:"elidedLines,omitempty"`
-	ColumnDroppedBytes   *int64                `json:"columnDroppedBytes,omitempty"`
-	ColumnTruncatedLines *int64                `json:"columnTruncatedLines,omitempty"`
+	Output              string  `json:"output"`
+	Cancelled           bool    `json:"cancelled"`
+	Truncated           bool    `json:"truncated"`
+	TotalLines          int64   `json:"totalLines"`
+	TotalBytes          int64   `json:"totalBytes"`
+	OutputLines         int64   `json:"outputLines"`
+	OutputBytes         int64   `json:"outputBytes"`
+	ExitCode            *int64  `json:"exitCode,omitempty"`
+	TimedOut            *bool   `json:"timedOut,omitempty"`
+	ArtifactID          *string `json:"artifactId,omitempty"`
+	ArtifactElidedBytes *int64  `json:"artifactElidedBytes,omitempty"`
+	// Bytes dropped from the middle of `output`, which keeps the head and tail.
+	ElidedBytes *int64 `json:"elidedBytes,omitempty"`
+	// Lines dropped from the middle of `output`.
+	ElidedLines *int64 `json:"elidedLines,omitempty"`
+	// Bytes the per-line column cap cut from `output`, across all lines.
+	ColumnDroppedBytes *int64 `json:"columnDroppedBytes,omitempty"`
+	// Lines of `output` the per-line column cap cut; the artifact holds them whole.
+	ColumnTruncatedLines *int64 `json:"columnTruncatedLines,omitempty"`
+	// First and last lines the column cap cut, numbered as in the artifact; absent when the numbering cannot match it.
 	ColumnTruncatedRange *ColumnTruncatedRange `json:"columnTruncatedRange,omitempty"`
-	ColumnMax            *int64                `json:"columnMax,omitempty"`
-	ArtifactID           *string               `json:"artifactId,omitempty"`
-	ArtifactElidedBytes  *int64                `json:"artifactElidedBytes,omitempty"`
-	ArtifactError        *OutputArtifactError  `json:"artifactError,omitempty"`
-	WorkingDir           *string               `json:"workingDir,omitempty"`
-	Images               []ImageContent        `json:"images,omitempty"`
+	// The per-line column cap in UTF-8 bytes, set when it cut a line.
+	ColumnMax     *int64                     `json:"columnMax,omitempty"`
+	ArtifactError *OutputArtifactError       `json:"artifactError,omitempty"`
+	Minimized     map[string]json.RawMessage `json:"minimized,omitempty"`
+	WorkingDir    *string                    `json:"workingDir,omitempty"`
+	Images        []ImageContent             `json:"images,omitempty"`
+	// The embedded shell's final `ShellTrace` of the run; only when the caller asked for one.
+	Trace map[string]json.RawMessage `json:"trace,omitempty"`
+	// Set when the command overlapped another one on the session's persistent shell and ran in a fork of it.
+	Fork *ShellForkOutcome `json:"fork,omitempty"`
 }
 
 func (v *BashResult) UnmarshalJSON(data []byte) error {
@@ -2663,17 +2705,43 @@ func (v *BashResult) decodeFrom(raw map[string]json.RawMessage) error {
 	d.required("outputBytes", &out.OutputBytes)
 	d.optional("exitCode", &out.ExitCode)
 	d.optional("timedOut", &out.TimedOut)
+	d.optional("artifactId", &out.ArtifactID)
+	d.optional("artifactElidedBytes", &out.ArtifactElidedBytes)
 	d.optional("elidedBytes", &out.ElidedBytes)
 	d.optional("elidedLines", &out.ElidedLines)
 	d.optional("columnDroppedBytes", &out.ColumnDroppedBytes)
 	d.optional("columnTruncatedLines", &out.ColumnTruncatedLines)
 	d.optional("columnTruncatedRange", &out.ColumnTruncatedRange)
 	d.optional("columnMax", &out.ColumnMax)
-	d.optional("artifactId", &out.ArtifactID)
-	d.optional("artifactElidedBytes", &out.ArtifactElidedBytes)
 	d.optional("artifactError", &out.ArtifactError)
+	d.optional("minimized", &out.Minimized)
 	d.optional("workingDir", &out.WorkingDir)
 	d.optional("images", &out.Images)
+	d.optional("trace", &out.Trace)
+	d.optional("fork", &out.Fork)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
+type ShellForkOutcome struct {
+	// What the command set carried back into the session's shell; `false`: it stayed in the fork.
+	Carried bool `json:"carried"`
+	// It left background jobs running in the fork, where later commands' `jobs`, `wait` and `%N` miss them.
+	Jobs bool `json:"jobs"`
+}
+
+func (v *ShellForkOutcome) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "ShellForkOutcome", v.decodeFrom)
+}
+
+func (v *ShellForkOutcome) decodeFrom(raw map[string]json.RawMessage) error {
+	var out ShellForkOutcome
+	d := fieldDecoder{raw: raw, owner: "ShellForkOutcome"}
+	d.required("carried", &out.Carried)
+	d.required("jobs", &out.Jobs)
 	if d.err != nil {
 		return d.err
 	}
@@ -3633,6 +3701,8 @@ func (v *AgentLifecycleOutcome) UnmarshalJSON(data []byte) error {
 }
 
 type AgentStartEvent struct {
+	RunID   *string                `json:"runId,omitempty"`
+	Outcome *AgentLifecycleOutcome `json:"outcome,omitempty"`
 	// Calls of an unpaired assistant tail a continued run executes before its first model request.
 	ResumedToolCallIds []string `json:"resumedToolCallIds,omitempty"`
 }
@@ -3645,6 +3715,8 @@ func (v *AgentStartEvent) decodeFrom(raw map[string]json.RawMessage) error {
 	var out AgentStartEvent
 	d := fieldDecoder{raw: raw, owner: "AgentStartEvent"}
 	d.constant("type", "agent_start")
+	d.optional("runId", &out.RunID)
+	d.optional("outcome", &out.Outcome)
 	d.optional("resumedToolCallIds", &out.ResumedToolCallIds)
 	if d.err != nil {
 		return d.err
@@ -3661,10 +3733,11 @@ func (v AgentStartEvent) MarshalJSON() ([]byte, error) {
 type AgentEndEvent struct {
 	// Messages of the run; an oversized frame drops a prefix already delivered by `message_end` (see `messageCount`).
 	Messages []AgentMessage `json:"messages"`
-	// Original message count when the frame was compacted.
-	MessageCount *int64 `json:"messageCount,omitempty"`
+	RunID    *string        `json:"runId,omitempty"`
 	// This loop's outcome, independent of persisted transcript messages.
 	Outcome *AgentLifecycleOutcome `json:"outcome,omitempty"`
+	// Original message count when the frame was compacted.
+	MessageCount *int64 `json:"messageCount,omitempty"`
 	// False when a continuation or async delivery remains.
 	IsTerminal *bool `json:"isTerminal,omitempty"`
 	// The agent finished its turn and resumes only for queued input or background-job results.
@@ -3684,8 +3757,9 @@ func (v *AgentEndEvent) decodeFrom(raw map[string]json.RawMessage) error {
 	d := fieldDecoder{raw: raw, owner: "AgentEndEvent"}
 	d.constant("type", "agent_end")
 	d.required("messages", &out.Messages)
-	d.optional("messageCount", &out.MessageCount)
+	d.optional("runId", &out.RunID)
 	d.optional("outcome", &out.Outcome)
+	d.optional("messageCount", &out.MessageCount)
 	d.optional("isTerminal", &out.IsTerminal)
 	d.optional("yielded", &out.Yielded)
 	d.optional("awaitingAsyncWork", &out.AwaitingAsyncWork)
@@ -3703,7 +3777,10 @@ func (v AgentEndEvent) MarshalJSON() ([]byte, error) {
 	return encodeObject(plain(v), `"type":"agent_end"`, nil)
 }
 
-type TurnStartEvent struct{}
+type TurnStartEvent struct {
+	RunID   *string                `json:"runId,omitempty"`
+	Outcome *AgentLifecycleOutcome `json:"outcome,omitempty"`
+}
 
 func (v *TurnStartEvent) UnmarshalJSON(data []byte) error {
 	return decodeWith(data, "TurnStartEvent", v.decodeFrom)
@@ -3713,6 +3790,8 @@ func (v *TurnStartEvent) decodeFrom(raw map[string]json.RawMessage) error {
 	var out TurnStartEvent
 	d := fieldDecoder{raw: raw, owner: "TurnStartEvent"}
 	d.constant("type", "turn_start")
+	d.optional("runId", &out.RunID)
+	d.optional("outcome", &out.Outcome)
 	if d.err != nil {
 		return d.err
 	}
@@ -3726,8 +3805,10 @@ func (v TurnStartEvent) MarshalJSON() ([]byte, error) {
 }
 
 type TurnEndEvent struct {
-	Message     AgentMessage        `json:"message"`
-	ToolResults []ToolResultMessage `json:"toolResults"`
+	Message     AgentMessage           `json:"message"`
+	ToolResults []ToolResultMessage    `json:"toolResults"`
+	RunID       *string                `json:"runId,omitempty"`
+	Outcome     *AgentLifecycleOutcome `json:"outcome,omitempty"`
 }
 
 func (v *TurnEndEvent) UnmarshalJSON(data []byte) error {
@@ -3740,6 +3821,8 @@ func (v *TurnEndEvent) decodeFrom(raw map[string]json.RawMessage) error {
 	d.constant("type", "turn_end")
 	d.required("message", &out.Message)
 	d.required("toolResults", &out.ToolResults)
+	d.optional("runId", &out.RunID)
+	d.optional("outcome", &out.Outcome)
 	if d.err != nil {
 		return d.err
 	}
@@ -3753,7 +3836,9 @@ func (v TurnEndEvent) MarshalJSON() ([]byte, error) {
 }
 
 type MessageStartEvent struct {
-	Message AgentMessage `json:"message"`
+	Message AgentMessage           `json:"message"`
+	RunID   *string                `json:"runId,omitempty"`
+	Outcome *AgentLifecycleOutcome `json:"outcome,omitempty"`
 	// Shared by the start, updates, and end of one message; unique per process.
 	MessageID *string `json:"messageId,omitempty"`
 }
@@ -3767,6 +3852,8 @@ func (v *MessageStartEvent) decodeFrom(raw map[string]json.RawMessage) error {
 	d := fieldDecoder{raw: raw, owner: "MessageStartEvent"}
 	d.constant("type", "message_start")
 	d.required("message", &out.Message)
+	d.optional("runId", &out.RunID)
+	d.optional("outcome", &out.Outcome)
 	d.optional("messageId", &out.MessageID)
 	if d.err != nil {
 		return d.err
@@ -3781,8 +3868,10 @@ func (v MessageStartEvent) MarshalJSON() ([]byte, error) {
 }
 
 type MessageUpdateEvent struct {
-	Message               AgentMessage          `json:"message"`
-	AssistantMessageEvent AssistantMessageEvent `json:"assistantMessageEvent"`
+	Message               AgentMessage           `json:"message"`
+	AssistantMessageEvent AssistantMessageEvent  `json:"assistantMessageEvent"`
+	RunID                 *string                `json:"runId,omitempty"`
+	Outcome               *AgentLifecycleOutcome `json:"outcome,omitempty"`
 	// Shared by the start, updates, and end of one message; unique per process.
 	MessageID *string `json:"messageId,omitempty"`
 }
@@ -3797,6 +3886,8 @@ func (v *MessageUpdateEvent) decodeFrom(raw map[string]json.RawMessage) error {
 	d.constant("type", "message_update")
 	d.required("message", &out.Message)
 	d.required("assistantMessageEvent", &out.AssistantMessageEvent)
+	d.optional("runId", &out.RunID)
+	d.optional("outcome", &out.Outcome)
 	d.optional("messageId", &out.MessageID)
 	if d.err != nil {
 		return d.err
@@ -3811,7 +3902,9 @@ func (v MessageUpdateEvent) MarshalJSON() ([]byte, error) {
 }
 
 type MessageEndEvent struct {
-	Message AgentMessage `json:"message"`
+	Message AgentMessage           `json:"message"`
+	RunID   *string                `json:"runId,omitempty"`
+	Outcome *AgentLifecycleOutcome `json:"outcome,omitempty"`
 	// Shared by the start, updates, and end of one message; unique per process.
 	MessageID *string `json:"messageId,omitempty"`
 }
@@ -3825,6 +3918,8 @@ func (v *MessageEndEvent) decodeFrom(raw map[string]json.RawMessage) error {
 	d := fieldDecoder{raw: raw, owner: "MessageEndEvent"}
 	d.constant("type", "message_end")
 	d.required("message", &out.Message)
+	d.optional("runId", &out.RunID)
+	d.optional("outcome", &out.Outcome)
 	d.optional("messageId", &out.MessageID)
 	if d.err != nil {
 		return d.err
@@ -3839,10 +3934,12 @@ func (v MessageEndEvent) MarshalJSON() ([]byte, error) {
 }
 
 type ToolExecutionStartEvent struct {
-	ToolCallID string          `json:"toolCallId"`
-	ToolName   string          `json:"toolName"`
-	Args       json.RawMessage `json:"args,omitempty"`
-	Intent     *string         `json:"intent,omitempty"`
+	ToolCallID string                 `json:"toolCallId"`
+	ToolName   string                 `json:"toolName"`
+	RunID      *string                `json:"runId,omitempty"`
+	Outcome    *AgentLifecycleOutcome `json:"outcome,omitempty"`
+	Args       json.RawMessage        `json:"args,omitempty"`
+	Intent     *string                `json:"intent,omitempty"`
 }
 
 func (v *ToolExecutionStartEvent) UnmarshalJSON(data []byte) error {
@@ -3855,6 +3952,8 @@ func (v *ToolExecutionStartEvent) decodeFrom(raw map[string]json.RawMessage) err
 	d.constant("type", "tool_execution_start")
 	d.required("toolCallId", &out.ToolCallID)
 	d.required("toolName", &out.ToolName)
+	d.optional("runId", &out.RunID)
+	d.optional("outcome", &out.Outcome)
 	d.optional("args", &out.Args)
 	d.optional("intent", &out.Intent)
 	if d.err != nil {
@@ -3870,10 +3969,12 @@ func (v ToolExecutionStartEvent) MarshalJSON() ([]byte, error) {
 }
 
 type ToolExecutionUpdateEvent struct {
-	ToolCallID    string          `json:"toolCallId"`
-	ToolName      string          `json:"toolName"`
-	Args          json.RawMessage `json:"args,omitempty"`
-	PartialResult json.RawMessage `json:"partialResult,omitempty"`
+	ToolCallID    string                 `json:"toolCallId"`
+	ToolName      string                 `json:"toolName"`
+	RunID         *string                `json:"runId,omitempty"`
+	Outcome       *AgentLifecycleOutcome `json:"outcome,omitempty"`
+	Args          json.RawMessage        `json:"args,omitempty"`
+	PartialResult json.RawMessage        `json:"partialResult,omitempty"`
 }
 
 func (v *ToolExecutionUpdateEvent) UnmarshalJSON(data []byte) error {
@@ -3886,6 +3987,8 @@ func (v *ToolExecutionUpdateEvent) decodeFrom(raw map[string]json.RawMessage) er
 	d.constant("type", "tool_execution_update")
 	d.required("toolCallId", &out.ToolCallID)
 	d.required("toolName", &out.ToolName)
+	d.optional("runId", &out.RunID)
+	d.optional("outcome", &out.Outcome)
 	d.optional("args", &out.Args)
 	d.optional("partialResult", &out.PartialResult)
 	if d.err != nil {
@@ -3901,9 +4004,11 @@ func (v ToolExecutionUpdateEvent) MarshalJSON() ([]byte, error) {
 }
 
 type ToolStreamUpdateEvent struct {
-	ToolCallID string          `json:"toolCallId"`
-	ToolName   string          `json:"toolName"`
-	Update     json.RawMessage `json:"update,omitempty"`
+	ToolCallID string                 `json:"toolCallId"`
+	ToolName   string                 `json:"toolName"`
+	RunID      *string                `json:"runId,omitempty"`
+	Outcome    *AgentLifecycleOutcome `json:"outcome,omitempty"`
+	Update     json.RawMessage        `json:"update,omitempty"`
 }
 
 func (v *ToolStreamUpdateEvent) UnmarshalJSON(data []byte) error {
@@ -3916,6 +4021,8 @@ func (v *ToolStreamUpdateEvent) decodeFrom(raw map[string]json.RawMessage) error
 	d.constant("type", "tool_stream_update")
 	d.required("toolCallId", &out.ToolCallID)
 	d.required("toolName", &out.ToolName)
+	d.optional("runId", &out.RunID)
+	d.optional("outcome", &out.Outcome)
 	d.optional("update", &out.Update)
 	if d.err != nil {
 		return d.err
@@ -3930,10 +4037,12 @@ func (v ToolStreamUpdateEvent) MarshalJSON() ([]byte, error) {
 }
 
 type ToolExecutionEndEvent struct {
-	ToolCallID string          `json:"toolCallId"`
-	ToolName   string          `json:"toolName"`
-	Result     json.RawMessage `json:"result,omitempty"`
-	IsError    *bool           `json:"isError,omitempty"`
+	ToolCallID string                 `json:"toolCallId"`
+	ToolName   string                 `json:"toolName"`
+	RunID      *string                `json:"runId,omitempty"`
+	Outcome    *AgentLifecycleOutcome `json:"outcome,omitempty"`
+	Result     json.RawMessage        `json:"result,omitempty"`
+	IsError    *bool                  `json:"isError,omitempty"`
 }
 
 func (v *ToolExecutionEndEvent) UnmarshalJSON(data []byte) error {
@@ -3946,6 +4055,8 @@ func (v *ToolExecutionEndEvent) decodeFrom(raw map[string]json.RawMessage) error
 	d.constant("type", "tool_execution_end")
 	d.required("toolCallId", &out.ToolCallID)
 	d.required("toolName", &out.ToolName)
+	d.optional("runId", &out.RunID)
+	d.optional("outcome", &out.Outcome)
 	d.optional("result", &out.Result)
 	d.optional("isError", &out.IsError)
 	if d.err != nil {
@@ -4735,6 +4846,8 @@ type ReadyEvent struct {
 	SupportedEventSubscriptionLevels []EventSubscriptionLevel `json:"supportedEventSubscriptionLevels,omitempty"`
 	MaxFrameBytes                    *int64                   `json:"maxFrameBytes,omitempty"`
 	MaxReassembledFrameBytes         *int64                   `json:"maxReassembledFrameBytes,omitempty"`
+	// `bash` accepts `excludeFromContext`; require exactly true before sending excluded commands.
+	SupportsBashExcludeFromContext *bool `json:"supportsBashExcludeFromContext,omitempty"`
 }
 
 func (v *ReadyEvent) UnmarshalJSON(data []byte) error {
@@ -4750,6 +4863,7 @@ func (v *ReadyEvent) decodeFrom(raw map[string]json.RawMessage) error {
 	d.optional("supportedEventSubscriptionLevels", &out.SupportedEventSubscriptionLevels)
 	d.optional("maxFrameBytes", &out.MaxFrameBytes)
 	d.optional("maxReassembledFrameBytes", &out.MaxReassembledFrameBytes)
+	d.optional("supportsBashExcludeFromContext", &out.SupportsBashExcludeFromContext)
 	if d.err != nil {
 		return d.err
 	}
@@ -5978,7 +6092,15 @@ type SelectUiRequest struct {
 	Title         string               `json:"title"`
 	Options       []string             `json:"options"`
 	OptionDetails []SelectOptionDetail `json:"optionDetails,omitempty"`
-	Timeout       *int64               `json:"timeout,omitempty"`
+	// Index into `options` to focus first.
+	InitialIndex *int64 `json:"initialIndex,omitempty"`
+	// Marker style for the first `markableCount` options.
+	SelectionMarker *SelectUiRequestSelectionMarker `json:"selectionMarker,omitempty"`
+	// For `checkbox`: indices into `options` currently checked. Authoritative; hosts render it per option.
+	CheckedIndices []int64 `json:"checkedIndices,omitempty"`
+	// Leading options that get a marker; trailing ones are actions. Defaults to all options when `selectionMarker` is set.
+	MarkableCount *int64 `json:"markableCount,omitempty"`
+	Timeout       *int64 `json:"timeout,omitempty"`
 }
 
 func (v *SelectUiRequest) UnmarshalJSON(data []byte) error {
@@ -5994,6 +6116,10 @@ func (v *SelectUiRequest) decodeFrom(raw map[string]json.RawMessage) error {
 	d.required("title", &out.Title)
 	d.required("options", &out.Options)
 	d.optional("optionDetails", &out.OptionDetails)
+	d.optional("initialIndex", &out.InitialIndex)
+	d.optional("selectionMarker", &out.SelectionMarker)
+	d.optional("checkedIndices", &out.CheckedIndices)
+	d.optional("markableCount", &out.MarkableCount)
 	d.optional("timeout", &out.Timeout)
 	if d.err != nil {
 		return d.err
@@ -6005,6 +6131,26 @@ func (v *SelectUiRequest) decodeFrom(raw map[string]json.RawMessage) error {
 func (v SelectUiRequest) MarshalJSON() ([]byte, error) {
 	type plain SelectUiRequest
 	return encodeObject(plain(v), `"type":"extension_ui_request","method":"select"`, nil)
+}
+
+type SelectUiRequestSelectionMarker string
+
+const (
+	SelectUiRequestSelectionMarkerRadio    SelectUiRequestSelectionMarker = "radio"
+	SelectUiRequestSelectionMarkerCheckbox SelectUiRequestSelectionMarker = "checkbox"
+)
+
+func (v *SelectUiRequestSelectionMarker) UnmarshalJSON(data []byte) error {
+	s, err := decodeString(data, "SelectUiRequestSelectionMarker")
+	if err != nil {
+		return err
+	}
+	switch value := SelectUiRequestSelectionMarker(s); value {
+	case SelectUiRequestSelectionMarkerRadio, SelectUiRequestSelectionMarkerCheckbox:
+		*v = value
+		return nil
+	}
+	return unknownValue("SelectUiRequestSelectionMarker", s)
 }
 
 type ConfirmUiRequest struct {
@@ -6105,7 +6251,7 @@ func (v EditorUiRequest) MarshalJSON() ([]byte, error) {
 	return encodeObject(plain(v), `"type":"extension_ui_request","method":"editor"`, nil)
 }
 
-// Every question of one `ask` tool call; sent only after `set_ask_dialog` enables it.
+// Every question of one extension `ui.askDialog` call; sent only after `set_ask_dialog` enables it.
 type AskUiRequest struct {
 	ID        string        `json:"id"`
 	Questions []AskQuestion `json:"questions"`
@@ -6419,11 +6565,13 @@ func (v *ExtensionUiRequest) decodeFrom(raw map[string]json.RawMessage) error {
 	return nil
 }
 
-// Answer to one `ask` question: exact option labels, plus optional free text.
+// Answer to one `ui.askDialog` question: exact option labels, plus optional free text.
 type AskAnswer struct {
 	ID              string   `json:"id"`
 	SelectedOptions []string `json:"selectedOptions"`
 	CustomInput     *string  `json:"customInput,omitempty"`
+	// The answer is incomplete because the host's deadline elapsed, not authorization.
+	TimedOut *bool `json:"timedOut,omitempty"`
 }
 
 func (v *AskAnswer) UnmarshalJSON(data []byte) error {
@@ -6436,6 +6584,7 @@ func (v *AskAnswer) decodeFrom(raw map[string]json.RawMessage) error {
 	d.required("id", &out.ID)
 	d.required("selectedOptions", &out.SelectedOptions)
 	d.optional("customInput", &out.CustomInput)
+	d.optional("timedOut", &out.TimedOut)
 	if d.err != nil {
 		return d.err
 	}
@@ -6499,7 +6648,7 @@ func (v ConfirmUiResponse) MarshalJSON() ([]byte, error) {
 	return encodeObject(plain(v), `"type":"extension_ui_response"`, nil)
 }
 
-// Dismisses a dialog; `timedOut` reports the host's own deadline (an `ask` then takes its recommended answers).
+// Dismisses a dialog; `timedOut` reports the host's own deadline without selecting any recommended or first answer.
 type CancelUiResponse struct {
 	ID       string `json:"id"`
 	TimedOut *bool  `json:"timedOut,omitempty"`
@@ -8602,10 +8751,11 @@ func (c Commands) AbortRetry(ctx context.Context) error {
 
 // BashCommand holds the parameters of "bash".
 type BashCommand struct {
-	Command string `json:"command"`
+	Command            string `json:"command"`
+	ExcludeFromContext *bool  `json:"excludeFromContext,omitempty"`
 }
 
-// Bash sends "bash": Run a shell command.
+// Bash sends "bash": Run a shell command. Before excluding output, require ready.supportsBashExcludeFromContext to be true.
 func (c Commands) Bash(ctx context.Context, p BashCommand) (BashResult, error) {
 	var out BashResult
 	err := c.call(ctx, "bash", p, 0, &out)

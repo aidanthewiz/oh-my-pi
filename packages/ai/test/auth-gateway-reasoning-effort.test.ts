@@ -70,7 +70,7 @@ async function requestUpstream(
 		return { status: response.status, upstream };
 	} finally {
 		await gateway.close();
-		storage.close();
+		await storage.close();
 	}
 }
 

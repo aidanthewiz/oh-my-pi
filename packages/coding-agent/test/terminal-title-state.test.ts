@@ -1,6 +1,7 @@
 import { isNativeRendering, setNativeRendering } from "@oh-my-pi/pi-tui/native/state";
 import { afterEach, beforeEach, describe, expect, it, spyOn, vi } from "bun:test";
 import * as os from "node:os";
+import { DEFAULT_SPINNER_INTERVAL_MS } from "@oh-my-pi/pi-tui/spinner-clock";
 import {
 	buildTerminalTitleWithState,
 	disposeTerminalTitleState,
@@ -12,6 +13,7 @@ import {
 	setExtensionTerminalTitle,
 	setTerminalTitleStateEnabled,
 	setTerminalSessionSource,
+	setTerminalTitleSpinnerInterval,
 	setTerminalTitleSpinnerStyle,
 	setTerminalTitleState,
 } from "@oh-my-pi/pi-coding-agent/utils/title-generator";
@@ -162,6 +164,7 @@ describe("disposeTerminalTitleState", () => {
 		// test's teardown latched it off), a fresh session base, run state idle.
 		initTerminalTitleState();
 		setTerminalTitleSpinnerStyle("braille");
+		setTerminalTitleSpinnerInterval(DEFAULT_SPINNER_INTERVAL_MS);
 		setSessionTerminalTitle("my-project");
 		setTerminalTitleState("idle");
 		resetObserved(writes, windowsTitleMock);
@@ -242,7 +245,7 @@ describe("disposeTerminalTitleState", () => {
 		setTerminalTitleState("working");
 
 		// Control: BEFORE dispose the interval is live — advancing the clock across
-		// several 80ms tick periods DOES emit further OSC-title writes (proves the
+		// several tick periods DOES emit further OSC-title writes (proves the
 		// timer was actually running, so the post-dispose silence is meaningful and
 		// not a headless/TTY misconfiguration masking all writes).
 		resetObserved(writes, windowsTitleMock);
@@ -369,7 +372,7 @@ describe("disposeTerminalTitleState", () => {
 		setTerminalTitleState("working");
 		resetObserved(writes, windowsTitleMock);
 
-		vi.advanceTimersByTime(160);
+		vi.advanceTimersByTime(DEFAULT_SPINNER_INTERVAL_MS * 2);
 
 		const titles = observedTitles(writes, windowsTitleMock);
 		expect(titles.length).toBeGreaterThan(0);
@@ -410,6 +413,36 @@ describe("disposeTerminalTitleState", () => {
 		resetObserved(writes, windowsTitleMock);
 		vi.advanceTimersByTime(400);
 		expect(observedTitles(writes, windowsTitleMock).length).toBeGreaterThan(0);
+	});
+
+	it("ticks at the configured interval, re-arming a live spinner on change", () => {
+		setTerminalTitleState("working");
+		setTerminalTitleSpinnerInterval(1000);
+		resetObserved(writes, windowsTitleMock);
+
+		// Nothing before the new period elapses, even though the default period has passed several times.
+		vi.advanceTimersByTime(999);
+		expect(observedTitles(writes, windowsTitleMock)).toEqual([]);
+		vi.advanceTimersByTime(1);
+		expect(observedTitles(writes, windowsTitleMock)).toHaveLength(1);
+		vi.advanceTimersByTime(1000);
+		expect(observedTitles(writes, windowsTitleMock)).toHaveLength(2);
+	});
+
+	it("pins a static ':' working separator and schedules no timer at interval 0", () => {
+		setTerminalTitleSpinnerInterval(0);
+		resetObserved(writes, windowsTitleMock);
+		setTerminalTitleState("working");
+
+		expect(observedTitles(writes, windowsTitleMock)).toEqual(["π : my-project"]);
+		expect(vi.getTimerCount()).toBe(0);
+		resetObserved(writes, windowsTitleMock);
+		vi.advanceTimersByTime(DEFAULT_SPINNER_INTERVAL_MS * 10);
+		expect(observedTitles(writes, windowsTitleMock)).toEqual([]);
+
+		// Other states are unaffected by the static spinner.
+		setTerminalTitleState("idle");
+		expect(observedTitles(writes, windowsTitleMock)).toEqual(["π > my-project"]);
 	});
 
 	it("clears the title before popping the saved one on shutdown", () => {

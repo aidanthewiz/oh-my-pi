@@ -18,9 +18,10 @@
  * simply never sees those events (see `WIRE_AGENT_EVENT_TYPES` in
  * `collab/host.ts`).
  *
- * Physical loop completions preserve host ownership independently of public
- * session completion. Non-terminal settles map to `willContinue`; only
- * background waits also map to `awaitingAsyncWork`.
+ * Extensions keep one `agent_end` per stopped model loop: the session's
+ * `agent_pause` (a loop stop inside a run) maps to `agent_end` with
+ * `willContinue` (and `awaitingAsyncWork` when only outside work resumes the
+ * run), the session's `agent_end` (the run's end) to a plain `agent_end`.
  */
 import { logger } from "@oh-my-pi/pi-utils";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
@@ -111,20 +112,28 @@ export type MappedExtensionEvent =
  *   does the same for its mirrored stream.
  */
 export function extensionEventFromSessionEvent(
-	event: AgentSessionEvent,
+	event: AgentSessionEvent | AgentSessionLifecycleEvent,
 	turnIndex: number,
 	runId: string,
 ): MappedExtensionEvent | null {
 	switch (event.type) {
 		case "agent_start":
 			return { type: "agent_start", runId };
+		case "agent_pause":
+			return {
+				type: "agent_end",
+				runId,
+				messages: event.messages,
+				willContinue: true,
+				...(event.awaiting ? { awaitingAsyncWork: true } : {}),
+			};
 		case "agent_end":
 			return {
 				type: "agent_end",
 				runId,
 				messages: event.messages,
-				willContinue: event.isTerminal === false ? true : undefined,
-				...(event.isTerminal === false && event.awaitingAsyncWork === true ? { awaitingAsyncWork: true } : {}),
+				...("isTerminal" in event && !event.isTerminal ? { willContinue: true } : {}),
+				...("awaitingAsyncWork" in event && event.awaitingAsyncWork ? { awaitingAsyncWork: true } : {}),
 			};
 		case "turn_start":
 			return { type: "turn_start", turnIndex, timestamp: Date.now() };

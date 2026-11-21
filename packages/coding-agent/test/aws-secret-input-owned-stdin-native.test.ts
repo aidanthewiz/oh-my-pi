@@ -61,7 +61,6 @@ test.skipIf(process.platform === "win32")(
 			repoRoot,
 			entrypoint,
 			outfile,
-			transformersVersion: "unused",
 			native: { platform: process.platform, arch: process.arch },
 			minifyIdentifiers: true,
 			skipBuiltinCodesign: shouldAdhocSign,

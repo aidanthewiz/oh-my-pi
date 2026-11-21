@@ -2,12 +2,10 @@
  * Idle maintenance owned by one session: the idle recap and idle compaction that run once the
  * session has been quiet for a while and its owner does not hold them back.
  *
- * A stretch of activity ends at `agent_end`. Its recap is armed once the run that produced the
- * `agent_end` has unwound and nothing is admitted, queued or scheduled; background work does not
- * hold it back. Idle compaction also waits until no background job or delivery can wake the
- * session. New activity, compaction, a session transition or disposal invalidates everything
- * captured before it: timers, the settling check and an in-flight recap, so a late reply can never
- * be announced.
+ * A model-loop pause or run end opens a quiet stretch. Recaps wait for that loop's
+ * admitted work; compaction also waits until the whole run and every wake source end.
+ * New activity, compaction, a session transition or disposal invalidates captured
+ * timers and replies. A terminal end after a pause does not open a second stretch.
  */
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { isPromptCachePersistent } from "@oh-my-pi/pi-catalog/compat/prompt-cache-persistent";
@@ -24,7 +22,7 @@ import {
 	cfgCompactionIdleThresholdTokens,
 	cfgCompactionIdleTimeoutSeconds,
 } from "./context-settings";
-import { isSessionSettled, type SessionSettleHost, waitForSessionSettlement } from "./session-settle";
+import { isSessionSettled, type SessionSettleState } from "./session-settle";
 
 /** Probes the owner of the session supplies. Both are re-read whenever work could start. */
 export interface IdleMaintenanceOptions {
@@ -37,7 +35,7 @@ export interface IdleMaintenanceOptions {
 }
 
 /** The session surface idle maintenance reads and drives. */
-export type IdleMaintenanceSession = SessionSettleHost &
+export type IdleMaintenanceSession = SessionSettleState &
 	Pick<
 		AgentSession,
 		| "settings"
@@ -48,6 +46,7 @@ export type IdleMaintenanceSession = SessionSettleHost &
 		| "messages"
 		| "subscribe"
 		| "waitForIdle"
+		| "waitForRunEnd"
 		| "waitForAdmittedSubmissions"
 		| "getContextUsage"
 		| "getGoalModeState"
@@ -142,10 +141,12 @@ export class IdleMaintenance {
 			case "auto_compaction_end":
 				this.invalidate();
 				break;
+			case "agent_pause":
 			case "agent_end":
-				this.invalidate();
-				// Nothing was generated to recap: the stretch owes no recap, however its blockers change later.
-				this.#pending = { recap: priorMessageWasGenerated(event.messages), compaction: true };
+				if (event.type === "agent_pause" || !this.#pending) {
+					this.invalidate();
+					this.#pending = { recap: priorMessageWasGenerated(event.messages), compaction: true };
+				}
 				this.#schedule();
 				break;
 		}
@@ -169,10 +170,7 @@ export class IdleMaintenance {
 		return this.#options.isBlocked?.() === true || session.isCompacting || session.isSessionTransitioning;
 	}
 
-	/**
-	 * Nothing is live, admitted, queued or scheduled. Background work may still wake the session: that holds
-	 * back only idle compaction (see {@link #isSettled}), as it did before the scheduler owned this work.
-	 */
+	/** No model loop is live, admitted, queued or scheduled; background wake sources may remain. */
 	#isQuiet(): boolean {
 		const session = this.#session;
 		return (
@@ -183,7 +181,7 @@ export class IdleMaintenance {
 		);
 	}
 
-	/** Quiet, and no background job or delivery can wake the session. */
+	/** No run is open, live, admitted, queued or scheduled. */
 	#isSettled(): boolean {
 		return isSessionSettled(this.#session, this.#options.scheduledTurn);
 	}
@@ -198,8 +196,8 @@ export class IdleMaintenance {
 
 	/**
 	 * Restart the settling check for the current stretch, replacing any earlier one and the armed timers.
-	 * The check is launched off the caller's stack: the terminal `agent_end` is published while its own
-	 * prompt is still admitted, so it must wait for the authoritative barriers before judging the session.
+	 * The loop boundary is published before its prompt unwinds, so this check waits
+	 * for authoritative loop and admission barriers.
 	 */
 	#schedule(): void {
 		this.#clearTimers();
@@ -221,12 +219,8 @@ export class IdleMaintenance {
 		}
 		if (this.#isBlocked() || !this.#isQuiet()) return;
 		this.#armRecap();
-		// Compacting while a background result is still due would rewrite the context that result wakes into.
-		const settled = await waitForSessionSettlement(session, {
-			isCurrent,
-			scheduledTurn: this.#options.scheduledTurn,
-		});
-		if (!settled || this.#isBlocked()) return;
+		await session.waitForRunEnd();
+		if (!isCurrent() || this.#isBlocked() || !this.#isSettled()) return;
 		this.#armCompaction();
 	}
 

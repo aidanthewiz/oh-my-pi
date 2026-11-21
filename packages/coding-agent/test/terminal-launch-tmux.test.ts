@@ -1,11 +1,22 @@
 import { expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
-import * as os from "node:os";
 import * as path from "node:path";
 import { createTerminalLauncher, type TerminalLaunchResult } from "../src/subprocess/terminal-launch";
 
 const tmuxPath = Bun.which("tmux");
+
+async function createPrivateRoot(): Promise<string> {
+	// Unix socket paths have a 104-byte limit on macOS, independently of TMPDIR.
+	const root = await fsp.mkdtemp("/tmp/omp-tmux-");
+	try {
+		await fsp.chmod(root, 0o700);
+		return await fsp.realpath(root);
+	} catch (error) {
+		await fsp.rm(root, { recursive: true, force: true });
+		throw error;
+	}
+}
 
 async function runTmux(
 	socket: string,
@@ -43,14 +54,20 @@ async function startPrivateServer(socket: string, cwd: string): Promise<Bun.Subp
 	watcher.once("error", ready.reject);
 	const timer = setTimeout(() => expired.reject(new Error("Private tmux server readiness timed out")), 5_000);
 	let server: Bun.Subprocess | undefined;
+	const stderrPath = path.join(cwd, "server.stderr");
 	try {
-		server = Bun.spawn([tmuxPath ?? "tmux", "-D", "-S", socket, "-f", "/dev/null"], {
-			cwd,
-			env: { ...process.env, TMUX: undefined, TMUX_PANE: undefined },
-			stdin: "ignore",
-			stdout: "ignore",
-			stderr: "ignore",
-		});
+		const stderrFd = fs.openSync(stderrPath, "wx", 0o600);
+		try {
+			server = Bun.spawn([tmuxPath ?? "tmux", "-D", "-S", socket, "-f", "/dev/null"], {
+				cwd,
+				env: { ...process.env, TMUX: undefined, TMUX_PANE: undefined },
+				stdin: "ignore",
+				stdout: "ignore",
+				stderr: stderrFd,
+			});
+		} finally {
+			fs.closeSync(stderrFd);
+		}
 		await Promise.race([
 			ready.promise,
 			expired.promise,
@@ -62,7 +79,18 @@ async function startPrivateServer(socket: string, cwd: string): Promise<Bun.Subp
 	} catch (error) {
 		if (server?.exitCode === null) server.kill("SIGKILL");
 		await server?.exited;
-		throw error;
+		if (!fs.existsSync(stderrPath)) throw error;
+		const stderrFd = fs.openSync(stderrPath, "r");
+		try {
+			const buffer = Buffer.alloc(4_096);
+			const length = fs.readSync(stderrFd, buffer, 0, buffer.length, 0);
+			throw new Error(
+				`${String(error)}\nPrivate tmux startup stderr (first 4096 bytes): ${buffer.toString("utf8", 0, length)}`,
+				{ cause: error },
+			);
+		} finally {
+			fs.closeSync(stderrFd);
+		}
 	} finally {
 		clearTimeout(timer);
 		watcher.close();
@@ -114,7 +142,7 @@ async function captureLaunch(
 }
 
 it.skipIf(!tmuxPath)("preserves literal semicolons in tmux operands and direct command argv", async () => {
-	const root = await fsp.realpath(await fsp.mkdtemp(path.join(os.tmpdir(), "omp-tmux-injection-")));
+	const root = await createPrivateRoot();
 	const socket = path.join(root, "private.sock");
 	const seedSession = `tmux-injection-seed-${process.pid}`;
 	const targetSession = `tmux-injection-target-${process.pid};`;
@@ -208,13 +236,16 @@ it.skipIf(!tmuxPath)("preserves literal semicolons in tmux operands and direct c
 
 		assertTmuxSuccess(await runTmux(socket, root, "has-session", "-t", seedSession), "private server liveness check");
 	} finally {
-		await stopPrivateServer(server, socket, root);
-		await fsp.rm(root, { recursive: true, force: true });
+		try {
+			await stopPrivateServer(server, socket, root);
+		} finally {
+			await fsp.rm(root, { recursive: true, force: true });
+		}
 	}
 });
 
 it.skipIf(!tmuxPath)("opens a literal # cwd and runs shell mode without the tmux default-shell", async () => {
-	const root = await fsp.realpath(await fsp.mkdtemp(path.join(os.tmpdir(), "omp-tmux-format-")));
+	const root = await createPrivateRoot();
 	const socket = path.join(root, "private.sock");
 	const session = `tmux-format-${process.pid}`;
 	// Unescaped, tmux runs #(…) as a job and expands #S, opening the pane in $HOME instead.
@@ -267,7 +298,10 @@ it.skipIf(!tmuxPath)("opens a literal # cwd and runs shell mode without the tmux
 		expect(fs.existsSync(path.join(root, "pwned"))).toBe(false);
 		expect(fs.existsSync(path.join(cwd, "pwned"))).toBe(false);
 	} finally {
-		await stopPrivateServer(server, socket, root);
-		await fsp.rm(root, { recursive: true, force: true });
+		try {
+			await stopPrivateServer(server, socket, root);
+		} finally {
+			await fsp.rm(root, { recursive: true, force: true });
+		}
 	}
 });

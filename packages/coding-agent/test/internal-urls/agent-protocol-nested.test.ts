@@ -3,7 +3,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { Settings } from "../../src/config/settings";
-import { bridgeValueFromToolResult } from "../../src/eval/js/tool-bridge";
+import { bridgeValueFromToolResult } from "../../src/eval/js/session-tool";
 import { IrcBus } from "../../src/irc/bus";
 import { parseInternalUrl } from "../../src/internal-urls/parse";
 import { AgentProtocolHandler } from "../../src/internal-urls/agent-protocol";
@@ -278,14 +278,18 @@ it("agent:// writes deliver peer messages but reject JSON paths and disabled IRC
 			},
 		} as unknown as AgentSession,
 	});
-	const session = {
+	const session: ToolSession = {
+		cwd: tempDir.path(),
+		hasUI: false,
+		getSessionFile: () => null,
+		getSessionSpawns: () => "*",
 		agentRegistry: registry,
 		getAgentId: () => "Main",
 		settings: Settings.isolated(),
 		taskDepth: 0,
-	} as unknown as ToolSession;
+	};
 	const handler = new AgentProtocolHandler();
-	const context = { session } as never;
+	const context = { session };
 	const receipt = await handler.write(parseInternalUrl("agent://Worker"), "Check context", context);
 	expect(receipt.isError).toBe(false);
 	expect(delivered).toEqual(["Check context"]);
@@ -317,6 +321,7 @@ it.each(["Visuals", "Parent.Child"])(
 		const wokenSession = {
 			sessionManager: { getArtifactsDir: () => sharedArtifactManager.dir },
 			isStreaming: true,
+			runStartedAt: 1,
 		} as unknown as AgentSession;
 		const registry = AgentRegistry.global();
 		registry.register({
@@ -330,11 +335,11 @@ it.each(["Visuals", "Parent.Child"])(
 
 		const handler = new AgentProtocolHandler();
 		const url = `agent://${id}`;
-		const superseded = `Superseded: ${id} is running a newer turn`;
 		const whileRunning = await handler.resolve(parseInternalUrl(url));
 		expect(whileRunning.content.endsWith(published)).toBe(true);
 		expect(whileRunning.content).not.toBe(published);
-		expect(whileRunning.notes).toContain(superseded);
+		const notice = whileRunning.notes?.[0];
+		if (!notice) throw new Error("The newer turn did not mark the previous output");
 		// `read` reads a located file directly, skipping resolve(): a superseded
 		// output must route as a resource so the banner reaches the reader.
 		const router = InternalUrlRouter.instance();
@@ -344,8 +349,8 @@ it.each(["Visuals", "Parent.Child"])(
 		expect(field.content).toBe("partial");
 		const queried = await handler.resolve(parseInternalUrl(`${url}?q=.status`));
 		expect(queried.content).toBe("partial");
-		expect(field.notes).toContain(superseded);
-		expect(queried.notes).toContain(superseded);
+		expect(field.notes).toContain(notice);
+		expect(queried.notes).toContain(notice);
 		const reader = new ReadTool({
 			cwd: root,
 			hasUI: false,
@@ -356,13 +361,13 @@ it.each(["Visuals", "Parent.Child"])(
 		for (const extractedUrl of [`${url}/status`, `${url}?q=.status`]) {
 			const output = await reader.execute("superseded-output", { path: extractedUrl });
 			expect(output.content[0]).toEqual({ type: "text", text: "partial" });
-			expect(output.details?.notes).toContain(superseded);
+			expect(output.details?.notes).toContain(notice);
 			expect(
 				output.content
 					.slice(1)
 					.map(block => (block.type === "text" ? block.text : ""))
 					.join("\n"),
-			).toContain(superseded);
+			).toContain(notice);
 		}
 		const extractedArgs = { path: `${url}?q=.` };
 		const extracted = bridgeValueFromToolResult(
@@ -383,8 +388,17 @@ it.each(["Visuals", "Parent.Child"])(
 
 		const scopedRegistry = new AgentRegistry();
 		scopedRegistry.register({ id, displayName: "scoped", kind: "sub", parentId: "Main", session: wokenSession });
-		const context = { session: { agentRegistry: scopedRegistry } as ToolSession };
+		const context = {
+			session: {
+				cwd: root,
+				hasUI: false,
+				settings: Settings.isolated(),
+				getSessionFile: () => rootSessionFile,
+				getSessionSpawns: () => "*",
+				agentRegistry: scopedRegistry,
+			} satisfies ToolSession,
+		};
 		expect(await handler.locate(parseInternalUrl(url), context)).toBeNull();
-		expect((await handler.resolve(parseInternalUrl(url), context)).notes).toContain(superseded);
+		expect((await handler.resolve(parseInternalUrl(url), context)).notes).toEqual(whileRunning.notes);
 	},
 );

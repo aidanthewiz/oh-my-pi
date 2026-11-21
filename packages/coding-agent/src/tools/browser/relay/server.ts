@@ -4,12 +4,14 @@
  * Impersonates Chrome's CDP discovery endpoint for authenticated Puppeteer clients:
  * - `GET /json/version` → public liveness; returns 503 metadata until the extension connects.
  * - `GET /json` / `/json/list` → token-gated attachable page targets.
- * - `WS /cdp` → token-gated downstream CDP clients.
+ * - `WS /cdp` → token-gated downstream CDP clients; a tab worker adds `?claim=<targetId>` for its tab.
  * - `WS /ext` → token-gated Chrome extension.
  *
  * Binds loopback only. Every endpoint that can inspect or drive browser state
  * requires the machine-local shared secret.
  */
+import { macOSFrontApp } from "@oh-my-pi/pi-natives";
+import { parseFlag } from "@oh-my-pi/pi-utils";
 import { VERSION } from "@oh-my-pi/pi-utils/dirs";
 import { RelayBridge, type RelayBridgeExtensionUpdater } from "./bridge";
 import {
@@ -90,6 +92,8 @@ interface SocketData {
 	connId?: number;
 	/** The Chrome extension id an `ext` upgrade's `Origin` named. */
 	extensionId?: string;
+	/** The target a connecting omp tab worker drives (`/cdp?claim=`). */
+	claim?: string;
 }
 
 type RelayWebSocket = Bun.ServerWebSocket<SocketData>;
@@ -120,6 +124,10 @@ export function startRelayServer(opts: RelayServerOptions): RelayServer {
 	const bridge = new RelayBridge({ log, group, updateExtension });
 	const sockets = new Set<RelayWebSocket>();
 	const startedAt = Date.now();
+	// Only macOS can hand the front app back; elsewhere the relay never reads it.
+	if (process.platform === "darwin" && parseFlag(process.env.PI_BROWSER_RELAY_KEEP_FRONT, true)) {
+		bridge.keepFrontAppWith(macOSFrontApp);
+	}
 
 	const server = Bun.serve<SocketData>({
 		hostname: "127.0.0.1",
@@ -139,7 +147,7 @@ export function startRelayServer(opts: RelayServerOptions): RelayServer {
 				// don't. Reject any Origin so a web page can't drive the relay.
 				if (req.headers.get("origin")) return new Response("Forbidden", { status: 403 });
 				if (!authorized(url, token)) return new Response("Unauthorized", { status: 401 });
-				const data: SocketData = { role: "cdp" };
+				const data: SocketData = { role: "cdp", claim: url.searchParams.get("claim") ?? undefined };
 				if (srv.upgrade(req, { data })) return undefined;
 				return new Response("websocket upgrade required", { status: 426 });
 			}
@@ -185,7 +193,7 @@ export function startRelayServer(opts: RelayServerOptions): RelayServer {
 				if (ws.data.role === "ext") {
 					bridge.extConnected(ws, ws.data.extensionId);
 				} else {
-					ws.data.connId = bridge.cdpConnected(ws);
+					ws.data.connId = bridge.cdpConnected(ws, ws.data.claim);
 				}
 			},
 			message(ws: RelayWebSocket, message: string | Buffer): void {

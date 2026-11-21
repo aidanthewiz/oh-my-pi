@@ -47,12 +47,13 @@ function deviceWriteTier(
 		if (name && isResolutionDeviceName(name)) return "read";
 		const inst = name && session?.xdev ? resolveXdevTool(session.xdev, name) : undefined;
 		if (!name || !inst) return "exec";
-		if (typeof content !== "string") return { tier: "exec", policyKey: name };
+		if (typeof content !== "string") return { tier: "exec", policyKey: inst.name };
 		try {
 			const parsed = parseDeviceArgs(inst, content, "approval-policy", () => "");
-			return { ...resolveToolDecision(inst, parsed), policyKey: name };
+			// Use the canonical device key for both direct calls and wire aliases.
+			return { ...resolveToolDecision(inst, parsed), policyKey: inst.name };
 		} catch {
-			return { tier: "exec", policyKey: name };
+			return { tier: "exec", policyKey: inst.name };
 		}
 	} catch {
 		return "exec";
@@ -74,7 +75,7 @@ export class XdProtocolHandler implements ProtocolHandler {
 	readonly scheme = "xd";
 	readonly spec: SchemeSpec = {
 		backing: "device",
-		selectors: "none",
+		selectors: "lines",
 		immutable: true,
 		compactTranscript: true,
 		write: {
@@ -133,7 +134,12 @@ export class XdProtocolHandler implements ProtocolHandler {
 		if (!xdev) throw new ToolError(NOT_MOUNTED);
 		if (!name) throw new ToolError(`Cannot write to xd:// itself — pick a device:\n${xdevListing(xdev)}`);
 		const toolCall = context.toolCall;
-		if (!toolCall) throw new ToolError(`xd://${name} can only be written by the write tool.`);
+		if (!toolCall) throw new ToolError(`xd://${name} dispatches only from a tool call (write, or a bash redirect).`);
+		// The write tool's gate already resolved approval at this device's tier and
+		// under its canonical tool's `tools.approval` key (see `deviceWriteTier`) —
+		// record that key so a wrapped inner tool does not ask the same question
+		// again, whichever spelling the URL used.
+		const xdevPolicyKey = resolveXdevTool(xdev, name)?.name ?? name;
 		const { result, xdev: dispatch } = await dispatchXdevTool(
 			xdev,
 			name,
@@ -141,10 +147,7 @@ export class XdProtocolHandler implements ProtocolHandler {
 			toolCall.id,
 			context.signal,
 			toolCall.onUpdate,
-			// The write tool's gate already resolved approval at this device's tier
-			// and under `tools.approval.<device>` (see `deviceWriteTier`) — record the
-			// key so a wrapped inner tool does not ask the same question again.
-			toolCall.context ? { ...toolCall.context, xdevPolicyKey: name } : undefined,
+			toolCall.context ? { ...toolCall.context, xdevPolicyKey } : undefined,
 		);
 		return {
 			content: result.content,

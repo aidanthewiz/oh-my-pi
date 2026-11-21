@@ -103,6 +103,8 @@ Compatibility separates target/runner, actual OS/architecture, Bazel 9.2.0, comp
 
 S3 restores first. A confirmed miss or incompatible snapshot falls back to the identity-scoped GitHub hot cache, then the real cold build. Corrupt, partial, denied, or unreachable snapshots produce scoped warnings. They never skip required work or convert failed builds into success.
 
+Generated Bazel configuration scopes `--config=ci` to `build`, not `common`. The named configuration contains build options and does not apply to `shutdown`. Release and relay builders shut down the same Bazel server before packing its cache; a failed shutdown prevents snapshot publication.
+
 Archives/manifests are immutable; current references update last. Restore checks identity, size/SHA256, and every member before atomically replacing either root with rollback. GNU tar long names support valid SHA-512 repository paths; traversal, duplicate paths, links, devices, sparse entries, and unapproved layouts are rejected.
 
 ## Retention and cleanup

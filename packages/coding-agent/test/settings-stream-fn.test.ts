@@ -8,14 +8,17 @@ import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream"
 import { bindEffects } from "@oh-my-pi/pi-coding-agent/config/registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { cfgProvidersMuseCodeStoreResponses } from "@oh-my-pi/pi-coding-agent/session/settings";
-import { createSettingsAwareStreamFn } from "@oh-my-pi/pi-coding-agent/session/settings-stream-fn";
 import {
-	anthropicChunks,
-	type CapturedRequest,
-	captureFetch,
-	factoryModel,
-	WORKOS_TOKEN,
-} from "../../ai/test/helpers/factory-droid";
+	createSettingsAwareStreamFn,
+	resolveWebsocketPreference,
+} from "@oh-my-pi/pi-coding-agent/session/settings-stream-fn";
+import { anthropicChunks, type CapturedRequest, captureFetch } from "../../ai/test/helpers/factory-droid";
+
+function persistedStore(value: boolean | undefined): Settings {
+	const settings = Settings.isolated();
+	if (value !== undefined) cfgProvidersMuseCodeStoreResponses.set(settings, value);
+	return settings;
+}
 
 function captureBase(): { fn: StreamFn; calls: Array<{ options?: SimpleStreamOptions }> } {
 	const calls: Array<{ options?: SimpleStreamOptions }> = [];
@@ -81,6 +84,16 @@ function replayedReasoningContext(producer: Model): Context {
 }
 
 describe("createSettingsAwareStreamFn", () => {
+	it("treats standard Responses settings, model and request false as independent vetoes", () => {
+		const model = getBundledModel("openai", "gpt-6.1-sol");
+		const enabled = Settings.isolated({ "providers.openaiResponsesWebsockets": true });
+		const disabled = Settings.isolated({ "providers.openaiResponsesWebsockets": false });
+		expect(resolveWebsocketPreference(disabled, { ...model, preferWebsockets: true }, true)).toBe(false);
+		expect(resolveWebsocketPreference(enabled, { ...model, preferWebsockets: false }, true)).toBe(false);
+		expect(resolveWebsocketPreference(enabled, { ...model, preferWebsockets: true }, false)).toBe(false);
+		expect(resolveWebsocketPreference(enabled, model)).toBe(true);
+	});
+
 	it("lowers the output cap so prompt plus output fits the model's context window", () => {
 		// The reported DeepSeek /btw 400: a 666k-token prompt plus the model's
 		// 384k default output cap exceeded the window. Test-env counts are bytes/4.
@@ -206,84 +219,12 @@ describe("createSettingsAwareStreamFn", () => {
 			base,
 		);
 		elsewhere(copilot, context, { apiKey: "k", providerSessionState: new Map() });
+		// Explicit transport preference cannot change native-history accounting.
+		queued(copilot, context, { apiKey: "k", providerSessionState: new Map(), preferWebsockets: true });
 
 		expect(calls[0]?.options?.maxTokens).toBeLessThan(9_000);
 		expect(calls[1]?.options?.maxTokens).toBeUndefined();
-	});
-
-	describe("providers.anthropic.serverSideFallback (opt-in)", () => {
-		const stubFableModel = {
-			api: "anthropic-messages",
-			provider: "anthropic",
-			id: "claude-fable-5",
-		} as unknown as Model;
-		const stubOpusModel = {
-			api: "anthropic-messages",
-			provider: "anthropic",
-			id: "claude-opus-4-8",
-		} as unknown as Model;
-		const stubFable51Model = {
-			api: "anthropic-messages",
-			provider: "anthropic",
-			id: "claude-fable-5-1",
-		} as unknown as Model;
-		const stubMythosModel = {
-			api: "anthropic-messages",
-			provider: "anthropic",
-			id: "claude-mythos-5-1",
-		} as unknown as Model;
-		const stubBedrockFableModel = {
-			api: "bedrock-converse-stream",
-			provider: "amazon-bedrock",
-			id: "anthropic.claude-fable-5-1",
-		} as unknown as Model;
-
-		// Targets must be in the model's `allowed_fallback_models`; Fable 5 / 5.1
-		// publish ["claude-opus-4-8", "claude-opus-5"] and reject claude-opus-5-5
-		// with a 400 (#13059).
-		it.each([
-			["Fable 5", stubFableModel],
-			["Fable 5.1", stubFable51Model],
-			["Mythos 5.1", stubMythosModel],
-		])("injects an allowed Opus 5 fallback for %s when the setting is on", (_label, model) => {
-			const settings = Settings.isolated({ "providers.anthropic.serverSideFallback": true });
-			const { fn: base, calls } = captureBase();
-			const wrapped = createSettingsAwareStreamFn(settings, base);
-
-			wrapped(model, stubContext, { apiKey: "k" });
-
-			expect(calls[0]?.options?.fallbacks).toEqual([{ model: "claude-opus-5" }]);
-		});
-
-		it("does NOT inject fallbacks for Fable off first-party Anthropic even when the setting is on", () => {
-			const settings = Settings.isolated({ "providers.anthropic.serverSideFallback": true });
-			const { fn: base, calls } = captureBase();
-			const wrapped = createSettingsAwareStreamFn(settings, base);
-
-			wrapped(stubBedrockFableModel, stubContext, { apiKey: "k" });
-
-			expect(calls[0]?.options?.fallbacks).toBeUndefined();
-		});
-
-		it("does NOT inject fallbacks on non-Fable/Mythos Anthropic models even when the setting is on", () => {
-			const settings = Settings.isolated({ "providers.anthropic.serverSideFallback": true });
-			const { fn: base, calls } = captureBase();
-			const wrapped = createSettingsAwareStreamFn(settings, base);
-
-			wrapped(stubOpusModel, stubContext, { apiKey: "k" });
-
-			expect(calls[0]?.options?.fallbacks).toBeUndefined();
-		});
-
-		it("never injects fallbacks for a session that disables server-side fallback", () => {
-			const settings = Settings.isolated({ "providers.anthropic.serverSideFallback": true });
-			const { fn: base, calls } = captureBase();
-			const wrapped = createSettingsAwareStreamFn(settings, base, { disableServerSideFallback: true });
-
-			wrapped(stubFableModel, stubContext, { apiKey: "k" });
-
-			expect(calls[0]?.options?.fallbacks).toBeUndefined();
-		});
+		expect(calls[2]?.options?.maxTokens).toBeLessThan(9_000);
 	});
 
 	describe("providers.muse-code.storeResponses (opt-in)", () => {
@@ -350,16 +291,11 @@ describe("createSettingsAwareStreamFn", () => {
 		};
 
 		it.each([
-			["stays off by default", {}, undefined, false],
-			["stores when the setting is on", { "providers.muse-code.storeResponses": true }, undefined, true],
-			[
-				"lets PI_MUSE_STORE_RESPONSES=1 override the setting",
-				{ "providers.muse-code.storeResponses": false },
-				"1",
-				true,
-			],
-		] as const)("%s", async (_label, values, env, expected) => {
-			expect(await wireStore(env, viaSession(Settings.isolated(values), museModel))).toBe(expected);
+			["stays off by default", undefined, undefined, false],
+			["stores when the setting is on", true, undefined, true],
+			["lets PI_MUSE_STORE_RESPONSES=1 override the setting", false, "1", true],
+		] as const)("%s", async (_label, stored, env, expected) => {
+			expect(await wireStore(env, viaSession(persistedStore(stored), museModel))).toBe(expected);
 		});
 
 		it("does not opt other storing hosts into retention", async () => {
@@ -439,31 +375,47 @@ describe("createSettingsAwareStreamFn", () => {
 });
 
 describe("per-call server-side fallback switch", () => {
-	it.each([false, true])(
-		"removes paid fallback routes from the provider request only for a per-call worker: %p",
-		async disabled => {
-			const model = factoryModel("claude-fable-5", ["anthropic"]);
-			model.factoryDroidOrgId = "org-1";
-			const captured: CapturedRequest[] = [];
-			const chunks = anthropicChunks("ok").map(chunk => {
-				const frame = JSON.parse(chunk) as { message?: { model?: string } };
-				if (frame.message) frame.message.model = model.id;
-				return JSON.stringify(frame);
-			});
-			const stream = await createSettingsAwareStreamFn(
-				Settings.isolated({ "providers.anthropic.serverSideFallback": true }),
-				undefined,
-				{ disableServerSideFallback: disabled },
-			)(
-				model,
-				{ messages: [{ role: "user", content: "hi", timestamp: 0 }] },
-				{ apiKey: WORKOS_TOKEN, fetch: captureFetch(captured, chunks), fallbacks: [{ model: "claude-opus-5" }] },
-			);
-			const result = await stream.result();
-			expect(result.stopReason).toBe("stop");
-			expect(result.content).toContainEqual({ type: "text", text: "ok" });
-			expect(captured).toHaveLength(1);
-			expect(captured[0]?.body.fallbacks).toEqual(disabled ? undefined : [{ model: "claude-opus-5" }]);
-		},
-	);
+	const model = getBundledModel("anthropic", "claude-fable-5");
+	if (!model) throw new Error("Expected bundled Anthropic Fable model");
+	const context: Context = { messages: [{ role: "user", content: "hi", timestamp: 0 }] };
+	const chunks = anthropicChunks("ok").map(chunk => {
+		const frame = JSON.parse(chunk) as { message?: { model?: string } };
+		if (frame.message) frame.message.model = model.id;
+		return JSON.stringify(frame);
+	});
+
+	it.each([
+		{ catalog: false, disabled: false },
+		{ catalog: true, disabled: false },
+		{ catalog: false, disabled: true },
+		{ catalog: true, disabled: true },
+	])("projects explicit Anthropic fallbacks with %p", async ({ catalog, disabled }) => {
+		const fallbacks = [{ model: "claude-sonnet-4-5" }];
+		const captured: CapturedRequest[] = [];
+		const stream = await createSettingsAwareStreamFn(
+			Settings.isolated({ "providers.anthropic.serverSideFallback": catalog }),
+			undefined,
+			{ disableServerSideFallback: disabled },
+		)(model, context, { apiKey: "sk-ant-test", fetch: captureFetch(captured, chunks), fallbacks });
+		const result = await stream.result();
+
+		expect(result.stopReason).toBe("stop");
+		expect(captured).toHaveLength(1);
+		expect(captured[0]?.body.fallbacks).toEqual(disabled ? undefined : fallbacks);
+		const betas = captured[0]?.headers["anthropic-beta"] ?? "";
+		expect(betas.includes("server-side-fallback-2026-06-01")).toBe(!disabled);
+	});
+
+	it("does not inject catalog fallbacks without opt-in when the per-call veto is false", async () => {
+		const captured: CapturedRequest[] = [];
+		const stream = await createSettingsAwareStreamFn(Settings.isolated(), undefined, {
+			disableServerSideFallback: false,
+		})(model, context, { apiKey: "sk-ant-test", fetch: captureFetch(captured, chunks) });
+		const result = await stream.result();
+
+		expect(result.stopReason).toBe("stop");
+		expect(captured).toHaveLength(1);
+		expect(captured[0]?.body.fallbacks).toBeUndefined();
+		expect(captured[0]?.headers["anthropic-beta"] ?? "").not.toContain("server-side-fallback-2026-06-01");
+	});
 });

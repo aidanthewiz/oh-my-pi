@@ -197,6 +197,11 @@ describe("openai-responses stateful chaining", () => {
 			providerSessionState,
 			statefulResponses: true,
 			fetch: fetchMock,
+			onPayload: (payload: unknown) => ({
+				...(payload as Record<string, unknown>),
+				store: true,
+				previous_response_id: "foreign-stored-response",
+			}),
 		};
 		const firstUser = { role: "user" as const, content: "First question", timestamp: 1000 };
 		const firstResponse = await streamOpenAIResponses(

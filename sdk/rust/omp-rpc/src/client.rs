@@ -827,6 +827,7 @@ impl Client {
 				supported_event_subscription_levels: None,
 				max_frame_bytes:                     None,
 				max_reassembled_frame_bytes:         None,
+				supports_bash_exclude_from_context:   None,
 			},
 			shared,
 			child,
@@ -921,6 +922,14 @@ impl Client {
 		frame: &Value,
 		timeout: Duration,
 	) -> Result<RpcResponse, Error> {
+		if command == "bash"
+			&& frame.get("excludeFromContext").and_then(Value::as_bool) == Some(true)
+			&& self.ready.supports_bash_exclude_from_context != Some(true)
+		{
+			return Err(Error::InvalidArgument(
+				"RPC runtime does not support bash context exclusion".to_owned(),
+			));
+		}
 		let (tx, rx) = mpsc::sync_channel(1);
 		self
 			.shared

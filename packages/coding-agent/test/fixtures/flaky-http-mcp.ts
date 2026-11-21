@@ -31,7 +31,12 @@ export interface FlakyHttpMcpServer {
 }
 
 export function startFlakyHttpMcpServer(
-	options: { port?: number; log?: (line: string) => void } = {},
+	options: {
+		port?: number;
+		log?: (line: string) => void;
+		/** When set, MCP requests whose `Authorization` header differs from its current value get 401. */
+		authorization?: () => string;
+	} = {},
 ): FlakyHttpMcpServer {
 	const log = options.log ?? (() => {});
 	const state = { down: false, unauthorized: false, generation: 1, initializes: 0, refusals: 0, authRefusals: 0 };
@@ -63,6 +68,9 @@ export function startFlakyHttpMcpServer(
 					status: 401,
 					headers: { "WWW-Authenticate": 'Bearer realm="https://auth.example.com"' },
 				});
+			}
+			if (options.authorization && request.headers.get("Authorization") !== options.authorization()) {
+				return new Response("unauthorized", { status: 401 });
 			}
 			if (request.method === "GET") {
 				let close = () => {};
@@ -110,6 +118,7 @@ export function startFlakyHttpMcpServer(
 								name: "ping",
 								description: "Answers with the server generation",
 								inputSchema: { type: "object", properties: {} },
+								annotations: { readOnlyHint: true },
 							},
 						],
 					};

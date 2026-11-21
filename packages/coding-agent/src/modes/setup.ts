@@ -9,6 +9,7 @@ import {
 	type RunSetupWizardOptions,
 	selectSetupScenes as selectScenes,
 	type SetupSceneSelectionOptions,
+	setupWizardAllowed,
 } from "@oh-my-pi/pi-tui/setup/wizard";
 import { getAllowedAvailableModels } from "../config/model-resolver";
 import type { Settings } from "../config/settings";
@@ -28,7 +29,7 @@ import {
 } from "./settings";
 import { cfgDisabledProviders, cfgModelRoleStorage } from "../config/model-settings";
 
-export { ALL_SCENES, CURRENT_SETUP_VERSION };
+export { ALL_SCENES, CURRENT_SETUP_VERSION, setupWizardAllowed };
 export type { SetupScene, SetupSceneHost } from "@oh-my-pi/pi-tui/setup/scenes/types";
 export { runStartupSplash } from "@oh-my-pi/pi-tui/setup/startup-splash";
 
@@ -78,7 +79,7 @@ export function createSetupHost(ctx: InteractiveModeContext): SetupHost {
 			// OAuth aliases store credentials under their canonical provider.
 			await session.modelRegistry.refreshProvider(getOAuthCredentialProvider(provider), "online");
 			if (ctx.session !== session || session.sessionId !== sessionId || session.isDisposed) return;
-			await ctx.refreshScopedModelsAfterLogin?.();
+			await session.refreshScopedModels();
 		},
 		saveComposerShape: async shape => {
 			cfgComposerShape.set(ctx.settings, shape);

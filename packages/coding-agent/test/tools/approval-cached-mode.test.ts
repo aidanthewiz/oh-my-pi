@@ -81,7 +81,7 @@ function harness(approve: (prompt: ExtensionApprovalPrompt) => Promise<Extension
 	runner.initialize(
 		{
 			sendMessage: () => {},
-			sendUserMessage: () => {},
+			sendUserMessage: async () => {},
 			appendEntry: () => {},
 			setLabel: () => {},
 			getActiveTools: () => [],
@@ -114,6 +114,7 @@ function harness(approve: (prompt: ExtensionApprovalPrompt) => Promise<Extension
 			notify: () => {},
 			onTerminalInput: () => () => {},
 			rerenderMessage: () => {},
+			refreshTranscript: () => {},
 			getLinkClicksAvailable: () => false,
 			setStatus: () => {},
 			setWorkingMessage: () => {},

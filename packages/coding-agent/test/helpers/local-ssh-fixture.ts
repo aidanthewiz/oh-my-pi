@@ -1,7 +1,6 @@
 import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as net from "node:net";
-import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ptree } from "@oh-my-pi/pi-utils";
@@ -71,7 +70,7 @@ export interface LocalSshFixture {
 	close(): Promise<void>;
 }
 
-/** Requires OpenSSH ssh/sshd/ssh-keygen, ps, and a POSIX account allowed to run a private sshd. */
+/** Requires OpenSSH ssh/sshd/ssh-keygen, ps, whoami, and a POSIX account allowed to run a private sshd. */
 export async function createLocalSshFixture(): Promise<LocalSshFixture> {
 	if (process.platform === "win32")
 		throw new Error("Local SSH fixture requires a POSIX OpenSSH server; no tests were qualified");
@@ -79,15 +78,15 @@ export async function createLocalSshFixture(): Promise<LocalSshFixture> {
 	const sshd = executable("sshd");
 	const keygen = executable("ssh-keygen");
 	executable("ps");
-	const username = os.userInfo().username;
+	const deadline = Date.now() + 4_000;
+	// SSH must authenticate the effective OS account, not an environment-supplied name.
+	const username = (await command([executable("whoami")], { LC_ALL: "C" }, deadline - Date.now())).trim();
 	if (!/^[a-zA-Z0-9_.-]+\$?$/.test(username))
 		throw new Error("Local SSH fixture cannot encode this account name safely");
-	const root = fs.mkdtempSync(path.join(os.tmpdir(), "omp-ssh-fixture-"));
-	fs.chmodSync(root, 0o700);
+	// OpenSSH limits ControlPath to 104 bytes on macOS, independently of TMPDIR.
+	const root = fs.mkdtempSync("/tmp/omp-ssh-");
 	const home = path.join(root, "home");
 	const bin = path.join(root, "bin");
-	fs.mkdirSync(home, { mode: 0o700 });
-	fs.mkdirSync(bin, { mode: 0o700 });
 	const env: Record<string, string> = {
 		HOME: home,
 		ZDOTDIR: home,
@@ -97,7 +96,6 @@ export async function createLocalSshFixture(): Promise<LocalSshFixture> {
 		LC_ALL: "C",
 		TMPDIR: root,
 	};
-	const deadline = Date.now() + 4_000;
 	let supervisor: Bun.Subprocess<"pipe", number, number> | undefined;
 	let closed = false;
 
@@ -117,6 +115,9 @@ export async function createLocalSshFixture(): Promise<LocalSshFixture> {
 	}
 
 	try {
+		fs.chmodSync(root, 0o700);
+		fs.mkdirSync(home, { mode: 0o700 });
+		fs.mkdirSync(bin, { mode: 0o700 });
 		const keys = await Promise.allSettled(
 			["host", "client"].map(name =>
 				command(

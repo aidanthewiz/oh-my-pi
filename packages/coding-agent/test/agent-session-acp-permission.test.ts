@@ -200,7 +200,7 @@ it("eval applies a custom-wire patch exactly once through the canonical tool's A
 		"tools.approval": { edit: "prompt" },
 	});
 	toolSession.getToolForEvalBridge = name => session!.getToolForEvalBridge(name);
-	toolSession.getEvalBridgeToolNames = () => session!.getEvalBridgeToolNames();
+	toolSession.getAdvertisedEvalToolNames = () => session!.getAdvertisedEvalToolNames();
 	await Bun.write(tempDir.join("eval-wire-old.txt"), "old\n");
 	const input =
 		"*** Begin Patch\n*** Add File: eval-wire.txt\n+ok\n*** Delete File: eval-wire-old.txt\n*** End Patch\n";
@@ -214,7 +214,7 @@ it("eval applies a custom-wire patch exactly once through the canonical tool's A
 	expect(permissionSpy).toHaveBeenCalledTimes(1);
 	expect(session.getToolForEvalBridge("edit")?.name).toBe("edit");
 	expect(session.getEvalBridgeToolNames()).toEqual(["edit", "apply_patch"]);
-	expect(new EvalTool(toolSession).description).toContain("`edit`, `apply_patch`");
+	expect(new EvalTool(toolSession).description).toContain("edit, apply_patch");
 });
 
 it("eval refuses both canonical and wire names after their tool is disabled", async () => {
@@ -381,7 +381,7 @@ function createRunner(
 	runner.initialize(
 		{
 			sendMessage: () => {},
-			sendUserMessage: () => {},
+			sendUserMessage: async () => {},
 			appendEntry: () => {},
 			setLabel: () => {},
 			getActiveTools: () => [],
@@ -682,6 +682,44 @@ it("startup-mounted destructive tools gain the ACP permission gate when the brid
 	expect(permissionSpy).toHaveBeenCalledTimes(1);
 	expect(deleteTool.executeCalls).toBe(1);
 });
+
+it("xd wire aliases cannot bypass ACP rejection", async () => {
+	const requests: ClientBridgePermissionToolCall[] = [];
+	const bridge: ClientBridge = {
+		capabilities: { requestPermission: true },
+		async requestPermission(toolCall) {
+			requests.push(toolCall);
+			return { outcome: "selected", optionId: "reject_once", kind: "reject_once" };
+		},
+	};
+	const toolSession = makeToolSession(bridge);
+	const edit = new EditTool(toolSession);
+	const xdev: XdevState = {
+		tools: new Map([[edit.name, edit as AgentTool]]),
+		mountedNames: new Set(),
+		builtInNames: new Set(["edit"]),
+		isActive: name => session?.getActiveToolNames().includes(name) ?? false,
+	};
+	toolSession.xdev = xdev;
+	const write = new WriteTool(toolSession);
+	session = await createSession([edit as AgentTool, write as AgentTool], bridge, {}, { xdev });
+	const target = tempDir.join("xd-wire-permission.txt");
+	await Bun.write(target, "keep\n");
+	const input = ["*** Begin Patch", `*** Delete File: ${target}`, "*** End Patch"].join("\n");
+	const content = JSON.stringify({ input });
+
+	for (const name of ["edit", "apply_patch"]) {
+		const result = await write.execute(`xd-permission-${name}`, { path: `xd://${name}`, content });
+		expect(result.isError).toBe(true);
+		expect(result.content.find(entry => entry.type === "text")?.text).toContain("rejected by user");
+		expect(await Bun.file(target).text()).toBe("keep\n");
+	}
+	expect(requests.map(({ toolName, title, locations }) => ({ toolName, title, locations }))).toEqual([
+		{ toolName: "edit", title: `Delete ${target}`, locations: [{ path: target }] },
+		{ toolName: "edit", title: `Delete ${target}`, locations: [{ path: target }] },
+	]);
+});
+
 it("edit, write, and ast_edit do not request ACP permission", async () => {
 	const editTool = makeFakeTool("edit");
 	const writeTool = makeFakeTool("write");
@@ -887,6 +925,7 @@ it("lets the computer display sleep while the ACP client asks the user for permi
 		releaseDisplay(turn) {
 			releases.push(turn);
 		},
+		async reset() {},
 		async close() {},
 	});
 	try {
@@ -1730,7 +1769,7 @@ async function createSessionWithMockModel(
 	const getApiKey = options?.getApiKey ?? (() => "test-key");
 	const registry = new ModelRegistry(auth);
 	registry.getApiKey = async () => getApiKey();
-	const agent = new Agent({
+	const agent: Agent = new Agent({
 		getApiKey,
 		getToolContext: context => ({
 			sessionManager,

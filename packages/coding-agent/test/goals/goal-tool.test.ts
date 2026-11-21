@@ -46,6 +46,7 @@ function createRuntimeHarness(initialState?: GoalModeState) {
 			state = cloneState(next);
 		},
 		getCurrentUsage: () => createUsage(),
+		isWaitingForUser: () => false,
 		emit: async () => {},
 		persist: (_mode, _state) => {},
 		sendHiddenMessage: async _message => {},

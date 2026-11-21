@@ -83,7 +83,6 @@ describe("tool reply transcript ownership and renderer invalidation", () => {
 		mode = new InteractiveMode(
 			session,
 			"test",
-			undefined,
 			() => {},
 			undefined,
 			undefined,
@@ -100,6 +99,7 @@ describe("tool reply transcript ownership and renderer invalidation", () => {
 			tools: new Map(),
 			assistantThinkingRenderers: [],
 			assistantTextRenderers: [({ text }) => text.replace("now", "NOW")],
+			transcriptPresenters: [],
 			linkSchemes: [],
 			fileWriteFallbackHandlers: [],
 			fileDeleteFallbackHandlers: [],

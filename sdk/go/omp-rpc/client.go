@@ -287,6 +287,23 @@ func (c *Client) Call(ctx context.Context, command string, params any, timeout t
 	if err != nil {
 		return nil, err
 	}
+	if command == "bash" && (c.ready.SupportsBashExcludeFromContext == nil || !*c.ready.SupportsBashExcludeFromContext) {
+		excluded := false
+		if options, ok := params.(BashCommand); ok {
+			excluded = options.ExcludeFromContext != nil && *options.ExcludeFromContext
+		} else {
+			var options struct {
+				ExcludeFromContext bool `json:"excludeFromContext"`
+			}
+			if err := json.Unmarshal(frame, &options); err != nil {
+				return nil, fmt.Errorf("omprpc: bash params: %w", err)
+			}
+			excluded = options.ExcludeFromContext
+		}
+		if excluded {
+			return nil, errors.New("omprpc: RPC runtime does not support bash context exclusion")
+		}
+	}
 	if timeout <= 0 {
 		timeout = DefaultTimeout
 	}

@@ -974,85 +974,79 @@ describe("MCP Streamable HTTP transport timeouts", () => {
 		}
 	});
 
-	it("keeps the timeout result when the caller aborts before the JSON body rejection propagates", async () => {
+	it.each(["deadline", "caller"] as const)("preserves %s-first JSON response failure precedence", async first => {
 		vi.useFakeTimers();
 		const caller = new AbortController();
-		const originalFetch = globalThis.fetch;
-		const jsonStarted = Promise.withResolvers<void>();
-		globalThis.fetch = (async (_input, init) => {
-			const response = new Response(null, { headers: { "Content-Type": "application/json" } });
-			Object.assign(response, {
-				json: () => {
-					const { promise, reject } = Promise.withResolvers<unknown>();
-					const rejectBodyRead = () => {
-						caller.abort();
-						reject(new SyntaxError("Unexpected end of JSON input"));
-					};
-					if (init?.signal?.aborted) rejectBodyRead();
-					else init?.signal?.addEventListener("abort", rejectBodyRead, { once: true });
-					jsonStarted.resolve();
-					return promise;
+		const callerReason = new DOMException("Synthetic caller cancellation", "AbortError");
+		const bodyFailure = new SyntaxError("Synthetic interrupted JSON body");
+		const bodyReadStarted = Promise.withResolvers<void>();
+		const operationAborted = Promise.withResolvers<void>();
+		let bodyController!: ReadableStreamDefaultController<Uint8Array>;
+		const body = new ReadableStream<Uint8Array>(
+			{
+				start(controller) {
+					bodyController = controller;
 				},
-			});
-			return response;
-		}) as typeof globalThis.fetch;
-		try {
-			const transport = new HttpTransport({
-				type: "http",
-				url: "http://mcp.invalid",
-				timeout: REQUEST_TIMEOUT_MS,
-			});
-			await transport.connect();
-			const request = transport.request("tools/list", undefined, { signal: caller.signal });
-			await jsonStarted.promise;
-			vi.advanceTimersByTime(REQUEST_TIMEOUT_MS);
-
-			await expect(request).rejects.toThrow(`Request timeout after ${REQUEST_TIMEOUT_MS}ms`);
-		} finally {
-			globalThis.fetch = originalFetch;
-			vi.useRealTimers();
-		}
-	});
-
-	it("does not report a timeout when caller cancellation wins a delayed JSON body rejection", async () => {
-		vi.useFakeTimers();
-		const caller = new AbortController();
-		const originalFetch = globalThis.fetch;
-		const jsonStarted = Promise.withResolvers<void>();
-		globalThis.fetch = (async (_input, init) => {
-			const response = new Response(null, { headers: { "Content-Type": "application/json" } });
-			Object.assign(response, {
-				json: () => {
-					const { promise, reject } = Promise.withResolvers<unknown>();
-					init?.signal?.addEventListener(
-						"abort",
-						() => {
-							setTimeout(() => reject(new SyntaxError("Unexpected end of JSON input")), REQUEST_TIMEOUT_MS + 20);
-						},
-						{ once: true },
-					);
-					jsonStarted.resolve();
-					return promise;
+				pull() {
+					bodyReadStarted.resolve();
 				},
-			});
-			return response;
-		}) as typeof globalThis.fetch;
+			},
+			{ highWaterMark: 0 },
+		);
+		const receiver = Object.assign(
+			async (...[_input, init]: Parameters<typeof fetch>) => {
+				if (init?.signal?.aborted) operationAborted.resolve();
+				else init?.signal?.addEventListener("abort", () => operationAborted.resolve(), { once: true });
+				return new Response(body, {
+					headers: {
+						"Content-Type": "application/json",
+						"X-Request-Id": "synthetic-precedence",
+					},
+				});
+			},
+			{ preconnect: globalThis.fetch.preconnect },
+		);
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(receiver);
+		const transport = new HttpTransport({
+			type: "http",
+			url: "http://first-abort.invalid/mcp",
+			timeout: REQUEST_TIMEOUT_MS,
+		});
 		try {
-			const transport = new HttpTransport({
-				type: "http",
-				url: "http://mcp.invalid",
-				timeout: REQUEST_TIMEOUT_MS,
-			});
 			await transport.connect();
-			const request = transport.request("tools/list", undefined, { signal: caller.signal });
-			await jsonStarted.promise;
-			caller.abort();
-			vi.advanceTimersByTime(REQUEST_TIMEOUT_MS + 20);
+			const outcome = transport.request("tools/list", undefined, { signal: caller.signal }).then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+			await bodyReadStarted.promise;
+			if (first === "deadline") vi.advanceTimersByTime(REQUEST_TIMEOUT_MS);
+			else caller.abort(callerReason);
+			await operationAborted.promise;
+			if (first === "deadline") caller.abort(callerReason);
+			else vi.advanceTimersByTime(REQUEST_TIMEOUT_MS);
+			bodyController.error(bodyFailure);
 
-			await expect(request).rejects.toThrow("Unexpected end of JSON input");
+			const error = await outcome;
+			if (first === "deadline") {
+				expect(error).toBeInstanceOf(MCPTransportError);
+				expect(error).toMatchObject({
+					transport: "http",
+					stage: "decode",
+					failure: "timeout",
+					retryable: false,
+					traceId: "synthetic-precedence",
+				});
+			} else {
+				expect(error).toBe(callerReason);
+			}
 		} finally {
-			globalThis.fetch = originalFetch;
-			vi.useRealTimers();
+			bodyController.error(bodyFailure);
+			try {
+				await transport.close();
+			} finally {
+				fetchSpy.mockRestore();
+				vi.useRealTimers();
+			}
 		}
 	});
 
@@ -1138,51 +1132,179 @@ describe("MCP Streamable HTTP transport timeouts", () => {
 		}
 	});
 
-	it("keeps draining an accepted request stream after its caller aborts", async () => {
+	it("drains post-result SSE notifications and server requests after caller abort until transport close", async () => {
 		const caller = new AbortController();
-		const notificationReceived = Promise.withResolvers<void>();
-		const sendNotification = Promise.withResolvers<void>();
+		const streamReady = Promise.withResolvers<ReadableStreamDefaultController<Uint8Array>>();
+		const bodyCancelled = Promise.withResolvers<void>();
+		const replyReceived = Promise.withResolvers<unknown>();
+		const receiver = Object.assign(
+			async (...[input, init]: Parameters<typeof fetch>) => {
+				const request =
+					input instanceof Request
+						? new Request(input, init as RequestInit)
+						: new Request(String(input), init as RequestInit);
+				const body = (await request.json()) as { id: string | number; method?: string };
+				if (body.method === "tools/list") {
+					return new Response(
+						new ReadableStream<Uint8Array>({
+							start(controller) {
+								streamReady.resolve(controller);
+								controller.enqueue(
+									encoder.encode(
+										`data: ${JSON.stringify({
+											jsonrpc: "2.0",
+											id: body.id,
+											result: { tools: [{ name: "synthetic", inputSchema: { type: "object" } }] },
+										})}\n\n`,
+									),
+								);
+							},
+							cancel() {
+								bodyCancelled.resolve();
+							},
+						}),
+						{ headers: { "Content-Type": "text/event-stream" } },
+					);
+				}
+				replyReceived.resolve(body);
+				return new Response(null, { status: 202 });
+			},
+			{ preconnect: globalThis.fetch.preconnect },
+		);
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(receiver);
+		const transport = new HttpTransport({
+			type: "http",
+			url: "http://post-result-drain.invalid/mcp",
+			timeout: 0,
+		});
+		const notifications: { method: string; params: unknown }[] = [];
+		const requests: { method: string; params: unknown }[] = [];
+		transport.onNotification = (method, params) => notifications.push({ method, params });
+		transport.onRequest = async (method, params) => {
+			requests.push({ method, params });
+			return { roots: [{ uri: "file:///synthetic", name: "synthetic" }] };
+		};
+
+		try {
+			await transport.connect();
+			const result = await transport.request("tools/list", undefined, { signal: caller.signal });
+			expect(result).toEqual({ tools: [{ name: "synthetic", inputSchema: { type: "object" } }] });
+			caller.abort();
+			const stream = await streamReady.promise;
+			stream.enqueue(
+				encoder.encode(
+					`data: ${JSON.stringify({
+						jsonrpc: "2.0",
+						method: "notifications/resources/updated",
+						params: { uri: "file:///synthetic/drain-result" },
+					})}\n\n` +
+						`data: ${JSON.stringify({
+							jsonrpc: "2.0",
+							id: "trailing-roots",
+							method: "roots/list",
+							params: { _meta: { sequence: 1 } },
+						})}\n\n`,
+				),
+			);
+
+			const outcome = await Promise.race([
+				replyReceived.promise.then(reply => ({ kind: "reply", reply })),
+				bodyCancelled.promise.then(() => ({ kind: "cancelled" })),
+			]);
+			expect(outcome).toEqual({
+				kind: "reply",
+				reply: {
+					jsonrpc: "2.0",
+					id: "trailing-roots",
+					result: { roots: [{ uri: "file:///synthetic", name: "synthetic" }] },
+				},
+			});
+
+			stream.enqueue(
+				encoder.encode(
+					`data: ${JSON.stringify({
+						jsonrpc: "2.0",
+						method: "notifications/resources/updated",
+						params: { uri: "file:///synthetic/obsolete" },
+					})}\n\n` +
+						`data: ${JSON.stringify({
+							jsonrpc: "2.0",
+							id: "obsolete-roots",
+							method: "roots/list",
+							params: { _meta: { sequence: 2 } },
+						})}\n\n`,
+				),
+			);
+			await Promise.all([transport.close(), bodyCancelled.promise]);
+			expect(notifications).toEqual([
+				{ method: "notifications/resources/updated", params: { uri: "file:///synthetic/drain-result" } },
+			]);
+			expect(requests).toEqual([{ method: "roots/list", params: { _meta: { sequence: 1 } } }]);
+		} finally {
+			try {
+				await transport.close();
+			} finally {
+				fetchSpy.mockRestore();
+			}
+		}
+	});
+
+	it("refuses pre-result SSE notifications and server requests after request-owner retirement", async () => {
+		let ownerCurrent = true;
+		const streamReady = Promise.withResolvers<{
+			stream: ReadableStreamDefaultController<Uint8Array>;
+			id: string | number;
+		}>();
 		server = Bun.serve({
 			port: 0,
 			async fetch(req) {
-				const body = (await req.json()) as { id: string | number };
-				let cancelled = false;
+				const body = (await req.json()) as { id: string | number; method?: string };
+				if (body.method !== "tools/list") return new Response(null, { status: 202 });
 				return new Response(
 					new ReadableStream<Uint8Array>({
-						start(controller) {
-							controller.enqueue(
-								encoder.encode(`data: {"jsonrpc":"2.0","id":${JSON.stringify(body.id)},"result":{}}\n\n`),
-							);
-							void sendNotification.promise.then(() => {
-								if (cancelled) return;
-								try {
-									controller.enqueue(
-										encoder.encode('data: {"jsonrpc":"2.0","method":"notifications/progress"}\n\n'),
-									);
-									controller.close();
-								} catch {
-									// The negative path intentionally cancels the client stream.
-								}
-							});
-						},
-						cancel() {
-							cancelled = true;
+						start(stream) {
+							streamReady.resolve({ stream, id: body.id });
 						},
 					}),
 					{ headers: { "Content-Type": "text/event-stream" } },
 				);
 			},
 		});
-		const transport = await connectedTransport(GUARD_TIMEOUT_MS);
-		transport.onNotification = method => {
-			if (method === "notifications/progress") notificationReceived.resolve();
+		const transport = await connectedTransport(0);
+		const notifications: { method: string; params: unknown }[] = [];
+		const requests: { method: string; params: unknown }[] = [];
+		transport.onNotification = (method, params) => notifications.push({ method, params });
+		transport.onRequest = async (method, params) => {
+			requests.push({ method, params });
+			return { roots: [{ uri: "file:///synthetic/protected" }] };
 		};
 
 		try {
-			await transport.request("tools/list", undefined, { signal: caller.signal });
-			caller.abort();
-			sendNotification.resolve();
-			await withPendingGuard(notificationReceived.promise, "post-response notification");
+			const pending = transport.request("tools/list", undefined, { mcpOwnerCurrent: () => ownerCurrent }).then(
+				result => ({ result, error: undefined }),
+				error => ({ result: undefined, error }),
+			);
+			const { stream, id } = await streamReady.promise;
+			ownerCurrent = false;
+			stream.enqueue(
+				encoder.encode(
+					`data: ${JSON.stringify([
+						{
+							jsonrpc: "2.0",
+							method: "notifications/resources/updated",
+							params: { uri: "file:///synthetic/protected" },
+						},
+						{ jsonrpc: "2.0", id: "retired-roots", method: "roots/list", params: {} },
+						{ jsonrpc: "2.0", id, result: { tools: [{ name: "protected", inputSchema: { type: "object" } }] } },
+					])}\n\n`,
+				),
+			);
+
+			const outcome = await pending;
+			expect(outcome.error).toMatchObject({ name: "AbortError" });
+			expect(outcome.result).toBeUndefined();
+			expect(notifications).toEqual([]);
+			expect(requests).toEqual([]);
 		} finally {
 			await transport.close();
 		}

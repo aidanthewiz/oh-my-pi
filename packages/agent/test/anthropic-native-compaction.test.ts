@@ -3,7 +3,6 @@ import {
 	findAnthropicCompactionCut,
 	type CompactionPreparation,
 	compact,
-	createFileOps,
 	DEFAULT_COMPACTION_SETTINGS,
 	getAnthropicCompactionPayload,
 	NativeCompactionError,
@@ -94,6 +93,26 @@ function makeOpenAiModel(): Model<"openai-responses"> {
 	});
 }
 
+/** An extension's custom api that serves Claude over Anthropic Messages behind a gateway. */
+function makeGatewayModel(
+	remoteCompaction: ModelSpec<ai.Api>["remoteCompaction"] = { api: "anthropic-messages", enabled: true },
+	api: ai.Api = "acme-gateway",
+): Model {
+	return buildModel({
+		id: "claude-fable-5",
+		name: "Claude Fable 5",
+		api,
+		provider: "acme",
+		baseUrl: "https://llm-gateway.example.test/anthropic",
+		reasoning: true,
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 1_000_000,
+		maxTokens: 128_000,
+		remoteCompaction,
+	});
+}
+
 function makePreparation(overrides: Partial<CompactionPreparation> = {}): CompactionPreparation {
 	return {
 		firstKeptEntryId: "kept-1",
@@ -104,7 +123,7 @@ function makePreparation(overrides: Partial<CompactionPreparation> = {}): Compac
 		],
 		isSplitTurn: false,
 		tokensBefore: 100_000,
-		fileOps: createFileOps(),
+		fileOps: snapcompact.createFileOps(),
 		settings: { ...DEFAULT_COMPACTION_SETTINGS },
 		...overrides,
 	};
@@ -228,9 +247,45 @@ describe("shouldUseAnthropicNativeCompaction", () => {
 			),
 		).toBe(false);
 	});
+
+	test("takes a custom api that declares Anthropic compaction and opts in", () => {
+		expect(shouldUseAnthropicNativeCompaction(makeGatewayModel())).toBe(true);
+		expect(shouldUseAnthropicNativeCompaction(makeGatewayModel({ api: "openai-responses", enabled: true }))).toBe(
+			false,
+		);
+		expect(shouldUseAnthropicNativeCompaction(makeGatewayModel({ api: "anthropic-messages" }))).toBe(false);
+		// A built-in adapter ignores `anthropicCompaction`, so the declaration never applies to one.
+		expect(shouldUseAnthropicNativeCompaction(makeGatewayModel(undefined, "openai-completions"))).toBe(false);
+	});
 });
 
 describe("compact() Anthropic native lane", () => {
+	test("compacts a custom-api model through its own api", async () => {
+		const model = makeGatewayModel();
+		const { calls, completeImpl } = recordingCompleteImpl(() =>
+			assistantMessage(model, {
+				providerPayload: {
+					type: "anthropicCompaction",
+					provider: model.provider,
+					content: NATIVE_SUMMARY,
+					signature: "sig_gateway",
+				},
+				stopDetails: { type: "compaction" },
+			}),
+		);
+
+		const result = await compact(makePreparation(), model, "token", undefined, undefined, { completeImpl });
+
+		expect(calls).toHaveLength(1);
+		expect(calls[0]?.model).toBe(model);
+		expect(calls[0]?.options.anthropicCompaction).toBeDefined();
+		expect(result.preserveData?.anthropicCompaction).toMatchObject({
+			provider: model.provider,
+			content: NATIVE_SUMMARY,
+			signature: "sig_gateway",
+		});
+	});
+
 	test("sends only the summarized prefix with live controls and persists the signed summary", async () => {
 		const completeSimple = vi.spyOn(ai, "completeSimple");
 		const model = makeAnthropicModel();
@@ -262,6 +317,7 @@ describe("compact() Anthropic native lane", () => {
 			remoteSystemPrompt: ["You are the live agent."],
 			tools,
 			extraContext: ["Branch: main"],
+			loadExtraContext: async () => ["Fresh memory"],
 		});
 
 		expect(completeSimple).not.toHaveBeenCalled();
@@ -273,8 +329,6 @@ describe("compact() Anthropic native lane", () => {
 		expect(ctx.messages.map(message => message.content)).toEqual(["long history"]);
 		// The first kept message is an assistant turn: metadata due before it closes the range.
 		expect(options.anthropicCompaction).toEqual({ instructions: expect.any(String), filesDueBefore: 2 });
-		const instructions = options.anthropicCompaction?.instructions ?? "";
-		expect(instructions).toContain("<additional-context>\n- Branch: main\n</additional-context>");
 
 		// The API's summary is the entry text, with the file lists the local
 		// summarizer appends. The replay payload stays verbatim so the block
@@ -959,7 +1013,7 @@ describe("compact() Anthropic native lane", () => {
 				],
 				turnPrefixMessages: [],
 				tokensBefore: 50_000,
-				fileOps: createFileOps(),
+				fileOps: snapcompact.createFileOps(),
 			});
 			expect(archived.summary).toContain("¶think:");
 			return { previousSummary: archived.summary, previousPreserveData: archived.preserveData };

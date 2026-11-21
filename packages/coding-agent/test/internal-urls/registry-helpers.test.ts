@@ -14,6 +14,7 @@ import {
 	hasResolvableTranscript,
 	registerArtifactsDir,
 	resetRegisteredArtifactDirsForTests,
+	sessionFilesFromDisk,
 } from "@oh-my-pi/pi-coding-agent/internal-urls/registry-helpers";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
@@ -129,5 +130,32 @@ describe("hasResolvableTranscript", () => {
 			status: "running",
 		});
 		expect(await hasResolvableTranscript("__advisor1")).toBe(false);
+	});
+
+	it("isolates preferred scans and retains every same-id source candidate", async () => {
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "source-scan-"));
+		const source = path.join(dir, "source");
+		const foreign = path.join(dir, "foreign");
+		await fs.mkdir(path.join(source, "child"), { recursive: true });
+		await fs.mkdir(foreign);
+		const direct = path.join(source, "Worker.jsonl");
+		const nested = path.join(source, "child", "Worker.jsonl");
+		await fs.writeFile(direct, "{}\n");
+		await fs.writeFile(nested, "{}\n");
+		await fs.writeFile(path.join(foreign, "HostOnly.jsonl"), "{}\n");
+		const unregister = registerArtifactsDir(foreign);
+		try {
+			const candidates = await sessionFilesFromDisk(source, { onlyPreferred: true, preserveDuplicates: true });
+			expect(candidates.get("Worker")).toEqual([direct, nested]);
+			expect(candidates.has("HostOnly")).toBe(false);
+			const selected = await sessionFilesFromDisk(source, { onlyPreferred: true });
+			expect(selected.get("Worker")).toBe(direct);
+			expect(selected.has("HostOnly")).toBe(false);
+			expect(await sessionFilesFromDisk(path.join(dir, "missing"), { onlyPreferred: true })).toEqual(new Map());
+			expect(await sessionFilesFromDisk(undefined, { onlyPreferred: true })).toEqual(new Map());
+		} finally {
+			unregister();
+			await removeWithRetries(dir);
+		}
 	});
 });
