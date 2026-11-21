@@ -28,6 +28,7 @@
 - Preserve inferred HTTP transport, raw environment placeholders, and exact project trust during OAuth recovery, including default-enabled URL-only definitions. Replace stale Authorization headers without adding unrelated fields. Stop automatic reconnection retries for permission-only HTTP 403 failures.
 - Keep server-specific OAuth cancellation isolated from queued sibling sign-ins.
 - Refuse browser replacement of explicit read-only managed credentials without changing configuration or grants. Keep managed definitions authoritative over writable user shadows during in-session reauthorization.
+- Test authoritative managed stdio servers without falling back to same-named user definitions. Keep browser reauthorization restricted to HTTP/SSE.
 - Accept matching legacy and session SSO settings and valid AWS portal paths when delivering secrets through private stdin.
 - Show exact AWS approval bindings without duplicating inline consumer source; retain one-use approval and command-guard explanations.
 - Synchronize shell job-control fixtures with actual shell startup before starting their signal delays.

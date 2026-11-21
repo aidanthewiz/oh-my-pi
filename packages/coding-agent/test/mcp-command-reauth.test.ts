@@ -30,6 +30,7 @@ import {
 	createMcpManagerStub,
 	type McpManagerOverrides,
 } from "./helpers/interactive-mode-context";
+import { startFlakyHttpMcpServer } from "./fixtures/flaky-http-mcp";
 
 const RAW_SERVER_URL = `https://\${MCP_HOST}/mcp`;
 const EXPANDED_SERVER_URL = "https://mcp.example.com/mcp";
@@ -203,6 +204,88 @@ describe("/mcp auth commands", () => {
 		}
 		await removeWithRetries(projectDir);
 		await removeWithRetries(agentDir);
+	});
+
+	test.each([
+		{ transport: "stdio", changed: false },
+		{ transport: "http", changed: false },
+		{ transport: "stdio", changed: true },
+	] as const)("managed $transport connection test honors source ownership (changed=$changed)", async row => {
+		const authStorage = freshAuthStorage();
+		await authStorage.credentials.reload();
+		const http = row.transport === "http" ? startFlakyHttpMcpServer() : undefined;
+		const effectsPath = path.join(projectDir, "effects");
+		const managedPath = path.join(agentDir, "mcp.managed.json");
+		const managed: MCPServerConfig = http
+			? { type: "http", url: http.url }
+			: {
+					type: "stdio",
+					command: process.execPath,
+					args: [path.join(import.meta.dir, "fixtures/side-effect-mcp.ts"), effectsPath],
+				};
+		const managedText = JSON.stringify({ mcpServers: { envserver: managed } });
+		const userText = JSON.stringify({
+			mcpServers: { envserver: { type: "stdio", command: process.execPath, args: ["-e", "process.exit(27)"] } },
+		});
+		await Bun.write(managedPath, managedText);
+		await Bun.write(configPath, userText);
+		clearFsCache();
+		const loadConfigs = (cwd: string, options?: Parameters<typeof loadAllMCPConfigs>[1]) =>
+			loadAllMCPConfigs(cwd, {
+				...options,
+				discoveryProviders: ["native", "mcp-managed"],
+				enableProjectConfig: false,
+			});
+		const loaded = await loadConfigs(projectDir);
+		const manager = new MCPManager(projectDir, undefined, loadConfigs);
+		manager.setAuthStorage(authStorage);
+		const ctx = createInteractiveModeContext({
+			session: { modelRegistry: { authStorage } },
+			mcpManager: manager,
+			settings: Settings.isolated(),
+		});
+		cfgMcpEnableProjectConfig.set(ctx.settings, false);
+		const controller = new MCPCommandController(ctx);
+		try {
+			await manager.connectServers(loaded.configs, loaded.sources, undefined, 0);
+			await manager.waitForStartup(0);
+			const toolName = http ? "ping" : "record_effect";
+			expect((await manager.callTool("envserver", toolName)).content).toEqual([
+				{ type: "text", text: http ? http.pong : "effect recorded" },
+			]);
+			const selectedText = row.changed
+				? JSON.stringify({ mcpServers: { envserver: { ...managed, args: ["-e", "process.exit(28)"] } } })
+				: managedText;
+			if (row.changed) {
+				await Bun.write(managedPath, selectedText);
+				clearFsCache();
+			}
+			const probe = vi.spyOn(mcpClient, "connectToServer");
+			const login = vi.spyOn(oauthFlow.MCPOAuthFlow.prototype, "login");
+			await controller.handle("/mcp test envserver");
+			if (row.changed) {
+				expect(ctx.showError).toHaveBeenCalled();
+				expect(probe).not.toHaveBeenCalled();
+			} else {
+				expect(ctx.showError).not.toHaveBeenCalled();
+				expect(ctx.chatContainer.render(160).join("\n")).toContain(toolName);
+				if (!http) {
+					const probes = probe.mock.calls.length;
+					await controller.handle("/mcp reauth envserver");
+					expect(ctx.showError).toHaveBeenCalled();
+					expect(probe).toHaveBeenCalledTimes(probes);
+				}
+			}
+			expect(login).not.toHaveBeenCalled();
+			expect(await Bun.file(managedPath).text()).toBe(selectedText);
+			expect(await Bun.file(configPath).text()).toBe(userText);
+			expect((await manager.callTool("envserver", toolName)).content).toEqual([
+				{ type: "text", text: http ? http.pong : "effect recorded" },
+			]);
+		} finally {
+			await manager.disconnectAll();
+			http?.stop();
+		}
 	});
 
 	test.each([

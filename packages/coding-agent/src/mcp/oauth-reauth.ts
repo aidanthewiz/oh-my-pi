@@ -409,7 +409,6 @@ export function matchingManagerServerConfig(
 	const hasCommand = "command" in selected && selected.command;
 	const hasUrl = "url" in selected && selected.url;
 	const transport = selected.type ?? (hasCommand ? "stdio" : hasUrl ? "http" : "stdio");
-	if (transport !== "http" && transport !== "sse") return undefined;
 	const managerConfig = manager?.getServerConfig(name);
 	if (!managerConfig || managerConfig.type !== transport) return undefined;
 	const runtimeSelected =

@@ -291,6 +291,11 @@ headers and API keys remain authoritative over same-named user definitions.
 Browser sign-in refuses to replace these credentials. Update the managed
 credential or its environment instead; refusal preserves configuration and grants.
 
+`/mcp test <name>` uses the active managed definition for stdio and hosted
+transports, not a same-named writable user definition. If that source changes
+after startup, reload it before testing. Browser reauthorization still requires
+HTTP/SSE.
+
 Results distinguish verified connections from saved grants whose connection
 could not be verified. Exit codes are `0` for ready, `1` for unresolved readiness,
 `2` for invalid arguments or selection, and `130` for cancellation.
