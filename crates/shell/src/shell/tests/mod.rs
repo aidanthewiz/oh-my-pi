@@ -36,7 +36,6 @@ impl TestStdio {
 	}
 
 	/// Read stdin from (a duplicate of) `file`.
-	#[cfg(unix)]
 	fn stdin(mut self, file: &fs::File) -> Self {
 		self.stdin = Some(file.try_clone().expect("clone test stdin"));
 		self

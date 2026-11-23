@@ -3699,6 +3699,8 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				toolContext,
 			});
 			const details: ReadToolDetails = result.details ?? {};
+			delete details.resolvedPath;
+			delete details.displayTarget;
 			details.meta = { ...details.meta, source: { type: "internal", value: url } };
 			return { ...result, details };
 		}
