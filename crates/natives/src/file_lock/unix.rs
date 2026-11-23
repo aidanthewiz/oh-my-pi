@@ -11,10 +11,6 @@ pub struct PlatformFileLock {
 	file: Option<File>,
 }
 
-pub fn try_acquire(path: &str) -> io::Result<Option<PlatformFileLock>> {
-	try_acquire_with_create(path, true)
-}
-
 pub fn try_acquire_with_create(path: &str, create: bool) -> io::Result<Option<PlatformFileLock>> {
 	let mut options = OpenOptions::new();
 	options

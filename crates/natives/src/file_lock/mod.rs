@@ -165,7 +165,7 @@ impl Drop for FileLock {
 mod tests {
 	use std::time::{SystemTime, UNIX_EPOCH};
 
-	use super::platform::{is_held, try_acquire};
+	use super::{acquire, platform::is_held};
 
 	fn unique_lock_path(label: &str) -> String {
 		let nonce = SystemTime::now()
@@ -182,12 +182,12 @@ mod tests {
 		let path = unique_lock_path("probe");
 		let path = path.as_str();
 		assert!(!is_held(path).expect("probe unlocked path"));
-		let mut lease = try_acquire(path).expect("acquire").expect("free lease");
+		let mut lease = acquire(path, true).expect("acquire").expect("free lease");
 		assert!(is_held(path).expect("probe held path"));
 		lease.release().expect("release");
 		assert!(!is_held(path).expect("probe released path"));
 		// A probe never leaves the path held for the next acquirer.
-		let mut successor = try_acquire(path)
+		let mut successor = acquire(path, true)
 			.expect("reacquire")
 			.expect("probe left the lease free");
 		successor.release().expect("release successor");
