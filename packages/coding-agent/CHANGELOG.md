@@ -28,6 +28,7 @@
 - Cancel mounted commands when the native-timeout backstop fires, then drain their cleanup without aborting the native result signal.
 - Keep binary MCP resource reads in separate private backing files and release each file after its reader finishes or fails.
 - Do not link byte-resource cards to their already-released temporary backing files.
+- Compare verbose safe-link conformance diagnostics without depending on inter-process output order, while retaining exact line content and filesystem checks.
 - Abort and join embedded tool-command callbacks on shell cancellation or deadline, preserving their final public reply and structured completion details.
 - Keep native tool commands attached to their approval and cleanup owner instead of automatically backgrounding them. Ordinary shell auto-background behavior is unchanged.
 - Reject mounted-command replacement during approval without changing accepted in-flight cleanup.

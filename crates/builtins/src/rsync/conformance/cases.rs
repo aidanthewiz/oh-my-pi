@@ -140,7 +140,7 @@ pub(super) const LOCAL: &[Case] = &[
 	c("no_keep_dirlinks", 0, "keepdir", &["-ai", "src/", "dst/"]),
 	c("copy_unsafe_links", 23, "", &["-ai", "--copy-unsafe-links", "src/", "dst/"]),
 	c("safe_links", 0, "", &["-ai", "--safe-links", "src/", "dst/"]),
-	c("safe_links_v", 0, "", &["-av", "--safe-links", "src/", "dst/"]),
+	u("safe_links_v", 0, "", &["-av", "--safe-links", "src/", "dst/"]),
 	c("munge_links", 0, "", &["-ai", "--munge-links", "src/", "dst/"]),
 	u("devices_specials", 0, "", &["-rDi", "src/", "dst/"]),
 	c("no_specials", 0, "", &["-rlti", "--no-D", "src/", "dst/"]),
