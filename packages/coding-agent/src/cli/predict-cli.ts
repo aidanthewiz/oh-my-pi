@@ -31,7 +31,7 @@ import {
 import chalk from "@oh-my-pi/pi-utils/chalk";
 import { CliUsageError } from "@oh-my-pi/pi-utils/cli";
 import type { TspSpan } from "@oh-my-pi/pi-wire";
-import { closeDaemonClients } from "../launch/client";
+import { closeDaemonClient } from "../daemon/client";
 import { closeTextPrediction, requestTextPrediction } from "../predict/client";
 import type { TextPredictMethod } from "../predict/protocol";
 import { smolLmWeightsReady } from "../predict/smollm-weights";
@@ -367,8 +367,7 @@ export async function runPredictCompare(includeSmollm = false): Promise<void> {
 	} finally {
 		overlay.hide();
 		ui.stop();
-		// The daemon socket and the global broker lease would keep the process alive.
 		closeTextPrediction();
-		await closeDaemonClients();
+		await closeDaemonClient();
 	}
 }

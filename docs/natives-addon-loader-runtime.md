@@ -8,7 +8,7 @@ This page documents `packages/natives/native/loader-state.js`, the runtime betwe
 - `native/desktop.js`, `native/clipboard.js`, `native/path.js`, `native/vcs.js`, and `native/mermaid.js` defer native loading. Desktop, path, and VCS wrappers cache their selected class/bindings; clipboard and Mermaid call `loadNative()` on invocation. Path helpers return their input unchanged without loading on non-Windows platforms.
 - Pure loader helpers are exported for focused tests and do not perform detection or filesystem probing until `loadNative()` or `initLoaderContext()` is called.
 
-A successful call is not memoized by JS. Repeated calls rely on the runtime's `require(...)` module cache, while post-load setup is idempotent or best-effort.
+A successful call is not memoized by JS. Repeated calls rely on `openNativeAddon`'s cache: it opens each `.node` path once with `process.dlopen` and returns the same exports on every later call, as `require`'s module cache did (a second `dlopen` would run the addon's init again and make new classes). Post-load setup is idempotent or best-effort.
 
 ## Loader context
 
@@ -129,8 +129,8 @@ Missing grammars make summary/block operations unsupported and AST searches repo
 For each candidate:
 
 1. Emit a startup marker when enabled.
-2. `require(candidate)`.
-3. Unless this is workspace development, require `__piNativesBuildVersion()` or the matching legacy `__piNativesV<version_with_underscores>` export to identify the package release. The build pipeline writes the current version into a fixed 64-byte slot (`PI_NATIVES_VERSION_STAMP:<version>` + NUL padding) after linking (`scripts/stamp-native-version.ts`, called from every `scripts/bazel-natives.ts` install, the local cargo build, and the Nix package build), so a release bump edits no Rust input. An addon from before release identities existed is accepted only when it has the legacy core and desktop ABI and the on-disk file lacks the current stamp.
+2. Open `candidate` with `openNativeAddon`, which uses `process.dlopen` once per path. This preserves literal paths containing `?`, which Bun's `require` cannot load. A failed open records its reason, caches nothing, and allows the next candidate to be tried.
+3. Outside workspace development, require `__piNativesBuildVersion()` or the matching legacy per-release export to identify the expected package release. The build pipeline writes the version into a fixed 64-byte `PI_NATIVES_VERSION_STAMP:<version>` slot after linking, so a release bump edits no Rust input. An addon predating release identities is eligible only under the legacy core/desktop ABI and absent-current-stamp checks described below; this is not permission to accept an arbitrary stale addon.
 4. Call `__ompInstallTokioRuntime()` if the addon provides it.
 5. Configure the on-demand grammar directory.
 6. Best-effort remove valid semantic-version cache directories older than the current version.
@@ -160,7 +160,7 @@ entrypoint evaluates or lazy wrapper is invoked
   -> initialize loader context
   -> extract matching embedded addons, if any
   -> otherwise stage Windows node_modules addon, if applicable
-  -> require candidates in deterministic order
+  -> open candidates in deterministic order (process.dlopen, once per path)
        -> validate release stamp outside workspace development
        -> install optional post-load runtime; record addon identity
        -> best-effort clean older version caches

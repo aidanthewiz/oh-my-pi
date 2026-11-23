@@ -89,8 +89,8 @@ describe("GrepTool internal URL resolution", () => {
 		LocalProtocolHandler.resetOverrideForTests();
 		InternalUrlRouter.resetForTests();
 
-		// Register a synthetic main session so artifact:// can derive
-		// `artifactsDir` from its sessionFile (sessionFile.slice(0,-6)).
+		// Register a synthetic main session whose artifacts dir derives from its
+		// sessionFile (sessionFile.slice(0,-6)).
 		AgentRegistry.global().register({
 			id: "test-main",
 			displayName: "test",
@@ -242,40 +242,24 @@ describe("GrepTool internal URL resolution", () => {
 		expect(getResultText(result)).toContain("searchable pre-compaction needle");
 	});
 
-	it("greps artifact:// with regex pattern", async () => {
-		const content = "ERROR: connection refused\nWARN: timeout\nERROR: disk full\nINFO: ok\n";
-		await Bun.write(path.join(artifactsDir, "3.python.log"), content);
+	it("searches every spill named in a semicolon-delimited local:// list (issue #14091)", async () => {
+		await Bun.write(path.join(artifactsDir, "local", "44.log"), "alpha needle\n");
+		await Bun.write(path.join(artifactsDir, "local", "43.log"), "beta needle\n");
+		LocalProtocolHandler.setOverride({ getArtifactsDir: () => artifactsDir, getSessionId: () => "session" });
 
 		const session = createSession();
 		const tool = new GrepTool(session);
 
-		const result = await tool.execute("test-call", {
-			pattern: "ERROR.*",
-			path: "artifact://3",
+		await Bun.write(path.join(artifactsDir, "local", "42.log"), "unrelated needle\n");
+		const result = await tool.execute("spill-list", {
+			pattern: "(alpha|beta) needle",
+			path: "local://44.log;local://43.log",
 		});
-
 		const text = getResultText(result);
-		expect(text).toContain("connection refused");
-		expect(text).toContain("disk full");
-		expect(text).not.toContain("timeout");
-		expect(text).not.toContain("INFO");
-	});
-
-	it("searches each artifact in a semicolon-delimited internal URL list", async () => {
-		await Bun.write(path.join(artifactsDir, "31.bash.log"), "needle first artifact\n");
-		await Bun.write(path.join(artifactsDir, "32.bash.log"), "needle second artifact\n");
-		await Bun.write(path.join(artifactsDir, "33.bash.log"), "needle unrelated artifact\n");
-
-		const result = await new GrepTool(createSession()).execute("artifact-list", {
-			pattern: "needle",
-			path: "artifact://31;artifact://32",
-		});
-
-		const text = getResultText(result);
-		expect(text).toContain("needle first artifact");
-		expect(text).toContain("needle second artifact");
-		expect(text).not.toContain("needle unrelated artifact");
-		expect(result.details?.files?.slice().sort()).toEqual(["artifact://31", "artifact://32"]);
+		expect(text).toContain("alpha needle");
+		expect(text).toContain("beta needle");
+		expect(text).not.toContain("unrelated needle");
+		expect(result.details?.files?.slice().sort()).toEqual(["local://43.log", "local://44.log"]);
 		expect(result.details?.matchCount).toBe(2);
 	});
 
@@ -388,22 +372,23 @@ describe("GrepTool internal URL resolution", () => {
 	});
 
 	it("searches a mixed internal URL and local path semicolon list", async () => {
-		await Bun.write(path.join(artifactsDir, "1.python.log"), "artifact needle\n");
+		await Bun.write(path.join(artifactsDir, "local", "1.log"), "spill needle\n");
 		await Bun.write(path.join(tmpDir, "notes.txt"), "local needle\n");
+		LocalProtocolHandler.setOverride({ getArtifactsDir: () => artifactsDir, getSessionId: () => "session" });
 
 		const text = getResultText(
 			await new GrepTool(createSession()).execute("mixed-url-local", {
 				pattern: "needle",
-				path: "artifact://1;notes.txt",
+				path: "local://1.log;notes.txt",
 			}),
 		);
 
-		// Both targets are searched — the list is not one artifact URI.
-		expect(text).toContain("artifact://1");
-		expect(text).toContain("artifact needle");
+		// Both targets are searched — the list is not one local:// URI.
+		expect(text).toContain("1.log");
+		expect(text).toContain("spill needle");
 		expect(text).toContain("notes.txt");
 		expect(text).toContain("local needle");
-		expect(text).not.toContain("artifact://1;notes.txt");
+		expect(text).not.toContain("1.log;notes.txt");
 	});
 
 	it("globs a mixed internal URL and local path semicolon list", async () => {
@@ -841,19 +826,19 @@ describe("GrepTool internal URL resolution", () => {
 	it("rejects a malformed selector on a selector-capable internal URL instead of widening the search", async () => {
 		const session = createSession();
 		const tool = new GrepTool(session);
-		await expect(tool.execute("bad-sel", { pattern: "needle", path: "artifact://5:-10" })).rejects.toThrow(
+		await expect(tool.execute("bad-sel", { pattern: "needle", path: "local://5.log:-10" })).rejects.toThrow(
 			/invalid selector/i,
 		);
-		await expect(tool.execute("bad-mixed", { pattern: "needle", path: "artifact://5:1-1:-10" })).rejects.toThrow(
+		await expect(tool.execute("bad-mixed", { pattern: "needle", path: "local://5.log:1-1:-10" })).rejects.toThrow(
 			/invalid selector/i,
 		);
 		// Multi-range colon compounds are rejected by read's parseSel; search must match.
-		await expect(tool.execute("bad-multi", { pattern: "needle", path: "artifact://5:1-1:1-2" })).rejects.toThrow(
+		await expect(tool.execute("bad-multi", { pattern: "needle", path: "local://5.log:1-1:1-2" })).rejects.toThrow(
 			/invalid selector/i,
 		);
 		// A `conflicts` display chunk is not valid in a range compound (only `raw` is).
 		await expect(
-			tool.execute("bad-conflicts", { pattern: "needle", path: "artifact://5:conflicts:1-1" }),
+			tool.execute("bad-conflicts", { pattern: "needle", path: "local://5.log:conflicts:1-1" }),
 		).rejects.toThrow(/invalid selector/i);
 	});
 
@@ -861,13 +846,13 @@ describe("GrepTool internal URL resolution", () => {
 		const session = createSession();
 		const read = new ReadTool(session);
 		// read.ts rejects a peeled internal-URL selector whose parseSel kind is "none"
-		// before resolving the resource, so artifact 5 need not exist. (`:-10` alone is
+		// before resolving the resource, so local://5.log need not exist. (`:-10` alone is
 		// a valid read tail; search rejects it because it cannot filter by tail.)
-		await expect(read.execute("read-bad-neg", { path: "artifact://5:-10-3" })).rejects.toThrow(/invalid selector/i);
-		await expect(read.execute("read-bad-multi", { path: "artifact://5:1-1:1-2" })).rejects.toThrow(
+		await expect(read.execute("read-bad-neg", { path: "local://5.log:-10-3" })).rejects.toThrow(/invalid selector/i);
+		await expect(read.execute("read-bad-multi", { path: "local://5.log:1-1:1-2" })).rejects.toThrow(
 			/invalid selector/i,
 		);
-		await expect(read.execute("read-bad-conflicts", { path: "artifact://5:conflicts:1-1" })).rejects.toThrow(
+		await expect(read.execute("read-bad-conflicts", { path: "local://5.log:conflicts:1-1" })).rejects.toThrow(
 			/invalid selector/i,
 		);
 	});
@@ -906,25 +891,6 @@ describe("GrepTool internal URL resolution", () => {
 
 		expect(text).toContain("omp://tools/read.md");
 		expect(text).toContain("omp://tools/grep.md");
-	});
-
-	it("suppresses hashline anchors when searching immutable artifact:// sources", async () => {
-		const content = "alpha line\nbeta needle line\ngamma line\n";
-		await Bun.write(path.join(artifactsDir, "9.bash.log"), content);
-
-		const session = createSession({ hasEditTool: true });
-		const tool = new GrepTool(session);
-
-		const result = await tool.execute("test-call", {
-			pattern: "needle",
-			path: "artifact://9",
-		});
-
-		const text = getResultText(result);
-		expect(text).toContain("needle");
-		// No hashline section headers or numbered editable lines for immutable sources.
-		expect(text).not.toMatch(/^\[[^#\r\n]+#[0-9A-F]{4}\]$/m);
-		expect(text).not.toMatch(/^\*?\s*\d+:/m);
 	});
 
 	it("resolves local:// URLs before file-name lookup", async () => {
@@ -1022,14 +988,6 @@ describe("GrepTool internal URL resolution", () => {
 		expect(text).toContain("second needle");
 		expect(text).not.toContain("first needle");
 		expect(text).not.toContain("third needle");
-	});
-
-	it("names the unknown artifact id and the available ones when find cannot locate it", async () => {
-		await Bun.write(path.join(artifactsDir, "4.bash.log"), "log\n");
-
-		await expect(
-			new GlobTool(createSession()).execute("find-missing-artifact", { path: "artifact://9" }),
-		).rejects.toThrow("Artifact 9 not found. Available: 4");
 	});
 
 	it("reports a glob in a skill:// name through the nameless skill root's error", async () => {
@@ -1138,9 +1096,8 @@ describe("GrepTool internal URL resolution", () => {
 		expect(text).not.toContain("sibling literal shadow");
 	});
 
-	it("keeps hashlines on mutable files when mixed with immutable artifact:// inputs", async () => {
-		const content = "alpha line\nbeta needle line\ngamma line\n";
-		await Bun.write(path.join(artifactsDir, "11.bash.log"), content);
+	it("keeps hashlines on mutable files when mixed with immutable skill:// inputs", async () => {
+		await registerSkillDirectory();
 		await Bun.write(path.join(tmpDir, "mixed.txt"), "mixed needle line\n");
 
 		const session = createSession({ hasEditTool: true });
@@ -1148,7 +1105,7 @@ describe("GrepTool internal URL resolution", () => {
 
 		const result = await tool.execute("test-call", {
 			pattern: "needle",
-			path: JSON.stringify(["artifact://11", "mixed.txt"]),
+			path: JSON.stringify(["skill://demo/references/index.md", "mixed.txt"]),
 		});
 
 		const text = getResultText(result);
@@ -1156,15 +1113,6 @@ describe("GrepTool internal URL resolution", () => {
 		// Mutable mixed.txt keeps hashlines somewhere in the output.
 		expect(text).toMatch(/^# mixed\.txt#[0-9A-F]{4}/m);
 		expect(text).toMatch(/^\*\d+:.*mixed needle/m);
-	});
-
-	it("throws on nonexistent artifact ID", async () => {
-		const session = createSession();
-		const tool = new GrepTool(session);
-
-		expect(tool.execute("test-call", { pattern: "foo", path: "artifact://999" })).rejects.toThrow(
-			"Artifact 999 not found",
-		);
 	});
 
 	it("emits forward-only, deduplicated context lines for adjacent virtual matches", async () => {

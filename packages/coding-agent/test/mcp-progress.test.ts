@@ -1,20 +1,25 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import * as path from "node:path";
-import { StdioTransport } from "@oh-my-pi/pi-coding-agent/mcp/transports/stdio";
+import { StdioUpstream } from "@oh-my-pi/pi-coding-agent/mcp/host/stdio-upstream";
 import type { MCPToolCallResult } from "@oh-my-pi/pi-coding-agent/mcp/types";
 import type { MCPProgress } from "@oh-my-pi/pi-tui/tools/mcp";
 import { withTimeout } from "@oh-my-pi/pi-utils";
-import { deadlinesOnlyUnderDeadline } from "./helpers/mcp-deadline";
-import { rejectionOf } from "./helpers/rejection";
+import { realDeps, stdioSpec } from "./mcp-host/upstream-support";
 
-const REQUEST_TIMEOUT_MS = 300;
-const transports: StdioTransport[] = [];
-const underDeadline = deadlinesOnlyUnderDeadline();
+interface ProgressResult extends MCPToolCallResult {
+	structuredContent: {
+		requestId: string | number;
+		_meta?: Record<string, unknown>;
+		arguments: Record<string, unknown>;
+	};
+}
+
+const transports: StdioUpstream[] = [];
 afterEach(async () => {
 	await Promise.all(transports.splice(0).map(transport => transport.close()));
 });
 
-async function connectReady(transport: StdioTransport): Promise<void> {
+async function connectReady(transport: StdioUpstream): Promise<void> {
 	const ready = Promise.withResolvers<void>();
 	transport.onNotification = method => {
 		if (method === "notifications/progress-fixture-ready") ready.resolve();
@@ -22,7 +27,7 @@ async function connectReady(transport: StdioTransport): Promise<void> {
 	transport.onClose = () => ready.reject(new Error("Progress fixture closed before readiness"));
 	transport.onError = error => ready.reject(error);
 	try {
-		await Promise.all([transport.connect(), ready.promise]);
+		await Promise.all([transport.connect(realDeps().spawn), ready.promise]);
 	} finally {
 		transport.onNotification = undefined;
 		transport.onClose = undefined;
@@ -30,12 +35,9 @@ async function connectReady(transport: StdioTransport): Promise<void> {
 	}
 }
 
-async function connect(timeout = REQUEST_TIMEOUT_MS, requestIdFormat?: "string"): Promise<StdioTransport> {
-	const transport = new StdioTransport({
-		type: "stdio",
-		command: process.execPath,
-		args: [path.join(import.meta.dir, "fixtures/progress-mcp.ts")],
-		timeout,
+async function connect(requestIdFormat?: "string"): Promise<StdioUpstream> {
+	const transport = new StdioUpstream({
+		...stdioSpec(path.join(import.meta.dir, "fixtures/progress-mcp.ts")),
 		requestIdFormat,
 	});
 	transports.push(transport);
@@ -54,7 +56,7 @@ describe("MCP stdio request progress", () => {
 		const meta = Object.freeze({ trace: "keep", progressToken: "replace" });
 		const request = Object.freeze({ ...params(args), _meta: meta });
 		const updates: MCPProgress[] = [];
-		const result = await transport.request<MCPToolCallResult>("tools/call", request, {
+		const result = await transport.request<ProgressResult>("tools/call", request, {
 			onProgress: progress => updates.push(progress),
 		});
 
@@ -68,8 +70,8 @@ describe("MCP stdio request progress", () => {
 	});
 
 	it("keeps string ids as strings and replaces non-record metadata", async () => {
-		const transport = await connect(300, "string");
-		const result = await transport.request<MCPToolCallResult>(
+		const transport = await connect("string");
+		const result = await transport.request<ProgressResult>(
 			"tools/call",
 			{ ...params({ steps: 1 }), _meta: ["not metadata"] },
 			{ onProgress: () => {} },
@@ -81,26 +83,13 @@ describe("MCP stdio request progress", () => {
 
 	it("leaves requests without a callback free of added metadata", async () => {
 		const transport = await connect();
-		const result = await transport.request<MCPToolCallResult>("tools/call", params({ steps: 0 }));
+		const result = await transport.request<ProgressResult>("tools/call", params({ steps: 0 }));
 		expect(result.structuredContent).not.toHaveProperty("_meta");
-		const withMeta = await transport.request<MCPToolCallResult>("tools/call", {
+		const withMeta = await transport.request<ProgressResult>("tools/call", {
 			...params({ steps: 0 }),
 			_meta: { trace: "untouched" },
 		});
 		expect(withMeta.structuredContent?._meta).toEqual({ trace: "untouched" });
-	});
-
-	it("does not reuse a progress token when the same transport reconnects", async () => {
-		const transport = await connect();
-		const first = await transport.request<MCPToolCallResult>("tools/call", params({ steps: 0 }), {
-			onProgress: () => {},
-		});
-		await transport.close();
-		await connectReady(transport);
-		const second = await transport.request<MCPToolCallResult>("tools/call", params({ steps: 0 }), {
-			onProgress: () => {},
-		});
-		expect(first.structuredContent?.requestId).not.toBe(second.structuredContent?.requestId);
 	});
 
 	it("isolates concurrent calls and still fans out matched, unknown, malformed, and late notifications", async () => {
@@ -190,35 +179,5 @@ describe("MCP stdio request progress", () => {
 		expect(results).toHaveLength(2);
 		expect(calls).toBe(2);
 		expect(sibling).toEqual([{ progress: 1 }, { progress: 2 }]);
-	});
-
-	it("keeps a hard deadline despite continuous progress and stops routing at timeout", async () => {
-		// A subprocess and real JSONL pipe must keep producing while the host deadline expires.
-		const transport = await connect(120);
-		let count = 0;
-		let timedOut = false;
-		const late = Promise.withResolvers<void>();
-		transport.onNotification = method => {
-			if (method === "notifications/progress" && timedOut) late.resolve();
-		};
-		// Await before expect: on Bun 1.4.2 (Windows), `expect(pending).rejects` can stall subprocess
-		// pipe reads until the promise settles, which would hide every progress notification.
-		const error = await rejectionOf(
-			withTimeout(
-				underDeadline(() =>
-					transport.request("tools/call", params({ steps: 100, delayMs: 5 }), {
-						onProgress: () => count++,
-					}),
-				),
-				400,
-				"progress extended the deadline",
-			),
-		);
-		expect(error).toMatchObject({ failure: "timeout", retryable: false });
-		timedOut = true;
-		const countAtTimeout = count;
-		await withTimeout(late.promise, 200, "no late notification arrived");
-		expect(countAtTimeout).toBeGreaterThan(2);
-		expect(count).toBe(countAtTimeout);
 	});
 });

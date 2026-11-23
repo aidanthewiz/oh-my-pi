@@ -6,7 +6,6 @@ import { Process, ProcessStatus } from "@oh-my-pi/pi-natives";
 import { getBrowserProfilesDir, isRecord, untilAborted } from "@oh-my-pi/pi-utils";
 import type { Socket } from "bun";
 import type { Browser, Page, Target } from "puppeteer-core";
-import { CF_BRAND } from "../../cli/cf-version";
 import { throwIfAborted } from "../tool-errors";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { isPuppeteerTimeout } from "./launch";
@@ -490,7 +489,7 @@ export async function findReusableCdp(
 export interface PickTargetOptions {
 	matcher?: string;
 	preferVisible?: boolean;
-	/** Relay /json endpoint (e.g. http://127.0.0.1:9224); enables metadata-first target selection. */
+	/** Relay /json endpoint; enables metadata-first target selection. */
 	relayJson?: string;
 	signal?: AbortSignal;
 }
@@ -606,19 +605,19 @@ function isAdoptableRelayEntry(entry: RelayJsonEntry): boolean {
 	);
 }
 
-/** One of the user's Chrome tabs as `browser.targets()` lists it: its `target` (the URL) adopts it. */
-export interface RelayTarget {
+/** A page of a CDP browser (the relay's Chrome, an attached endpoint) as `browser.targets()` lists it: its `target` (the URL) adopts it. */
+export interface CdpTarget {
 	/** The page URL, as `target` takes it (a URL/title substring). */
 	target: string;
 	title: string;
 	url: string;
-	/** Whether it is the active tab of its Chrome window. */
-	shown: boolean;
+	/** Whether it is the active tab of its Chrome window; only the relay reports it. */
+	shown?: boolean;
 }
 
-/** The adoptable pages among relay `/json` entries; malformed, discarded, and internal entries are skipped. */
-export function relayTargets(entries: readonly unknown[]): RelayTarget[] {
-	const targets: RelayTarget[] = [];
+/** The adoptable pages among CDP `/json` entries; malformed, discarded, and internal entries are skipped. */
+export function cdpTargets(entries: readonly unknown[]): CdpTarget[] {
+	const targets: CdpTarget[] = [];
 	for (const raw of entries) {
 		if (!isRecord(raw) || raw.type !== "page" || typeof raw.url !== "string") continue;
 		const entry: RelayJsonEntry = {
@@ -630,30 +629,32 @@ export function relayTargets(entries: readonly unknown[]): RelayTarget[] {
 			discarded: typeof raw.discarded === "string" ? raw.discarded : undefined,
 		};
 		if (!isAdoptableRelayEntry(entry)) continue;
-		targets.push({ target: entry.url, title: entry.title, url: entry.url, shown: entry.active === "true" });
+		const target: CdpTarget = { target: entry.url, title: entry.title, url: entry.url };
+		if (entry.active !== undefined) target.shown = entry.active === "true";
+		targets.push(target);
 	}
 	return targets;
 }
 
-/** The `browser.targets()` listing of relay pages: `- "Title" https://… (active)`. */
-export function describeRelayTargets(targets: readonly RelayTarget[]): string {
-	if (targets.length === 0) return "The relay lists no Chrome pages to adopt.";
+/** The `browser.targets()` listing: `<source> (adopt one …):` then `- "Title" https://… (active)`. */
+export function describeCdpTargets(targets: readonly CdpTarget[], source: string): string {
+	if (targets.length === 0) return `${source}: none to adopt.`;
 	const list = targets
 		.map(entry => `- ${JSON.stringify(entry.title)} ${entry.url}${entry.shown ? " (active)" : ""}`)
 		.join("\n");
-	return `Chrome pages via the relay (adopt one with target set to its URL or a title substring):\n${list}`;
+	return `${source} (adopt one with target set to its URL or a title substring):\n${list}`;
 }
 
-/** The pages of the user's Chrome the relay at `relayJson` can adopt. */
-export async function listRelayTargets(relayJson: string, signal?: AbortSignal): Promise<RelayTarget[]> {
-	const entries = await fetchRelayEntries(relayJson, signal);
+/** The pages at a CDP discovery endpoint, including an authenticated relay. */
+export async function listCdpTargets(cdpUrl: string, signal?: AbortSignal): Promise<CdpTarget[]> {
+	const entries = await fetchRelayEntries(cdpUrl, signal);
 	if (!entries) {
-		const displayUrl = new URL(relayJson);
+		const endpoint = new URL(cdpUrl);
 		throw new ToolError(
-			`${CF_BRAND} browser relay at ${displayUrl.origin}${displayUrl.pathname} did not list its pages (GET /json failed).`,
+			`The browser at ${endpoint.origin}${endpoint.pathname} did not list its pages (GET /json failed).`,
 		);
 	}
-	return relayTargets(entries);
+	return cdpTargets(entries);
 }
 
 function relayEntryMatches(entry: RelayJsonEntry, matcher: string): boolean {
@@ -870,13 +871,6 @@ async function pickPageFromList(pages: Page[], options: PickTargetOptions): Prom
 	const usable = enriched.filter(
 		p => !ATTACH_TARGET_SKIP_PATTERN.test(p.url) && !ATTACH_TARGET_SKIP_PATTERN.test(p.title),
 	);
-	if (options.preferVisible && usable.length > 1) {
-		const foreground = await firstVisiblePage(
-			usable.map(entry => entry.page),
-			options.signal,
-		);
-		if (foreground) return foreground;
-	}
 	return usable[0]?.page ?? enriched[0]!.page;
 }
 

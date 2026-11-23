@@ -22,6 +22,7 @@ export interface PyToolBridgeEntry {
 	 * delegated work — above all the subagents `agent()` spawns — stops at once.
 	 */
 	signal?: AbortSignal;
+	parentToolCallId?: string;
 	/** The cell's `timeout` in ms, the budget of a prelude call that sets none (`EvalPreludeContext.cellTimeoutMs`). */
 	cellTimeoutMs?: number;
 	/**
@@ -131,6 +132,7 @@ async function callSessionToolPromptOnAbort(
 	const call = withoutCleanupOwnedToolCall(() =>
 		callSessionTool(name, args, {
 			session: entry.toolSession,
+			parentToolCallId: entry.parentToolCallId,
 			signal: entry.signal,
 			cellTimeoutMs: entry.cellTimeoutMs,
 			emitStatus: entry.emitStatus,

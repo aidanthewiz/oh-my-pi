@@ -9,7 +9,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
-import { $env, $which, APP_NAME, compareVersions, isCompiledBinary, isEnoent } from "@oh-my-pi/pi-utils";
+import { $env, $which, APP_NAME, isCompiledBinary, isEnoent, logger } from "@oh-my-pi/pi-utils";
 import chalk from "@oh-my-pi/pi-utils/chalk";
 import { withFileLock } from "@oh-my-pi/pi-utils/file-lock";
 import { $ } from "bun";
@@ -37,6 +37,23 @@ interface ReleaseInfo {
 	tag: string;
 	version: string;
 }
+
+export type UpdateProgress =
+	| { phase: "downloading"; version: string; received: number; total: number }
+	| { phase: "installing"; version: string };
+type UpdateProgressListener = (progress: UpdateProgress) => void;
+
+export interface UpdateOptions {
+	force: boolean;
+	check: boolean;
+	onProgress?: UpdateProgressListener;
+}
+
+export type UpdateOutcome =
+	| { kind: "current" }
+	| { kind: "available"; version: string }
+	| { kind: "unsupported"; reason: string }
+	| { kind: "installed"; version: string };
 
 /** A release binary the updater can download, resolved from published GitHub release metadata. */
 export interface ReleaseBinaryAsset {
@@ -159,6 +176,7 @@ export interface VerifiedBinaryDownloadOptions {
 	expectedSize: number;
 	expectedDigest: string;
 	fetchImpl?: Fetch;
+	onProgress?: (received: number) => void;
 }
 
 /**
@@ -200,6 +218,7 @@ export async function downloadVerifiedBinary(options: VerifiedBinaryDownloadOpti
 				return;
 			}
 			hash.update(chunk);
+			options.onProgress?.(size);
 			callback(null, chunk);
 		},
 	});
@@ -347,14 +366,12 @@ export function isSourceCheckout(): boolean {
 }
 
 /**
- * Whether the running omp may install its own updates: not a source checkout
- * (git updates it), not kept by a managing app (Tern updates its omp itself),
- * and not in the Nix store. Judged from the running build alone, without the
- * package-manager probes `omp update` runs.
+ * Only a compiled, unmanaged Coreforge install may update itself.
+ * Package managers, source checkouts and managing apps retain their own update authority.
  */
 export async function canSelfUpdate(): Promise<boolean> {
-	if (isSourceCheckout()) return false;
-	if (isPathInDirectory(isCompiledBinary() ? process.execPath : import.meta.dir, NIX_STORE_DIR)) return false;
+	if (!isCompiledBinary()) return false;
+	if (isPathInDirectory(process.execPath, NIX_STORE_DIR)) return false;
 	return (await managedInstallName(process.execPath)) === undefined;
 }
 
@@ -672,160 +689,6 @@ async function getLatestRelease(): Promise<ReleaseInfo> {
 	return { tag: lastCfRelease.tag, version: lastCfRelease.version };
 }
 
-interface BunInstallCachePruneResult {
-	scannedPackages: number;
-	removedEntries: number;
-}
-
-interface BunCachePackageGroup {
-	actualDirs: Map<string, string[]>;
-	markerDir?: string;
-	markerEntries: Map<string, string[]>;
-}
-
-function stripBunCacheVersionSuffix(name: string): string {
-	const metadataIndex = name.indexOf("@@");
-	return metadataIndex === -1 ? name : name.slice(0, metadataIndex);
-}
-
-async function readdirIfExists(dir: string): Promise<fs.Dirent[]> {
-	try {
-		return await fs.promises.readdir(dir, { withFileTypes: true });
-	} catch (err) {
-		if (isEnoent(err)) return [];
-		throw err;
-	}
-}
-
-function getBunCacheGroup(groups: Map<string, BunCachePackageGroup>, packageName: string): BunCachePackageGroup {
-	let group = groups.get(packageName);
-	if (!group) {
-		group = { actualDirs: new Map(), markerEntries: new Map() };
-		groups.set(packageName, group);
-	}
-	return group;
-}
-
-function addVersionPath(entries: Map<string, string[]>, version: string, entryPath: string): void {
-	const paths = entries.get(version);
-	if (paths) {
-		paths.push(entryPath);
-		return;
-	}
-	entries.set(version, [entryPath]);
-}
-
-async function addBunCacheActualDir(
-	groups: Map<string, BunCachePackageGroup>,
-	dirPath: string,
-	packageNames: Set<string> | undefined,
-): Promise<void> {
-	try {
-		// `fs.promises` rather than `Bun.file().json()`: on Windows, Bun's rejected read of a
-		// missing file holds no loop handle, so the loop can drain mid-await (#13470).
-		const manifest = JSON.parse(await fs.promises.readFile(path.join(dirPath, "package.json"), "utf8")) as Partial<
-			Record<"name" | "version", unknown>
-		>;
-		if (typeof manifest.name !== "string" || typeof manifest.version !== "string") return;
-		if (packageNames && !packageNames.has(manifest.name)) return;
-		const group = getBunCacheGroup(groups, manifest.name);
-		addVersionPath(group.actualDirs, manifest.version, dirPath);
-	} catch (err) {
-		if (isEnoent(err)) return;
-		throw err;
-	}
-}
-
-async function addBunCacheMarkerDir(
-	groups: Map<string, BunCachePackageGroup>,
-	packageName: string,
-	markerDir: string,
-	packageNames: Set<string> | undefined,
-): Promise<void> {
-	if (packageNames && !packageNames.has(packageName)) return;
-	const markerEntries = await readdirIfExists(markerDir);
-	const group = getBunCacheGroup(groups, packageName);
-	group.markerDir = markerDir;
-	for (const entry of markerEntries) {
-		const cacheVersion = stripBunCacheVersionSuffix(entry.name);
-		addVersionPath(group.markerEntries, cacheVersion, path.join(markerDir, entry.name));
-	}
-}
-
-async function collectBunCacheGroups(
-	cacheDir: string,
-	packageNames: Set<string> | undefined,
-): Promise<Map<string, BunCachePackageGroup>> {
-	const groups = new Map<string, BunCachePackageGroup>();
-	for (const entry of await readdirIfExists(cacheDir)) {
-		if (!entry.isDirectory()) continue;
-		const entryPath = path.join(cacheDir, entry.name);
-		if (entry.name.startsWith("@")) {
-			for (const scopedEntry of await readdirIfExists(entryPath)) {
-				if (!scopedEntry.isDirectory()) continue;
-				const scopedEntryPath = path.join(entryPath, scopedEntry.name);
-				const versionSeparator = scopedEntry.name.lastIndexOf("@");
-				if (versionSeparator === -1) {
-					await addBunCacheMarkerDir(groups, `${entry.name}/${scopedEntry.name}`, scopedEntryPath, packageNames);
-				} else {
-					await addBunCacheActualDir(groups, scopedEntryPath, packageNames);
-				}
-			}
-			continue;
-		}
-		const versionSeparator = entry.name.lastIndexOf("@");
-		if (versionSeparator === -1) {
-			await addBunCacheMarkerDir(groups, entry.name, entryPath, packageNames);
-		} else {
-			await addBunCacheActualDir(groups, entryPath, packageNames);
-		}
-	}
-	return groups;
-}
-
-async function removeCacheEntries(paths: string[]): Promise<number> {
-	for (const entryPath of paths) {
-		await fs.promises.rm(entryPath, { recursive: true, force: true });
-	}
-	return paths.length;
-}
-
-/**
- * Prune Bun's package cache so each package keeps only its newest cached version.
- *
- * Bun stores package cache entries as both a package marker directory
- * (`react/19.2.6@@@1`) and a materialized package directory
- * (`react@19.2.6@@@1`). Global `omp` updates can leave one full copy per
- * release. The marker and materialized entries are removed together so the
- * cache stays internally consistent.
- */
-export async function pruneBunInstallCache(
-	cacheDir: string,
-	packageNames?: Set<string>,
-): Promise<BunInstallCachePruneResult> {
-	const groups = await collectBunCacheGroups(cacheDir, packageNames);
-	let scannedPackages = 0;
-	let removedEntries = 0;
-	for (const group of groups.values()) {
-		if (group.actualDirs.size === 0) continue;
-		scannedPackages++;
-		let latestVersion: string | undefined;
-		for (const version of group.actualDirs.keys()) {
-			if (!latestVersion || compareVersions(version, latestVersion) > 0) latestVersion = version;
-		}
-		if (!latestVersion) continue;
-		for (const [version, paths] of group.actualDirs) {
-			if (version !== latestVersion) removedEntries += await removeCacheEntries(paths);
-		}
-		for (const [version, paths] of group.markerEntries) {
-			if (version !== latestVersion) removedEntries += await removeCacheEntries(paths);
-		}
-	}
-	return { scannedPackages, removedEntries };
-}
-
-// [coreforge patch] resolveBunInstallCacheDir removed with the bun channel.
-
 interface BunGlobalInstallLocations {
 	globalDir?: string;
 	globalBinDir?: string;
@@ -847,13 +710,6 @@ export function resolveBunGlobalNodeModulesDirFromLocations({
 	}
 	return undefined;
 }
-
-// [coreforge patch] resolveBunGlobalNodeModulesDir and
-// collectInstalledPackageNames removed with the bun channel;
-// resolveBunGlobalNodeModulesDirFromLocations stays exported for its tests.
-
-// [coreforge patch] pruneBunCacheAfterGlobalInstall removed with the bun
-// update channel; pruneBunInstallCache stays exported for its unit tests.
 
 /**
  * Detect a musl-libc Linux host (Alpine, Void-musl) so self-update replaces a
@@ -978,6 +834,11 @@ async function verifyBinaryAtPath(binaryPath: string, expectedVersion: string): 
 	return { ok: actual === expectedVersion, actual, path: binaryPath };
 }
 
+export async function verifyInstalledVersion(expectedVersion: string): Promise<InstalledVersionVerification> {
+	const binaryPath = resolveOmpPath();
+	return binaryPath ? verifyBinaryAtPath(binaryPath, expectedVersion) : { ok: false };
+}
+
 async function validateExistingUpdateTarget(targetPath: string): Promise<void> {
 	let hasShebang = false;
 	try {
@@ -1005,6 +866,34 @@ function formatVerificationFailure(result: InstalledVersionVerification, expecte
 		return `${APP_NAME} at ${result.path} still reports ${result.actual} (expected ${expectedVersion})`;
 	}
 	return `could not verify updated version${result.path ? ` at ${result.path}` : ""}`;
+}
+
+/** Publish extension assets from a verified launcher, not from the process that updated it. */
+export async function syncRelayAfterVerifiedUpdate(launcher: string | undefined): Promise<void> {
+	if (!launcher) return;
+	try {
+		const result = await $`${launcher} browser-relay sync`.quiet().nothrow();
+		if (result.exitCode !== 0) {
+			logger.warn("browser relay sync after update failed", {
+				launcher,
+				exitCode: result.exitCode,
+				error: result.stderr.toString().trim(),
+			});
+		}
+	} catch (error) {
+		logger.warn("browser relay sync after update failed", { launcher, error: String(error) });
+	}
+}
+
+/** Report verification and publish assets only when the requested installed version was confirmed. */
+async function finishVerifiedUpdate(result: InstalledVersionVerification, expectedVersion: string): Promise<void> {
+	if (result.ok) {
+		printVerifiedVersion(expectedVersion, result.path);
+		await syncRelayAfterVerifiedUpdate(result.path);
+		return;
+	}
+	console.log(chalk.yellow(`\nWarning: ${formatVerificationFailure(result, expectedVersion)}`));
+	console.log(chalk.yellow("Reinstall through the Coreforge installer."));
 }
 
 async function unlinkIfExists(filePath: string): Promise<void> {
@@ -1161,6 +1050,7 @@ async function downloadCoreforgeBinary(
 	binaryName: string,
 	fetchImpl: Fetch | undefined,
 	githubToken: string | undefined,
+	onProgress?: UpdateProgressListener,
 ): Promise<string> {
 	const requestOptions = {
 		fetchImpl,
@@ -1197,12 +1087,15 @@ async function downloadCoreforgeBinary(
 		throw new Error(`GitHub release asset ${binaryName} has no supported SHA-256 digest`);
 	}
 	const expectedDigest = `sha256:${digest}`;
+	onProgress?.({ phase: "downloading", version: expectedVersion, received: 0, total: asset.size });
 	await downloadVerifiedBinary({
 		url: asset.url,
 		targetPath,
 		expectedSize: asset.size,
 		expectedDigest,
 		fetchImpl: (_input, init) => fetchCfAsset(asset, init?.signal ?? undefined, requestOptions),
+		onProgress: received =>
+			onProgress?.({ phase: "downloading", version: expectedVersion, received, total: asset.size }),
 	});
 	return expectedDigest;
 }
@@ -1227,6 +1120,7 @@ export async function updateViaBinaryAt(
 		/** Refuse replacement unless the existing path passes Coreforge ownership validation. */
 		validateExistingTarget?: boolean | ((targetPath: string) => Promise<void>);
 		verifyInstalledVersion?: (expectedVersion: string) => Promise<InstalledVersionVerification>;
+		onProgress?: UpdateProgressListener;
 	} = {},
 ): Promise<void> {
 	const requestedValidator = options.validateExistingTarget;
@@ -1251,7 +1145,14 @@ export async function updateViaBinaryAt(
 	const tempPath = `${targetPath}.${attempt}.new`;
 	const backupPath = `${targetPath}.${attempt}.bak`;
 	console.log(chalk.dim(`Downloading ${binaryName}…`));
-	await downloadCoreforgeBinary(tempPath, expectedVersion, binaryName, options.fetchImpl, options.githubToken);
+	await downloadCoreforgeBinary(
+		tempPath,
+		expectedVersion,
+		binaryName,
+		options.fetchImpl,
+		options.githubToken,
+		options.onProgress,
+	);
 
 	// Serialize the target swap and stale-artifact sweep per target so two
 	// overlapping `omp update` runs never replace the same binary concurrently
@@ -1259,6 +1160,7 @@ export async function updateViaBinaryAt(
 	// to a unique temp path and is safe to overlap; only the swap is shared.
 	const verification = await withFileLock(targetPath, async () => {
 		console.log(chalk.dim("Installing update..."));
+		options.onProgress?.({ phase: "installing", version: expectedVersion });
 		const result = await replaceBinaryForUpdate({
 			targetPath,
 			tempPath,
@@ -1281,17 +1183,17 @@ export async function updateViaBinaryAt(
 		await sweepStaleUpdateArtifacts(targetPath);
 		return result;
 	});
-	printVerifiedVersion(expectedVersion, verification.path ?? targetPath);
+	await finishVerifiedUpdate({ ...verification, path: verification.path ?? targetPath }, expectedVersion);
 	console.log(chalk.dim(`Restart ${APP_NAME} to use the new version`));
 }
 
-export async function runUpdateCommand(opts: { force: boolean; check: boolean }): Promise<void> {
+export async function runUpdateCommand(opts: UpdateOptions): Promise<UpdateOutcome> {
 	const ompPath = resolveOmpPath();
 	const manager = ompPath ? await managedInstallName(ompPath) : undefined;
 	if (manager) {
 		const reason = `${ompPath} is installed and kept up to date by ${manager}; update it from ${manager}.`;
 		console.log(chalk.yellow(reason));
-		return;
+		return { kind: "unsupported", reason };
 	}
 	console.log(chalk.dim(`Current version: ${CF_VERSION}`));
 
@@ -1299,8 +1201,7 @@ export async function runUpdateCommand(opts: { force: boolean; check: boolean })
 	try {
 		release = await getLatestRelease();
 	} catch (err) {
-		console.error(chalk.red(`Failed to check for updates: ${err}`));
-		process.exit(1);
+		throw new Error(`Failed to check for updates: ${err}`, { cause: err });
 	}
 
 	const comparison = compareCfVersions(release.version, CF_VERSION);
@@ -1308,7 +1209,7 @@ export async function runUpdateCommand(opts: { force: boolean; check: boolean })
 	if (comparison <= 0 && !opts.force) {
 		const icon = theme?.status?.success ?? "✔";
 		console.log(chalk.green(`${icon} Already up to date`));
-		return;
+		return { kind: "current" };
 	}
 
 	if (comparison > 0) {
@@ -1319,7 +1220,7 @@ export async function runUpdateCommand(opts: { force: boolean; check: boolean })
 
 	if (opts.check) {
 		// Just check, don't install
-		return;
+		return { kind: "available", version: release.version };
 	}
 
 	// Coreforge releases are compiled binaries from the private mirror. Do not
@@ -1334,11 +1235,12 @@ export async function runUpdateCommand(opts: { force: boolean; check: boolean })
 		}
 		await updateViaBinaryAt(target.path, release.version, {
 			validateExistingTarget: target.validateExistingTarget,
+			onProgress: opts.onProgress,
 		});
 	} catch (err) {
-		console.error(chalk.red(`Update failed: ${err}`));
-		process.exit(1);
+		throw new Error(`Update failed: ${err}`, { cause: err });
 	}
+	return { kind: "installed", version: release.version };
 }
 
 /**

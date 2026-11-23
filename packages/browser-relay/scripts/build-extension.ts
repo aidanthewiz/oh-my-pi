@@ -1,14 +1,9 @@
 /**
- * Builds the browser relay extension and its distribution artifacts:
- * - `dist/extension/` — unpacked extension (load via chrome://extensions)
- * - `dist/coreforge-browser-relay-extension.zip` — packaged extension for GH releases
- * - `../coding-agent/src/tools/browser/relay/extension-assets/*.txt` —
- *   generated text assets embedded into the Coreforge CLI for compiled
- *   `coreforge browser-relay install`.
- *
- * Dependency-free on purpose: CI runs this without `bun install`.
+ * Builds the Coreforge extension's release ZIP and embedded asset bundle.
+ * --embedded writes only the generated bundle consumed by source and compiled builds.
  */
 import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 import { $ } from "bun";
 import {
@@ -17,65 +12,126 @@ import {
 } from "../../coding-agent/src/tools/browser/relay/protocol";
 
 const root = path.resolve(import.meta.dir, "..");
-const repoRoot = path.resolve(root, "../..");
+const source = path.join(root, "extension");
 const dist = path.join(root, "dist");
-const distExtension = path.join(dist, "extension");
-const assetsDir = path.resolve(root, "../coding-agent/src/tools/browser/relay/extension-assets");
+/** Where the CLI reads the embedded copy in a source checkout (see extension-files.ts). */
+const embeddedFile = path.resolve(root, "../coding-agent/src/tools/browser/relay/extension.generated.json");
 
-await fs.rm(dist, { recursive: true, force: true });
-await fs.mkdir(distExtension, { recursive: true });
-
-const bundle = await Bun.build({
-	entrypoints: [path.join(root, "extension/background.ts")],
-	outdir: distExtension,
-	target: "browser",
-	sourcemap: "none",
-});
-if (!bundle.success) {
-	for (const log of bundle.logs) console.error(log);
-	process.exit(1);
+if (import.meta.main) {
+	if (process.argv.includes("--embedded")) {
+		await generateEmbeddedExtension();
+		console.log(`Generated ${embeddedFile}`);
+	} else {
+		await buildRelease();
+	}
 }
 
-for (const file of ["options.html", "options.js"]) {
-	await Bun.write(path.join(distExtension, file), Bun.file(path.join(root, "extension", file)));
-}
-await Bun.write(path.join(distExtension, "LICENSE"), Bun.file(path.join(repoRoot, "LICENSE")));
-await Bun.write(
-	path.join(distExtension, "THIRD-PARTY-NOTICES.txt"),
-	Bun.file(path.join(repoRoot, "THIRD-PARTY-NOTICES.txt")),
-);
-// The release zip carries the omp version it ships with, as `omp browser-relay install` stamps its copy;
-// the extension reports it to the relay. The embedded assets stay unstamped so releases do not rewrite them.
-const sourceManifest = path.join(root, "extension/manifest.json");
-const distScript = path.join(distExtension, "background.js");
-const unstampedScript = await Bun.file(distScript).text();
-const { version: ompVersion } = await Bun.file(path.join(root, "../coding-agent/package.json")).json();
-await Bun.write(distScript, stampRelayExtensionScript(unstampedScript, ompVersion));
-await Bun.write(
-	path.join(distExtension, "manifest.json"),
-	stampRelayExtensionManifest(await Bun.file(sourceManifest).text(), ompVersion),
-);
-
-const zip = await $`zip -qr ../coreforge-browser-relay-extension.zip .`.cwd(distExtension).nothrow();
-if (zip.exitCode !== 0) {
-	console.error("zip failed:", zip.stderr.toString());
-	process.exit(1);
+/**
+ * Bundle the unstamped extension and write it to `extension.generated.json` as `{ build, files }`, binary files
+ * base64-encoded. Returns the JSON text written.
+ */
+export async function generateEmbeddedExtension(): Promise<string> {
+	const scratch = await fs.mkdtemp(path.join(os.tmpdir(), "omp-relay-extension-"));
+	try {
+		await bundleExtension(scratch);
+		return (await writeEmbedded(scratch)).json;
+	} finally {
+		await fs.rm(scratch, { recursive: true, force: true });
+	}
 }
 
-await fs.rm(assetsDir, { recursive: true, force: true });
-await Bun.write(path.join(assetsDir, "background.js.txt"), unstampedScript);
-const embeddedAssets = [
-	[sourceManifest, "manifest.json.txt"],
-	[path.join(distExtension, "options.html"), "options.html.txt"],
-	[path.join(distExtension, "options.js"), "options.js.txt"],
-	[path.join(distExtension, "LICENSE"), "LICENSE.txt"],
-	[path.join(distExtension, "THIRD-PARTY-NOTICES.txt"), "THIRD-PARTY-NOTICES.txt"],
-] as const;
-for (const [source, destination] of embeddedAssets) {
-	await Bun.write(path.join(assetsDir, destination), Bun.file(source));
+/** `dist/extension/`, the pre-stamped release ZIP, and the embedded copy. */
+async function buildRelease(): Promise<void> {
+	const distExtension = path.join(dist, "extension");
+	await fs.rm(dist, { recursive: true, force: true });
+	await bundleExtension(distExtension);
+	const { build } = await writeEmbedded(distExtension);
+	// Only the release ZIP is pre-stamped. CLI installs stamp their own version with this build.
+	const manifest = path.join(distExtension, "manifest.json");
+	const background = path.join(distExtension, "background.js");
+	const { version: ompVersion } = await Bun.file(path.join(root, "../coding-agent/package.json")).json();
+	const [unstampedManifest, unstampedScript] = await Promise.all([
+		Bun.file(manifest).text(),
+		Bun.file(background).text(),
+	]);
+	await Promise.all([
+		Bun.write(manifest, stampRelayExtensionManifest(unstampedManifest, ompVersion)),
+		Bun.write(background, stampRelayExtensionScript(unstampedScript, ompVersion, build)),
+	]);
+	const zipPath = path.join(dist, "coreforge-browser-relay-extension.zip");
+	await $`zip -qr ${zipPath} .`.cwd(distExtension);
+	console.log(`Built:\n  ${distExtension}\n  ${zipPath}\n  ${embeddedFile}`);
 }
 
-console.log("built:");
-console.log(`  ${distExtension}`);
-console.log(`  ${path.join(dist, "coreforge-browser-relay-extension.zip")}`);
-console.log(`  ${assetsDir} (embedded CLI assets — commit these)`);
+/** Bundle the extension's scripts and copy its static files into `outDir`, unstamped. */
+async function bundleExtension(outDir: string): Promise<void> {
+	await fs.mkdir(outDir, { recursive: true });
+	await Promise.all([
+		bundle(outDir, "background.ts", "background", "iife"),
+		bundle(outDir, "panel/main.tsx", "panel", "esm"),
+		bundle(outDir, "overlay/main.ts", "overlay", "iife"),
+		bundle(outDir, "teach/recorder.ts", "recorder", "iife"),
+		bundle(outDir, "offscreen/main.ts", "offscreen", "iife"),
+	]);
+
+	const staticFiles = ["manifest.json", "panel.html", "offscreen.html"];
+	await Promise.all([
+		...staticFiles.map(name => Bun.write(path.join(outDir, name), Bun.file(path.join(source, name)))),
+		Bun.write(
+			path.join(outDir, "icons/coreforge.png"),
+			Bun.file(path.resolve(root, "../collab-web/public/favicon-512x512.png")),
+		),
+		Bun.write(path.join(outDir, "LICENSE"), Bun.file(path.resolve(root, "../../LICENSE"))),
+		Bun.write(
+			path.join(outDir, "THIRD-PARTY-NOTICES.txt"),
+			Bun.file(path.resolve(root, "../../THIRD-PARTY-NOTICES.txt")),
+		),
+	]);
+	for (const name of ["panel.css", "icons/coreforge.png"]) {
+		if (!(await Bun.file(path.join(outDir, name)).exists())) throw new Error(`Missing extension file: ${name}`);
+	}
+}
+
+/** Write the unstamped extension in `extensionDir` to {@link embeddedFile}; returns its build id and the JSON text. */
+async function writeEmbedded(extensionDir: string): Promise<{ build: string; json: string }> {
+	const names = [...new Bun.Glob("**/*").scanSync({ cwd: extensionDir, dot: true })]
+		.map(name => name.replaceAll(path.sep, "/"))
+		.sort();
+	const files: Record<string, string | { base64: string }> = {};
+	for (const name of names) {
+		const file = Bun.file(path.join(extensionDir, name));
+		const isText = name === "LICENSE" || /\.(?:css|html|js|json|map|svg|txt)$/.test(name);
+		files[name] = isText ? await file.text() : { base64: Buffer.from(await file.arrayBuffer()).toBase64() };
+	}
+	const build = await buildId(extensionDir, names);
+	const json = JSON.stringify({ build, files });
+	await Bun.write(embeddedFile, json);
+	return { build, json };
+}
+
+/** First 16 hex chars of SHA-256 over each unstamped file's name and bytes, in `names` order. */
+async function buildId(extensionDir: string, files: readonly string[]): Promise<string> {
+	const hasher = new Bun.CryptoHasher("sha256");
+	for (const name of files) {
+		hasher.update(`${name}\0`);
+		hasher.update(new Uint8Array(await Bun.file(path.join(extensionDir, name)).arrayBuffer()));
+		hasher.update("\0");
+	}
+	return hasher.digest("hex").slice(0, 16);
+}
+
+async function bundle(outDir: string, entry: string, name: string, format: "iife" | "esm"): Promise<void> {
+	const result = await Bun.build({
+		entrypoints: [path.join(source, entry)],
+		outdir: outDir,
+		target: "browser",
+		format,
+		naming: { entry: `${name}.[ext]` },
+		minify: name === "panel",
+		define: { "process.env.NODE_ENV": JSON.stringify("production") },
+	});
+	if (!result.success) throw new AggregateError(result.logs, `Failed to bundle ${entry}`);
+	if (!(await Bun.file(path.join(outDir, `${name}.js`)).exists())) {
+		throw new Error(`Bundling ${entry} did not produce ${name}.js`);
+	}
+}

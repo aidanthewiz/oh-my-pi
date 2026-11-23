@@ -225,6 +225,7 @@ describe("InteractiveMode fork placement bridge", () => {
 			}
 			let cancelFork = true;
 			let switchedId: string | undefined;
+			let expectedLeaf = manager.getLeafId();
 			const runtime = new ExtensionRuntime();
 			const extension = await loadExtensionFromFactory(
 				api => {
@@ -240,7 +241,10 @@ describe("InteractiveMode fork placement bridge", () => {
 						if (event.reason !== "fork") return;
 						switchedId = ctx.sessionManager.getSessionId();
 						ctx.ui.onTerminalInput(data => (data === "x" ? { data: "y" } : undefined));
-						if (surface === "answer") await mode.handleBtwCommand("incoming side question");
+						if (surface === "answer") {
+							expectedLeaf = ctx.sessionManager.getLeafId();
+							await mode.handleBtwCommand("incoming side question");
+						}
 						await mode.handleBtwCommand("");
 					});
 				},
@@ -345,7 +349,7 @@ describe("InteractiveMode fork placement bridge", () => {
 				).toMatchObject({
 					answer: surface === "answer" ? "incoming-partial survived" : "copied history answer",
 					status: "complete",
-					leafId: manager.getLeafId(),
+					leafId: expectedLeaf,
 				});
 				incomingSurface.handleInput("\x1b");
 				composer.ui.setFocus(input);

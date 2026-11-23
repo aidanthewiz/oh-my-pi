@@ -1,7 +1,7 @@
 /**
  * Bash command execution with streaming support and cancellation.
  *
- * Uses the embedded bash engine (pi-shell) through native bindings for shell
+ * Uses the embedded bash engine through native bindings for shell
  * execution.
  */
 import type { ImageContent } from "@oh-my-pi/pi-ai";
@@ -11,16 +11,19 @@ import {
 	PtySession,
 	RunTrace,
 	Shell,
+	type ShellCommands,
 	type ShellFilesystem,
 	type ShellRunResult,
+	type ShellSpeech,
 } from "@oh-my-pi/pi-natives";
 import { isShellTrace, type ShellTrace } from "@oh-my-pi/pi-wire";
 import { logger } from "@oh-my-pi/pi-utils";
+import { formatRawOutputNotice } from "@oh-my-pi/pi-tui/tools/output-meta";
 import { $env } from "@oh-my-pi/pi-utils/env";
 import { isCmdShell, isExecutable, type ShellConfig } from "@oh-my-pi/pi-utils/procmgr";
 import { Settings } from "../config/settings";
 import type { MinimizedMeta } from "@oh-my-pi/pi-tui/tools/output-meta";
-import { OutputSink, type OutputSummary } from "@oh-my-pi/pi-tui/tools/streaming-output";
+import { type ArtifactAllocator, OutputSink, type OutputSummary } from "@oh-my-pi/pi-tui/tools/streaming-output";
 import { attachShellTrace } from "@oh-my-pi/pi-tui/tools/shell-viz";
 import {
 	resolveOutputMaxColumns,
@@ -29,7 +32,9 @@ import {
 } from "../tools/output-meta";
 import { quotePosixArgv } from "../utils/shell-quote";
 import { getOrCreateSnapshot } from "../utils/shell-snapshot";
+import { StreamNewlineNormalizer } from "../utils/stream-newlines";
 import { TerminalGraphicsDecoder } from "../utils/terminal-graphics";
+import { appendImageLinks } from "../utils/image-temp";
 import { loadDirenvEnv } from "./direnv";
 import { buildNonInteractiveEnv } from "./non-interactive-env";
 
@@ -58,6 +63,11 @@ export interface BashExecutorOptions {
 	signal?: AbortSignal;
 	/** Session key suffix to isolate shell sessions per agent */
 	sessionKey?: string;
+	/**
+	 * Session key whose persistent shell a new shell for `sessionKey` starts as a copy of
+	 * (variables, functions, aliases, options); what the run sets stays in the copy.
+	 */
+	seedSessionKey?: string;
 	/** Additional environment variables to inject */
 	env?: Record<string, string>;
 	/** Command and environment already transformed and reviewed by the calling tool. */
@@ -80,13 +90,17 @@ export interface BashExecutorOptions {
 	 * `cwd` included). External shells and processes never see it.
 	 */
 	filesystem?: ShellFilesystem;
+	/** Speech synthesizer the embedded shell's `say` speaks through when the session has one set up. */
+	speech?: ShellSpeech;
+	/** Session tool commands the embedded shell resolves during this run. Other shells never see them. */
+	commands?: ShellCommands & { abort?: () => void };
 	/**
 	 * Receives a copy of every byte crossing the command's pipes in the
 	 * embedded shell (`proc://<id>/streams`). The user-shell paths ignore it.
 	 */
 	streams?: PipeStreams;
 	/**
-	 * Receives the embedded shell's live trace of the command (pi-shell's
+	 * Receives the embedded shell's live trace of the command (omp-shell's
 	 * `RunTrace` snapshot) every {@link TRACE_POLL_MS} while it changed, and
 	 * once more after the run settles. The PTY path never calls it.
 	 */
@@ -108,14 +122,13 @@ export interface BashExecutorOptions {
 	 * experiment shapes the output instead. Default: the setting decides.
 	 */
 	minimize?: boolean;
-	/** Artifact path/id for full output storage */
-	artifactPath?: string;
-	artifactId?: string;
+	/** Claims the spill file for output that overflows the inline view. */
+	allocateArtifact?: ArtifactAllocator;
 	/**
 	 * Invoked when the native minimizer rewrote the command's output, giving
 	 * the caller a chance to persist the lossless original capture (typically
-	 * via the session's `ArtifactManager`). The returned id is spliced into
-	 * the sink output as `artifact://<id>` so the agent can retrieve the raw
+	 * via the session's `ArtifactManager`). The returned spill id is spliced
+	 * into the sink output as its spill URL so the agent can retrieve the raw
 	 * bytes. Return `undefined` to skip the footer.
 	 */
 	onMinimizedSave?: (
@@ -183,13 +196,18 @@ const TRACE_POLL_MS = 80;
 
 /**
  * Polls `trace` every {@link TRACE_POLL_MS} while the run is in flight and
- * forwards each changed snapshot; `stop()` takes the final one.
+ * forwards each changed snapshot, bound to the run (and its `streams`, so
+ * a card can show what a step writes there); `stop()` takes the final one.
  *
  * An invalid snapshot is logged once and skipped: the poll runs from a timer,
  * where a throw would escape as an uncaught exception and end the session,
  * and the trace is only a visualization of the run.
  */
-function pollRunTrace(trace: RunTrace, onTrace: (trace: ShellTrace) => void): { stop: () => ShellTrace | undefined } {
+function pollRunTrace(
+	trace: RunTrace,
+	streams: PipeStreams | undefined,
+	onTrace: (trace: ShellTrace) => void,
+): { stop: () => ShellTrace | undefined } {
 	let last = -1;
 	let latest: ShellTrace | undefined;
 	let warned = false;
@@ -204,7 +222,7 @@ function pollRunTrace(trace: RunTrace, onTrace: (trace: ShellTrace) => void): { 
 			return;
 		}
 		latest = snapshot;
-		attachShellTrace(latest, trace);
+		attachShellTrace(latest, trace, streams);
 		onTrace(latest);
 	};
 	const timer = setInterval(poll, TRACE_POLL_MS);
@@ -665,6 +683,7 @@ async function executeUserShellPty(run: {
 	dump: (notice?: string) => Promise<OutputSummary & { images?: ImageContent[] }>;
 }): Promise<BashResult> {
 	const session = new PtySession();
+	const newlines = new StreamNewlineNormalizer();
 	const result = await session.startArgv(
 		{
 			application: run.shell,
@@ -682,7 +701,7 @@ async function executeUserShellPty(run: {
 			// Preserve raw bytes for the terminal display, but extract graphics
 			// before the transcript sink sanitizes or truncates the clean text.
 			const clean = run.graphics.push(chunk);
-			if (clean) run.sink.push(clean.replace(/\r\n?/gu, "\n"));
+			if (clean) run.sink.push(newlines.push(clean));
 		},
 		err => {
 			if (err) return;
@@ -781,8 +800,7 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 						onPreview?.(sink.preview());
 					}
 				: undefined,
-		artifactPath: options?.artifactPath,
-		artifactId: options?.artifactId,
+		allocateArtifact: options?.allocateArtifact,
 		headBytes: resolveOutputSinkHeadBytes(settings),
 		artifactMaxBytes: resolveOutputSinkArtifactMaxBytes(settings),
 		maxColumns: resolveOutputMaxColumns(settings),
@@ -807,8 +825,11 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 			if (tail) sink.push(tail);
 			decodedImages = await graphics.images();
 		}
+		const summary = await sink.dump(notice);
+		const output = await appendImageLinks(summary.output, decodedImages);
 		return {
-			...(await sink.dump(notice)),
+			...summary,
+			output,
 			...(decodedImages.length > 0 ? { images: decodedImages } : {}),
 		};
 	};
@@ -865,7 +886,13 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 	const sessionBusy = shellSessionsInUse.has(sessionKey);
 	let shellSession = sessionBusy ? undefined : shellSessions.get(sessionKey);
 	if (!shellSession && !sessionBusy) {
-		shellSession = new Shell(shellOptions);
+		const seed =
+			options?.seedSessionKey === undefined
+				? undefined
+				: shellSessions.get(
+						buildSessionKey(shell, prefix, snapshotPath, sessionEnv, options.seedSessionKey, minimizer),
+					);
+		shellSession = seed?.fork() ?? new Shell(shellOptions);
 		shellSessions.set(sessionKey, shellSession);
 	}
 	const busyShell = sessionBusy ? shellSessions.get(sessionKey) : undefined;
@@ -889,6 +916,7 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 		return abortCleanupPromise;
 	};
 	const abortCurrentExecution = () => {
+		options?.commands?.abort?.();
 		if (!runAbortController.signal.aborted) {
 			runAbortController.abort();
 		}
@@ -913,22 +941,34 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 		const fallbackTimeoutMs = nativeOwnsTimeout
 			? deadlineTimeoutMs + NATIVE_TIMEOUT_FALLBACK_GRACE_MS
 			: deadlineTimeoutMs;
-		timeoutTimer = setTimeout(() => {
-			// Explicit timeouts are enforced inside pi-natives via `timeoutMs`.
+		const fallbackAt = performance.now() + fallbackTimeoutMs;
+		const onDeadline = (): void => {
+			// A timer can fire early by the clock the deadline and wall time use: after the
+			// host slept, timers count the sleep while the native deadline does not. Wait out
+			// the rest, or a running command is reported timed out (and the backend hung)
+			// with wall time well under its deadline.
+			const remainingMs = fallbackAt - performance.now();
+			if (remainingMs > 0) {
+				timeoutTimer = setTimeout(onDeadline, remainingMs);
+				return;
+			}
+			// Explicit timeouts are enforced inside omp-natives via `timeoutMs`.
 			// Give native cancellation time to flush pipeline output and drain the
 			// N-API bridge before this result-only watchdog gives up on the run.
 			if (!nativeOwnsTimeout) {
 				abortCurrentExecution();
 			}
 			timeoutDeferred.resolve("timeout");
-		}, fallbackTimeoutMs);
+		};
+		timeoutTimer = setTimeout(onDeadline, fallbackTimeoutMs);
 	}
 
 	let resetSession = false;
 	// Set when the command returns before its native run settled.
 	let unsettled: { run: Promise<ShellRunResult>; cleanup: Promise<void> } | undefined;
 	const runTrace = options?.onTrace ? new RunTrace(finalCommand) : undefined;
-	const tracePoll = runTrace && options?.onTrace ? pollRunTrace(runTrace, options.onTrace) : undefined;
+	const tracePoll =
+		runTrace && options?.onTrace ? pollRunTrace(runTrace, options.streams, options.onTrace) : undefined;
 	// The last snapshot once the run settled (any outcome); `stop()` is idempotent past the first call.
 	let finalTrace: ShellTrace | undefined;
 	const settleTrace = (): { trace: ShellTrace } | Record<string, never> => {
@@ -937,6 +977,24 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 		}
 		return finalTrace ? { trace: finalTrace } : {};
 	};
+
+	const rawCommands = options?.useUserShell ? undefined : options?.commands;
+	const pendingCommands = rawCommands ? new Set<Promise<unknown>>() : undefined;
+	const commands: ShellCommands | undefined =
+		rawCommands && pendingCommands
+			? {
+					...rawCommands,
+					handler: request => {
+						const execution = rawCommands.handler(request);
+						pendingCommands.add(execution);
+						void execution.then(
+							() => pendingCommands.delete(execution),
+							() => pendingCommands.delete(execution),
+						);
+						return execution;
+					},
+				}
+			: undefined;
 
 	try {
 		options?.validate?.();
@@ -948,6 +1006,8 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 				timeoutMs: nativeTimeoutMs,
 				signal: runAbortController.signal,
 				filesystem: options?.filesystem,
+				speech: options?.useUserShell ? undefined : options?.speech,
+				commands,
 				streams: options?.useUserShell ? undefined : options?.streams,
 				trace: runTrace,
 			},
@@ -1004,6 +1064,7 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 
 		// Handle timeout
 		if (winner.result.timedOut) {
+			options?.commands?.abort?.();
 			const annotation = options?.timeout
 				? `Command timed out after ${Math.round(options.timeout / 1000)} seconds`
 				: "Command timed out";
@@ -1019,6 +1080,7 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 
 		// Handle cancellation
 		if (winner.result.cancelled) {
+			options?.commands?.abort?.();
 			return {
 				exitCode: undefined,
 				cancelled: true,
@@ -1030,7 +1092,7 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 
 		// When the native minimizer rewrote the output, persist the original and
 		// swap the sink's accumulated raw stream for the minimized text with an
-		// `artifact://<id>` footer so the agent can retrieve the raw bytes
+		// `[raw output: <spill url>]` footer so the agent can retrieve the raw bytes
 		// losslessly. The minimized text is a lossy summary, so substitute it
 		// only once the original is addressable — a caller that returns no id
 		// (or an unavailable allocator) must keep the raw stream rather than
@@ -1055,7 +1117,10 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 				const minimizedText = minimizedGraphics.push(minimized.text) + minimizedGraphics.finish();
 				sink.replace(minimizedText);
 				const sep = minimizedText.endsWith("\n") ? "" : "\n";
-				sink.push(`${sep}[raw output: artifact://${artifactId}]\n`);
+				// The label keeps its own line so the `[raw output: …]` line stays parseable.
+				sink.push(
+					`${sep}[output summarized by the ${minimized.filter} filter; pipe through \`| cat\` for verbatim output]\n${formatRawOutputNotice(artifactId)}\n`,
+				);
 			}
 		}
 
@@ -1070,9 +1135,12 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 			...(await dump()),
 		};
 	} catch (err) {
+		options?.commands?.abort?.();
 		resetSession = true;
 		throw err;
 	} finally {
+		// Native cancellation can settle before JS tool callbacks release their owned resources.
+		while (pendingCommands && pendingCommands.size > 0) await Promise.allSettled(pendingCommands);
 		settleTrace();
 		await sink.dispose();
 		if (timeoutTimer) {

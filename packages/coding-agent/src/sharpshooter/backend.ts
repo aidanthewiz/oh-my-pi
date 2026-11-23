@@ -89,6 +89,7 @@ export const sharpshooterBackend: MemoryBackend = {
 				modelRegistry,
 				sessionId: session.sessionId,
 				getSessionProvider: () => session.model?.provider,
+				usageLedger: session.sessionManager,
 			});
 			try {
 				const unsubscribe = session.subscribe(event => {
@@ -153,6 +154,7 @@ export const sharpshooterBackend: MemoryBackend = {
 			getSessionProvider: () => session.model?.provider,
 			force: true,
 			signal,
+			usageLedger: session.sessionManager,
 		});
 		signal?.throwIfAborted();
 	},

@@ -18,11 +18,13 @@ import { InternalUrlRouter } from "@oh-my-pi/pi-coding-agent/internal-urls";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { BashTool } from "@oh-my-pi/pi-coding-agent/tools/bash";
 import { AstGrepTool } from "@oh-my-pi/pi-coding-agent/tools/ast-grep";
 import { GlobTool } from "@oh-my-pi/pi-coding-agent/tools/glob";
 import { GrepTool } from "@oh-my-pi/pi-coding-agent/tools/grep";
 import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
 import { WriteTool } from "@oh-my-pi/pi-coding-agent/tools/write";
+import { quotePosixArgv } from "@oh-my-pi/pi-coding-agent/utils/shell-quote";
 import { getAgentDir, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
 import { writeArchive } from "@oh-my-pi/pi-utils/ar";
 
@@ -304,7 +306,7 @@ describe("cached approval protects executed content and effects", () => {
 		expect(fs.readFileSync(path.join(cwd, "b.txt"), "utf8")).toBe(PRIVATE);
 	});
 
-	it("executes a device Once without recording a filesystem or session grant", async () => {
+	it("executes a mounted command Once without recording a filesystem or session grant", async () => {
 		const destination = path.join(cwd, "result.txt");
 		fs.writeFileSync(destination, "original");
 		const device = {
@@ -318,25 +320,33 @@ describe("cached approval protects executed content and effects", () => {
 				return { content: [{ type: "text" as const, text: "saved" }] };
 			},
 		};
+		const tools = new Map([[device.name, new ExtensionToolWrapper(device, runner)]]);
 		toolSession = {
 			...toolSession,
-			xdev: {
-				tools: new Map([[device.name, device]]),
+			toolRegistry: tools,
+			isToolActive: name => name === "bash",
+			toolCommands: {
+				tools,
 				mountedNames: new Set([device.name]),
 				builtInNames: new Set(),
 				isActive: () => false,
 			},
 		};
 		answer = async () => "once";
-		await execute(new WriteTool(toolSession), { path: "xd://boundarywriter", content: '{"content":"approved"}' });
+		await execute(new BashTool(toolSession), {
+			command: quotePosixArgv([device.name, "--json", JSON.stringify({ content: "approved" })]),
+		});
 		expect(fs.readFileSync(destination, "utf8")).toBe("approved");
 		answer = async () => "deny";
-		await refuses(new WriteTool(toolSession), { path: "xd://boundarywriter", content: '{"content":"unapproved"}' });
+		const denied = await execute(new BashTool(toolSession), {
+			command: quotePosixArgv([device.name, "--json", JSON.stringify({ content: "unapproved" })]),
+		});
+		expect(denied.isError).toBe(true);
 		expect(fs.readFileSync(destination, "utf8")).toBe("approved");
 		expect(prompts).toBe(2);
 	});
 
-	it("does not dispatch a replacement device mounted while approval awaits", async () => {
+	it("does not dispatch a replacement command mounted while approval awaits", async () => {
 		const first = path.join(cwd, "first.txt");
 		const second = path.join(cwd, "second.txt");
 		fs.writeFileSync(first, "original");
@@ -353,10 +363,12 @@ describe("cached approval protects executed content and effects", () => {
 			},
 		});
 		const initial = deviceFor(first);
-		const tools = new Map([[initial.name, initial]]);
+		const tools = new Map([[initial.name, new ExtensionToolWrapper(initial, runner)]]);
 		toolSession = {
 			...toolSession,
-			xdev: {
+			toolRegistry: tools,
+			isToolActive: name => name === "bash",
+			toolCommands: {
 				tools,
 				mountedNames: new Set([initial.name]),
 				builtInNames: new Set(),
@@ -365,10 +377,13 @@ describe("cached approval protects executed content and effects", () => {
 		};
 		answer = async () => {
 			if (prompts > 1) return "deny";
-			tools.set(initial.name, deviceFor(second));
+			tools.set(initial.name, new ExtensionToolWrapper(deviceFor(second), runner));
 			return "once";
 		};
-		await refuses(new WriteTool(toolSession), { path: "xd://boundarywriter", content: '{"content":"unapproved"}' });
+		const denied = await execute(new BashTool(toolSession), {
+			command: quotePosixArgv([initial.name, "--json", JSON.stringify({ content: "unapproved" })]),
+		});
+		expect(denied.isError).toBe(true);
 		expect(fs.readFileSync(first, "utf8")).toBe("original");
 		expect(fs.readFileSync(second, "utf8")).toBe(PRIVATE);
 	});

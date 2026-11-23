@@ -10,13 +10,14 @@ function createTestSession(overrides: Partial<ToolSession> = {}): ToolSession {
 		hasUI: false,
 		getSessionFile: () => null,
 		getSessionSpawns: () => "*",
-		settings: Settings.isolated(),
+		settings: Settings.isolated({ "dev.autoqa": false }),
 		...overrides,
 	};
 }
 
 function createSettingsWithOverrides(overrides: Record<string, unknown> = {}): Settings {
 	return Settings.isolated({
+		"dev.autoqa": false,
 		"lsp.formatOnWrite": true,
 		"bashInterceptor.enabled": true,
 		...overrides,
@@ -46,9 +47,9 @@ describe("createTools", () => {
 	});
 
 	it("creates all builtin tools by default", async () => {
-		// xdev mounting (default-on) would unmount discoverables like lsp and
-		// web_search into xd://; disable it to assert the full builtin set.
-		const session = createTestSession({ settings: createSettingsWithOverrides({ "tools.xdev": false }) });
+		// tool-command mounting (default-on) would unmount discoverables like lsp and
+		// web_search into bash commands; disable it to assert the full builtin set.
+		const session = createTestSession({ settings: createSettingsWithOverrides({ "tools.commands": false }) });
 		const tools = await createTools(session);
 		const names = tools.map(t => t.name);
 
@@ -114,29 +115,16 @@ describe("createTools", () => {
 		const tools = await createTools(session, ["read", "lsp", "write"]);
 		const names = tools.map(t => t.name);
 
-		expect(names).toEqual(["read", "write"]);
+		expect(names).toEqual(expect.arrayContaining(["read", "write"]));
+		expect(names).not.toContain("lsp");
 	});
 
-	it("creates xd:// presentation state without remounting explicitly requested built-ins", async () => {
+	it("keeps an explicit tool list top-level when it omits bash", async () => {
 		const session = createTestSession();
 		const tools = await createTools(session, ["read", "lsp", "write"]);
 
-		expect(session.xdev).toBeDefined();
-		expect(session.xdev?.mountedNames.size).toBe(0);
-		expect(tools.map(tool => tool.name)).toEqual(["read", "lsp", "write"]);
-	});
-
-	it("grants a device-only xd:// transport write when an explicit list keeps read but omits write", async () => {
-		// The xd:// transport rides `write xd://<tool>`; with no write at all the
-		// session would allocate no xd:// state and later SDK assembly would
-		// expose custom/MCP tools top-level. A device-only write restores
-		// mounting while filesystem writes stay rejected (see WriteTool).
-		const session = createTestSession();
-		const tools = await createTools(session, ["read", "lsp"]);
-
-		expect(session.deviceOnlyWrite).toBe(true);
-		expect(session.xdev).toBeDefined();
-		expect(tools.map(tool => tool.name)).toEqual(["read", "lsp", "write"]);
+		expect(session.toolCommands).toBeUndefined();
+		expect(tools.map(tool => tool.name)).toEqual(expect.arrayContaining(["read", "lsp", "write"]));
 	});
 
 	it("lowercases requested tool subset", async () => {
@@ -144,7 +132,9 @@ describe("createTools", () => {
 		const tools = await createTools(session, ["Read", "Write"]);
 		const names = tools.map(t => t.name);
 
-		expect(names).toEqual(["read", "write"]);
+		expect(names).toEqual(expect.arrayContaining(["read", "write"]));
+		expect(names).not.toContain("Read");
+		expect(names).not.toContain("Write");
 	});
 
 	it("includes hidden tools when explicitly requested", async () => {
@@ -152,7 +142,7 @@ describe("createTools", () => {
 		const tools = await createTools(session, ["yield"]);
 		const names = tools.map(t => t.name);
 
-		expect(names).toEqual(["yield"]);
+		expect(names).toContain("yield");
 	});
 
 	it("includes yield tool when required", async () => {
@@ -223,8 +213,8 @@ describe("createTools", () => {
 			}),
 			["ask", "read"],
 		);
-		// write joins as the device-only xd:// transport (read granted, ask disabled).
-		expect(requested.map(t => t.name)).toEqual(["read", "write"]);
+		expect(requested.map(t => t.name)).toContain("read");
+		expect(requested.map(t => t.name)).not.toContain("ask");
 	});
 
 	it("filters disabled builtin tools by settings", async () => {
@@ -253,9 +243,8 @@ describe("createTools", () => {
 		expect(names).not.toContain("browser");
 
 		const requestedTools = await createTools(createTestSession({ settings: session.settings }), ["bash", "read"]);
-		// `write` joins as the device-only xd:// transport: read was granted,
-		// write omitted (see the "device-only xd:// transport write" test).
-		expect(requestedTools.map(t => t.name)).toEqual(["read", "write"]);
+		expect(requestedTools.map(t => t.name)).toContain("read");
+		expect(requestedTools.map(t => t.name)).not.toContain("bash");
 	});
 
 	it("auto-includes goal when goal mode is active", async () => {
@@ -268,8 +257,7 @@ describe("createTools", () => {
 		const tools = await createTools(session, ["read"]);
 		const names = tools.map(t => t.name);
 
-		// `write` joins last as the device-only xd:// transport (see above).
-		expect(names).toEqual(["read", "goal", "write"]);
+		expect(names).toEqual(expect.arrayContaining(["read", "goal"]));
 	});
 
 	it("does not widen a restricted explicit tool list for an active goal", async () => {

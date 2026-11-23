@@ -104,7 +104,7 @@ Breadcrumb writes are best-effort and non-fatal.
 
 Resume-key discovery follows validated continuations unless the named session has turns the copy lacks. A notice names both files. Discovery can recover an unlisted replaced generated filename through its recorded id. Literal path arguments never use continuation or generated-filename recovery. The startup picker re-reads the selected file's metadata, then can choose its continuation; the chosen record supplies both path and cwd. Interactive in-session picker selection remains exact.
 
-If a matched session's recorded cwd no longer exists, CLI prompts `Move (re-root) it into the current directory? [Y/n]`. Acceptance uses `SessionManager.openRelocated(...)` under ownership and publication fences; a live writer refuses relocation. Decline exits cleanly. A non-TTY cannot answer and raises `SessionResolutionError`.
+If a matched session's recorded cwd is gone, an interactive launch normally asks `Move (re-root) it into the current directory? [Y/n]`; decline exits cleanly. Protocol modes (`rpc`, `rpc-ui`, `acp`) can open the stored session with the launch cwd without prompting, and recovery from a removed worktree has its dedicated relocation path. Any actual relocation uses the session ownership, source-header and destination publication fences; a live writer is not overridden. A non-TTY launch that still requires an interactive decision raises `SessionResolutionError`.
 
 Otherwise the session is opened in its recorded project, including global matches; startup switches process cwd, reloads project-scoped settings/plugins, and re-resolves enabled models before constructing the agent. It does **not** fork merely because the match is cross-project.
 

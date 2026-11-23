@@ -13,6 +13,7 @@ import type { ModelRegistry } from "../config/model-registry";
 import { getAllowedAvailableModels, getModelMatchPreferences, resolveModelRoleValue } from "../config/model-resolver";
 import type { Settings } from "../config/settings";
 import commitSystemPrompt from "../prompts/system/commit-message-system.md" with { type: "text" };
+import { journalCompletion, type ModelUsageLedger } from "../session/model-usage-journal";
 import { concreteThinkingLevel, toReasoningEffort } from "@oh-my-pi/pi-tui/thinking";
 
 const COMMIT_SYSTEM_PROMPT = prompt.render(commitSystemPrompt);
@@ -83,6 +84,7 @@ function getSmolModelCandidates(
 /**
  * Generate a commit message from a unified diff.
  * Returns null if generation fails (caller should fall back to generic message).
+ * `usageLedger` journals each billed attempt as `commit:message` on the calling session.
  */
 export async function generateCommitMessage(
 	diff: string,
@@ -90,6 +92,7 @@ export async function generateCommitMessage(
 	settings: Settings,
 	sessionId?: string,
 	activeProvider?: string,
+	usageLedger?: Partial<ModelUsageLedger>,
 ): Promise<string | null> {
 	const candidates = getSmolModelCandidates(registry, settings, activeProvider);
 	if (candidates.length === 0) {
@@ -112,9 +115,10 @@ export async function generateCommitMessage(
 
 		try {
 			const maxTokens = COMMIT_MAX_TOKENS;
+			const journal = journalCompletion(usageLedger, { purpose: "commit:message", role: "smol" });
 			const response = await retryTransientCompletion(
-				() =>
-					completeSimple(
+				async () => {
+					const attempt = await completeSimple(
 						candidate.model,
 						{
 							systemPrompt: [COMMIT_SYSTEM_PROMPT],
@@ -126,7 +130,11 @@ export async function generateCommitMessage(
 							maxTokens,
 							reasoning: toReasoningEffort(candidate.thinkingLevel),
 						},
-					),
+					);
+					// Reported per attempt: a transient retry was billed too and would otherwise be replaced.
+					journal?.(attempt, userMessage);
+					return attempt;
+				},
 				{ provider: candidate.model.provider },
 			);
 

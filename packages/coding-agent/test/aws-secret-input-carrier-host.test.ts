@@ -33,7 +33,7 @@ for (const language of ["js", "py"] as const) {
 	test.skipIf(process.platform === "win32" || (language === "py" && process.env.PI_PYTHON_INTEGRATION !== "1"))(
 		language === "js"
 			? "actual SDK and JS Eval carriers refuse AWS secret input while native dispatch owns approval and cleanup"
-			: "actual Python Eval refuses canonical AWS and Write capability probes and secret delivery before protected work",
+			: "actual Python Eval refuses canonical AWS and Bash capability probes and secret delivery before protected work",
 		async () => {
 			const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "aws-secret-input-carrier-host-")));
 			try {
@@ -107,34 +107,26 @@ for (const language of ["js", "py"] as const) {
 					const expectedDenials: string[] = [];
 					for (const kind of ["transfer", "capability"]) {
 						if (language === "js") {
-							for (const carrier of [
-								"raw-aws",
-								"canonical-aws",
-								"canonical-write",
-								"copied-write",
-								"bridge-aws",
-								"bridge-write",
-							])
+							for (const carrier of ["raw-aws", "canonical-aws", "canonical-bash", "bridge-aws", "bridge-bash"])
 								expectedDenials.push(`sdk-${carrier}-${kind}`);
 						}
-						for (const carrier of ["aws", "write", "copied-write"])
-							expectedDenials.push(`${language}-eval-${carrier}-${kind}`);
+						for (const carrier of ["aws", "bash"]) expectedDenials.push(`${language}-eval-${carrier}-${kind}`);
 					}
 					if (language === "js")
 						expectedDenials.push(
-							"preflight-write-canonical-aws",
-							"preflight-write-canonical-write",
-							"preflight-write-nested-native-dispatch",
-							"result-write-canonical-aws",
-							"result-write-canonical-write",
+							"preflight-bash-canonical-aws",
+							"preflight-bash-canonical-bash",
+							"preflight-bash-nested-native-dispatch",
+							"result-bash-canonical-aws",
+							"result-bash-canonical-bash",
 							"stale-canonical-aws",
-							"stale-canonical-write",
-							"held-canonical-write",
+							"stale-canonical-bash",
+							"held-canonical-bash",
 							"held-bridge-aws",
 							"preflight-aws-canonical-aws",
-							"preflight-aws-canonical-write",
+							"preflight-aws-canonical-bash",
 							"result-aws-canonical-aws",
-							"result-aws-canonical-write",
+							"result-aws-canonical-bash",
 						);
 					expect(summary?.denied).toEqual(expectedDenials);
 					const counts = isRecord(summary?.counts) ? summary.counts : undefined;
@@ -167,12 +159,7 @@ for (const language of ["js", "py"] as const) {
 								protectedActivity: route.protectedActivity,
 							})),
 						).toEqual(
-							[
-								"native-hashline-content-capability",
-								"native-inner-intent-capability",
-								"native-mounted-aws-capability",
-								"native-top-level-write-capability",
-							].map(stage => ({
+							["native-mounted-aws-capability", "native-top-level-bash-capability"].map(stage => ({
 								stage,
 								compatible: true,
 								protectedActivity: {
@@ -191,17 +178,15 @@ for (const language of ["js", "py"] as const) {
 						expect(native?.stdout).toBe("carrier-input-approved\n");
 						expect(native?.directStdout).toBe("carrier-input-approved\n");
 						expect(native?.transferRoutes).toEqual(
-							[
-								"native-mounted-ordinary-write",
-								"native-active-ordinary-write",
-								"native-active-copied-write",
-								"native-active-normalized-write",
-								"native-remounted-copied-write",
-							].map(stage => ({ stage, stdout: "carrier-input-approved\n", approvals: 1 })),
+							["native-mounted-bash", "native-active-bash", "native-remounted-bash"].map(stage => ({
+								stage,
+								stdout: "carrier-input-approved\n",
+								approvals: 1,
+							})),
 						);
 						expect(native?.policyRevokedBeforeDelivery).toBe(true);
 						expect(native?.disabledBeforeProtectedWork).toBe(true);
-						expect(native?.resultHandlers).toEqual({ write: 1, aws: 1 });
+						expect(native?.resultHandlers).toEqual({ bash: 1, aws: 1 });
 						expect(native?.cancelled).toBe(true);
 						expect(native?.cleanupRemoved).toBe(true);
 					}

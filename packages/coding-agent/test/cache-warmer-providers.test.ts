@@ -395,6 +395,8 @@ function createResponsesPayloadHarness(
 	if (!bundled) throw new Error("Expected bundled openai/gpt-5.6");
 	const model: Model<"openai-responses"> = {
 		...bundled,
+		// Fixed rates keep short retention uneconomic and 12h retention beneficial.
+		cost: { input: 4, output: 8, cacheRead: 0.4, cacheWrite: 4 },
 		promptCache: { short: ACCELERATED_CACHE_TTL_SECONDS, long: ACCELERATED_CACHE_TTL_SECONDS },
 	};
 	const bodies: Record<string, unknown>[] = [];

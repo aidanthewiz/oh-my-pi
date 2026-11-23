@@ -177,7 +177,7 @@ describe("async-job thread custody", () => {
 				agentId: "WidgetRoot",
 				sessionManager: SessionManager.inMemory(dir),
 				bindProcessState: false,
-				cacheWarming: false,
+				cacheWarming: "off",
 				disableExtensionDiscovery: true,
 				skills: [],
 				contextFiles: [],

@@ -9,7 +9,7 @@ import {
 	queryBlobBrokerProbe,
 	queryBlobBrokerPurge,
 	queryBlobBrokerStatus,
-} from "../blob-broker/daemon";
+} from "../blob-broker/service";
 import {
 	type BlobDestinationId,
 	type BlobDestinationMetadata,
@@ -45,7 +45,7 @@ import {
 import { providerFileCachePath, resolveBlobBrokerConfigs } from "../blob-broker/service";
 import { createConfiguredUploader } from "../blob-broker/uploaders";
 import { Settings } from "../config/settings";
-import { closeDaemonClients } from "../launch/client";
+import { closeDaemonClient } from "../daemon/client";
 import { applyUnpausedProviders, resolveEffectiveSettings } from "../session/auth-broker-config";
 
 import { cfgImagesUrlsBackends, cfgImagesUrlsEnabled } from "../blob-broker/settings";
@@ -288,7 +288,7 @@ const DEFAULT_DEPENDENCIES: ImagesCliDependencies = {
 	writeStderr: text => {
 		process.stderr.write(text);
 	},
-	closeRuntime: closeDaemonClients,
+	closeRuntime: closeDaemonClient,
 };
 
 function dependencies(overrides: Partial<ImagesCliDependencies> | undefined): ImagesCliDependencies {

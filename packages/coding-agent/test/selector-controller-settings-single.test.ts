@@ -66,7 +66,6 @@ function pickerContext(ui: OverlayUi, models: Model[] = [], model?: Model, setti
 			getContextUsage: () => undefined,
 			effectiveServiceTier: () => undefined,
 			getRoleModelCycle: () => undefined,
-			resolveTemporaryModelThinkingLevel: () => "off",
 			setModelTemporary: vi.fn(async () => {}),
 			applyRoleModel: vi.fn(async () => {}),
 			modelRegistry: {

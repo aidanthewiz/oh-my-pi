@@ -3,10 +3,9 @@ import type { PathLike } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { daemonBrokerRuntimeDir } from "../../src/launch/paths";
-import { registerDaemonProjectPresence } from "../../src/launch/presence";
+import { canonicalProjectDir } from "../../src/daemon/paths";
 
-describe("daemon presence canonicalProjectDir EISDIR fallback", () => {
+describe("daemon project canonicalization EISDIR fallback", () => {
 	const originalRealpath = fs.realpath.bind(fs);
 
 	afterEach(() => {
@@ -15,13 +14,10 @@ describe("daemon presence canonicalProjectDir EISDIR fallback", () => {
 
 	it("falls back to the resolved path when realpath throws EISDIR", async () => {
 		const projectDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-eisdir-fallback-"));
-		const runtimeDir = path.join(projectDir, "runtime");
 		const resolvedProjectDir = path.resolve(projectDir);
-		let realpathCalls = 0;
 
 		vi.spyOn(fs, "realpath").mockImplementation((async (p: PathLike) => {
 			if (path.resolve(String(p)) === resolvedProjectDir) {
-				realpathCalls++;
 				const err = new Error("EISDIR: illegal operation on a directory") as NodeJS.ErrnoException;
 				err.code = "EISDIR";
 				err.errno = -21;
@@ -33,15 +29,7 @@ describe("daemon presence canonicalProjectDir EISDIR fallback", () => {
 		}) as typeof fs.realpath);
 
 		try {
-			const presence = await registerDaemonProjectPresence(projectDir, runtimeDir);
-			expect(typeof presence.close).toBe("function");
-			expect(realpathCalls).toBe(1);
-
-			const clientsDir = path.join(daemonBrokerRuntimeDir(runtimeDir), "clients");
-			const entries = await fs.readdir(clientsDir);
-			expect(entries).toHaveLength(1);
-
-			await presence.close();
+			expect(await canonicalProjectDir(projectDir)).toBe(resolvedProjectDir);
 		} finally {
 			await fs.rm(projectDir, { recursive: true, force: true });
 		}

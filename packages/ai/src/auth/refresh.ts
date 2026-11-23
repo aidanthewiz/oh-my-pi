@@ -2,8 +2,8 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { scheduler } from "node:timers/promises";
 import { isSqliteBusyError, logger, postmortem } from "@oh-my-pi/pi-utils";
 import * as AIError from "../error";
-import { getOAuthProvider, normalizeOAuthCredentialExpiry, refreshOAuthToken } from "../registry/oauth";
-import type { OAuthCredentials, OAuthProvider } from "../registry/oauth/types";
+import { normalizeOAuthCredentialExpiry, refreshProviderOAuthToken } from "../registry/oauth";
+import type { OAuthCredentials } from "../registry/oauth/types";
 import type { Provider } from "../types";
 import { raceSignal } from "./abort";
 import { authCredentialEquals, type CredentialPool, credentialDisabledEvent, redactCredentialForWire } from "./pool";
@@ -414,7 +414,10 @@ export class OAuthRefresher {
 		options: StoredOAuthRefreshOptions<T>,
 	): Promise<StoredOAuthRefreshResult<T>> {
 		const refreshSkewMs = options.refreshSkewMs ?? OAUTH_REFRESH_SKEW_MS;
-		const leaseStore = hasRefreshLeases(this.#deps.store) ? this.#deps.store : undefined;
+		const credentialId =
+			options.credentialId ??
+			this.#deps.store.listAuthCredentials(provider).find(row => row.credential.type === "oauth")?.id;
+		const leaseStore = hasRefreshLeases(this.#deps.store, credentialId) ? this.#deps.store : undefined;
 		const owner = crypto.randomUUID();
 		let leasedCredentialId: number | undefined;
 		let takenOverFrom: CredentialRefreshLeaseHolder | undefined;
@@ -968,7 +971,7 @@ export class OAuthRefresher {
 					rejectedAccess,
 				);
 				// Only direct local requests establish mint time.
-				if (!hasRefreshLeases(this.#deps.store) && this.#mintsLocally()) {
+				if (!hasRefreshLeases(this.#deps.store, credentialId) && this.#mintsLocally()) {
 					this.#rememberMint(provider, credentialId, refreshed);
 				}
 				return refreshed;
@@ -988,7 +991,7 @@ export class OAuthRefresher {
 		reason?: OAuthRefreshReason,
 		rejectedAccess?: string,
 	): Promise<OAuthCredentials> {
-		if (credentialId !== undefined && hasRefreshLeases(this.#deps.store)) {
+		if (credentialId !== undefined && hasRefreshLeases(this.#deps.store, credentialId)) {
 			const forceRefresh = credential.expires === 0;
 			const result = await this.refreshStored(provider, {
 				credentialId,
@@ -1079,18 +1082,7 @@ export class OAuthRefresher {
 				reason === "auth-recovery" ? rejectedAccess : undefined,
 			);
 		} else {
-			const customProvider = getOAuthProvider(provider);
-			if (customProvider) {
-				if (!customProvider.refreshToken) {
-					throw new AIError.OAuthError(`OAuth provider "${provider}" does not support token refresh`, {
-						kind: "configuration",
-						provider,
-					});
-				}
-				refreshPromise = customProvider.refreshToken(credential, signal, reason);
-			} else {
-				refreshPromise = refreshOAuthToken(provider as OAuthProvider, credential, signal, reason);
-			}
+			refreshPromise = refreshProviderOAuthToken(provider, credential, signal, reason);
 		}
 		// Leased exchanges retain the actual provider operation through abort and persistence.
 		if (timeoutMs === undefined) return refreshPromise;

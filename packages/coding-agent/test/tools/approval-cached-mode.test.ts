@@ -6,7 +6,6 @@ import type { Model } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { registerArtifactsDir } from "@oh-my-pi/pi-coding-agent/internal-urls/registry-helpers";
 import { ExtensionRuntime } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
 import type {
@@ -197,36 +196,30 @@ describe("captured approval grants", () => {
 			"a file and a recursive search",
 			(dir: string) => [approvalTargetKey(dir, "a.txt")!, approvalTreeSearchKey(approvalDirectoryKey(dir))],
 		],
-		["a file and an internal URL", (dir: string) => [approvalTargetKey(dir, "a.txt")!, "artifact://99"]],
+		["a file and a non-file URL", (dir: string) => [approvalTargetKey(dir, "a.txt")!, "https://example.com/a"]],
 	] as const)("refuses a forged folder grant for %s", async (_label, targets) => {
 		const dir = root.join("dir");
 		fs.mkdirSync(dir);
 		fs.writeFileSync(path.join(dir, "a.txt"), "A");
 		fs.writeFileSync(root.join("outside.txt"), "OUTSIDE");
-		fs.writeFileSync(root.join("99.mcp.log"), "ARTIFACT");
-		const unregister = registerArtifactsDir(root.path());
-		try {
-			const tool = { ...fileTool(), approvalCacheTargets: () => targets(dir) };
-			const captured = await captureApprovalTargets(tool, {}, root.path());
-			expect(captured.failed).toBe(false);
-			let scopes: string[] = [];
-			const answer = await requestApproval(
-				{
-					select: async () => undefined,
-					approve: async prompt => {
-						scopes = prompt.grants?.map(grant => grant.scope) ?? [];
-						return { grant: "folder", always: false };
-					},
+		const tool = { ...fileTool(), approvalCacheTargets: () => targets(dir) };
+		const captured = await captureApprovalTargets(tool, {}, root.path());
+		expect(captured.failed).toBe(false);
+		let scopes: string[] = [];
+		const answer = await requestApproval(
+			{
+				select: async () => undefined,
+				approve: async prompt => {
+					scopes = prompt.grants?.map(grant => grant.scope) ?? [];
+					return { grant: "folder", always: false };
 				},
-				tool,
-				{},
-				{ grants: true, targets: captured },
-			);
-			expect(scopes).toEqual(["target"]);
-			expect(answer).toBe("deny");
-		} finally {
-			unregister();
-		}
+			},
+			tool,
+			{},
+			{ grants: true, targets: captured },
+		);
+		expect(scopes).toEqual(["target"]);
+		expect(answer).toBe("deny");
 	});
 
 	it("binds persistent grants to account/trust and resolved file identity", async () => {

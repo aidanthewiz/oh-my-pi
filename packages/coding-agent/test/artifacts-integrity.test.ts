@@ -23,36 +23,36 @@ describe("ArtifactManager write integrity", () => {
 		for (const dir of dirs.splice(0)) removeSyncWithRetries(dir);
 	});
 
-	it("keeps large resident artifacts scoped to the restored live owner without removing bounded reads", async () => {
+	it("keeps large spills scoped to the restored live owner with bounded reads", async () => {
 		const manager = SessionManager.inMemory();
-		const content = `${"x".repeat(8 * 1024 * 1024)}\ncomplete resident tail`;
-		const id = await manager.saveArtifact(content, "read");
-		if (!id) throw new Error("Expected resident artifact id");
+		dirs.push(manager.getArtifactManager().dir);
+		const content = `${"x".repeat(8 * 1024 * 1024)}\ncomplete spill tail`;
+		const id = await manager.saveArtifact(content);
+		if (id === undefined) throw new Error("Expected spill id");
 		expect(await manager.getArtifactContent(id, 8 * 1024 * 1024)).toBeNull();
-		expect(manager.getResidentArtifactContent(id)).toBe(content);
-		expect(manager.getResidentArtifactContent(`0${id}`)).toBeNull();
+		expect(await manager.getArtifactContent(id, Buffer.byteLength(content))).toBe(content);
+		expect(await manager.getArtifactContent(`0${id}`, Buffer.byteLength(content))).toBeNull();
 		const snapshot = manager.captureState();
 
 		await manager.newSession();
-		expect(manager.getResidentArtifactContent(id)).toBeNull();
-		expect(await manager.saveArtifact("replacement owner", "read")).toBe(id);
-		expect(manager.getResidentArtifactContent(id)).toBe("replacement owner");
+		dirs.push(manager.getArtifactManager().dir);
+		expect(await manager.getArtifactContent(id, Buffer.byteLength(content))).toBeNull();
+		expect(await manager.saveArtifact("replacement owner")).toBe(id);
+		expect(await manager.getArtifactContent(id, 17)).toBe("replacement owner");
 		manager.restoreState(snapshot);
-		expect(manager.getResidentArtifactContent(id)).toBe(content);
+		expect(await manager.getArtifactContent(id, Buffer.byteLength(content))).toBe(content);
 
 		manager.seal();
-		expect(manager.getResidentArtifactContent(id)).toBeNull();
 		expect(await manager.getArtifactContent(id, content.length)).toBeNull();
 		manager.releaseRetainedEntries();
 	});
 
-	it("never exposes a file-backed artifact through the resident capability", async () => {
+	it("keeps persistent spill reads bounded", async () => {
 		const dir = freshDir();
 		const manager = SessionManager.create(dir, dir);
 		try {
-			const id = await manager.saveArtifact("disk-owned report", "read");
+			const id = await manager.saveArtifact("disk-owned report");
 			if (!id) throw new Error("Expected disk artifact id");
-			expect(manager.getResidentArtifactContent(id)).toBeNull();
 			expect(await manager.getArtifactContent(id, 16)).toBeNull();
 			expect(await manager.getArtifactContent(id, 17)).toBe("disk-owned report");
 		} finally {
@@ -169,12 +169,10 @@ describe("ArtifactManager write integrity", () => {
 	});
 
 	it("rejects a short write instead of publishing an unreadable artifact id", async () => {
-		const manager = new ArtifactManager(freshDir());
+		const manager = new ArtifactManager(freshDir(), null);
 		vi.spyOn(Bun, "write").mockResolvedValue(1);
 
-		await expect(manager.save("complete report", "task")).rejects.toThrow(
-			"Artifact write incomplete: wrote 1 of 15 bytes",
-		);
+		await expect(manager.save("complete report")).rejects.toThrow("Artifact write incomplete: wrote 1 of 15 bytes");
 	});
 
 	it("preserves the write failure when staging cleanup also fails", async () => {
@@ -209,7 +207,7 @@ describe("ArtifactManager write integrity", () => {
 		await expect(writeArtifact(destination, "full report body")).rejects.toThrow("Artifact write incomplete");
 
 		// Neither the destination nor a leftover staging file survives, so
-		// agent:// / artifact:// scans cannot resolve a truncated artifact.
+		// agent:// scans and local:// spill reads cannot resolve a truncated artifact.
 		expect(await fs.promises.readdir(dir)).toEqual([]);
 	});
 

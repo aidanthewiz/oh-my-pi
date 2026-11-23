@@ -1,313 +1,163 @@
 # MCP runtime lifecycle
 
-This document describes how MCP servers are discovered, connected, exposed as tools, refreshed, and torn down in the coding-agent runtime.
+How MCP servers are discovered, hosted, shared between sessions, exposed as tools, and stopped.
 
 ## Lifecycle at a glance
 
-1. **SDK startup** kicks off MCP discovery (unless MCP is disabled or tool names are restricted): headless/SDK sessions await `discoverAndLoadMCPTools()`; interactive sessions (`hasUI: true`) create the manager up front and defer `discoverAndConnect()` until the session is live.
-2. **Discovery** (`loadAllMCPConfigs`) resolves MCP server configs from capability sources, filters disabled/project/Exa entries and browser MCP servers when the built-in browser prelude is callable, and preserves source metadata.
-3. **Manager connect phase** (`MCPManager.connectServers`) starts per-server connect + `tools/list` in parallel.
-4. **Fast startup gate** waits up to 250ms, then may return:
-   - fully loaded `MCPTool`s,
-   - failures per server,
-   - or cached `DeferredMCPTool`s for still-pending servers.
-5. **SDK wiring** merges MCP tools into runtime tool registry for the session.
-6. **Post-connect enrichment** best-effort loads resources, resource templates, prompts, and optional resource subscriptions.
-7. **Live session** receives late tool changes through the manager callback; `/mcp reload` does `disconnectAll` + rediscovery + `session.refreshMCPTools`, while transport close and `/mcp reconnect` use the per-server reconnect path.
-8. **Teardown** happens on explicit manager disconnects and automatically when an owning `AgentSession` is disposed; borrowed parent managers are not disconnected by subagents.
+1. **Discovery** (`loadAllMCPConfigs`) resolves server configs from capability sources and filters disabled, project-level, Exa and browser entries.
+2. **Connect** (`MCPManager.connectServers`): for each server the session resolves credentials, asks the **MCP host** for the server's protocol era, attaches a tunnel to the server's host unit, and reads `server/discover` and `tools/list` over it.
+3. **Host** (`src/mcp/host/`, served by the daemon's `mcp` module or in-process): owns every server process and remote connection. It answers discovery and list requests from a shared store and starts a server only when a request needs it.
+4. **Startup window**: `connectServers` waits up to `mcp.startupTimeoutMs` (250 ms). Servers that answered contribute tools; the rest are merged when they are ready.
+5. **Live session**: list changes arrive as notifications on the tunnel; `/mcp reload` rediscovers; `/mcp reconnect <name>` restarts one server.
+6. **Teardown**: closing a link releases the session's lease on the unit. Units and processes nobody holds are stopped by the host.
+
+Sessions speak MCP 2026-07-28 to the host; the host owns upstream connections and any `initialize` handshake, including when it runs in-process.
 
 ## Authentication readiness
 
-Background HTTP/SSE initialization and tool-catalog challenges retain
-`authRequired` separately from the bounded transport diagnostic.
-The manager's `getConnectionStatusSnapshot()` preserves current readiness for
-hosts that subscribe after an early connection result.
-`getPendingAuthServers()` exposes sign-ins that remain unresolved.
+Background HTTP/SSE and catalog challenges retain `authRequired` separately from bounded transport diagnostics. `getConnectionStatusSnapshot()` preserves readiness for late subscribers; `getPendingAuthServers()` exposes unresolved sign-ins.
 
-Interactive startup shows a persistent notice without opening a browser or
-taking editor focus. `/mcp` offers Authenticate and Not now.
-Authenticate calls `authenticateServer()` through the existing host-owned OAuth
-handler and reconnects the affected server. This also works without cached tools.
-`deferAuthentication()` changes session readiness only; it does not change
-configuration or credentials. Explicit retry remains available.
-Successful connection clears the pending sign-in state.
-Permission-only HTTP 403 failures do not request authorization or schedule
-automatic reconnection retries. Explicit manual reconnection remains available.
+Interactive startup shows a persistent notice without opening a browser or taking editor focus. `/mcp` offers Authenticate and Not now. `authenticateServer()` uses the existing host-owned OAuth handler and reconnects the affected server, even without cached tools. `deferAuthentication()` changes session readiness only, not configuration or credentials. Successful connection clears pending sign-in state.
 
-The native `mcp auth` command checks selected hosted servers without creating
-an agent session. It shares credential refresh, discovery, and reauthorization
-with in-session flows. Passive checks and unattended invocations never prompt.
+Permission-only HTTP 403 failures do not request authorization or schedule automatic authentication retries. Explicit manual reconnection remains available. Native `mcp auth` checks selected hosted servers without creating an agent session; passive checks and unattended invocations never prompt.
 
-## Discovery and load phase
+## Session side
 
-### Entry path from SDK
+### Discovery and startup
 
-`createAgentSession()` in `src/sdk.ts` performs MCP startup when `enableMCP` is true (default) and tool names are not restricted. A supplied `mcpManager` is reused without discovery. Otherwise there are two paths:
+`createAgentSession()` (`src/sdk.ts`) starts MCP when `enableMCP` is true and tool names are not restricted. A supplied `mcpManager` is reused without discovery. Otherwise:
 
-- **Headless/SDK** (no UI, no provided manager): awaits `discoverAndLoadMCPTools(cwd, { ... })` and merges the returned tools into the startup `customTools` set. Print mode alone then waits for configured servers' tool handshakes or failures before its first prompt (bounded by `OMP_MCP_TIMEOUT_MS`, default 30 seconds), refreshes the session's tool registry, and warns per unavailable server; `OMP_MCP_REQUIRE_READY=1` instead exits 1 without sending the prompt. `OMP_MCP_TIMEOUT_MS=0` disables this barrier deadline and may wait indefinitely.
-- **Interactive/TUI** (`hasUI: true`, no provided manager): constructs `MCPManager` immediately (with cache + auth storage), defers `discoverAndConnect()` to a background task started after the session exists, then binds tools via `session.refreshMCPTools(...)` (disposing the manager if the session was torn down mid-connect).
-  The first turn of such a session (interactive or `--mode rpc-ui`) waits up to 1.5 s for this MCP startup, so its system prompt includes servers connected by then; slower servers register later and change the next turn's prompt.
+- **Headless/SDK**: awaits `discoverAndLoadMCPTools()`. Print mode then waits for every configured server to list tools or fail before its first prompt, bounded by `OMP_MCP_TIMEOUT_MS` (default 30 s; `0` waits indefinitely); `OMP_MCP_REQUIRE_READY=1` exits 1 instead of warning.
+- **Interactive** (`hasUI: true`): constructs `MCPManager` at once and runs `discoverAndConnect()` in the background. The first turn waits up to 1.5 s for it.
 
-Both paths:
+Sessions that bind process state hold `holdSharedMcp(mcp.shared)` for their lifetime; that hold decides whether links attach to the daemon or to the in-process host. With no hold (embedders, tests, `omp read`) the in-process host is used.
 
-- pass `authStorage`, cache storage, `mcp.startupTimeoutMs`, and `mcp.enableProjectConfig`; browser-MCP filtering requires `browser.enabled`, registered and active Eval, and an unrestricted session,
-- always set `filterExa: true`,
-- log per-server load/connect errors,
-- store the manager in `toolSession.mcpManager` and the session result.
+Discovery failures are isolated: a config discovery exception yields an empty tool set and one synthetic `.mcp.json` error; a failing server yields an entry in the `errors` map while the others continue.
 
-If `enableMCP` is false or the session restricts tool names, MCP discovery and manager inheritance are skipped entirely. ACP sessions disable on-disk discovery because their MCP definitions come from the ACP client.
+### Connect pipeline
 
-### Config discovery and filtering
+For each server, `connectServers()`:
 
-`loadAllMCPConfigs()` (`src/mcp/config.ts`) loads canonical MCP server items through capability discovery, then converts to legacy `MCPServerConfig`.
+1. validates the config (`validateServerConfig`),
+2. resolves OAuth credentials and `!command`/environment values (`#resolveAuthConfig`),
+3. builds an `McpServerSpec` (`buildServerSpec`): absolute cwd, declared env, complete spawn environment, or URL and final headers,
+4. `connectToServer()`: creates a `HostLink`, which resolves the server's era, attaches to its unit and sends its roots; then `server/discover` gives capabilities, server info and instructions,
+5. `listTools()`, then resources, templates and prompts in the background,
+6. opens one list-change subscription; resource subscriptions are opened when `mcp.notifications` is on.
 
-Filtering behavior:
+Discovery and list requests carry the `stale-ok` hint, so a server the host already knows answers within the startup window without a process. A stale entry is served at once and revalidated by the host; a difference arrives as a list-change notification. A server the host has never seen is probed first, which takes as long as the server takes to start.
 
-- `enableProjectConfig: false` removes project-level entries (`_source.level === "project"`).
-- `enabled: false` entries are suppressed unless the active-profile user `enabledServers` allowlist names them; the user `disabledServers` denylist always suppresses a same-named entry.
-- Exa servers are filtered out by default and API keys are extracted for native Exa tool integration, unless the config explicitly requests Exa tools the native integration does not provide (`web_fetch_exa`, `web_search_advanced_exa`); browser automation MCP servers are filtered when `filterBrowser` is true.
+There are no deferred or cached tool handles in the session: a server that has not answered by the end of the startup window contributes nothing until it does, and then registers through the manager's tools-changed callback.
 
-Result includes both `configs` and `sources` (metadata used later for provider labeling).
+### Manager state
 
-### Discovery-level failure behavior
+`MCPManager` keeps connections, pending connects, tools in stable name order, source metadata, unresolved configs (so reconnect can re-resolve credentials), listeners, per-session tool scopes, tracked resource subscriptions, and the latest upstream status per server. Each manager owns one instance id, sent with every attach; it identifies the manager's private unit for handshake-era servers.
 
-`discoverAndLoadMCPTools()` distinguishes two failure classes:
+`getConnectionStatus(name)` reports `connected` once discovery and `tools/list` succeed on the current attachment, `connecting` during connect/reconnect/re-attach, and `disconnected` otherwise. Startup/print readiness uses the same test: a failed reload is not ready merely because old tools remain registered.
 
-- **Discovery hard failure** (exception from `manager.discoverAndConnect`, typically from config discovery): returns an empty tool set and one synthetic error `{ path: ".mcp.json", error }`.
-- **Per-server runtime/connect failure**: manager returns partial success with `errors` map; other servers continue.
+`getServerRuntime(name)` exposes the host's `McpUpstreamStatus`: era, idle/starting/running/failed state, pid, attached sessions and last exit. `/mcp list` shows this state.
 
-So startup does not fail the whole agent session when individual MCP servers fail.
+### Tool exposure and result ownership
 
-## Manager state model
+Loaded tools enter the current tool registry as `mcp__<server>_<tool>`. Name components are normalized and length-bounded with deterministic collision handling; presentation never changes the original server/tool or session authority. Retired XD presentation is not a separate execution route.
 
-`MCPManager` tracks runtime lifecycle with separate registries:
+The manager preserves unresolved configuration for credential re-resolution and records per-server failures without discarding other successful servers. Its current catalog and callback paths replace the former deferred-tool/cache owner.
 
-- `#connections: Map<string, MCPServerConnection>` — fully connected servers.
-- `#pendingConnections: Map<string, Promise<MCPServerConnection>>` — handshake in progress.
-- `#pendingToolLoads: Map<string, Promise<{ connection, serverTools }>>` — initialized connections whose `tools/list` is still in flight.
-- `#tools: CustomTool[]` — current MCP tool view exposed to callers, kept in stable name order.
-- `#sources: Map<string, SourceMeta>` — provider/source metadata even before connect completes.
-- `#pendingReconnections: Map<string, Promise<MCPServerConnection | null>>` — reconnects in progress after a dropped transport or explicit reconnect.
-- `#startupUpdates`, `#startupServers`, and `#startupFailures` — track tool registration/callback completion for startup readiness barriers.
-- `#lostRemoteServers` — scheduled recovery state for previously connected HTTP/SSE servers that remain unavailable.
-- `#serverConfigs: Map<string, MCPServerConfig>` — original unresolved configs preserved so reconnect can re-resolve credentials without leaking resolved tokens.
-- `#reconnectHistory: Map<string, number[]>` plus `#epoch` — per-server crash-window accounting and invalidation of reconnect attempts that outlive a global disconnect.
-- listener/callback state, including a bounded pending-notification FIFO and tracked resource subscriptions/refreshes.
-
-`getConnectionStatus(name)` derives status from these maps:
-
-- `connected` if in `#connections`,
-- `connecting` if pending connect, pending tool load, or pending reconnect,
-- `disconnected` otherwise.
-
-## Connection establishment and startup timing
-
-### Per-server connect pipeline
-
-For each discovered server in `connectServers()`:
-
-1. store/update source metadata,
-2. skip if already connected/pending/reconnecting,
-3. validate transport fields (`validateServerConfig`),
-4. save the unresolved config for possible reconnect,
-5. resolve managed OAuth credentials and env/header shell substitutions (`#resolveAuthConfig`),
-6. call `connectToServer(name, resolvedConfig)` with manager notification/request handlers,
-7. wire HTTP OAuth refresh and transport `onClose` reconnect handling,
-8. call `listTools(connection)`,
-9. cache tool definitions (`MCPToolCache.set`) best-effort,
-10.   best-effort load resources, resource templates, prompts, and subscriptions after tools load.
-
-`connectToServer()` behavior (`src/mcp/client.ts`):
-
-- creates stdio or HTTP/SSE transport,
-- performs MCP `initialize` using protocol version `2025-11-25` and advertises the `roots` capability,
-- answers server-to-client `ping` and `roots/list` requests; unsupported request methods return JSON-RPC `-32601`,
-- sends `notifications/initialized` before any further session traffic,
-- for Streamable HTTP, starts the background SSE listener only after `notifications/initialized`,
-- uses timeout precedence `OMP_MCP_TIMEOUT_MS`, then `config.timeout`, then 30s; `0` disables the client-side timeout,
-- records the server's negotiated protocol revision; Streamable HTTP carries it on subsequent requests in `MCP-Protocol-Version`,
-- closes transport on init failure.
-
-### Streamable HTTP response ownership
-
-- Before result capture, SSE events enforce the caller's cancellation signal and current-owner checks.
-- Capturing a result transfers trailing notifications and server requests to transport ownership. Later caller cancellation or retirement does not end that drain.
-- The captured transport lifecycle still controls dispatch and cancellation. Closing the transport cancels the drain and suppresses obsolete messages.
-- Between the request deadline and caller cancellation, the first abort source wins. A winning deadline retains its structured timeout diagnostic. A winning caller cancellation preserves its original abort reason despite a later body-decoder failure.
-- Terminal operation failures retain their diagnostics. Authentication recovery still checks ownership before credential work or replay.
-
-### Fast startup gate + deferred fallback
-
-`connectServers()` waits on a race between:
-
-- all connect/tool-load tasks settled, and
-- `resolveMCPStartupTimeoutMs`: `OMP_MCP_STARTUP_TIMEOUT_MS` env override, else `mcp.startupTimeoutMs`, else 250 ms; `0` waits until initial loads settle.
-
-After the startup window:
-
-- fulfilled tasks become live `MCPTool`s,
-- rejected tasks produce per-server errors,
-- still-pending tasks:
-   - use cached tool definitions if available (`MCPToolCache.get`) to create `DeferredMCPTool`s,
-   - otherwise contribute no tools at startup; they stay in flight, and the background continuation registers their tools via `#onToolsChanged` once connect/list finishes (a slow server no longer blocks startup — issue #2100).
-
-This is a hybrid startup model: fast return with deferred handles when cache is available, late background registration when it is not.
-
-### Background completion behavior
-
-Each pending `toolsPromise` also has a background continuation that eventually:
-
-- replaces that server's tool slice in manager state and restores stable name ordering,
-- invokes `#onToolsChanged` so a live session can rebind the late tools,
-- writes cache,
-- logs late failures only after startup (`allowBackgroundLogging`).
-
-## Tool exposure and live-session availability
-
-### Startup registration
-
-`discoverAndLoadMCPTools()` converts manager tools into `LoadedCustomTool[]` and decorates paths (`mcp:<server> via <providerName>` when known).
-
-`createAgentSession()` then pushes these tools into `customTools`, which are wrapped and added to the runtime tool registry with names like `mcp__<server>_<tool>`.
-
-Server and tool name components are lowercased and sanitized to letters, digits, and underscores; repeated/edge underscores are collapsed/trimmed, and a redundant server prefix on the tool is stripped. Names longer than 64 characters are capped with a deterministic hash suffix. If two distinct origins mint the same runtime name, OMP logs the collision and keeps a deterministic winner based on the original server/tool identity, so reconnect ordering cannot change ownership.
-
-Connected manager tools become enabled immediately. Presentation is reconciled with the session's current tool policy: tools may be mounted under `xd://` rather than exposed as top-level function definitions. Registry identity and original server/tool ownership remain intact regardless of presentation.
+Before result capture, caller cancellation and owner checks apply. Captured results and any remaining physical stream cleanup have separate ownership: late notifications cannot revive a retired caller or overwrite its winning cancellation/deadline. Authentication recovery remains subject to owner and replay checks.
 
 ### Tool calls
 
-- `MCPTool` calls tools through an already connected `MCPServerConnection`.
-- `DeferredMCPTool` waits for `waitForConnection(server)` before calling; this allows cached tools to exist before connection is ready.
-- Both attempt a reconnect + single retry for retriable connection failures before dispatch, such as `Transport not connected`.
-- Connection loss after a request may have reached the server is non-retryable and is never replayed automatically: stdio has written its frame to stdin, or an HTTP or legacy SSE connection was reset or closed after it was established (with or without a response). The operation may already have run; check its effect before retrying. Refused connections are retried.
-- A structured tool-result auth challenge can trigger the configured auth handler, reconnect, and one retry. Interactive mode wires this to the `/mcp` OAuth controller; without a handler the challenge remains an MCP error.
+`MCPTool` calls through the connection's link. The link owns deadlines, bounded progress extensions and abort; cancellation sends `notifications/cancelled`. A failure proven retryable can recover once after reconnection, but a request that may have reached the server is not replayed automatically. Authentication challenges can enter recovery only when the caller's authority and replay contract permit it.
 
-Both preserve MCP content and metadata; `structuredContent` is retained in `details.structuredContent` and rendered as text when not already duplicated in a text block. Server `isError` results propagate the error flag. Remaining exceptions become an `MCP failure` diagnostic with server/tool, transport, stage, failure class, retryability, message, optional code/trace/data, and next-step guidance; abort remains abort. Structured transport errors drive retry classification.
+### Reconnect
 
-Extension MCP calls use their captured manager and canonical session owner. Worker calls without that owner are rejected before dispatch.
-Disposal or registry retirement prevents the caller's later authentication, connection dispatch, and result release.
-The direct main-thread manager API still permits calls without a session context.
+There is no session-owned reconnect ladder, crash breaker or background retry schedule; server restart and crash policy belong to the host.
 
-Call ownership follows reconnects and OAuth queue admission. A retired caller cannot start queued authentication or cancel another caller's authentication.
-An admitted credential refresh can finish storing a rotated token without permitting a retired caller to reconnect.
-An independently admitted parent reconnect can finish after a joining child retires. The retired child still cannot dispatch its tool action.
-AWS authentication probes retain the host context through asynchronous preparation and final execution admission.
-Validation probes cannot start authentication recovery. The surrounding operation retains control of user-approved recovery and avoids joining its own recovery promise.
-Validation probes do not own the shared authentication attempt merely because their recovery budget is exhausted.
-Legacy discovery documents must agree with the protected resource captured from exact challenge metadata.
-Authorization-server default audiences do not replace that resource.
+Extension calls retain their captured manager and session owner across reconnect and OAuth queue admission. Disposal or registry retirement prevents later authentication initiation, dispatch and result release. A retired caller cannot cancel another caller's authentication.
 
-## Refresh/reload paths (startup vs live reload)
+An admitted refresh may finish storing a rotated token without authorizing the retired caller to reconnect. An independently admitted parent reconnect may finish after a joining child retires, but that child still cannot dispatch its action.
 
-### Initial startup path
+Validation probes do not initiate or take ownership of shared authentication recovery. The surrounding operation controls user-approved recovery and must not join its own recovery promise. Legacy discovery must agree with the protected resource captured from the actual challenge; authorization-server defaults do not replace it.
 
-- one-time discovery/load in `sdk.ts`,
-- tools are registered in initial session tool registry.
+- `reconnectServer(name, { manual })` re-resolves credentials. If they changed, the link retargets to the new identity. A manual reconnect (`/mcp reconnect`) additionally sends `omp/restart`, which stops the upstream and clears the host's crash guard; automatic recovery never restarts an upstream, because a modern one is shared with other sessions. Then discovery and catalogs are reloaded.
+- If the tunnel is lost (daemon restart), the link fails its in-flight requests as non-retryable, re-attaches, re-sends its roots, and the manager re-opens subscriptions and reloads catalogs.
+- An authentication challenge from a remote server, including the initial era probe, may call the manager's refresh hook once when permitted by owner/replay policy. Fresh headers retarget the link. Permission-only 403 responses do not trigger sign-in. Old resource subscriptions are not replayed; the manager derives them from the reloaded catalog.
+- A handshake-era HTTP server that expired its session answers 404: the host retires that session and the retried call opens a new one.
+- `/mcp test`, the OAuth discovery probe and other one-off connections pass `live: true`, which sends the `no-store` hint so every answer comes from the server, not the store.
 
-### Interactive reload and live-change paths
+### Notifications
 
-`/mcp reload` (`src/modes/controllers/mcp-command-controller.ts`) runs `reconnectMCPServers` (`src/mcp/reload.ts`), which:
+The manager refreshes tools, resources or prompts on the corresponding list-change notification, forwards `notifications/resources/updated` for subscribed URIs, and fans every notification out to listeners (`addNotificationListener`), buffering up to 100 until the first listener attaches.
 
-1. `mcpManager.disconnectAll()`,
-2. clears stale MCP prompt commands,
-3. calls `mcpManager.discoverAndConnect()` with the same project/Exa/browser filters as startup,
-4. calls `session.refreshMCPTools(mcpManager.getTools())`.
+### Reload and cwd changes
 
-A working-directory change (`/move`, resuming a session from another project) re-scopes the session-owned manager: `session.refreshProjectScope()` calls `mcpManager.setCwd(newCwd)`, which re-points project config discovery and the advertised `roots/list`, and then runs the same reconnect for every server, since roots are advertised without `listChanged`. The reconnect runs in the background, and the next turn waits for it, bounded, as it does for startup discovery. Reloads are serialized, and the first one waits for startup-deferred discovery to finish.
+`/mcp reload` runs `disconnectAll()`, clears prompt commands, rediscovers and rebinds tools. A working-directory change calls `setCwd()`, which re-points project config discovery, re-sends roots on every link and reconnects, since a stdio server's identity includes its working directory.
 
-`session.refreshMCPTools()` delegates to `src/session/session-tools.ts`, which serializes registry mutations, reconciles manager and extension-owned MCP tools, re-wraps the latest tools, and reapplies availability/presentation without restarting. Connected manager tools become enabled; extension-owned MCP tools preserve their previous selection. A failed refresh restores the previous MCP registry. The owning SDK session also installs `setOnToolsChanged`, so late initial connections, server `tools/list_changed` notifications, reconnects, and disconnects can trigger the same rebinding. Explicit `/mcp reconnect <name>` performs one final refresh after the manager reconnect completes.
+## Host side
 
-### Live settings reconciliation
+### Units and eras
 
-The owning SDK session listens for `mcp.enableProjectConfig` changes: it disconnects affected project entries, restores user definitions they shadowed, or loads newly allowed project entries without `/mcp reload`. Browser-MCP reconciliation is serialized and follows whether the built-in browser prelude is actually callable. Borrowed managers keep the parent's single-slot tools/prompts/resources callbacks; each session still installs its own notification listener.
+One host unit (`McpEndpoint`) is one upstream server. How it is shared follows the protocol era of the server, which the host probes once and records:
 
-## Server-initiated notifications
+- **Modern** (answers `server/discover`): stateless by specification. One unit per identity serves every session, multiplexing their requests onto one process or origin.
+- **Handshake-era** (needs `initialize`; includes `sse`): the server holds a session. Each manager gets its own unit, keyed by its instance id, and the host's legacy adapter holds the `initialize` session and presents it as a modern endpoint.
 
-MCP servers may push JSON-RPC notification frames at any point after `initialize` completes. The transport surfaces them via `onNotification`; the manager fans them out in two paths:
+Identity (`mcpIdentity`): for stdio the command, arguments, working directory, declared `env`, and every inherited variable whose name looks like a credential or account selector; for remote servers the URL and all headers. A refreshed token is therefore another unit.
 
-1. **Internal refresh** for known methods:
-   - `notifications/tools/list_changed` → `refreshServerTools`
-   - `notifications/resources/list_changed` → `refreshServerResources`
-   - `notifications/resources/updated` → `#onResourcesChanged` (only for currently subscribed URIs)
-   - `notifications/prompts/list_changed` → `refreshServerPrompts`
-2. **Listener fanout**: every notification (known and server-custom) is delivered after any internal refresh. `MCPManager.addNotificationListener(listener)` returns an unsubscribe function; multiple listeners have independent error isolation.
+### What a unit does
 
-If no listener is attached, the manager buffers up to 100 frames, dropping the oldest on overflow, then drains the FIFO into the first listener that attaches. `sdk.ts` registers a per-session listener that bridges to the extension runner's `mcp_notification` event with `{ server, method, params }`; the extension runner has its own bounded startup buffer. The listener and debounce timers are released through session postmortem cleanup.
+- **Multiplexing**: request ids, progress tokens and subscription ids are isolated per link; a link's `_meta` (revision, capabilities, client info) reaches the server unchanged.
+- **Store**: results of `server/discover`, the four list methods and `resources/read` are kept in a sqlite store shared by all units, honouring `ttlMs` and `cacheScope`. Handshake-era results, which declare no TTL, are kept for 30 days and reconciled whenever the server runs.
+- **Lazy start**: opening a unit starts nothing. The upstream starts on the first request the store cannot answer.
+- **Freshness**: after every start, on `stale-ok` hits past their TTL, and on upstream list-change notifications the host refetches and notifies every session subscribed to that list.
+- **Subscriptions**: the unit holds one upstream list-change subscription while the server runs and fans it out; list-change subscriptions of sessions never start a server. Resource subscriptions are forwarded and keep the server running.
+- **Crash guard**: after 5 failed starts or unexpected exits within 30 s the unit refuses to start for 30 s and fails requests with the last error; `omp/restart` clears it.
 
-A `tools/list_changed` notification received during a tool or extension call scopes new tools to that call's completed owner.
-Completion waits for notification refresh settlement before granting visibility. Sibling scopes retain their existing catalogs.
+### Lifetime and garbage collection
 
-## Health, reconnect, and partial failure behavior
+| Resource | Ends when |
+| --- | --- |
+| Session lease on a unit | Its link closes or its session process dies |
+| Unit | Nothing holds a lease for `mcp.idleStopMinutes` (modern), immediately for handshake-era, or daemon shutdown |
+| Modern server process | Its unit stops, or no request/resource subscription keeps it active for `mcp.idleStopMinutes`; a later request can start it again |
+| Handshake-era server process | Its unit stops; a lists/reads-only process can also be idled before session state exists |
+| Upstream request | It is answered or its link cancels/disconnects; cancellation does not prove remote rollback |
+| Probe process | Before its probe returns |
+| Stored results | Replaced on refetch, invalidated on list change, or dropped after 30 days unread |
 
-Current runtime behavior is connection-event driven:
+Catalog changes received during a tool or extension call are reconciled with that call's completed owner. Completion waits for notification refresh settlement before granting visibility; sibling scopes retain their own catalogs.
 
-- **No autonomous polling health monitor** in manager/client.
-- **Automatic reconnect is wired to `transport.onClose`** for managed connections.
-- Reconnect retries with backoff (`500`, `1000`, `2000`, `4000` ms), reloads tools, and notifies consumers on success. A crash-storm circuit breaker suspends automatic reconnects for a server after more than 5 reconnect attempts within 30s; manual `/mcp reconnect` resets that history.
-- If a previously connected HTTP/SSE server remains unavailable after the retry ladder, quiet scheduled probes continue after 15s, doubling up to 5 minutes until recovery, explicit disconnect, or reconfiguration. Scheduled probes make one full connection attempt and concurrent reconnect callers share it. Stdio and remote servers that never connected stop at the ladder.
-- Initial connection timeouts trigger a reconnect attempt; print-mode readiness includes these attempts.
-- Tool calls that see retriable connection errors also attempt one reconnect + retry; calls already dispatched under the boundaries above are not replayed after connection loss.
-- Reconnect is also explicit via `/mcp reconnect <name>` or broader `/mcp reload`.
+Subprocess units survive a daemon re-exec with their pipes; sessions re-attach afterwards.
 
-Operationally:
+### Where the host runs
 
-- one server failing does not remove tools from healthy servers,
-- connect/list failures are isolated per server,
-- stale tools may remain visible while reconnect is attempted; calls report MCP errors if recovery fails,
-- tool cache, resource/prompt loading, subscriptions, and background updates are best-effort (warnings/errors logged, no hard stop).
+`mcpHostAccess()` picks the daemon's `mcp` module when sharing is held on and the daemon advertises the module; otherwise, or on any error, the in-process host (`LocalMcpHost`) runs the same units inside the session, shared only between managers of that process and stopped with their last lease.
 
-## Teardown semantics
+## Failure modes
 
-### Server-level teardown
-
-`disconnectServer(name)`:
-
-- removes pending connect/tool-load/reconnect and startup-readiness entries, source metadata, saved config, reconnect history, scheduled remote recovery, and resource refresh/subscription state,
-- detaches `onClose` so explicit close does not trigger reconnect,
-- closes the transport if connected,
-- removes tools by their exact `mcpServerName` owner (not by a sanitized name prefix) and notifies tool consumers,
-- notifies prompt consumers when stale prompt commands need removal.
-
-### Global teardown and ownership
-
-`disconnectAll()`:
-
-- increments a lifecycle epoch so initial connections or reconnects that finish later cannot resurrect old connections, and cancels scheduled remote recovery,
-- detaches `onClose` for all active transports, then closes them with `Promise.allSettled`,
-- clears pending maps, sources, saved configs, connections, subscriptions, resource refreshes, reconnect history, and manager tools.
-
-Top-level sessions own managers they create. `AgentSession.dispose()` disconnects that owned manager with a 3-second cleanup timeout and logs cleanup failure; a subagent/session given `options.mcpManager` borrows the parent manager and does not disconnect it. `/mcp reload` deliberately reuses the manager object after `disconnectAll`, so installed callbacks/listeners remain available for the next discovery cycle.
-
-## Failure modes and guarantees
-
-| Scenario                                                                | Behavior                                                                                                                  | Hard fail vs best-effort        |
-| ----------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- | ------------------------------- |
-| Discovery throws (capability/config load path)                          | Loader returns empty tools + synthetic `.mcp.json` error                                                                  | Best-effort session startup     |
-| Invalid server config                                                   | Server skipped with validation error entry                                                                                | Best-effort per server          |
-| Connect timeout/init failure                                            | Server error recorded; others continue                                                                                    | Best-effort per server          |
-| `tools/list` still pending at startup with cache hit                    | Deferred tools returned immediately                                                                                       | Best-effort fast startup        |
-| `tools/list` still pending at startup without cache                     | No tools at startup; background continuation registers them via `#onToolsChanged` when ready                              | Best-effort late registration   |
-| Late background tool-load failure                                       | Logged after startup gate                                                                                                 | Best-effort logging             |
-| Runtime dropped transport                                               | Manager attempts reconnect; stale tools remain while reconnecting and future calls may retry once or fail with MCP errors | Best-effort automatic recovery  |
-| Previously connected remote server still unavailable after retry ladder | Quiet single-attempt probes continue from 15s up to 5-minute intervals until recovery/disconnect/reconfiguration          | Best-effort background recovery |
-| More than 5 reconnect invocations within 30s                            | Circuit breaker closes/removes the stale connection but leaves tools registered; manual reconnect resets the history      | Automatic reconnect suspended   |
-| Owning session disposal                                                 | Owned manager disconnect is awaited for up to 3s; failure is logged                                                       | Bounded best-effort cleanup     |
-
-## Public API surface
-
-`src/mcp/index.ts` re-exports client operations, config loader/writer APIs, loader and manager APIs, OAuth discovery, tool bridges/cache, HTTP and stdio transports, protocol types, plus the lightweight HTTP helpers `callMCP`, `readMcpJsonRpcResponse`, and `redactUrlForLog`. `src/sdk.ts` exposes `discoverMCPServers()` as a convenience wrapper over `discoverAndLoadMCPTools`; it returns `{ manager, tools, errors, connectedServers, exaApiKeys }`.
+| Scenario | Behavior |
+| --- | --- |
+| Config discovery throws | empty tool set plus a synthetic `.mcp.json` error; the session starts |
+| Invalid server config | that server is skipped with a validation error |
+| Server cannot start or connect | error recorded for that server; status `failed` with exit code and stderr tail; others continue |
+| Server slower than the startup window | no tools at startup; they register when it answers |
+| Server exits with requests in flight | those requests fail (non-retryable) with exit code and stderr; the next request starts a new process |
+| Server crashes repeatedly | crash guard: requests fail immediately for 30 s; `/mcp reconnect` clears it |
+| Daemon restarts | links re-attach; in-flight requests fail and are not replayed |
+| Daemon unreachable | the in-process host is used |
+| Owning session disposed | its manager disconnects (bounded to 3 s); leases drop and the host collects what is unused |
 
 ## Implementation files
 
-- [`src/mcp/loader.ts`](../packages/coding-agent/src/mcp/loader.ts) — loader facade, discovery error normalization, `LoadedCustomTool` conversion.
-- [`src/mcp/manager.ts`](../packages/coding-agent/src/mcp/manager.ts) — lifecycle state registries, parallel connect/list flow, refresh/disconnect.
-- [`src/mcp/client.ts`](../packages/coding-agent/src/mcp/client.ts) — transport setup, initialize handshake, list/call/disconnect.
-- [`src/mcp/index.ts`](../packages/coding-agent/src/mcp/index.ts) — MCP module API exports.
-- [`src/sdk.ts`](../packages/coding-agent/src/sdk.ts) — startup wiring into session/tool registry.
-- [`src/mcp/config.ts`](../packages/coding-agent/src/mcp/config.ts) — config discovery/filtering/validation used by manager.
-- [`src/mcp/tool-bridge.ts`](../packages/coding-agent/src/mcp/tool-bridge.ts) — `MCPTool` and `DeferredMCPTool` runtime behavior.
-- [`src/session/agent-session.ts`](../packages/coding-agent/src/session/agent-session.ts) — session ownership/disposal and tool-refresh facade.
-- [`src/session/session-tools.ts`](../packages/coding-agent/src/session/session-tools.ts) — serialized MCP registry rebinding and tool presentation.
-- [`src/mcp/errors.ts`](../packages/coding-agent/src/mcp/errors.ts) — structured transport failures and tool diagnostics.
-- [`src/modes/controllers/mcp-command-controller.ts`](../packages/coding-agent/src/modes/controllers/mcp-command-controller.ts) — interactive reload/reconnect flows.
-- [`src/task/executor.ts`](../packages/coding-agent/src/task/executor.ts) — subagent MCP proxying via parent manager connections.
+- [`src/mcp/manager.ts`](../packages/coding-agent/src/mcp/manager.ts) — connect flow, catalogs, tool scopes, reconnect, status.
+- [`src/mcp/client.ts`](../packages/coding-agent/src/mcp/client.ts) — MCP 2026-07-28 operations: discover, lists, calls with input rounds, subscriptions.
+- [`src/mcp/link.ts`](../packages/coding-agent/src/mcp/link.ts) — `HostLink`: tunnel, deadlines, cancellation, re-attach, auth retarget.
+- [`src/mcp/protocol.ts`](../packages/coding-agent/src/mcp/protocol.ts) — revision constants, `_meta` keys, result types.
+- [`src/mcp/host/contract.ts`](../packages/coding-agent/src/mcp/host/contract.ts) — server spec, identity, unit key and policy, tunnel extensions, host errors.
+- [`src/mcp/host/endpoint.ts`](../packages/coding-agent/src/mcp/host/endpoint.ts) — the unit: multiplexing, store, lazy start, crash guard, subscriptions.
+- [`src/mcp/host/peers.ts`](../packages/coding-agent/src/mcp/host/peers.ts) — modern peer, legacy adapter, era probe.
+- [`src/mcp/host/store.ts`](../packages/coding-agent/src/mcp/host/store.ts) — era records and cached results.
+- [`src/mcp/host/local.ts`](../packages/coding-agent/src/mcp/host/local.ts), [`access.ts`](../packages/coding-agent/src/mcp/host/access.ts) — in-process host and host selection.
+- [`src/daemon/modules/mcp.ts`](../packages/coding-agent/src/daemon/modules/mcp.ts) — the daemon module.
+- [`src/mcp/tool-bridge.ts`](../packages/coding-agent/src/mcp/tool-bridge.ts) — `MCPTool`.
+- [`src/mcp/loader.ts`](../packages/coding-agent/src/mcp/loader.ts), [`src/sdk.ts`](../packages/coding-agent/src/sdk.ts) — startup wiring.

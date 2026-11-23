@@ -1,15 +1,11 @@
 import { logger } from "@oh-my-pi/pi-utils";
 import { isExcludedModel } from "../compat/behavior";
-import { reviewedCollapseTable } from "../compat/collapse";
-import { classifyModel } from "../compat/taxonomy";
 import { providerEntry } from "../compat/providers";
 import { fetchAntigravityDiscoveryModels } from "../discovery/antigravity";
 import { fetchGeminiModels } from "../discovery/gemini";
-import { fetchGeminiCliQuotaModels } from "../discovery/gemini-cli";
 import type { ModelManagerOptions } from "../model-manager";
 import type { FetchImpl, ModelSpec } from "../types";
 import { unionAccountCatalogs } from "./account-access";
-import { resolveModelCacheProviderId, getDefaultModelDiscoveryBaseUrl } from "./cache-provider-id";
 
 export interface GoogleModelManagerConfig {
 	apiKey?: string;
@@ -51,14 +47,6 @@ export interface GoogleAntigravityModelManagerConfig {
 	 * partial one.
 	 */
 	resolveAccounts?: () => Promise<readonly GoogleAntigravityAccount[] | null>;
-	endpoint?: string;
-	fetch?: FetchImpl;
-}
-
-export interface GoogleGeminiCliModelManagerConfig {
-	oauthToken?: string;
-	/** GCP project id required by Workspace/Standard credentials for quota discovery. */
-	projectId?: string;
 	endpoint?: string;
 	fetch?: FetchImpl;
 }
@@ -155,52 +143,6 @@ export function googleAntigravityModelManagerOptions(
 									: models,
 							),
 						);
-					},
-				}
-			: undefined),
-	};
-}
-
-export function googleGeminiCliModelManagerOptions(
-	config?: GoogleGeminiCliModelManagerConfig,
-): ModelManagerOptions<"google-gemini-cli"> {
-	const token = config?.oauthToken;
-	const endpoint = config?.endpoint ?? getDefaultModelDiscoveryBaseUrl("google-gemini-cli")!;
-	return {
-		providerId: "google-gemini-cli",
-		cacheProviderId: resolveModelCacheProviderId("google-gemini-cli", {
-			apiKey: token,
-			baseUrl: endpoint,
-			projectId: config?.projectId,
-		}),
-		...(token
-			? {
-					fetchDynamicModels: async () => {
-						const fetcher = toDiscoveryFetch(config?.fetch);
-						const collapseTable = reviewedCollapseTable("google-gemini-cli");
-						if (collapseTable === undefined) {
-							throw new Error("missing reviewed collapse table for google-gemini-cli");
-						}
-						const result = await fetchAntigravityDiscoveryModels({
-							token,
-							projectId: config?.projectId,
-							fetcher,
-							collapseTable,
-						});
-						// Antigravity's fetchAvailableModels is unreachable for
-						// credentials without Antigravity entitlement (Code Assist
-						// Standard returns HTTP 403). Fall back to the account's own
-						// retrieveUserQuota list on Cloud Code Assist.
-						if (result === null || result.rejectedStatus !== undefined) {
-							return fetchGeminiCliQuotaModels({ token, projectId: config?.projectId, endpoint, fetcher });
-						}
-						return result.models
-							.filter(m => classifyModel("google-gemini-cli", m.id, { lenient: true }).class === "gemini")
-							.map(m => ({
-								...m,
-								provider: "google-gemini-cli" as const,
-								baseUrl: endpoint,
-							}));
 					},
 				}
 			: undefined),

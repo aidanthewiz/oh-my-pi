@@ -1,11 +1,30 @@
-import { afterEach, describe, expect, it } from "bun:test";
-import { findFreeCdpPort } from "../../src/tools/browser/attach";
-import { type RelayServer, type RelayUnavailableInfo, startRelayServer } from "../../src/tools/browser/relay/server";
-import { relayCdpClientsOf } from "../../src/tools/browser/relay/probe";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
+import * as dirs from "@oh-my-pi/pi-utils/dirs";
+import { findFreeCdpPort } from "@oh-my-pi/pi-coding-agent/tools/browser/attach";
+import { relayCdpClientsOf } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/probe";
+import {
+	type RelayServer,
+	type RelayUnavailableInfo,
+	startRelayServer,
+} from "@oh-my-pi/pi-coding-agent/tools/browser/relay/server";
 
 const relays: RelayServer[] = [];
-afterEach(() => {
-	for (const relay of relays.splice(0)) relay.stop();
+let directory: string;
+beforeEach(async () => {
+	directory = await fs.mkdtemp(path.join(os.tmpdir(), "omp-relay-server-test-"));
+	vi.spyOn(dirs, "getBrowserRelayInstallRegistryFile").mockReturnValue(path.join(directory, "installs.json"));
+	vi.spyOn(dirs, "getBrowserRelayDir").mockReturnValue(path.join(directory, "profile"));
+});
+afterEach(async () => {
+	try {
+		for (const relay of relays.splice(0)) relay.stop();
+	} finally {
+		vi.restoreAllMocks();
+		await fs.rm(directory, { recursive: true, force: true });
+	}
 });
 
 async function rawGet(port: number, requestBytes: string): Promise<string> {
@@ -87,6 +106,21 @@ describe("browser relay authentication", () => {
 		expect(
 			(await fetch(`${base}/cdp?token=test-token`, { headers: { Origin: "chrome-extension://example" } })).status,
 		).toBe(403);
+		for (const path of ["/omp/extensions/recheck", "/omp/relay/restart"]) {
+			expect((await fetch(`${base}${path}`, { method: "POST" })).status).toBe(401);
+			expect((await fetch(`${base}${path}?token=wrong`, { method: "POST" })).status).toBe(401);
+			expect(
+				(
+					await fetch(`${base}${path}?token=test-token`, {
+						method: "POST",
+						headers: { Origin: "https://example.com" },
+					})
+				).status,
+			).toBe(403);
+			expect((await fetch(`${base}${path}?token=test-token`, { method: "POST" })).status).toBe(
+				path.endsWith("/recheck") ? 204 : 409,
+			);
+		}
 
 		const socket = new WebSocket(`ws://127.0.0.1:${port}/ext?token=test-token`);
 		await new Promise<void>((resolve, reject) => {
@@ -163,18 +197,7 @@ describe("browser relay authentication", () => {
 		expect(() => startRelayServer({ port, token: " " })).toThrow("Browser relay token must be nonempty");
 	});
 
-	it("reports 503 with extensionSeen=false before an extension handshake", async () => {
-		const port = await findFreeCdpPort();
-		const relay = startRelayServer({ port, token: "test-token" });
-		relays.push(relay);
-		const response = await fetch(`http://127.0.0.1:${port}/json/version`);
-		expect(response.status).toBe(503);
-		const info = (await response.json()) as RelayUnavailableInfo;
-		expect(info.extensionSeen).toBeFalse();
-		expect(info.uptimeMs).toBeGreaterThanOrEqual(0);
-	});
-
-	it("keeps extensionSeen=true after an authenticated extension disconnect", async () => {
+	it("keeps relay identity stable when its authenticated extension disconnects", async () => {
 		const port = await findFreeCdpPort();
 		const connected = Promise.withResolvers<void>();
 		const relay = startRelayServer({
@@ -203,6 +226,10 @@ describe("browser relay authentication", () => {
 			}),
 		);
 		await connected.promise;
+		const before = (await (await fetch(`http://127.0.0.1:${port}/json/version`)).json()) as {
+			ompRelayInstance: string;
+		};
+		expect(before.ompRelayInstance).toBeString();
 		extension.close();
 		const deadline = Date.now() + 1_000;
 		let response = await fetch(`http://127.0.0.1:${port}/json/version`);
@@ -211,9 +238,7 @@ describe("browser relay authentication", () => {
 		}
 		expect(response.status).toBe(503);
 		const info = (await response.json()) as RelayUnavailableInfo;
-		expect(info.extensionSeen).toBeTrue();
-		// Clients measure the redial window from the disconnect.
-		expect(info.disconnectedMs).toBeGreaterThanOrEqual(0);
+		expect(info.ompRelayInstance).toBe(before.ompRelayInstance);
 	});
 
 	it("reports how many CDP clients are connected, both while waiting for the extension and once ready", async () => {

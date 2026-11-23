@@ -42,6 +42,7 @@ import { type Theme, theme } from "@oh-my-pi/pi-tui/theme";
 import type { AsyncJobSnapshot, SendUserMessageOptions } from "../../session/agent-session";
 import { MAIN_AGENT_ID } from "../../registry/agent-registry";
 import type { SessionManager } from "../../session/session-manager";
+import type { ApprovalRecordSink } from "../../session/tool-approval-records";
 import { addFileDeleteFallback, addFileWriteFallback } from "../../tools/file-write-fallback";
 import type {
 	SubagentRuntimeApprovalHandler,
@@ -752,9 +753,9 @@ export class ExtensionRunner {
 	 * The agent loop emits `tool_call` at arg-prep time (before scheduling and
 	 * `tool_execution_start`) via the session's `beforeToolCall` wiring; the
 	 * marker tells `ExtensionToolWrapper.execute` not to emit a second event for
-	 * the same dispatch. Keyed by call id + tool name because a nested xd://
-	 * device dispatch reuses the model's toolCallId under a different tool name
-	 * and must still emit its own event. Bounded: markers for calls whose
+	 * the same dispatch. Keyed by call id + tool name because a tool command run
+	 * inside a `bash` call reuses the model's toolCallId while dispatching under
+	 * its own name and must still emit its own event. Bounded: markers for calls whose
 	 * execute path never runs (policy deny, validation failure) would otherwise
 	 * accumulate for the session's lifetime.
 	 */
@@ -939,6 +940,15 @@ export class ExtensionRunner {
 	 */
 	get sessionId(): string {
 		return this.sessionManager.getSessionId();
+	}
+
+	/**
+	 * Writer for the records the approval gate keeps in this session's file. The gate scopes its
+	 * grants to this runner's session, so its records belong to that same file; the tool context
+	 * only carries a read-only view.
+	 */
+	get approvalRecords(): ApprovalRecordSink {
+		return this.sessionManager;
 	}
 
 	/**
@@ -2035,6 +2045,8 @@ export class ExtensionRunner {
 						const onTextDelta = options.onTextDelta;
 						const request = {
 							...options,
+							// Unnamed extension turns still journal their spend.
+							purpose: options.purpose ?? "extension",
 							onTextDelta: onTextDelta
 								? (delta: string) => this.#ephemeralTurnBlocker.exit(() => onTextDelta(delta))
 								: undefined,

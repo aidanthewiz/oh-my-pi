@@ -1,121 +1,111 @@
 /**
- * `omp browser-relay` implementation: serve the local CDP relay and install
- * its Chrome extension. Standalone CLI command — console output here is
- * intentional user-facing output.
+ * Coreforge browser-relay: install and sync the extension or serve Chrome's native host.
  */
-
-import * as path from "node:path";
-import { VERSION } from "@oh-my-pi/pi-utils/dirs";
-import { probeRelayServer } from "../tools/browser/relay/daemon";
-import { defaultRelayExtensionDir, writeRelayExtension } from "../tools/browser/relay/extension-files";
-import { DEFAULT_RELAY_URL } from "../tools/browser/relay/kind";
-import { type RelayServer, startRelayServer } from "../tools/browser/relay/server";
-import { ensureBrowserRelayToken, writeBrowserRelayToken } from "../tools/browser/relay/token";
 import { CF_BRAND, CF_COMMAND } from "./cf-version";
 
-export const BROWSER_RELAY_ACTIONS = ["serve", "install"] as const;
+import { findUnpackedInstalls } from "../tools/browser/relay/chromium-profiles";
+import { defaultRelayExtensionDir, extensionIdForPath } from "../tools/browser/relay/extension-files";
+import { installRelayExtension, registeredRelayExtensionIds, syncRelayInstalls } from "../tools/browser/relay/installs";
+import { runNativeHost } from "../tools/browser/relay/native-host";
+import { registerRelayNativeHost } from "../tools/browser/relay/native-host-manifest";
+import { installRelayInChrome } from "../tools/browser/relay/chrome";
+
+/** Subcommands supported by `omp browser-relay`. */
+export const BROWSER_RELAY_ACTIONS = ["install", "sync", "native-host"] as const;
+
+/** Selected browser-relay subcommand. */
 export type BrowserRelayAction = (typeof BROWSER_RELAY_ACTIONS)[number];
 
+/** Parsed browser-relay command and options. */
 export interface BrowserRelayCommandArgs {
 	action: BrowserRelayAction;
-	port: number;
-	token?: string;
 	/** Install target directory; defaults to ~/.omp/browser-relay/extension. */
 	dir?: string;
-	/** Gather tabs the agent actively drives into an 'omp' Chrome tab group (default true). */
-	group?: boolean;
-	verbose?: boolean;
+	/** Explicitly register in a real Chrome profile and restart its browser if running. Default false. */
+	chrome?: boolean;
+	/** Chrome profile directory name for the unattended install (default: last used). */
+	profile?: string;
 }
 
-/** Default port of the relay endpoint (kept in sync with DEFAULT_RELAY_URL). */
-export const DEFAULT_RELAY_PORT = Number(new URL(DEFAULT_RELAY_URL).port);
-
+/** Run a relay lifecycle command or the native messaging host. */
 export async function runBrowserRelayCommand(args: BrowserRelayCommandArgs): Promise<void> {
-	if (args.action === "install") {
-		await runInstall(args.dir);
+	switch (args.action) {
+		case "install":
+			return runInstall(args);
+		case "sync":
+			return runSync();
+		case "native-host":
+			return runNativeHost();
+	}
+}
+
+async function runSync(): Promise<void> {
+	const results = await syncRelayInstalls();
+	if (results.length === 0) {
+		console.log(
+			`No ${CF_BRAND} extension directories registered. Use \`${CF_COMMAND} browser-relay install\` to register one.`,
+		);
 		return;
 	}
-	await runServe(args);
-}
-async function runInstall(dirOverride: string | undefined): Promise<void> {
-	const dir = dirOverride ? path.resolve(dirOverride) : defaultRelayExtensionDir();
-	await writeRelayExtension(dir, VERSION);
-	console.log(`Installed the ${CF_BRAND} Browser Relay extension to ${dir}`);
-	console.log("");
-	console.log("Finish setup in Chrome:");
-	console.log("  1. Open chrome://extensions and enable Developer mode.");
-	console.log(`  2. Click "Load unpacked" and select: ${dir}`);
-	console.log(`  3. Enable the mode:  ${CF_COMMAND} config set browser.relay true`);
-	console.log("");
-	console.log(`${CF_BRAND} starts the relay automatically when the browser prelude needs it;`);
-	console.log(`run \`${CF_COMMAND} browser-relay\` yourself only for --token or --no-group.`);
-	console.log("The extension badge shows 'on' once it reaches a relay.");
-	if (!dirOverride)
-		console.log(`Newer ${CF_BRAND} versions update the extension in this folder and reload it on their own.`);
-	console.log(
-		"Old connection-refused entries in chrome://extensions > Errors may persist after reconnect; use Clear all.",
-	);
-}
-
-async function runServe(args: BrowserRelayCommandArgs): Promise<void> {
-	const log = args.verbose
-		? (message: string, data?: Record<string, unknown>) => {
-				console.error(`[relay] ${message}${data ? ` ${JSON.stringify(data)}` : ""}`);
-			}
-		: undefined;
-	const token = args.token === undefined ? await ensureBrowserRelayToken() : args.token.trim();
-	let relay: RelayServer | undefined;
-	try {
-		relay = startRelayServer({ port: args.port, token, group: args.group !== false, log });
-		if (args.token !== undefined) await writeBrowserRelayToken(token);
-	} catch (err) {
-		if (relay) relay.stop();
-		// The port is machine-global while relays can be started by any project's
-		// broker (or by hand): losing the bind to a live relay is success.
-		if (err instanceof Error && "code" in err && err.code === "EADDRINUSE") {
-			if (await probeRelayServer(`http://127.0.0.1:${args.port}`)) {
-				console.log(`${CF_BRAND} browser relay already running on http://127.0.0.1:${args.port}; nothing to do.`);
-				return;
-			}
-			console.error(`Port ${args.port} is in use by something that is not a ${CF_BRAND} browser relay.`);
-			process.exit(1);
+	let failed = false;
+	for (const result of results) {
+		if (result.status === "failed") {
+			failed = true;
+			console.error(`${result.dir}: failed (${result.error})`);
+		} else {
+			console.log(`${result.dir}: ${result.status}`);
 		}
-		throw err;
 	}
-	if (!relay) throw new Error("Browser relay failed to start");
-	const runningRelay = relay;
+	if (failed) process.exitCode = 1;
+}
+async function runInstall(args: BrowserRelayCommandArgs): Promise<void> {
+	const dir = await installRelayExtension(args.dir ?? defaultRelayExtensionDir());
+	await registerRelayNativeHost(await registeredRelayExtensionIds());
+	console.log(`Installed the ${CF_BRAND} extension to ${dir}`);
+	const extensionId = extensionIdForPath(dir);
+	const profiles = await findUnpackedInstalls(extensionId);
 
-	console.log(`${CF_BRAND} browser relay listening on http://127.0.0.1:${args.port}`);
-	console.log(`  extension endpoint  ws://127.0.0.1:${args.port}/ext?token=***`);
-	if (args.port === DEFAULT_RELAY_PORT) {
-		console.log(`  enable with         ${CF_COMMAND} config set browser.relay true`);
-	} else {
+	if (args.chrome === true && !profiles.some(profile => profile.loaded)) {
+		const report = await installRelayInChrome({ dir, profile: args.profile }).catch((error: unknown) => {
+			console.error(
+				`Could not register the extension in Chrome: ${error instanceof Error ? error.message : String(error)}`,
+			);
+			return [];
+		});
+		for (const installed of report) {
+			console.log(
+				`Registered in ${installed.browser} (${installed.profileDir})` +
+					`${installed.restarted ? "; Chrome was restarted" : ""}.`,
+			);
+		}
+		if (report.length > 0) {
+			const deadline = Date.now() + 8_000;
+			while (Date.now() < deadline) {
+				if ((await findUnpackedInstalls(extensionId)).some(profile => profile.loaded)) break;
+				await Bun.sleep(250);
+			}
+		}
+	}
+
+	const loaded = (await findUnpackedInstalls(extensionId)).filter(profile => profile.loaded);
+	for (const { browser, profile, enabled } of loaded) {
 		console.log(
-			`  enable with         ${CF_COMMAND} config set browser.relay true && ${CF_COMMAND} config set browser.relayUrl http://127.0.0.1:${args.port}`,
+			enabled
+				? `${browser} (${profile}) has it loaded and reloads into this build once idle.`
+				: `${browser} (${profile}) has it loaded but switched off; turn it on in chrome://extensions.`,
+		);
+	}
+	if (loaded.length === 0) {
+		const developerMode = profiles.some(profile => profile.developerMode);
+		console.log("");
+		console.log(
+			`Open chrome://extensions${developerMode ? "" : ", turn on Developer mode"}, click "Load unpacked" and pick ${dir}.`,
+		);
+		console.log(
+			`To register a profile automatically and permit a browser restart, explicitly use \`${CF_COMMAND} browser-relay install --chrome\`.`,
 		);
 	}
 	console.log(
-		`Waiting for the ${CF_BRAND} Browser Relay extension to connect (${CF_COMMAND} browser-relay install)...`,
+		`Optional: \`${CF_COMMAND} config set browser.relay true\` makes the browser tool drive this Chrome by default.`,
 	);
-
-	let announced = false;
-	const readiness = setInterval(() => {
-		if (runningRelay.bridge.ready && !announced) {
-			announced = true;
-			console.log(`Extension connected. The ${CF_BRAND} browser prelude can now drive your tabs.`);
-		} else if (!runningRelay.bridge.ready && announced) {
-			announced = false;
-			console.log("Extension disconnected; waiting for it to reconnect...");
-		}
-	}, 500);
-
-	const shutdown = () => {
-		clearInterval(readiness);
-		runningRelay.stop();
-		process.exit(0);
-	};
-	process.on("SIGINT", shutdown);
-	process.on("SIGTERM", shutdown);
-	// Serve runs until SIGINT/SIGTERM; keep the process alive.
-	await new Promise<never>(() => {});
 }

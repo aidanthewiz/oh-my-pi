@@ -12,7 +12,7 @@ import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
-import { dispatchReportIssueDevice } from "@oh-my-pi/pi-coding-agent/tools/report-tool-issue";
+import { reportToolIssue } from "@oh-my-pi/pi-coding-agent/tools/report-tool-issue";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
 class TestModalEditor extends CustomEditor {}
@@ -86,7 +86,7 @@ describe("InteractiveMode editor and report handoff", () => {
 			.spyOn(ExtensionUiController.prototype, "showCollabAwareSelector")
 			.mockResolvedValue("Prepare /report");
 
-		await dispatchReportIssueDevice({} as ToolSession, "read: selector parse dropped trailing line");
+		await reportToolIssue({} as ToolSession, "read: selector parse dropped trailing line");
 
 		expect(prompt).not.toHaveBeenCalled();
 
@@ -117,8 +117,8 @@ describe("InteractiveMode editor and report handoff", () => {
 				.mockImplementationOnce(() => firstAnswer.promise)
 				.mockResolvedValueOnce("Prepare /report");
 
-			await dispatchReportIssueDevice({} as ToolSession, "read: first failure");
-			await dispatchReportIssueDevice({} as ToolSession, "bash: second failure");
+			await reportToolIssue({} as ToolSession, "read: first failure");
+			await reportToolIssue({} as ToolSession, "bash: second failure");
 
 			const submittedPromise = mode.getUserInput();
 			vi.advanceTimersByTime(1_000);

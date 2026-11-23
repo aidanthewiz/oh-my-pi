@@ -1,6 +1,12 @@
 import { rm } from "node:fs/promises";
 import * as path from "node:path";
-import { type ApiKeyResolver, completeSimple, retryTransientCompletion } from "@oh-my-pi/pi-ai";
+import {
+	type ApiKeyResolver,
+	type AssistantMessage,
+	completeSimple,
+	type Model,
+	retryTransientCompletion,
+} from "@oh-my-pi/pi-ai";
 import { hostMatchesUrl } from "@oh-my-pi/pi-catalog/hosts";
 import { clampThinkingLevelForModel } from "@oh-my-pi/pi-catalog/model-thinking";
 import type { Mnemopi } from "@oh-my-pi/pi-mnemopi";
@@ -11,6 +17,7 @@ import { logger, prompt, withLoopPhase } from "@oh-my-pi/pi-utils";
 import { cfgOffline } from "../config/auxiliary-model-policy";
 import type { ModelRegistry } from "../config/model-registry";
 import { isModelEnabledBySettings, resolveRoleChain, roleCandidatePool } from "../config/model-resolver";
+import { completionRecord } from "../session/model-usage-journal";
 import type {
 	MemoryBackend,
 	MemoryBackendSaveInput,
@@ -19,12 +26,12 @@ import type {
 	MemoryBackendStatus,
 	MemoryPromptPreparation,
 } from "../memory-backend/types";
-import { memoryToolRefs } from "../memory-backend/tool-names";
 import memoryConsolidationPrompt from "../prompts/system/memory-consolidation-system.md" with { type: "text" };
 import memoryExtractionPrompt from "../prompts/system/memory-extraction-system.md" with { type: "text" };
 import mnemopiInstructions from "../prompts/system/mnemopi-instructions.md" with { type: "text" };
 import type { AgentSession } from "../session/agent-session";
 import { tinyModelClient } from "../tiny/title-client";
+import { unmeteredMessage } from "../utils/title-generator";
 import { shortenPath } from "@oh-my-pi/pi-tui/render/render-utils";
 import { concreteThinkingLevel, shouldDisableReasoning, toReasoningEffort } from "@oh-my-pi/pi-tui/thinking";
 import {
@@ -154,9 +161,7 @@ export const mnemopiBackend: MemoryBackend = {
 		return withLoopPhase("mnemopi.recall", () => {
 			const state = getMnemopiSessionState(session);
 			const primary = state?.aliasOf ?? state;
-			const parts = [
-				prompt.render(mnemopiInstructions, { toolRefs: memoryToolRefs(session?.getXdevToolEntries()) }),
-			];
+			const parts = [prompt.render(mnemopiInstructions)];
 			if (primary?.lastRecallSnippet) parts.push(primary.lastRecallSnippet);
 			const rendered = parts.join("\n\n").trim();
 			if (!rendered) return undefined;
@@ -607,13 +612,31 @@ async function resolveMnemopiProviderOptions(
 			if (owner.manager !== session.sessionManager || !owner.isCurrent()) return null;
 			const sessionId = owner.sessionId;
 			const usageOwner = { sessionId, parentId: owner.parentId };
-			const candidates = resolveRoleChain("memory", settings, roleCandidatePool("memory", settings, modelRegistry));
 			const request = resolveMemoryCompletionInput(prompt, opts);
 			const signal =
 				typeof opts?.timeout === "number" && Number.isFinite(opts.timeout) && opts.timeout > 0
 					? AbortSignal.timeout(opts.timeout)
 					: undefined;
-			const assertOwnerCurrent = (model: (typeof candidates)[number]["model"]): void => {
+			const journal = (message: AssistantMessage): void => {
+				const entryId = owner.manager.appendModelUsage(
+					{
+						purpose: "memory",
+						role: "memory",
+						api: message.api,
+						provider: message.provider,
+						model: message.model,
+						usage: message.usage,
+						stopReason: message.stopReason,
+						errorMessage: message.errorMessage,
+						duration: message.duration,
+						ttft: message.ttft,
+						completion: completionRecord(request.prompt, message),
+					},
+					usageOwner,
+				);
+				if (entryId !== undefined) usageOwner.parentId = entryId;
+			};
+			const assertOwnerCurrent = (model: Model): void => {
 				signal?.throwIfAborted();
 				if (cfgOffline.get(settings) && session.model?.provider !== model.provider)
 					throw new Error("Memory model provider differs from the active session provider");
@@ -629,12 +652,23 @@ async function resolveMnemopiProviderOptions(
 					if (model.api === "local-inference") {
 						// The tiny worker may download its runtime or model on first use.
 						if (cfgOffline.get(settings)) continue;
+						const started = performance.now();
 						const result = await tinyModelClient.complete(model.id, request.prompt, {
 							maxTokens: opts?.maxTokens,
 							systemPrompt: request.systemPrompt,
 							signal,
 						});
-						if (result !== null) return result;
+						if (result !== null) {
+							// A null result may never have reached the worker, so only produced output is journaled.
+							if (result) {
+								journal({
+									...unmeteredMessage(model, result),
+									duration: Math.round(performance.now() - started),
+								});
+							}
+							if (!owner.isCurrent()) return null;
+							return result;
+						}
 						if (signal?.aborted) return null;
 						logger.warn("Mnemopi: local memory completion failed; trying the next configured fallback.", {
 							provider: model.provider,
@@ -690,28 +724,13 @@ async function resolveMnemopiProviderOptions(
 										reasoning: clampThinkingLevelForModel(model, toReasoningEffort(level)),
 										disableReasoning: shouldDisableReasoning(level) ? true : undefined,
 										signal,
-										onAttempt: message => {
-											const entryId = owner.manager.appendModelUsage(
-												{
-													purpose: "memory",
-													role: "memory",
-													api: model.api,
-													provider: model.provider,
-													model: model.id,
-													usage: message.usage,
-													stopReason: message.stopReason,
-													errorMessage: message.errorMessage,
-												},
-												usageOwner,
-											);
-											if (entryId !== undefined) usageOwner.parentId = entryId;
-										},
+										onAttempt: journal,
 									},
 								);
 							}),
 						{ provider: model.provider, signal },
 					);
-					if (message.stopReason === "aborted" || signal?.aborted) return null;
+					if (message.stopReason === "aborted" || signal?.aborted || !owner.isCurrent()) return null;
 					if (message.stopReason === "error") {
 						logger.warn("Mnemopi: memory completion model failed; trying the next configured fallback.", {
 							provider: model.provider,

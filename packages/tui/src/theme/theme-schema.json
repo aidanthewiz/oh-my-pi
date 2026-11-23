@@ -323,6 +323,10 @@
 					"$ref": "#/$defs/colorValue",
 					"description": "Editor border color in python mode"
 				},
+				"btwMode": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Editor border color in btw (side question) mode"
+				},
 				"statusLineBg": {
 					"$ref": "#/$defs/colorValue",
 					"description": "Status line background"

@@ -45,6 +45,12 @@ The dashboard binds to `127.0.0.1` by default and does not authenticate readers.
 
 The Frustration page shows a cost estimate before starting paid AI analysis. Judge actions are disabled on non-loopback dashboards. Other local processes can trigger paid analysis on a loopback dashboard without using the page; use it only on a trusted machine.
 
+The dashboard answers to its `--host` name, IP addresses, `localhost`, single-label names, and `.localhost`, `.local`, `.internal`, `.home.arpa`, `.lan`, `.home`, `.corp`, `.localdomain` and Tailscale `.ts.net` names. Any other host name (for example a reverse proxy's or tunnel's domain) is refused to block DNS rebinding unless listed in `OMP_STATS_ALLOWED_HOSTS`; a `*.` entry allows that domain's subdomains:
+
+```bash
+OMP_STATS_ALLOWED_HOSTS=stats.example.com,*.trycloudflare.com omp stats --host 0.0.0.0
+```
+
 ### Programmatic
 
 ```typescript
@@ -87,7 +93,7 @@ Range queries read `message_rollup` / `tool_rollup` / `session_rollup`, maintain
 
 ## Dashboard
 
-Pages: Overview, Models, Providers, Costs, Requests, Errors, Traces, Tools, Frustration, Projects and Gain. `1`–`6` pick the time range; `g` then a letter jumps to a page. Every page revalidates when the live data version moves, so there is no refresh button.
+Pages: Overview, Models, Providers, Costs, Requests, Errors, Traces, Tools, Frustration, Projects and Gain. `1`–`8` pick the time range; `g` then a letter jumps to a page. Every page revalidates when the live data version moves, so there is no refresh button.
 
 ## License
 

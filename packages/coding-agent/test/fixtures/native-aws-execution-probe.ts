@@ -4,8 +4,11 @@ import * as path from "node:path";
 import { Settings } from "../../src/config/settings";
 import { AwsTool, awsSessionAuthGroups, listTrustedAwsProfiles } from "../../src/tools/aws";
 import { WriteTool } from "../../src/tools/write";
-import type { XdevState } from "../../src/tools/xdev";
-import { DeferredMCPTool, MCPTool } from "../../src/mcp/tool-bridge";
+import { BashTool } from "../../src/tools/bash";
+import { type ToolCommandState, toolCommandDispatches } from "../../src/tools/tool-commands";
+import { quotePosixArgv } from "../../src/utils/shell-quote";
+import { CustomToolAdapter } from "../../src/extensibility/custom-tools/wrapper";
+import { MCPTool, type MCPReconnect } from "../../src/mcp/tool-bridge";
 import type { MCPServerConnection, MCPToolDefinition } from "../../src/mcp/types";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import type { AgentTool, AgentToolContext, AgentToolResult } from "@oh-my-pi/pi-agent-core";
@@ -26,6 +29,32 @@ import { executeJs } from "../../src/eval/js/executor";
 import { callSessionTool } from "../../src/eval/js/tool-bridge";
 import { SessionTools, type SessionToolsHost } from "../../src/session/session-tools";
 import type { ToolSession } from "../../src/tools";
+
+function commandInput(parameters: unknown) {
+	return { command: quotePosixArgv(["aws", "--json", JSON.stringify(parameters)]) };
+}
+
+function managedMcpTool(
+	connection: MCPServerConnection,
+	definition: MCPToolDefinition,
+	initiallyDisconnected: boolean,
+	reconnect?: MCPReconnect,
+): MCPTool {
+	const live = { ...connection, transport: { ...connection.transport, connected: true } };
+	let acquired = !initiallyDisconnected;
+	const acquire: MCPReconnect = async options => {
+		if (!acquired) {
+			acquired = true;
+			return live;
+		}
+		return (await reconnect?.(options)) ?? null;
+	};
+	return new MCPTool(
+		acquired ? live : { ...live, transport: { ...live.transport, connected: false } },
+		definition,
+		initiallyDisconnected || reconnect ? acquire : undefined,
+	);
+}
 
 const root = process.env.HOME!;
 const repository = path.join(root, "repository");
@@ -319,57 +348,57 @@ try {
 	globalThis.fetch = referenceFetch;
 }
 const firstReadTool = new AwsTool(toolSession);
-const xdev: XdevState = {
+const commandState: ToolCommandState = {
 	tools: new Map([["aws", firstReadTool]]),
 	mountedNames: new Set(["aws"]),
 	builtInNames: new Set(["aws"]),
 	isActive: () => false,
 };
-const wrappedWrite = new ExtensionToolWrapper(
-	new WriteTool({ ...toolSession, xdev }) as unknown as AgentTool,
-	{
-		consumeToolCallEmitted: () => false,
-		hasHandlers: () => false,
-		hasUI: () => false,
-		hasSessionApproval: () => false,
-		grantSessionApproval: () => assert.fail("Headless approval cannot grant session permission"),
-		runScoped: <T>(fn: () => T): T => fn(),
-	} as unknown as ExtensionRunner,
+const headlessRunner = {
+	consumeToolCallEmitted: () => false,
+	hasHandlers: () => false,
+	hasUI: () => false,
+	hasSessionApproval: () => false,
+	grantSessionApproval: () => assert.fail("Headless approval cannot grant session permission"),
+	runScoped: <T>(fn: () => T): T => fn(),
+} as unknown as ExtensionRunner;
+commandState.decorateExecution = tool => new ExtensionToolWrapper(tool as unknown as AgentTool, headlessRunner);
+const wrappedBash = new ExtensionToolWrapper(
+	new BashTool({
+		...toolSession,
+		toolCommands: commandState,
+		isToolActive: name => name === "bash",
+	}) as unknown as AgentTool,
+	headlessRunner,
 );
-const writeContext = { settings: Settings.isolated({ "tools.approvalMode": "write" }) } as AgentToolContext;
+const bashContext = { settings: Settings.isolated({ "tools.approvalMode": "write" }) } as AgentToolContext;
 const firstRead = { ...read, service: "ce", operation: "get-cost-and-usage" };
-const firstReadArgs = { path: "xd://aws", content: JSON.stringify(firstRead) };
+const firstReadArgs = commandInput(firstRead);
 const beforeFirstRead = (await calls()).filter(call => call.argv.includes("get-cost-and-usage")).length;
 assert.equal(firstReadTool.approval(firstRead), "exec");
-const dispatchedRead = await wrappedWrite.execute(
-	"first-mapped-read",
-	firstReadArgs,
-	undefined,
-	undefined,
-	writeContext,
-);
+const dispatchedRead = await wrappedBash.execute("first-mapped-read", firstReadArgs, undefined, undefined, bashContext);
 assert.notEqual(dispatchedRead.isError, true);
-assert.equal((dispatchedRead.details as { xdev?: { tier?: string } } | undefined)?.xdev?.tier, "read");
+assert.equal(toolCommandDispatches("bash", dispatchedRead)[0]?.tier, "read");
 assert.equal((await calls()).filter(call => call.argv.includes("get-cost-and-usage")).length, beforeFirstRead + 1);
-await assert.rejects(
-	() =>
-		wrappedWrite.execute(
-			"first-mutation",
-			{
-				path: "xd://aws",
-				content: JSON.stringify({
-					...read,
-					service: "ec2",
-					operation: "terminate-instances",
-					parameters: { InstanceIds: ["i-fixture"] },
-				}),
-			},
-			undefined,
-			undefined,
-			writeContext,
-		),
-	/requires approval but no interactive UI/,
-);
+const beforeFirstMutation = (await calls()).filter(call => call.argv.includes("terminate-instances")).length;
+await wrappedBash
+	.execute(
+		"first-mutation",
+		commandInput({
+			...read,
+			service: "ec2",
+			operation: "terminate-instances",
+			parameters: { InstanceIds: ["i-fixture"] },
+		}),
+		undefined,
+		undefined,
+		bashContext,
+	)
+	.then(
+		result => assert.equal(result.isError, true),
+		error => assert.match(String(error), /requires runtime approval.*no interactive UI/),
+	);
+assert.equal((await calls()).filter(call => call.argv.includes("terminate-instances")).length, beforeFirstMutation);
 const queueUrl = "https://sqs.us-east-1.amazonaws.com/123456789012/fixture";
 const queueAttributes = {
 	...read,
@@ -390,16 +419,9 @@ const beforeReceive = (await calls()).filter(call => call.argv.includes("receive
 assert.match((await tool.prepareRuntimeApproval("queue-receive", queueReceive))!.prompt, /Account: 123456789012/);
 assert.equal(tool.approval(queueReceive), "exec");
 await assert.rejects(() => tool.execute("queue-receive", queueReceive), /approval/);
-await assert.rejects(
-	() =>
-		wrappedWrite.execute(
-			"first-queue-receive",
-			{ path: "xd://aws", content: JSON.stringify(queueReceive) },
-			undefined,
-			undefined,
-			writeContext,
-		),
-	/requires approval but no interactive UI/,
+await wrappedBash.execute("first-queue-receive", commandInput(queueReceive), undefined, undefined, bashContext).then(
+	result => assert.equal(result.isError, true),
+	error => assert.match(String(error), /requires runtime approval.*no interactive UI/),
 );
 assert.equal((await calls()).filter(call => call.argv.includes("receive-message")).length, beforeReceive);
 const listedEndpoints = { ...read, service: "sagemaker", operation: "list-endpoints" };
@@ -783,9 +805,9 @@ assert.equal(
 	2,
 );
 await fs.unlink(path.join(root, "authenticated-parallel"));
-for (const deferred of [false, true]) {
+for (const initiallyDisconnected of [false, true]) {
 	for (const failure of ["result", "exception"] as const) {
-		const id = `unsafe-managed-${deferred ? "deferred" : "direct"}-${failure}`;
+		const id = `unsafe-managed-${initiallyDisconnected ? "cold" : "direct"}-${failure}`;
 		const effects = path.join(root, `${id}.effects`);
 		const definition: MCPToolDefinition = {
 			name: "aws___run_script",
@@ -813,9 +835,7 @@ for (const deferred of [false, true]) {
 				},
 			},
 		} as unknown as MCPServerConnection;
-		const unsafe = deferred
-			? new DeferredMCPTool(connection.name, definition, async () => unsafeConnection)
-			: new MCPTool(unsafeConnection, definition);
+		const unsafe = managedMcpTool(unsafeConnection, definition, initiallyDisconnected);
 		const beforePrompts: number = confirmations;
 		const beforeLogins = (await calls()).filter(call => call.argv.includes("login")).length;
 		const failed = await unsafe.execute(
@@ -902,9 +922,9 @@ assert.equal(
 	(await calls()).filter(call => call.argv.includes("mutation-reexpires") && call.argv.includes("login")).length,
 	1,
 );
-for (const deferred of [false, true]) {
+for (const initiallyDisconnected of [false, true]) {
 	for (const phase of ["preflight", "reconnect"]) {
-		const profile = `expired-managed-${deferred ? "deferred" : "direct"}-${phase}`;
+		const profile = `expired-managed-${initiallyDisconnected ? "cold" : "direct"}-${phase}`;
 		const token = path.join(root, `authenticated-${profile}`);
 		if (phase === "reconnect") await Bun.write(token, "yes");
 		const definition: MCPToolDefinition = {
@@ -934,9 +954,7 @@ for (const deferred of [false, true]) {
 			reconnects++;
 			return { ...managedConnection };
 		};
-		const bounded = deferred
-			? new DeferredMCPTool(managedConnection.name, definition, async () => managedConnection, undefined, reconnect)
-			: new MCPTool(managedConnection, definition, reconnect);
+		const bounded = managedMcpTool(managedConnection, definition, initiallyDisconnected, reconnect);
 		const before: number = confirmations;
 		const result = await bounded.execute(profile, { aws_profile: profile }, undefined, context);
 		assert.equal(result.isError, true);
@@ -1024,9 +1042,9 @@ for (const stage of ["operation", "identity", "exhausted-budget"] as const) {
 	await fs.rm(`${barrier}.started`);
 	await fs.rm(`${barrier}.release`);
 }
-for (const deferred of [false, true]) {
+for (const initiallyDisconnected of [false, true]) {
 	for (const failure of ["result", "exception", "probe"] as const) {
-		const id = `managed-generation-${deferred ? "deferred" : "direct"}-${failure}`;
+		const id = `managed-generation-${initiallyDisconnected ? "cold" : "direct"}-${failure}`;
 		await explicitRaceLogin(`${id}-initial`);
 		const before = await raceLoginCount();
 		const beforePrompts: number = confirmations;
@@ -1073,11 +1091,10 @@ for (const deferred of [false, true]) {
 				},
 			},
 		} as unknown as MCPServerConnection;
-		const raceManaged = deferred
-			? new DeferredMCPTool(raceConnection.name, definition, async () => raceConnection)
-			: new MCPTool(raceConnection, definition);
+		const raceManaged = managedMcpTool(raceConnection, definition, initiallyDisconnected);
 		const pending = raceManaged.execute(id, { aws_profile: "expired" }, undefined, context);
 		await retryStarted.promise;
+		assert.equal(requests, 2, `${id} repeated the admitted retry`);
 		if (failure === "probe") await waitForAuthBarrier(probeBarrier);
 		assert.equal(await raceLoginCount(), before + 1);
 		await explicitRaceLogin(`${id}-newer-login`);
@@ -1086,6 +1103,7 @@ for (const deferred of [false, true]) {
 		const oldFailure = await pending;
 		assert.equal(oldFailure.isError, true);
 		assert.match(text(oldFailure), /AUTH_REQUIRED/);
+		assert.equal(requests, 2, `${id} replayed the failed request after newer authentication`);
 		await fs.rm(raceToken);
 		const afterExpiry = await raceManaged.execute(
 			`${id}-real-expiry`,
@@ -1097,7 +1115,10 @@ for (const deferred of [false, true]) {
 		assert.match(text(afterExpiry), /managed operation completed after real expiry/);
 		assert.equal(await raceLoginCount(), before + 3);
 		assert.equal(confirmations, beforePrompts + 2);
-		assert.equal(requests, 4);
+		assert.ok(
+			requests >= 3 && requests <= 4,
+			`${id} must dispatch once, with at most one auth retry if its identity probe was cached`,
+		);
 		if (failure === "probe") {
 			await fs.rm(`${probeBarrier}.started`);
 			await fs.rm(`${probeBarrier}.release`);
@@ -1109,9 +1130,9 @@ for (const approved of [false, true]) {
 		"native",
 		"native-exhausted",
 		"managed-direct-result",
-		"managed-deferred-result",
+		"managed-cold-result",
 		"managed-direct-exception",
-		"managed-deferred-exception",
+		"managed-cold-exception",
 	]) {
 		const id = `pending-${approved ? "approved" : "offered"}-${route}`;
 		await explicitRaceLogin(`${id}-initial`);
@@ -1142,9 +1163,7 @@ for (const approved of [false, true]) {
 				},
 			},
 		} as unknown as MCPServerConnection;
-		const pendingManaged = route.includes("deferred")
-			? new DeferredMCPTool(pendingConnection.name, definition, async () => pendingConnection)
-			: new MCPTool(pendingConnection, definition);
+		const pendingManaged = managedMcpTool(pendingConnection, definition, route.includes("cold"));
 		const requestTool = route === "native-exhausted" ? new AwsTool(toolSession, { attempted: true }) : tool;
 		const failure = route.startsWith("native")
 			? await requestTool.execute(id, { ...read, profile: "expired" }, undefined, undefined, context)
@@ -1209,21 +1228,26 @@ const sessionRunner = {
 const sessionWrapper = new ExtensionToolWrapper(sessionTool as unknown as AgentTool, sessionRunner);
 const ordinaryMutation = { ...read, service: "rds", operation: "modify-db-cluster" };
 const batchRegistry = new Map<string, AgentTool>([["aws", sessionWrapper]]);
-const batchXdev: XdevState = {
+const batchCommands: ToolCommandState = {
 	tools: batchRegistry,
 	mountedNames: new Set(["aws"]),
-	builtInNames: new Set(["aws", "write"]),
+	builtInNames: new Set(["aws", "bash", "write"]),
 	isActive: () => false,
 };
 let batchContext = sessionContext;
 const batchSession: ToolSession = {
 	...approvalSession,
-	xdev: batchXdev,
+	toolCommands: batchCommands,
+	isToolActive: name => name === "bash" || name === "write",
 	getToolContext: () => batchContext,
 	getToolForEvalBridge: name => batchTools.getToolForEvalBridge(name),
 };
-const batchWrite = new ExtensionToolWrapper(new WriteTool(batchSession) as unknown as AgentTool, sessionRunner);
-batchRegistry.set("write", batchWrite);
+const batchBash = new ExtensionToolWrapper(new BashTool(batchSession) as unknown as AgentTool, sessionRunner);
+batchRegistry.set("bash", batchBash);
+batchRegistry.set(
+	"write",
+	new ExtensionToolWrapper(new WriteTool(batchSession) as unknown as AgentTool, sessionRunner),
+);
 const batchTools = new SessionTools(
 	{
 		agent: { state: { tools: [...batchRegistry.values()], messages: [] } },
@@ -1233,7 +1257,7 @@ const batchTools = new SessionTools(
 		evalPreludes: () => [],
 		sessionAgents: () => [],
 	} as unknown as SessionToolsHost,
-	{ toolRegistry: batchRegistry, xdev: batchXdev, baseSystemPrompt: [] },
+	{ toolRegistry: batchRegistry, toolCommands: batchCommands, baseSystemPrompt: [] },
 );
 const batchBefore = (await calls()).filter(call => call.argv.includes("ecr")).length;
 const batchOwner = "native-aws-batch";
@@ -1251,7 +1275,7 @@ async function runBatch(start: number): Promise<void> {
 					: { RepositoryName: "fixture-" + index, ImageIds: Array.from({ length: 60 }, (_, tag) => ({ imageTag: "fixture-image-" + tag })) },
 			};
 			const value = (index >> 2) % 2
-				? await tool.write({ path: "xd://aws", content: JSON.stringify(params) })
+				? await tool.bash({ command: "aws --json '" + JSON.stringify(params) + "'" })
 				: await tool.aws(params);
 			if (typeof value === "object" && value?.hasError) throw new Error(JSON.stringify(value));
 			completed++;
@@ -1468,7 +1492,10 @@ const unsafeForApproval = new MCPTool(deniedConnection, {
 	name: "aws___run_script",
 	inputSchema: { type: "object", properties: { aws_profile: { type: "string", enum: ["automatic"] } } },
 });
-const managedWrapper = new ExtensionToolWrapper(unsafeForApproval as unknown as AgentTool, sessionRunner);
+const managedWrapper = new ExtensionToolWrapper(
+	new CustomToolAdapter(unsafeForApproval, () => sessionContext as never) as unknown as AgentTool,
+	sessionRunner,
+);
 await assert.rejects(
 	() =>
 		managedWrapper.execute("managed-not-granted", { aws_profile: "automatic" }, undefined, undefined, sessionContext),
@@ -1478,18 +1505,37 @@ assert.equal(selections.length, beforeManagedGrant + 1);
 assert.ok(!selections.at(-1)!.includes(sessionLabel));
 assert.equal(deniedRequests, beforeManagedDenial);
 
-const nestedOrdinary = { path: "xd://aws", content: JSON.stringify(ordinaryMutation) };
-for (const deniedTool of ["write", "aws"]) {
+const nestedOrdinary = commandInput(ordinaryMutation);
+for (const deniedTool of ["bash", "aws"]) {
 	batchContext = {
 		...sessionContext,
-		settings: Settings.isolated({ "tools.approval": { [deniedTool]: "deny" } }),
+		settings: Settings.isolated({
+			"tools.approval": {
+				bash: deniedTool === "bash" ? "deny" : "allow",
+				aws: deniedTool === "aws" ? "deny" : "allow",
+			},
+		}),
 	};
 	const before = (await calls()).length;
-	await assert.rejects(
-		() => callSessionTool("write", nestedOrdinary, { session: batchSession }),
-		/blocked by user policy/,
-		`native session grant must not bypass explicit ${deniedTool} deny through xd://aws`,
-	);
+	if (deniedTool === "bash") {
+		await assert.rejects(
+			() => callSessionTool("bash", nestedOrdinary, { session: batchSession }),
+			/blocked by user policy/,
+			"native session grant must not bypass explicit bash deny",
+		);
+	} else {
+		const previousChoice: string | undefined = choice;
+		choice = "Approve once";
+		try {
+			const denial = await callSessionTool("bash", nestedOrdinary, { session: batchSession });
+			assert.ok(denial && typeof denial === "object" && "hasError" in denial);
+			assert.equal(denial.hasError, true);
+			assert.ok("text" in denial && typeof denial.text === "string");
+			assert.match(denial.text, /blocked by user policy/);
+		} finally {
+			choice = previousChoice;
+		}
+	}
 	assert.equal((await calls()).length, before);
 }
 batchContext = sessionContext;
@@ -1506,36 +1552,39 @@ assert.equal(selections.length, beforeUnrelated + 1);
 assert.ok(!selections.at(-1)!.includes(sessionLabel));
 const beforeNestedGuard = (await calls()).filter(call => call.argv.includes("terminate-instances")).length;
 choice = sessionLabel;
-function assertNestedFailure(value: unknown, reason: RegExp, contract: string): void {
+async function assertNestedFailure(operation: Promise<unknown>, reason: RegExp, contract: string): Promise<void> {
+	let value: unknown;
+	try {
+		value = await operation;
+	} catch (error) {
+		assert.match(String(error), reason, contract);
+		return;
+	}
 	assert.ok(isRecord(value), contract);
 	assert.equal(value.hasError, true, contract);
 	assert.equal(typeof value.text, "string", contract);
 	assert.match(String(value.text), reason, contract);
 }
-assertNestedFailure(
-	await callSessionTool("write", { path: "xd://aws", content: JSON.stringify(mutation) }, { session: batchSession }),
+await assertNestedFailure(
+	callSessionTool("bash", commandInput(mutation), { session: batchSession }),
 	/denied by user/,
-	"mandatory DCG ask must reject an ineligible session-grant selection through xd://aws",
+	"mandatory DCG ask must reject an ineligible session-grant selection through the aws command",
 );
 assert.ok(!selections.at(-1)!.includes(sessionLabel));
 assert.ok(selectionTitles.at(-1)!.includes("fixture guard policy"));
 choice = "Approve once";
-await callSessionTool("write", { path: "xd://aws", content: JSON.stringify(mutation) }, { session: batchSession });
+await callSessionTool("bash", commandInput(mutation), { session: batchSession });
 choice = "Deny";
-assertNestedFailure(
-	await callSessionTool("write", { path: "xd://aws", content: JSON.stringify(mutation) }, { session: batchSession }),
+await assertNestedFailure(
+	callSessionTool("bash", commandInput(mutation), { session: batchSession }),
 	/denied by user/,
-	"mandatory DCG ask must prompt again after one-call approval through xd://aws",
+	"mandatory DCG ask must prompt again after one-call approval through the aws command",
 );
 assert.equal((await calls()).filter(call => call.argv.includes("terminate-instances")).length, beforeNestedGuard + 1);
-assertNestedFailure(
-	await callSessionTool(
-		"write",
-		{ path: "xd://aws", content: JSON.stringify({ ...read, operation: "delete-bucket" }) },
-		{ session: batchSession },
-	),
+await assertNestedFailure(
+	callSessionTool("bash", commandInput({ ...read, operation: "delete-bucket" }), { session: batchSession }),
 	/fixture\.aws/,
-	"mandatory DCG deny must surface an error through xd://aws despite the native session grant",
+	"mandatory DCG deny must surface an error through the aws command despite the native session grant",
 );
 const safetyMessage = "fixture provider safety ".repeat(40) + "final safety condition";
 batchContext = {

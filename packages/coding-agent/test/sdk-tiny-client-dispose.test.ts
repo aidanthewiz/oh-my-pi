@@ -3,6 +3,8 @@ import type { Api, ModelSpec } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import * as daemonClientModule from "@oh-my-pi/pi-coding-agent/daemon/client";
+import type { DaemonClient, DaemonTunnel, UnitSnapshot } from "@oh-my-pi/pi-coding-agent/daemon/protocol";
 import { type CreateAgentSessionOptions, createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
@@ -31,7 +33,6 @@ const TINY_MODEL = "qwen3-1.7b";
 /** Stands in for the tiny-model worker; replies only when the test emits one. */
 class FakeTinyWorker {
 	#messageHandlers = new Set<(message: TinyWorkerResponse) => void>();
-	#errorHandlers = new Set<(error: Error) => void>();
 	#requests: TinyWorkerRequest[] = [];
 	#waiters: Array<(request: TinyWorkerRequest) => void> = [];
 
@@ -56,24 +57,57 @@ class FakeTinyWorker {
 		return () => this.#messageHandlers.delete(handler);
 	}
 
-	onError(handler: (error: Error) => void): () => void {
-		this.#errorHandlers.add(handler);
-		return () => this.#errorHandlers.delete(handler);
-	}
-
-	async terminate(): Promise<void> {}
-
-	ref(): void {}
-
-	unref(): void {}
-
 	emit(message: TinyWorkerResponse): void {
 		for (const handler of this.#messageHandlers) handler(message);
 	}
 }
 
-// The tiny-model client is a process singleton; terminating it fails every request
-// in flight, so only the session that owns process state may shut it down, once.
+function inferDaemon(worker: FakeTinyWorker): DaemonClient {
+	const unit: UnitSnapshot = {
+		id: "tiny-fixture",
+		kind: "infer",
+		scope: { kind: "global" },
+		key: TINY_MODEL,
+		label: TINY_MODEL,
+		generation: "fixture-generation",
+		state: "running",
+		pids: [],
+		createdAt: 0,
+		startedAt: 0,
+		restartCount: 0,
+		outputBytes: 0,
+		leases: 1,
+		policy: { hold: "leases", idleMs: 0, onIdle: "stop", restart: "no", survive: "exec" },
+		supervised: true,
+	};
+	const encoder = new TextEncoder();
+	const decoder = new TextDecoder();
+	return {
+		open: async () => ({ unit, lease: crypto.randomUUID(), created: false }),
+		attach: async () => {
+			let unsubscribe: (() => void) | undefined;
+			return {
+				unit,
+				send(data) {
+					const text = typeof data === "string" ? data : decoder.decode(data);
+					for (const line of text.trim().split("\n")) worker.send(JSON.parse(line));
+					return true;
+				},
+				start(onData) {
+					unsubscribe = worker.onMessage(message => onData(encoder.encode(`${JSON.stringify(message)}\n`)));
+				},
+				close: () => unsubscribe?.(),
+				drained: async () => {},
+				ref() {},
+				unref() {},
+			} satisfies DaemonTunnel;
+		},
+		release: async () => {},
+		onReconnect: () => () => {},
+	} as unknown as DaemonClient;
+}
+
+// Only the process-owning session closes its shared client tunnels; daemon workers may serve other processes.
 describe("tiny-model client shutdown on session dispose", () => {
 	const sessions: AgentSession[] = [];
 
@@ -131,7 +165,7 @@ describe("tiny-model client shutdown on session dispose", () => {
 		const { start, close } = await starter(tempDir);
 		const worker = new FakeTinyWorker();
 		vi.spyOn(titleClient, "tinyWorkerUsesMlx").mockReturnValue(false);
-		vi.spyOn(titleClient, "connectTinyWorker").mockResolvedValue(worker);
+		vi.spyOn(daemonClientModule, "daemonClient").mockResolvedValue(inferDaemon(worker));
 		const client = titleClient.tinyTitleClient;
 		try {
 			const parentSettings = Settings.isolated({ "compaction.enabled": false });

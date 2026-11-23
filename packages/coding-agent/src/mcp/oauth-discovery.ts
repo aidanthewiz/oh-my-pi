@@ -7,6 +7,7 @@
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import type { FetchImpl } from "@oh-my-pi/pi-ai/types";
 import { withTimeoutSignal } from "../utils/fetch-timeout";
+import type { MCPAuthChallenge, MCPServerConfig } from "./types";
 
 /** Per-request abort deadline for each OAuth discovery metadata fetch. */
 const DISCOVERY_FETCH_TIMEOUT_MS = 10_000;
@@ -56,7 +57,7 @@ export interface AuthDetectionResult {
 	message?: string;
 }
 
-interface OAuthDiscoveryHints {
+export interface OAuthDiscoveryHints {
 	oauth: OAuthEndpoints | null;
 	authServerUrl?: string;
 	resourceMetadataUrl?: string;
@@ -66,6 +67,38 @@ interface OAuthDiscoveryHints {
 
 // Protocol hints must survive diagnostic redaction without retaining response bodies on errors.
 const oauthDiscoveryHints = new WeakMap<Error, OAuthDiscoveryHints>();
+
+/** Private transport metadata; never includes the response body or diagnostic data. */
+export function storedOAuthDiscoveryHints(error: Error): OAuthDiscoveryHints | undefined {
+	const hints = oauthDiscoveryHints.get(error);
+	return hints &&
+		(hints.oauth || hints.authServerUrl || hints.resourceMetadataUrl || hints.wwwAuthenticate || hints.scopes)
+		? hints
+		: undefined;
+}
+
+export function restoreOAuthDiscoveryHints(error: Error, hints: OAuthDiscoveryHints): void {
+	oauthDiscoveryHints.set(error, hints);
+}
+
+/** Only an OAuth configuration or challenge may turn an HTTP refusal into sign-in. */
+export function getMcpAuthChallengeFromError(error: unknown, config: MCPServerConfig): MCPAuthChallenge | undefined {
+	if (config.enabled === false || (config.type !== "http" && config.type !== "sse")) return undefined;
+	const message = error instanceof Error ? error.message : String(error);
+	const status = message.match(/^HTTP (401|403):/i)?.[1];
+	if (!status) return undefined;
+	const authError = error instanceof Error ? error : new Error(message);
+	const wwwAuthenticate = extractOAuthChallengeHeader(authError);
+	const bearerChallenge = wwwAuthenticate !== undefined && /\bBearer\b/i.test(wwwAuthenticate);
+	const oauthHint = extractOAuthEndpoints(authError) || extractMcpAuthServerUrl(authError, config.url);
+	const configuredOAuth = config.oauth !== undefined || config.auth?.type === "oauth";
+	if (
+		(status === "401" && !bearerChallenge && !oauthHint && !configuredOAuth) ||
+		(status === "403" && (!bearerChallenge || !/\berror\s*=\s*"insufficient_scope"/i.test(wwwAuthenticate ?? "")))
+	)
+		return undefined;
+	return { wwwAuthenticate: wwwAuthenticate ? [wwwAuthenticate] : [] };
+}
 
 /** Retain only discovery fields before sanitizing or cloning a transport error. */
 export function preserveOAuthDiscoveryHints(error: Error, source: Error): void {

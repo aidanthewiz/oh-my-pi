@@ -1,7 +1,6 @@
 import * as path from "node:path";
 import {
 	filterChildShellEnv,
-	getLogsDir,
 	getProjectDir,
 	isCompiledBinary,
 	logger,
@@ -14,7 +13,7 @@ import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { CF_BRAND, CF_COMMAND } from "../../cli/cf-version";
 import { ToolAbortError } from "../tool-errors";
 import { findFreeCdpPort, findReusableCdp, gracefulKillTreeOnce, resolveSpawnArgs, waitForCdp } from "./attach";
-import type { CmuxKind } from "./cmux/rpc";
+import { type CmuxKind, CmuxUnavailableError } from "./cmux/rpc";
 import { CmuxSocketClient } from "./cmux/socket-client";
 import {
 	BROWSER_PROTOCOL_TIMEOUT_MS,
@@ -27,13 +26,13 @@ import {
 	type UserAgentOverride,
 } from "./launch";
 import { reapOrphanSharedTargets, type SharedTargetScope } from "./orphan-registry";
-import { ensureRelayDaemon, isLoopbackRelayUrl, restartRelayDaemon } from "./relay/daemon";
-import { type RelayKind, resolveRelayWebSocketEndpoint } from "./relay/kind";
-import { UPDATE_RELAY_EXTENSION, waitForRelayExtension } from "./relay/probe";
-import { ensureBrowserRelayToken, writeBrowserRelayToken } from "./relay/token";
+import { isLoopbackRelayUrl, type RelayKind, resolveRelayWebSocketEndpoint } from "./relay/kind";
+import { requestRelayRestart, UPDATE_RELAY_EXTENSION, waitForRelayExtension } from "./relay/probe";
+import { ensureBrowserRelayToken } from "./relay/token";
 import { ensureSharedBrowser } from "./shared-daemon";
 import type { TernKind } from "./tern/kind";
 import { TernSocketClient } from "./tern/wire";
+import type { UnitLease } from "./unit-lease";
 import { WebKitHost } from "./webkit/host";
 import type { WebKitKind } from "./webkit/kind";
 
@@ -70,8 +69,10 @@ export interface PuppeteerBrowserHandle extends BrowserHandleCommon {
 	pid?: number;
 	/** OMP-owned temp Chromium profile directory removed on dispose (process-local headless launches). */
 	userDataDir?: string;
-	/** Broker daemon backing this handle; dispose disconnects instead of closing, kill routes to the broker. */
+	/** Daemon unit backing this handle; dispose disconnects instead of closing, kill routes to the daemon. */
 	sharedDaemon?: { name: string; projectDir: string };
+	/** Lease on the shared Chromium daemon unit this handle uses; released on dispose. */
+	daemonLease?: UnitLease;
 	subprocess?: Subprocess;
 	stealth: { browserSession: CDPSession | null; override: UserAgentOverride | null };
 }
@@ -100,7 +101,7 @@ export type BrowserHandle = PuppeteerBrowserHandle | CmuxBrowserHandle | TernBro
 
 /**
  * Durable-ownership scope for a browser handle, or undefined when the handle is
- * not the project-shared broker-owned Chromium (the only browser whose targets
+ * not the project-shared daemon-supervised Chromium (the only browser whose targets
  * outlive their creating process and thus need cross-process orphan reaping).
  */
 export function sharedTargetScopeOf(handle: BrowserHandle): SharedTargetScope | undefined {
@@ -148,8 +149,8 @@ export interface AcquireBrowserOptions {
 	signal?: AbortSignal;
 	/** Runs before a fresh browser connection, never when reusing a connected handle. */
 	beforeOpen?: () => Promise<void>;
-	/** Start, or replace an outdated, loopback relay daemon when a relay is not serving. Default true. */
-	startRelay?: boolean;
+	/** Ask an older native relay host to restart from the installed version. */
+	restartRelay?: boolean;
 }
 
 export async function acquireBrowser(kind: BrowserKind, opts: AcquireBrowserOptions): Promise<BrowserHandle> {
@@ -287,7 +288,12 @@ async function relayBrowserWSEndpoint(
 async function openBrowserHandle(kind: BrowserKind, opts: AcquireBrowserOptions): Promise<BrowserHandle> {
 	if (kind.kind === "cmux") {
 		const client = new CmuxSocketClient({ socketPath: kind.socketPath, password: kind.password });
-		await client.connect();
+		await client.connect().catch((error: unknown) => {
+			if (error instanceof ToolError && !(error instanceof ToolAbortError)) {
+				throw new CmuxUnavailableError(error.message);
+			}
+			throw error;
+		});
 		return {
 			key: browserKey(kind),
 			kind,
@@ -311,10 +317,10 @@ async function openBrowserHandle(kind: BrowserKind, opts: AcquireBrowserOptions)
 	}
 	if (kind.kind === "headless") {
 		// Every real omp process (session, subagent, worker — anything with a CLI
-		// worker host) MUST go through the project-shared broker-owned Chromium:
+		// worker host) MUST go through the project-shared daemon-supervised Chromium:
 		// per-process launches are what produced launch storms and orphaned
 		// process trees. The process-local launch survives only for hosts that
-		// cannot spawn the broker (bun test, SDK embedding without a CLI entry).
+		// cannot spawn the omp daemon (bun test, SDK embedding without a CLI entry).
 		if (isCompiledBinary() || workerHostEntry() !== null) {
 			return await openSharedHeadlessHandle(kind, opts);
 		}
@@ -354,58 +360,41 @@ async function openBrowserHandle(kind: BrowserKind, opts: AcquireBrowserOptions)
 		};
 	}
 	if (kind.kind === "relay") {
+		if (!kind.cdpUrl)
+			throw new ToolError(
+				`No local ${CF_BRAND} browser relay found. Open Chrome with the ${CF_BRAND} extension, or configure browser.relayUrl.`,
+			);
 		const configured = relayEndpoint(kind.cdpUrl);
 		const cdpUrl = configured.cdpUrl;
-		const loopback = isLoopbackRelayUrl(cdpUrl);
-		let token = configured.token;
-		if (loopback) {
-			if (token === undefined) token = await ensureBrowserRelayToken();
-			else await writeBrowserRelayToken(token);
+		const token = configured.token ?? (isLoopbackRelayUrl(cdpUrl) ? await ensureBrowserRelayToken() : undefined);
+		if (!token) {
+			throw new ToolError(`The ${CF_BRAND} browser relay requires a token in its configured URL.`);
 		}
-		// Loopback relays are owned by a machine-global broker and auto-started
-		// on demand (the extension dials in on its own). Hosts without a CLI
-		// worker entry (bun test, SDK embedding) never spawn brokers. Remote
-		// relay URLs must already be serving.
-		const autoStart = opts.startRelay !== false && loopback && (isCompiledBinary() || workerHostEntry() !== null);
-		if (autoStart) {
-			await ensureRelayDaemon({ cdpUrl, signal: opts.signal });
-		}
-		// The relay answers /json/version with 503 until its extension dials in;
-		// the wait fails fast when nothing serves the port or the server has
-		// already outlived the window an installed extension needs to connect.
 		let outcome = await waitForRelayExtension(cdpUrl, opts.signal);
-		// A broker-owned relay outlives omp upgrades; replace an incompatible one
-		// with this version's once, and a compatible older one only while no CDP
-		// client uses it. A manually started relay is left to its owner.
-		if (outcome === "outdated-relay" && autoStart && (await restartRelayDaemon({ cdpUrl, signal: opts.signal }))) {
-			outcome = await waitForRelayExtension(cdpUrl, opts.signal);
-		} else if (outcome === "idle-older-relay" && autoStart) {
-			// Probe again even when it was kept: another omp may have replaced it since.
-			await restartRelayDaemon({ cdpUrl, signal: opts.signal, idleOnly: true });
-			outcome = await waitForRelayExtension(cdpUrl, opts.signal);
+		// A host from an older omp keeps serving across upgrades. Restart an incompatible one from the installed omp,
+		// and a compatible older one only while no CDP client uses it; an older one that stays is still usable.
+		if ((outcome === "outdated-relay" || outcome === "idle-older-relay") && opts.restartRelay !== false) {
+			const idleOnly = outcome === "idle-older-relay";
+			const restarted = await requestRelayRestart(cdpUrl, { idleOnly, token, signal: opts.signal });
+			outcome = await waitForRelayExtension(cdpUrl, opts.signal, restarted ? { restarted: true } : undefined);
 		}
 		if (outcome === "unreachable") {
 			throw new ToolError(
-				`${CF_BRAND} browser relay is not reachable at ${cdpUrl}. Start it with \`${CF_COMMAND} browser-relay\` (or check the endpoint), and make sure the ${CF_BRAND} Browser Relay extension is loaded in Chrome.`,
+				`Nothing serves the ${CF_BRAND} browser relay at ${cdpUrl}: Chrome is not running with the extension. Open Chrome; if the extension is loaded, run \`${CF_COMMAND} browser-relay install\` to register its native host.`,
 			);
 		}
 		if (outcome === "no-extension") {
 			throw new ToolError(
-				`${CF_BRAND} browser relay is serving at ${cdpUrl} but its extension never connected. Install it with \`${CF_COMMAND} browser-relay install\` and check the toolbar badge shows "on".`,
-			);
-		}
-		if (outcome === "extension-gone") {
-			throw new ToolError(
-				`${CF_BRAND} browser relay is serving at ${cdpUrl} but its extension disconnected and has not come back. Open Chrome with the ${CF_BRAND} Browser Relay extension and check the toolbar badge shows "on".`,
+				`The ${CF_BRAND} browser relay at ${cdpUrl} is up, but its browser never said hello. Reload the extension in Chrome.`,
 			);
 		}
 		if (outcome === "outdated-relay") {
 			throw new ToolError(
-				`The browser relay at ${cdpUrl} is out of date. Restart the relay under this ${CF_BRAND} version, then retry.`,
+				`The browser relay at ${cdpUrl} comes from an older ${CF_BRAND}. Run \`${CF_COMMAND} browser-relay install\` with this version, then reload the extension in Chrome.`,
 			);
 		}
 		if (outcome === "outdated-extension") {
-			throw new ToolError(`The ${CF_BRAND} Browser Relay extension is out of date. ${UPDATE_RELAY_EXTENSION}`);
+			throw new ToolError(`The ${CF_BRAND} extension is out of date. ${UPDATE_RELAY_EXTENSION}`);
 		}
 		const browserWSEndpoint = await relayBrowserWSEndpoint(cdpUrl, token, opts.signal);
 		const puppeteer = await loadPuppeteer();
@@ -520,12 +509,13 @@ async function disposeBrowserHandle(handle: BrowserHandle, opts: ReleaseBrowserO
 	}
 	if (handle.kind.kind === "headless") {
 		if (handle.sharedDaemon) {
-			// The broker owns the Chromium; this process only drops its CDP
-			// connection. `kill` is scoped to spawned-app browsers — stopping the
-			// shared daemon here would tear down every other session's tabs. The
-			// daemon dies with the last omp client in the project (broker idle
-			// teardown), when its CDP endpoint stops answering after a failed tab
-			// cleanup (`stopSharedBrowserIfUnreachable`), or via an explicit stop
+			// The daemon owns the Chromium; this process only drops its CDP
+			// connection and its lease. `kill` is scoped to spawned-app browsers —
+			// stopping the shared unit here would tear down every other session's
+			// tabs. Chrome dies shortly after the last omp client in the project
+			// releases its lease (unit idle policy), when its CDP endpoint stops
+			// answering after a failed tab cleanup
+			// (`stopSharedBrowserIfUnreachable`), or via an explicit stop
 			// (`write proc://<name>/kill`).
 			if (handle.browser.connected) {
 				try {
@@ -534,6 +524,7 @@ async function disposeBrowserHandle(handle: BrowserHandle, opts: ReleaseBrowserO
 					logger.debug("Failed to disconnect from shared browser", { error: (err as Error).message });
 				}
 			}
+			await handle.daemonLease?.release();
 			return;
 		}
 		await closeLaunchedBrowser({ browser: handle.browser, userDataDir: handle.userDataDir });
@@ -552,6 +543,7 @@ async function disposeBrowserHandle(handle: BrowserHandle, opts: ReleaseBrowserO
 				logger.debug("Failed to disconnect from remote browser", { error: (err as Error).message });
 			}
 		}
+		await handle.daemonLease?.release();
 		return;
 	}
 	if (handle.browser.connected) {
@@ -568,9 +560,9 @@ async function disposeBrowserHandle(handle: BrowserHandle, opts: ReleaseBrowserO
 }
 
 /**
- * Attach to the project-shared broker-owned Chromium. Failures surface as
+ * Attach to the project-shared daemon-supervised Chromium. Failures surface as
  * `ToolError` — a CLI-host process never silently falls back to a private
- * Chromium, so a broken broker cannot quietly recreate per-process launch
+ * Chromium, so a broken daemon cannot quietly recreate per-process launch
  * storms.
  */
 async function openSharedHeadlessHandle(
@@ -578,6 +570,7 @@ async function openSharedHeadlessHandle(
 	opts: AcquireBrowserOptions,
 ): Promise<PuppeteerBrowserHandle> {
 	const vp = opts.viewport ?? DEFAULT_VIEWPORT;
+	let lease: UnitLease | undefined;
 	try {
 		const shared = await ensureSharedBrowser({
 			projectDir: opts.cwd,
@@ -585,11 +578,7 @@ async function openSharedHeadlessHandle(
 			viewport: vp,
 			signal: opts.signal,
 		});
-		if (!shared) {
-			throw new ToolError(
-				`Shared browser daemon unavailable (broker start or Chromium launch failed); check \`omp ps\` for omp.browser.* daemons and ${getLogsDir()} for details`,
-			);
-		}
+		lease = shared.lease;
 		const puppeteer = await loadPuppeteer();
 		const browser = await connectPuppeteer(puppeteer, {
 			browserWSEndpoint: shared.wsEndpoint,
@@ -614,10 +603,12 @@ async function openSharedHeadlessHandle(
 			wsEndpoint: shared.wsEndpoint,
 			pid: shared.pid,
 			sharedDaemon: { name: shared.daemonName, projectDir: shared.projectDir },
+			daemonLease: shared.lease,
 			refCount: 0,
 			stealth: { browserSession: null, override: null },
 		};
 	} catch (err) {
+		await lease?.release();
 		if (err instanceof ToolAbortError || err instanceof ToolError) throw err;
 		if (opts.signal?.aborted) throw new ToolAbortError("Browser open aborted");
 		throw new ToolError(`Shared browser attach failed: ${err instanceof Error ? err.message : String(err)}`);

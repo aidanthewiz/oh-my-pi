@@ -212,7 +212,7 @@ describe("session-owned extension MCP", () => {
 		await manager.reconnectServer("minions", { manual: true });
 		expect(manager.getTools()).toEqual([]);
 		const result = await manager.callTool("minions", "get_task", {}, { retry: "read" });
-		expect(result.structuredContent?.tenant).toBe("tenant-a");
+		expect(result.structuredContent).toMatchObject({ tenant: "tenant-a" });
 		expect(calls).toHaveLength(1);
 	});
 
@@ -220,7 +220,7 @@ describe("session-owned extension MCP", () => {
 		const f = await fixture();
 		await f.manager.getConnection("minions")!.transport.close();
 		const result = await f.manager.callTool("minions", "create_task", {}, { retry: "never" });
-		expect(result.structuredContent?.tenant).toBe("tenant-a");
+		expect(result.structuredContent).toMatchObject({ tenant: "tenant-a" });
 		expect(f.calls).toEqual([{ name: "create_task", arguments: {} }]);
 		expect(f.manager.getTools()).toEqual([]);
 	});
@@ -235,7 +235,7 @@ describe("session-owned extension MCP", () => {
 		expect(f.calls.map(call => call.name)).toEqual(["create_task", "create_task"]);
 		f.failNext();
 		const read = await f.manager.callTool("minions", "get_task", {}, { retry: "read" });
-		expect(read.structuredContent?.tenant).toBe("tenant-a");
+		expect(read.structuredContent).toMatchObject({ tenant: "tenant-a" });
 		expect(f.calls.map(call => call.name)).toEqual(["create_task", "create_task", "get_task", "get_task"]);
 	});
 
@@ -244,7 +244,7 @@ describe("session-owned extension MCP", () => {
 		for (const name of ["get_task", "idempotent_task"]) {
 			f.failNext();
 			const result = await f.manager.callTool("minions", name);
-			expect(result.structuredContent?.tenant).toBe("tenant-a");
+			expect(result.structuredContent).toMatchObject({ tenant: "tenant-a" });
 			f.failNext();
 			await expect(f.manager.callTool("minions", name, {}, { retry: "never" })).rejects.toThrow();
 		}
@@ -307,7 +307,7 @@ describe("session-owned extension MCP", () => {
 		const result = await first
 			.extensionRunner!.createContext()
 			.mcp!.callTool("minions", "get_task", {}, { retry: "read" });
-		expect(result.structuredContent?.tenant).toBe("tenant-a");
+		expect(result.structuredContent).toMatchObject({ tenant: "tenant-a" });
 		expect(b.calls).toEqual([]);
 		const disabled = await session();
 		await expect(disabled.extensionRunner!.createContext().mcp!.callTool("minions", "create_task")).rejects.toThrow(
@@ -669,10 +669,12 @@ describe("session-owned extension MCP", () => {
 			.extensionRunner!.createContext()
 			.mcp!.callTool("minions", "get_task", {}, { retry: "read" });
 		expect(result.isError).toBe(true);
-		expect(result.structuredContent?.error).toMatchObject({
-			code: -32042,
-			failure: "json_rpc",
-			traceId: "synthetic-trace",
+		expect(result.structuredContent).toMatchObject({
+			error: {
+				code: -32042,
+				failure: "json_rpc",
+				traceId: "synthetic-trace",
+			},
 		});
 		expect(JSON.stringify(result)).not.toContain("secret-value");
 		expect(f.calls).toHaveLength(1);
@@ -755,7 +757,7 @@ describe("MCP authentication replay contracts", () => {
 			);
 			if (scenario.read) {
 				expect(attempt.result.isError).not.toBe(true);
-				expect(attempt.result.structuredContent?.state).toBe("synthetic-state");
+				expect(attempt.result.structuredContent).toMatchObject({ state: "synthetic-state" });
 				expect(attempts).toBe(2);
 				expect(reconnects).toBe(1);
 				expect(effects).toEqual([]);
@@ -764,7 +766,7 @@ describe("MCP authentication replay contracts", () => {
 				expect(attempts).toBe(1);
 				expect(reconnects).toBe(0);
 				expect(attempt.result.isError).toBe(true);
-				expect(attempt.result.structuredContent?.recordId).toBe("synthetic-record");
+				expect(attempt.result.structuredContent).toMatchObject({ recordId: "synthetic-record" });
 				expect(attempt.result._meta?.receipt).toBe("partial-receipt");
 				expect(attempt.result._meta?.["mcp/www_authenticate"]).toEqual(['Bearer realm="synthetic"']);
 			}

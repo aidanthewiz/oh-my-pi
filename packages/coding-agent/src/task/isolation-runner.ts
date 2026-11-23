@@ -178,7 +178,14 @@ export function makeIsolationCommitMessage(session: ToolSession): BuildCommitMes
 		const settings = session.settings;
 		const sessionId = session.getSessionId?.() ?? undefined;
 		return async (diff: string) =>
-			generateCommitMessage(diff, registry, settings, sessionId, session.getActiveModel?.()?.provider);
+			generateCommitMessage(
+				diff,
+				registry,
+				settings,
+				sessionId,
+				session.getActiveModel?.()?.provider,
+				session.sessionManager,
+			);
 	};
 }
 
@@ -932,7 +939,6 @@ async function applyRootPatch(
 				tool: "task",
 				before: before.text,
 				after: after.text,
-				beforeMtimeMs: before.mtimeMs,
 				agent: { agent: journal.agent, parent: journal.parent },
 			});
 		}

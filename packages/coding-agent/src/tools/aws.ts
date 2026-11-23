@@ -1708,6 +1708,7 @@ export class AwsTool implements AgentTool<typeof awsSchema, AwsToolDetails | Aws
 			credentialsFile,
 			prepared.sessionManagerBin,
 		);
+		let sink: OutputSink | undefined;
 		try {
 			signal?.throwIfAborted();
 			if (sessionId !== this.#getSessionId()) {
@@ -1800,8 +1801,7 @@ export class AwsTool implements AgentTool<typeof awsSchema, AwsToolDetails | Aws
 					"AUTH_REQUIRED: AWS identity changed after approval; review and retry the operation",
 				);
 			}
-			const allocation = await this.session.allocateOutputArtifact?.("aws");
-			const sink = new OutputSink({ artifactPath: allocation?.path, artifactId: allocation?.id });
+			sink = new OutputSink({ allocateArtifact: this.session.allocateOutputArtifact });
 			if (sessionId !== this.#getSessionId()) {
 				throw new AwsToolError("AUTH_REQUIRED: session changed before AWS execution");
 			}
@@ -1906,7 +1906,11 @@ export class AwsTool implements AgentTool<typeof awsSchema, AwsToolDetails | Aws
 		} finally {
 			this.#approved.delete(toolCallId);
 			this.#prepared.delete(toolCallId);
-			await fs.rm(prepared.tempDir, { force: true, recursive: true });
+			try {
+				await sink?.dispose();
+			} finally {
+				await fs.rm(prepared.tempDir, { force: true, recursive: true });
+			}
 		}
 	}
 }

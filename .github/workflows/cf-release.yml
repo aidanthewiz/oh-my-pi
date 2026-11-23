@@ -274,7 +274,7 @@ jobs:
       - name: Require Apple Foundation Models toolchain
         if: matrix.target == 'darwin-arm64'
         run: |
-          toolchain="$(/bin/sh crates/pi-natives/src/applefm/build-bridge.sh detect)"
+          toolchain="$(/bin/sh crates/natives/src/applefm/build-bridge.sh detect)"
           if [ -z "$toolchain" ]; then
             echo "::error::Darwin ARM64 release requires Swift 6.4+ and macOS 27 SDK; refusing an addon without the Apple Foundation Models bridge"
             exit 1

@@ -1,11 +1,11 @@
 import { dlopen, FFIType, ptr } from "bun:ffi";
 import { readFileSync, readdirSync } from "node:fs";
-import { createRequire } from "node:module";
 import { connect, type NetConnectOpts, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { Readable } from "node:stream";
 import { Process, ProcessStatus } from "@oh-my-pi/pi-natives";
+import { nativeAddonPathFor } from "@oh-my-pi/pi-natives/loader-state";
 import type { Subprocess } from "bun";
 import { TempDir } from "./temp";
 
@@ -33,9 +33,7 @@ export interface OwnedInputCommand {
 
 function loadedNativeBindingPath(): string | undefined {
 	try {
-		for (const [filename, entry] of Object.entries(createRequire(import.meta.url).cache)) {
-			if (filename.endsWith(".node") && entry?.exports?.Process === Process) return filename;
-		}
+		return nativeAddonPathFor("Process", Process);
 	} catch {}
 	return undefined;
 }
@@ -249,7 +247,6 @@ function guardianScript(bindingPath: string, startupDirectory: string): string {
 	return `
 import { dlopen, FFIType, ptr } from "bun:ffi";
 import { closeSync, readdirSync, rmSync } from "node:fs";
-import { createRequire } from "node:module";
 import { connect } from "node:net";
 import { finished } from "node:stream/promises";
 
@@ -436,7 +433,9 @@ async function finish(exitCode, signalCode, output) {
 
 let NativeProcess;
 try {
-	({ Process: NativeProcess } = createRequire(import.meta.url)(${JSON.stringify(bindingPath)}));
+	const nativeModule = { exports: {} };
+	process.dlopen(nativeModule, ${JSON.stringify(bindingPath)});
+	({ Process: NativeProcess } = nativeModule.exports);
 	root = NativeProcess.fromPid(process.pid);
 	if (!root || root.groupId() !== process.pid) throw new Error("PTREE_OWNED_INPUT_UNSUPPORTED");
 	for (const candidate of process.platform === "darwin" ? ["/usr/lib/libSystem.B.dylib"] : ["libc.so.6", "libc.so"]) {

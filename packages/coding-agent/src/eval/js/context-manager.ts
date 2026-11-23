@@ -1,8 +1,11 @@
+import * as fs from "node:fs";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import { MessageChannel, type MessagePort, receiveMessageOnPort } from "node:worker_threads";
 import { withoutCleanupOwnedToolCall } from "@oh-my-pi/pi-agent-core/agent-loop";
 import { filterChildShellEnv, isRecord, logger, Snowflake, workerHostEntry } from "@oh-my-pi/pi-utils";
 import { createWorkerHandle, createWorkerSubprocess, resolveWorkerSpawnCmd } from "../../subprocess/worker-client";
+import { registerOnBoard } from "../../daemon/client";
 import type { ToolSession } from "../../tools";
 import { ToolAbortError } from "../../tools/tool-errors";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
@@ -42,6 +45,7 @@ export { rewriteImports, wrapCode } from "./shared/rewrite-imports";
 
 export interface VmRunState {
 	signal?: AbortSignal;
+	parentToolCallId?: string;
 	onText?: (chunk: string) => void;
 	onDisplay?: (output: EvalDisplayOutput) => void;
 	/** Shows the user `out://` replies of the run's bridged tool calls; absent, those calls are refused. */
@@ -64,7 +68,8 @@ export interface JsEvalWorkerHandle {
 
 /** Startup dependencies overridden by tests to exercise process-to-Worker recovery. */
 export interface JsEvalWorkerFactories {
-	spawnProcess(cwd: string): JsEvalWorkerHandle;
+	/** `sessionId` labels the process on the daemon board; `cwd` scopes its environment filter. */
+	spawnProcess(cwd: string, sessionId?: string): JsEvalWorkerHandle;
 	spawnWorker(cwd: string): JsEvalWorkerHandle;
 }
 
@@ -243,6 +248,7 @@ export async function invokeJsTool(
 	options: {
 		sessionKey: string;
 		session: ToolSession;
+		parentToolCallId?: string;
 		signal?: AbortSignal;
 	},
 ): Promise<EvalToolInvokeResult | { ok: true; tools: EvalToolDescriptor[]; missing: string[] }> {
@@ -254,7 +260,7 @@ export async function invokeJsTool(
 	let envelope: unknown;
 	const pending: PendingRun = {
 		runId,
-		runState: { signal: options.signal },
+		runState: { signal: options.signal, parentToolCallId: options.parentToolCallId },
 		toolSession: options.session,
 		resolve,
 		reject,
@@ -404,6 +410,11 @@ export async function runIfSnapshotMatches(options: {
 	}
 }
 
+/** Whether `sessionKey` has a retained, live JS worker. */
+export function hasLiveVmContext(sessionKey: string): boolean {
+	return sessions.get(sessionKey)?.state === "alive";
+}
+
 export async function resetVmContext(sessionKey: string): Promise<void> {
 	lostSessions.delete(sessionKey);
 	const session = sessions.get(sessionKey) ?? (await startingSessions.get(sessionKey)?.promise.catch(() => undefined));
@@ -457,7 +468,10 @@ export async function disposeVmContextsByOwner(ownerId: string, options?: Dispos
 		if (ownerIds.delete(ownerId) && ownerIds.size === 0) lostSessions.delete(sessionKey);
 	}
 	for (const session of toKill) {
-		if (sessions.get(session.sessionKey) === session) sessions.delete(session.sessionKey);
+		if (sessions.get(session.sessionKey) !== session) continue;
+		sessions.delete(session.sessionKey);
+		// The owner may return to this session id (switch back): its next cell must hear the VM state is gone.
+		lostSessions.set(session.sessionKey, new Set(session.ownerIds));
 	}
 	const started = await Promise.allSettled(startingToKill.map(starting => starting.promise));
 	for (const result of started) {
@@ -651,7 +665,7 @@ async function acquireSession(
 	const startup = (async (): Promise<JsSession> => {
 		// Attach the message listener before sending init. Both Bun Worker messages
 		// and subprocess IPC can arrive immediately after the evaluator loads.
-		const worker = spawnJsWorker(snapshot.cwd);
+		const worker = spawnJsWorker(snapshot.cwd, toolSession.getSessionId?.() ?? undefined);
 		const session: JsSession = {
 			sessionKey,
 			sessionId: snapshot.sessionId,
@@ -849,6 +863,7 @@ async function handleToolCall(session: JsSession, msg: Extract<WorkerOutbound, {
 		const value = await withoutCleanupOwnedToolCall(() =>
 			callSessionTool(msg.name, msg.args, {
 				session: pending.toolSession,
+				parentToolCallId: pending.runState.parentToolCallId,
 				signal: ctrl.signal,
 				cellTimeoutMs: pending.cellTimeoutMs,
 				identity: msg.identity,
@@ -1010,10 +1025,10 @@ async function raceWithTimeout<T>(promise: Promise<T>, timeoutMs: number, reason
 	}
 }
 
-function spawnJsWorker(cwd: string): JsEvalWorkerHandle {
+function spawnJsWorker(cwd: string, sessionId?: string): JsEvalWorkerHandle {
 	if (useWorkerThreadForTests) return workerFactories.spawnWorker(cwd);
 	try {
-		return workerFactories.spawnProcess(cwd);
+		return workerFactories.spawnProcess(cwd, sessionId);
 	} catch (error) {
 		// A worker thread remains isolated and can interrupt synchronous user code
 		// via terminate(), so it is the only safe recovery from subprocess spawn.
@@ -1024,16 +1039,23 @@ function spawnJsWorker(cwd: string): JsEvalWorkerHandle {
 	return workerFactories.spawnWorker(cwd);
 }
 
+const SOURCE_WORKER_ENTRY = new URL("./worker-entry.ts", import.meta.url);
+
+/**
+ * A bundled CLI has no source worker sibling; without a declared host its own
+ * module is the worker entry. Source checkouts keep their standalone worker.
+ */
+function bundledHostEntry(): string | null {
+	return fs.existsSync(fileURLToPath(SOURCE_WORKER_ENTRY)) ? null : fileURLToPath(import.meta.url);
+}
+
 function spawnBunWorker(cwd: string): JsEvalWorkerHandle {
 	try {
-		const options: WorkerOptions = {
-			type: "module",
-			env: filterChildShellEnv(Bun.env, cwd),
-		};
-		const hostEntry = workerHostEntry();
+		const options: WorkerOptions = { type: "module", env: filterChildShellEnv(Bun.env, cwd) };
+		const hostEntry = workerHostEntry() ?? bundledHostEntry();
 		const worker = hostEntry
 			? new Worker(hostEntry, { ...options, argv: ["__omp_worker_js_eval"] })
-			: new Worker(new URL("./worker-entry.ts", import.meta.url).href, options);
+			: new Worker(SOURCE_WORKER_ENTRY.href, options);
 		const channel = new MessageChannel();
 		const outbox: WorkerOutboxMessage = { type: "outbox", port: channel.port2 };
 		worker.postMessage(outbox, [channel.port2]);
@@ -1046,7 +1068,7 @@ function spawnBunWorker(cwd: string): JsEvalWorkerHandle {
 	}
 }
 
-function spawnJsProcess(cwd: string): JsEvalWorkerHandle {
+function spawnJsProcess(cwd: string, sessionId?: string): JsEvalWorkerHandle {
 	const spawned = createWorkerSubprocess<WorkerOutbound>({
 		spawnCommand: resolveWorkerSpawnCmd(JS_EVAL_PROCESS_ARG, { sameBuild: true }),
 		env: filterChildShellEnv(Bun.env, cwd),
@@ -1055,6 +1077,16 @@ function spawnJsProcess(cwd: string): JsEvalWorkerHandle {
 		reportCleanExit: true,
 		unref: false,
 	});
+	const pid = spawned.proc.pid;
+	const board = registerOnBoard({
+		kind: "external",
+		scope: { kind: "session", id: sessionId || `process-${process.pid}` },
+		key: `js-eval:${pid}`,
+		label: "js eval",
+		pid,
+	});
+	// Exit covers every teardown path: close, terminate, and crashes.
+	void spawned.proc.exited.finally(() => board.dispose());
 	const base = createWorkerHandle<WorkerInbound, WorkerOutbound>(spawned, message =>
 		safeSendIpc(spawned.proc, message, "js-eval"),
 	);

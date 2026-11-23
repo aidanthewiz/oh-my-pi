@@ -18,26 +18,26 @@ This document describes operator-visible behavior for session export, sharing, c
 
 ## Operation matrix
 
-| Operation                               | Entry path                   | Session mutation                              | Session file creation/switch                                                               | Output artifact                                                                     |
-| --------------------------------------- | ---------------------------- | --------------------------------------------- | ------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------- |
-| `/dump [all]`                           | Slash command (TUI/headless) | No                                            | No                                                                                         | Clipboard/command text plus best-effort temporary JSON sidecar; `all`: temp zip    |
-| `/export [--themes] [path]`             | Slash command (TUI/headless) | No                                            | No                                                                                         | HTML file                                                                           |
-| `--export <session.jsonl> [outputPath]` | CLI startup fast-path        | No runtime session mutation                   | No active session; reads target file                                                       | HTML file                                                                           |
-| `/share`                                | Slash command (TUI/headless) | No                                            | No                                                                                         | Encrypted share link (gist or share server); temp HTML only for TUI custom handlers |
-| `/new`                                  | Interactive slash command    | Yes (starts an empty conversation)            | Switches identity and materializes a new header in persistent mode                         | None                                                                                |
-| `/fresh`                                | Slash command (TUI/headless) | Yes (provider-facing in-memory id/state only) | No; keeps current session file/header                                                      | None                                                                                |
-| `/clear`                                | Interactive slash command    | Yes (clears live/model conversation context)  | Retains identity/file/history; a lazy session still follows the normal persistence gate    | Appends `reset_boundary`                                                            |
-| `/delete`                               | Interactive slash command    | Yes (starts an empty conversation)            | Attempts to delete the current persisted session and artifacts, then switches to a lazy successor (no empty file until content) | None                                                                                |
-| `/fork`                                 | Interactive slash command    | Normally yes; existing Tern pane specialization retains the parent | Forks in place, except the existing Tern pane flow | Copies artifacts according to the selected flow |
-| `/fork pane`, `/fork window`, `/fork tab` | Interactive slash command  | No (parent session retained)                   | Opens a child OMP process from the flushed current transcript in a multiplexer pane/group (tmux window, Zellij/Herdr/Orca tab, or CMUX workspace) | Child receives a separate forked session                                            |
-| `--fork <id\|path>`                     | CLI startup                  | Yes after session creation                    | Creates a new session fork from the selected source into current cwd/session dir           | Copies source artifacts recursively by default                                      |
-| `/seance [id\|path] [--model sel]`      | Interactive slash command    | No (active session and model unchanged)       | Forks the source transcript into a read-only consultant subagent under the current session  | None; the consultant reads the source's artifacts in place                          |
-| `/resume [id\|@claude\|@codex]`         | Interactive slash command    | Yes (active in-memory state replaced)         | Switches to a selected/matched session, or imports a selected foreign session              | None                                                                                |
-| `--resume`                              | CLI startup picker           | Yes after session creation                    | Opens selected existing session file (picker opens in current-folder scope; the global list is preloaded only for the empty-everything early exit and instant Tab switching) | None                |
-| `--resume <id\|path>`                   | CLI startup                  | Yes after session creation                    | Opens existing session; a missing recorded cwd may be re-rooted into the current directory | None                                                                                |
-| `/restart` | Interactive slash command | Yes (process relaunches) | Keeps configuration flags; restores a materialized session (`--restore`), otherwise starts fresh | None |
-| `--continue`                            | CLI startup                  | Yes after session creation                    | Opens terminal breadcrumb or most-recent session; creates new one if none exists           | None                                                                                |
-| `--restore [id\|path]` | CLI startup | Yes after session creation | Resumes the selected session and restores unfinished turns and eligible subagent runs; interactive only | None |
+| Operation | Entry path | Session mutation | Session file creation/switch | Output |
+| --- | --- | --- | --- | --- |
+| `/dump [all]` | Slash command | No | No | Clipboard/command text and best-effort temporary sidecar; `all` produces a temporary zip |
+| `/export [--themes] [path]` | Slash command | No | No | HTML |
+| `--export <session.jsonl> [outputPath]` | CLI fast path | No runtime session | Reads the named file | HTML |
+| `/share` | Slash command | No | No | Encrypted link; temporary HTML only for TUI custom handlers |
+| `/new` | Interactive | Starts an empty conversation | Switches identity; persistent mode materializes a header | None |
+| `/fresh` | Slash command | Provider-facing in-memory identity/state | Keeps current file/header | None |
+| `/clear` | Interactive | Clears live/model context | Retains identity/file/history; normal lazy persistence applies | `reset_boundary` |
+| `/delete` | Interactive | Starts an empty conversation | Deletes current persisted session/outputs where allowed, then selects a lazy successor | None |
+| `/fork` | Interactive | Normally changes active identity; existing Tern-pane specialization retains the parent | Forks in place except that pane flow | Owned outputs copied according to the selected flow |
+| `/fork pane`, `/fork window`, `/fork tab` | Interactive | Parent retained | Child CLI starts from the flushed transcript in a supported multiplexer | Separate forked child session |
+| `--fork <id\|path>` | CLI startup | New fork | Forks into current cwd/session directory | Copies source session outputs by default |
+| `/seance [id\|path] [--model sel]` | Interactive | Active session/model unchanged | Read-only consultant under the current session | Reads source outputs in place |
+| `/resume [id\|@claude\|@codex]` | Interactive | Replaces active state | Opens or imports the selected session | None |
+| `--resume` | CLI picker | Opens selection | Starts in current-folder scope; global data is preloaded for early-empty handling and Tab switching | None |
+| `--resume <id\|path>` | CLI startup | Opens existing session | Missing cwd may be re-rooted; protocol modes open in place except for removed worktrees | None |
+| `/restart` | Interactive | Relaunches process | Keeps configuration flags; restores materialized state or starts fresh | None |
+| `--continue` | CLI startup | Opens recent session | Uses terminal breadcrumb/recent session, or creates a new one | None |
+| `--restore [id\|path]` | CLI startup | Resumes session and eligible unfinished work | Interactive restore of turns and subagent runs | None |
 
 ## Export and dump
 
@@ -434,7 +434,7 @@ The original bare `/fork` uses `AgentSession.fork()`:
 - It throws `SessionBusyError` while `AgentSession.isBusyForSnapshot` is true (a response is streaming, or user bash/eval, compaction, handoff, or retry work is running). The check runs before `session_before_branch`, again after it, and once more after pending bash output and session writes flush. That last check comes before anything of the old session is discarded (pending next-turn messages, async jobs, the auto-learn capture), so a refused fork leaves the session as it was. A prompt admitted during the remaining drain awaits is dropped by the prompt-generation bump at the cut, as for `branch()`. `/btw` branches use the same predicate.
 - When `entryId` sits inside an assistant tool-call batch (the assistant message, or a tool result answering it), the cut extends through the batch's recorded tool results, following the tree from `entryId` and stepping over lone non-message entries between results. A fork therefore never ends on tool calls whose results exist in the source session; calls that never got a result stay as they are.
 - The transition is the one `AgentSession.branch()` uses, cut at the resolved entry rather than before it: `session_before_branch` with reason `"fork"` (cancellable; `entryId` is the last kept entry, not a dropped one as for `branch()`), `SessionManager.createBranchedSession(leafId, { copyArtifacts: true })`, rebuilt agent messages, then `session_branch` with reason `"fork"`.
-- The new file keeps the root-to-entry path including the resolved entry, carries labels for kept entries, keeps the title, and sets `parentSession` to the previous session file. The whole artifact directory is copied in the background (including artifacts only cited by dropped entries), and the new session's artifact manager waits for the copy before allocating ids or resolving `artifact://`, so kept `artifact://N` references still resolve and new artifacts get fresh ids. Unlike the whole-session fork, the provider prompt-cache key is not inherited (same as `branch()`).
+- The new file keeps the root-to-entry path including the resolved entry, carries labels for kept entries, keeps the title, and sets `parentSession` to the previous session file. The whole artifact directory is copied in the background (including artifacts only cited by dropped entries), and the new session's artifact manager waits for the copy before allocating ids or resolving spills, so kept `local://N.log` references still resolve and new spills get fresh ids. Unlike the whole-session fork, the provider prompt-cache key is not inherited (same as `branch()`).
 - Works in non-persistent mode (in-memory replacement), unlike the whole-session fork.
 - `AgentSession.fork(undefined, { requireIdle: true })` applies the same idle rule to the whole-session fork (before `session_before_switch` and again after the flushes). RPC `fork` passes it for both variants, so both reject with `code: "session_busy"`. Interactive `/fork` does not, so it can still carry a running bash command into the new session.
 
@@ -463,7 +463,7 @@ Use `--prompt-cache-key <key>` to pin the provider prompt-cache identity explici
 
 File-backed sources resolve to their canonical journal path before forking. A journal symlink uses the target journal's artifact directory, not the link's directory.
 
-Each consult forks only the source transcript, into `<current session artifacts>/<ConsultId>.jsonl`, with `seanceSource` in its header. Artifacts are not copied: the consultant's `history://`, `artifact://`, and `agent://` read the source's artifacts directory in place, and its own new artifact ids are allocated past the source's so inherited `artifact://<n>` references keep naming the source artifact. Consulting the current session repeatedly adds one transcript per consult, not a copy of the tree.
+Each consult forks only the source transcript into `<current session artifacts>/<ConsultId>.jsonl`, with `seanceSource` in its header. It does not copy or rewrite the source's output tree. Source-bound `history://` and `agent://` reads remain confined to that source. Current spills use the configured `local://` root; the retired `artifact://` handler and source-ID reservation are not restored. Historical link text remains in the transcript without an automatic compatibility remap.
 
 Source-bound agent reads do not expose the host registry's progress, known IDs, or supersession metadata. A selection from an earlier session is discarded if its initiating session changes before launch.
 
@@ -517,6 +517,8 @@ Id/filename-prefix match behavior (local or global):
 - If the matched session's recorded directory no longer exists, CLI asks `Session's directory no longer exists (...). Move (re-root) it into the current directory? [Y/n]`.
    - On yes (default), `SessionManager.openRelocated(session.path, session.cwd, cwd, sessionDir)` re-roots the existing session under the session ownership and publication fences. A live writer refuses the move; the runtime does not duplicate or silently replace its transcript.
    - On no, startup is cancelled. In non-TTY mode, startup fails with an error directing the user to run interactively.
+   - Under `--mode rpc`, `--mode rpc-ui` and `--mode acp` no question is asked, because the protocol owns standard input and standard output: the session opens where it is stored, with the launch directory as its working directory, as a path-valued resume does.
+   - A session recorded in a since-removed worktree of the launch checkout's repository is moved into the launch directory without a question, in every mode.
 - If the recorded directory still exists, the matched session is opened directly. Startup later changes the process/project scope to the resumed session's cwd and reloads cwd-scoped settings and plugin caches. It is not implicitly forked.
 
 Path-valued resume opens directly rather than using the missing-directory move

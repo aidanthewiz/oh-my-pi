@@ -1,20 +1,20 @@
 import { afterEach, beforeEach, describe, expect, it, spyOn, vi } from "bun:test";
 import * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
-import { TempDir } from "@oh-my-pi/pi-utils";
-import { VERSION } from "@oh-my-pi/pi-utils/dirs";
-import { findFreeCdpPort } from "@oh-my-pi/pi-coding-agent/tools/browser/attach";
 import { RelayBridge, type RelaySocket } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/bridge";
 import {
 	extensionIdForPath,
 	installedRelayExtensionVersion,
 	relayExtensionFiles,
-	unpackedExtensionId,
 	writeRelayExtension,
 } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/extension-files";
-import type { RelayToExtMessage, TabSnapshot } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/protocol";
-import { type RelayServer, startRelayServer } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/server";
-import * as relayToken from "@oh-my-pi/pi-coding-agent/tools/browser/relay/token";
+import type {
+	RelayExtensionStamp,
+	RelayToExtMessage,
+	TabSnapshot,
+} from "@oh-my-pi/pi-coding-agent/tools/browser/relay/protocol";
+import { TempDir } from "@oh-my-pi/pi-utils";
+import { VERSION } from "@oh-my-pi/pi-utils/dirs";
 
 const OLD = "18.6.1";
 const EXTENSION_ID = "abcdefghijklmnopabcdefghijklmnop";
@@ -51,6 +51,7 @@ function tab(tabId: number): TabSnapshot {
 interface Hello {
 	instanceId?: string;
 	ompVersion?: string;
+	ompBuild?: string;
 	reloadProtocol?: number;
 	extensionId?: string;
 	attachedTabIds?: number[];
@@ -60,6 +61,7 @@ function hello(bridge: RelayBridge, socket: FakeExtSocket, opts: Hello = {}): vo
 	const {
 		instanceId = "chrome",
 		ompVersion = OLD,
+		ompBuild,
 		reloadProtocol = 1,
 		extensionId = EXTENSION_ID,
 		attachedTabIds = [],
@@ -74,6 +76,7 @@ function hello(bridge: RelayBridge, socket: FakeExtSocket, opts: Hello = {}): vo
 			browserVersion: "Chrome/155.0.0.0",
 			discardedTabsProtocol: 1,
 			ompVersion,
+			ompBuild,
 			reloadProtocol,
 			tabs: [tab(1)],
 			attachedTabIds,
@@ -82,7 +85,11 @@ function hello(bridge: RelayBridge, socket: FakeExtSocket, opts: Hello = {}): vo
 }
 
 /** A bridge whose updater records the ids it was asked about and resolves when the test says. */
-function bridgeWithUpdater(): { bridge: RelayBridge; calls: string[]; finish: (updated: boolean) => Promise<void> } {
+function bridgeWithUpdater(): {
+	bridge: RelayBridge;
+	calls: string[];
+	finish: (updated: boolean) => Promise<void>;
+} {
 	const calls: string[] = [];
 	const pending: Array<(updated: boolean) => void> = [];
 	const bridge = new RelayBridge({
@@ -130,7 +137,10 @@ describe("relay extension self-update decisions", () => {
 		const { bridge, finish } = bridgeWithUpdater();
 		const reloading = new FakeExtSocket();
 		hello(bridge, reloading, { instanceId: "chrome" });
-		hello(bridge, new FakeExtSocket(), { instanceId: "edge", ompVersion: VERSION });
+		hello(bridge, new FakeExtSocket(), {
+			instanceId: "edge",
+			ompVersion: VERSION,
+		});
 		await finish(true);
 		expect(reloading.reloads).toBe(1);
 		expect(bridge.ready).toBe(true);
@@ -229,7 +239,11 @@ describe("relay extension self-update decisions", () => {
 			hello(bridge, socket);
 			bridge.cdpMessage(
 				conn,
-				JSON.stringify({ id: 1, method: "Target.createTarget", params: { background: true } }),
+				JSON.stringify({
+					id: 1,
+					method: "Target.createTarget",
+					params: { background: true },
+				}),
 			);
 			await flushMicrotasks();
 			const create = socket.messages.find(msg => msg.t === "rpc" && msg.op === "createTab") as { id: number };
@@ -241,7 +255,12 @@ describe("relay extension self-update decisions", () => {
 			expect(calls).toEqual([]);
 			bridge.extMessage(
 				socket,
-				JSON.stringify({ t: "rpcResult", id: create.id, ok: true, result: { tab: tab(2) } }),
+				JSON.stringify({
+					t: "rpcResult",
+					id: create.id,
+					ok: true,
+					result: { tab: tab(2) },
+				}),
 			);
 			await flushMicrotasks();
 			const close = socket.messages.find(msg => msg.t === "rpc" && msg.op === "removeTab") as {
@@ -295,14 +314,29 @@ describe("relay extension self-update decisions", () => {
 		const conn = bridge.cdpConnected(FAKE_CDP);
 		const socket = new FakeExtSocket();
 		hello(bridge, socket);
-		bridge.cdpMessage(conn, JSON.stringify({ id: 1, method: "Target.createTarget", params: { background: true } }));
+		bridge.cdpMessage(
+			conn,
+			JSON.stringify({
+				id: 1,
+				method: "Target.createTarget",
+				params: { background: true },
+			}),
+		);
 		await flushMicrotasks();
 		const create = socket.messages.find(msg => msg.t === "rpc" && msg.op === "createTab") as { id: number };
 		bridge.cdpClosed(conn);
 		await finish(true);
 		// A reload now would cut the create off, and the reloaded extension's new browser session retires its tab id.
 		expect(calls).toEqual([]);
-		bridge.extMessage(socket, JSON.stringify({ t: "rpcResult", id: create.id, ok: true, result: { tab: tab(2) } }));
+		bridge.extMessage(
+			socket,
+			JSON.stringify({
+				t: "rpcResult",
+				id: create.id,
+				ok: true,
+				result: { tab: tab(2) },
+			}),
+		);
 		await flushMicrotasks();
 		const close = socket.messages.find(msg => msg.t === "rpc" && msg.op === "removeTab") as {
 			id: number;
@@ -325,11 +359,23 @@ describe("relay extension self-update decisions", () => {
 		const code = new Bun.CryptoHasher("sha256").update("chrome").digest("base64url").slice(0, 8);
 		bridge.cdpMessage(
 			conn,
-			JSON.stringify({ id: 1, method: "Target.closeTarget", params: { targetId: `PAGE${code}.1` } }),
+			JSON.stringify({
+				id: 1,
+				method: "Target.closeTarget",
+				params: { targetId: `PAGE${code}.1` },
+			}),
 		);
 		await flushMicrotasks();
 		const refused = socket.messages.find(msg => msg.t === "rpc" && msg.op === "removeTab") as { id: number };
-		bridge.extMessage(socket, JSON.stringify({ t: "rpcResult", id: refused.id, ok: false, error: "dragging" }));
+		bridge.extMessage(
+			socket,
+			JSON.stringify({
+				t: "rpcResult",
+				id: refused.id,
+				ok: false,
+				error: "dragging",
+			}),
+		);
 		await flushMicrotasks();
 		bridge.cdpClosed(conn);
 		await finish(true);
@@ -368,6 +414,82 @@ describe("relay extension self-update decisions", () => {
 	});
 });
 
+describe("reloading into the installed folder", () => {
+	/** A bridge whose extension folder holds `installed.stamp`, and that must never rewrite a folder itself. */
+	function bridgeWithFolder(stamp: RelayExtensionStamp | null): {
+		bridge: RelayBridge;
+		installed: { stamp: RelayExtensionStamp | null };
+		writes: string[];
+	} {
+		const installed = { stamp };
+		const writes: string[] = [];
+		const bridge = new RelayBridge({
+			installedStamp: () => Promise.resolve(installed.stamp),
+			updateExtension: extensionId => {
+				writes.push(extensionId);
+				return Promise.resolve(true);
+			},
+		});
+		return { bridge, installed, writes };
+	}
+
+	it("reloads an extension running another build of this omp version, once per running build", async () => {
+		const { bridge, writes } = bridgeWithFolder({
+			ompVersion: VERSION,
+			ompBuild: "rebuilt",
+		});
+		const socket = new FakeExtSocket();
+		hello(bridge, socket, { ompVersion: VERSION, ompBuild: "stale" });
+		await flushMicrotasks();
+		expect(socket.reloads).toBe(1);
+		expect(socket.closed).toBe(true);
+		// Chrome kept the old service worker: the same build is back, and asking again would loop.
+		const back = new FakeExtSocket();
+		hello(bridge, back, { ompVersion: VERSION, ompBuild: "stale" });
+		await flushMicrotasks();
+		expect(back.reloads).toBe(0);
+		expect(writes).toEqual([]);
+	});
+
+	it("leaves an extension running its folder's build alone until a recheck finds the folder changed", async () => {
+		const { bridge, installed } = bridgeWithFolder({
+			ompVersion: VERSION,
+			ompBuild: "current",
+		});
+		const socket = new FakeExtSocket();
+		hello(bridge, socket, { ompVersion: VERSION, ompBuild: "current" });
+		await flushMicrotasks();
+		expect(socket.reloads).toBe(0);
+		installed.stamp = { ompVersion: VERSION, ompBuild: "rebuilt" };
+		bridge.recheckExtensions();
+		await flushMicrotasks();
+		expect(socket.reloads).toBe(1);
+	});
+
+	it("waits for the last CDP client to leave before reloading", async () => {
+		const { bridge } = bridgeWithFolder({
+			ompVersion: VERSION,
+			ompBuild: "rebuilt",
+		});
+		const conn = bridge.cdpConnected(FAKE_CDP);
+		const socket = new FakeExtSocket();
+		hello(bridge, socket, { ompVersion: VERSION, ompBuild: "stale" });
+		await flushMicrotasks();
+		expect(socket.reloads).toBe(0);
+		bridge.cdpClosed(conn);
+		await flushMicrotasks();
+		expect(socket.reloads).toBe(1);
+	});
+
+	it("never reloads an extension whose folder omp does not manage", async () => {
+		const { bridge } = bridgeWithFolder(null);
+		const socket = new FakeExtSocket();
+		hello(bridge, socket, { ompVersion: VERSION, ompBuild: "anything" });
+		await flushMicrotasks();
+		expect(socket.reloads).toBe(0);
+	});
+});
+
 describe("Chrome's unpacked extension id", () => {
 	// Chromium's own fixtures: components/crx_file/id_util_unittest.cc, GenerateIDForPath.
 	it("matches Chromium's id for a path on macOS and Linux", () => {
@@ -381,127 +503,86 @@ describe("Chrome's unpacked extension id", () => {
 	});
 });
 
-describe("relay extension self-update on a real relay", () => {
+describe("writing the omp extension", () => {
 	let home: TempDir;
-	let relay: RelayServer | undefined;
-	const sockets: WebSocket[] = [];
-	const token = "synthetic-relay-update-token";
 
 	beforeEach(async () => {
 		home = await TempDir.create("@omp-relay-self-update-");
-		spyOn(relayToken, "ensureBrowserRelayToken").mockResolvedValue(token);
 	});
 
 	afterEach(async () => {
-		for (const socket of sockets.splice(0)) socket.close();
-		relay?.stop();
-		relay = undefined;
 		await home.remove();
 		vi.restoreAllMocks();
 	});
 
-	/** Start a relay keeping `dir` current; `settled` resolves after `count` reload requests or stopped updates. */
-	async function startRelay(
-		dir: string,
-		count = 1,
-	): Promise<{ port: number; events: string[]; settled: Promise<void> }> {
-		const port = await findFreeCdpPort();
-		const events: string[] = [];
-		const settled = Promise.withResolvers<void>();
-		let outcomes = 0;
-		relay = startRelayServer({
-			port,
-			token,
-			group: false,
-			extensionDir: dir,
-			log: message => {
-				events.push(message);
-				if (message !== "extension reloading into update" && message !== "extension update stopped") return;
-				if (++outcomes === count) settled.resolve();
-			},
-		});
-		return { port, events, settled: settled.promise };
-	}
-
-	/** Dial the relay as the extension Chrome loaded from `loadedFrom` in browser `instanceId`, and say hello. */
-	async function dialExtension(port: number, loadedFrom: string, instanceId = "chrome"): Promise<void> {
-		const socket = new WebSocket(`ws://127.0.0.1:${port}/ext?token=${token}`, {
-			headers: { Origin: `chrome-extension://${await unpackedExtensionId(loadedFrom)}` },
-		});
-		sockets.push(socket);
-		const opened = Promise.withResolvers<void>();
-		socket.addEventListener("open", () => opened.resolve(), { once: true });
-		await opened.promise;
-		socket.send(
-			JSON.stringify({
-				t: "hello",
-				instanceId,
-				userAgent: "test",
-				browserVersion: "Chrome/155.0.0.0",
-				discardedTabsProtocol: 1,
-				ompVersion: OLD,
-				reloadProtocol: 1,
-				tabs: [],
-				attachedTabIds: [],
-			}),
-		);
-	}
-
 	async function expectCurrentFiles(dir: string): Promise<void> {
-		const files = relayExtensionFiles(VERSION);
+		const files = await relayExtensionFiles(VERSION);
 		for (const [name, content] of Object.entries(files)) {
-			const expected =
-				name === "background.js"
-					? content.replace(JSON.stringify("__COREFORGE_BROWSER_RELAY_TOKEN__"), JSON.stringify(token))
-					: content;
-			expect(await Bun.file(`${dir}/${name}`).text()).toBe(expected);
+			const installed = await Bun.file(`${dir}/${name}`).bytes();
+			expect(installed).toEqual(
+				typeof content === "string" ? new TextEncoder().encode(content) : new Uint8Array(content),
+			);
 			if (process.platform !== "win32") expect((await fs.stat(`${dir}/${name}`)).mode & 0o777).toBe(0o600);
 		}
 		if (process.platform !== "win32") expect((await fs.stat(dir)).mode & 0o777).toBe(0o700);
 	}
 
-	it("rewrites the copy Chrome loaded from the install directory to this omp's files and asks for a reload", async () => {
+	it("installs the side panel, worker, content scripts, and icons under Chrome's expected paths", async () => {
 		const dir = home.join("extension");
-		await writeRelayExtension(dir, OLD);
-		const { port, events, settled } = await startRelay(dir);
-		await dialExtension(port, dir);
-		await settled;
-		expect(events).toContain("extension reloading into update");
-		await expectCurrentFiles(dir);
+		expect(await writeRelayExtension(dir, VERSION)).toBe(true);
+
+		const files = await relayExtensionFiles(VERSION);
+		const text = (name: string): string => {
+			const content = files[name];
+			if (typeof content !== "string") throw new Error(`${name} should be a text asset`);
+			return content;
+		};
+		// What Chrome loads by name: the manifest's worker, side panel and icons; the files the worker injects or opens
+		// (content scripts, the offscreen page); and the scripts and styles those pages pull in.
+		const manifest: {
+			background: { service_worker: string };
+			side_panel: { default_path: string };
+			icons: Record<string, string>;
+			action: { default_icon: Record<string, string> };
+		} = JSON.parse(text("manifest.json"));
+		const worker = manifest.background.service_worker;
+		const needed = new Set([
+			"manifest.json",
+			worker,
+			manifest.side_panel.default_path,
+			...Object.values(manifest.icons),
+			...Object.values(manifest.action.default_icon),
+			...Array.from(text(worker).matchAll(/"([\w/-]+\.(?:css|html|js|png))"/g), match => match[1]!),
+		]);
+		for (const page of [...needed].filter(name => name.endsWith(".html"))) {
+			for (const match of text(page).matchAll(/\b(?:src|href)="([^"]+)"/g)) needed.add(match[1]!);
+		}
+		expect([...needed].filter(name => !Object.hasOwn(files, name))).toEqual([]);
+
+		// Every shipped file lands at its own path with the content the installing omp stamped.
+		for (const [name, expected] of Object.entries(files)) {
+			const installed = Buffer.from(await Bun.file(home.join(`extension/${name}`)).arrayBuffer());
+			if (typeof expected === "string") expect(installed.toString("utf8")).toBe(expected);
+			else expect(installed).toEqual(Buffer.from(expected));
+		}
+
+		for (const name of new Set(Object.values(manifest.icons))) {
+			const icon = Buffer.from(await Bun.file(home.join(`extension/${name}`)).arrayBuffer());
+			expect(icon.subarray(0, 8).toString("hex")).toBe("89504e470d0a1a0a");
+		}
 	});
 
-	it("reloads every Chrome profile that loaded the install directory, writing its files one at a time", async () => {
+	it("repairs a corrupted nested icon even when the installed version matches", async () => {
 		const dir = home.join("extension");
-		await writeRelayExtension(dir, OLD);
-		const { port, events, settled } = await startRelay(dir, 3);
-		await Promise.all(["work", "home", "test"].map(profile => dialExtension(port, dir, profile)));
-		await settled;
-		expect(events.filter(event => event === "extension reloading into update")).toHaveLength(3);
-		expect(events).not.toContain("extension update stopped");
-		await expectCurrentFiles(dir);
-	});
+		await writeRelayExtension(dir, VERSION);
+		const manifest = (await Bun.file(`${dir}/manifest.json`).json()) as { icons: Record<string, string> };
+		const icon = `${dir}/${manifest.icons["32"]}`;
+		const original = await Bun.file(icon).bytes();
+		await Bun.write(icon, original.with(0, 0));
 
-	it("leaves an extension loaded from another directory alone", async () => {
-		const dir = home.join("extension");
-		const elsewhere = home.join("dev-build");
-		await writeRelayExtension(dir, OLD);
-		await writeRelayExtension(elsewhere, OLD);
-		const { port, events, settled } = await startRelay(dir);
-		await dialExtension(port, elsewhere);
-		await settled;
-		expect(events).toContain("extension update stopped");
-		expect(await installedRelayExtensionVersion(dir)).toBe(OLD);
-		expect(await installedRelayExtensionVersion(elsewhere)).toBe(OLD);
-	});
-
-	it("leaves files a newer omp installed for that omp's relay", async () => {
-		const dir = home.join("extension");
-		await writeRelayExtension(dir, "999.0.0");
-		const { port, events, settled } = await startRelay(dir);
-		await dialExtension(port, dir);
-		await settled;
-		expect(events).toContain("extension update stopped");
-		expect(await installedRelayExtensionVersion(dir)).toBe("999.0.0");
+		expect(await writeRelayExtension(dir, VERSION)).toBe(true);
+		expect(await Bun.file(icon).bytes()).toEqual(original);
+		expect(await writeRelayExtension(dir, VERSION)).toBe(false);
 	});
 
 	it("writes background.js last, so an update that fails midway leaves the old version reported", async () => {
@@ -512,7 +593,9 @@ describe("relay extension self-update on a real relay", () => {
 		const rename = nodeFs.promises.rename.bind(nodeFs.promises);
 		const spy = spyOn(nodeFs.promises, "rename").mockImplementation(async (from, to) => {
 			if (String(to).endsWith("manifest.json")) {
-				throw Object.assign(new Error("EIO: i/o error, rename"), { code: "EIO" });
+				throw Object.assign(new Error("EIO: i/o error, rename"), {
+					code: "EIO",
+				});
 			}
 			return rename(from, to);
 		});
@@ -522,16 +605,18 @@ describe("relay extension self-update on a real relay", () => {
 			spy.mockRestore();
 		}
 		expect(await Bun.file(home.join("extension/background.js")).text()).toBe(oldBackground);
+		expect((await fs.readdir(dir)).filter(name => name.endsWith(".tmp"))).toEqual([]);
 	});
 
 	it("replaces a file Windows refuses to rename over, as when Chrome or antivirus holds it", async () => {
 		const dir = home.join("extension");
 		await writeRelayExtension(dir, OLD);
 		const rename = nodeFs.promises.rename.bind(nodeFs.promises);
-		let refused = 0;
+		let injected = false;
 		const spy = spyOn(nodeFs.promises, "rename").mockImplementation(async (from, to) => {
 			// Windows answers a rename over a held file with EPERM; moving the held file aside still works.
-			if (String(from).endsWith(".tmp") && refused++ === 0) {
+			if (String(from).endsWith(".tmp") && !injected) {
+				injected = true;
 				throw Object.assign(new Error("EPERM: operation not permitted, rename"), { code: "EPERM" });
 			}
 			return rename(from, to);
@@ -541,7 +626,7 @@ describe("relay extension self-update on a real relay", () => {
 		} finally {
 			spy.mockRestore();
 		}
-		expect(refused).toBeGreaterThan(1);
+		expect(injected).toBe(true);
 		expect(await installedRelayExtensionVersion(dir)).toBe(VERSION);
 		await expectCurrentFiles(dir);
 		expect((await fs.readdir(dir)).filter(name => name.endsWith(".tmp") || name.endsWith(".bak"))).toEqual([]);

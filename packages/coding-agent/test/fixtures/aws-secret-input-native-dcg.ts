@@ -1,5 +1,6 @@
 import { appendFile } from "node:fs/promises";
 import * as path from "node:path";
+import { quotePosixArgv } from "../../src/utils/shell-quote";
 
 export function createAwsSecretInputNativeGuardLauncher(neutralCwd: string): string {
 	const quote = (value: string) => `'${value.replace(/'/gu, "'\\''")}'`;
@@ -42,13 +43,16 @@ if (import.meta.main) {
 		console.log(JSON.stringify({ decision: "deny", rule_id: "fixture.argv", reason: "Invalid guard invocation" }));
 		process.exit(1);
 	}
-	const decision = command.includes("aws-secret-input-guard-deny")
-		? "deny"
-		: command.includes("consumer-secret-input-guard-deny")
+	const carrier = command.startsWith(`${quotePosixArgv(["aws", "--json"])} `);
+	const decision = carrier
+		? "allow"
+		: command.includes("aws-secret-input-guard-deny")
 			? "deny"
-			: command.includes("secret-input-guard-ask")
-				? "ask"
-				: "allow";
+			: command.includes("consumer-secret-input-guard-deny")
+				? "deny"
+				: command.includes("secret-input-guard-ask")
+					? "ask"
+					: "allow";
 	const reason = "Synthetic secret-input command policy";
 	await appendFile(path.join(home, "guard-public.jsonl"), `${JSON.stringify({ command, cwd, decision, reason })}\n`);
 	console.log(JSON.stringify({ decision, rule_id: "fixture.aws-secret-input", reason }));

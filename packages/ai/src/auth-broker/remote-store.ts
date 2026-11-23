@@ -1,7 +1,7 @@
 /**
  * Client-side {@link AuthCredentialStore} that mirrors a remote broker's
- * snapshot. Refresh tokens never leave the broker; mutating methods (`replace*`,
- * `upsert*`, `delete*ForProvider`) throw because login flows are server-side.
+ * snapshot. Refresh tokens never leave the broker; credential writes (`replace*`,
+ * `upsert*`, `delete*`) are forwarded to the broker, which owns persistence.
  *
  * Cache (`getCache`/`setCache`/`cleanExpiredCache`) is in-memory and ephemeral.
  * The bounded hot set preserves recently used session pins without keeping
@@ -11,6 +11,7 @@ import { randomUUID } from "node:crypto";
 import * as os from "node:os";
 import { getAppName, getInstallId, logger, postmortem } from "@oh-my-pi/pi-utils";
 import type { AuthCredentialStore } from "../auth/store";
+import { resolveCredentialIdentityKey } from "../auth/sqlite-credential-store";
 import {
 	type AuthCredential,
 	type AuthCredentialSnapshotEntry,
@@ -27,7 +28,12 @@ import type { OAuthCredentials } from "../registry/oauth/types";
 import type { Provider } from "../types";
 import type { ClientUsageIdentity, ObservedUsageEntry, UsageReport } from "../usage";
 import { raceSignal } from "../auth/abort";
-import { type AuthBrokerClient, AuthBrokerError, AuthBrokerStreamUnsupportedError } from "./client";
+import {
+	type AuthBrokerClient,
+	AuthBrokerError,
+	AuthBrokerStreamUnsupportedError,
+	type FetchSnapshotResult,
+} from "./client";
 import { compareCredentialBlockSnapshots } from "./protocol";
 import type {
 	BlockRevision,
@@ -42,6 +48,21 @@ import type {
 // keys/values; an evicted session falls back to normal credential selection.
 const REMOTE_CACHE_MAX_ENTRIES = 4096;
 const REMOTE_CACHE_MAX_CHARACTERS = 4 * 1024 * 1024;
+
+/**
+ * A broker accepted a credential upload but serves none of the provider's rows
+ * back, as a broker whose version pauses the provider does: the login would be
+ * gone on the next snapshot. {@link HybridAuthCredentialStore} catches it and
+ * keeps the login in the local `agent.db` instead.
+ */
+export class AuthBrokerUnservedProviderError extends Error {
+	readonly provider: string;
+	constructor(provider: string) {
+		super(`The auth broker stored the ${provider} credential but does not serve it back`);
+		this.name = "AuthBrokerUnservedProviderError";
+		this.provider = provider;
+	}
+}
 
 /** Visibility rule for one provider's broker credentials. */
 export interface AuthBrokerProviderPool {
@@ -90,7 +111,7 @@ function providerPoolRule(
 }
 
 function isCredentialInAccountPool(
-	entry: Pick<SnapshotEntry, "provider" | "credential" | "identityKey">,
+	entry: { provider: string; credential: Pick<AuthCredential, "type">; identityKey: string | null },
 	accountPool: ReadonlyMap<string, ResolvedProviderPool> | undefined,
 ): boolean {
 	const rule = providerPoolRule(accountPool, entry.provider);
@@ -816,6 +837,13 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		return true;
 	}
 
+	isCredentialAllowed(provider: string, credential: AuthCredential): boolean {
+		return isCredentialInAccountPool(
+			{ provider, credential, identityKey: resolveCredentialIdentityKey(provider, credential) },
+			this.#accountPool,
+		);
+	}
+
 	listAuthCredentials(provider?: string): StoredAuthCredential[] {
 		this.#noteActivity();
 		const out: StoredAuthCredential[] = [];
@@ -1133,14 +1161,14 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 	 * Upsert a single credential through the broker. The broker server is the
 	 * canonical writer — see `POST /v1/credential`. The redacted snapshot
 	 * entries returned by the server replace the provider's rows in our local
-	 * snapshot, and the global snapshot is then refreshed in the background so
-	 * any concurrent peer (refresh, generation bump) stays in sync.
+	 * snapshot, then {@link #confirmServed} re-reads the snapshot so a broker
+	 * that stores the row without serving it fails the login.
 	 */
 	async upsertAuthCredential(provider: string, credential: AuthCredential): Promise<StoredAuthCredential[]> {
 		this.#noteActivity();
 		const { entries } = await this.#client.uploadCredential(provider, credential);
 		this.#applyProviderEntries(provider, entries);
-		this.#maybeRefreshSnapshot("upload");
+		await this.#confirmServed(provider, entries);
 		return this.listAuthCredentials(provider);
 	}
 
@@ -1165,11 +1193,13 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		// Snapshot reflects the disables before we add the new rows so a concurrent
 		// reader cannot momentarily see old + new together for the same provider.
 		this.#removeProviderEntries(provider);
+		let uploaded: AuthCredentialSnapshotEntry[] = [];
 		for (const credential of credentials) {
 			const { entries } = await this.#client.uploadCredential(provider, credential);
 			this.#applyProviderEntries(provider, entries);
+			uploaded = entries;
 		}
-		this.#maybeRefreshSnapshot("replace");
+		await this.#confirmServed(provider, uploaded);
 		return this.listAuthCredentials(provider);
 	}
 
@@ -1193,6 +1223,29 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		}
 		this.#removeProviderEntries(provider);
 		this.#maybeRefreshSnapshot("delete");
+	}
+
+	/**
+	 * Adopt a fresh snapshot after an upload and throw when it serves none of
+	 * `uploaded`, the provider rows the broker just reported storing. A broker
+	 * whose version pauses `provider` accepts the write but never serves the row
+	 * ({@link AuthBrokerUnservedProviderError}). A failed fetch only logs: the
+	 * upload itself succeeded.
+	 */
+	async #confirmServed(provider: string, uploaded: readonly AuthCredentialSnapshotEntry[]): Promise<void> {
+		let result: FetchSnapshotResult;
+		try {
+			result = await this.#client.fetchSnapshot();
+		} catch (error) {
+			logger.debug("auth-broker snapshot refresh after upload failed", { provider, error: String(error) });
+			return;
+		}
+		if (result.status !== 200) return;
+		this.#applySnapshot(result.snapshot, result.generation);
+		if (uploaded.length === 0) return;
+		const served = new Set(result.snapshot.credentials.map(entry => entry.id));
+		if (uploaded.some(entry => served.has(entry.id))) return;
+		throw new AuthBrokerUnservedProviderError(provider);
 	}
 
 	#applyProviderEntries(provider: string, entries: AuthCredentialSnapshotEntry[]): void {

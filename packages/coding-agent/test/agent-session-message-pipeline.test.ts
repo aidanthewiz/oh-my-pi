@@ -57,6 +57,7 @@ import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { convertToLlm, wrapSteeringForModel } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
+import { quotePosixArgv } from "@oh-my-pi/pi-coding-agent/utils/shell-quote";
 import { requestBodyText } from "@oh-my-pi/pi-ai/utils/request-body";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
@@ -1065,6 +1066,7 @@ describe("AgentSession message pipeline", () => {
 		if (!context.runEphemeralTurn) throw new Error("Host did not expose side turns");
 		const messagesBefore = structuredClone(session.agent.state.messages);
 		const entriesBefore = structuredClone(sessionManager.getEntries());
+		const transcriptBefore = structuredClone(sessionManager.buildSessionContext().messages);
 		const deltas: string[] = [];
 		const result = await context.runEphemeralTurn({
 			promptText: "Question?",
@@ -1075,7 +1077,17 @@ describe("AgentSession message pipeline", () => {
 		expect(deltas.join("")).toBe("Answer");
 		expect(JSON.stringify(capturedContext?.messages)).toContain("zephyr-42");
 		expect(session.agent.state.messages).toEqual(messagesBefore);
-		expect(sessionManager.getEntries()).toEqual(entriesBefore);
+		// Only the spend is journaled, off-transcript: the reply without the question, and no message entry.
+		const entriesAfter = sessionManager.getEntries();
+		expect(entriesAfter.slice(0, entriesBefore.length)).toEqual(entriesBefore);
+		expect(entriesAfter.slice(entriesBefore.length)).toEqual([
+			expect.objectContaining({
+				type: "model_usage",
+				purpose: "extension",
+				completion: { reply: "Answer" },
+			}),
+		]);
+		expect(sessionManager.buildSessionContext().messages).toEqual(transcriptBefore);
 
 		expect(result.replyText).toBe("Answer");
 		expect(capturedOptions?.promptCacheKey).toBe(promptCacheKey);
@@ -1724,9 +1736,9 @@ describe("AgentSession message pipeline", () => {
 			true,
 		],
 		[
-			"Gemini CLI",
+			"Antigravity",
 			buildModel({
-				...getBundledModel("google-gemini-cli", "gemini-2.5-pro"),
+				...getBundledModel("google-antigravity", "gemini-2.5-pro"),
 				thinking: { mode: "budget", efforts: [Effort.Medium] },
 			}),
 			false,
@@ -3007,7 +3019,7 @@ describe("AgentSession message pipeline", () => {
 			}
 		},
 	);
-	it("preserves mounted MCP identity through the provider-dispatched write pipeline", async () => {
+	it("preserves mounted MCP identity through the provider-dispatched native command pipeline", async () => {
 		using tempDir = TempDir.createSync("@pi-mcp-event-identity-");
 		const api = "test-mcp-event-identity";
 		const cappedName = "mcp__coreforge_zendesk_mcp_zendesk_check_engineering_re_1s1l4a1y";
@@ -3025,8 +3037,8 @@ describe("AgentSession message pipeline", () => {
 					const toolCall = {
 						type: "toolCall",
 						id: "call-mcp-identity-1",
-						name: "write",
-						arguments: { path: `xd://${cappedName}`, content: "{}" },
+						name: "bash",
+						arguments: { command: quotePosixArgv([cappedName, "--json", "{}"]) },
 					} as const;
 					message.content = [toolCall];
 					message.stopReason = "toolUse";
@@ -3073,7 +3085,7 @@ describe("AgentSession message pipeline", () => {
 		}> = [];
 		const captureIdentity: ExtensionFactory = pi => {
 			const record = (event: (typeof events)[number]) => {
-				if (event.toolName !== "write" && event.toolName !== cappedName) return;
+				if (event.toolName !== "bash" && event.toolName !== cappedName) return;
 				events.push({
 					type: event.type,
 					toolName: event.toolName,
@@ -3114,16 +3126,16 @@ describe("AgentSession message pipeline", () => {
 		});
 		try {
 			await session.refreshMCPTools([mcpTool]);
-			expect(session.getXdevToolEntries().map(entry => entry.name)).toContain(cappedName);
+			expect(session.getToolCommandEntries().map(entry => entry.name)).toContain(cappedName);
 
 			await session.sendUserMessage("check access");
 
 			expect(executions).toBe(1);
 			expect(events).toEqual([
-				{ type: "tool_call", toolName: "write", ...identity },
+				{ type: "tool_call", toolName: "bash", mcpServerName: undefined, mcpToolName: undefined },
 				{ type: "tool_call", toolName: cappedName, ...identity },
 				{ type: "tool_result", toolName: cappedName, ...identity },
-				{ type: "tool_result", toolName: "write", ...identity },
+				{ type: "tool_result", toolName: "bash", mcpServerName: undefined, mcpToolName: undefined },
 			]);
 		} finally {
 			await session.dispose();
@@ -3205,7 +3217,6 @@ describe("AgentSession message pipeline", () => {
 				"compaction.enabled": false,
 				"bash.autoBackground.enabled": false,
 				"bashInterceptor.enabled": false,
-				"tools.xdev": false,
 			}),
 			model,
 			disableExtensionDiscovery: true,
@@ -3292,7 +3303,7 @@ describe("AgentSession message pipeline", () => {
 				"compaction.enabled": false,
 				"bash.autoBackground.enabled": false,
 				"bashInterceptor.enabled": false,
-				"tools.xdev": false,
+				"tools.commands": false,
 			}),
 			model,
 			disableExtensionDiscovery: true,
@@ -3410,7 +3421,7 @@ describe("AgentSession message pipeline", () => {
 				"compaction.enabled": false,
 				"bash.autoBackground.enabled": false,
 				"bashInterceptor.enabled": false,
-				"tools.xdev": false,
+				"tools.commands": false,
 			}),
 			model,
 			disableExtensionDiscovery: true,
@@ -3510,7 +3521,7 @@ describe("AgentSession message pipeline", () => {
 			modelRegistry,
 			settings: Settings.isolated({
 				"compaction.enabled": false,
-				"tools.xdev": false,
+				"tools.commands": false,
 				"web_search.enabled": true,
 			}),
 			model,

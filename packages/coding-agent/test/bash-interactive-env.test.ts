@@ -1,6 +1,5 @@
 import { expect, test } from "bun:test";
 import type { AgentToolContext } from "@oh-my-pi/pi-agent-core";
-import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { runInteractiveBashPty } from "@oh-my-pi/pi-coding-agent/tools/bash-interactive";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
@@ -28,10 +27,11 @@ test("interactive PTY commands receive only the filtered replacement environment
 	const tempDir = TempDir.createSync("@omp-filtered-pty-env-");
 	try {
 		Bun.env.MANAGED_PROFILE_SECRET = "parent-secret";
-		const shell = (await Settings.init()).getShellConfig();
+		const command = `printf "%s|%s" "\${MANAGED_PROFILE_SECRET-unset}" "\${EXPLICIT_SAFE-unset}" > filtered-env.txt`;
 		const result = await runInteractiveBashPty(headlessUi(), {
-			command: `printf "%s|%s" "\${MANAGED_PROFILE_SECRET-unset}" "\${EXPLICIT_SAFE-unset}" > filtered-env.txt`,
-			shell,
+			command,
+			application: "/bin/bash",
+			args: ["-c", command],
 			cwd: tempDir.path(),
 			env: {
 				MANAGED_PROFILE_SECRET: "caller-secret",

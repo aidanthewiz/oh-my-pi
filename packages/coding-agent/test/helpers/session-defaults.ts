@@ -6,7 +6,7 @@ export function createSessionDefaults() {
 		isDisposed: false,
 		loadDeferredExtensions: async () => {},
 		setActiveToolsByName: async (_toolNames: string[]) => {},
-		getMountedXdevToolNames: () => [],
+		getMountedToolCommandNames: () => [],
 		waitForIdle: async () => {},
 		prepareForHeadlessAdvisorDrain: () => {},
 		waitForAdvisorCatchup: async () => true,
@@ -23,5 +23,6 @@ export function createSessionDefaults() {
 		isAdvisorActive: () => false,
 		subscribeRunState: () => () => {},
 		addDisposer: () => {},
+		getWorkPoolYieldItems: () => [],
 	} satisfies Partial<AgentSession>;
 }

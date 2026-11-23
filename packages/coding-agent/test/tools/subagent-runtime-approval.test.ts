@@ -30,6 +30,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/tools/subagent-runtime-approval";
 import * as runtimeApproval from "@oh-my-pi/pi-coding-agent/tools/subagent-runtime-approval";
 import { cfgToolsApproval, cfgToolsApprovalMode } from "@oh-my-pi/pi-coding-agent/tools/settings";
+import * as shellSnapshot from "@oh-my-pi/pi-coding-agent/utils/shell-snapshot";
 import { Container, TUI } from "@oh-my-pi/pi-tui";
 import { CustomEditor } from "@oh-my-pi/pi-tui/prompt/custom-editor";
 import { getEditorTheme, getThemeByName, setThemeInstance } from "@oh-my-pi/pi-tui/theme";
@@ -471,12 +472,12 @@ describe.skipIf(process.platform === "win32")("headless subagent runtime approva
 	);
 
 	it.each(["parent", "child-deny", "input"] as const)(
-		"refuses stale %s approval after Bash output-artifact allocation",
+		"refuses stale %s approval after asynchronous shell preparation",
 		async drift => {
 			const owner = await parent();
 			const ownerSignal = owner.session.extensionRunner!.getUIContextSignal();
 			const rootPolicy = structuredClone(cfgToolsApproval.get(owner.settings));
-			const allocating = Promise.withResolvers<void>();
+			const preparing = Promise.withResolvers<void>();
 			const release = Promise.withResolvers<void>();
 			const controller = new AbortController();
 			let approved = false;
@@ -495,17 +496,15 @@ describe.skipIf(process.platform === "win32")("headless subagent runtime approva
 					},
 				],
 			});
-			const allocate = fixture.session.sessionManager.allocateArtifactPath.bind(fixture.session.sessionManager);
-			const allocation = spyOn(fixture.session.sessionManager, "allocateArtifactPath").mockImplementation(
-				async toolType => {
-					if (toolType === "bash") {
-						allocating.resolve();
-						await release.promise;
-					}
-					return await allocate(toolType);
-				},
-			);
-			const marker = path.join(fixture.cwd, "stale-bash-allocation.txt");
+			const prepareSnapshot = shellSnapshot.getOrCreateSnapshot;
+			const preparation = spyOn(shellSnapshot, "getOrCreateSnapshot").mockImplementation(async (...args) => {
+				if (approved) {
+					preparing.resolve();
+					await release.promise;
+				}
+				return prepareSnapshot(...args);
+			});
+			const marker = path.join(fixture.cwd, "stale-bash-preflight.txt");
 			const args = { command: `printf forbidden > ${JSON.stringify(marker)}`, cwd: fixture.cwd };
 			let finished = false;
 			const execution =
@@ -526,9 +525,9 @@ describe.skipIf(process.platform === "win32")("headless subagent runtime approva
 				owner.terminal.sendInput("\x1b[B");
 				owner.terminal.sendInput("\r");
 				await Promise.race([
-					allocating.promise,
+					preparing.promise,
 					settled.then(() => {
-						throw new Error("Child settled before the Bash allocation handshake");
+						throw new Error("Child settled before the shell preparation handshake");
 					}),
 				]);
 				expect(approved).toBeTrue();
@@ -563,7 +562,7 @@ describe.skipIf(process.platform === "win32")("headless subagent runtime approva
 				release.resolve();
 				await settled;
 				controller.abort();
-				allocation.mockRestore();
+				preparation.mockRestore();
 			}
 		},
 	);
@@ -915,7 +914,7 @@ describe.skipIf(process.platform === "win32")("headless subagent runtime approva
 				}),
 				enableIrc: false,
 				skipPythonPreflight: true,
-				cacheWarming: false,
+				cacheWarming: "off",
 			});
 			let finished = false;
 			const settled = callSessionTool(

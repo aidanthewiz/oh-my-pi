@@ -358,7 +358,7 @@ describe("seance artifact lifecycle", () => {
 		}
 	});
 
-	it("allocates past the source's artifact ids and resolves inherited ids to the source, never another session", async () => {
+	it("keeps a consult's local spills separate from source and other session roots", async () => {
 		using tempDir = TempDir.createSync("@omp-seance-artifact-ids-");
 		const cwd = path.join(tempDir.path(), "project");
 		await fs.mkdir(cwd, { recursive: true });
@@ -369,19 +369,12 @@ describe("seance artifact lifecycle", () => {
 			`${JSON.stringify({ type: "session", version: CURRENT_SESSION_VERSION, id: "host", timestamp: "2026-10-01T00:00:00.000Z", cwd })}\n`,
 		);
 		for (let id = 0; id < 5; id++) {
-			await Bun.write(path.join(sourceArtifacts, `${id}.read.log`), `source artifact ${id}`);
+			await Bun.write(path.join(sourceArtifacts, "local", `${id}.log`), `source artifact ${id}`);
 		}
 		const otherFile = path.join(tempDir.path(), "other", "other.jsonl");
-		await Bun.write(path.join(otherFile.slice(0, -".jsonl".length), "2.read.log"), "other session artifact 2");
-		await Bun.write(path.join(otherFile.slice(0, -".jsonl".length), "9.bash.log"), "other session only");
-		AgentRegistry.global().register({
-			id: "OtherSession",
-			displayName: "task",
-			kind: "sub",
-			session: null,
-			sessionFile: otherFile,
-			status: "parked",
-		});
+		const otherArtifacts = otherFile.slice(0, -".jsonl".length);
+		await Bun.write(path.join(otherArtifacts, "local", "2.log"), "other session artifact 2");
+		await Bun.write(path.join(otherArtifacts, "local", "9.log"), "other session only");
 
 		const fork = await SessionManager.forkFrom(sourceFile, cwd, undefined, undefined, {
 			seance: true,
@@ -391,7 +384,8 @@ describe("seance artifact lifecycle", () => {
 			repairInterruptedTail: true,
 		});
 		try {
-			expect(await fork.saveArtifact("seance output", "bash")).toBe("5");
+			const ownId = await fork.saveArtifact("seance output");
+			if (ownId === undefined) throw new Error("Expected consult spill");
 			const toolSession: ToolSession = {
 				cwd,
 				hasUI: false,
@@ -404,23 +398,31 @@ describe("seance artifact lifecycle", () => {
 			const context = sessionResolveContext(toolSession);
 			const router = InternalUrlRouter.instance();
 
-			expect((await router.resolve("artifact://2", context)).content).toBe("source artifact 2");
-			expect((await router.resolve("artifact://5", context)).content).toBe("seance output");
-			await expect(router.resolve("artifact://9", context)).rejects.toThrow("Artifact 9 not found");
-			// Without the seance binding the other session's artifact is reachable, so the miss above is scoping.
-			expect((await router.resolve("artifact://9")).content).toBe("other session only");
+			expect((await router.resolve(`local://${ownId}.log`, context)).content).toBe("seance output");
+			await expect(router.resolve("local://2.log", context)).rejects.toThrow();
+			await expect(router.resolve("local://9.log", context)).rejects.toThrow();
+			expect(
+				(
+					await router.resolve("local://9.log", {
+						localProtocolOptions: { getArtifactsDir: () => otherArtifacts },
+					})
+				).content,
+			).toBe("other session only");
+			expect(await fs.readFile(path.join(sourceArtifacts, "local", "2.log"), "utf8")).toBe("source artifact 2");
 		} finally {
 			await fork.close();
 		}
 	});
 
-	it("reads a symlink source's real artifacts and reserves their ids without modifying the source", async () => {
+	it("uses the canonical readonly source while writing spills only in the consult root", async () => {
 		using tempDir = TempDir.createSync("@omp-seance-symlink-source-");
 		const cwd = path.join(tempDir.path(), "project");
 		const sourceFile = path.join(tempDir.path(), "sessions", "host.jsonl");
 		const sourceArtifacts = sourceFile.slice(0, -".jsonl".length);
 		const aliasFile = path.join(tempDir.path(), "aliases", "linked.jsonl");
 		const aliasArtifacts = aliasFile.slice(0, -".jsonl".length);
+		const sourceLocal = path.join(sourceArtifacts, "local");
+		const aliasLocal = path.join(aliasArtifacts, "local");
 		await fs.mkdir(cwd, { recursive: true });
 		await fs.mkdir(path.dirname(aliasFile), { recursive: true });
 		const sourceText = `${JSON.stringify({
@@ -431,11 +433,12 @@ describe("seance artifact lifecycle", () => {
 			cwd,
 		})}\n`;
 		await Bun.write(sourceFile, sourceText);
-		await Bun.write(path.join(sourceArtifacts, "7.read.log"), "real source artifact");
-		await Bun.write(path.join(aliasArtifacts, "7.read.log"), "alias decoy");
+		await Bun.write(path.join(sourceLocal, "7.log"), "real source artifact");
+		await Bun.write(path.join(aliasLocal, "7.log"), "alias decoy");
 		await fs.symlink(sourceFile, aliasFile, "file");
 		await fs.chmod(sourceFile, 0o444);
-		await fs.chmod(path.join(sourceArtifacts, "7.read.log"), 0o444);
+		await fs.chmod(path.join(sourceLocal, "7.log"), 0o444);
+		await fs.chmod(sourceLocal, 0o555);
 		await fs.chmod(sourceArtifacts, 0o555);
 		let fork: SessionManager | undefined;
 		try {
@@ -445,7 +448,8 @@ describe("seance artifact lifecycle", () => {
 				sessionFile: path.join(tempDir.path(), "consult", "fork.jsonl"),
 			});
 			expect(fork.getSeanceSourceArtifactsDir()).toBe((await fs.realpath(sourceFile)).slice(0, -6));
-			expect(await fork.saveArtifact("consult result", "read")).toBe("8");
+			const ownId = await fork.saveArtifact("consult result");
+			if (ownId === undefined) throw new Error("Expected consult spill");
 			const context = sessionResolveContext({
 				cwd,
 				hasUI: false,
@@ -455,21 +459,22 @@ describe("seance artifact lifecycle", () => {
 				settings: Settings.isolated(),
 				seanceSourceArtifactsDir: fork.getSeanceSourceArtifactsDir() ?? undefined,
 			});
-			expect((await InternalUrlRouter.instance().resolve("artifact://7", context)).content).toBe(
-				"real source artifact",
+			expect((await InternalUrlRouter.instance().resolve(`local://${ownId}.log`, context)).content).toBe(
+				"consult result",
 			);
-			expect((await InternalUrlRouter.instance().resolve("artifact://8", context)).content).toBe("consult result");
+			await expect(InternalUrlRouter.instance().resolve("local://7.log", context)).rejects.toThrow();
 			expect(await fs.readFile(sourceFile, "utf8")).toBe(sourceText);
-			expect(await fs.readFile(path.join(sourceArtifacts, "7.read.log"), "utf8")).toBe("real source artifact");
-			expect(await fs.readFile(path.join(aliasArtifacts, "7.read.log"), "utf8")).toBe("alias decoy");
-			expect(await fs.readdir(sourceArtifacts)).toEqual(["7.read.log"]);
+			expect(await fs.readFile(path.join(sourceLocal, "7.log"), "utf8")).toBe("real source artifact");
+			expect(await fs.readFile(path.join(aliasLocal, "7.log"), "utf8")).toBe("alias decoy");
+			expect(await fs.readdir(sourceLocal)).toEqual(["7.log"]);
 			expect((await fs.lstat(aliasFile)).isSymbolicLink()).toBe(true);
 		} finally {
 			try {
 				await fork?.close();
 			} finally {
 				await fs.chmod(sourceArtifacts, 0o755);
-				await fs.chmod(path.join(sourceArtifacts, "7.read.log"), 0o644);
+				await fs.chmod(sourceLocal, 0o755);
+				await fs.chmod(path.join(sourceLocal, "7.log"), 0o644);
 				await fs.chmod(sourceFile, 0o644);
 			}
 		}

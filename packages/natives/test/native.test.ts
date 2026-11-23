@@ -194,7 +194,7 @@ function textPdf(text: string): Uint8Array {
 	return Buffer.from(document);
 }
 
-describe("pi-natives", () => {
+describe("omp-natives", () => {
 	beforeAll(async () => {
 		await setupFixtures();
 		return async () => {
@@ -1234,12 +1234,10 @@ try {
 			expect(() => htmlToMarkdown("<p>text</p>", { hiddenContent: "visible" })).toThrow(/hiddenContent/);
 		});
 
-		it("should reject depth-truncated HTML", async () => {
+		it("preserves content nested beyond the former converter depth limit", async () => {
 			const html = `${"<div>".repeat(90)}<p>deep-content</p>${"</div>".repeat(90)}`;
-
-			await expect(htmlToMarkdown(html, { cleanContent: true })).rejects.toThrow(
-				/Conversion error: .*effective depth limit of 64/,
-			);
+			const markdown = await htmlToMarkdown(html, { cleanContent: true });
+			expect(markdown).toContain("deep-content");
 		});
 
 		it("should survive pathologically deep HTML", async () => {
@@ -1299,7 +1297,7 @@ console.log("ok");
 		it("should create a stoppable power assertion handle, or surface a descriptive bus/service failure where the host cannot provide one", () => {
 			let assertion: PowerAssertion | undefined;
 			try {
-				assertion = PowerAssertion.start({ reason: "pi-natives test" });
+				assertion = PowerAssertion.start({ reason: "omp-natives test" });
 			} catch (error) {
 				// A host with no bus must fail in the documented bus/service vocabulary,
 				// so a wrong export or a no-op stub fails on any other message.
@@ -1314,7 +1312,7 @@ console.log("ok");
 		it.skipIf(process.platform !== "linux" || !Bun.which("systemd-inhibit"))(
 			"registers a login1 inhibitor for the handle's lifetime",
 			() => {
-				const reason = `pi-natives ${crypto.randomUUID()}`;
+				const reason = `omp-natives ${crypto.randomUUID()}`;
 				const held = (): boolean =>
 					Bun.spawnSync(["systemd-inhibit", "--list", "--no-pager"]).stdout.toString().includes(reason);
 				let assertion: PowerAssertion;

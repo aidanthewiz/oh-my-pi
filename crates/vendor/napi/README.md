@@ -40,9 +40,9 @@ path `crates/napi`, in `.cargo_vcs_info.json`.
 - `src/bindgen_runtime/mod.rs`, `src/bindgen_runtime/js_values/arraybuffer.rs`:
   `set_external_release_hook` registers a callback that the external
   `Buffer`/typed-array GC finalizers run after freeing the Rust allocation.
-  The exact diff is `patches/0002-external-release-hook.patch`. `pi-natives`
+  The exact diff is `patches/0002-external-release-hook.patch`. `omp-natives`
   uses it to trim freed heap pages after the JS GC releases a native result
-  (`crates/pi-natives/src/memory.rs`); without a registered hook the
+  (`crates/natives/src/memory.rs`); without a registered hook the
   finalizers behave as upstream.
 - `Cargo.toml`: `publish = false` and a `[lints.clippy]` block that keeps the
   workspace's lint config off upstream code. `CHANGELOG.md`: the vendor
@@ -64,5 +64,5 @@ upstream covers it) and regenerate them against the new release.
 Preserve `LICENSE` and record the new archive checksum and VCS commit.
 Restore the `Cargo.toml` and `CHANGELOG.md` edits above, bump `version` in
 `BUILD.bazel` and sync its `crate_features` with
-`cargo tree -p pi-natives -i napi -e normal -f '{p} [{f}]'`, then run
+`cargo tree -p omp-natives -i napi -e normal -f '{p} [{f}]'`, then run
 `cargo update -p napi -p napi-derive` and `bun scripts/gen-bazel-lock.ts`.

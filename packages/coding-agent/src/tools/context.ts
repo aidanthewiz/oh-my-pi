@@ -11,24 +11,25 @@ declare module "@oh-my-pi/pi-agent-core" {
 		hasUI?: boolean;
 		toolNames?: string[];
 		toolCall?: ToolCallContext;
-		/** Set after the write tool's outer gate approves an `xd://` device call:
-		 *  the `tools.approval` key that gate resolved (the canonical tool name). While the
-		 *  input flows through unchanged, the inner wrapper skips its tier-only
-		 *  prompt and an explicit prompt policy under this same key; overrides and
-		 *  policies under other keys still apply. */
-		xdevPolicyKey?: string;
 		/** One ACP acknowledgment bound to the call, target, policy, and source authority.
 		 *  Cached client decisions never cover a restricted-folder prompt. */
 		acpApproval?: AcpApproval;
-		/** Reports the approval tier resolved after an extension rewrites an
-		 *  xd:// device call, so dispatch metadata describes the input that ran. */
-		xdevTierResolved?(tier: "read" | "write" | "exec"): void;
+		/** Called right before a tool asks the user for approval. */
+		onApprovalPrompt?(): void;
+		/** Reports the approval tier resolved after an extension rewrites a tool command's input, so dispatch metadata describes the input that ran. */
+		toolCommandTierResolved?(tier: "read" | "write" | "exec"): void;
 		/** Set only after an interactive prompt approves provider computer safety checks. */
 		providerSafetyApproved?: boolean;
 		/** Set by the Cursor exec bridge, whose read frames compose `:raw` only to
 		 *  drop line gutters. `read` then still returns image files as images
 		 *  instead of their bytes decoded as text, which Cursor rejects (#15630). */
 		rawImages?: boolean;
+		/** Set by eval's tool bridge: a program, not a model, consumes the result. The tool wrapper
+		 *  then neither spills the result to an artifact nor appends display notices (truncation
+		 *  stays structured in `details.meta`), and `read` returns `:raw` selections whole. */
+		programmatic?: boolean;
+		/** Enclosing eval invocation for a host-dispatched session tool. */
+		parentToolCallId?: string;
 		/** Set while the session runs the Spotlight experiment: the tool wrapper passes the final result of each of
 		 *  the agent's own calls (`toolCall` lists it under the tool's name) through it. */
 		spotlightShape?: CalledToolShaper;

@@ -17,7 +17,6 @@
 import { afterEach, beforeEach, describe, expect, it, spyOn, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { daemonRuntimeDir } from "@oh-my-pi/pi-coding-agent/launch/paths";
 import {
 	CdpTargetCloseTimeoutError,
 	closeCdpTarget,
@@ -31,6 +30,7 @@ import {
 	retryUnclosedSharedTargets,
 	type SharedTargetScope,
 } from "@oh-my-pi/pi-coding-agent/tools/browser/orphan-registry";
+import { getDaemonRuntimeDir } from "@oh-my-pi/pi-utils";
 import type { Browser } from "puppeteer-core";
 
 const DAEMON_NAME = "omp.browser.headless";
@@ -42,7 +42,7 @@ function makeScope(): SharedTargetScope {
 }
 
 function registryDir(scope: SharedTargetScope): string {
-	return path.join(daemonRuntimeDir(scope.projectDir), `${scope.daemonName}.targets`);
+	return path.join(getDaemonRuntimeDir(scope.projectDir), `${scope.daemonName}.targets`);
 }
 
 async function writeOwnershipFile(
@@ -360,7 +360,7 @@ function trackedScope(): SharedTargetScope {
 afterEach(async () => {
 	resetOrphanRegistryForTest();
 	for (const scope of scopes.splice(0)) {
-		await fs.rm(daemonRuntimeDir(scope.projectDir), { recursive: true, force: true }).catch(() => undefined);
+		await fs.rm(getDaemonRuntimeDir(scope.projectDir), { recursive: true, force: true }).catch(() => undefined);
 	}
 });
 

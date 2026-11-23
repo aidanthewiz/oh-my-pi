@@ -3,7 +3,7 @@ import * as os from "node:os";
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import type { CustomToolContext } from "@oh-my-pi/pi-coding-agent/extensibility/custom-tools/types";
-import { DeferredMCPTool, MCPTool, PROGRESS_UPDATE_INTERVAL_MS } from "@oh-my-pi/pi-coding-agent/mcp/tool-bridge";
+import { MCPTool, PROGRESS_UPDATE_INTERVAL_MS } from "@oh-my-pi/pi-coding-agent/mcp/tool-bridge";
 import type {
 	MCPRequestOptions,
 	MCPServerConnection,
@@ -16,11 +16,11 @@ import { visibleWidth } from "@oh-my-pi/pi-tui";
 import type { MCPProgress, MCPToolDetails } from "@oh-my-pi/pi-tui/tools/mcp";
 
 const definition = { name: "progress_tool", inputSchema: { type: "object" as const } };
-const result: MCPToolCallResult = {
+const result = {
 	content: [{ type: "text", text: "done" }],
 	isError: true,
 	structuredContent: { rows: [1], cursor: "next:opaque" },
-};
+} satisfies MCPToolCallResult;
 let auth: AuthStorage;
 let context: CustomToolContext;
 
@@ -38,9 +38,9 @@ beforeEach(async () => {
 	vi.useFakeTimers();
 });
 
-afterEach(() => {
+afterEach(async () => {
 	vi.useRealTimers();
-	auth.close();
+	await auth.close();
 });
 
 function connectionFor(handler: (options?: MCPRequestOptions) => MCPToolCallResult): MCPServerConnection {
@@ -73,7 +73,7 @@ function withSteps(steps: MCPProgress[]): MCPServerConnection {
 }
 
 describe("MCP tools/call progress updates", () => {
-	for (const kind of ["connected", "deferred"] as const) {
+	for (const kind of ["connected"] as const) {
 		it(`${kind}: emits coalesced progress partials without changing the final result`, async () => {
 			const connection = withSteps([
 				{ progress: 1, message: "Fetching\n\trows" },
@@ -82,10 +82,7 @@ describe("MCP tools/call progress updates", () => {
 				{ progress: 4, total: 4 },
 				{ progress: 5 },
 			]);
-			const tool =
-				kind === "connected"
-					? new MCPTool(connection, definition)
-					: new DeferredMCPTool(connection.name, definition, async () => connection, connection._source);
+			const tool = new MCPTool(connection, definition);
 			const updates: AgentToolResult<MCPToolDetails>[] = [];
 			const actual = await tool.execute("progress", {}, partial => updates.push(partial), context);
 			const baseline = await tool.execute("no-progress", {}, undefined, context);
@@ -108,7 +105,7 @@ describe("MCP tools/call progress updates", () => {
 			).toBe(true);
 			expect(actual).toEqual(baseline);
 			expect(actual.isError).toBe(true);
-			expect(actual.details?.structuredContent).toEqual(result.structuredContent);
+			expect<unknown>(actual.details?.structuredContent).toEqual(result.structuredContent);
 			expect(actual.details).not.toHaveProperty("progress");
 			// Coalescing belongs to one execute call, not to the reusable tool instance.
 			const next: AgentToolResult<MCPToolDetails>[] = [];
@@ -153,7 +150,7 @@ describe("MCP tools/call progress updates", () => {
 		expect(updates[0]?.details?.progress).toEqual({ progress: 1, total: 2, message });
 	});
 
-	for (const kind of ["connected", "deferred"] as const) {
+	for (const kind of ["connected"] as const) {
 		for (const failure of ["auth", "connection"] as const) {
 			it(`${kind}: retains progress on a ${failure} retry`, async () => {
 				const readDefinition = { ...definition, annotations: { readOnlyHint: true } };
@@ -178,10 +175,7 @@ describe("MCP tools/call progress updates", () => {
 					reconnects++;
 					return next;
 				};
-				const tool =
-					kind === "connected"
-						? new MCPTool(first, readDefinition, reconnect)
-						: new DeferredMCPTool(first.name, readDefinition, async () => first, first._source, reconnect);
+				const tool = new MCPTool(first, readDefinition, reconnect);
 				const messages: string[] = [];
 				await tool.execute("retry", {}, partial => messages.push(partial.details!.progress!.message!), context);
 				expect(messages).toEqual(["initial", "retry"]);
@@ -191,7 +185,7 @@ describe("MCP tools/call progress updates", () => {
 		}
 	}
 
-	for (const kind of ["connected", "deferred"] as const) {
+	for (const kind of ["connected"] as const) {
 		for (const failure of ["auth", "connection"] as const) {
 			for (const safety of ["unknown", "mutation"] as const) {
 				it(`${kind}: reports only the original progress for a non-replayed ${safety} ${failure} failure`, async () => {
@@ -220,10 +214,7 @@ describe("MCP tools/call progress updates", () => {
 						safety === "unknown"
 							? definition
 							: { ...definition, annotations: { readOnlyHint: false, destructiveHint: true } };
-					const tool =
-						kind === "connected"
-							? new MCPTool(first, unsafeDefinition, reconnect)
-							: new DeferredMCPTool(first.name, unsafeDefinition, async () => first, first._source, reconnect);
+					const tool = new MCPTool(first, unsafeDefinition, reconnect);
 					const messages: string[] = [];
 					const actual = await tool.execute(
 						"unsafe",
@@ -239,22 +230,6 @@ describe("MCP tools/call progress updates", () => {
 			}
 		}
 	}
-
-	it("retains progress when a deferred connection lookup needs reconnecting", async () => {
-		const connection = withSteps([{ progress: 1, message: "reconnected" }]);
-		const tool = new DeferredMCPTool(
-			connection.name,
-			definition,
-			async () => {
-				throw new Error("not connected");
-			},
-			connection._source,
-			async () => connection,
-		);
-		const updates: AgentToolResult<MCPToolDetails>[] = [];
-		await tool.execute("lookup-retry", {}, partial => updates.push(partial), context);
-		expect(updates.map(update => update.details?.progress)).toEqual([{ progress: 1, message: "reconnected" }]);
-	});
 
 	it("contains immediate and coalesced sink failures without losing the final result or leaking timers", async () => {
 		const seen: number[] = [];

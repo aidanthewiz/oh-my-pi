@@ -4,15 +4,7 @@
  * schema, fed the job's brief and redacted output samples.
  */
 import { type AgentTelemetryConfig, instrumentedCompleteSimple, resolveTelemetry } from "@oh-my-pi/pi-agent-core";
-import type {
-	Api,
-	AssistantMessage,
-	Context,
-	Model,
-	SimpleStreamOptions,
-	ToolChoice,
-	UserMessage,
-} from "@oh-my-pi/pi-ai";
+import type { Api, AssistantMessage, Model, SimpleStreamOptions, Tool, ToolChoice, UserMessage } from "@oh-my-pi/pi-ai";
 import { markPerCallContextMessage } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import { formatBytes, prompt, truncate } from "@oh-my-pi/pi-utils";
 import type { ModelRegistry } from "../config/model-registry";
@@ -190,7 +182,7 @@ export interface JobWidgetAuthorAdmission {
 	signal?: AbortSignal;
 	isCurrent(): boolean;
 	admit(): void;
-	onUsage(message: AssistantMessage): void;
+	onUsage(message: AssistantMessage, prompt: string): void;
 }
 
 export interface ModelJobWidgetAuthorOptions {
@@ -210,7 +202,10 @@ export interface ModelJobWidgetAuthorOptions {
 
 /** One admitted `widget`-role operation owned by a running job. */
 export interface WidgetRequest {
-	context: Context;
+	systemPrompt: string;
+	/** The user turn: the job's own text, which never repeats across requests. */
+	prompt: string;
+	tools?: Tool[];
 	maxTokens: number;
 	toolChoice?: ToolChoice;
 	oneshotKind: string;
@@ -229,6 +224,31 @@ export async function completeWidgetRequest(
 	if (!options.admit || !canAuthor()) return undefined;
 	const { settings, modelRegistry } = options;
 	let failure: AssistantMessage | undefined;
+	const content = { type: "text" as const, text: request.prompt };
+	const message: UserMessage = {
+		role: "user",
+		content: [content],
+		timestamp: Date.now(),
+	};
+	// The system prompt and tools are the reusable prefix (cached by the provider). The job's text
+	// never repeats, so a cache breakpoint on it would only bill a cache write.
+	markPerCallContextMessage(message);
+	const context = { systemPrompt: [request.systemPrompt], messages: [message], tools: request.tools };
+	const bytes = Buffer.byteLength(JSON.stringify(context));
+	if (bytes > MAX_PAYLOAD_BYTES) {
+		const text = content.text;
+		const budget = MAX_PAYLOAD_BYTES - bytes + Buffer.byteLength(JSON.stringify(text));
+		if (budget < 2) throw new Error("Widget author context exceeds the outbound limit");
+		let low = 0;
+		let high = text.length;
+		while (low < high) {
+			const mid = Math.ceil((low + high) / 2);
+			if (Buffer.byteLength(JSON.stringify(text.slice(0, mid))) <= budget) low = mid;
+			else high = mid - 1;
+		}
+		if (low > 0 && /[\uD800-\uDBFF]/.test(text[low - 1])) low--;
+		content.text = text.slice(0, low);
+	}
 	for (const { model } of resolveRoleChain("widget", settings, roleCandidatePool("widget", settings, modelRegistry))) {
 		if (!canAuthor()) return undefined;
 		const lease = await options.admit(model, signal, request.owner);
@@ -245,12 +265,12 @@ export async function completeWidgetRequest(
 				if (!current()) throw new Error("Widget request owner changed before dispatch");
 				lease.admit();
 			},
-			onAttempt: lease.onUsage,
+			onAttempt: message => lease.onUsage(message, content.text),
 			disableReasoning: true,
 			maxTokens: request.maxTokens,
 			toolChoice: request.toolChoice,
 		};
-		const response = await instrumentedCompleteSimple(model, request.context, streamOptions, {
+		const response = await instrumentedCompleteSimple(model, context, streamOptions, {
 			telemetry: resolveTelemetry(options.telemetry?.(), lease.sessionId),
 			oneshotKind: request.oneshotKind,
 		});
@@ -270,46 +290,19 @@ export function createModelJobWidgetAuthor(options: ModelJobWidgetAuthorOptions)
 	return async (request, signal) => {
 		const obfuscate = options.obfuscate?.();
 		const redact = (text: string): string => redactWidgetSample(text, obfuscate);
-		const content = { type: "text" as const, text: renderJobWidgetPrompt(request, redact) };
-		const message: UserMessage = {
-			role: "user",
-			content: [content],
-			timestamp: Date.now(),
-		};
-		// The system prompt and schema are the reusable prefix (cached by the provider). The job's
-		// samples never repeat, so a cache breakpoint on them would only bill a cache write.
-		markPerCallContextMessage(message);
-		const context = {
-			systemPrompt: [systemPrompt],
-			messages: [message],
-			tools: [
-				{
-					name: RESPOND_TOOL,
-					description: "Install the widget spec for this job.",
-					parameters: JOB_WIDGET_SPEC_SCHEMA,
-					strict: false,
-				},
-			],
-		};
-		const bytes = Buffer.byteLength(JSON.stringify(context));
-		if (bytes > MAX_PAYLOAD_BYTES) {
-			const text = content.text;
-			const budget = MAX_PAYLOAD_BYTES - bytes + Buffer.byteLength(JSON.stringify(text));
-			if (budget < 2) throw new Error("Widget author context exceeds the outbound limit");
-			let low = 0;
-			let high = text.length;
-			while (low < high) {
-				const mid = Math.ceil((low + high) / 2);
-				if (Buffer.byteLength(JSON.stringify(text.slice(0, mid))) <= budget) low = mid;
-				else high = mid - 1;
-			}
-			if (low > 0 && /[\uD800-\uDBFF]/.test(text[low - 1])) low--;
-			content.text = text.slice(0, low);
-		}
 		const response = await completeWidgetRequest(
 			options,
 			{
-				context,
+				systemPrompt,
+				prompt: renderJobWidgetPrompt(request, redact),
+				tools: [
+					{
+						name: RESPOND_TOOL,
+						description: "Install the widget spec for this job.",
+						parameters: JOB_WIDGET_SPEC_SCHEMA,
+						strict: false,
+					},
+				],
 				maxTokens: MAX_SPEC_TOKENS,
 				toolChoice: { type: "tool", name: RESPOND_TOOL },
 				oneshotKind: "job_widget",

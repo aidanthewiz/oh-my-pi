@@ -283,7 +283,7 @@ describe("AgentSession prompt admission racing abort", () => {
 				),
 			).toBe(false);
 			expect(session.sessionManager.getEntries().filter(entry => entry.type === "model_usage")).toMatchObject([
-				{ purpose: "image-attachment-describe", usage: { input: 17, output: 5 } },
+				{ purpose: "image-describe", usage: { input: 17, output: 5 } },
 			]);
 			finishRival.resolve();
 			if (rival) expect(await rival).toEqual({ value: true });
@@ -575,7 +575,7 @@ describe("AgentSession prompt admission racing abort", () => {
 				.split("\n")
 				.map(line => JSON.parse(line));
 			expect(persisted.filter(entry => entry.type === "model_usage")).toMatchObject([
-				{ purpose: "image-attachment-describe", parentId: originalParent, usage: { input: 17, output: 5 } },
+				{ purpose: "image-describe", parentId: originalParent, usage: { input: 17, output: 5 } },
 			]);
 			if (transition === "new") {
 				expect(session.sessionManager.getEntries().filter(entry => entry.type === "model_usage")).toEqual([]);

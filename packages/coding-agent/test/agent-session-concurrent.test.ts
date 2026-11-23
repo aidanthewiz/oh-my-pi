@@ -2230,6 +2230,85 @@ describe("AgentSession TTSR resume gate", () => {
 		const modelResult = JSON.stringify(mock.calls[1]?.context.messages ?? []);
 		expect(modelResult.match(/Do not write FORBIDDEN_TOKEN\./g) ?? []).toHaveLength(1);
 	});
+	it("keeps nested tool-specific reminders while the outer command completes", async () => {
+		const parameters = type({ command: "string" });
+		const sessionManager = SessionManager.inMemory(tempDir);
+		const extensionRunner = new ExtensionRunner(
+			[],
+			new ExtensionRuntime(),
+			tempDir,
+			sessionManager,
+			sharedModelRegistry,
+		);
+		const commandTool: AgentTool<typeof parameters> = {
+			name: "lsp",
+			label: "LSP",
+			description: "Nested tool command",
+			parameters,
+			matcherDigest: args => {
+				if (!args || typeof args !== "object" || !("command" in args)) return undefined;
+				return typeof args.command === "string" ? args.command : undefined;
+			},
+			execute: async () => ({ content: [{ type: "text", text: "nested executed" }] }),
+		};
+		const inner = new ExtensionToolWrapper(commandTool, extensionRunner);
+		const bashTool: AgentTool<typeof parameters> = {
+			name: "bash",
+			label: "Bash",
+			description: "Outer bash command",
+			parameters,
+			execute: (id, args, signal, onUpdate, context) =>
+				inner.execute(id, { command: args.command }, signal, onUpdate, context),
+		};
+		const outer = new ExtensionToolWrapper(bashTool, extensionRunner);
+		const mock = createMockModel({
+			responses: [
+				{
+					content: [{ type: "toolCall", name: "bash", arguments: { command: "NESTED_TOOL_TOKEN" } }],
+				},
+			],
+			handler: () => ({ content: ["Done"] }),
+		});
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model: getBundledModel("anthropic", "claude-sonnet-4-5")!, tools: [outer] },
+			streamFn: mock.stream,
+			convertToLlm,
+			getToolContext: () =>
+				({ settings: Settings.isolated({ "tools.approvalMode": "yolo" }), autoApprove: true }) as never,
+		});
+		const ttsrManager = new TtsrManager({
+			enabled: true,
+			interruptMode: "never",
+			contextMode: "keep",
+			repeatMode: "once",
+			repeatGap: 10,
+		});
+		ttsrManager.addRule({
+			name: "no-nested-tool-token",
+			path: "nested-tool-rule.md",
+			content: "Do not use NESTED_TOOL_TOKEN.",
+			condition: ["NESTED_TOOL_TOKEN"],
+			scope: ["tool:lsp"],
+			interruptMode: "never",
+			_source: { provider: "test", providerName: "test", path: "nested-tool-rule.md", level: "project" },
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated({ "compaction.enabled": false, "tools.approvalMode": "yolo" }),
+			modelRegistry: sharedModelRegistry,
+			ttsrManager,
+			extensionRunner,
+			autoApprove: true,
+		});
+
+		await session.prompt("Run the lsp tool command through bash");
+		await session.waitForIdle();
+		const modelResult = JSON.stringify(mock.calls[1]?.context.messages ?? []);
+		expect(modelResult).toContain("nested executed");
+		expect(modelResult.match(/Do not use NESTED_TOOL_TOKEN\./g) ?? []).toHaveLength(1);
+	});
 
 	it("matches finalized write arguments regardless of streaming chunk boundaries", async () => {
 		const model = getBundledModel("openai-codex", "gpt-5.6-sol");

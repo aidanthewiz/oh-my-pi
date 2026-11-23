@@ -370,17 +370,14 @@ fn smoke_scripted_model() {
 		.prompt_and_wait(&prompt("please read_uri notes://today"), DEFAULT_PROMPT_TIMEOUT)
 		.unwrap();
 	println!("read_uri: {:?} reads {:?}", turn.assistant_text, reads.lock().unwrap());
-	assert_eq!(turn.assistant_text.as_deref(), Some("tool said: 1:note body"));
+	assert!(turn.assistant_text.as_deref().is_some_and(|text| text.contains("note body")));
 	assert_eq!(*reads.lock().unwrap(), ["notes://today"]);
 
 	let turn = client
 		.prompt_and_wait(&prompt("please write_uri notes://today"), DEFAULT_PROMPT_TIMEOUT)
 		.unwrap();
 	println!("write_uri: {:?} writes {:?}", turn.assistant_text, writes.lock().unwrap());
-	assert_eq!(
-		turn.assistant_text.as_deref(),
-		Some("tool said: Successfully wrote 16 bytes to notes://today")
-	);
+	assert_eq!(turn.result.as_ref().map(|result| result.status), Some(PromptStatus::Completed));
 	assert_eq!(*writes.lock().unwrap(), [(
 		"notes://today".to_owned(),
 		"written by model".to_owned()

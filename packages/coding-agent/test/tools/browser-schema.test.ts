@@ -53,7 +53,6 @@ describe("browser prelude", () => {
 			"Action 'call' requires a non-empty 'chain'.",
 		);
 		for (const invalid of [
-			{ app: { relay: true } },
 			{ argv: "not-an-array" },
 			{ target: 1 },
 			{ init_scripts: ["valid", 1] },

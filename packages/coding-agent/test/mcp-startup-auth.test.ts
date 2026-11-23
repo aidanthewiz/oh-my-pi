@@ -7,7 +7,7 @@ import { MCPManager } from "@oh-my-pi/pi-coding-agent/mcp/manager";
 import type { MCPHttpServerConfig, MCPServerConfig, MCPToolDefinition } from "@oh-my-pi/pi-coding-agent/mcp/types";
 import type { McpConnectionStatusEvent } from "@oh-my-pi/pi-coding-agent/mcp/startup-events";
 import { MCPOAuthCancelledError } from "@oh-my-pi/pi-coding-agent/mcp/oauth-reauth";
-import type { MCPToolCache } from "@oh-my-pi/pi-coding-agent/mcp/tool-cache";
+import { disposeLocalMcpHost } from "@oh-my-pi/pi-coding-agent/mcp/host/local";
 
 type RequestRecord = {
 	url: string;
@@ -30,6 +30,7 @@ function installMcpFetch(
 	options?: {
 		initialize?: Promise<void>;
 		catalogs?: boolean;
+		catalogsReady?: Promise<void>;
 		failTools?: boolean;
 		authStatus?: number;
 		authMethod?: "initialize" | "tools/list";
@@ -41,13 +42,14 @@ function installMcpFetch(
 	const failedInitializations = new Set<string>();
 	const fetchImpl = Object.assign(
 		async (input: string | Request | URL, init?: RequestInit | BunFetchRequestInit) => {
-			const url = String(input);
-			const rawBody = typeof init?.body === "string" ? init.body : undefined;
+			const request = input instanceof Request ? new Request(input, init) : new Request(String(input), init);
+			const url = request.url;
+			const rawBody = await request.text();
 			const body = rawBody ? (JSON.parse(rawBody) as RequestRecord["body"]) : {};
 			requests.push({
 				url,
-				method: init?.method ?? "GET",
-				headers: new Headers(init?.headers),
+				method: request.method,
+				headers: new Headers(request.headers),
 				body,
 			});
 
@@ -55,7 +57,7 @@ function installMcpFetch(
 				body.method === (options?.authMethod ?? "initialize") &&
 				authUrls.has(url) &&
 				(requireAuthHeader
-					? new Headers(init?.headers).get("authorization") !== "Bearer fresh-token"
+					? request.headers.get("authorization") !== "Bearer fresh-token"
 					: !failedInitializations.has(url))
 			) {
 				failedInitializations.add(url);
@@ -93,6 +95,7 @@ function installMcpFetch(
 				return jsonResponse({ jsonrpc: "2.0", id: body.id, result: { tools: options?.tools ?? [] } });
 			}
 			if (body.method === "resources/list") {
+				await options?.catalogsReady;
 				return jsonResponse({
 					jsonrpc: "2.0",
 					id: body.id,
@@ -103,6 +106,7 @@ function installMcpFetch(
 				return jsonResponse({ jsonrpc: "2.0", id: body.id, result: { resourceTemplates: [] } });
 			}
 			if (body.method === "prompts/list") {
+				await options?.catalogsReady;
 				return jsonResponse({ jsonrpc: "2.0", id: body.id, result: { prompts: [{ name: "review" }] } });
 			}
 			if (body.method === "tools/call") {
@@ -110,6 +114,13 @@ function installMcpFetch(
 					jsonrpc: "2.0",
 					id: body.id,
 					result: { content: [{ type: "text", text: `Result from ${url}` }] },
+				});
+			}
+			if (body.id !== undefined) {
+				return jsonResponse({
+					jsonrpc: "2.0",
+					id: body.id,
+					error: { code: -32601, message: "Method not found" },
 				});
 			}
 			return new Response(null, { status: 202 });
@@ -127,8 +138,15 @@ function httpConfig(url: string, enabled?: boolean): MCPHttpServerConfig {
 const ROOTLY_URL = "https://mcp.rootly.test/mcp-codemode";
 const SENTRY_URL = "https://mcp.sentry.test/mcp";
 
+async function seedCatalog(name: string, config: MCPServerConfig): Promise<MCPManager> {
+	const manager = new MCPManager(process.cwd());
+	await manager.connectServers({ [name]: config }, {}, undefined, 0);
+	return manager;
+}
+
 describe("MCP startup OAuth", () => {
-	afterEach(() => {
+	afterEach(async () => {
+		await disposeLocalMcpHost();
 		vi.restoreAllMocks();
 	});
 
@@ -201,6 +219,9 @@ describe("MCP startup OAuth", () => {
 				]);
 				expect(handler).not.toHaveBeenCalled();
 				const healthyConnection = manager.getConnection("rootly");
+				const healthyInitializations = requests.filter(
+					request => request.url === ROOTLY_URL && request.body.method === "initialize",
+				);
 				const liveSnapshots: string[][] = [];
 				const unsubscribe = manager.addConnectionStatusListener(() => {
 					liveSnapshots.push([...manager.getConnectionStatusSnapshot().connectedServers]);
@@ -214,7 +235,7 @@ describe("MCP startup OAuth", () => {
 				expect(manager.getConnection("rootly")).toBe(healthyConnection);
 				expect(
 					requests.filter(request => request.url === ROOTLY_URL && request.body.method === "initialize"),
-				).toHaveLength(1);
+				).toEqual(healthyInitializations);
 				expect(manager.getTools().map(tool => tool.name)).toEqual(["mcp__rootly_lookup", "mcp__sentry_lookup"]);
 				expect(manager.getPendingAuthServers()).toEqual([]);
 				expect(manager.getConnectionStatusSnapshot().failedServers).toEqual([]);
@@ -326,53 +347,51 @@ describe("MCP startup OAuth", () => {
 		}
 	});
 
-	test("keeps cached tools when signed-out background discovery fails without opening authorization", async () => {
+	test("exposes a cached catalog without authorizing a now-signed-out upstream", async () => {
 		const cachedTools: MCPToolDefinition[] = [{ name: "lookup", inputSchema: { type: "object", properties: {} } }];
-		const toolCache = {
-			get: async () => cachedTools,
-			set: async () => {},
-		} as unknown as MCPToolCache;
-		const manager = new MCPManager(process.cwd(), toolCache);
 		const config = httpConfig(SENTRY_URL);
-		const { requests } = installMcpFetch(new Set([SENTRY_URL]));
+		const authUrls = new Set<string>();
+		const { requests } = installMcpFetch(authUrls, new Map(), true, { tools: cachedTools });
+		const seed = await seedCatalog("sentry", config);
+		authUrls.add(SENTRY_URL);
+		const offset = requests.length;
+		const manager = new MCPManager(process.cwd());
 		const handler = vi.fn(async () => ({ ...config, headers: { Authorization: "Bearer fresh-token" } }));
 		manager.setAuthHandler(handler);
-
 		try {
-			const result = await manager.connectServers({ sentry: config }, {});
+			const result = await manager.connectServers({ sentry: config }, {}, undefined, 0);
 			expect(result.errors.has("sentry")).toBe(false);
 			expect(result.tools.map(tool => tool.name)).toEqual(["mcp__sentry_lookup"]);
-			await manager.waitForPendingConnections();
-			expect(requests.filter(request => request.body.method === "initialize")).toHaveLength(1);
+			expect(requests.slice(offset).some(request => request.body.method === "initialize")).toBe(false);
 			expect(handler).not.toHaveBeenCalled();
-			expect(manager.getTools().map(tool => tool.name)).toEqual(["mcp__sentry_lookup"]);
 		} finally {
 			await manager.disconnectAll();
+			await seed.disconnectAll();
 		}
 	});
 
-	test("loads prompts and resources behind cached tools without waiting for initialization", async () => {
+	test("exposes cached tools while resource and prompt hydration is pending", async () => {
 		const gate = Promise.withResolvers<void>();
 		const cachedTools: MCPToolDefinition[] = [{ name: "lookup", inputSchema: { type: "object", properties: {} } }];
-		const toolCache = {
-			get: async () => cachedTools,
-			set: async () => {},
-		} as unknown as MCPToolCache;
-		const manager = new MCPManager(process.cwd(), toolCache);
-		installMcpFetch(new Set(), new Map(), false, { initialize: gate.promise, catalogs: true });
+		const config = httpConfig(SENTRY_URL);
+		installMcpFetch(new Set(), new Map(), false, {
+			tools: cachedTools,
+			catalogs: true,
+			catalogsReady: gate.promise,
+		});
+		const seed = await seedCatalog("catalog", config);
+		const manager = new MCPManager(process.cwd());
 		const kinds = new Set<string>();
 		const catalogsReady = Promise.withResolvers<void>();
 		manager.addCatalogChangeListener(event => {
 			kinds.add(event.kind);
 			if (kinds.has("resources") && kinds.has("prompts")) catalogsReady.resolve();
 		});
-
 		try {
-			const result = await manager.connectServers({ catalog: httpConfig(SENTRY_URL) }, {});
+			const result = await manager.connectServers({ catalog: config }, {}, undefined, 0);
 			expect(result.tools.map(tool => tool.name)).toEqual(["mcp__catalog_lookup"]);
-			expect(manager.getServerResources("catalog")).toBeUndefined();
-			expect(manager.getServerPrompts("catalog")).toBeUndefined();
-
+			expect(manager.getServerResources("catalog")?.resources).toEqual([]);
+			expect(manager.getServerPrompts("catalog") ?? []).toEqual([]);
 			gate.resolve();
 			await catalogsReady.promise;
 			expect(manager.getConnection("catalog")?.instructions).toBe("catalog guidance");
@@ -381,58 +400,58 @@ describe("MCP startup OAuth", () => {
 		} finally {
 			gate.resolve();
 			await manager.disconnectAll();
+			await seed.disconnectAll();
 		}
 	}, 15_000);
 
-	test("retains cached tools when background tools/list fails", async () => {
+	test("retains cached tools when a live catalog refresh fails", async () => {
 		const cachedTools: MCPToolDefinition[] = [{ name: "lookup", inputSchema: { type: "object", properties: {} } }];
-		const toolCache = {
-			get: async () => cachedTools,
-			set: async () => {},
-		} as unknown as MCPToolCache;
-		const manager = new MCPManager(process.cwd(), toolCache);
-		const { requests } = installMcpFetch(new Set(), new Map(), false, { failTools: true });
-
+		const options = { tools: cachedTools, failTools: false };
+		installMcpFetch(new Set(), new Map(), false, options);
+		const config = httpConfig(SENTRY_URL);
+		const seed = await seedCatalog("catalog", config);
+		const manager = new MCPManager(process.cwd());
 		try {
-			const result = await manager.connectServers({ catalog: httpConfig(SENTRY_URL) }, {});
-			expect(result.tools.map(tool => tool.name)).toEqual(["mcp__catalog_lookup"]);
-			await manager.waitForPendingConnections();
-			expect(requests.some(request => request.body.method === "tools/list")).toBe(true);
+			await manager.connectServers({ catalog: config }, {}, undefined, 0);
+			options.failTools = true;
+			await expect(manager.refreshServerTools("catalog")).rejects.toThrow();
 			expect(manager.getTools().map(tool => tool.name)).toEqual(["mcp__catalog_lookup"]);
-			expect(manager.getServerPrompts("catalog")).toBeUndefined();
 		} finally {
 			await manager.disconnectAll();
+			await seed.disconnectAll();
 		}
 	});
 
-	test("authorizes cached tools on first use when the server still requires credentials", async () => {
-		const cachedTools: MCPToolDefinition[] = [{ name: "lookup", inputSchema: { type: "object", properties: {} } }];
-		const toolCache = {
-			get: async () => cachedTools,
-			set: async () => {},
-		} as unknown as MCPToolCache;
-		const manager = new MCPManager(process.cwd(), toolCache);
+	test("authorizes a cached tool only when its upstream is first used", async () => {
+		const cachedTools: MCPToolDefinition[] = [
+			{
+				name: "lookup",
+				inputSchema: { type: "object", properties: {} },
+				annotations: { readOnlyHint: true },
+			},
+		];
 		const config = httpConfig(SENTRY_URL);
-		const { requests } = installMcpFetch(new Set([SENTRY_URL]), new Map(), true);
-		const handler = vi.fn(async () => ({
-			...config,
-			headers: { Authorization: "Bearer fresh-token" },
-		}));
+		const authUrls = new Set<string>();
+		const { requests } = installMcpFetch(authUrls, new Map(), true, { tools: cachedTools });
+		const seed = await seedCatalog("sentry", config);
+		authUrls.add(SENTRY_URL);
+		const manager = new MCPManager(process.cwd());
+		const handler = vi.fn(async () => ({ ...config, headers: { Authorization: "Bearer fresh-token" } }));
 		manager.setAuthHandler(handler);
-
 		try {
-			await manager.connectServers({ sentry: config }, {});
-			await manager.waitForPendingConnections();
-			expect(requests.filter(request => request.body.method === "initialize")).toHaveLength(1);
+			await manager.connectServers({ sentry: config }, {}, undefined, 0);
 			expect(handler).not.toHaveBeenCalled();
-
-			await manager.waitForConnection("sentry");
+			expect(manager.getConnection("sentry")?.tools?.[0]?.annotations?.readOnlyHint).toBe(true);
+			const tool = manager.getTools().find(tool => tool.mcpToolName === "lookup");
+			if (!tool) throw new Error("Cached lookup tool was not published");
+			const result = await tool.execute("cached-first-use", {}, () => {}, {} as Parameters<typeof tool.execute>[3]);
 			expect(handler).toHaveBeenCalledTimes(1);
+			expect(result.content).toEqual([{ type: "text", text: `Result from ${SENTRY_URL}` }]);
 			const initializations = requests.filter(request => request.body.method === "initialize");
-			expect(initializations).toHaveLength(2);
-			expect(initializations[1].headers.get("authorization")).toBe("Bearer fresh-token");
+			expect(initializations.at(-1)?.headers.get("authorization")).toBe("Bearer fresh-token");
 		} finally {
 			await manager.disconnectAll();
+			await seed.disconnectAll();
 		}
 	}, 15_000);
 

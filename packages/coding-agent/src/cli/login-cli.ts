@@ -8,14 +8,14 @@
  */
 import * as readline from "node:readline";
 import { getOAuthProviders } from "@oh-my-pi/pi-ai";
-import { getAgentDbPath, getProjectDir } from "@oh-my-pi/pi-utils";
+import { getProjectDir } from "@oh-my-pi/pi-utils";
 import chalk from "@oh-my-pi/pi-utils/chalk";
 import { ModelRegistry } from "../config/model-registry";
 import { assertOAuthLoginProviderAllowed, filterOAuthLoginProviders } from "../config/oauth-login-gate";
 import { Settings } from "../config/settings";
 import { ensureCoreforgeIdentityAtStartup } from "../identity/startup";
 import { discoverAuthStorage, loadCliExtensionProviders } from "../sdk";
-import { resolveAuthBrokerConfig } from "../session/auth-broker-config";
+import { credentialStoreLabel } from "../session/auth-broker-config";
 import { CF_COMMAND } from "./cf-version";
 import { formatLoginIdentity, pickOAuthProvider, runTerminalOAuthLogin } from "./oauth-terminal";
 
@@ -61,12 +61,8 @@ export async function runLoginCommand(provider: string | undefined): Promise<voi
 
 		const who = formatLoginIdentity(identity);
 		process.stdout.write(chalk.green(`\nLogged in to ${info.name}${who ? ` as ${who}` : ""}\n`));
-		const broker = await resolveAuthBrokerConfig();
-		process.stdout.write(
-			chalk.dim(
-				broker ? `Credentials saved to auth broker ${broker.url}\n` : `Credentials saved to ${getAgentDbPath()}\n`,
-			),
-		);
+		const destination = await credentialStoreLabel(info.storeCredentialsAs ?? info.id);
+		process.stdout.write(chalk.dim(`Credentials saved to ${destination}\n`));
 	} catch (error) {
 		process.stderr.write(chalk.red(`Login failed: ${error instanceof Error ? error.message : String(error)}\n`));
 		process.exitCode = 1;

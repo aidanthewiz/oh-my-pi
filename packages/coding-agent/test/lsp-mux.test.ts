@@ -2,16 +2,20 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { IpcConnection, ipcEndpoint } from "@oh-my-pi/pi-natives";
+import { daemonClient, isolateDaemonForSmokeTest } from "../src/daemon/client";
+import type { DaemonClient, DaemonTunnel } from "../src/daemon/protocol";
+import { getOrCreateClient, holdSharedLsp, sendRequest, shutdownAll } from "../src/lsp/client";
 import { MessageFramer } from "../src/jsonrpc/message-framing";
 import {
-	MUX_CONNECT_METHOD,
-	MUX_PING_METHOD,
+	LSP_ACQUIRE_METHOD,
+	LSP_MODULE_KIND,
+	LSP_UNRESERVE_METHOD,
 	MUX_RESTART_METHOD,
-	type MuxConnectParams,
-	type MuxConnectResult,
+	muxServerKey,
+	type LspAcquireResult,
+	type LspServerParams,
 } from "../src/lsp/mux/protocol";
-import { LspMuxServer } from "../src/lsp/mux/server";
+import { workerEnvFromParent } from "../src/subprocess/worker-client";
 import { FileChangeType, type FileEvent } from "../src/lsp/types";
 import { fileToUri } from "../src/lsp/utils";
 
@@ -45,7 +49,7 @@ interface PublishDiagnosticsParams {
 }
 
 class MuxTestClient {
-	readonly #connection: IpcConnection;
+	readonly #connection: DaemonTunnel;
 	readonly #framer = new MessageFramer(Buffer.alloc(0));
 	readonly #pending = new Map<
 		string | number,
@@ -56,9 +60,9 @@ class MuxTestClient {
 	readonly #closed = Promise.withResolvers<void>();
 	#nextId = 1;
 
-	constructor(connection: IpcConnection) {
+	constructor(connection: DaemonTunnel) {
 		this.#connection = connection;
-		connection.startRaw(
+		connection.start(
 			chunk => {
 				this.#framer.push(chunk);
 				for (const text of this.#framer.drain(() => {})) this.#receive(JSON.parse(text) as RpcMessage);
@@ -68,10 +72,6 @@ class MuxTestClient {
 				this.#closed.resolve();
 			},
 		);
-	}
-
-	static async connect(endpoint: string): Promise<MuxTestClient> {
-		return new MuxTestClient(await IpcConnection.connect(endpoint, { framing: "raw" }));
 	}
 
 	request<T>(method: string, params?: unknown, id: string | number = this.#nextId++): Promise<T> {
@@ -100,24 +100,12 @@ class MuxTestClient {
 		return (await withTimeout(promise, `notification ${method}`)).params as T;
 	}
 
-	async waitForClose(idleMux?: LspMuxServer): Promise<void> {
-		if (!idleMux) return withTimeout(this.#closed.promise, "connection close");
-		const idle = Promise.withResolvers<void>();
-		let immediate: NodeJS.Immediate;
-		const checkIdle = (): void => {
-			if (idleMux.sessionCount === 0) idle.resolve();
-			else immediate = setImmediate(checkIdle);
-		};
-		immediate = setImmediate(checkIdle);
-		try {
-			await withTimeout(Promise.all([this.#closed.promise, idle.promise]), "connection close");
-		} finally {
-			clearImmediate(immediate);
-		}
+	async waitForClose(): Promise<void> {
+		return withTimeout(this.#closed.promise, "connection close");
 	}
 
 	destroy(): void {
-		this.#connection.destroy();
+		this.#connection.close();
 	}
 
 	#write(message: RpcMessage): void {
@@ -191,39 +179,60 @@ async function state(client: MuxTestClient): Promise<FakeState> {
 	return client.request<FakeState>("test/state");
 }
 
-describe("LspMuxServer", () => {
-	let server: LspMuxServer;
+describe("LSP sessions through the daemon module", () => {
+	let control: DaemonClient;
+	let restoreDaemon: (() => Promise<void>) | undefined;
 	let tmpDir: string;
-	let endpoint: string;
-	let connectParams: MuxConnectParams;
+	let connectParams: LspServerParams;
 	const clients: MuxTestClient[] = [];
 
 	beforeEach(async () => {
-		tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-lsp-mux-test-"));
-		endpoint = ipcEndpoint(tmpDir, "mux");
+		tmpDir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "omp-lsp-module-parity-")));
+		restoreDaemon = await isolateDaemonForSmokeTest();
+		control = await daemonClient();
 		connectParams = { command: process.execPath, args: ["--no-env-file", "run", fixturePath], cwd: tmpDir };
-		server = new LspMuxServer();
-		await server.listen(endpoint);
 	});
 
 	afterEach(async () => {
+		await shutdownAll();
 		for (const client of clients.splice(0)) client.destroy();
-		await server.shutdown();
+		await restoreDaemon?.();
 		await fs.rm(tmpDir, { recursive: true, force: true });
 	});
 
-	async function link(params = connectParams): Promise<{ client: MuxTestClient; connected: MuxConnectResult }> {
-		const client = await MuxTestClient.connect(endpoint);
+	async function link(
+		params = connectParams,
+		reuse = false,
+	): Promise<{
+		client: MuxTestClient;
+		connected: { spawned: boolean; pid: number };
+	}> {
+		let reservation: LspAcquireResult;
+		const deadline = Date.now() + 5_000;
+		for (;;) {
+			reservation = await control.call<LspAcquireResult>(LSP_MODULE_KIND, LSP_ACQUIRE_METHOD, params);
+			if (!reuse || reservation.key === muxServerKey(params)) break;
+			await control.call(LSP_MODULE_KIND, LSP_UNRESERVE_METHOD, reservation);
+			if (Date.now() >= deadline) throw new Error("Previous LSP session did not release its server");
+			await Bun.sleep(25);
+		}
+		const opened = await control.open({
+			kind: LSP_MODULE_KIND,
+			scope: reservation.scope,
+			key: reservation.key,
+			params: { ...params, spawnEnv: { ...workerEnvFromParent(), ...params.env } },
+		});
+		const pid = opened.unit.pids[0];
+		if (pid === undefined) throw new Error("LSP unit did not publish its process");
+		const client = new MuxTestClient(await control.attach(opened.unit.id, reservation.token));
 		clients.push(client);
-		const connected = await client.request<MuxConnectResult>(MUX_CONNECT_METHOD, params);
-		return { client, connected };
+		return { client, connected: { spawned: opened.created, pid } };
 	}
 
 	it("disconnects a malformed link without terminating other sessions", async () => {
 		const healthy = await link();
 		await initialize(healthy.client);
-		const malformed = await MuxTestClient.connect(endpoint);
-		clients.push(malformed);
+		const { client: malformed } = await link();
 		const closed = malformed.waitForClose();
 		malformed.sendRaw(Buffer.alloc(16 * 1024, 97));
 		await closed;
@@ -254,7 +263,7 @@ describe("LspMuxServer", () => {
 	it("rewrites initialize processId to the mux process", async () => {
 		const { client } = await link();
 		await initialize(client, 424242);
-		expect((await state(client)).processId).toBe(process.pid);
+		expect((await state(client)).processId).toBe(control.welcome.daemon.pid);
 	}, 10_000);
 
 	it("isolates equal request ids between sessions", async () => {
@@ -291,14 +300,24 @@ describe("LspMuxServer", () => {
 		async () => {
 			const previousSecret = Bun.env.OPENAI_API_KEY;
 			Bun.env.OPENAI_API_KEY = "managed-profile-sentinel";
+			const shared = holdSharedLsp(true);
 			try {
 				await Bun.write(path.join(tmpDir, ".env"), "OPENAI_API_KEY=managed-profile-sentinel\n");
-				const { client } = await link();
-				await initialize(client);
-				const childState = await state(client);
+				const client = await getOrCreateClient(
+					{
+						command: process.execPath,
+						args: ["--no-env-file", "run", fixturePath],
+						fileTypes: [".ts"],
+						rootMarkers: [],
+					},
+					tmpDir,
+					10_000,
+				);
+				const childState = (await sendRequest(client, "test/state", {}, undefined, 10_000)) as FakeState;
 				expect(childState.openAiKey).toBe("");
 				expect(childState.path).toBe(Bun.env.PATH ?? "");
 			} finally {
+				shared.release();
 				if (previousSecret === undefined) delete Bun.env.OPENAI_API_KEY;
 				else Bun.env.OPENAI_API_KEY = previousSecret;
 			}
@@ -340,10 +359,10 @@ describe("LspMuxServer", () => {
 			diagnostics: [{ message: "fake", severity: 2, range: expect.any(Object) }],
 		});
 
-		const closed = first.client.waitForClose(server);
+		const closed = first.client.waitForClose();
 		first.client.destroy();
 		await closed;
-		const second = await link();
+		const second = await link(connectParams, true);
 		expect(second.connected.spawned).toBe(false);
 		expect(second.connected.pid).toBe(first.connected.pid);
 		await initialize(second.client);
@@ -368,7 +387,7 @@ describe("LspMuxServer", () => {
 		await initialize(second.client, 424242, { probe: "B" });
 		expect((await state(second.client)).initializationOptions).toEqual({ probe: "B" });
 
-		const third = await link({ ...connectParams, initializationOptions: { probe: "A" } });
+		const third = await link({ ...connectParams, initializationOptions: { probe: "A" } }, true);
 		expect(third.connected.spawned).toBe(false);
 		expect(third.connected.pid).toBe(first.connected.pid);
 		await initialize(third.client, 424242, { probe: "A" });
@@ -384,12 +403,6 @@ describe("LspMuxServer", () => {
 		first.client.notify("exit");
 		await closed;
 		expect(await second.client.request<{ alive: boolean }>("test/echo", { alive: true })).toEqual({ alive: true });
-	}, 10_000);
-
-	it("answers muxPing before a link is bound", async () => {
-		const client = await MuxTestClient.connect(endpoint);
-		clients.push(client);
-		expect(await client.request<string>(MUX_PING_METHOD)).toBe("pong");
 	}, 10_000);
 
 	it("restarts only the calling session's server", async () => {
@@ -417,7 +430,7 @@ describe("LspMuxServer", () => {
 		first.client.destroy();
 		await firstClosed;
 
-		const second = await link();
+		const second = await link(connectParams, true);
 		expect(second.connected.spawned).toBe(false);
 		await initialize(second.client);
 		expect((await state(second.client)).workspaceFolders).toEqual([]);

@@ -136,6 +136,9 @@ export interface NativeAddonStatus {
 /** The addon behind this process's exports; `null` before a successful load. */
 export function nativeAddonStatus(): NativeAddonStatus | null;
 
+/** Resolve an exact loaded native class/function without opening or probing another addon. */
+export function nativeAddonPathFor(exportName: string, nativeExport: unknown): string | undefined;
+
 /**
  * Stub for an export the addon does not provide: `undefined` on a current
  * addon, a throwing function on a stale one.
@@ -170,5 +173,11 @@ export function reportStaleWorkspaceAddon(
 
 /** Actionable text for {@link missingNativeExport}. */
 export function missingNativeExportMessage(symbolName: string, addon?: NativeAddonStatus | null): string;
+
+/**
+ * Open one `.node` addon with `process.dlopen` and return its exports, as
+ * `require` does; unlike Bun's `require`, it loads from a path that holds `?`.
+ */
+export function openNativeAddon(candidate: string): Record<string, unknown>;
 
 export function loadNative(): Record<string, unknown>;
