@@ -1029,6 +1029,9 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 
 		if (winner.kind === "timeout" || winner.kind === "abort") {
 			acceptingChunks = false;
+			if (winner.kind === "timeout" && nativeOwnsTimeout) {
+				options?.commands?.abort?.();
+			}
 			const cleanupPromise = abortShell();
 			if (shellSession) {
 				unsettled = { run: runPromise, cleanup: cleanupPromise };

@@ -1091,7 +1091,7 @@ exit 64
 		},
 	);
 
-	it("aborts the shell without aborting its native signal when the JavaScript timeout fallback wins", async () => {
+	it("aborts and drains mounted commands without aborting the native signal when the timeout fallback wins", async () => {
 		// Compress the JS-side fallback timer (floored at 1000ms in the source) so
 		// the safety-net fires deterministically without a real 1s wait. Only long
 		// timers are shrunk — fs/subprocess setup keeps real scheduling — and the
@@ -1107,30 +1107,58 @@ exit 64
 		let clock = 0;
 		vi.spyOn(performance, "now").mockImplementation(() => (clock += 10_000));
 
+		const nativeRun = Promise.withResolvers<ShellRunResult>();
+		const commandAborted = Promise.withResolvers<void>();
+		const commandReleased = Promise.withResolvers<void>();
+		let commandSettled = false;
+		const watchdog = Promise.withResolvers<never>();
+		void watchdog.promise.catch(() => {});
+		const watchdogTimer = realSetTimeout(() => watchdog.reject(new Error("Mounted command was not cancelled")), 1000);
 		let nativeSignal: AbortSignal | undefined;
 		vi.spyOn(piNatives.Shell.prototype, "run").mockImplementation((options, onChunk) => {
 			if (options.signal instanceof AbortSignal) {
 				nativeSignal = options.signal;
 			}
+			void options.commands?.handler({ name: "held", argv: [], cwd: tempDir, stdin: "" });
 			onChunk?.(null, "streamed-before-timeout\n");
-			return Promise.withResolvers<never>().promise;
+			return nativeRun.promise;
 		});
 		const abortSpy = vi.spyOn(piNatives.Shell.prototype, "abort").mockResolvedValue();
 
-		const result = await executeBash("sleep 10", {
+		const pending = executeBash("held", {
 			cwd: tempDir,
 			timeout: 1000,
 			sessionKey: "explicit-timeout-keeps-native-signal",
+			commands: {
+				names: ["held"],
+				abort: () => commandAborted.resolve(),
+				handler: async () => {
+					await commandAborted.promise;
+					await commandReleased.promise;
+					commandSettled = true;
+					return { stdout: "", stderr: "", exitCode: 1 };
+				},
+			},
 		});
-
-		expect(result.cancelled).toBe(true);
-		expect(result.output).toContain("streamed-before-timeout");
-		expect(result.output).toContain("Command timed out after 1 seconds");
-		// Watchdog-win path: native never returned, so the result must be
-		// distinguishable from a confirmed empty run (#10308).
-		expect(result.output).toContain("the shell backend did not respond");
-		expect(nativeSignal?.aborted).toBe(false);
-		expect(abortSpy).toHaveBeenCalledTimes(1);
+		try {
+			await Promise.race([commandAborted.promise, watchdog.promise]);
+			expect(commandSettled).toBe(false);
+			commandReleased.resolve();
+			const result = await Promise.race([pending, watchdog.promise]);
+			expect(commandSettled).toBe(true);
+			expect(result.cancelled).toBe(true);
+			expect(result.output).toContain("streamed-before-timeout");
+			expect(result.output).toContain("Command timed out after 1 seconds");
+			expect(result.output).toContain("the shell backend did not respond");
+			expect(nativeSignal?.aborted).toBe(false);
+			expect(abortSpy).toHaveBeenCalledTimes(1);
+		} finally {
+			clearTimeout(watchdogTimer);
+			commandAborted.resolve();
+			commandReleased.resolve();
+			nativeRun.resolve({ exitCode: undefined, cancelled: true, timedOut: true });
+			await pending;
+		}
 	});
 
 	it("explicitly aborts an overlapping one-shot shell when timeout cleanup stalls", async () => {

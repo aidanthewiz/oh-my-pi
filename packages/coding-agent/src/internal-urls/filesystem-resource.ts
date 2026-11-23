@@ -32,11 +32,15 @@ const EXTENSION_BY_MIME: Record<string, string> = {
 };
 
 /**
- * Write a byte resource to a stable backing file and return its path, so `read`
- * handles it like any other file. The file keeps the URL's last path segment;
- * one without an extension gains the extension its MIME type implies.
+ * Write bytes into a private, read-scoped directory. The caller must dispose it
+ * after the file pipeline completes. Preserve the URL basename and inferred
+ * extension for format detection.
  */
-export async function writeResourceBackingFile(url: string, bytes: Uint8Array, mimeType: string): Promise<string> {
+export async function writeResourceBackingFile(
+	url: string,
+	bytes: Uint8Array,
+	mimeType: string,
+): Promise<AsyncDisposable & { path: string }> {
 	const root = await fs.realpath(os.tmpdir());
 	// Server URIs are often opaque (`repo://logo`), so take the last segment of the whole string.
 	let name = url.split(/[?#]/, 1)[0].split("/").filter(Boolean).at(-1) ?? "";
@@ -49,9 +53,18 @@ export async function writeResourceBackingFile(url: string, bytes: Uint8Array, m
 	if (!name || name === "." || name === "..") name = "resource";
 	const extension = EXTENSION_BY_MIME[mimeType.split(";")[0].trim().toLowerCase()];
 	if (extension && !path.extname(name)) name += extension;
-	const file = path.join(root, "omp-resource", Bun.hash(url).toString(16), name);
-	await Bun.write(file, bytes);
-	return file;
+	const directory = await fs.mkdtemp(path.join(root, "omp-resource-"));
+	const file = path.join(directory, name);
+	try {
+		await fs.writeFile(file, bytes, { flag: "wx", mode: 0o600 });
+	} catch (error) {
+		await fs.rm(directory, { recursive: true, force: true });
+		throw error;
+	}
+	return {
+		path: file,
+		[Symbol.asyncDispose]: () => fs.rm(directory, { recursive: true, force: true }),
+	};
 }
 
 /**

@@ -3691,9 +3691,9 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		if (typeof resource.content !== "string") {
 			// Bytes take the file pipeline under the URL's identity: images and documents by their
 			// content and type, anything else as a binary file (`:raw` reads it verbatim).
-			const backing = await writeResourceBackingFile(url, resource.content, resource.contentType);
-			const result = await this.#readFilesystemPath(backing, {
-				located: { ...target, path: backing },
+			await using backing = await writeResourceBackingFile(url, resource.content, resource.contentType);
+			const result = await this.#readFilesystemPath(backing.path, {
+				located: { ...target, path: backing.path },
 				question,
 				signal,
 				toolContext,
