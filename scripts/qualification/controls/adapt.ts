@@ -98,6 +98,11 @@ export function adaptFixture(id: string, raw: string, checkout: string): string 
 			"['--no-env-file', import.meta.path, bindingFile, 'cli-child', config]",
 			"[...(process.env.PI_COMPILED === 'true' ? [] : ['--no-env-file', import.meta.path]), bindingFile, 'cli-child', config]",
 		);
+		text = replaceOne(
+			text,
+			"  await runAuthBrokerCommand({ action: 'serve', flags: { bind: '127.0.0.1:0' } });",
+			"  utils.postmortem.installProcessHandlers();\n  await runAuthBrokerCommand({ action: 'serve', flags: { bind: '127.0.0.1:0' } });",
+		);
 	}
 	if (id === "browser") {
 		const puppeteerPath = Bun.resolveSync("puppeteer-core", checkout);

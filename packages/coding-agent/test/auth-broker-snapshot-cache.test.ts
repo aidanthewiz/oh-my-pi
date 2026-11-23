@@ -300,8 +300,9 @@ describe("discoverAuthStorage auth-broker snapshot cache", () => {
 			process.env.OMP_AUTH_BROKER_TOKEN = TOKEN;
 			process.env.OMP_AUTH_BROKER_SNAPSHOT_TTL_MS = "0";
 			let settled = false;
-			const retries: AuthBrokerStartupRetry[] = [];
-			const discovered = discoverAuthStorage(tempDir, { onBrokerRetry: retry => retries.push(retry) });
+			const deadline = Date.now() + 30_000;
+			const retryTimes: number[] = [];
+			const discovered = discoverAuthStorage(tempDir, { onBrokerRetry: () => retryTimes.push(Date.now()) });
 			const outcome = rejectionOf(discovered).finally(() => {
 				settled = true;
 			});
@@ -315,8 +316,11 @@ describe("discoverAuthStorage auth-broker snapshot cache", () => {
 			// At 30 s the deadline cancels the request in flight.
 			vi.advanceTimersByTime(1_000);
 			expect(await outcome).toBeInstanceOf(AuthBrokerError);
-			// Giving up is not reported as one more retry.
-			expect(retries).toEqual([]);
+			const retriesAtSettlement = retryTimes.length;
+			await turn();
+			// Valid transport retries can precede the deadline; terminal cancellation cannot add one.
+			expect(retryTimes).toHaveLength(retriesAtSettlement);
+			for (const at of retryTimes) expect(at).toBeLessThan(deadline);
 		} finally {
 			vi.useRealTimers();
 			hang.resolve(new Response(null, { status: 503 }));

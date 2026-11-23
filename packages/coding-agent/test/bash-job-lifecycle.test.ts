@@ -40,12 +40,12 @@ it.skipIf(process.platform === "win32")(
 		const script = path.join(cwd, "cleanup.sh");
 		await Bun.write(
 			script,
-			"trap 'sleep 0.2; printf cleaned >> cleaned; exit 0' TERM\nprintf 'ready\\n'\nwhile :; do :; done\n",
+			"trap 'sleep 0.2; printf cleaned >> cleaned; printf complete > cleanup-complete.tmp; mv cleanup-complete.tmp cleanup-complete; exit 0' TERM\nprintf 'ready\\n'\nwhile :; do :; done\n",
 		);
 		const ready = Promise.withResolvers<void>();
 		const result = await tool.execute(
 			"term-cleanup",
-			{ command: `sh ${JSON.stringify(script)}`, async: true, timeout: 0 },
+			{ command: `/bin/sh ${JSON.stringify(script)}`, async: true, timeout: 0 },
 			undefined,
 			update => {
 				if (update.content?.some(block => block.type === "text" && block.text.includes("ready"))) ready.resolve();
@@ -59,8 +59,7 @@ it.skipIf(process.platform === "win32")(
 		const watcher = fs.watch(cwd, { signal: watchAbort.signal });
 		const cleaned = (async () => {
 			for await (const event of watcher) {
-				// File creation can precede the trap's write.
-				if (event.filename === "cleaned" && (await fs.stat(cleanedPath)).size > 0) return true;
+				if (event.filename === "cleanup-complete") return true;
 			}
 			return false;
 		})();
