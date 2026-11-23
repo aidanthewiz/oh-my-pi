@@ -182,20 +182,20 @@ describe("omp browser-relay install", () => {
 	it("retains the running worker version when Chrome reloads a newer manifest", async () => {
 		// After reinstalling, a Chrome restart re-reads manifest.json but keeps running the old service worker.
 		const port = await findFreeCdpPort();
-		const hello = Promise.withResolvers<void>();
+		const updateStopped = Promise.withResolvers<void>();
 		relay = startRelayServer({
 			port,
 			token: SYNTHETIC_TOKEN,
 			group: false,
 			installRegistryFile: dir.join("installs.json"),
 			log: message => {
-				if (message === "extension connected") hello.resolve();
+				if (message === "extension update stopped") updateStopped.resolve();
 			},
 		});
 		const runningScript = (await relayExtensionFiles("18.6.1"))["background.js"];
 		const manifestOnDisk = JSON.parse((await relayExtensionFiles(VERSION))["manifest.json"]);
 		stopWorker = runExtensionWorker(runningScript, port, manifestOnDisk);
-		await hello.promise;
+		await updateStopped.promise;
 		const response = await fetch(`http://127.0.0.1:${port}/json/version?token=${SYNTHETIC_TOKEN}`);
 		expect(response.status).toBe(200);
 		expect(await response.json()).toMatchObject({ ompExtensionVersion: "18.6.1" });

@@ -24,7 +24,7 @@ const MODERN = "modern";
 const LEGACY = "legacy";
 const DAEMON_TEST_TIMEOUT_MS = 60_000;
 const WAIT_MS = 15_000;
-/** Linger of the unleased modern unit: long enough to observe it running, short enough to wait out. */
+/** Quiet window for the modern upstream and its unleased unit. */
 const IDLE_MS = 1_500;
 
 const noop = () => {};
@@ -83,9 +83,16 @@ describe.skipIf(process.platform === "win32")("MCP through the daemon", () => {
 	});
 
 	async function connect(): Promise<void> {
+		// A resource subscription, not a bare link, keeps the modern process in use.
+		manager.setNotificationsEnabled(true);
 		harness.track((await daemonClient()).welcome.daemon.pid);
 		await manager.connectServers(CONFIGS, {});
 		expect((await manager.waitForStartup(0)).connected.sort()).toEqual([LEGACY, MODERN]);
+		await waitFor(
+			() => manager.getNotificationState().subscriptions.get(MODERN)?.has("fixture://one"),
+			"modern resource subscription",
+			WAIT_MS,
+		);
 	}
 
 	async function call(server: string, toolName: string): Promise<string> {

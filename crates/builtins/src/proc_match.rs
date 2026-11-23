@@ -386,7 +386,9 @@ async fn wait_for_watchable_exits(
 		if process.status() == proc_snapshot::ProcessStatus::Exited {
 			continue;
 		}
-		match AsyncFd::with_interest(fd, Interest::READABLE) {
+		// SAFETY: the uniquely owned pidfd moves into AsyncFd and is never
+		// replaced or closed while its readiness registration exists.
+		match unsafe { AsyncFd::register_with_interest(fd, Interest::READABLE) } {
 			Ok(fd) => watched.push((process, fd)),
 			Err(_) => polled.push(process),
 		}

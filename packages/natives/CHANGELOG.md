@@ -9,6 +9,8 @@
 
 ### Fixed
 
+- Honor non-creating Linux file locks and the existing legacy-held refusal boundary through both native acquisition entry points.
+- Register owned Linux pidfds through Tokio's current readiness API without changing process identity checks or polling fallback.
 - Ignore replayed creation notifications in `entr` when the known file revision is unchanged, while preserving genuine writes, removals and conservative handling of unknown metadata.
 - Publish reftable commits atomically against the captured HEAD. Preserve concurrent commits, configured signing and hooks, author overrides, and selected-index ownership.
 - Preserve finite-stdin worker capability checks with `process.dlopen` addons without relying on `require.cache`.
