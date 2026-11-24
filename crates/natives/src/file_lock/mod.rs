@@ -47,7 +47,11 @@ pub struct FileLock {
 	inner: Option<platform::PlatformFileLock>,
 }
 
-fn acquire(path: &str, create: bool) -> io::Result<Option<platform::PlatformFileLock>> {
+fn acquire(
+	path: &str,
+	create: bool,
+	legacy_key: Option<&str>,
+) -> io::Result<Option<platform::PlatformFileLock>> {
 	#[cfg(unix)]
 	let inner = platform::try_acquire_with_create(path, create)?;
 	#[cfg(target_os = "windows")]
@@ -61,6 +65,19 @@ fn acquire(path: &str, create: bool) -> io::Result<Option<platform::PlatformFile
 	} else {
 		inner
 	};
+	#[cfg(target_os = "linux")]
+	let inner = {
+		let mut inner = inner;
+		if let (Some(lock), Some(key)) = (inner.as_mut(), legacy_key) {
+			let Some(legacy) = legacy_abstract::try_bind(key)? else {
+				return Ok(None);
+			};
+			lock.legacy = Some(legacy);
+		}
+		inner
+	};
+	#[cfg(not(target_os = "linux"))]
+	let _ = legacy_key;
 	Ok(inner)
 }
 
@@ -74,7 +91,7 @@ impl FileLock {
 		let path = path.to_str().ok_or_else(|| {
 			io::Error::new(io::ErrorKind::InvalidInput, "lock path is not valid UTF-8")
 		})?;
-		acquire(path, true).map(|inner| Self { inner })
+		acquire(path, true, None).map(|inner| Self { inner })
 	}
 
 	pub(crate) fn is_held_path(path: &str) -> io::Result<bool> {
@@ -89,10 +106,18 @@ impl FileLock {
 	/// File-backed Unix locks create their file by default. `create = false`
 	/// refuses symlinks and leaves missing files unacquired.
 	/// Name-only locks never create files.
+	///
+	/// On Linux, `legacy_key` also retains that exact old abstract identity
+	/// until release. It is never opened as a path. Other platforms ignore it.
 	#[napi(factory)]
-	pub fn try_acquire(path: JsString, create: Option<bool>) -> napi::Result<Self> {
+	pub fn try_acquire(
+		path: JsString,
+		create: Option<bool>,
+		legacy_key: Option<JsString>,
+	) -> napi::Result<Self> {
 		let path = js::utf8(path)?;
-		acquire(&path, create.unwrap_or(true))
+		let legacy_key = legacy_key.map(js::utf8).transpose()?;
+		acquire(&path, create.unwrap_or(true), legacy_key.as_deref())
 			.map(|inner| Self { inner })
 			.map_err(|error| {
 				napi::Error::from_reason(format!(
@@ -182,12 +207,14 @@ mod tests {
 		let path = unique_lock_path("probe");
 		let path = path.as_str();
 		assert!(!is_held(path).expect("probe unlocked path"));
-		let mut lease = acquire(path, true).expect("acquire").expect("free lease");
+		let mut lease = acquire(path, true, None)
+			.expect("acquire")
+			.expect("free lease");
 		assert!(is_held(path).expect("probe held path"));
 		lease.release().expect("release");
 		assert!(!is_held(path).expect("probe released path"));
 		// A probe never leaves the path held for the next acquirer.
-		let mut successor = acquire(path, true)
+		let mut successor = acquire(path, true, None)
 			.expect("reacquire")
 			.expect("probe left the lease free");
 		successor.release().expect("release successor");
@@ -217,7 +244,7 @@ mod tests {
 		assert!(FileLock::is_held_path(&path).expect("probe while the older build holds it"));
 		for create in [false, true] {
 			assert!(
-				super::acquire(&path, create)
+				super::acquire(&path, create, None)
 					.expect("shared acquisition")
 					.is_none()
 			);
@@ -229,5 +256,72 @@ mod tests {
 		assert!(lock.is_acquired());
 		lock.release_native().expect("release");
 		let _ = std::fs::remove_file(&path);
+	}
+
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn explicit_legacy_identity_is_owned_until_release_or_drop() {
+		use std::os::{
+			linux::net::SocketAddrExt,
+			unix::net::{SocketAddr, UnixDatagram},
+		};
+
+		use super::FileLock;
+
+		let root = tempfile::tempdir().expect("private lock directory");
+		let first_path = root.path().join("first.lock");
+		let second_path = root.path().join("second.lock");
+		std::fs::write(&first_path, []).expect("prepare first sidecar");
+		std::fs::write(&second_path, []).expect("prepare second sidecar");
+		let first_path = first_path.to_str().expect("UTF-8 sidecar");
+		let second_path = second_path.to_str().expect("UTF-8 sidecar");
+		let key = format!(
+			"omp-legacy-{} α",
+			root
+				.path()
+				.file_name()
+				.expect("directory name")
+				.to_string_lossy()
+		);
+		let address =
+			SocketAddr::from_abstract_name(super::memory_lock_name(&key).as_bytes()).expect("address");
+
+		let old_owner = UnixDatagram::bind_addr(&address).expect("old protocol owner");
+		assert!(
+			acquire(first_path, false, Some(&key))
+				.expect("old owner contention")
+				.is_none()
+		);
+		let mut file_only = acquire(first_path, false, None)
+			.expect("file-only acquisition")
+			.expect("failed compatibility acquisition released its file lease");
+		file_only.release().expect("release file-only lease");
+		drop(old_owner);
+
+		let mut owner =
+			FileLock { inner: acquire(first_path, false, Some(&key)).expect("new owner") };
+		assert!(owner.is_acquired());
+		assert_eq!(
+			UnixDatagram::bind_addr(&address)
+				.expect_err("new owner excludes old protocol")
+				.kind(),
+			std::io::ErrorKind::AddrInUse
+		);
+		assert!(
+			acquire(second_path, false, Some(&key))
+				.expect("same identity with a different sidecar")
+				.is_none()
+		);
+		let mut second_file = acquire(second_path, false, None)
+			.expect("second file-only acquisition")
+			.expect("contended identity released the second file lease");
+		second_file.release().expect("release second file");
+		owner.release_native().expect("release both identities");
+		drop(UnixDatagram::bind_addr(&address).expect("old protocol after release"));
+
+		let owner = FileLock { inner: acquire(first_path, false, Some(&key)).expect("reacquire") };
+		assert!(owner.is_acquired());
+		drop(owner);
+		drop(UnixDatagram::bind_addr(&address).expect("old protocol after owner drop"));
 	}
 }

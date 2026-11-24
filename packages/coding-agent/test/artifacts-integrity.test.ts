@@ -23,6 +23,54 @@ describe("ArtifactManager write integrity", () => {
 		for (const dir of dirs.splice(0)) removeSyncWithRetries(dir);
 	});
 
+	it.skipIf(process.platform !== "linux")(
+		"publishes from fresh and hostile working directories without opening the legacy name",
+		async () => {
+			const root = freshDir();
+			const key = `coreforge-artifact-publication-v1-${os.userInfo().uid}`;
+			const code = `
+				import { writeArtifact } from ${JSON.stringify(new URL("../src/session/artifacts.ts", import.meta.url).href)};
+				await writeArtifact(process.argv[1], "complete child publication");
+			`;
+			for (const kind of ["missing", "regular", "fifo"]) {
+				const cwd = path.join(root, kind);
+				await fsPromises.mkdir(cwd, { recursive: true });
+				const legacyPath = path.join(cwd, key);
+				if (kind === "regular") await fsPromises.writeFile(legacyPath, "unrelated working-directory file");
+				if (kind === "fifo") {
+					const madeFifo = Bun.spawnSync(["mkfifo", legacyPath], { env: { PATH: "/usr/bin:/bin" } });
+					expect(madeFifo.exitCode).toBe(0);
+				}
+				const destination = path.join(cwd, "published.md");
+				const child = Bun.spawn([process.execPath, "-e", code, destination], {
+					cwd,
+					env: { HOME: cwd, TMPDIR: cwd, PATH: "/usr/bin:/bin" },
+					stdin: "ignore",
+					stdout: "pipe",
+					stderr: "pipe",
+				});
+				const deadline = setTimeout(() => child.kill(), 10_000);
+				try {
+					const [exit, stdout, stderr] = await Promise.all([
+						child.exited,
+						new Response(child.stdout).text(),
+						new Response(child.stderr).text(),
+					]);
+					expect({ exit, stdout, stderr }).toEqual({ exit: 0, stdout: "", stderr: "" });
+					expect(await fsPromises.readFile(destination, "utf8")).toBe("complete child publication");
+					if (kind === "missing") expect(fs.existsSync(legacyPath)).toBe(false);
+					if (kind === "regular")
+						expect(await fsPromises.readFile(legacyPath, "utf8")).toBe("unrelated working-directory file");
+					if (kind === "fifo") expect((await fsPromises.lstat(legacyPath)).isFIFO()).toBe(true);
+				} finally {
+					clearTimeout(deadline);
+					if (child.exitCode === null) child.kill();
+					await child.exited;
+				}
+			}
+		},
+	);
+
 	it("keeps large spills scoped to the restored live owner with bounded reads", async () => {
 		const manager = SessionManager.inMemory();
 		dirs.push(manager.getArtifactManager().dir);

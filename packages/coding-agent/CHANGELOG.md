@@ -24,6 +24,7 @@
 
 ### Fixed
 
+- Keep Linux artifact publication on a secure persistent sidecar while retaining the previous abstract lock identity until release.
 - Preserve actionable MCP authentication readiness across asynchronous startup, late subscriptions, native CLI checks, and truncated HTTP diagnostics. Offer Authenticate / Not now without cached tools, startup browsers, or editor focus changes.
 - Cancel mounted commands when the native-timeout backstop fires, then drain their cleanup without aborting the native result signal.
 - Keep binary MCP resource reads in separate private backing files and release each file after its reader finishes or fails.

@@ -318,8 +318,11 @@ export declare class FileLock {
    * File-backed Unix locks create their file by default. `create = false`
    * refuses symlinks and leaves missing files unacquired.
    * Name-only locks never create files.
+   *
+   * On Linux, `legacy_key` also retains that exact old abstract identity
+   * until release. It is never opened as a path. Other platforms ignore it.
    */
-  static tryAcquire(path: string, create?: boolean | undefined | null): FileLock
+  static tryAcquire(path: string, create?: boolean | undefined | null, legacyKey?: string | undefined | null): FileLock
   /**
    * Whether any handle, in any process including this one, holds `path`.
    *

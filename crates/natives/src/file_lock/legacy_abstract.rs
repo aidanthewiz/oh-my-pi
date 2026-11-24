@@ -6,6 +6,16 @@ use std::{
 	},
 };
 
+/// Acquire the exact old abstract identity without interpreting it as a path.
+pub fn try_bind(key: &str) -> io::Result<Option<UnixDatagram>> {
+	let address = SocketAddr::from_abstract_name(super::memory_lock_name(key).as_bytes())?;
+	match UnixDatagram::bind_addr(&address) {
+		Ok(socket) => Ok(Some(socket)),
+		Err(error) if error.kind() == io::ErrorKind::AddrInUse => Ok(None),
+		Err(error) => Err(error),
+	}
+}
+
 /// Whether an older omp build holds `path` by binding its abstract-socket
 /// name. `connect(2)` resolves the name without binding it. An LSM or seccomp
 /// policy can refuse that connect (`EACCES`/`EPERM`); the probe then cannot

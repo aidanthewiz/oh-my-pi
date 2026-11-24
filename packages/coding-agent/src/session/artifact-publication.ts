@@ -20,16 +20,15 @@ interface PublicationScope {
 
 const publicationScope = new AsyncLocalStorage<PublicationScope>();
 
-function publicationLockName(): string {
+function publicationLockTarget(): { path: string; legacyKey?: string } {
 	const user = userInfo();
 	if (process.platform === "win32") {
 		const identity = createHash("sha256").update(`${user.username}\0${user.homedir}`.toLowerCase()).digest("hex");
-		return `coreforge-artifact-publication-v1-${identity}`;
+		return { path: `coreforge-artifact-publication-v1-${identity}` };
 	}
 	const name = `coreforge-artifact-publication-v1-${user.uid}`;
-	if (process.platform === "linux") return name;
 
-	// HOME, TMPDIR and artifact paths cannot select a different lease namespace.
+	// HOME, TMPDIR, CWD and artifact paths cannot select a different lease namespace.
 	const root = realpathSync("/tmp");
 	const rootStat = lstatSync(root);
 	if (!rootStat.isDirectory() || rootStat.uid !== 0 || (rootStat.mode & 0o1002) !== 0o1002)
@@ -55,7 +54,7 @@ function publicationLockName(): string {
 	if (!lockStat.isFile() || lockStat.uid !== user.uid || lockStat.nlink !== 1 || (lockStat.mode & 0o777) !== 0o600)
 		throw new Error("Artifact publication lock file is not private to this OS user.");
 	// This inode is persistent: unlinking it would split concurrent flock owners.
-	return lockPath;
+	return { path: lockPath, legacyKey: process.platform === "linux" ? name : undefined };
 }
 
 /** Serialize cooperating artifact writers and directory relocations for this OS user. */
@@ -67,10 +66,10 @@ export async function withArtifactPublicationLock<T>(
 	const inherited = publicationScope.getStore();
 	let lease = inherited?.active && inherited.lease.live ? inherited.lease : undefined;
 	if (!lease) {
-		const name = publicationLockName();
+		const target = publicationLockTarget();
 		for (;;) {
 			signal?.throwIfAborted();
-			const lock = FileLock.tryAcquire(name, false);
+			const lock = FileLock.tryAcquire(target.path, false, target.legacyKey);
 			if (lock.acquired) {
 				lease = { lock, holders: 0, live: true };
 				break;
