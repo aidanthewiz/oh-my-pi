@@ -1115,9 +1115,9 @@ return { value: await tab.value("#msg"), sent: await tab.evaluate(() => window.s
 		const session = makeSession();
 		const prelude = createBrowserPrelude(session);
 		const tabName = `fill-keyup-${crypto.randomUUID()}`;
-		// `#q` searches only on `keyup`, as CyberChef's operation search does, and its input spends the page's user
-		// activation on a popup; input in `#opens` and a keydown in `#hops` move focus to a button; a keydown in `#flip`
-		// makes it a checkbox; `#box` is a MathML element named like a text field.
+		// `#q` searches only on keyup. Its input may consume user activation on a popup, depending on
+		// Chrome's popup policy; the key notification must not renew activation once consumed.
+		// Other handlers move focus or change the field type before that notification.
 		const html = `<!doctype html><input id="q" value="old"><p id="results"></p><input id="opens"><input id="hops">
 <input id="flip"><button id="ok">OK</button><math><textarea id="box" tabindex="0"></textarea></math>
 <script>
@@ -1125,8 +1125,14 @@ window.events = [];
 for (const type of ["keydown", "keypress", "beforeinput", "input", "keyup", "click"]) {
   addEventListener(type, event => events.push([type, event.target.id, event.key ?? "", event.target.value].join(":")), true);
 }
-q.addEventListener("input", () => window.open()?.close());
-q.addEventListener("keyup", () => { results.textContent = q.value + " active:" + navigator.userActivation.isActive; });
+q.addEventListener("input", () => {
+  window.open()?.close();
+  window.activationAfterInput = navigator.userActivation.isActive;
+});
+q.addEventListener("keyup", () => {
+  results.textContent = q.value;
+  window.activationAtKeyup = navigator.userActivation.isActive;
+});
 opens.addEventListener("input", () => ok.focus());
 hops.addEventListener("keydown", () => ok.focus());
 flip.addEventListener("keydown", () => { flip.type = "checkbox"; });
@@ -1148,13 +1154,19 @@ const results = await tab.text("#results");
 await tab.fill("#opens", " ");
 await tab.fill("#hops", "x");
 await tab.fill("#flip", "x");
-return { boxKeys, results, events: await tab.evaluate(() => window.events) };`,
+return {
+  boxKeys,
+  results,
+  events: await tab.evaluate(() => window.events),
+  activationRenewed: await tab.evaluate(() => !window.activationAfterInput && window.activationAtKeyup)
+};`,
 					timeout: 25,
 				},
 				context,
 			);
 			expect(valueFrom<unknown>(result)).toEqual({
-				results: "to base64 active:false",
+				results: "to base64",
+				activationRenewed: false,
 				events: [
 					"beforeinput:q::",
 					"input:q::to base64",

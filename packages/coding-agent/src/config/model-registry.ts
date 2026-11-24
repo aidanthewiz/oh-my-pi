@@ -1039,8 +1039,14 @@ export class ModelRegistry {
 		if (this.#owner) return this.#owner.hydrateCredentialScopedModelCaches();
 		if (!this.#credentialScopedCacheHydration) {
 			const providerIds = new Set<string>();
-			for (const providerId of STARTUP_MODEL_CACHE_PROVIDER_IDS) {
-				if (isCredentialScopedModelCacheProvider(providerId)) providerIds.add(providerId);
+			for (const providerId of new Set([
+				...STARTUP_MODEL_CACHE_PROVIDER_IDS,
+				...this.#providerOverrides.keys(),
+				...this.#runtimeProviderOverrides.keys(),
+			])) {
+				if (isCredentialScopedModelCacheProvider(providerId) || this.#piNativeGateway(providerId)) {
+					providerIds.add(providerId);
+				}
 			}
 			this.#credentialScopedCacheHydration = this.#refreshRuntimeDiscoveries("offline", providerIds).catch(error => {
 				logger.debug("credential-scoped model cache hydration failed", {
@@ -1977,9 +1983,8 @@ export class ModelRegistry {
 	 * (`isCredentialScopedModelCacheProvider`), whose discovery writes hash the
 	 * credential in; those load only through their model manager.
 	 */
-	#resolveStartupModelCacheProviderId(providerId: string): string {
-		const gateway = this.#piNativeGateway(providerId);
-		if (gateway) return resolvePiNativeModelCacheProviderId(providerId, gateway);
+	#resolveStartupModelCacheProviderId(providerId: string): string | undefined {
+		if (this.#piNativeGateway(providerId)) return undefined;
 		const baseUrl =
 			this.#runtimeProviderOverrides.get(providerId)?.baseUrl ??
 			this.#providerOverrides.get(providerId)?.baseUrl ??
@@ -2009,6 +2014,7 @@ export class ModelRegistry {
 		using _cacheConnection = retainModelCacheConnection(this.#cacheDbPath);
 		for (const providerId of providerIds) {
 			const cacheProviderId = this.#resolveStartupModelCacheProviderId(providerId);
+			if (cacheProviderId === undefined) continue;
 			const cache = readModelCache<Api>(cacheProviderId, 24 * 60 * 60 * 1000, Date.now, this.#cacheDbPath);
 			const sharedCatalogProvider = MODELS_DEV_CATALOG_PROVIDER_ID_LOOKUP[providerId] === true;
 			const additiveSharedCatalogProvider = ADDITIVE_MODELS_DEV_CATALOG_PROVIDER_ID_LOOKUP[providerId] === true;
@@ -2176,8 +2182,7 @@ export class ModelRegistry {
 				const models = loaded.modelsByProvider.get(providerId) ?? [];
 				if (
 					providersWithAuthoritativeProjectCatalog(models).has(providerId) ||
-					AUTHORITATIVE_RUNTIME_CATALOG_PROVIDERS.has(providerId) ||
-					this.#piNativeGateway(providerId) !== undefined
+					AUTHORITATIVE_RUNTIME_CATALOG_PROVIDERS.has(providerId)
 				) {
 					this.#cachedAuthoritativeProviders.add(providerId);
 				}
@@ -3455,9 +3460,13 @@ export class ModelRegistry {
 			if (!gateway || disabledProviders.has(providerId) || configuredDiscoveryProviders.has(providerId)) continue;
 			if ((providerFilter && !providerFilter.has(providerId)) || this.#runtimeModelManagers.has(providerId))
 				continue;
-			const cacheProviderId = resolvePiNativeModelCacheProviderId(providerId, gateway);
-			// The same bearer the provider's pi-native streams carry.
-			const apiKey = await this.#resolveBuiltInDiscoveryApiKey(providerId, strategy, cacheProviderId, true);
+			// The namespace must use the same resolved bearer as the gateway request.
+			const apiKey = await this.#resolveBuiltInDiscoveryApiKey(providerId, strategy, undefined, true);
+			if (gateway.apiKey && !isAuthenticated(apiKey)) continue;
+			const cacheProviderId = resolvePiNativeModelCacheProviderId(providerId, {
+				baseUrl: gateway.baseUrl,
+				apiKey: isAuthenticated(apiKey) ? apiKey : undefined,
+			});
 			options.push(
 				piNativeModelManagerOptions({
 					providerId,

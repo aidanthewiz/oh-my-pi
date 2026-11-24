@@ -99,12 +99,12 @@ describe("native addon embedding", () => {
 import { extractEmbeddedAddons } from ${JSON.stringify(loaderPath)};
 import * as fs from "node:fs";
 fs.mkdirSync(${JSON.stringify(cacheDir)});
-extractEmbeddedAddons({
+const extracted = extractEmbeddedAddons({
 	files: embeddedAddon.files,
 	targetDir: ${JSON.stringify(cacheDir)},
 });
-console.log(JSON.stringify(embeddedAddon.files.map(file =>
-	fs.readFileSync(${JSON.stringify(cacheDir)} + "/" + file.filename, "utf8"))));
+console.log(JSON.stringify(extracted.map(file =>
+	fs.readFileSync(file, "utf8"))));
 `,
 			);
 			await Bun.build({ entrypoints: [entrypoint], outdir: outDir, target: "bun", files });

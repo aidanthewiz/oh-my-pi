@@ -303,14 +303,15 @@ describe("read image results on a native surface", () => {
 		return tool;
 	};
 
-	it("shows the file by path when Tern runs on this machine", async () => {
+	it("uses captured image bytes even when the local terminal advertises media paths", async () => {
 		setThemeInstance((await getThemeByName("dark"))!);
 		tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "tern-blobs-"));
 		harness = await TspHarness.start(tui => tui.addChild(readImage()), { blobDir: tempDir });
-		expect(harness.findAll(n => n.k === "media").map(n => n.p)).toEqual([
-			expect.objectContaining({ path: "/project/shots/frame.png" }),
-		]);
-		expect(harness.findAll(n => n.k === "image")).toEqual([]);
+		expect(harness.findAll(n => n.k === "media")).toEqual([]);
+		const images = harness.findAll(n => n.k === "image");
+		await harness.until(() => images.every(image => harness!.terminal.blobs.has((image.p as { blob: string }).blob)));
+		expect(images).toHaveLength(1);
+		expect(harness.terminal.blobs.get((images[0]!.p as { blob: string }).blob)).toEqual(Buffer.from(PNG, "base64"));
 	});
 
 	it("uploads the image when Tern runs on another machine, though it advertises media", async () => {

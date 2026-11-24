@@ -143,6 +143,7 @@ describe("AgentSession prewalk", () => {
 			extendedContext?: boolean;
 			primary?: Model;
 			target?: Model;
+			prewalkInherited?: boolean;
 			startupTarget?: Model;
 			tools?: AgentTool[];
 			registry?: Map<string, AgentTool>;
@@ -195,6 +196,7 @@ describe("AgentSession prewalk", () => {
 				options.armed === false
 					? undefined
 					: { target: options.startupTarget ?? target, thinkingLevel: Effort.Low },
+			prewalkInherited: options.prewalkInherited,
 			agentKind: options.agentKind,
 		});
 		session = created;
@@ -449,7 +451,12 @@ describe("AgentSession prewalk", () => {
 		const literal = { ...row, id: `${row.id}@sambanova` };
 		const manager = SessionManager.inMemory(tempDir.path());
 		manager.appendModelChange(selector, "prewalk");
-		const created = createLifecycleSession([], { sessionManager: manager, primary: literal, target });
+		const created = createLifecycleSession([], {
+			sessionManager: manager,
+			primary: literal,
+			target,
+			prewalkInherited: true,
+		});
 
 		expect(created.session.model?.id).toBe(created.primary.id);
 		expect(created.session.getPrewalkState()?.target.id).toBe(target.id);
@@ -466,7 +473,12 @@ describe("AgentSession prewalk", () => {
 		if (!source || !target) throw new Error("Expected routed prewalk models");
 		const manager = SessionManager.inMemory(tempDir.path());
 		manager.appendModelChange("openrouter/z-ai/glm-4.7", "prewalk");
-		const created = createLifecycleSession([], { sessionManager: manager, primary: source, target });
+		const created = createLifecycleSession([], {
+			sessionManager: manager,
+			primary: source,
+			target,
+			prewalkInherited: true,
+		});
 
 		if (armed) {
 			expect(created.session.getPrewalkState()?.target.compat).toEqual(target.compat);

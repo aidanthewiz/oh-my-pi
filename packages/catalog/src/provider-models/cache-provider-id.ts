@@ -59,19 +59,17 @@ const CREDENTIAL_SCOPED_MODEL_CACHE_PROVIDERS: Readonly<Record<string, true>> = 
 
 /**
  * Cache namespace for a provider's auth-gateway roster (`transport: "pi-native"`).
- * Scoped by gateway and configured bearer: a client-scoped gateway token lists
- * only its granted models and the roster replaces the provider's catalog, so
- * another gateway's or token's rows must never serve this one. `apiKey` is the
- * configured value (a literal, env name, or `!command`), never resolved, so
- * startup can name the namespace without running a command. Distinct from the
- * provider's own namespace, which holds its direct roster.
+ * Scoped by gateway and the resolved bearer used for discovery. Client-scoped
+ * tokens can expose different authoritative rosters even when the configured
+ * environment variable or command is unchanged. Distinct from the provider's
+ * own namespace, which holds its direct roster.
  */
 export function resolvePiNativeModelCacheProviderId(
 	providerId: string,
 	scope: { baseUrl: string; apiKey?: string },
 ): string {
 	const baseUrl = scope.baseUrl.trim().replace(/\/+$/, "");
-	return `${providerId}:pi-native-v1:${Bun.hash(`${scope.apiKey ?? ""}\u0000${baseUrl}`).toString(36)}`;
+	return `${providerId}:pi-native-v2:${Bun.hash(`${scope.apiKey ?? ""}\u0000${baseUrl}`).toString(36)}`;
 }
 
 /** Whether a provider's model-cache namespace requires its resolved credential. */

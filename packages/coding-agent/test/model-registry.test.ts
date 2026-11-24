@@ -388,7 +388,7 @@ describe("ModelRegistry", () => {
 			expect(
 				roleCandidatePool("web", scopedSettings, registry).map(model => `${model.provider}/${model.id}`),
 			).toEqual(["web/duckduckgo"]);
-			expect(roleCandidatePool("judge", scopedSettings, registry)).toEqual([]);
+			expect([...roleCandidatePool("judge", scopedSettings, registry)]).toEqual([]);
 		});
 	});
 
@@ -734,6 +734,85 @@ describe("ModelRegistry", () => {
 			expect(registry.find("openai-codex", kept.id)?.transport).toBe("pi-native");
 			expect(registry.find("openai-codex", pruned.id)).toBeUndefined();
 			expect(registry.find("openai-codex", otherProvider.id)).toBeUndefined();
+		});
+
+		test("pi-native gateway caches follow resolved credentials through rotation and offline hydration", async () => {
+			const envName = `OMP_TEST_GATEWAY_${crypto.randomUUID().replaceAll("-", "").toUpperCase()}`;
+			const requested: string[] = [];
+			const modelFor = (id: string) =>
+				buildModel({
+					id,
+					name: id,
+					provider: "openai",
+					api: "openai-responses",
+					baseUrl: "https://example.invalid",
+					reasoning: false,
+					input: ["text"],
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+					contextWindow: 8192,
+					maxTokens: 1024,
+				});
+			const rosters = new Map([
+				["Bearer gateway-a", modelFor("client-a-only")],
+				["Bearer gateway-b", modelFor("client-b-only")],
+			]);
+			const server = Bun.serve({
+				port: 0,
+				fetch(request) {
+					if (new URL(request.url).pathname !== "/v1/pi/models") return new Response("Not Found", { status: 404 });
+					const authorization = request.headers.get("Authorization") ?? "";
+					requested.push(authorization);
+					const model = rosters.get(authorization);
+					return model
+						? Response.json({ models: [toPiNativeModelSpec(model)] })
+						: new Response("Unauthorized", { status: 401 });
+				},
+			});
+			const cacheDbPath = path.join(tempDir, "gateway-models.db");
+			writeRawModelsJson({
+				openai: { baseUrl: `http://127.0.0.1:${server.port}`, apiKey: envName, transport: "pi-native" },
+			});
+			const registry = () =>
+				new ModelRegistry(authStorage, modelsJsonPath, {
+					cacheDbPath,
+					fetch: (input, init) => {
+						const request = new Request(input instanceof Request ? input.url : String(input), init);
+						if (new URL(request.url).origin !== `http://127.0.0.1:${server.port}`) {
+							throw new Error(`Unexpected gateway request: ${request.url}`);
+						}
+						return fetch(request);
+					},
+				});
+			try {
+				Bun.env[envName] = "gateway-a";
+				const first = registry();
+				await first.refreshProvider("openai", "online");
+				expect(requested).toEqual(["Bearer gateway-a"]);
+				expect(first.find("openai", "client-a-only")).toBeDefined();
+				expect(first.find("openai", "client-b-only")).toBeUndefined();
+
+				Bun.env[envName] = "gateway-b";
+				const rotated = registry();
+				expect(rotated.find("openai", "client-a-only")).toBeUndefined();
+				await rotated.refreshProvider("openai", "online-if-uncached");
+				expect(rotated.find("openai", "client-a-only")).toBeUndefined();
+				expect(rotated.find("openai", "client-b-only")).toBeDefined();
+				expect(requested).toEqual(["Bearer gateway-a", "Bearer gateway-b"]);
+
+				Bun.env[envName] = "gateway-a";
+				const hydrated = registry();
+				await hydrated.hydrateCredentialScopedModelCaches();
+				expect(hydrated.find("openai", "client-a-only")).toBeDefined();
+				expect(hydrated.find("openai", "client-b-only")).toBeUndefined();
+				Bun.env[envName] = "gateway-b";
+				await first.refreshProvider("openai", "offline");
+				expect(first.find("openai", "client-a-only")).toBeUndefined();
+				expect(first.find("openai", "client-b-only")).toBeDefined();
+				expect(requested).toEqual(["Bearer gateway-a", "Bearer gateway-b"]);
+			} finally {
+				delete Bun.env[envName];
+				await server.stop(true);
+			}
 		});
 	});
 

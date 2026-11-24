@@ -58,7 +58,7 @@ describe("createExtensionModelQuery", () => {
 	test("list() and resolve() honor the enabledModels allowlist", () => {
 		const settings = Settings.isolated({ enabledModels: ["anthropic/*"] });
 		const q = createExtensionModelQuery(registry(), settings, () => undefined);
-		expect(q.list()).toEqual([claude]);
+		expect([...q.list()]).toEqual([claude]);
 		expect(q.resolve("gpt-5.4")).toBeUndefined();
 	});
 

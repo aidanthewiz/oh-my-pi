@@ -26,6 +26,8 @@
 
 - Restore relay tracing and profiling restrictions during browser worker initialization.
 - Preserve configured upstream model pins through provider/model filtering and explicit CLI/SDK selection; a permitted base model no longer admits an unapproved pinned route.
+- Scope auth-gateway model caches to the resolved bearer, including token rotation and offline startup hydration, instead of sharing rosters by credential-setting text.
+- Align integration fixtures with content-addressed native extraction, captured image payloads, inherited prewalk state and queued model selection without relaxing production deadlines or authority guards.
 - Keep Linux artifact publication on its named kernel lease across sandboxed and ordinary processes, without filesystem prerequisites; preserve the prior abstract identity and non-Linux file protections.
 - Preserve actionable MCP authentication readiness across asynchronous startup, late subscriptions, native CLI checks, and truncated HTTP diagnostics. Offer Authenticate / Not now without cached tools, startup browsers, or editor focus changes.
 - Cancel mounted commands when the native-timeout backstop fires, then drain their cleanup without aborting the native result signal.

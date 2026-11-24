@@ -211,13 +211,8 @@ describe("git native", () => {
 		});
 		try {
 			await loaded.promise;
-			const ready = () => h.find(node => node.k === "diff" && JSON.stringify(node.p).includes("changed 5"));
-			for (let i = 0; i < 10 && !ready(); i++) {
-				await Promise.resolve();
-				h.tui.requestRender();
-				h.flush(10);
-			}
-			expect(ready()).toBeDefined();
+			const ready = () => h.find(node => (node.p as { role?: string } | undefined)?.role === "omp.app.git.diff");
+			await h.until(() => ready() !== undefined);
 			for (const key of keys) {
 				h.terminal.send(key);
 				h.flush();
@@ -275,7 +270,7 @@ describe("git native", () => {
 		kinds: readonly TspKind[] = TSP_KINDS,
 	) {
 		await initTheme();
-		// A blob cache marks the terminal as on this machine, able to open media paths.
+		// A local blob cache must not authorize reopening the asset's mutable source path.
 		await using blobDir = await TempDir.create("@omp-git-media-");
 		const h = await TspHarness.start(undefined, { cols: 150, rows: 40, kinds, blobDir: blobDir.path() });
 		const changed = file("assets/logo.png", area);
@@ -295,11 +290,9 @@ describe("git native", () => {
 		try {
 			const role = (n: { p?: unknown }) => (n.p as { role?: string } | undefined)?.role;
 			const shown = () => h.find(n => role(n) === "omp.app.git.compare" || n.k === "kv");
-			for (let i = 0; i < 10 && !shown(); i++) {
-				await Promise.resolve();
-				h.tui.requestRender();
-				h.flush(10);
-			}
+			await h.until(() => shown() !== undefined);
+			const images = h.findAll(n => n.k === "image").map(n => n.p as { blob: string });
+			await h.until(() => images.every(image => h.terminal.blobs.has(image.blob)));
 			return {
 				media: h
 					.findAll(n => n.k === "media")
@@ -307,6 +300,10 @@ describe("git native", () => {
 						const { path, rev, link } = n.p as { path: string; rev?: string; link?: string };
 						return { path, rev, link };
 					}),
+				images,
+				blobs: Object.fromEntries(
+					[...h.terminal.blobs].map(([id, bytes]) => [id, Buffer.from(bytes).toString("base64")]),
+				),
 				heads: h.findAll(n => role(n) === "omp.app.git.media-head").map(n => JSON.stringify(n.p)),
 				notes: h.findAll(n => role(n) === "omp.app.git.media-none").map(n => JSON.stringify(n.p)),
 				kv: h.find(n => n.k === "kv")?.p,
@@ -319,7 +316,7 @@ describe("git native", () => {
 		}
 	}
 
-	it("compares an unstaged image change as index and worktree media nodes when the terminal has media", async () => {
+	it("shows both captured payloads for an unstaged image without reopening media paths", async () => {
 		const shown = await describeImageChange("unstaged", {
 			kind: "asset",
 			old: pngSide,
@@ -327,15 +324,14 @@ describe("git native", () => {
 			oldRef: { path: "/repo/assets/logo.png", rev: ":0" },
 			newRef: { path: "/repo/assets/logo.png" },
 		});
-		expect(shown.media).toEqual([
-			{ path: "/repo/assets/logo.png", rev: ":0", link: "git-compare" },
-			{ path: "/repo/assets/logo.png", rev: undefined, link: "git-compare" },
-		]);
+		expect(shown.media).toEqual([]);
+		expect(shown.images).toHaveLength(2);
+		for (const image of shown.images) expect(shown.blobs[image.blob]).toBe(pngSide.image.data);
 		expect(shown.heads).toHaveLength(2);
 		expect(shown.kv).toBeUndefined();
 	});
 
-	it("compares a staged image change as HEAD and index media nodes when the terminal has media", async () => {
+	it("shows both captured payloads for a staged image without reopening HEAD or index paths", async () => {
 		const shown = await describeImageChange("staged", {
 			kind: "asset",
 			old: pngSide,
@@ -343,25 +339,26 @@ describe("git native", () => {
 			oldRef: { path: "/repo/assets/old-logo.png", rev: "HEAD" },
 			newRef: { path: "/repo/assets/logo.png", rev: ":0" },
 		});
-		expect(shown.media).toEqual([
-			{ path: "/repo/assets/old-logo.png", rev: "HEAD", link: "git-compare" },
-			{ path: "/repo/assets/logo.png", rev: ":0", link: "git-compare" },
-		]);
+		expect(shown.media).toEqual([]);
+		expect(shown.images).toHaveLength(2);
+		for (const image of shown.images) expect(shown.blobs[image.blob]).toBe(pngSide.image.data);
 		expect(shown.notes).toEqual([]);
 	});
 
-	it("shows an added image's missing side as a note beside its media node", async () => {
+	it("shows an added image's missing side beside its captured payload", async () => {
 		const shown = await describeImageChange("staged", {
 			kind: "asset",
 			old: { kind: "empty" },
 			new: pngSide,
 			newRef: { path: "/repo/assets/logo.png", rev: ":0" },
 		});
-		expect(shown.media).toEqual([{ path: "/repo/assets/logo.png", rev: ":0", link: "git-compare" }]);
+		expect(shown.media).toEqual([]);
+		expect(shown.images).toHaveLength(1);
+		expect(shown.blobs[shown.images[0]!.blob]).toBe(pngSide.image.data);
 		expect(shown.notes).toHaveLength(1);
 	});
 
-	it("falls back to the before/after facts when the terminal lacks media", async () => {
+	it("falls back to the before/after facts when the terminal lacks image support", async () => {
 		const shown = await describeImageChange(
 			"staged",
 			{
@@ -371,9 +368,11 @@ describe("git native", () => {
 				oldRef: { path: "/repo/assets/logo.png", rev: "HEAD" },
 				newRef: { path: "/repo/assets/logo.png", rev: ":0" },
 			},
-			TSP_KINDS.filter(kind => kind !== "media"),
+			TSP_KINDS.filter(kind => kind !== "image"),
 		);
 		expect(shown.media).toEqual([]);
+		expect(shown.images).toEqual([]);
+		expect(shown.blobs).toEqual({});
 		expect(JSON.stringify(shown.kv)).toContain("image 1×1");
 	});
 });

@@ -156,9 +156,11 @@ describe("AgentSession title fork", () => {
 		);
 		await titled;
 
-		expect(target.sessionName).toBe("🧪 FLAKY: Fix flaky park tests");
+		expect(target.sessionName).not.toContain("FLAKY:");
+		expect(target.sessionName).not.toContain("🧪");
+		expect(target.sessionManager.getSessionTitleCard()).toEqual({ code: "FLAKY", emoji: "🧪", nf: "nf-md-flask" });
 		expect(target.sessionManager.getEntries().filter(entry => entry.type === "title_change")).toEqual([
-			expect.objectContaining({ title: "🧪 FLAKY: Fix flaky park tests", source: "auto" }),
+			expect.objectContaining({ source: "auto" }),
 		]);
 	});
 

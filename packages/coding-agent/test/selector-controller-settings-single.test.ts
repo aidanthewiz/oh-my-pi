@@ -243,14 +243,16 @@ describe("single-instance menus", () => {
 		expect(selected).toHaveBeenCalledTimes(1);
 	});
 
-	it("replaces selection-only with an ordinary session model picker", () => {
+	it("replaces selection-only with an ordinary session model picker", async () => {
 		const { ui, shown } = overlayUi();
 		const model = createMockModel({ provider: "openai", id: "session-target" }).model;
 		const hostModel = createMockModel({ provider: "anthropic", id: "host-model" }).model;
 		const ctx = pickerContext(ui, [model], hostModel);
 		let appliedModel: Model = hostModel;
+		const applied = Promise.withResolvers<void>();
 		ctx.session.setModelTemporary = async next => {
 			appliedModel = next;
+			applied.resolve();
 		};
 		const selected = vi.fn();
 		const controller = new SelectorController(ctx);
@@ -269,6 +271,7 @@ describe("single-instance menus", () => {
 		selectionPicker.handleInput?.("\r");
 		expect(selected).not.toHaveBeenCalled();
 		shown[1]?.handleInput?.("\r");
+		await applied.promise;
 
 		expect(selected).not.toHaveBeenCalled();
 		expect(appliedModel.provider).toBe("openai");
