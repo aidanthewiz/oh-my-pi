@@ -24,6 +24,7 @@
 
 ### Fixed
 
+- Restore relay tracing and profiling restrictions during browser worker initialization.
 - Keep Linux artifact publication on its named kernel lease across sandboxed and ordinary processes, without filesystem prerequisites; preserve the prior abstract identity and non-Linux file protections.
 - Preserve actionable MCP authentication readiness across asynchronous startup, late subscriptions, native CLI checks, and truncated HTTP diagnostics. Offer Authenticate / Not now without cached tools, startup browsers, or editor focus changes.
 - Cancel mounted commands when the native-timeout backstop fires, then drain their cleanup without aborting the native result signal.

@@ -2203,6 +2203,7 @@ export class WorkerCore {
 		try {
 			this.#mode = payload.mode;
 			this.#ownsPage = ownsPage(payload);
+			this.#relay = payload.mode === "attach" && payload.relay === true;
 			this.#uploads = new UploadStaging(payload.uploadDir);
 			const puppeteer = await loadPuppeteerInWorker(payload.safeDir);
 			registerSemanticQueryHandlers(puppeteer);

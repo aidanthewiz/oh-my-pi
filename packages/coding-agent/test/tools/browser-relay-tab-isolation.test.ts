@@ -32,6 +32,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
 import { WorkerCore } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-worker";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools/index";
+import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { filterChildShellEnv, getProjectDir, getPuppeteerDir } from "@oh-my-pi/pi-utils";
 import { VERSION } from "@oh-my-pi/pi-utils/dirs";
 import puppeteer, { type Browser, type Page, type Protocol } from "puppeteer-core";
@@ -424,6 +425,29 @@ async function emptiedFrames(page: Page): Promise<number> {
 }
 
 describe.skipIf(!CHROMIUM_AVAILABLE)("relay tab ownership", () => {
+	it("refuses unavailable relay diagnostic domains without losing the tab", async () => {
+		const fixture = await launchRelayFixture();
+		const relay = await acquireBrowser({ kind: "relay", cdpUrl: fixture.cdpUrl }, { cwd: process.cwd() });
+		const name = `relay-diagnostic-domains-${process.pid}`;
+		try {
+			await acquireTab(name, relay, { url: `${fixture.origin}/first`, timeoutMs: 15_000 });
+			for (const method of ["traceStart", "profileStart"]) {
+				const failure = await runInTab(name, {
+					code: `await tab.${method}();`,
+					timeoutMs: 5_000,
+					session,
+				}).catch(error => error);
+				expect(failure).toBeInstanceOf(ToolError);
+			}
+			const result = await runInTab(name, { code: "return await tab.title();", timeoutMs: 5_000, session });
+			expect(result.returnValue).toBe("First");
+		} finally {
+			await releaseTab(name).catch(() => undefined);
+			await releaseBrowser(relay, { kill: false });
+			await fixture.close();
+		}
+	}, 60_000);
+
 	it("keeps another connection's cross-site frame alive when a page disables auto-attach", async () => {
 		const fixture = await launchRelayFixture();
 		let first: Browser | undefined;
