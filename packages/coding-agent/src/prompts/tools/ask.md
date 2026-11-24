@@ -10,9 +10,10 @@ Do not make optional suggestions or future execution prerequisites block work th
   - NEVER <script>, <style>, style=, or buttons (<button>, type="submit"): the UI supplies Submit and Cancel.
 - Every control needs a name; the submitted form data arrives as JSON `{"name": value}`.
 - One-of: `<input type="radio">`; many-of: type="checkbox"; long lists: <select>.
+  - One question = one `name`: every option repeats it with its own `value` (`name="store" value="sqlite"`, `name="store" value="redis"`). A different `name` per option makes each option a group of its own and submits two answers; ask refuses a <fieldset> that does that.
 - Wrap each control in a <label>; group a question in a <fieldset> with a <legend>, or put it in a <p> right before the group.
 - Radio and checkbox groups automatically get an "Other" free-text answer. NEVER add your own "Other" option or a text field for it.
-- Preselect your recommendation with checked/selected/value: those values are submitted if the user does not answer in time.
+- Preselect your recommendation with checked/selected/value. A timed-out form is incomplete: only explicit answers are retained, and they do not approve any pending operation.
 - Context the user needs to decide (findings, tradeoffs, diffs, drafts) goes inside the form: <p>, <ul>, <table>, <pre>.
 - Keep forms short: a few questions, 2–5 options each; ask follow-ups in a later call.
 - Answer values:

@@ -7,6 +7,12 @@
 - Authenticated the manual relay smoke against the configured authority and removed tokenized endpoint output.
 - Preserve active connections when unrelated extension storage changes.
 - Bind startup and hello callbacks to their originating socket.
+## [19.1.1] - 2026-11-23
+
+### Fixed
+
+- The side panel’s Connection settings now show the browser’s specific reason when it refuses the native host (for example, because native messaging is blocked by enterprise policy), instead of incorrectly suggesting that the host may be missing.
+
 ## [19.1.0] - 2026-11-21
 
 ### Breaking Changes

@@ -634,6 +634,8 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * post-turn steering.
 	 */
 	onTurnEnd?: (messages: AgentMessage[], signal?: AbortSignal, context?: AgentTurnEndContext) => Promise<void> | void;
+	/** Called synchronously when the loop pushes `turn_end` onto the event stream. */
+	onTurnEndEmitted?: () => void;
 
 	/**
 	 * Called once an assistant message is finalized from the model stream, before
@@ -1203,6 +1205,12 @@ export interface AgentTool<
 	 * obtains by delegating to this native tool through `ctx.invokeTool` follow this tool's contract.
 	 */
 	readonly delegationGuidance?: string;
+	/**
+	 * Whether `command` is traffic this tool must run itself rather than shell work.
+	 * Same-name extension replacements route pure session-tool command lines back
+	 * to the native transport host after their normal approval and event handlers.
+	 */
+	servesToolCommandLine?(command: string): boolean;
 	/**
 	 * On-demand documentation topics, readable as `help://<tool>/<topic>`.
 	 * Strings are markdown documents; JSON topics return their complete value.

@@ -148,6 +148,15 @@ export class RegisteredToolAdapter implements AgentTool<any, any, any> {
 		context?: AgentToolContext,
 	) {
 		if (!this.#isActive()) throw new Error("Extension owner is no longer active");
+		// Pure tool-command lines need the native transport even when a shell
+		// replacement does not delegate. Outer approval and event handlers still apply.
+		if (this.runner.servesToolCommandLine(this.registeredTool.definition.name, params)) {
+			return await this.runner.invokeNativeTool(this.registeredTool.definition.name, params, {
+				signal,
+				onUpdate,
+				callerContext: context,
+			});
+		}
 		// Bind the extension context to this tool's own name so `ctx.invokeTool` delegates to the
 		// native built-in of the same name (present only when this tool re-registers a built-in). The
 		// wrapper's own context, abort signal, and progress callback are inherited by the delegated

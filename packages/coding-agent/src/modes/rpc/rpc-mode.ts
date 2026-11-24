@@ -18,7 +18,7 @@ import type { Model } from "@oh-my-pi/pi-ai";
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
-import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
+import { routedModelsAreEqual } from "@oh-my-pi/pi-catalog/models";
 import { $env, isRecord, logger, Snowflake, toError } from "@oh-my-pi/pi-utils";
 import { assertOAuthLoginProviderAllowed, filterOAuthLoginProviders } from "../../config/oauth-login-gate";
 import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../../discovery/helpers";
@@ -63,6 +63,7 @@ import { requestTextPrediction, textPredictionBackend } from "../../predict/clie
 import type { AgentSession, AgentSessionEvent, NavigateTreeResult, PromptOptions } from "../../session/agent-session";
 import { SessionBusyError } from "../../session/agent-session";
 import type { AgentSessionHandle } from "../../session/agent-session-handle";
+import { disposeLocalMcpHost } from "../../mcp/host/local";
 import type { MCPManager } from "../../mcp/manager";
 import { reconnectMcpManagerServer } from "../../mcp/oauth-reauth";
 import type { RestoredQueuedMessage } from "../../session/agent-session-types";
@@ -1130,7 +1131,7 @@ export async function openRpcSession(
 	}
 	// A resumed session is bound to the model by the switch; an already-open or
 	// fresh one selects it as `set_model` would.
-	if (!cancelled && model && !modelsAreEqual(session.model, model)) await session.setModel(model);
+	if (!cancelled && model && !routedModelsAreEqual(session.model, model)) await session.setModel(model);
 	return {
 		cancelled,
 		resumed: !cancelled && latest !== null,
@@ -1777,6 +1778,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 		abortBuiltinCommands("RPC output delivery failed");
 		void drainBuiltinPersistence()
 			.then(() => session.dispose())
+			.finally(() => disposeLocalMcpHost())
 			.finally(() => process.exit(1));
 	});
 	outputWriter.write(
@@ -2226,8 +2228,12 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			sessionDictationBridge.dispose();
 			await liveBridge.stop();
 			await session.dispose();
+			// Releasing the session's leases starts private unit shutdown, but
+			// process.exit() cannot await the host's registered exit callback.
+			await disposeLocalMcpHost();
 		} catch (error) {
 			if (!persistenceFailure || error !== persistenceFailure) throw error;
+			await disposeLocalMcpHost();
 			// The notice frame this failure queued must reach the client before the
 			// process ends (review 3983906393).
 			await outputWriter.close();

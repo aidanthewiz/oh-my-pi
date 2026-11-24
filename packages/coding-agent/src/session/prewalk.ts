@@ -1,10 +1,11 @@
 import type { Agent, AgentMessage, AgentToolResult, AgentTurnEndContext } from "@oh-my-pi/pi-agent-core";
 import { invalidateMessageCache } from "@oh-my-pi/pi-agent-core/compaction";
 import type { Model, ToolResultMessage } from "@oh-my-pi/pi-ai";
-import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
+import { getUpstreamPin, modelsAreEqual, routedModelsAreEqual } from "@oh-my-pi/pi-catalog/models";
 import { logger, prompt } from "@oh-my-pi/pi-utils";
 import type { AutoPrewalkDecision } from "../auto-prewalk/classifier";
 import { cfgOffline } from "../config/auxiliary-model-policy";
+import { formatModelString, formatModelStringWithRouting } from "../config/model-resolver";
 import type { Settings } from "../config/settings";
 import type { LocalProtocolOptions } from "../internal-urls";
 import { resolveApprovedPlan } from "../plan-mode/approved-plan";
@@ -160,13 +161,20 @@ export class PrewalkCoordinator {
 		this.#disableModelFallback = options.disableModelFallback === true;
 		const prewalk = this.#disableModelFallback ? undefined : options.prewalk;
 		const handoff = prewalk ? host.sessionManager.getSessionLocalModelChange() : undefined;
-		const target = prewalk ? `${prewalk.target.provider}/${prewalk.target.id}` : undefined;
+		// A revived session still on the target its recorded handoff switched to has spent this prewalk;
+		// one that starts elsewhere (an explicit startup model, a fallback) keeps the arm.
+		const target = prewalk?.target;
 		const current = host.model();
 		const spent =
 			options.prewalkInherited === true &&
 			handoff?.role === PREWALK_MODEL_CHANGE_ROLE &&
-			handoff.model === target &&
-			`${current?.provider}/${current?.id}` === target;
+			target !== undefined &&
+			((handoff.model === formatModelStringWithRouting(target) && routedModelsAreEqual(current, target)) ||
+				// Legacy handoff entries omitted the upstream route, so they restore unpinned.
+				(handoff.model === formatModelString(target) &&
+					current !== undefined &&
+					modelsAreEqual(current, target) &&
+					getUpstreamPin(current) === undefined));
 		this.#prewalk = spent ? undefined : prewalk;
 		this.#planYolo = this.#disableModelFallback ? undefined : options.planYolo;
 		this.#autoSuppressed = options.suppressAutoPrewalk === true;
@@ -242,10 +250,8 @@ export class PrewalkCoordinator {
 
 	/** Whether the session still sits on the model and effort `handoff` switched to. */
 	#onHandoffTarget(handoff: PrewalkHandoff): boolean {
-		const current = this.#host.model();
 		return (
-			current?.provider === handoff.target.provider &&
-			current?.id === handoff.target.id &&
+			routedModelsAreEqual(this.#host.model(), handoff.target) &&
 			this.#host.configuredThinkingLevel() === handoff.targetThinkingLevel
 		);
 	}
@@ -442,7 +448,8 @@ export class PrewalkCoordinator {
 		if (!switched) {
 			// `disarm()` already reported its cancellation, and a newer arm owns what comes next.
 			if (disarmed || replaced) return;
-			if (!modelsAreEqual(this.#host.model(), target)) {
+			const current = this.#host.model();
+			if (!routedModelsAreEqual(current, target)) {
 				this.#host.emitNotice(
 					"info",
 					`Prewalk: cancelled the switch to ${target.provider}/${target.id}; the model or thinking level changed while it was switching.`,
@@ -512,13 +519,10 @@ export class PrewalkCoordinator {
 		if (active) {
 			this.#host.emitNotice(
 				"info",
-				`Prewalk: already armed for ${active.target.provider}/${active.target.id}, waiting for the first edit/write.`,
+				`Prewalk: already armed for ${formatModelStringWithRouting(active.target)}, waiting for the first edit/write.`,
 				"prewalk",
 			);
-			const matches =
-				active.target.provider === target.provider &&
-				active.target.id === target.id &&
-				active.thinkingLevel === thinkingLevel;
+			const matches = routedModelsAreEqual(active.target, target) && active.thinkingLevel === thinkingLevel;
 			if (matches) this.#autoArm = undefined;
 			return matches;
 		}
@@ -566,12 +570,7 @@ export class PrewalkCoordinator {
 	): Promise<PrewalkRestartResult> {
 		if (this.#disableModelFallback) return "rejected";
 		const active = this.#prewalk;
-		if (
-			active &&
-			(active.target.provider !== target.provider ||
-				active.target.id !== target.id ||
-				active.thinkingLevel !== targetThinkingLevel)
-		) {
+		if (active && (!routedModelsAreEqual(active.target, target) || active.thinkingLevel !== targetThinkingLevel)) {
 			this.arm(target, targetThinkingLevel);
 			return "rejected";
 		}

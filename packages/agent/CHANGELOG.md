@@ -17,6 +17,14 @@
 - Invalidate cached tool context when NUL-bearing names and descriptions form different identity tuples.
 - Recount cross-model Claude signed thinking when the same reader's endpoint or prefix-binding policy changes.
 - Count opaque reasoning payloads by Factory's selected request wire and invalidate estimates when that wire changes.
+## [19.1.1] - 2026-11-23
+
+### Fixed
+
+- Prevented oversized handoffs from reaching the provider by detecting when prepared context exceeds the target model’s context window.
+- Preserved provider error status, error identifiers, retry classification, and cancellation markers on failed or cancelled assistant turns.
+- Fixed speculative tool calls hanging when discarded or aborted before execution completed.
+
 ## [19.1.0] - 2026-11-21
 
 ### Added

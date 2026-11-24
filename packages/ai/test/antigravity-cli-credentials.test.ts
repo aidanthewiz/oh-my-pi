@@ -179,6 +179,61 @@ describe("Antigravity CLI credential ownership", () => {
 		});
 	});
 
+	it("verifies its own grant when another stage for the same account replaces the shared token file", async () => {
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "agy-credentials-"));
+		directories.push(directory);
+		const account = path.join(directory, agyCredentialKey(apiKey));
+		const rotated = JSON.stringify({ ...JSON.parse(apiKey), token: "rotated-access" });
+		const release = Promise.withResolvers<void>();
+		const parked = Promise.withResolvers<void>();
+		let parkedOnce = false;
+		let sawOwnGrant = false;
+		const realRename = fs.rename.bind(fs);
+		const realReadFile = fs.readFile.bind(fs);
+		vi.spyOn(fs, "rename").mockImplementation(async (source, dest) => {
+			await realRename(source, dest);
+			if (!parkedOnce && String(dest).endsWith("antigravity-oauth-token")) {
+				parkedOnce = true;
+				parked.resolve();
+				await release.promise;
+			}
+		});
+		vi.spyOn(fs, "readFile").mockImplementation((async (file: string, encoding?: BufferEncoding) => {
+			const text = await realReadFile(file, encoding ?? "utf8");
+			if (
+				String(file).endsWith("antigravity-oauth-token") &&
+				text.includes("fixture-access") &&
+				!text.includes("rotated-access")
+			) {
+				sawOwnGrant = true;
+			}
+			return text;
+		}) as typeof fs.readFile);
+		let first: ReturnType<typeof stageAgyCredentials> | undefined;
+		let overlapping: ReturnType<typeof stageAgyCredentials> | undefined;
+		try {
+			first = stageAgyCredentials(apiKey, account);
+			const observed = await Promise.race([
+				parked.promise.then(() => "parked" as const),
+				first.then(() => "finished" as const),
+			]);
+			expect(observed).toBe("parked");
+			overlapping = stageAgyCredentials(rotated, account);
+			release.resolve();
+			await first;
+			expect(sawOwnGrant).toBe(true);
+			await overlapping;
+			expect((await exportAgyCredentials(account)).access).toBe("rotated-access");
+		} finally {
+			release.resolve();
+			for (const staged of [first, overlapping]) {
+				const cleanup = await staged?.catch(() => undefined);
+				await cleanup?.();
+			}
+			vi.restoreAllMocks();
+		}
+	});
+
 	it("renders broker credentials with the local structured policy before staging", async () => {
 		const result = await getOAuthApiKey("antigravity-cli", {
 			"antigravity-cli": { ...grant, refresh: "__remote__" },

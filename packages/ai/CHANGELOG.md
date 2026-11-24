@@ -59,12 +59,36 @@
 - Preserved lease-owned account restrictions alongside durable credential admission, and kept branded callback errors inert during OAuth completion.
 - Kept official fallback-credit payloads off Factory routes and isolated Droid capture credentials without overriding account entitlements.
 - Preserve effective-endpoint fallback replay restrictions while collapsing incompatible Anthropic reasoning chains. Keep quoted prose during doubled-pipe DSML cleanup.
+## [19.1.1] - 2026-11-23
+
+### Added
+
+- Added `AssistantMessage.requestId`, populated from Anthropic’s `request-id` response header, so failed or refused requests retain the identifier needed for Anthropic support.
+- Added `GET /v1/pi/models` to `omp auth-gateway`, serving the gateway's model catalog (limits, thinking levels, pricing) to pi-native clients.
+
+### Changed
+
+- Devin account selection now prioritizes logins with remaining daily or weekly quota, then accounts funded by on-demand balance, while skipping accounts with no available capacity. Devin logins also track email, user ID, and organization so separate organizations are distinguishable in `omp usage` and `auth.accountPolicies`; existing logins must be reauthenticated to populate this information.
+- Billing failures from providers are now treated as usage limits, allowing retries to rotate accounts and continue through the model fallback chain.
+- Provider usage reports registered by extensions now persist across omp processes, avoiding unnecessary repeated usage-endpoint checks.
+- Requests that stall during provider operations are now classified as timeouts, allowing automatic fallback to another model.
+- Reduced idle memory usage by loading prompt-perturbation data only when perturbation is enabled for a request.
+
 ### Fixed
 
-- With several Devin logins, omp now prefers a login with daily or weekly quota left; a login past its quota that its on-demand balance still funds comes next, and one with no balance is skipped until its quota resets ([#19929](https://github.com/can1357/oh-my-pi/pull/19929) by [@will-bogusz](https://github.com/will-bogusz))
-- Devin logins now store the account's email, user id and organization, so two organizations under one email show as two accounts in `omp usage` and `auth.accountPolicies` can name each; sign in again to identify an existing login ([#19928](https://github.com/can1357/oh-my-pi/pull/19928) by [@will-bogusz](https://github.com/will-bogusz))
-- Anthropic requests with no messages now fail locally with the model, provider, and how many messages arrived, instead of a bare `400 "messages is required"` ([#19881](https://github.com/can1357/oh-my-pi/pull/19881) by [@FnSGit](https://github.com/FnSGit))
-- Usage reports of a provider an extension registers now survive across omp processes. Registering a provider's first usage adapter no longer discards the reports another process cached for it, so each new session stops re-probing the provider's usage endpoint; replacing an existing adapter still invalidates them ([#20030](https://github.com/can1357/oh-my-pi/pull/20030) by [@ahsanatha](https://github.com/ahsanatha))
+- Fixed split tool-call handling so models configured with `splitToolCalls` receive each tool call together with its corresponding result in the correct message order.
+- Fixed `apple/on-device` finish-reason handling so requests no longer emit spurious stderr warnings and correctly report recognized stop or length completions.
+- Improved local validation for empty Anthropic requests by reporting the model, provider, and received message count instead of an opaque provider error.
+- Fixed OpenAI and Codex requests failing on MCP tool schemas containing unsupported unescaped character patterns.
+- OpenRouter Responses requests that end in an unbilled encrypted reasoning item now surface the underlying provider failure instead of completing silently.
+- Fixed preservation of Gemini thought signatures across tool calls when using Portkey or the authentication gateway.
+- Fixed the thinking-loop guard incorrectly retrying final answers containing long Markdown tables or similarly shaped JSON records.
+- Fixed strict tool-schema conversion so object properties that accept arbitrary fields are not incorrectly restricted to empty objects.
+- Fixed `antigravity-cli` models failing to receive images returned by tools such as `read`.
+- Fixed transient proxy errors from disrupting snapshot streaming and disabling usage reporting for the remainder of the process.
+- Fixed concurrent Antigravity CLI sessions for the same account failing during credential staging.
+- Fixed OpenAI Codex WebSocket continuations so sticky turn routing information is preserved for subsequent requests.
+- Improved recovery from a corrupt `agent.db` so readable provider credentials are restored where possible and disabled credentials remain disabled.
 
 ## [19.1.0] - 2026-11-21
 
@@ -2701,3 +2725,4 @@ Older entries are archived in [packages/ai/CHANGELOG.md@80ad1d6b2eb3](https://gi
 Older entries are archived in [packages/ai/CHANGELOG.md@6d3c42d33f26](https://github.com/can1357/oh-my-pi/blob/6d3c42d33f261e22588fbb7a96bff5af83a2e90e/packages/ai/CHANGELOG.md).
 Older entries are archived in [packages/ai/CHANGELOG.md@f6e1fbe1c735](https://github.com/can1357/oh-my-pi/blob/f6e1fbe1c735f06b8084102619f59e44e6f61d0f/packages/ai/CHANGELOG.md).
 Older entries are archived in [packages/ai/CHANGELOG.md@de21c0ac454b](https://github.com/can1357/oh-my-pi/blob/de21c0ac454b1a66d8dfff32b0ed4751a08f809b/packages/ai/CHANGELOG.md).
+Older entries are archived in [packages/ai/CHANGELOG.md@02eb912b7688](https://github.com/can1357/oh-my-pi/blob/02eb912b76887f1a06bc65e2352ef96742ec1067/packages/ai/CHANGELOG.md).

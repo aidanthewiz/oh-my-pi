@@ -10,7 +10,11 @@ import { resolveModelCacheProviderId } from "@oh-my-pi/pi-catalog/provider-model
 import { DEFAULT_MODEL_PER_PROVIDER } from "@oh-my-pi/pi-catalog/provider-models/descriptors";
 import { parseArgs } from "@oh-my-pi/pi-coding-agent/cli/args";
 import { ModelRegistry, type ProviderConfigInput } from "@oh-my-pi/pi-coding-agent/config/model-registry";
-import { getModelMatchPreferences, resolveModelScope } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
+import {
+	formatModelStringWithRouting,
+	getModelMatchPreferences,
+	resolveModelScope,
+} from "@oh-my-pi/pi-coding-agent/config/model-resolver";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import {
 	buildSessionOptions as buildCliSessionOptions,
@@ -180,6 +184,33 @@ describe("createAgentSession deferred model pattern resolution", () => {
 		try {
 			expect(session.model).toBeUndefined();
 			expect(modelFallbackMessage).toContain('Model "runtime-provider/runtime-model" not found');
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	test("constrains an explicit model to configured upstream routes", async () => {
+		const authStorage = createInMemoryAuthStorage();
+		authStoragesToClose.push(authStorage);
+		authStorage.keys.setRuntime("openrouter", "test-key");
+		vi.spyOn(authStorage.keys, "prefetchUsage").mockResolvedValue(undefined);
+		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
+		const [requested] = await resolveModelScope(
+			["openrouter/z-ai/glm-4.7@sambanova"],
+			modelRegistry,
+			undefined,
+			Settings.isolated(),
+		);
+		if (!requested) throw new Error("Missing routed model fixture");
+		const { session } = await createAgentSession({
+			...buildSessionOptions(""),
+			authStorage,
+			modelRegistry,
+			model: requested.model,
+			settings: Settings.isolated({ enabledModels: ["openrouter/z-ai/glm-4.7@cerebras"] }),
+		});
+		try {
+			expect(session.model && formatModelStringWithRouting(session.model)).toBe("openrouter/z-ai/glm-4.7@cerebras");
 		} finally {
 			await session.dispose();
 		}
@@ -1691,6 +1722,62 @@ describe("createAgentSession deferred model pattern resolution", () => {
 				prefetchSpy.mockRestore();
 				getApiKeySpy.mockRestore();
 				await authStorage.close();
+			}
+		},
+	);
+
+	test.each(["default role", "discovered default role", "default retry chain"] as const)(
+		"honors enabledModels pins when selecting from the %s",
+		async source => {
+			const authStorage = createInMemoryAuthStorage();
+			authStoragesToClose.push(authStorage);
+			authStorage.keys.setRuntime("openrouter", "test-key");
+			const modelsPath = path.join(tempDir, "models.yml");
+			const discovery = source === "discovered default role";
+			const id = discovery ? "test/sdk-discovered-routing" : "z-ai/glm-4.7";
+			const selectors = [`openrouter/${id}@sambanova`, `openrouter/${id}@cerebras`] as const;
+			const retry = source === "default retry chain";
+			const settings = Settings.isolated({
+				enabledModels: [selectors[1]],
+				modelRoles: { default: retry ? "missing-provider/missing-model" : selectors.join(",") },
+				"retry.modelFallback": retry,
+				"retry.fallbackChains": retry ? { default: [...selectors] } : {},
+			});
+			if (discovery) {
+				await Bun.write(
+					modelsPath,
+					JSON.stringify({
+						providers: {
+							openrouter: {
+								baseUrl: "http://127.0.0.1:9995",
+								api: "openai-completions",
+								auth: "none",
+								discovery: { type: "openai-models-list" },
+							},
+						},
+					}),
+				);
+			}
+			let modelListCalls = 0;
+			const modelRegistry = new ModelRegistry(authStorage, modelsPath, {
+				fetch: async input => {
+					if (String(input) !== "http://127.0.0.1:9995/v1/models") throw new Error(`Unexpected URL: ${input}`);
+					modelListCalls++;
+					return Response.json({ data: [{ id, context_length: 65_536 }] });
+				},
+			});
+			const { session } = await createAgentSession({
+				...buildSessionOptions(""),
+				authStorage,
+				modelRegistry,
+				settings,
+				extensions: [],
+			});
+			try {
+				if (discovery) expect(modelListCalls).toBeGreaterThan(0);
+				expect(session.model && formatModelStringWithRouting(session.model)).toBe(selectors[1]);
+			} finally {
+				await session.dispose();
 			}
 		},
 	);

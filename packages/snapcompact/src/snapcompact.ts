@@ -2633,7 +2633,6 @@ export async function compact<TMessage = Message>(
 	await Bun.sleep(0);
 
 	const { high, includedPreviousSummary } = source;
-	const geo = geometry(high);
 	const planned = withLoopPhase(COMPACT_LOOP_PHASE, () => {
 		const layout = planArchive(source.archiveText, high, source.low, source.maxFrames);
 		// Re-render the planned frames, carrying any open dim span across every
@@ -2671,11 +2670,13 @@ export async function compact<TMessage = Message>(
 
 	const frames = await Promise.all(newFrames);
 	const totalChars = frames.reduce((sum, frame) => sum + frame.chars, 0) + textChars;
-	const frameCols: number[] = [];
-	for (const frame of frames) {
-		if (!frameCols.includes(frame.cols)) frameCols.push(frame.cols);
+	// Every grid the frames are drawn in, in reading order: when a long
+	// archive's middle uses the dense companion, its rows (and, from a Claude
+	// shape, columns) differ from the edge frames'.
+	const grids: { cols: number; rows: number }[] = [];
+	for (const { cols, rows } of frames) {
+		if (!grids.some(grid => grid.cols === cols && grid.rows === rows)) grids.push({ cols, rows });
 	}
-	const summaryCols = frameCols.length > 0 ? frameCols.join(" or ") : geo.cols;
 
 	const { readFiles, modifiedFiles } = computeFileLists(fileOps);
 	const files = formatFileList(readFiles, modifiedFiles, fileOps.read);
@@ -2688,8 +2689,7 @@ export async function compact<TMessage = Message>(
 			frameCount: frames.length,
 			multipleFrames: frames.length > 1,
 			docColumns: high.columns === 2,
-			cols: summaryCols,
-			rows: geo.rows,
+			grids,
 			sentenceInk: high.variant === "sent",
 			stopwordDimmed: high.stopwordDim === true,
 			lineRepeated: high.lineRepeat > 1,

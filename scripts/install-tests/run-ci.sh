@@ -11,14 +11,10 @@ TMP_WORK_DIR="$WORK_DIR/tmp"
 mkdir -p "$TMP_WORK_DIR"
 export TMPDIR="$TMP_WORK_DIR"
 
-NATIVES_PACKAGE="$ROOT_DIR/packages/natives/package.json"
-NATIVES_PACKAGE_INITIAL="$WORK_DIR/natives-package.initial.json"
-cp "$NATIVES_PACKAGE" "$NATIVES_PACKAGE_INITIAL"
-restore_workspace() {
-   cp "$NATIVES_PACKAGE_INITIAL" "$NATIVES_PACKAGE"
+cleanup_workspace() {
    rm -rf "$WORK_DIR"
 }
-trap restore_workspace EXIT
+trap cleanup_workspace EXIT
 
 section() {
    echo ""

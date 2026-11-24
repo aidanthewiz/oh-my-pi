@@ -28,7 +28,7 @@ import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import { type AuthStorage, SqliteAuthCredentialStore } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { cfgToolsCommands } from "@oh-my-pi/pi-coding-agent/tools/settings";
+import { cfgToolsCommands, NATIVE_TODO_BACKEND } from "@oh-my-pi/pi-coding-agent/tools/settings";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { TempDir, withTimeout } from "@oh-my-pi/pi-utils";
 import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
@@ -85,6 +85,12 @@ describe("startup-deferred extensions", () => {
 			"text-renderer.ts": `pi.registerAssistantTextRenderer(() => undefined);`,
 			"thinking-renderer.ts": `pi.registerAssistantThinkingRenderer(() => undefined);`,
 		};
+		// A resumed session's list goes to the selected todo backend as soon as the session starts.
+		const todoBackend = path.join(tempDir.path(), "todo-backend.ts");
+		fs.writeFileSync(
+			todoBackend,
+			`export default function(pi) { pi.registerTodoBackend({ id: "demo", replace() {} }); }`,
+		);
 		const drawingPaths = Object.entries(drawing).map(([name, body]) => {
 			const file = path.join(tempDir.path(), name);
 			fs.writeFileSync(file, `export default function(pi) { ${body} }`);
@@ -92,21 +98,25 @@ describe("startup-deferred extensions", () => {
 		});
 		fs.writeFileSync(neverLoaded, `export default function() {}`);
 
-		const loaded = await loadExtensions([toolOnly, withShortcut, ...drawingPaths], tempDir.path());
+		const loaded = await loadExtensions([toolOnly, withShortcut, ...drawingPaths, todoBackend], tempDir.path());
 		expect(loaded.errors).toEqual([]);
 		await recordStartupVerdicts(storage, loaded.extensions);
 
-		const paths = [toolOnly, withShortcut, ...drawingPaths, neverLoaded];
-		expect(await partitionStartupExtensions(storage, paths, tempDir.path())).toEqual({
+		const paths = [toolOnly, withShortcut, ...drawingPaths, todoBackend, neverLoaded];
+		expect(await partitionStartupExtensions(storage, paths, tempDir.path(), "native")).toEqual({
 			eager: [withShortcut, ...drawingPaths, neverLoaded],
+			deferred: [toolOnly, todoBackend],
+		});
+		expect(await partitionStartupExtensions(storage, paths, tempDir.path(), "demo")).toEqual({
+			eager: [withShortcut, ...drawingPaths, todoBackend, neverLoaded],
 			deferred: [toolOnly],
 		});
 
 		// An edited source may now register something startup needs: load it eagerly again.
 		fs.appendFileSync(toolOnly, "\n// edited\n");
-		expect(await partitionStartupExtensions(storage, paths, tempDir.path())).toEqual({
+		expect(await partitionStartupExtensions(storage, paths, tempDir.path(), "native")).toEqual({
 			eager: [toolOnly, withShortcut, ...drawingPaths, neverLoaded],
-			deferred: [],
+			deferred: [todoBackend],
 		});
 	});
 
@@ -197,14 +207,20 @@ describe("startup-deferred extensions", () => {
 		const loaded = await loadExtensions(paths, tempDir.path());
 		expect(loaded.errors).toEqual([]);
 		await recordStartupVerdicts(storage, loaded.extensions);
-		expect(await partitionStartupExtensions(storage, paths, tempDir.path())).toEqual({ eager: paths, deferred: [] });
+		expect(await partitionStartupExtensions(storage, paths, tempDir.path(), NATIVE_TODO_BACKEND)).toEqual({
+			eager: paths,
+			deferred: [],
+		});
 		storage.setCache(`extension_startup:v1:${paths[0]}`, "{broken", Math.floor(Date.now() / 1000) + 60);
 		storage.setCache(
 			`extension_startup:v1:${paths[1]}`,
 			JSON.stringify({ fingerprint: "invalid", deferrable: true }),
 			Math.floor(Date.now() / 1000) + 60,
 		);
-		expect(await partitionStartupExtensions(storage, paths, tempDir.path())).toEqual({ eager: paths, deferred: [] });
+		expect(await partitionStartupExtensions(storage, paths, tempDir.path(), NATIVE_TODO_BACKEND)).toEqual({
+			eager: paths,
+			deferred: [],
+		});
 	});
 
 	it("discards staged providers and rejects stale factory registrations without touching another owner's queue", async () => {

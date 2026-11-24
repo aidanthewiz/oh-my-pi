@@ -159,6 +159,7 @@ export function agyCredentialEnv(): Record<string, string> {
 
 /**
  * Stage one transport generation's grant and retain its account-private file.
+ * Replacement and readback hold the same account lock.
  * Release only after startup fails without a child or the child actually exits.
  * Broker refresh sentinels are never sent to Google.
  */

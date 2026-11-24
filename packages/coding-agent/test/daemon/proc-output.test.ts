@@ -2,7 +2,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { isolateDaemonForSmokeTest } from "../../src/daemon/client";
-import { DAEMON_DIR_ENV, GLOBAL_SCOPE, type DaemonOp, type ProcSpec } from "../../src/daemon/protocol";
+import {
+	DAEMON_DIR_ENV,
+	DAEMON_RESUME_LEASE_GRACE_MS,
+	GLOBAL_SCOPE,
+	type DaemonOp,
+	type ProcSpec,
+} from "../../src/daemon/protocol";
 import { DaemonStore } from "../../src/daemon/store";
 import { UnitTable, type UnitConnection } from "../../src/daemon/units";
 import * as terminalOutput from "../../src/launch/terminal-output";
@@ -23,7 +29,13 @@ beforeEach(async () => {
 	if (!dir) throw new Error("Missing private runtime directory");
 	root = dir;
 	store = DaemonStore.open(path.join(root, "daemon.db"));
-	units = new UnitTable({ store, modules: [], resumed: false, onLivenessChange() {} });
+	units = new UnitTable({
+		store,
+		modules: [],
+		resumed: false,
+		leaseGraceMs: DAEMON_RESUME_LEASE_GRACE_MS,
+		onLivenessChange() {},
+	});
 	await units.start();
 });
 
