@@ -13,6 +13,7 @@ import { redactMemorySecrets as redactSecrets } from "../memory-backend/redact";
 import { truncateApproxTokens } from "../mnemopi/config";
 import consolidateInputTemplate from "../prompts/memories/sharpshooter-consolidate-input.md" with { type: "text" };
 import consolidateSystemTemplate from "../prompts/memories/sharpshooter-consolidate-system.md" with { type: "text" };
+import { journalCompletion, type ModelUsageLedger } from "../session/model-usage-journal";
 import { resolveSharpshooterModel } from "./extract";
 import {
 	readSharpshooterState,
@@ -107,8 +108,11 @@ export async function runSharpshooterConsolidation(options: {
 	getSessionProvider?: () => string | undefined;
 	force?: boolean;
 	signal?: AbortSignal;
+	/** Session journal the pass's model usage is billed to; unjournaled when omitted. */
+	usageLedger?: Partial<ModelUsageLedger>;
 }): Promise<SharpshooterConsolidationResult> {
 	options.signal?.throwIfAborted();
+	const journal = journalCompletion(options.usageLedger, { purpose: "sharpshooter:consolidate" });
 	const bankDir = sharpshooterBankDir(options.agentDir, options.cwd);
 	try {
 		await fs.mkdir(bankDir, { recursive: true });
@@ -125,7 +129,7 @@ export async function runSharpshooterConsolidation(options: {
 			async () => {
 				acquired = true;
 				options.signal?.throwIfAborted();
-				return await consolidateLocked(options, bankDir);
+				return await consolidateLocked(options, bankDir, journal);
 			},
 			{ retries: 1, retryDelayMs: 1 },
 		);
@@ -192,6 +196,7 @@ async function consolidateLocked(
 		signal?: AbortSignal;
 	},
 	bankDir: string,
+	journal: ReturnType<typeof journalCompletion>,
 ): Promise<SharpshooterConsolidationResult> {
 	options.signal?.throwIfAborted();
 	const state = await readSharpshooterState(options.agentDir, options.cwd);
@@ -261,6 +266,7 @@ async function consolidateLocked(
 						reasoning: clampThinkingLevelForModel(model, Effort.Medium),
 						toolChoice: "required",
 						signal: options.signal,
+						onAttempt: message => journal?.(message, input),
 					},
 				);
 			},

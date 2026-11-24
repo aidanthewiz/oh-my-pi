@@ -18,41 +18,105 @@ describe("ArtifactManager write integrity", () => {
 		return dir;
 	}
 
+	function observeContention(): Promise<void> {
+		const contended = Promise.withResolvers<void>();
+		const observe = (lock: FileLock): FileLock => {
+			if (!lock.acquired) contended.resolve();
+			return lock;
+		};
+		if (process.platform === "linux") {
+			const acquire = FileLock.tryAcquireNamed.bind(FileLock);
+			vi.spyOn(FileLock, "tryAcquireNamed").mockImplementation(name => observe(acquire(name)));
+		} else {
+			const acquire = FileLock.tryAcquire.bind(FileLock);
+			vi.spyOn(FileLock, "tryAcquire").mockImplementation((...args) => observe(acquire(...args)));
+		}
+		return contended.promise;
+	}
+
 	afterEach(() => {
 		vi.restoreAllMocks();
 		for (const dir of dirs.splice(0)) removeSyncWithRetries(dir);
 	});
 
-	it("keeps large resident artifacts scoped to the restored live owner without removing bounded reads", async () => {
+	it.skipIf(process.platform !== "linux")(
+		"publishes from fresh and hostile working directories without opening the legacy name",
+		async () => {
+			const root = freshDir();
+			const key = `coreforge-artifact-publication-v1-${os.userInfo().uid}`;
+			const code = `
+				import { writeArtifact } from ${JSON.stringify(new URL("../src/session/artifacts.ts", import.meta.url).href)};
+				await writeArtifact(process.argv[1], "complete child publication");
+			`;
+			for (const kind of ["missing", "regular", "fifo"]) {
+				const cwd = path.join(root, kind);
+				await fsPromises.mkdir(cwd, { recursive: true });
+				const legacyPath = path.join(cwd, key);
+				if (kind === "regular") await fsPromises.writeFile(legacyPath, "unrelated working-directory file");
+				if (kind === "fifo") {
+					const madeFifo = Bun.spawnSync(["mkfifo", legacyPath], { env: { PATH: "/usr/bin:/bin" } });
+					expect(madeFifo.exitCode).toBe(0);
+				}
+				const destination = path.join(cwd, "published.md");
+				const child = Bun.spawn([process.execPath, "-e", code, destination], {
+					cwd,
+					env: { HOME: cwd, TMPDIR: cwd, PATH: "/usr/bin:/bin" },
+					stdin: "ignore",
+					stdout: "pipe",
+					stderr: "pipe",
+				});
+				const deadline = setTimeout(() => child.kill(), 10_000);
+				try {
+					const [exit, stdout, stderr] = await Promise.all([
+						child.exited,
+						new Response(child.stdout).text(),
+						new Response(child.stderr).text(),
+					]);
+					expect({ exit, stdout, stderr }).toEqual({ exit: 0, stdout: "", stderr: "" });
+					expect(await fsPromises.readFile(destination, "utf8")).toBe("complete child publication");
+					if (kind === "missing") expect(fs.existsSync(legacyPath)).toBe(false);
+					if (kind === "regular")
+						expect(await fsPromises.readFile(legacyPath, "utf8")).toBe("unrelated working-directory file");
+					if (kind === "fifo") expect((await fsPromises.lstat(legacyPath)).isFIFO()).toBe(true);
+				} finally {
+					clearTimeout(deadline);
+					if (child.exitCode === null) child.kill();
+					await child.exited;
+				}
+			}
+		},
+	);
+
+	it("keeps large spills scoped to the restored live owner with bounded reads", async () => {
 		const manager = SessionManager.inMemory();
-		const content = `${"x".repeat(8 * 1024 * 1024)}\ncomplete resident tail`;
-		const id = await manager.saveArtifact(content, "read");
-		if (!id) throw new Error("Expected resident artifact id");
+		dirs.push(manager.getArtifactManager().dir);
+		const content = `${"x".repeat(8 * 1024 * 1024)}\ncomplete spill tail`;
+		const id = await manager.saveArtifact(content);
+		if (id === undefined) throw new Error("Expected spill id");
 		expect(await manager.getArtifactContent(id, 8 * 1024 * 1024)).toBeNull();
-		expect(manager.getResidentArtifactContent(id)).toBe(content);
-		expect(manager.getResidentArtifactContent(`0${id}`)).toBeNull();
+		expect(await manager.getArtifactContent(id, Buffer.byteLength(content))).toBe(content);
+		expect(await manager.getArtifactContent(`0${id}`, Buffer.byteLength(content))).toBeNull();
 		const snapshot = manager.captureState();
 
 		await manager.newSession();
-		expect(manager.getResidentArtifactContent(id)).toBeNull();
-		expect(await manager.saveArtifact("replacement owner", "read")).toBe(id);
-		expect(manager.getResidentArtifactContent(id)).toBe("replacement owner");
+		dirs.push(manager.getArtifactManager().dir);
+		expect(await manager.getArtifactContent(id, Buffer.byteLength(content))).toBeNull();
+		expect(await manager.saveArtifact("replacement owner")).toBe(id);
+		expect(await manager.getArtifactContent(id, 17)).toBe("replacement owner");
 		manager.restoreState(snapshot);
-		expect(manager.getResidentArtifactContent(id)).toBe(content);
+		expect(await manager.getArtifactContent(id, Buffer.byteLength(content))).toBe(content);
 
 		manager.seal();
-		expect(manager.getResidentArtifactContent(id)).toBeNull();
 		expect(await manager.getArtifactContent(id, content.length)).toBeNull();
 		manager.releaseRetainedEntries();
 	});
 
-	it("never exposes a file-backed artifact through the resident capability", async () => {
+	it("keeps persistent spill reads bounded", async () => {
 		const dir = freshDir();
 		const manager = SessionManager.create(dir, dir);
 		try {
-			const id = await manager.saveArtifact("disk-owned report", "read");
+			const id = await manager.saveArtifact("disk-owned report");
 			if (!id) throw new Error("Expected disk artifact id");
-			expect(manager.getResidentArtifactContent(id)).toBeNull();
 			expect(await manager.getArtifactContent(id, 16)).toBeNull();
 			expect(await manager.getArtifactContent(id, 17)).toBe("disk-owned report");
 		} finally {
@@ -67,13 +131,7 @@ describe("ArtifactManager write integrity", () => {
 		const destination = path.join(dir, "Worker.md");
 		const entered = Promise.withResolvers<void>();
 		const release = Promise.withResolvers<void>();
-		const contended = Promise.withResolvers<void>();
-		const acquire = FileLock.tryAcquire.bind(FileLock);
-		vi.spyOn(FileLock, "tryAcquire").mockImplementation((...args) => {
-			const lock = acquire(...args);
-			if (!lock.acquired) contended.resolve();
-			return lock;
-		});
+		const contended = observeContention();
 		const holder = withArtifactPublicationLock(async () => {
 			await writeArtifact(destination, "first accepted report");
 			entered.resolve();
@@ -82,7 +140,7 @@ describe("ArtifactManager write integrity", () => {
 		await entered.promise;
 		const replacement = writeArtifact(destination, "second accepted report");
 		try {
-			await contended.promise;
+			await contended;
 			expect(await Bun.file(destination).text()).toBe("first accepted report");
 		} finally {
 			release.resolve();
@@ -99,13 +157,7 @@ describe("ArtifactManager write integrity", () => {
 		await writeArtifact(destination, "accepted report");
 		const entered = Promise.withResolvers<void>();
 		const release = Promise.withResolvers<void>();
-		const contended = Promise.withResolvers<void>();
-		const acquire = FileLock.tryAcquire.bind(FileLock);
-		vi.spyOn(FileLock, "tryAcquire").mockImplementation((...args) => {
-			const lock = acquire(...args);
-			if (!lock.acquired) contended.resolve();
-			return lock;
-		});
+		const contended = observeContention();
 		const holder = withArtifactPublicationLock(async () => {
 			entered.resolve();
 			await release.promise;
@@ -120,7 +172,7 @@ describe("ArtifactManager write integrity", () => {
 			error => error,
 		);
 		try {
-			await contended.promise;
+			await contended;
 			controller.abort();
 			expect(await waiting).toMatchObject({ name: "AbortError" });
 			expect(await Bun.file(destination).text()).toBe("accepted report");
@@ -144,13 +196,7 @@ describe("ArtifactManager write integrity", () => {
 		});
 		const entered = Promise.withResolvers<void>();
 		const release = Promise.withResolvers<void>();
-		const contended = Promise.withResolvers<void>();
-		const acquire = FileLock.tryAcquire.bind(FileLock);
-		vi.spyOn(FileLock, "tryAcquire").mockImplementation((...args) => {
-			const lock = acquire(...args);
-			if (!lock.acquired) contended.resolve();
-			return lock;
-		});
+		const contended = observeContention();
 		const holder = withArtifactPublicationLock(async () => {
 			entered.resolve();
 			await release.promise;
@@ -158,7 +204,7 @@ describe("ArtifactManager write integrity", () => {
 		await entered.promise;
 		wake.resolve();
 		try {
-			await contended.promise;
+			await contended;
 			expect(await Bun.file(destination).text()).toBe("accepted report");
 		} finally {
 			release.resolve();
@@ -169,12 +215,10 @@ describe("ArtifactManager write integrity", () => {
 	});
 
 	it("rejects a short write instead of publishing an unreadable artifact id", async () => {
-		const manager = new ArtifactManager(freshDir());
+		const manager = new ArtifactManager(freshDir(), null);
 		vi.spyOn(Bun, "write").mockResolvedValue(1);
 
-		await expect(manager.save("complete report", "task")).rejects.toThrow(
-			"Artifact write incomplete: wrote 1 of 15 bytes",
-		);
+		await expect(manager.save("complete report")).rejects.toThrow("Artifact write incomplete: wrote 1 of 15 bytes");
 	});
 
 	it("preserves the write failure when staging cleanup also fails", async () => {
@@ -209,7 +253,7 @@ describe("ArtifactManager write integrity", () => {
 		await expect(writeArtifact(destination, "full report body")).rejects.toThrow("Artifact write incomplete");
 
 		// Neither the destination nor a leftover staging file survives, so
-		// agent:// / artifact:// scans cannot resolve a truncated artifact.
+		// agent:// scans and local:// spill reads cannot resolve a truncated artifact.
 		expect(await fs.promises.readdir(dir)).toEqual([]);
 	});
 

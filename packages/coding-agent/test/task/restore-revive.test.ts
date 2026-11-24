@@ -220,7 +220,7 @@ async function restoreInterruptedChild(options: { transcript?: "handoff" | "fall
 		enableMCP: false,
 		enableLsp: false,
 		enableIrc: false,
-		cacheWarming: false,
+		cacheWarming: "off",
 		skipPythonPreflight: true,
 	});
 	const manager = session.asyncJobManager;
@@ -381,7 +381,7 @@ it("does not replay interrupted child effects when /new cancels its registered j
 		enableMCP: false,
 		enableLsp: false,
 		enableIrc: false,
-		cacheWarming: false,
+		cacheWarming: "off",
 		skipPythonPreflight: true,
 	});
 	const manager = session.asyncJobManager;

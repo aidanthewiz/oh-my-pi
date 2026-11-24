@@ -20,6 +20,7 @@ import { MAX_THINKING_SUFFIX_OPTIONS, splitThinkingSuffix } from "@oh-my-pi/pi-t
 import type { ModelRegistry } from "../config/model-registry";
 import {
 	filterModelsByConfiguredScope,
+	findOpenRouterRouteVariant,
 	formatModelString,
 	formatModelStringWithRouting,
 	getModelMatchPreferences,
@@ -339,7 +340,10 @@ export function assertPerCallModelApproved(
 	if (granted === undefined) {
 		const chat = filterModelsByConfiguredScope(registry.getAvailable("chat"), grants.settings);
 		// Unavailability is never cached: a login can make the model available without a settings change.
-		if (!chat.some(candidate => candidate.provider === model.provider && candidate.id === model.id)) {
+		if (
+			!chat.some(candidate => candidate.provider === model.provider && candidate.id === model.id) &&
+			!findOpenRouterRouteVariant(formatModelString(model), chat)
+		) {
 			throw new PerCallModelUnavailableError(`Per-call model ${target} is not an available chat model.`);
 		}
 		granted = computeGranted(model, target, grants, chat, cache.catalog);

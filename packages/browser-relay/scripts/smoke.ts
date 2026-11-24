@@ -1,3 +1,4 @@
+import { discoverRelayEndpoints } from "../../coding-agent/src/tools/browser/relay/discovery";
 /**
  * Manual end-to-end smoke for the relay: replicates the omp browser tool's
  * connection pattern against a live relay + extension.
@@ -11,11 +12,12 @@
  */
 import type { Target } from "puppeteer-core";
 import puppeteer from "puppeteer-core";
-import { isLoopbackRelayUrl } from "../../coding-agent/src/tools/browser/relay/daemon";
-import { resolveRelayWebSocketEndpoint } from "../../coding-agent/src/tools/browser/relay/kind";
+import { isLoopbackRelayUrl, resolveRelayWebSocketEndpoint } from "../../coding-agent/src/tools/browser/relay/kind";
 import { ensureBrowserRelayToken } from "../../coding-agent/src/tools/browser/relay/token";
 
-const relayUrl = new URL(Bun.argv[2] ?? "http://127.0.0.1:9224");
+const endpoint = Bun.argv[2] ?? discoverRelayEndpoints()[0];
+if (!endpoint) throw new Error("No local Coreforge browser relay found; supply the relay URL explicitly.");
+const relayUrl = new URL(endpoint);
 const configuredToken = relayUrl.searchParams.get("token")?.trim();
 relayUrl.searchParams.delete("token");
 const token =

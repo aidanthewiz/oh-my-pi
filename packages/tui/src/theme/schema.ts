@@ -40,6 +40,7 @@ export type AnsiColor = keyof typeof ANSI_COLOR_INDEX;
  */
 export const OPTIONAL_THEME_COLOR_RECORD = {
 	assistantMessageText: true,
+	btwMode: true,
 	mdExtensionLink: true,
 	subagent1: true,
 	subagent2: true,
@@ -139,6 +140,7 @@ export type ThemeColor =
 	| "thinkingMax"
 	| "bashMode"
 	| "pythonMode"
+	| "btwMode"
 	| "statusLineSep"
 	| "statusLineModel"
 	| "statusLinePath"
@@ -210,6 +212,7 @@ const THEME_COLOR_RECORD = {
 	thinkingMax: true,
 	bashMode: true,
 	pythonMode: true,
+	btwMode: true,
 	statusLineSep: true,
 	statusLineModel: true,
 	statusLinePath: true,

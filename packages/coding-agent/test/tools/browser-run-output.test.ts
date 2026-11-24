@@ -46,7 +46,7 @@ describe("browser run output — stream text reaches the tool result", () => {
 // raw puppeteer ElementHandles only expose `.type()`. `input.fill is not a function`
 // was a live failure.
 describe("browser handle enrichment — fill()", () => {
-	it("adds a fill() that clears the current value before typing", async () => {
+	it("adds a fill() that clears the current value before inserting the new one", async () => {
 		const node = { value: "old", focused: false };
 		const stub = {
 			evaluate: async (fn: (el: unknown) => unknown) =>
@@ -65,10 +65,12 @@ describe("browser handle enrichment — fill()", () => {
 						return { activeElement: this };
 					},
 				}),
+			remoteObject: () => ({ objectId: "field" }),
 			frame: {
+				client: { send: async () => ({}) },
 				page: () => ({
 					keyboard: {
-						type: async (text: string) => {
+						sendCharacter: async (text: string) => {
 							node.value += text;
 						},
 					},
@@ -224,10 +226,12 @@ describe("browser handle enrichment — guarded actions", () => {
 					},
 				}),
 			type: async () => {},
+			remoteObject: () => ({ objectId: "field" }),
 			frame: {
+				client: { send: async () => ({}) },
 				page: () => ({
 					keyboard: {
-						type: async (text: string) => {
+						sendCharacter: async (text: string) => {
 							node.value += text;
 						},
 					},

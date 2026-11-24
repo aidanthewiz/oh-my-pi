@@ -85,7 +85,7 @@ jobs:
       - name: Require Apple Foundation Models toolchain
         if: inputs.target == 'darwin-arm64'
         run: |
-          toolchain="$(/bin/sh crates/pi-natives/src/applefm/build-bridge.sh detect)"
+          toolchain="$(/bin/sh crates/natives/src/applefm/build-bridge.sh detect)"
           if [ -z "$toolchain" ]; then
             echo "::error::Darwin ARM64 verification requires Swift 6.4+ and macOS 27 SDK; refusing an addon without the Apple Foundation Models bridge"
             exit 1
@@ -95,8 +95,8 @@ jobs:
         if: inputs.target == 'darwin-arm64'
         run: |
           swiftc -swift-version 6 -parse-as-library -D APPLEFM_GATE_TEST \
-            crates/pi-natives/src/applefm/bridge.swift \
-            crates/pi-natives/src/applefm/gate-test.swift \
+            crates/natives/src/applefm/bridge.swift \
+            crates/natives/src/applefm/gate-test.swift \
             -o "$RUNNER_TEMP/applefm-gate-test"
           "$RUNNER_TEMP/applefm-gate-test"
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
@@ -201,7 +201,7 @@ jobs:
         env:
           CARGO_TERM_COLOR: never
         run: |
-          cargo test --locked --profile ci --target aarch64-pc-windows-msvc -p pi-shell --lib pipe_contracts:: -- --nocapture 2>&1 | Tee-Object -Variable relayOutput
+          cargo test --locked --profile ci --target aarch64-pc-windows-msvc -p omp-shell --lib pipe_contracts:: -- --nocapture 2>&1 | Tee-Object -Variable relayOutput
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           foreach ($name in @("bash::mem::pipe_contracts::idle_producer_is_released_when_consumer_exits", "bash::mem::pipe_contracts::producer_eof_preserves_every_byte_and_closes_the_mirror", "sys::pump::os::imp::pipe_contracts::windows_query_failure_is_not_eof")) {
             if (-not ($relayOutput -match "^test $name \.\.\. ok$")) {
@@ -275,9 +275,9 @@ jobs:
           export RUSTC RUSTDOC
           cargo="$(rustup which --toolchain "$channel" cargo)"
           unset RSYNC_CONFORMANCE_FILTER
-          "$cargo" test --locked --profile ci --target x86_64-unknown-linux-gnu -p pi-builtins --lib -- --test-threads=2 --nocapture
-          "$cargo" build --locked --profile ci --target x86_64-unknown-linux-gnu -p pi-builtins --example rsync_peer
-          python3 crates/pi-builtins/tests/rsync_options_filters_peer_regressions.py \
+          "$cargo" test --locked --profile ci --target x86_64-unknown-linux-gnu -p omp-builtins --lib -- --test-threads=2 --nocapture
+          "$cargo" build --locked --profile ci --target x86_64-unknown-linux-gnu -p omp-builtins --example rsync_peer
+          python3 crates/builtins/tests/rsync_options_filters_peer_regressions.py \
             --native "$CARGO_TARGET_DIR/x86_64-unknown-linux-gnu/ci/examples/rsync_peer" \
             --reference "$PI_RSYNC_REFERENCE_BINARY" --scratch "$work" --case all
       - name: Verify embedded Apple Foundation Models bridge

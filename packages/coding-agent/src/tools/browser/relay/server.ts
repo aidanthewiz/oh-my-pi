@@ -1,11 +1,9 @@
 /**
  * HTTP + WebSocket server for the browser relay.
  *
- * Impersonates Chrome's CDP discovery endpoint for authenticated Puppeteer clients:
- * - `GET /json/version` → public liveness; returns 503 metadata until the extension connects.
- * - `GET /json` / `/json/list` → token-gated attachable page targets.
- * - `WS /cdp` → token-gated downstream CDP clients; a tab worker adds `?claim=<targetId>` for its tab.
- * - `WS /ext` → token-gated Chrome extension.
+ * The extension's native host owns the server lifetime. CDP discovery exposes
+ * liveness only; target listings, websocket links and install/restart hooks
+ * require the shared token. The leading host links its extension in-process.
  *
  * Binds loopback only. Every endpoint that can inspect or drive browser state
  * requires the machine-local shared secret.
@@ -13,53 +11,28 @@
 import { macOSFrontApp } from "@oh-my-pi/pi-natives";
 import { parseFlag } from "@oh-my-pi/pi-utils";
 import { VERSION } from "@oh-my-pi/pi-utils/dirs";
-import { RelayBridge, type RelayBridgeExtensionUpdater } from "./bridge";
-import {
-	defaultRelayExtensionDir,
-	installedRelayExtensionVersion,
-	unpackedExtensionId,
-	writeRelayExtension,
-} from "./extension-files";
-import { isOlderOmpVersion } from "./protocol";
+import { RelayBridge } from "./bridge";
+import { extensionIdForPath, installedRelayExtensionStamp } from "./extension-files";
+import { readRelayInstalls, registeredRelayExtensionIds, syncRelayInstalls } from "./installs";
+import { RELAY_RECHECK_PATH, RELAY_RESTART_PATH } from "./protocol";
 
 /** Options for {@link startRelayServer}. */
 export interface RelayServerOptions {
 	port: number;
-	/** Nonempty shared secret required by extension and CDP websocket clients. */
+	/** Nonempty shared secret required by extension and CDP clients. */
 	token: string;
+	/** Accept the browser only over its chat native messaging port. */
+	chatOnly?: boolean;
+	onRestart?(request: { version: string; idleOnly: boolean }): boolean;
 	/** Group tabs the agent actively drives under one per-window Chrome tab group (default on); `false` disables. */
 	group?: boolean | { title: string; color: string };
-	/**
-	 * The extension copy this relay keeps current: an older extension Chrome loaded from here is rewritten and
-	 * reloaded (default: `omp browser-relay install`'s directory).
-	 */
-	extensionDir?: string;
+	/** Override the shared extension install registry, for isolated relays. */
+	installRegistryFile?: string;
 	log?: (message: string, data?: Record<string, unknown>) => void;
 }
 
 function authorized(url: URL, token: string): boolean {
 	return token.length > 0 && url.searchParams.get("token") === token;
-}
-
-/**
- * Updates the extension when Chrome loaded it from `dir`: an extension loaded from elsewhere (`install --dir`, a
- * development build) is not this relay's to rewrite, and files a newer omp wrote are left for that omp's relay.
- * Calls run one at a time: Chrome profiles that load the same folder share its files, and a later call finds them
- * already current.
- */
-function extensionUpdaterFor(dir: string): RelayBridgeExtensionUpdater {
-	let queue: Promise<unknown> = Promise.resolve();
-	const update = async (extensionId: string) => {
-		if ((await unpackedExtensionId(dir)) !== extensionId) return false;
-		if (isOlderOmpVersion(VERSION, await installedRelayExtensionVersion(dir))) return false;
-		await writeRelayExtension(dir, VERSION);
-		return true;
-	};
-	return extensionId => {
-		const result = queue.then(() => update(extensionId));
-		queue = result.catch(() => {});
-		return result;
-	};
 }
 
 /** `chrome-extension://<id>` → `<id>`; anything else → undefined. */
@@ -69,15 +42,11 @@ const EXTENSION_ORIGIN = /^chrome-extension:\/\/([a-p]{32})$/;
 export interface RelayUnavailableInfo {
 	/** Version of the OMP binary serving this relay. */
 	ompRelayVersion: string;
+	/** Random id of this server, fixed for its life. */
+	ompRelayInstance: string;
 	error: string;
-	/** An extension completed the hello handshake at least once in this server's lifetime. */
-	extensionSeen: boolean;
-	/** Milliseconds this server has been listening. */
-	uptimeMs: number;
 	/** Downstream CDP clients connected to this relay. */
 	ompRelayCdpClients: number;
-	/** Milliseconds since the last connected extension went away; absent if none has connected yet. */
-	disconnectedMs?: number;
 }
 
 /** A running relay server. */
@@ -120,10 +89,46 @@ export function startRelayServer(opts: RelayServerOptions): RelayServer {
 	const log = opts.log ?? (() => {});
 	const group =
 		opts.group === false ? null : opts.group === true || opts.group === undefined ? DEFAULT_GROUP : opts.group;
-	const updateExtension = extensionUpdaterFor(opts.extensionDir ?? defaultRelayExtensionDir());
-	const bridge = new RelayBridge({ log, group, updateExtension });
+	const bridge = new RelayBridge({
+		log,
+		group,
+		async installedStamp(extensionId) {
+			if (opts.chatOnly) return null;
+			const installs = await readRelayInstalls({
+				registryFile: opts.installRegistryFile,
+			});
+			const install = installs.find(row => !row.missing && extensionIdForPath(row.dir) === extensionId);
+			return install ? installedRelayExtensionStamp(install.dir) : null;
+		},
+		async updateExtension(extensionId) {
+			if (opts.chatOnly) return false;
+			// Only a folder omp manages can be rewritten; Chrome named it by its path, so its id says which.
+			const ours = await registeredRelayExtensionIds({
+				registryFile: opts.installRegistryFile,
+			});
+			if (!ours.includes(extensionId)) {
+				log("connected extension is not a registered install; not updating it", { extensionId });
+				return false;
+			}
+			const results = await syncRelayInstalls({
+				mode: "relay",
+				registryFile: opts.installRegistryFile,
+			});
+			let current = false;
+			let failed = false;
+			for (const result of results) {
+				if (result.status === "failed") {
+					failed = true;
+					log("extension install sync failed", result);
+				} else if (result.status !== "missing" && result.ompVersion === VERSION) {
+					current = true;
+				}
+			}
+			return current && !failed;
+		},
+	});
 	const sockets = new Set<RelayWebSocket>();
-	const startedAt = Date.now();
+	const instance = crypto.randomUUID();
 	// Only macOS can hand the front app back; elsewhere the relay never reads it.
 	if (process.platform === "darwin" && parseFlag(process.env.PI_BROWSER_RELAY_KEEP_FRONT, true)) {
 		bridge.keepFrontAppWith(macOSFrontApp);
@@ -151,7 +156,7 @@ export function startRelayServer(opts: RelayServerOptions): RelayServer {
 				if (srv.upgrade(req, { data })) return undefined;
 				return new Response("websocket upgrade required", { status: 426 });
 			}
-			if (path === "/ext") {
+			if (path === "/ext" && !opts.chatOnly) {
 				const origin = req.headers.get("origin");
 				if (origin && !origin.startsWith("chrome-extension://")) {
 					return new Response("Forbidden", { status: 403 });
@@ -161,21 +166,44 @@ export function startRelayServer(opts: RelayServerOptions): RelayServer {
 				if (srv.upgrade(req, { data })) return undefined;
 				return new Response("websocket upgrade required", { status: 426 });
 			}
+			if (path === RELAY_RECHECK_PATH) {
+				if (req.method !== "POST") return new Response("Method not allowed", { status: 405 });
+				// Like `/cdp`: browsers send Origin, the omp CLI does not; a web page must not trigger reloads.
+				if (req.headers.get("origin")) return new Response("Forbidden", { status: 403 });
+				if (!authorized(url, token)) return new Response("Unauthorized", { status: 401 });
+				bridge.recheckExtensions();
+				return new Response(null, { status: 204 });
+			}
+			if (path === RELAY_RESTART_PATH) {
+				if (req.method !== "POST") return new Response("Method not allowed", { status: 405 });
+				if (req.headers.get("origin")) return new Response("Forbidden", { status: 403 });
+				if (!authorized(url, token)) return new Response("Unauthorized", { status: 401 });
+				const expectedInstance = url.searchParams.get("instance");
+				if (expectedInstance !== null && expectedInstance !== instance) {
+					return new Response("Relay instance changed", { status: 409 });
+				}
+				const restarting =
+					opts.onRestart?.({
+						version: url.searchParams.get("version") ?? "",
+						idleOnly: url.searchParams.get("idle") === "1",
+					}) ?? false;
+				return new Response(null, { status: restarting ? 202 : 409 });
+			}
 			if (req.method !== "GET") return new Response("Method not allowed", { status: 405 });
 			if (path === "/json/version") {
 				if (!bridge.ready) {
-					const disconnectedMs = bridge.extensionGoneForMs;
 					const info: RelayUnavailableInfo = {
 						ompRelayVersion: VERSION,
+						ompRelayInstance: instance,
 						error: "relay extension is not connected",
-						extensionSeen: bridge.extensionSeen,
-						uptimeMs: Date.now() - startedAt,
 						ompRelayCdpClients: bridge.cdpClientCount,
-						...(disconnectedMs === null ? {} : { disconnectedMs }),
 					};
 					return Response.json(info, { status: 503 });
 				}
-				return Response.json(bridge.versionInfo(`ws://${host}/cdp`));
+				return Response.json({
+					...bridge.versionInfo(`ws://${host}/cdp`),
+					ompRelayInstance: instance,
+				});
 			}
 			if (path === "/json" || path === "/json/list") {
 				if (!authorized(url, token)) return new Response("Unauthorized", { status: 401 });
@@ -225,7 +253,7 @@ export function startRelayServer(opts: RelayServerOptions): RelayServer {
 	log("relay listening", { port: opts.port });
 	return {
 		bridge,
-		port: opts.port,
+		port: server.port!,
 		stop() {
 			clearInterval(keepalive);
 			server.stop(true);

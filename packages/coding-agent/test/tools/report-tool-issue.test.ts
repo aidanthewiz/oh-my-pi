@@ -8,13 +8,14 @@ import * as reportIssue from "@oh-my-pi/pi-coding-agent/tools/report-tool-issue"
 import {
 	__resetAutoQaFlushStateForTests,
 	__resetCoreforgeReportHandlerForTests,
-	dispatchReportIssueDevice,
 	flushGrievances,
 	isAutoQaEnabled,
-	reportIssueDeviceUsage,
+	isReportIssueToolCall,
 	setCoreforgeReportHandler,
 } from "@oh-my-pi/pi-coding-agent/tools/report-tool-issue";
 import * as piUtils from "@oh-my-pi/pi-utils";
+import { specialToolCommands } from "@oh-my-pi/pi-coding-agent/tools/resolve";
+import { REPORT_ISSUE_COMMAND_NAME } from "@oh-my-pi/pi-tui/tools/report-tool-issue";
 import { mockFetch } from "../helpers/fetch-mock";
 
 function openTempDb(): Database {
@@ -28,7 +29,8 @@ function openTempDb(): Database {
 			report TEXT NOT NULL,
 			created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
 			pushed INTEGER NOT NULL DEFAULT 0,
-			push_error TEXT
+			push_error TEXT,
+			source TEXT
 		);
 	`);
 	return db;
@@ -126,10 +128,6 @@ describe("flushGrievances", () => {
 		const settings = Settings.isolated();
 		cfgDevAutoqa.set(settings, false);
 		expect(isAutoQaEnabled(settings)).toBe(true);
-	});
-
-	it("disables auto QA by default", () => {
-		expect(isAutoQaEnabled(Settings.isolated())).toBe(false);
 	});
 
 	it("keeps explicitly enabled auto QA on despite denied consent", () => {
@@ -459,9 +457,14 @@ describe("flushGrievances", () => {
 	});
 });
 
-describe("dispatchReportIssueDevice", () => {
-	const session = {} as ToolSession;
+async function runReportIssue(session: ToolSession, text: string) {
+	const tool = specialToolCommands(session).find(command => command.name === REPORT_ISSUE_COMMAND_NAME);
+	if (!tool) throw new Error(`Missing ${REPORT_ISSUE_COMMAND_NAME} tool command`);
+	return tool.execute("report-issue-call", { report: text });
+}
 
+describe("report_issue tool command", () => {
+	const session = { settings: Settings.isolated() } as ToolSession;
 	beforeEach(() => {
 		stubIdentity("/home/omp-test-user", "omp-test-user");
 	});
@@ -471,13 +474,13 @@ describe("dispatchReportIssueDevice", () => {
 		__resetCoreforgeReportHandlerForTests();
 	});
 
-	it("never stores or uploads a device report, including when the native handoff is accepted", async () => {
+	it("never stores or uploads a report, including when the native handoff is accepted", async () => {
 		const open = vi.spyOn(reportIssue, "openAutoQaDb").mockImplementation(() => {
-			throw new Error("Device reports must not open the telemetry database");
+			throw new Error("Reports must not open the telemetry database");
 		});
-		const send = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("Device reports must not upload"));
+		const send = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("Reports must not upload"));
 		setCoreforgeReportHandler(async () => true);
-		await dispatchReportIssueDevice({ settings: pushSettings() } as ToolSession, "read: dropped selected rows");
+		await runReportIssue({ settings: pushSettings() } as ToolSession, "read: dropped selected rows");
 		expect(open).not.toHaveBeenCalled();
 		expect(send).not.toHaveBeenCalled();
 	});
@@ -488,9 +491,7 @@ describe("dispatchReportIssueDevice", () => {
 			received = { tool, report };
 			return true;
 		});
-
-		await dispatchReportIssueDevice(session, "grep\nreported matches include a deleted file");
-
+		await runReportIssue(session, "grep\nreported matches include a deleted file");
 		expect(received).toEqual({ tool: "grep", report: "reported matches include a deleted file" });
 	});
 
@@ -500,40 +501,22 @@ describe("dispatchReportIssueDevice", () => {
 			calls += 1;
 			return false;
 		});
-
-		await dispatchReportIssueDevice(session, "read: first failure");
-		await dispatchReportIssueDevice(session, "grep: second failure");
-
+		await runReportIssue(session, "read: first failure");
+		await runReportIssue(session, "grep: second failure");
 		expect(calls).toBe(2);
-	});
-
-	it("does not file when the user dismisses the handoff", async () => {
-		setCoreforgeReportHandler(async () => false);
-
-		const { result } = await dispatchReportIssueDevice(session, "read: selector parse dropped trailing line");
-
-		expect(result.content[0]).toEqual({
-			type: "text",
-			text: "Coreforge report dismissed. Nothing was filed.",
-		});
-	});
-
-	it("degrades safely without an interactive parent session", async () => {
-		const { result } = await dispatchReportIssueDevice(session, "read: selector parse dropped trailing line");
-
-		expect(result.content[0]).toEqual({
-			type: "text",
-			text: "Coreforge /report requires an interactive parent session. Nothing was filed.",
-		});
 	});
 
 	it.each([
 		[
-			"xd://tui: start fails because kitty-vt-wasm is missing",
-			"xd://tui",
+			"help://read/sources: start fails because kitty-vt-wasm is missing",
+			"help://read/sources",
 			"start fails because kitty-vt-wasm is missing",
 		],
-		["write xd://tui: start fails before executing bun", "write xd://tui", "start fails before executing bun"],
+		[
+			"write help://read/sources: start fails before executing bun",
+			"write help://read/sources",
+			"start fails before executing bun",
+		],
 		[
 			'write conflict://*: per-id content "2:\ttext" was read as a hashline prefix',
 			"write conflict://*",
@@ -545,7 +528,7 @@ describe("dispatchReportIssueDevice", () => {
 			received = { tool, report };
 			return false;
 		});
-		await dispatchReportIssueDevice(session, text);
+		await runReportIssue(session, text);
 		expect(received).toEqual({ tool, report });
 	});
 
@@ -553,7 +536,7 @@ describe("dispatchReportIssueDevice", () => {
 		"read agent://ReviewLifecycleLever returned an empty response",
 		"browser.open({name:'jio-terms',url:'https://www.jio.com/'}) navigated the attached relay tab",
 	])("rejects %p, which has no `: ` separator, instead of splitting inside it", async text => {
-		await expect(dispatchReportIssueDevice(session, text)).rejects.toThrow("Invalid report format");
+		await expect(runReportIssue(session, text)).rejects.toThrow("Invalid report format");
 	});
 
 	it("clamps a prose first line so the stored tool stays within the collector limit", async () => {
@@ -564,7 +547,7 @@ describe("dispatchReportIssueDevice", () => {
 			received = { tool, report };
 			return false;
 		});
-		await dispatchReportIssueDevice(session, `${prose}\nglob threw instead of returning empty`);
+		await runReportIssue(session, `${prose}\nglob threw instead of returning empty`);
 		expect(Buffer.byteLength(received!.tool, "utf8")).toBeLessThanOrEqual(128);
 		expect(prose.startsWith(received!.tool)).toBe(true);
 		expect(received!.report).toBe(`${prose}\nglob threw instead of returning empty`);
@@ -577,7 +560,7 @@ describe("dispatchReportIssueDevice", () => {
 			received = text;
 			return false;
 		});
-		await dispatchReportIssueDevice(session, `bash: ${report}`);
+		await runReportIssue(session, `bash: ${report}`);
 		return received;
 	}
 
@@ -607,16 +590,19 @@ describe("dispatchReportIssueDevice", () => {
 			received = report;
 			return false;
 		});
-		await dispatchReportIssueDevice(
-			session,
-			"read: c:\\users\\will\\secret.txt and C:/USERS/WILL/x and -users-will-proj",
-		);
+		await runReportIssue(session, "read: c:\\users\\will\\secret.txt and C:/USERS/WILL/x and -users-will-proj");
 		expect(received).toBe("~\\secret.txt and ~/x and -users-<user>-proj");
 	});
+});
 
-	it("rejects malformed body text with a usage hint", async () => {
-		await expect(dispatchReportIssueDevice(session, "just a vague sentence")).rejects.toThrow(
-			reportIssueDeviceUsage(),
+describe("isReportIssueToolCall", () => {
+	it("does not hide ordinary tool calls that mention the reporting command", () => {
+		expect(isReportIssueToolCall({ name: "report_issue" })).toBe(true);
+		expect(isReportIssueToolCall({ name: "bash", arguments: { command: "report_issue something went wrong" } })).toBe(
+			true,
 		);
+		expect(isReportIssueToolCall({ name: "resolve" })).toBe(false);
+		expect(isReportIssueToolCall({ name: "bash", arguments: { command: "echo report_issue" } })).toBe(false);
+		expect(isReportIssueToolCall({ name: "bash" })).toBe(false);
 	});
 });

@@ -26,7 +26,7 @@ test("classifies only native build inputs as source-build changes", () => {
 		"packages/natives/native/version-sentinel.js",
 		"scripts/host-detect.ts",
 		"bazel/native.bzl",
-		"crates/pi-natives/src/lib.rs",
+		"crates/natives/src/lib.rs",
 	]) {
 		expect(isNativeBuildPath(relativePath)).toBe(true);
 	}

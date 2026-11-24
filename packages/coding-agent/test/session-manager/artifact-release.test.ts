@@ -8,16 +8,10 @@ import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manage
 import { postProcessToolResult } from "@oh-my-pi/pi-coding-agent/tools/output-meta";
 import { TempDir, withTimeout } from "@oh-my-pi/pi-utils";
 
-interface RetentionProbeResult {
-	baselineBytes: number;
-	liveBytes: number;
-	releasedBytes: number;
-	retainedEntries: number;
-}
-
 describe("SessionManager artifact terminal release", () => {
 	let tempDir: TempDir;
 	const managers: SessionManager[] = [];
+	const spillRoots = new Set<string>();
 
 	beforeEach(() => {
 		tempDir = TempDir.createSync("@omp-artifact-release-");
@@ -26,75 +20,52 @@ describe("SessionManager artifact terminal release", () => {
 	afterEach(async () => {
 		vi.restoreAllMocks();
 		for (const manager of managers.splice(0)) await manager.close();
+		for (const root of spillRoots) await fs.promises.rm(root, { recursive: true, force: true });
+		spillRoots.clear();
 		tempDir.removeSync();
 	});
 
 	function inMemory(): SessionManager {
 		const manager = SessionManager.inMemory(tempDir.path());
 		managers.push(manager);
+		spillRoots.add(manager.getArtifactManager().dir);
 		return manager;
 	}
-
-	it("makes spill payloads collectible while the released manager remains reachable", async () => {
-		const probe = Bun.spawn(
-			[process.execPath, path.join(import.meta.dir, "../fixtures/sdk-artifact-retention-probe.ts")],
-			{
-				cwd: path.join(import.meta.dir, "../../../.."),
-				env: {
-					...process.env,
-					PI_CODING_AGENT_DIR: tempDir.path(),
-					BUN_JSC_useConcurrentJIT: "0",
-				},
-				stdout: "pipe",
-				stderr: "pipe",
-			},
-		);
-		const [stdout, stderr, exitCode] = await Promise.all([
-			new Response(probe.stdout).text(),
-			new Response(probe.stderr).text(),
-			probe.exited,
-		]);
-		expect(exitCode, stderr).toBe(0);
-		const result = JSON.parse(stdout) as RetentionProbeResult;
-		expect(result.liveBytes - result.baselineBytes).toBeGreaterThan(8 * 1024 * 1024);
-		expect(result.releasedBytes - result.baselineBytes).toBeLessThan(2 * 1024 * 1024);
-		expect(result.retainedEntries).toBe(0);
-	});
 
 	it("drops new spill writes after terminal release", async () => {
 		const manager = inMemory();
 		const payload = `live-${crypto.randomUUID()}`;
-		expect(await manager.saveArtifact(payload, "read")).toBe("0");
+		expect(await manager.saveArtifact(payload)).toBe("0");
 		await manager.close();
 		manager.releaseRetainedEntries();
 		manager.releaseRetainedEntries();
-		expect(await manager.saveArtifact(`late-${crypto.randomUUID()}`, "read")).toBeUndefined();
+		expect(await manager.saveArtifact(`late-${crypto.randomUUID()}`)).toBeUndefined();
 		expect(await manager.getArtifactContent("0", Buffer.byteLength(payload))).toBeNull();
 	});
 
 	it("keeps accepting spill writes across nonterminal close and branch changes", async () => {
 		const manager = inMemory();
 		const firstEntry = manager.appendMessage({ role: "user", content: "first branch", timestamp: Date.now() });
-		expect(await manager.saveArtifact("first spill", "read")).toBe("0");
+		expect(await manager.saveArtifact("first spill")).toBe("0");
 		await manager.close();
 		manager.appendMessage({ role: "user", content: "second branch", timestamp: Date.now() });
 		manager.branch(firstEntry);
-		expect(await manager.saveArtifact("second spill", "read")).toBe("1");
+		expect(await manager.saveArtifact("second spill")).toBe("1");
 	});
 
 	it("preserves adopted artifacts and their owner when a child is released", async () => {
-		const shared = new ArtifactManager(path.join(tempDir.path(), "shared"));
+		const shared = new ArtifactManager(path.join(tempDir.path(), "shared"), null);
 		const child = inMemory();
 		const sibling = inMemory();
 		child.adoptArtifactManager(shared);
 		sibling.adoptArtifactManager(shared);
-		const firstId = await child.saveArtifact("completed child output", "task");
+		const firstId = await child.saveArtifact("completed child output");
 		if (!firstId) throw new Error("Expected a child artifact id");
 		await child.close();
 		child.releaseRetainedEntries();
-		expect(await child.saveArtifact(`late-${crypto.randomUUID()}`, "task")).toBeUndefined();
-		expect(await child.allocateArtifactPath("task")).toEqual({});
-		const secondId = await sibling.saveArtifact("sibling output", "task");
+		expect(await child.saveArtifact(`late-${crypto.randomUUID()}`)).toBeUndefined();
+		expect(await child.allocateArtifactPath()).toEqual({});
+		const secondId = await sibling.saveArtifact("sibling output");
 		if (!secondId) throw new Error("Expected a sibling artifact id");
 		expect(secondId).not.toBe(firstId);
 		const firstPath = await child.getArtifactPath(firstId);
@@ -102,16 +73,16 @@ describe("SessionManager artifact terminal release", () => {
 		if (!firstPath || !secondPath) throw new Error("Expected retained artifact paths");
 		expect(await Bun.file(firstPath).text()).toBe("completed child output");
 		expect(await Bun.file(secondPath).text()).toBe("sibling output");
-		expect(await shared.listFiles()).toHaveLength(2);
+		expect(await fs.promises.readdir(shared.dir)).toHaveLength(2);
 	});
 
 	it("finishes a disk spill admitted before release and keeps persisted output readable", async () => {
 		const ready = Promise.withResolvers<void>();
-		const shared = new ArtifactManager(path.join(tempDir.path(), "pending"), ready.promise);
+		const shared = new ArtifactManager(path.join(tempDir.path(), "pending"), null, ready.promise);
 		const manager = inMemory();
 		manager.adoptArtifactManager(shared);
 		const content = `complete-${crypto.randomUUID()}-${"x".repeat(32 * 1024)}`;
-		const saving = manager.saveArtifact(content, "task");
+		const saving = manager.saveArtifact(content);
 		await manager.close();
 		manager.releaseRetainedEntries();
 		ready.resolve();
@@ -125,15 +96,15 @@ describe("SessionManager artifact terminal release", () => {
 	it("keeps owned disk artifacts readable after release without creating new spills", async () => {
 		const manager = SessionManager.create(tempDir.path(), tempDir.path());
 		managers.push(manager);
-		const id = await manager.saveArtifact("persisted output", "bash");
+		const id = await manager.saveArtifact("persisted output");
 		if (!id) throw new Error("Expected a persisted artifact id");
 		await manager.close();
 		manager.releaseRetainedEntries();
 		const artifactPath = await manager.getArtifactPath(id);
 		if (!artifactPath) throw new Error("Expected the persisted artifact path");
 		expect(await Bun.file(artifactPath).text()).toBe("persisted output");
-		expect(await manager.saveArtifact(`late-${crypto.randomUUID()}`, "bash")).toBeUndefined();
-		expect(await manager.allocateArtifactPath("bash")).toEqual({});
+		expect(await manager.saveArtifact(`late-${crypto.randomUUID()}`)).toBeUndefined();
+		expect(await manager.allocateArtifactPath()).toEqual({});
 		expect(await manager.getArtifactContent(id, 1024)).toBeNull();
 	});
 
@@ -184,8 +155,8 @@ describe("SessionManager artifact terminal release", () => {
 	it("isolates equal numeric IDs across owners and clears the old namespace when switching sessions", async () => {
 		const first = inMemory();
 		const second = inMemory();
-		const firstId = await first.saveArtifact('{"owner":"first","route":"/first"}', "mcp");
-		const secondId = await second.saveArtifact('{"owner":"second","route":"/second"}', "mcp");
+		const firstId = await first.saveArtifact('{"owner":"first","route":"/first"}');
+		const secondId = await second.saveArtifact('{"owner":"second","route":"/second"}');
 		if (firstId === undefined || secondId === undefined) throw new Error("Expected artifact IDs");
 		expect(firstId).toBe(secondId);
 		expect(JSON.parse((await first.getArtifactContent(firstId, 1024))!)).toEqual({ owner: "first", route: "/first" });
@@ -194,8 +165,9 @@ describe("SessionManager artifact terminal release", () => {
 			route: "/second",
 		});
 		await first.newSession();
+		spillRoots.add(first.getArtifactManager().dir);
 		expect(await first.getArtifactContent(firstId, 1024)).toBeNull();
-		const nextId = await first.saveArtifact('{"owner":"replacement","route":"/new"}', "mcp");
+		const nextId = await first.saveArtifact('{"owner":"replacement","route":"/new"}');
 		if (nextId === undefined) throw new Error("Expected replacement artifact ID");
 		expect(nextId).toBe(firstId);
 		expect(JSON.parse((await first.getArtifactContent(nextId, 1024))!)).toEqual({
@@ -204,25 +176,26 @@ describe("SessionManager artifact terminal release", () => {
 		});
 	});
 
-	it("restores the original memory artifact namespace after another owner reuses its numeric ID", async () => {
+	it("restores the original spill namespace after another owner reuses its numeric ID", async () => {
 		const manager = inMemory();
-		const id = await manager.saveArtifact('{"owner":"original"}', "mcp");
+		const id = await manager.saveArtifact('{"owner":"original"}');
 		if (id === undefined) throw new Error("Expected original artifact ID");
 		const original = manager.captureState();
 		await manager.newSession();
-		expect(await manager.saveArtifact('{"owner":"replacement"}', "mcp")).toBe(id);
+		spillRoots.add(manager.getArtifactManager().dir);
+		expect(await manager.saveArtifact('{"owner":"replacement"}')).toBe(id);
 		manager.restoreState(original);
 		expect(await manager.getArtifactContent(id, 1024)).toBe('{"owner":"original"}');
-		const nextId = await manager.saveArtifact('{"owner":"original","next":true}', "mcp");
+		const nextId = await manager.saveArtifact('{"owner":"original","next":true}');
 		if (nextId === undefined) throw new Error("Expected next artifact ID");
 		expect(await manager.getArtifactContent(id, 1024)).toBe('{"owner":"original"}');
 		expect(await manager.getArtifactContent(nextId, 1024)).toBe('{"owner":"original","next":true}');
 	});
 
-	it("enforces UTF-8 byte limits and rejects invalid or missing artifact requests in memory", async () => {
+	it("enforces UTF-8 byte limits and rejects invalid or missing spill requests without a transcript file", async () => {
 		const manager = inMemory();
 		const content = "λ東京🦊";
-		const id = await manager.saveArtifact(content, "mcp");
+		const id = await manager.saveArtifact(content);
 		if (id === undefined) throw new Error("Expected artifact ID");
 		const bytes = Buffer.byteLength(content, "utf8");
 		expect(await manager.getArtifactContent(id, content.length)).toBeNull();
@@ -231,7 +204,7 @@ describe("SessionManager artifact terminal release", () => {
 		expect(await manager.getArtifactContent(id, Number.NaN)).toBeNull();
 		expect(await manager.getArtifactContent("../0", bytes)).toBeNull();
 		expect(await manager.getArtifactContent("99", bytes)).toBeNull();
-		const emptyId = await manager.saveArtifact("", "mcp");
+		const emptyId = await manager.saveArtifact("");
 		if (emptyId === undefined) throw new Error("Expected empty artifact ID");
 		expect(await manager.getArtifactContent(emptyId, 0)).toBe("");
 	});
@@ -240,7 +213,7 @@ describe("SessionManager artifact terminal release", () => {
 		const manager = SessionManager.create(tempDir.path(), tempDir.path());
 		managers.push(manager);
 		const content = '{"route":"/東京🦊","status":"modified"}';
-		const id = await manager.saveArtifact(content, "mcp");
+		const id = await manager.saveArtifact(content);
 		if (id === undefined) throw new Error("Expected persisted artifact ID");
 		const bytes = Buffer.byteLength(content, "utf8");
 		expect(await manager.getArtifactContent(id, bytes - 1)).toBeNull();
@@ -250,9 +223,8 @@ describe("SessionManager artifact terminal release", () => {
 		});
 		const privatePath = tempDir.join("another-owner.log");
 		await Bun.write(privatePath, "private other-owner content");
-		const artifactsDir = manager.getArtifactsDir();
-		if (!artifactsDir) throw new Error("Expected owner artifact directory");
-		await fs.promises.symlink(privatePath, path.join(artifactsDir, "99.mcp.log"));
+		const artifactsDir = manager.getArtifactManager().dir;
+		await fs.promises.symlink(privatePath, path.join(artifactsDir, "99.log"));
 		expect(await manager.getArtifactContent("99", 1024)).toBeNull();
 		expect(await manager.getArtifactContent("100", 1024)).toBeNull();
 	});
@@ -261,11 +233,11 @@ describe("SessionManager artifact terminal release", () => {
 		const manager = inMemory();
 		const ownerDir = tempDir.join("owner");
 		const otherDir = tempDir.join("other-owner");
-		manager.adoptArtifactManager(new ArtifactManager(ownerDir));
-		const id = await manager.saveArtifact("owned bytes", "mcp");
+		manager.adoptArtifactManager(new ArtifactManager(ownerDir, null));
+		const id = await manager.saveArtifact("owned bytes");
 		if (id === undefined) throw new Error("Expected artifact ID");
 		await fs.promises.mkdir(otherDir);
-		await Bun.write(path.join(otherDir, `${id}.mcp.log`), "private other-owner bytes");
+		await Bun.write(path.join(otherDir, `${id}.log`), "private other-owner bytes");
 		await fs.promises.rename(ownerDir, tempDir.join("displaced-owner"));
 		await fs.promises.symlink(otherDir, ownerDir, "dir");
 		expect(await manager.getArtifactContent(id, 1024)).toBeNull();
@@ -274,19 +246,19 @@ describe("SessionManager artifact terminal release", () => {
 	it("rejects invalid UTF-8 rather than returning equal-length replacement text", async () => {
 		const manager = inMemory();
 		const ownerDir = tempDir.join("owner");
-		manager.adoptArtifactManager(new ArtifactManager(ownerDir));
+		manager.adoptArtifactManager(new ArtifactManager(ownerDir, null));
 		await fs.promises.mkdir(ownerDir);
-		await Bun.write(path.join(ownerDir, "0.mcp.log"), new Uint8Array([0xf0, 0x9f, 0xa6]));
+		await Bun.write(path.join(ownerDir, "0.log"), new Uint8Array([0xf0, 0x9f, 0xa6]));
 		expect(await manager.getArtifactContent("0", 3)).toBeNull();
 	});
 
 	it("ignores unpublished staging files and returns the published payload after the atomic rename", async () => {
 		const manager = inMemory();
 		const ownerDir = tempDir.join("owner");
-		manager.adoptArtifactManager(new ArtifactManager(ownerDir));
+		manager.adoptArtifactManager(new ArtifactManager(ownerDir, null));
 		await fs.promises.mkdir(ownerDir);
-		const staged = path.join(ownerDir, "0.mcp.log.tmp-interrupted");
-		const published = path.join(ownerDir, "0.mcp.log");
+		const staged = path.join(ownerDir, "0.log.tmp-interrupted");
+		const published = path.join(ownerDir, "0.log");
 		await Bun.write(staged, "incomplete");
 		expect(await manager.getArtifactContent("0", 1024)).toBeNull();
 		await Bun.write(published, "complete payload");
@@ -302,11 +274,11 @@ describe("SessionManager artifact terminal release", () => {
 			const manager = SessionManager.create(tempDir.path(), tempDir.path());
 			managers.push(manager);
 			const content = "retained branch payload";
-			const id = await manager.saveArtifact(content, "mcp");
+			const id = await manager.saveArtifact(content);
 			if (!id) throw new Error("Expected a persisted artifact id");
 			const leafId = manager.appendMessage({
 				role: "user",
-				content: `Retain artifact://${id}`,
+				content: `Retain local://${id}.log`,
 				timestamp: 1,
 			});
 			await manager.ensureOnDisk();
@@ -339,13 +311,13 @@ describe("SessionManager artifact terminal release", () => {
 				if (ownerChange === "switch") await manager.newSession();
 				else if (ownerChange === "release") manager.releaseRetainedEntries();
 				else if (ownerChange === "adopt")
-					manager.adoptArtifactManager(new ArtifactManager(tempDir.join("adopted")));
+					manager.adoptArtifactManager(new ArtifactManager(tempDir.join("adopted"), null));
 				releaseCopy.resolve();
 				expect(await reading).toBe(ownerChange === "unchanged" ? content : null);
 			} finally {
 				releaseCopy.resolve();
 				await reading;
-				await artifacts.listFiles();
+				await artifacts.ready;
 			}
 		});
 	}
@@ -354,26 +326,29 @@ describe("SessionManager artifact terminal release", () => {
 		it(`returns ${replaceDirectory ? "null" : "owned bytes"} when the directory is ${replaceDirectory ? "replaced" : "unchanged"} during lookup`, async () => {
 			const manager = inMemory();
 			const ownerDir = tempDir.join("lookup-owner");
-			const artifacts = new ArtifactManager(ownerDir);
+			const artifacts = new ArtifactManager(ownerDir, null);
 			manager.adoptArtifactManager(artifacts);
 			const ownedContent = '{"owner":"original"}';
-			const id = await manager.saveArtifact(ownedContent, "mcp");
+			const id = await manager.saveArtifact(ownedContent);
 			if (id === undefined) throw new Error("Expected disk artifact ID");
 			const lookupEntered = Promise.withResolvers<void>();
 			const releaseLookup = Promise.withResolvers<void>();
-			const listFiles = artifacts.listFiles.bind(artifacts);
-			vi.spyOn(artifacts, "listFiles").mockImplementation(async () => {
-				lookupEntered.resolve();
-				await releaseLookup.promise;
-				return listFiles();
-			});
+			const lstat = fs.promises.lstat.bind(fs.promises);
+			vi.spyOn(fs.promises, "lstat").mockImplementation((async (target, options) => {
+				const result = await lstat(target, options);
+				if (target.toString() === path.join(ownerDir, `${id}.log`)) {
+					lookupEntered.resolve();
+					await releaseLookup.promise;
+				}
+				return result;
+			}) as typeof fs.promises.lstat);
 			const reading = manager.getArtifactContent(id, 1024);
 			try {
 				await withTimeout(lookupEntered.promise, 2_000, "Owned artifact never reached lookup");
 				if (replaceDirectory) {
 					await fs.promises.rename(ownerDir, tempDir.join("displaced-lookup-owner"));
 					await fs.promises.mkdir(ownerDir);
-					await Bun.write(path.join(ownerDir, `${id}.mcp.log`), '{"owner":"replacement"}');
+					await Bun.write(path.join(ownerDir, `${id}.log`), '{"owner":"replacement"}');
 				}
 				releaseLookup.resolve();
 				expect(await reading).toBe(replaceDirectory ? null : ownedContent);
@@ -387,15 +362,16 @@ describe("SessionManager artifact terminal release", () => {
 	it("discards an admitted disk read when its owner switches before the artifact lookup completes", async () => {
 		const manager = inMemory();
 		const artifactDir = tempDir.join("old-owner");
-		const original = new ArtifactManager(artifactDir);
+		const original = new ArtifactManager(artifactDir, null);
 		manager.adoptArtifactManager(original);
-		const id = await manager.saveArtifact('{"owner":"old"}', "mcp");
+		const id = await manager.saveArtifact('{"owner":"old"}');
 		if (id === undefined) throw new Error("Expected disk artifact ID");
 		const ready = Promise.withResolvers<void>();
-		manager.adoptArtifactManager(new ArtifactManager(artifactDir, ready.promise));
+		manager.adoptArtifactManager(new ArtifactManager(artifactDir, null, ready.promise));
 		const reading = manager.getArtifactContent(id, 1024);
 		await manager.newSession();
-		const replacementId = await manager.saveArtifact('{"owner":"new"}', "mcp");
+		spillRoots.add(manager.getArtifactManager().dir);
+		const replacementId = await manager.saveArtifact('{"owner":"new"}');
 		if (replacementId === undefined) throw new Error("Expected replacement artifact ID");
 		ready.resolve();
 		expect(await reading).toBeNull();
@@ -406,8 +382,8 @@ describe("SessionManager artifact terminal release", () => {
 		it(`does not return old-owner bytes when ${transition} happens during the file-close await`, async () => {
 			const manager = inMemory();
 			const ownerDir = tempDir.join("closing-owner");
-			manager.adoptArtifactManager(new ArtifactManager(ownerDir));
-			const id = await manager.saveArtifact('{"owner":"old","route":"/private"}', "mcp");
+			manager.adoptArtifactManager(new ArtifactManager(ownerDir, null));
+			const id = await manager.saveArtifact('{"owner":"old","route":"/private"}');
 			if (id === undefined) throw new Error("Expected disk artifact ID");
 			const artifactPath = await manager.getArtifactPath(id);
 			if (!artifactPath) throw new Error("Expected owned artifact path");
@@ -432,11 +408,11 @@ describe("SessionManager artifact terminal release", () => {
 				if (transition === "switch") await manager.newSession();
 				else if (transition === "release") manager.releaseRetainedEntries();
 				else if (transition === "adopt") {
-					manager.adoptArtifactManager(new ArtifactManager(tempDir.join("replacement-owner")));
+					manager.adoptArtifactManager(new ArtifactManager(tempDir.join("replacement-owner"), null));
 				} else {
 					await fs.promises.rename(ownerDir, tempDir.join("displaced-owner"));
 					await fs.promises.mkdir(ownerDir);
-					await Bun.write(path.join(ownerDir, `${id}.mcp.log`), "replacement namespace");
+					await Bun.write(path.join(ownerDir, `${id}.log`), "replacement namespace");
 				}
 				releaseClose.resolve();
 				expect(await reading).toBeNull();

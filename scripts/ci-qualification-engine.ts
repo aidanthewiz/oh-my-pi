@@ -474,20 +474,28 @@ function normalizeLicenseParagraphs(text: string): string {
 async function legal(): Promise<void> {
 	const notice = (await Bun.file(path.join(root, "THIRD-PARTY-NOTICES.txt")).text()).replaceAll("\r\n", "\n");
 	const normalizedNotice = normalizeLicenseParagraphs(notice);
-	for (const file of [
-		"packages/natives/THIRD-PARTY-NOTICES.txt",
-		"packages/coding-agent/src/tools/browser/relay/extension-assets/THIRD-PARTY-NOTICES.txt",
-	]) {
+	for (const file of ["packages/natives/THIRD-PARTY-NOTICES.txt"]) {
 		assert.equal(
 			(await Bun.file(path.join(root, file)).text()).replaceAll("\r\n", "\n"),
 			notice,
 			`Notice copy diverged: ${file}`,
 		);
 	}
+	const embedded = await Bun.file(
+		path.join(root, "packages/coding-agent/src/tools/browser/relay/extension.generated.json"),
+	).json();
+	const payload: unknown = embedded.files?.["THIRD-PARTY-NOTICES.txt"];
+	const embeddedNotice =
+		typeof payload === "string"
+			? payload
+			: payload && typeof payload === "object" && "base64" in payload && typeof payload.base64 === "string"
+				? Buffer.from(payload.base64, "base64").toString("utf8")
+				: undefined;
+	assert.equal(embeddedNotice?.replaceAll("\r\n", "\n"), notice, "Embedded extension notice missing or diverged");
 	const sourceLicenses = [
-		"crates/pi-builtins/LICENSE",
-		"crates/pi-natives/src/hpatch/LICENSE.HDiffPatch",
-		"crates/pi-natives/src/syntaxes/NOTICE",
+		"crates/builtins/LICENSE",
+		"crates/natives/src/hpatch/LICENSE.HDiffPatch",
+		"crates/natives/src/syntaxes/NOTICE",
 		"crates/vendor/cranelift-codegen/LICENSE",
 		"crates/vendor/cranelift-codegen/COREFORGE-PATCHES.md",
 	];

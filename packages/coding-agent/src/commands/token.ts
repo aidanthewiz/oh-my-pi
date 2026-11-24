@@ -79,7 +79,7 @@ export default class Token extends Command {
 	static examples = [
 		`# Get API key for Anthropic\n  ${CF_COMMAND} token anthropic`,
 		`# Get raw Copilot credential JSON\n  ${CF_COMMAND} token github-copilot --raw`,
-		`# Force refresh and get Gemini CLI token\n  ${CF_COMMAND} token google-gemini-cli --force-refresh`,
+		`# Force refresh and get an Antigravity token\n  ${CF_COMMAND} token google-antigravity --force-refresh`,
 		`# List Anthropic OAuth accounts\n  ${CF_COMMAND} token anthropic --list`,
 		`# Get the 2nd Anthropic OAuth account's token\n  ${CF_COMMAND} token anthropic --account 2`,
 	];

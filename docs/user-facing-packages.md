@@ -74,16 +74,10 @@ Sources: [`packages/metaharness/README.md`](../packages/metaharness/README.md), 
 Sources: [`packages/browser-relay/README.md`](../packages/browser-relay/README.md), [`packages/browser-relay/package.json`](../packages/browser-relay/package.json), [`packages/coding-agent/src/tools/browser/relay/`](../packages/coding-agent/src/tools/browser/relay/).
 
 - Package: private `@oh-my-pi/browser-relay`; user command: `coreforge browser-relay`.
-- Setup: run `coreforge browser-relay install`, load the unpacked extension from
-  `~/.omp/browser-relay/extension`, then opt in per call with `app: "relay"` — or set
-  `browser.relay`, which makes the relay the profile-wide default across projects (scope
-  details in the package README).
-- Behavior: the relay auto-starts through the profile-independent global daemon broker; consumers
-  across projects hold leases, and the relay stops after the last lease is released. `target`
-  borrows a tab by exact CDP target id or URL/title substring; otherwise Coreforge opens its own background tab, which a URL
-  navigates and close removes. `coreforge browser-relay --no-group` disables automatic tab grouping.
-- Security/limits: it binds loopback, enforces the local origin boundary, and requires a machine-local relay token for discovery, CDP, and extension attachment. Public `/json/version` exposes liveness metadata only. Chrome
-  internal pages, DevTools, Web Store, extension pages, and tabs with DevTools open cannot attach.
+- Setup stages the pinned extension and native host. Modifying or restarting a real Chrome profile requires explicit `--chrome`; otherwise follow the manual unpacked-extension instructions. Opt in with `app: "relay"` or the profile-wide `browser.relay` setting.
+- The extension's native host serves the relay on an OS-assigned loopback port while Chrome runs; sidebar chats use a separate native messaging connection. The retired client-started global relay broker is not a second owner.
+- A `target` borrows a tab by exact id or URL/title match; otherwise Coreforge opens an owned background tab. Borrowing never authorizes unsolicited navigation. `--no-group` disables automatic tab grouping.
+- Loopback, local-origin and machine-local token checks remain on discovery, CDP and extension attachment; public `/json/version` exposes liveness metadata only. Chrome internal pages, DevTools, Web Store, extension pages and tabs with DevTools open cannot attach.
 
 ### `packages/collab-web` — browser client for collaborative sessions
 

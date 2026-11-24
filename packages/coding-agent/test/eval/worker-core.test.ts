@@ -884,10 +884,11 @@ await finish(outcomes, outcomes.every(result => !result.premature && !result.ok 
 const registered = waitForMessage(message => message.type === "result" && message.runId === "register-tools");
 send({
 	type: "run", runId: "register-tools", snapshot,
-	code: 'tool(() => { void read("."); return "floated"; }, { name: "floatedRead" });' +
-		'tool(async () => { try { await read("."); } catch { return "caught"; } }, { name: "caughtRead" });' +
+	code: 'const missingReadPath = ' + JSON.stringify(process.cwd() + "/omp-missing-tool-" + crypto.randomUUID()) + ';' +
+		'tool(() => { void read(missingReadPath); return "floated"; }, { name: "floatedRead" });' +
+		'tool(async () => { try { await read(missingReadPath); } catch { return "caught"; } }, { name: "caughtRead" });' +
 		'tool(async () => { await read("package.json"); return "awaited"; }, { name: "awaitedRead" });' +
-		'tool(async () => { await read("."); return "unreachable"; }, { name: "failedRead" });',
+		'tool(async () => { await read(missingReadPath); return "unreachable"; }, { name: "failedRead" });',
 	filename: "[register-tools].js",
 });
 await registered;
@@ -1089,46 +1090,46 @@ await finish(result, result.ownerOk && result.attacherFailed && !result.ownerWar
 		expect(stderr).not.toContain("[Uncaught Exception]");
 	});
 
-	it("reads artifact:// from the artifacts dir of the run's snapshot, not the first one", async () => {
-		const dirA = await fs.mkdtemp(path.join(os.tmpdir(), "omp-artifacts-a-"));
-		const dirB = await fs.mkdtemp(path.join(os.tmpdir(), "omp-artifacts-b-"));
-		await Bun.write(path.join(dirA, "5.eval.log"), "from A");
-		await Bun.write(path.join(dirB, "5.eval.log"), "from B");
+	it("reads local:// spills from the local root of the run's snapshot, not the first one", async () => {
+		const dirA = await fs.mkdtemp(path.join(os.tmpdir(), "omp-local-a-"));
+		const dirB = await fs.mkdtemp(path.join(os.tmpdir(), "omp-local-b-"));
+		await Bun.write(path.join(dirA, "5.log"), "from A");
+		await Bun.write(path.join(dirB, "5.log"), "from B");
 		const harness = createWorkerHarness();
-		const probe = globalThis as { __omp_artifact_probe?: unknown };
-		const run = async (runId: string, artifacts: string) => {
+		const probe = globalThis as { __omp_spill_probe?: unknown };
+		const run = async (runId: string, root: string) => {
 			const result = waitForMessage(harness, message => message.type === "result" && message.runId === runId);
 			harness.send({
 				type: "run",
 				runId,
-				code: `globalThis.__omp_artifact_probe = await read("artifact://5");`,
+				code: `globalThis.__omp_spill_probe = await read("local://5.log");`,
 				filename: `[${runId}].js`,
-				snapshot: { cwd: process.cwd(), sessionId: "artifact-roots", localRoots: { artifact: artifacts } },
+				snapshot: { cwd: process.cwd(), sessionId: "spill-roots", localRoots: { local: root } },
 			});
 			expect(await result).toMatchObject({ type: "result", runId, ok: true });
-			return probe.__omp_artifact_probe;
+			return probe.__omp_spill_probe;
 		};
 		try {
 			await initializeWorker(harness, {
 				cwd: process.cwd(),
-				sessionId: "artifact-roots",
-				localRoots: { artifact: dirA },
+				sessionId: "spill-roots",
+				localRoots: { local: dirA },
 			});
-			expect(await run("artifact-a", dirA)).toBe("from A");
-			expect(await run("artifact-b", dirB)).toBe("from B");
+			expect(await run("spill-a", dirA)).toBe("from A");
+			expect(await run("spill-b", dirB)).toBe("from B");
 		} finally {
-			delete probe.__omp_artifact_probe;
+			delete probe.__omp_spill_probe;
 			harness.send({ type: "close" });
 			await fs.rm(dirA, { recursive: true, force: true });
 			await fs.rm(dirB, { recursive: true, force: true });
 		}
 	});
 
-	it("keeps a suspended run on its own artifact root while an overlapping run uses another", async () => {
-		const dirA = await fs.mkdtemp(path.join(os.tmpdir(), "omp-artifacts-a-"));
-		const dirB = await fs.mkdtemp(path.join(os.tmpdir(), "omp-artifacts-b-"));
-		await Bun.write(path.join(dirA, "5.eval.log"), "from A");
-		await Bun.write(path.join(dirB, "5.eval.log"), "from B");
+	it("keeps a suspended run on its own local:// root while an overlapping run uses another", async () => {
+		const dirA = await fs.mkdtemp(path.join(os.tmpdir(), "omp-local-a-"));
+		const dirB = await fs.mkdtemp(path.join(os.tmpdir(), "omp-local-b-"));
+		await Bun.write(path.join(dirA, "5.log"), "from A");
+		await Bun.write(path.join(dirB, "5.log"), "from B");
 		const harness = createWorkerHarness();
 		const gate = Promise.withResolvers<void>();
 		const entered = Promise.withResolvers<void>();
@@ -1138,10 +1139,10 @@ await finish(result, result.ownerOk && result.attacherFailed && !result.ownerWar
 		};
 		probe.__omp_roots_gate = { entered: () => entered.resolve(), wait: gate.promise };
 		probe.__omp_roots_probe = {};
-		const snapshot = (artifacts: string): SessionSnapshot => ({
+		const snapshot = (root: string): SessionSnapshot => ({
 			cwd: process.cwd(),
-			sessionId: "artifact-roots-overlap",
-			localRoots: { artifact: artifacts },
+			sessionId: "spill-roots-overlap",
+			localRoots: { local: root },
 		});
 		try {
 			await initializeWorker(harness, snapshot(dirA));
@@ -1149,7 +1150,7 @@ await finish(result, result.ownerOk && result.attacherFailed && !result.ownerWar
 			harness.send({
 				type: "run",
 				runId: "hold",
-				code: `globalThis.__omp_roots_gate.entered(); await globalThis.__omp_roots_gate.wait; globalThis.__omp_roots_probe.hold = await read("artifact://5");`,
+				code: `globalThis.__omp_roots_gate.entered(); await globalThis.__omp_roots_gate.wait; globalThis.__omp_roots_probe.hold = await read("local://5.log");`,
 				filename: "[roots-hold].js",
 				snapshot: snapshot(dirA),
 			});
@@ -1162,7 +1163,7 @@ await finish(result, result.ownerOk && result.attacherFailed && !result.ownerWar
 			harness.send({
 				type: "run",
 				runId: "overlap",
-				code: `globalThis.__omp_roots_probe.overlap = await read("artifact://5");`,
+				code: `globalThis.__omp_roots_probe.overlap = await read("local://5.log");`,
 				filename: "[roots-overlap].js",
 				snapshot: snapshot(dirB),
 			});

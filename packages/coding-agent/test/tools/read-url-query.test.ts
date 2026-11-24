@@ -60,10 +60,12 @@ describe("read routed documents", () => {
 			const text = result.content.flatMap(part => (part.type === "text" ? [part.text] : [])).join("\n");
 			expect(result.isError).not.toBe(true);
 			expect(result.details?.notes).toContain("synthetic resource note");
+			expect(text).toContain("selected-document-line");
 			if (raw) {
-				expect(text).toBe("selected-document-line");
+				expect(text).not.toContain("unselected-before");
+				expect(text).not.toContain("unselected-after");
+				expect(text).not.toContain("synthetic resource note");
 			} else {
-				expect(text).toContain("selected-document-line");
 				expect(text).toContain("synthetic resource note");
 			}
 		} finally {

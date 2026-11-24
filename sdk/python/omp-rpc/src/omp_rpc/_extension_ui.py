@@ -9,7 +9,9 @@ PASSIVE_EXTENSION_UI_METHODS: Final[frozenset[str]] = frozenset(
 )
 """Fire-and-forget presentation methods; they never take a response."""
 
-INTERACTIVE_EXTENSION_UI_METHODS: Final[frozenset[str]] = frozenset({"select", "confirm", "input", "editor", "ask"})
+INTERACTIVE_EXTENSION_UI_METHODS: Final[frozenset[str]] = frozenset(
+    {"select", "confirm", "input", "editor", "ask", "form"}
+)
 """Dialog methods the host must answer (or cancel)."""
 
 VALUE_EXTENSION_UI_METHODS: Final[frozenset[str]] = frozenset({"select", "input", "editor"})

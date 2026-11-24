@@ -1,16 +1,53 @@
 {
 	"manifest_version": 3,
 	"name": "Coreforge Browser Relay",
-	"version": "0.1.0",
-	"description": "Lets the Coreforge coding agent drive your existing tabs through a local CDP relay.",
+	"version": "0.2.0",
+	"description": "Coreforge in Chrome: a side panel for sessions that drive your tabs through the local Coreforge relay.",
 	"author": "Stencil Labs, Inc.",
-	"permissions": ["debugger", "tabs", "tabGroups", "storage", "alarms", "scripting", "downloads"],
+	"minimum_chrome_version": "120",
+	"permissions": [
+		"debugger",
+		"tabs",
+		"tabGroups",
+		"storage",
+		"unlimitedStorage",
+		"alarms",
+		"scripting",
+		"downloads",
+		"sidePanel",
+		"nativeMessaging",
+		"notifications",
+		"offscreen"
+	],
 	"host_permissions": ["<all_urls>"],
 	"background": {
 		"service_worker": "background.js"
 	},
-	"options_page": "options.html",
+	"side_panel": {
+		"default_path": "panel.html"
+	},
 	"action": {
-		"default_title": "Coreforge Browser Relay (click for settings)"
+		"default_title": "Coreforge Browser Relay",
+		"default_icon": {
+			"16": "icons/coreforge.png",
+			"32": "icons/coreforge.png",
+			"48": "icons/coreforge.png",
+			"128": "icons/coreforge.png"
+		}
+	},
+	"icons": {
+		"16": "icons/coreforge.png",
+		"32": "icons/coreforge.png",
+		"48": "icons/coreforge.png",
+		"128": "icons/coreforge.png"
+	},
+	"commands": {
+		"toggle-side-panel": {
+			"description": "Open Coreforge",
+			"suggested_key": {
+				"default": "Ctrl+E",
+				"mac": "Command+E"
+			}
+		}
 	}
 }

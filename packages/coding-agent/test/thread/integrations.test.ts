@@ -62,7 +62,7 @@ describe("integrations thread service", () => {
 		frameLog = path.join(dir, "frames.log");
 		authStorage = createInMemoryAuthStorage();
 		registry = new ModelRegistry(authStorage, path.join(dir, "models.yml"));
-		manager = new MCPManager(dir, null, async () => ({ configs: {}, sources: {}, exaApiKeys: [] }));
+		manager = new MCPManager(dir, async () => ({ configs: {}, sources: {}, exaApiKeys: [] }));
 		const configs: Record<string, MCPStdioServerConfig> = {
 			progress: { type: "stdio", command: process.execPath, args: [path.join(FIXTURES, "progress-mcp.ts")] },
 			cancel: {
@@ -196,8 +196,8 @@ describe("integrations thread service", () => {
 			parameters: { type: "object", properties: {} },
 			async execute(_toolCallId, _params, _onUpdate, ctx) {
 				const manager = ctx.sessionManager;
-				const id = await manager.saveArtifact(content, "mcp");
-				const emptyId = await manager.saveArtifact("", "mcp");
+				const id = await manager.saveArtifact(content);
+				const emptyId = await manager.saveArtifact("");
 				if (id === undefined || emptyId === undefined) throw new Error("Expected worker artifact ids");
 				const recovered = {
 					content: await manager.getArtifactContent(id, bytes),

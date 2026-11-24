@@ -229,7 +229,15 @@ describe("AgentSession account pools after a dispose deadline", () => {
 		);
 		try {
 			const operation = start();
-			await armed.promise;
+			expect(
+				await Promise.race([
+					armed.promise.then(() => "armed"),
+					operation.then(
+						() => "settled",
+						() => "settled",
+					),
+				]),
+			).toBe("armed");
 			vi.advanceTimersByTime(20);
 			return await operation;
 		} finally {
@@ -276,7 +284,7 @@ describe("AgentSession account pools after a dispose deadline", () => {
 		expect(await authStorage.keys.get("anthropic", PROVIDER_SESSION_ID)).toBe("runtime-key");
 	});
 
-	it("keeps pool custody through deferred delivery of an accepted cache replay", async () => {
+	it("keeps pool custody through a refused prewarm and deferred accepted replay", async () => {
 		const journal = SessionManager.create(tempDir.path(), tempDir.join("sessions"));
 		const entered = Promise.withResolvers<void>();
 		const settle = Promise.withResolvers<void>();
@@ -293,6 +301,13 @@ describe("AgentSession account pools after a dispose deadline", () => {
 						const request =
 							input instanceof Request ? new Request(input, init) : new Request(input.toString(), init);
 						replayKeys.push(request.headers.get("x-api-key"));
+						const payload: unknown = await request.clone().json();
+						if (payload && typeof payload === "object" && "max_tokens" in payload && payload.max_tokens === 0) {
+							return Response.json(
+								{ error: { type: "invalid_request_error", message: "prewarm unsupported" } },
+								{ status: 400 },
+							);
+						}
 						const events = [
 							{
 								type: "message_start",
@@ -331,6 +346,7 @@ describe("AgentSession account pools after a dispose deadline", () => {
 					},
 				});
 				await source.result();
+				if (options?.prewarm) return source;
 				entered.resolve();
 				await settle.promise;
 				replayKey = await authStorage.keys.get("anthropic", PROVIDER_SESSION_ID);
@@ -343,7 +359,7 @@ describe("AgentSession account pools after a dispose deadline", () => {
 		expect(session.sessionId).toBe(PROVIDER_SESSION_ID);
 		expect(session.sessionManager.getSessionId()).not.toBe(PROVIDER_SESSION_ID);
 		vi.useFakeTimers();
-		const context = { messages: [] };
+		const context = { messages: [{ role: "user" as const, content: "synthetic cache custody", timestamp: 1 }] };
 		session.startCacheWarming(replayModel, context, { cacheRetention: "short" });
 		session.markPromptCacheDispatched(context);
 		let disposal: Promise<void> | undefined;
@@ -364,7 +380,7 @@ describe("AgentSession account pools after a dispose deadline", () => {
 			await released;
 		}
 		expect(replayKey).toBe("access-c");
-		expect(replayKeys).toEqual(["access-c"]);
+		expect(replayKeys).toEqual(["access-c", "access-c"]);
 		const persisted = await SessionManager.open(journal.getSessionFile()!);
 		try {
 			const entries = persisted
@@ -398,8 +414,8 @@ describe("AgentSession account pools after a dispose deadline", () => {
 		const released = Promise.withResolvers<void>();
 		const originalDispose = AgentSession.prototype.dispose;
 		const originalRelease = SessionAccountPoolScope.prototype.release;
-		vi.spyOn(AgentSession.prototype, "dispose").mockImplementation(function (this: AgentSession, options) {
-			return originalDispose.call(this, { ...options, drainTimeoutMs: 20 });
+		vi.spyOn(AgentSession.prototype, "dispose").mockImplementationOnce(function (this: AgentSession, options) {
+			return pastDisposeDeadline(() => originalDispose.call(this, { ...options, drainTimeoutMs: 20 }));
 		});
 		vi.spyOn(SessionAccountPoolScope.prototype, "release").mockImplementation(
 			function (this: SessionAccountPoolScope) {
@@ -407,33 +423,29 @@ describe("AgentSession account pools after a dispose deadline", () => {
 				released.resolve();
 			},
 		);
-		vi.spyOn(AgentSession.prototype, "registerSessionChangeCallback").mockImplementation(
-			function (this: AgentSession) {
-				sessions.push(this);
-				vi.spyOn(this.agent, "waitForIdle").mockImplementation(() => settle.promise);
-				throw new Error("synthetic startup failure");
-			},
-		);
+		vi.spyOn(AgentSession.prototype, "startHintCompression").mockImplementation(function (this: AgentSession) {
+			sessions.push(this);
+			vi.spyOn(this.agent, "waitForIdle").mockImplementation(() => settle.promise);
+			throw new Error("synthetic startup failure");
+		});
 		try {
 			await expect(
-				pastDisposeDeadline(() =>
-					createAgentSession({
-						cwd: tempDir.path(),
-						agentDir: tempDir.path(),
-						sessionManager: SessionManager.inMemory(tempDir.path()),
-						authStorage,
-						modelRegistry: new ModelRegistry(authStorage, tempDir.join("models.yml")),
-						settings: Settings.isolated({
-							"async.enabled": false,
-							"compaction.enabled": false,
-						}),
-						model,
-						providerSessionId: PROVIDER_SESSION_ID,
-						oauthAccountPools: { anthropic: ["email:c@example.com|org:org-c"] },
-						toolNames: ["read"],
-						disableExtensionDiscovery: true,
+				createAgentSession({
+					cwd: tempDir.path(),
+					agentDir: tempDir.path(),
+					sessionManager: SessionManager.inMemory(tempDir.path()),
+					authStorage,
+					modelRegistry: new ModelRegistry(authStorage, tempDir.join("models.yml")),
+					settings: Settings.isolated({
+						"async.enabled": false,
+						"compaction.enabled": false,
 					}),
-				),
+					model,
+					providerSessionId: PROVIDER_SESSION_ID,
+					oauthAccountPools: { anthropic: ["email:c@example.com|org:org-c"] },
+					toolNames: ["read"],
+					disableExtensionDiscovery: true,
+				}),
 			).rejects.toThrow("synthetic startup failure");
 			expect(await authStorage.keys.get("anthropic", PROVIDER_SESSION_ID)).toBe("access-c");
 		} finally {
@@ -582,7 +594,7 @@ describe("SDK inherited account-pool lifetime", () => {
 				"advisor.enabled": false,
 				"todo.enabled": false,
 			}),
-			cacheWarming: false,
+			cacheWarming: "off",
 			toolNames: ["read"],
 			disableExtensionDiscovery: true,
 			enableLsp: false,
@@ -612,7 +624,7 @@ describe("SDK inherited account-pool lifetime", () => {
 		lifecycle.adopt("StartupPeer", { idleTtlMs: 0 });
 		const startupError = new Error("synthetic startup failure");
 		const registration = vi
-			.spyOn(AgentSession.prototype, "registerSessionChangeCallback")
+			.spyOn(AgentSession.prototype, "startHintCompression")
 			.mockImplementationOnce(function (this: AgentSession) {
 				sessions.push(this);
 				throw startupError;
@@ -635,7 +647,7 @@ describe("SDK inherited account-pool lifetime", () => {
 						"advisor.enabled": false,
 						"todo.enabled": false,
 					}),
-					cacheWarming: false,
+					cacheWarming: "off",
 					toolNames: ["read"],
 					disableExtensionDiscovery: true,
 					enableLsp: false,

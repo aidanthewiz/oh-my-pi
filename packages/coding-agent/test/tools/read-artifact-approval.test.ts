@@ -4,7 +4,6 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { registerArtifactsDir } from "@oh-my-pi/pi-coding-agent/internal-urls/registry-helpers";
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
@@ -28,6 +27,7 @@ describe("artifact reads through session approval", () => {
 
 	beforeEach(async () => {
 		root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-artifact-approval-"));
+		await fs.mkdir(path.join(root, "local"));
 	});
 
 	afterEach(async () => {
@@ -76,11 +76,11 @@ describe("artifact reads through session approval", () => {
 			const produced = await bash.execute("produce", {
 				command: "printf 'artifact-start-'; printf '%010000d' 0; printf -- '-artifact-end'",
 			});
-			const hint = /Use (artifact:\/\/\S+:raw:1-1) to read/.exec(textOf(produced))?.[1];
-			expect(hint).toBeDefined();
-			if (!hint) throw new Error("Expected a raw artifact recovery hint");
+			const spill = /local:\/\/\d+\.log/.exec(textOf(produced))?.[0];
+			expect(spill).toBeDefined();
+			if (!spill) throw new Error("Expected a current spill recovery path");
 
-			const recovered = await read.execute("recover", { path: hint });
+			const recovered = await read.execute("recover", { path: `${spill}:raw:1-1` });
 			expect(textOf(recovered)).toBe(`artifact-start-${"0".repeat(10_000)}-artifact-end`);
 		},
 	);
@@ -90,64 +90,49 @@ describe("artifact reads through session approval", () => {
 			cwd: root,
 			hasUI: false,
 			getSessionFile: () => null,
+			getArtifactsDir: () => root,
 			getSessionSpawns: () => "*",
 			settings: Settings.isolated(),
 		});
 	}
 
-	it("reuses an artifact grant across selectors without granting another artifact", async () => {
-		await Bun.write(path.join(root, "54.mcp.log"), "approved artifact");
-		await Bun.write(path.join(root, "55.mcp.log"), "private artifact");
-		const unregister = registerArtifactsDir(root);
-		try {
-			const read = readTool();
-			const grants = new ApprovalGrants(new SessionApprovals(), new ApprovalCache(path.join(root, "agent")));
-			const approve = async (target: string) => {
-				const args = { path: target };
-				const captured = await captureApprovalTargets(read, args, root);
-				return resolveApproval(read, args, "always-ask-cached", {}, grants, undefined, captured).policy;
-			};
-			const captured = await captureApprovalTargets(read, { path: "artifact://54:raw:4-4" }, root);
-			expect(await approve("artifact://54:raw:4-4")).toBe("prompt");
-			recordApprovalGrant(
-				read,
-				{ path: "artifact://54:raw:4-4" },
-				grants,
-				"read",
-				{ grant: "target", always: false },
-				captured,
-			);
-			expect(await approve("artifact://54:raw:4-4")).toBe("allow");
-			expect(await approve("artifact://54:5-10")).toBe("allow");
-			expect(await approve("artifact://55:raw:4-4")).toBe("prompt");
-		} finally {
-			unregister();
-		}
+	it("reuses a spill grant across selectors without granting another spill", async () => {
+		await Bun.write(path.join(root, "local", "54.log"), "approved artifact");
+		await Bun.write(path.join(root, "local", "55.log"), "private artifact");
+		const read = readTool();
+		const grants = new ApprovalGrants(new SessionApprovals(), new ApprovalCache(path.join(root, "agent")));
+		const approve = async (target: string) => {
+			const args = { path: target };
+			const captured = await captureApprovalTargets(read, args, root);
+			return resolveApproval(read, args, "always-ask-cached", {}, grants, undefined, captured).policy;
+		};
+		const args = { path: "local://54.log:raw:4-4" };
+		const captured = await captureApprovalTargets(read, args, root);
+		expect(await approve(args.path)).toBe("prompt");
+		recordApprovalGrant(read, args, grants, "read", { grant: "target", always: false }, captured);
+		expect(await approve(args.path)).toBe("allow");
+		expect(await approve("local://54.log:5-10")).toBe("allow");
+		expect(await approve("local://55.log:raw:4-4")).toBe("prompt");
 	});
 
-	it("binds an oversized artifact grant without materializing it and rejects a replacement file", async () => {
-		const artifact = path.join(root, "56.mcp.log");
+	it("binds an oversized spill grant without materializing it and rejects a replacement file", async () => {
+		const artifact = path.join(root, "local", "56.log");
 		await Bun.write(artifact, "large artifact\n");
 		await fs.truncate(artifact, 16 * 1024 * 1024);
-		const unregister = registerArtifactsDir(root);
-		try {
-			const read = readTool();
-			const args = { path: "artifact://56:raw:1-1" };
-			const grants = new ApprovalGrants(new SessionApprovals(), new ApprovalCache(path.join(root, "agent")));
-			const captured = await captureApprovalTargets(read, args, root);
-			expect(captured.failed).toBe(false);
-			recordApprovalGrant(read, args, grants, "read", { grant: "target", always: false }, captured);
-			expect(resolveApproval(read, args, "always-ask-cached", {}, grants, undefined, captured).policy).toBe("allow");
+		const read = readTool();
+		const args = { path: "local://56.log:raw:1-1" };
+		const grants = new ApprovalGrants(new SessionApprovals(), new ApprovalCache(path.join(root, "agent")));
+		const captured = await captureApprovalTargets(read, args, root);
+		expect(captured.failed).toBe(false);
+		recordApprovalGrant(read, args, grants, "read", { grant: "target", always: false }, captured);
+		expect(resolveApproval(read, args, "always-ask-cached", {}, grants, undefined, captured).policy).toBe("allow");
 
-			const replacement = path.join(root, "replacement.log");
-			await Bun.write(replacement, "replacement content");
-			await fs.rename(replacement, artifact);
-			const rebound = await captureApprovalTargets(read, args, root);
-			expect(rebound.failed).toBe(false);
-			expect(resolveApproval(read, args, "always-ask-cached", {}, grants, undefined, rebound).policy).toBe("prompt");
-		} finally {
-			unregister();
-		}
+		const replacement = path.join(root, "replacement.log");
+		await Bun.write(replacement, "replacement content");
+		await fs.rename(replacement, artifact);
+		const rebound = await captureApprovalTargets(read, args, root);
+		expect(rebound.failed).toBe(false);
+		expect(resolveApproval(read, args, "always-ask-cached", {}, grants, undefined, rebound).policy).toBe("prompt");
 	});
 
 	it("does not reuse unbound remote grants and keeps SSH reads execution-tier", async () => {

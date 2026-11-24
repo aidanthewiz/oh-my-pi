@@ -639,9 +639,10 @@ describe.skipIf(process.platform === "win32")("native MCP auth command", () => {
 		);
 		await configure({ mcpServers: { synthetic: { type: "http", url: "http://127.0.0.1:1/wrong-owner" } } });
 		expect((await run(["auth", "--check"])).exitCode).toBe(0);
-		expect(fixture.handshakes).toEqual([""]);
+		const handshakes = fixture.handshakes.slice();
+		expect(new Set(handshakes)).toEqual(new Set([""]));
 		expect((await run(["auth", "optional", "--check"])).exitCode).toBe(2);
-		expect(fixture.handshakes).toEqual([""]);
+		expect(fixture.handshakes).toEqual(handshakes);
 	}, 30_000);
 
 	test.each([

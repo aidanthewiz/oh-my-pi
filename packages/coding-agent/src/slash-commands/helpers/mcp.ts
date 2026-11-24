@@ -155,6 +155,7 @@ async function withPreparedMcpConnection<T>(
 		connection = await connectToServer(name, resolvedConfig, {
 			preserveExplicitCredentials: sourceLevel === "user",
 			preserveOperationalAws: false,
+			live: true,
 		});
 		return await fn(connection);
 	} finally {
@@ -470,7 +471,7 @@ async function handleReauthCommand(rest: string, runtime: SlashCommandRuntime): 
 					: state === "connecting"
 						? " Server reconnecting…"
 						: state === "disconnected"
-							? " Server still disconnected; no background retry is armed for a server that never connected — restart the session (or reconnect it interactively) to use the fresh credential."
+							? " Server still disconnected; restart the session (or reconnect it interactively) to use the fresh credential."
 							: " Credentials apply on the next connection; restart the session if the server stays disconnected.";
 			emit(`✓ Reauthorized "${name}" (${found.scope} config).${suffix}`);
 			return commandConsumed();

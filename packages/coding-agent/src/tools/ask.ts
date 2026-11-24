@@ -1,9 +1,9 @@
 /**
  * Ask Tool - the model asks the user to fill in one HTML `<form>`.
  *
- * Hosts with a form surface render the form whole. Rich choice hosts retain
- * answer attachments; other hosts walk the named fields through prompts.
- * A timed-out form is incomplete and never grants approval.
+ * Hosts with a form surface render the form whole and retain answer attachments.
+ * Other hosts use their rich-choice surface or walk the named fields.
+ * A timeout retains explicit partial answers but never supplies defaults or approval.
  */
 
 import { type as arkType } from "@oh-my-pi/omptype";
@@ -38,12 +38,18 @@ import { theme } from "@oh-my-pi/pi-tui/theme";
 import type { AskToolDetails } from "@oh-my-pi/pi-tui/tools/ask";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { isRecord, logger, parseImageMetadata, prompt, untilAborted } from "@oh-my-pi/pi-utils";
-import type { ExtensionUIContext, ExtensionUIDialogOptions, ExtensionUISelectItem } from "../extensibility/extensions";
+import type {
+	ExtensionFormDialogResult,
+	ExtensionUIContext,
+	ExtensionUIDialogOptions,
+	ExtensionUISelectItem,
+} from "../extensibility/extensions";
 import { askTimeoutMs, cfgAskNotify } from "../modes/settings";
 import askDescription from "../prompts/tools/ask.md" with { type: "text" };
-import { callRegisteredTool } from "../eval/js/session-tool";
+import { bridgeValueFromToolResult, getSessionTool, runSessionTool } from "../eval/js/session-tool";
 import askHeadlessForkMessage from "../prompts/tools/ask-headless-fork.md" with { type: "text" };
 import askResultTemplate from "../prompts/tools/ask-result.md" with { type: "text" };
+import askSplitRadioGroupsTemplate from "../prompts/tools/ask-split-radio-groups.md" with { type: "text" };
 import { renderAttachmentSourceNotice } from "../session/attachment-source-notice";
 import { cfgSpeechEnabled } from "../tts/settings";
 import { vocalizer } from "../tts/vocalizer";
@@ -56,6 +62,8 @@ const HEADLESS_FORK_ASK_ERROR = prompt.render(askHeadlessForkMessage);
 
 const NO_NAMED_CONTROLS_ERROR =
 	"Error: the form has no named controls. Put at least one <input>, <select> or <textarea> with a `name` attribute inside the <form>.";
+
+const INVALID_ASK_ERROR = "Error: ask takes one `html` string holding a <form>.";
 
 // Window after the timeout deadline within which an `undefined` answer is
 // attributed to a UI-enforced timeout (for surfaces that close the dialog at
@@ -70,11 +78,66 @@ const askSchema = arkType({
 
 export type AskParams = typeof askSchema.infer;
 
-/** The `html` of a persisted or streamed `ask` call, for `/tree` re-answer and status lines. */
+/**
+ * The form an `ask` call asks: its `html`, a bare string, or the pre-HTML `questions` list
+ * (`[{id, question, options: [{label, description?}], multi?, recommended?}]`) rebuilt as a form.
+ * Also reads persisted and streamed calls for `/tree` re-answer and status lines.
+ */
 export function recoverAskHtml(toolCallArguments: unknown): string | undefined {
+	if (typeof toolCallArguments === "string") return toolCallArguments;
 	if (!isRecord(toolCallArguments)) return undefined;
 	const html = toolCallArguments.html;
-	return typeof html === "string" ? html : undefined;
+	if (typeof html === "string") return html;
+	const questions = toolCallArguments.questions;
+	return Array.isArray(questions) && questions.length > 0 ? legacyQuestionsHtml(questions) : undefined;
+}
+
+function legacyQuestionsHtml(questions: unknown[]): string | undefined {
+	const fieldsets: string[] = [];
+	for (const [index, item] of questions.entries()) {
+		if (!isRecord(item) || typeof item.question !== "string") return undefined;
+		const name = Bun.escapeHTML(typeof item.id === "string" && item.id ? item.id : `q${index + 1}`);
+		const kind = item.multi === true ? "checkbox" : "radio";
+		const options = Array.isArray(item.options) ? item.options : [];
+		const inputs: string[] = [];
+		for (const [optionIndex, option] of options.entries()) {
+			const label = isRecord(option) ? option.label : option;
+			if (typeof label !== "string") return undefined;
+			const description =
+				isRecord(option) && typeof option.description === "string"
+					? ` — ${Bun.escapeHTML(option.description)}`
+					: "";
+			const checked = item.recommended === optionIndex ? " checked" : "";
+			inputs.push(
+				`<label><input type="${kind}" name="${name}" value="${Bun.escapeHTML(label)}"${checked}> ${Bun.escapeHTML(label)}${description}</label>`,
+			);
+		}
+		const control = inputs.length > 0 ? inputs.join("") : `<textarea name="${name}"></textarea>`;
+		fieldsets.push(`<fieldset><legend>${Bun.escapeHTML(item.question)}</legend>${control}</fieldset>`);
+	}
+	return `<form>${fieldsets.join("")}</form>`;
+}
+
+/**
+ * Fieldsets whose radios each sit in a group of their own — one `name` per
+ * input. HTML submits every checked radio under its own name, so a preselected
+ * option returns next to the user's pick as a second answer to one question.
+ * Separate questions belong in separate fieldsets, so this is an authoring slip.
+ */
+function splitRadioFieldsets(form: HtmlForm): { legend: string; names: string[] }[] {
+	const split: { legend: string; names: string[] }[] = [];
+	for (const section of form.sections) {
+		if (!section.fieldset) continue;
+		const names: string[] = [];
+		for (const block of section.blocks) {
+			if (block.kind !== "field") continue;
+			const field = block.field;
+			if (field.kind !== "choice" || field.multi || field.select) continue;
+			if (field.name && field.options.length === 1) names.push(field.name);
+		}
+		if (names.length > 1) split.push({ legend: spansText(section.title), names });
+	}
+	return split;
 }
 
 // =============================================================================
@@ -367,6 +430,8 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 	readonly summary = "Ask the user to fill in a form";
 	readonly parameters = askSchema;
 	readonly strict = true;
+	// Raw args reach execute() on schema failure, so a bare string or a legacy `questions` list still asks.
+	readonly lenientArgValidation = true;
 
 	// Run alone in its tool batch. The interactive dialog is a single shared UI
 	// surface (`ExtensionUiController` has no queue and overwrites the active
@@ -468,11 +533,21 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 		}
 
 		const html = params.html;
+		if (typeof html !== "string") {
+			return { content: [{ type: "text", text: INVALID_ASK_ERROR }], details: { answers: [] }, isError: true };
+		}
 		const form = parseHtmlForm(html);
 		const questions = fieldQuestions(form);
 		const named = form.fields.filter(field => field.name);
 		if (named.length === 0) {
 			return { content: [{ type: "text", text: NO_NAMED_CONTROLS_ERROR }], details: { answers: [] } };
+		}
+		const splitRadios = splitRadioFieldsets(form);
+		if (splitRadios.length > 0) {
+			return {
+				content: [{ type: "text", text: prompt.render(askSplitRadioGroupsTemplate, { fieldsets: splitRadios }) }],
+				details: { answers: [] },
+			};
 		}
 
 		const extensionUi = context.ui;
@@ -491,8 +566,23 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 		if (steeringSignal?.aborted) onSteer();
 		else steeringSignal?.addEventListener("abort", onSteer, { once: true });
 		const dialogSignal = signal ? AbortSignal.any([signal, userSteering.signal]) : userSteering.signal;
-		const abortError = (): ToolAbortError =>
-			new ToolAbortError(userSteering.signal.aborted ? "Ask interrupted by message" : "Ask input was cancelled");
+		let given: ExtensionFormDialogResult | undefined;
+		const abortError = (): ToolAbortError => {
+			if (!isCurrent()) return new ToolAbortError("Ask answer owner changed");
+			if (!userSteering.signal.aborted) return new ToolAbortError("Ask input was cancelled");
+			if (!given) return new ToolAbortError("Ask interrupted by message");
+			const notes = given.notes?.map(({ images: _images, ...note }) => ({
+				...note,
+				text: note.text.replace(/\s+/g, " ").trim(),
+			}));
+			return new ToolAbortError(
+				prompt.render(askResultTemplate, {
+					interrupted: true,
+					json: JSON.stringify(given.data, null, 2),
+					notes: notes?.length ? notes : undefined,
+				}),
+			);
+		};
 		const checkAnswerCurrent = () => {
 			if (dialogSignal.aborted) throw abortError();
 			if (!isCurrent()) throw new ToolAbortError("Ask answer owner changed");
@@ -527,7 +617,7 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 			const richCompatible = form.sections.every(section =>
 				section.blocks.every(block => block.kind === "text" || block.kind === "field"),
 			);
-			if (extensionUi.askDialog && choices.length === named.length && richCompatible) {
+			if (!extensionUi.formDialog && extensionUi.askDialog && choices.length === named.length && richCompatible) {
 				const richContext = form.sections
 					.flatMap(section => [
 						spansText(section.title),
@@ -633,11 +723,12 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 						try {
 							dialogSignal.throwIfAborted();
 							if (!isCurrent()) throw new ToolAbortError("Ask media owner changed");
-							const result = await callRegisteredTool(
-								"read",
+							const call = await runSessionTool(
+								getSessionTool(this.session, "read"),
 								{ path: /\.svgz?$/i.test(block.src) ? `${block.src}:img` : block.src },
 								{ session: this.session, signal: dialogSignal },
 							);
+							const result = bridgeValueFromToolResult(call.name, call.args, call.result);
 							dialogSignal.throwIfAborted();
 							if (!isCurrent()) throw new ToolAbortError("Ask media owner changed");
 							if (
@@ -692,6 +783,9 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 							if (!admitted) throw new ToolError("Form image source was not admitted");
 							if (admitted instanceof Error) throw admitted;
 							return { bytes: admitted.bytes.slice(), mime: admitted.mime };
+						},
+						onAbandon: partial => {
+							if (isCurrent()) given = partial;
 						},
 					}),
 				);

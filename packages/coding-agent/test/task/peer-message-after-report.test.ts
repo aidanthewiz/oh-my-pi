@@ -500,12 +500,16 @@ it("publishes an owned service completion after its task monitor detaches while 
 		expect(session.ircWakesPending).toBe(true);
 		const owner = session.sessionManager.getSessionId();
 		await session.queueLaunchCompletion({
-			event: "daemon-completed",
+			ev: "completed",
 			completionId: "publication-window-service",
 			owner,
-			daemon: {
-				name: "owned-service",
+			unit: {
 				id: "publication-window-service",
+				kind: "proc",
+				scope: { kind: "session", id: owner },
+				key: "owned-service",
+				label: "owned-service",
+				generation: "publication-window-generation",
 				state: "exited",
 				createdAt: 1,
 				startedAt: 1,
@@ -514,8 +518,10 @@ it("publishes an owned service completion after its task monitor detaches while 
 				restartCount: 0,
 				outputBytes: 0,
 				owner,
-				persist: false,
-				detached: false,
+				pids: [],
+				leases: 0,
+				policy: { hold: "leases", idleMs: 0, onIdle: "stop", restart: "no", survive: "exec" },
+				supervised: true,
 			},
 		});
 		await settle();

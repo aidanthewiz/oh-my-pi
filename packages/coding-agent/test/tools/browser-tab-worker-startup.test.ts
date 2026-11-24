@@ -224,31 +224,58 @@ describe("browser init deadline carry-over", () => {
 		"counts caller time already spent before acquisition against the worker-init budget",
 		async () => {
 			const launched = headless();
-			// The hang server makes the ready phase burn its (floor-clamped) budget
-			// without resolving, so the first init attempt fails on its own.
+			// A fresh ready budget can accept this response; the carried, exhausted budget cannot.
+			const pendingResponses = new Map<ReturnType<typeof setTimeout>, (response: Response) => void>();
+			let requestStarted = false;
 			const server = Bun.serve({
 				port: 0,
-				fetch: () => Promise.withResolvers<Response>().promise,
+				fetch: request => {
+					if (new URL(request.url).pathname === "/hang") requestStarted = true;
+					const response = Promise.withResolvers<Response>();
+					const timer = setTimeout(() => {
+						pendingResponses.delete(timer);
+						response.resolve(
+							new Response("<title>late response</title>", { headers: { "content-type": "text/html" } }),
+						);
+					}, 1_500);
+					pendingResponses.set(timer, response.resolve);
+					return response.promise;
+				},
 			});
 			let failure: unknown;
+			const controlName = `deadline-control-${process.pid}-${Math.random().toString(36).slice(2)}`;
+			const lateName = `deadline-carry-${process.pid}-${Math.random().toString(36).slice(2)}`;
 			try {
+				await acquireTab(controlName, launched, {
+					url: `http://127.0.0.1:${server.port}/control`,
+					waitUntil: "domcontentloaded",
+					timeoutMs: 5_000,
+				});
+				const control = await runInTab(controlName, {
+					code: "return await page.title();",
+					timeoutMs: 5_000,
+					session: {
+						cwd: process.cwd(),
+						hasUI: false,
+						settings: Settings.isolated(),
+						getSessionFile: () => null,
+					} as unknown as ToolSession,
+				});
+				expect(control.returnValue).toBe("late response");
+				await releaseTab(controlName, { kill: true });
+				requestStarted = false;
 				const deadlineStart = performance.now() - 60_000;
-				const started = performance.now();
 				// Mirror the browser prelude host's outer acquisition lease. Its timeout can
 				// release this lease before acquireTab spends the supervisor's
 				// phase floors, but acquireTab must retain its own hold so target
 				// cleanup still has a connected Puppeteer handle.
 				holdBrowser(launched);
-				const acquisition = acquireTab(
-					`deadline-carry-${process.pid}-${Math.random().toString(36).slice(2)}`,
-					launched,
-					{
-						url: `http://127.0.0.1:${server.port}/hang`,
-						waitUntil: "domcontentloaded",
-						timeoutMs: 5_000,
-						deadlineStartMs: deadlineStart,
-					},
-				);
+				const acquisition = acquireTab(lateName, launched, {
+					url: `http://127.0.0.1:${server.port}/hang`,
+					waitUntil: "domcontentloaded",
+					timeoutMs: 5_000,
+					deadlineStartMs: deadlineStart,
+				});
 				await releaseBrowser(launched, { kill: false });
 				if (!("browser" in launched)) throw new Error("Expected a puppeteer-backed browser handle");
 				const connectedAfterCallerRelease = launched.browser.connected;
@@ -257,13 +284,19 @@ describe("browser init deadline carry-over", () => {
 				} catch (error) {
 					failure = error;
 				}
-				const elapsed = performance.now() - started;
 				expect(connectedAfterCallerRelease).toBeTrue();
+				expect(requestStarted).toBeTrue();
 				expect(failure).toBeDefined();
-				// Only one attempt's floors are spent.
-				expect(elapsed).toBeLessThan(4_000);
 			} finally {
-				await server.stop(true);
+				try {
+					await Promise.all([releaseTab(controlName, { kill: true }), releaseTab(lateName, { kill: true })]);
+				} finally {
+					for (const [timer, resolve] of pendingResponses) {
+						clearTimeout(timer);
+						resolve(new Response("closed"));
+					}
+					await server.stop(true);
+				}
 			}
 		},
 		30_000,

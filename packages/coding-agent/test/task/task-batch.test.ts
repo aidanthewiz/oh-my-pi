@@ -853,7 +853,7 @@ describe("task.batch spawning", () => {
 					enableLsp: false,
 					enableIrc: false,
 					skipPythonPreflight: true,
-					cacheWarming: false,
+					cacheWarming: "off",
 				});
 				sessions.push(parent.session);
 				const observed = new Map<

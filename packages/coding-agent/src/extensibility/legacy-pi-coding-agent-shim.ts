@@ -74,7 +74,7 @@ import { formatBytes } from "@oh-my-pi/pi-tui/render/render-utils";
 import { WriteTool } from "../tools/write";
 import { expandTilde, resolveToCwd } from "../tools/path-utils";
 import { EventBus } from "../utils/event-bus";
-import { convertImageToPng } from "@oh-my-pi/pi-tui/chat/image-loading";
+import { convertImageToPng } from "@oh-my-pi/pi-tui/png-conversion";
 import { discoverExtensionPaths, loadExtensionFromFactory, loadExtensions } from "./extensions";
 import { ExtensionRuntime } from "./extensions/loader";
 import type {
@@ -1664,6 +1664,7 @@ export function sessionEntryToContextMessages(entry: SessionEntry): AgentMessage
 			entry.details,
 			entry.timestamp,
 			entry.attribution,
+			entry.excludeFromContext,
 		);
 		if (entry.stopHookAssistantEntryId) markStopHookResult(message, entry.stopHookAssistantEntryId);
 		return [message];

@@ -121,7 +121,7 @@ const probe: ProducerCustodyProbe = {
 				asyncJobManager: manager,
 				sessionManager: SessionManager.inMemory(cwd),
 				bindProcessState: false,
-				cacheWarming: false,
+				cacheWarming: "off",
 				disableModelFallback: true,
 				disableExtensionDiscovery: true,
 				skills: [],

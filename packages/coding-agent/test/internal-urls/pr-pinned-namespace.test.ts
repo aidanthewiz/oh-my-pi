@@ -18,6 +18,7 @@ import {
 import { captureForgeCliEnvironment } from "@oh-my-pi/pi-coding-agent/utils/forge-cli";
 import { github } from "@oh-my-pi/pi-coding-agent/utils/github";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
+import { resourceText } from "../helpers/resource-text";
 
 const FIRST = `diff --git a/src/saved-one.ts b/src/saved-one.ts
 --- a/src/saved-one.ts
@@ -172,7 +173,7 @@ describe("pinned PR credential namespace", () => {
 		const router = InternalUrlRouter.instance();
 		for (const suffix of SUFFIXES) {
 			const resource = await router.resolve(`${base}${suffix}${target.prDiffQuery}`, { cwd, settings });
-			expectSaved(resource.content, suffix, target.prDiffUrl!, target.prDiffQuery!);
+			expectSaved(resourceText(resource), suffix, target.prDiffUrl!, target.prDiffQuery!);
 		}
 	});
 
@@ -196,7 +197,7 @@ describe("pinned PR credential namespace", () => {
 				`${target.prDiffUrl}${suffix}${target.prDiffQuery}`,
 				{ cwd, settings },
 			);
-			expectSaved(result.content, suffix, target.prDiffUrl!, target.prDiffQuery!);
+			expectSaved(resourceText(result), suffix, target.prDiffUrl!, target.prDiffQuery!);
 		}
 	});
 
@@ -242,7 +243,7 @@ describe("pinned PR credential namespace", () => {
 				).toBe(generation);
 				response.resolve("https://github.com/owner/repo");
 				const result = await pending;
-				expectSaved(result.content, suffix, target.prDiffUrl!, target.prDiffQuery!);
+				expectSaved(resourceText(result), suffix, target.prDiffUrl!, target.prDiffQuery!);
 				const later = await InternalUrlRouter.instance().resolve(`${target.prDiffUrl}/all${target.prDiffQuery}`, {
 					cwd,
 					settings,

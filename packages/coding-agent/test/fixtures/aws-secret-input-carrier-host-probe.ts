@@ -13,7 +13,7 @@ import { AgentRegistry } from "../../src/registry/agent-registry";
 import { createAgentSession } from "../../src/sdk";
 import type { AgentSession } from "../../src/session/agent-session";
 import { SessionManager } from "../../src/session/session-manager";
-import { BUILTIN_TOOLS, type ToolSession } from "../../src/tools";
+import { BUILTIN_TOOLS, toolCommandDispatches, type ToolSession } from "../../src/tools";
 import { AwsTool, type AwsSecretInputDependencies } from "../../src/tools/aws";
 import {
 	AWS_SECRET_INPUT_CAPABILITY,
@@ -25,12 +25,15 @@ import {
 import { runAwsSecretInputScope } from "../../src/tools/aws-secret-input-scope";
 import { probeAwsSecretInputWorker } from "../../src/tools/aws-secret-input-worker-client";
 import { cfgToolsApproval } from "../../src/tools/settings";
+import { quotePosixArgv } from "../../src/utils/shell-quote";
 import { createInMemoryAuthStorage } from "../helpers/agent-session-setup";
 
 const emit = process.stdout.write.bind(process.stdout);
 const APPROVED_OUTPUT = "carrier-input-approved\n";
 const SYNTHETIC_INPUT = "carrier-fixture-private-input";
-const COPIED_AWS_PATH = "[xd://aws#ABCD]";
+function commandArgs(args: unknown): { command: string } {
+	return { command: quotePosixArgv(["aws", "--json", JSON.stringify(args)]) };
+}
 let stage = "setup";
 
 function proof(value: unknown): asserts value {
@@ -39,8 +42,8 @@ function proof(value: unknown): asserts value {
 
 function response(result: AgentToolResult<unknown>): Record<string, unknown> | undefined {
 	if (!isRecord(result.details)) return undefined;
-	const details =
-		isRecord(result.details.xdev) && isRecord(result.details.xdev.inner) ? result.details.xdev.inner : result.details;
+	const inner = toolCommandDispatches("bash", result).find(dispatch => dispatch.tool === "aws")?.inner;
+	const details = isRecord(inner) ? inner : result.details;
 	return isRecord(details.response) ? details.response : undefined;
 }
 
@@ -58,12 +61,9 @@ function incompatible(value: unknown): boolean {
 	);
 }
 
-function evalCode(language: "js" | "py", carrier: "aws" | "write" | "copied-write", args: unknown): string {
-	const tool = carrier === "aws" ? "aws" : "write";
-	const input =
-		carrier === "aws"
-			? args
-			: { path: carrier === "copied-write" ? COPIED_AWS_PATH : "xd://aws", content: JSON.stringify(args) };
+function evalCode(language: "js" | "py", carrier: "aws" | "bash", args: unknown): string {
+	const tool = carrier;
+	const input = carrier === "aws" ? args : commandArgs(args);
 	if (language === "js") {
 		return [
 			`const result = await tool.${tool}(${JSON.stringify(input)});`,
@@ -88,7 +88,7 @@ interface HeldCleanup {
 }
 
 interface CarrierResultHook {
-	root: "aws" | "write";
+	root: "aws" | "bash";
 	args: unknown;
 	entered: number;
 	completed: number;
@@ -136,7 +136,8 @@ async function run(root: string, language: "js" | "py") {
 		"eval.autoProvision": false,
 		"eval.autoBackground.enabled": false,
 		"python.interpreter": process.env.CARRIER_PYTHON ?? "",
-		"tools.xdev": true,
+		"tools.commands": true,
+		"tools.outputMaxColumns": 4_096,
 		"edit.mode": "hashline",
 		"tools.approvalMode": "yolo",
 		"approval.notify": "off",
@@ -312,7 +313,7 @@ async function run(root: string, language: "js" | "py") {
 				sessionManager,
 				settings,
 				model: { ...model, baseUrl: "https://carrier-model.invalid" },
-				cacheWarming: false,
+				cacheWarming: "off",
 				autoTitle: false,
 				bindProcessState: false,
 				disableExtensionDiscovery: true,
@@ -337,7 +338,7 @@ async function run(root: string, language: "js" | "py") {
 				enableLsp: false,
 				enableIrc: false,
 				skipPythonPreflight: true,
-				toolNames: ["aws", "edit", "eval", "read", "write"],
+				toolNames: ["aws", "bash", "edit", "eval", "read", "write"],
 				mountedToolNames: ["aws"],
 				requireYieldTool: false,
 				preloadedCustomToolPaths: [],
@@ -358,10 +359,10 @@ async function run(root: string, language: "js" | "py") {
 		const raw = native;
 		const live = session;
 		const canonicalAws = live.getToolByName("aws");
-		const canonicalWrite = live.getToolByName("write");
-		proof(canonicalAws && canonicalWrite && live.getToolForEvalBridge("aws"));
+		const canonicalBash = live.getToolByName("bash");
+		proof(canonicalAws && canonicalBash && live.getToolForEvalBridge("aws"));
 		proof(
-			live.agent.state.tools.some(tool => tool.name === "write") &&
+			live.agent.state.tools.some(tool => tool.name === "bash") &&
 				!live.agent.state.tools.some(tool => tool.name === "aws"),
 		);
 		const runner = live.extensionRunner;
@@ -390,10 +391,6 @@ async function run(root: string, language: "js" | "py") {
 		unsubscribe = live.agent.subscribe(event => {
 			if (event.type === "tool_execution_end")
 				results.set(event.toolCallId, { ...event.result, isError: event.isError === true });
-		});
-		const writeArgs = (args: unknown, destination = "xd://aws") => ({
-			path: destination,
-			content: JSON.stringify(args),
 		});
 		const execute = (tool: AgentTool, args: unknown) =>
 			tool.execute(
@@ -464,7 +461,7 @@ async function run(root: string, language: "js" | "py") {
 		const transfer = async (name: string, args: Record<string, unknown>) => {
 			stage = name;
 			const before = { ...counts };
-			const turn = dispatch("write", args);
+			const turn = dispatch("bash", args);
 			await turn.pending;
 			const result = results.get(turn.id);
 			proof(result && result.isError !== true);
@@ -490,14 +487,13 @@ async function run(root: string, language: "js" | "py") {
 			if (language === "js") {
 				await reject(`sdk-raw-aws-${kind}`, () => raw.execute(`raw-${++sequence}`, args));
 				await reject(`sdk-canonical-aws-${kind}`, () => execute(canonicalAws, args));
-				await reject(`sdk-canonical-write-${kind}`, () => execute(canonicalWrite, writeArgs(args)));
-				await reject(`sdk-copied-write-${kind}`, () => execute(canonicalWrite, writeArgs(args, COPIED_AWS_PATH)));
+				await reject(`sdk-canonical-bash-${kind}`, () => execute(canonicalBash, commandArgs(args)));
 				await reject(`sdk-bridge-aws-${kind}`, () => callSessionTool("aws", args, { session: owner }));
-				await reject(`sdk-bridge-write-${kind}`, () =>
-					callSessionTool("write", writeArgs(args), { session: owner }),
+				await reject(`sdk-bridge-bash-${kind}`, () =>
+					callSessionTool("bash", commandArgs(args), { session: owner }),
 				);
 			}
-			for (const carrier of ["aws", "write", "copied-write"] as const) {
+			for (const carrier of ["aws", "bash"] as const) {
 				await reject(`${language}-eval-${carrier}-${kind}`, async () => {
 					const turn = dispatch("eval", { language, code: evalCode(language, carrier, args), timeout: 30 });
 					await turn.pending;
@@ -515,22 +511,22 @@ async function run(root: string, language: "js" | "py") {
 				syntheticModelCalls: synthetic.calls.length,
 			};
 
-		const rejectPreflight = async (carrier: "aws" | "write") => {
-			const args = carrier === "aws" ? request : writeArgs(request, COPIED_AWS_PATH);
+		const rejectPreflight = async (carrier: "aws" | "bash") => {
+			const args = carrier === "aws" ? request : commandArgs(request);
 			const beforeToolCall = live.agent.beforeToolCall;
 			let entered = 0;
 			live.agent.beforeToolCall = async context => {
 				proof(context.tool.name === carrier && Bun.deepEquals(context.args, args));
 				entered++;
 				await reject(`preflight-${carrier}-canonical-aws`, () => execute(canonicalAws, request));
-				await reject(`preflight-${carrier}-canonical-write`, () => execute(canonicalWrite, writeArgs(request)));
-				if (carrier === "write") {
-					await reject("preflight-write-nested-native-dispatch", async () => {
-						proof(context.tool === live.agent.state.tools.find(tool => tool.name === "write"));
+				await reject(`preflight-${carrier}-canonical-bash`, () => execute(canonicalBash, commandArgs(request)));
+				if (carrier === "bash") {
+					await reject("preflight-bash-nested-native-dispatch", async () => {
+						proof(context.tool === live.agent.state.tools.find(tool => tool.name === "bash"));
 						const nestedId = `nested-preflight-${++sequence}`;
 						const nestedModel = createMockModel({
 							responses: [
-								{ content: [{ type: "toolCall", id: nestedId, name: "write", arguments: context.args }] },
+								{ content: [{ type: "toolCall", id: nestedId, name: "bash", arguments: context.args }] },
 								{ content: ["Nested carrier fixture complete"] },
 							],
 						});
@@ -565,53 +561,41 @@ async function run(root: string, language: "js" | "py") {
 				live.agent.beforeToolCall = beforeToolCall;
 			}
 		};
-		await rejectPreflight("write");
+		await rejectPreflight("bash");
 
-		stage = "native-copied-write-capability";
+		stage = "native-bash-capability";
 		const beforeCapability = { ...counts };
-		const capability = dispatch("write", writeArgs(capabilityRequest, COPIED_AWS_PATH));
+		const capability = dispatch("bash", commandArgs(capabilityRequest));
 		await capability.pending;
 		const capabilityResult = results.get(capability.id);
 		proof(capabilityResult && capabilityResult.isError !== true);
 		const discoveredCapability = response(capabilityResult);
 		assertAwsSecretInputCapability(discoveredCapability);
 		proof(Bun.deepEquals(counts, { ...beforeCapability, probeWorker: counts.probeWorker }));
-		await probeCapability("native-hashline-content-capability", "write", {
-			path: "xd://aws",
-			content: JSON.stringify(capabilityRequest, null, 2)
-				.split("\n")
-				.map((line, index) => `${index + 1}:${line}`)
-				.join("\n"),
-		});
-		await probeCapability(
-			"native-inner-intent-capability",
-			"write",
-			writeArgs({ ...capabilityRequest, i: "Checking synthetic AWS capability" }),
-		);
 		await probeCapability("native-mounted-aws-capability", "aws", capabilityRequest);
 
 		stage = "native-approved-result";
 		captureStale = async () => {
 			await reject("stale-canonical-aws", () => execute(canonicalAws, request));
-			await reject("stale-canonical-write", () => execute(canonicalWrite, writeArgs(request)));
+			await reject("stale-canonical-bash", () => execute(canonicalBash, commandArgs(request)));
 		};
-		const writeResultHook: CarrierResultHook = {
-			root: "write",
-			args: writeArgs(request, COPIED_AWS_PATH),
+		const bashResultHook: CarrierResultHook = {
+			root: "bash",
+			args: commandArgs(request),
 			entered: 0,
 			completed: 0,
 			failed: false,
 			check: async () => {
 				proof(live.agent.state.isStreaming && !results.has(successful.id));
-				await reject("result-write-canonical-aws", () => execute(canonicalAws, request));
-				await reject("result-write-canonical-write", () => execute(canonicalWrite, writeArgs(request)));
+				await reject("result-bash-canonical-aws", () => execute(canonicalAws, request));
+				await reject("result-bash-canonical-bash", () => execute(canonicalBash, commandArgs(request)));
 			},
 		};
-		resultHook = writeResultHook;
+		resultHook = bashResultHook;
 		const successStart = events.length;
-		const successful = dispatch("write", writeArgs(request, COPIED_AWS_PATH));
+		const successful = dispatch("bash", commandArgs(request));
 		await successful.pending;
-		proof(writeResultHook.entered === 1 && writeResultHook.completed === 1 && !writeResultHook.failed);
+		proof(bashResultHook.entered === 1 && bashResultHook.completed === 1 && !bashResultHook.failed);
 		const approved = results.get(successful.id);
 		proof(approved && approved.isError !== true);
 		const approvedResponse = response(approved);
@@ -631,7 +615,7 @@ async function run(root: string, language: "js" | "py") {
 		proof(stale);
 		stale.release();
 		await stale.settled;
-		await transfer("native-mounted-ordinary-write", writeArgs(request));
+		await transfer("native-mounted-bash", commandArgs(request));
 
 		stage = "native-held-cleanup";
 		hold = {
@@ -641,7 +625,7 @@ async function run(root: string, language: "js" | "py") {
 		};
 		const held = hold;
 		const heldStart = events.length;
-		const cancelled = dispatch("write", writeArgs(request, COPIED_AWS_PATH));
+		const cancelled = dispatch("bash", commandArgs(request));
 		let promptSettled = false;
 		void cancelled.pending.then(
 			() => {
@@ -656,7 +640,7 @@ async function run(root: string, language: "js" | "py") {
 			}),
 		]);
 		proof(held.home && (await fs.stat(held.home)).isDirectory());
-		await reject("held-canonical-write", () => execute(canonicalWrite, writeArgs(request)));
+		await reject("held-canonical-bash", () => execute(canonicalBash, commandArgs(request)));
 		await reject("held-bridge-aws", () => callSessionTool("aws", request, { session: owner }));
 		stage = "native-abort-barrier";
 		let abortSettled = false;
@@ -695,9 +679,9 @@ async function run(root: string, language: "js" | "py") {
 		hold = undefined;
 
 		stage = "native-direct-presentation";
-		await live.setActiveToolPresentation(["aws", "edit", "eval", "read", "write"], []);
+		await live.setActiveToolPresentation(["aws", "bash", "edit", "eval", "read", "write"], []);
 		proof(live.agent.state.tools.some(tool => tool.name === "aws"));
-		await probeCapability("native-top-level-write-capability", "write", writeArgs(capabilityRequest));
+		await probeCapability("native-top-level-bash-capability", "bash", commandArgs(capabilityRequest));
 		await rejectPreflight("aws");
 		stage = "native-direct-approved-result";
 		const directResultHook: CarrierResultHook = {
@@ -709,7 +693,7 @@ async function run(root: string, language: "js" | "py") {
 			check: async () => {
 				proof(live.agent.state.isStreaming && !results.has(direct.id));
 				await reject("result-aws-canonical-aws", () => execute(canonicalAws, request));
-				await reject("result-aws-canonical-write", () => execute(canonicalWrite, writeArgs(request)));
+				await reject("result-aws-canonical-bash", () => execute(canonicalBash, commandArgs(request)));
 			},
 		};
 		resultHook = directResultHook;
@@ -732,49 +716,30 @@ async function run(root: string, language: "js" | "py") {
 		proof(directOrder.indexOf("provider-sts") < directOrder.indexOf("provider-secretsmanager"));
 		proof(directOrder.indexOf("provider-secretsmanager") < directOrder.indexOf("receiver"));
 		proof(directOrder.indexOf("receiver") < directOrder.indexOf("cleanup-complete"));
-		await transfer("native-active-ordinary-write", writeArgs(request));
-		await transfer("native-active-copied-write", writeArgs(request, COPIED_AWS_PATH));
-		await transfer("native-active-normalized-write", {
-			path: COPIED_AWS_PATH,
-			content: JSON.stringify({ ...request, i: "Delivering synthetic private input" }, null, 2)
-				.split("\n")
-				.map((line, index) => `${index + 1}:${line}`)
-				.join("\n"),
-		});
+		await transfer("native-active-bash", commandArgs(request));
 
 		const nativeSettings = owner.getToolContext?.()?.settings ?? owner.settings;
 		cfgToolsApproval.override(nativeSettings, { aws: "deny", bash: "allow" });
 		try {
 			for (const mounted of [false, true]) {
 				await live.setActiveToolPresentation(
-					mounted ? ["edit", "eval", "read", "write"] : ["aws", "edit", "eval", "read", "write"],
+					mounted ? ["bash", "edit", "eval", "read", "write"] : ["aws", "bash", "edit", "eval", "read", "write"],
 					mounted ? ["aws"] : [],
 				);
 				for (const args of [capabilityRequest, request]) {
-					const innerIntent = JSON.stringify({ ...args, i: "Delivering synthetic private input" }, null, 2);
-					for (const content of [
-						JSON.stringify(args),
-						innerIntent,
-						innerIntent
-							.split("\n")
-							.map((line, index) => `${index + 1}:${line}`)
-							.join("\n"),
-					]) {
-						const form = content === innerIntent ? "intent" : content.startsWith("1:") ? "hashline" : "plain";
-						const policyCase = `native-policy-denied-${mounted ? "mounted" : "active"}-${args === capabilityRequest ? "capability" : "protected"}-${form}`;
-						stage = `${policyCase}-result`;
-						const before = { ...counts };
-						const turn = dispatch("write", { path: COPIED_AWS_PATH, content });
-						await turn.pending;
-						proof(results.get(turn.id)?.isError === true);
-						stage = `${policyCase}-effects`;
-						proof(Bun.deepEquals(counts, before));
-					}
+					const policyCase = `native-policy-denied-${mounted ? "mounted" : "active"}-${args === capabilityRequest ? "capability" : "protected"}`;
+					stage = `${policyCase}-result`;
+					const before = { ...counts };
+					const turn = dispatch("bash", commandArgs(args));
+					await turn.pending;
+					proof(results.get(turn.id)?.isError === true);
+					stage = `${policyCase}-effects`;
+					proof(Bun.deepEquals(counts, before));
 				}
 			}
 		} finally {
 			cfgToolsApproval.override(nativeSettings, { aws: "allow", bash: "allow" });
-			await live.setActiveToolPresentation(["aws", "edit", "eval", "read", "write"], []);
+			await live.setActiveToolPresentation(["aws", "bash", "edit", "eval", "read", "write"], []);
 		}
 
 		stage = "native-policy-revocation";
@@ -785,7 +750,7 @@ async function run(root: string, language: "js" | "py") {
 			cfgToolsApproval.override(nativeSettings, { aws: "deny", bash: "allow" });
 		};
 		try {
-			const turn = dispatch("write", writeArgs(request, COPIED_AWS_PATH));
+			const turn = dispatch("bash", commandArgs(request));
 			await turn.pending;
 			const result = results.get(turn.id);
 			proof(result?.isError === true);
@@ -801,18 +766,18 @@ async function run(root: string, language: "js" | "py") {
 			cfgToolsApproval.override(nativeSettings, { aws: "allow", bash: "allow" });
 		}
 
-		await live.setActiveToolPresentation(["edit", "eval", "read", "write"], []);
+		await live.setActiveToolPresentation(["bash", "edit", "eval", "read", "write"], []);
 		for (const args of [capabilityRequest, request]) {
-			stage = "native-disabled-write";
+			stage = "native-disabled-bash";
 			const before = { ...counts };
-			const turn = dispatch("write", writeArgs(args, COPIED_AWS_PATH));
+			const turn = dispatch("bash", commandArgs(args));
 			await turn.pending;
 			const result = results.get(turn.id);
 			proof(result?.isError === true);
 			proof(Bun.deepEquals(counts, before));
 		}
-		await live.setActiveToolPresentation(["aws", "edit", "eval", "read", "write"], ["aws"]);
-		await transfer("native-remounted-copied-write", writeArgs(request, COPIED_AWS_PATH));
+		await live.setActiveToolPresentation(["aws", "bash", "edit", "eval", "read", "write"], ["aws"]);
+		await transfer("native-remounted-bash", commandArgs(request));
 		return {
 			schema: "aws-secret-input-carrier-host/v1",
 			language,
@@ -826,7 +791,7 @@ async function run(root: string, language: "js" | "py") {
 				disabledBeforeProtectedWork: true,
 				stdout: approvedResponse.result.stdout,
 				directStdout: directResponse.result.stdout,
-				resultHandlers: { write: writeResultHook.completed, aws: directResultHook.completed },
+				resultHandlers: { bash: bashResultHook.completed, aws: directResultHook.completed },
 				cancelled: cancelledResponse.result.cancelled,
 				successOrder,
 				directOrder,

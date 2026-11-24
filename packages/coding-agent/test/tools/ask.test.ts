@@ -145,9 +145,6 @@ describe("AskTool form dialog", () => {
 			createContext({ formDialog: async () => ({ data: { store: "redis" }, notes }) }),
 		);
 
-		expect(text(result)).toBe(
-			`User answers:\n${JSON.stringify({ store: "redis" }, null, 2)}\nOption notes:\n- Session store: Redis [store="redis"] — shared cache`,
-		);
 		expect(result.details).toEqual({
 			answers: [
 				{ name: "store", question: "Session store", answer: "Redis" },
@@ -183,6 +180,39 @@ describe("AskTool form dialog", () => {
 		).execute("c", { html: DB_FORM }, undefined, undefined, createContext({ formDialog }));
 
 		expect(timeouts).toEqual([undefined, 30_000, undefined]);
+	});
+
+	it("retains explicit partial form answers without filling untouched defaults after timeout", async () => {
+		const result = await new AskTool(createSession()).execute(
+			"call-timeout",
+			{ html: DB_FORM },
+			undefined,
+			undefined,
+			createContext({ formDialog: async () => ({ data: { store: "redis" }, timedOut: true }) }),
+		);
+		const resultText = text(result)!;
+		expect(JSON.parse(resultText.slice(resultText.indexOf("{")))).toEqual({ store: "redis" });
+		expect(result.details).toEqual({
+			answers: [
+				{ name: "store", question: "Session store", answer: "Redis" },
+				{ name: "ttl", question: "Lifetime (days)", answer: "" },
+			],
+			timedOut: true,
+		});
+	});
+
+	it("does not invent an answer to a required field when the form times out", async () => {
+		const result = await new AskTool(createSession()).execute(
+			"call-timeout-required",
+			{ html: '<form><input name="transport" required></form>' },
+			undefined,
+			undefined,
+			createContext({ formDialog: async () => ({ data: {}, timedOut: true }) }),
+		);
+		const resultText = text(result)!;
+		expect(JSON.parse(resultText.slice(resultText.indexOf("{")))).toEqual({});
+		expect(result.details?.timedOut).toBe(true);
+		expect(result.details?.answers.some(answer => answer.answer !== "")).toBe(false);
 	});
 
 	it("aborts the turn when the user cancels the form", async () => {
@@ -323,6 +353,60 @@ describe("AskTool form dialog", () => {
 		expect(formDialog).not.toHaveBeenCalled();
 	});
 
+	it("refuses a <fieldset> whose radios each carry their own name, without showing it", async () => {
+		const formDialog = vi.fn<FormDialog>();
+		const result = await new AskTool(createSession()).execute(
+			"call-split-radios",
+			{
+				html: `<form><fieldset>
+  <legend>Sharing</legend>
+  <label><input type="radio" name="shared_sources" value="common" checked> Common location only</label>
+  <label><input type="radio" name="personal_auto"> Include personal installations</label>
+</fieldset></form>`,
+			},
+			undefined,
+			undefined,
+			createContext({ formDialog }),
+		);
+
+		const message = text(result) ?? "";
+		expect(message).toContain("shared_sources");
+		expect(message).toContain("personal_auto");
+		expect(message).toContain("Sharing");
+		expect(result.details).toEqual({ answers: [] });
+		expect(formDialog).not.toHaveBeenCalled();
+	});
+
+	it("shows forms whose radio names are not split inside one fieldset", async () => {
+		const forms = {
+			"shared name": `<form><fieldset><legend>Sharing</legend>
+  <label><input type="radio" name="sources" value="common" checked> Common location only</label>
+  <label><input type="radio" name="sources" value="personal"> Include personal installations</label>
+</fieldset></form>`,
+			"lone radio": `<form><fieldset><legend>Sharing</legend>
+  <label><input type="radio" name="personal_auto"> Include personal installations</label>
+</fieldset></form>`,
+			"separate fieldsets": `<form><fieldset><legend>Sharing</legend>
+  <label><input type="radio" name="shared_sources" value="common" checked> Common location only</label>
+</fieldset><fieldset><legend>Personal</legend>
+  <label><input type="radio" name="personal_auto"> Include personal installations</label>
+</fieldset></form>`,
+		};
+		for (const [shape, html] of Object.entries(forms)) {
+			const formDialog = vi.fn<FormDialog>(async () => ({ data: { sources: "personal" } }));
+			const result = await new AskTool(createSession()).execute(
+				`call-${shape}`,
+				{ html },
+				undefined,
+				undefined,
+				createContext({ formDialog }),
+			);
+
+			expect(formDialog, shape).toHaveBeenCalledTimes(1);
+			expect(text(result), shape).toContain("User answers:");
+		}
+	});
+
 	it("closes for a message the user queued without cancelling the turn, but stays open for other interrupts", async () => {
 		const ask = (source: string) => {
 			const steering = new AbortController();
@@ -350,6 +434,36 @@ describe("AskTool form dialog", () => {
 			expect((await interrupt.outcome).details?.answers[0]).toMatchObject({ name: "store", answer: "SQLite" });
 			expect(interrupt.abort).not.toHaveBeenCalled();
 		}
+	});
+
+	it("tells the model what the user answered before a message closed the form", async () => {
+		const steering = new AbortController();
+		const formDialog: FormDialog = async (_html, options) => {
+			options?.onAbandon?.({
+				data: { store: "postgres" },
+				notes: [{ name: "store", question: "Store", option: "Postgres", value: "postgres", text: "managed  one" }],
+			});
+			steering.abort("user");
+			return undefined;
+		};
+		const outcome = new AskTool(createSession()).execute(
+			"call-given",
+			{ html: DB_FORM },
+			undefined,
+			undefined,
+			createContext({ formDialog, steeringSignal: steering.signal }),
+		);
+
+		const error = await outcome.then(
+			() => undefined,
+			(rejection: unknown) => rejection,
+		);
+		expect(error).toBeInstanceOf(ToolAbortError);
+		const message = (error as Error).message;
+		expect(message).toContain("Ask interrupted by message");
+		expect(message).toContain('"store": "postgres"');
+		expect(message).toContain("Store: Postgres");
+		expect(message).toContain("managed one");
 	});
 
 	it("delivers queued steering while the form is open without cancelling the turn", async () => {
@@ -673,10 +787,18 @@ describe("AskTool without an interactive UI", () => {
 });
 
 describe("recoverAskHtml", () => {
-	it("recovers the form of an html call and nothing from legacy question calls", () => {
+	it("recovers the form of an html call, a bare string and a legacy question call", () => {
 		expect(recoverAskHtml({ html: DB_FORM })).toBe(DB_FORM);
-		expect(recoverAskHtml({ questions: [{ id: "q", question: "Q?", options: [] }] })).toBeUndefined();
-		expect(recoverAskHtml("<form></form>")).toBeUndefined();
+		expect(recoverAskHtml("<form></form>")).toBe("<form></form>");
+		const legacy = recoverAskHtml({
+			questions: [
+				{ id: "db", question: "Which <db>?", options: [{ label: "pg" }, { label: "sqlite" }], recommended: 1 },
+			],
+		});
+		expect(legacy).toBe(
+			'<form><fieldset><legend>Which &lt;db&gt;?</legend><label><input type="radio" name="db" value="pg"> pg</label><label><input type="radio" name="db" value="sqlite" checked> sqlite</label></fieldset></form>',
+		);
+		expect(recoverAskHtml({ questions: [{ id: "q" }] })).toBeUndefined();
 	});
 });
 

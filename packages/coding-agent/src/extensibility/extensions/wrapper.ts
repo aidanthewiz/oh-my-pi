@@ -32,10 +32,11 @@ import {
 } from "../../tools/approval";
 import { ParentRuntimeApprovalError, type SubagentRuntimeApprovalResult } from "../../tools/subagent-runtime-approval";
 import { getApprovalGrants } from "../../tools/approval-cache";
-import { withToolApprovalScope } from "../../tools/approval-scope";
+import { validateToolCommandInvocation, withToolApprovalScope } from "../../tools/approval-scope";
 import { defaultLoadModeForToolName } from "../../tools/essential-tools";
 import { withFileMutationSession } from "../../tools/file-write-fallback";
 import { mcpToolEventIdentity, normalizeToolEventInput, resolveToolEventInput } from "../tool-event-input";
+import { recordToolApprovalRequested, recordToolApprovalResolved } from "../../session/tool-approval-records";
 import { applyToolProxy } from "../tool-proxy";
 import type { ExtensionRunner } from "./runner";
 import type {
@@ -147,6 +148,15 @@ export class RegisteredToolAdapter implements AgentTool<any, any, any> {
 		context?: AgentToolContext,
 	) {
 		if (!this.#isActive()) throw new Error("Extension owner is no longer active");
+		// Pure tool-command lines need the native transport even when a shell
+		// replacement does not delegate. Outer approval and event handlers still apply.
+		if (this.runner.servesToolCommandLine(this.registeredTool.definition.name, params)) {
+			return await this.runner.invokeNativeTool(this.registeredTool.definition.name, params, {
+				signal,
+				onUpdate,
+				callerContext: context,
+			});
+		}
 		// Bind the extension context to this tool's own name so `ctx.invokeTool` delegates to the
 		// native built-in of the same name (present only when this tool re-registers a built-in). The
 		// wrapper's own context, abort signal, and progress callback are inherited by the delegated
@@ -245,7 +255,6 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 	constructor(
 		private tool: AgentTool<TParameters, TDetails>,
 		private runner: ExtensionRunner,
-		private resolveToolByName?: (name: string) => AgentTool | undefined,
 		agent?: ExtensionAgentIdentity,
 	) {
 		this.#agent = agent;
@@ -278,11 +287,8 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		onUpdate?: AgentToolUpdateCallback<TDetails, TParameters>,
 		context?: AgentToolContext,
 	): Promise<AgentToolResult<TDetails, TParameters>> {
-		// Loop dispatch checks TTSR both before and after the extension
-		// `tool_call` event in session `beforeToolCall`, before scheduling.
-		// Consume the loop marker so this wrapper does not emit the event or
-		// preflight again. Direct and nested xd:// calls have no loop marker:
-		// their final-input preflight still runs below.
+		// Loop dispatch has already emitted tool_call and checked final-input
+		// preflight. Nested command calls use their own ID and run that gate here.
 		const dispatchKey = `${toolCallId}:${this.tool.name}`;
 		const approvalSessionId = this.runner.sessionId;
 		const inheritedLoopDispatch =
@@ -334,7 +340,8 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 						type: "tool_call",
 						toolName: this.tool.name,
 						toolCallId,
-						...mcpToolEventIdentity(this.tool, toolEventArgs(params, context), this.resolveToolByName),
+						...mcpToolEventIdentity(this.tool),
+						...(context?.parentToolCallId !== undefined && { parentToolCallId: context.parentToolCallId }),
 						input: normalizeToolEventInput(
 							this.tool.name,
 							resolveToolEventInput(this.tool, toolEventArgs(params, context)),
@@ -382,6 +389,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		for (;;) {
 			try {
 				signal?.throwIfAborted();
+				validateToolCommandInvocation(toolCallId);
 				if (this.runner.sessionId !== approvalSessionId) throw new Error("Approval session changed");
 				const gateInput = structuredClone(effectiveParams);
 				const gateAuthority = captureAuthority();
@@ -445,12 +453,8 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 					targets,
 					context,
 				);
-				context?.xdevTierResolved?.(resolved.tier);
+				context?.toolCommandTierResolved?.(resolved.tier);
 				if (resolved.policy === "deny") throw denyError(resolved, this.tool.name);
-				const policyKey = resolved.policyKey ?? this.tool.name;
-				const explicitPrompt =
-					resolved.override || (resolved.source !== "mode" && policyKey !== context?.xdevPolicyKey);
-				const xdevBypass = context?.xdevPolicyKey !== undefined && effectiveParams === params;
 				const acp = context?.acpApproval;
 				const acpBypass =
 					acp !== undefined &&
@@ -490,7 +494,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				const required =
 					runtimeApproval !== undefined ||
 					safetySnapshot.length > 0 ||
-					(resolved.policy === "prompt" && !acpBypass && !sessionApproved && (explicitPrompt || !xdevBypass));
+					(resolved.policy === "prompt" && !acpBypass && !sessionApproved);
 				const reason = runtimeApproval?.reason ?? resolved.reason;
 				const capability = runtimeApprovalTool.sessionApproval;
 				const sessionApproval =
@@ -516,6 +520,13 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 					const hasApprovalHandlers =
 						this.runner.hasHandlers("tool_approval_requested") ||
 						this.runner.hasHandlers("tool_approval_resolved");
+					await recordToolApprovalRequested(this.runner.approvalRecords, {
+						toolCallId,
+						...(context?.parentToolCallId !== undefined && { parentToolCallId: context.parentToolCallId }),
+						toolName: this.tool.name,
+						approvalMode,
+						...(reason ? { reason } : {}),
+					});
 					if (hasApprovalHandlers) {
 						await this.runner.emit({
 							type: "tool_approval_requested",
@@ -527,6 +538,12 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 						});
 					}
 					const emitResolved = async (approved: boolean, reason?: string): Promise<void> => {
+						await recordToolApprovalResolved(this.runner.approvalRecords, {
+							toolCallId,
+							toolName: this.tool.name,
+							approved,
+							...(reason ? { reason } : {}),
+						});
 						if (hasApprovalHandlers) {
 							await this.runner.emit({
 								type: "tool_approval_resolved",
@@ -622,6 +639,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 						}
 						let approved = false;
 						try {
+							context?.onApprovalPrompt?.();
 							if (runtimeApproval) {
 								const safetySuffix = safetySnapshot.length
 									? `\n\nProvider safety checks:\n${safetyCheckLines(safetySnapshot).join("\n")}`
@@ -674,6 +692,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				);
 				signal?.throwIfAborted();
 				validateParentApproval?.();
+				validateToolCommandInvocation(toolCallId);
 				if (
 					(approvalMode === "always-ask-cached" || resolved.source === "restriction") &&
 					targets.failed &&
@@ -750,10 +769,12 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		}
 
 		// Registry entries can change while the tool runs; preserve the identity selected for this execution.
-		const resultMcpIdentity = this.runner.hasHandlers("tool_result")
-			? mcpToolEventIdentity(this.tool, toolEventArgs(effectiveParams, context), this.resolveToolByName)
-			: null;
-		const resultOrigin = { sessionId: approvalSessionId, cwd: this.runner.cwd };
+		const resultMcpIdentity = this.runner.hasHandlers("tool_result") ? mcpToolEventIdentity(this.tool) : null;
+		const resultOrigin = {
+			sessionId: approvalSessionId,
+			cwd: this.runner.cwd,
+			...(context?.parentToolCallId !== undefined && { parentToolCallId: context.parentToolCallId }),
+		};
 		const deferredIdentity = resultMcpIdentity
 			? {
 					toolName: this.tool.name,
@@ -827,9 +848,10 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			// trigger. `sdk.ts` wraps the whole tool registry with this class whenever
 			// a runner exists.
 			result = await this.runner.runScoped(() =>
-				withFileMutationSession(this.runner.sessionId, () =>
-					this.tool.execute(toolCallId, effectiveParams, signal, onUpdate, executionContext),
-				),
+				withFileMutationSession(this.runner.sessionId, () => {
+					validateToolCommandInvocation(toolCallId);
+					return this.tool.execute(toolCallId, effectiveParams, signal, onUpdate, executionContext);
+				}),
 			);
 		} catch (err) {
 			executionError = toError(err);

@@ -43,7 +43,7 @@ import type { AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { resetSettingsForTest, Settings, settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { PROPOSE_DEVICE_NAME } from "@oh-my-pi/pi-tui/tools/resolve";
+import { PROPOSE_COMMAND_NAME } from "@oh-my-pi/pi-tui/tools/resolve";
 import { cfgSpeechEnabled, cfgSpeechMode } from "@oh-my-pi/pi-coding-agent/tts/settings";
 import { vocalizer } from "@oh-my-pi/pi-coding-agent/tts/vocalizer";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
@@ -1478,7 +1478,7 @@ describe("collab guest extension lifecycle mirror", () => {
 						content: [{ type: "text", text: "Plan ready for approval." }],
 						details: {
 							xdev: {
-								tool: PROPOSE_DEVICE_NAME,
+								tool: PROPOSE_COMMAND_NAME,
 								mode: "execute",
 								args: { title: "host plan" },
 								inner: { planFilePath: "local://host-plan.md", title: "host plan", planExists: true },

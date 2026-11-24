@@ -74,7 +74,7 @@ describe("in-memory range reads keep the requested lines", () => {
 
 		expect(shownLines(output)).toEqual([4]);
 		expect(output).not.toContain("AAAA");
-		const continuation = output.match(/Use (:\d+) to continue/)?.[1];
+		const continuation = output.match(/Use (:\d+-?) to continue/)?.[1];
 		if (!continuation) throw new Error("Missing continuation selector");
 		expect(shownLines(await read(`remote://host/six.txt${continuation}`))).toEqual([5, 6]);
 	});

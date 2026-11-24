@@ -1,16 +1,16 @@
-import { logger } from "@oh-my-pi/pi-utils";
+import { logger, parseSpillUrl, spillUrl } from "@oh-my-pi/pi-utils";
 import type { SessionManager } from "../session/session-manager";
 import { SPOTLIGHT_FULL_OUTPUT_MAX_BYTES, type ShapedTool, type ShapeSink } from "./types";
 
 /**
- * Text of a session artifact, by id or as its `artifact://N` URL (a tool's full output, a shaped result's original),
+ * Text of a session spill, by id or as its `local://N.log` URL (a tool's full output, a shaped result's original),
  * or null when it is gone or unreadable.
  */
 export async function readArtifactText(
 	sessionManager: Pick<SessionManager, "getArtifactContent">,
 	ref: string,
 ): Promise<string | null> {
-	const id = ref.startsWith("artifact://") ? ref.slice("artifact://".length) : ref;
+	const id = String(parseSpillUrl(ref) ?? ref);
 	try {
 		return await sessionManager.getArtifactContent(id, SPOTLIGHT_FULL_OUTPUT_MAX_BYTES);
 	} catch (error) {
@@ -20,8 +20,8 @@ export async function readArtifactText(
 }
 
 /**
- * Saves the text a shaped result hides as a session artifact, read back with `read artifact://N` (and line
- * selectors, `artifact://N:A-B`). Non-persistent sessions keep it in memory, as the generic artifact spill does.
+ * Saves the text a shaped result hides as a session spill, read back with `read local://N.log` (and line
+ * selectors, `local://N.log:A-B`). Sessions without a file spill under the temporary `local://` root.
  */
 export class ArtifactShapeSink implements ShapeSink {
 	readonly #sessionManager: Pick<SessionManager, "saveArtifact">;
@@ -32,8 +32,8 @@ export class ArtifactShapeSink implements ShapeSink {
 
 	/** @throws {Error} when the session no longer stores artifacts (released); shaping then keeps the result whole. */
 	async save(text: string, label: ShapedTool): Promise<string> {
-		const id = await this.#sessionManager.saveArtifact(text, `spotlight-${label}`);
-		if (id === undefined) throw new Error("spotlight: session stores no artifacts");
-		return `artifact://${id}`;
+		const id = await this.#sessionManager.saveArtifact(text);
+		if (id === undefined) throw new Error(`spotlight: session stores no spills (${label})`);
+		return spillUrl(id);
 	}
 }

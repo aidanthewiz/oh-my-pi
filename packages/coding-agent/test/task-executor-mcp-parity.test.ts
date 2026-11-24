@@ -13,7 +13,7 @@ import { ExtensionRunner } from "../src/extensibility/extensions/runner";
 import type { ExtensionUIContext, RegisteredTool } from "../src/extensibility/extensions/types";
 import { ExtensionToolWrapper, wrapRegisteredTool } from "../src/extensibility/extensions/wrapper";
 import { MCPManager } from "../src/mcp/manager";
-import { DeferredMCPTool, MCPTool } from "../src/mcp/tool-bridge";
+import { MCPTool } from "../src/mcp/tool-bridge";
 import type { MCPServerConnection, MCPToolDefinition } from "../src/mcp/types";
 import { customToolToDefinition } from "../src/sdk";
 import { SessionManager } from "../src/session/session-manager";
@@ -183,20 +183,13 @@ const DRATA_MUTATION: MCPToolDefinition = {
 	annotations: { readOnlyHint: true },
 };
 
-function createApprovalFixture(kind: "active" | "cached") {
+function createApprovalFixture() {
 	const calls: CapturedRequest[] = [];
 	const connection = { ...createCapturedConnection(calls), name: DRATA_SERVER };
-	let connections = 0;
-	const source =
-		kind === "active"
-			? new MCPTool(connection, DRATA_MUTATION)
-			: new DeferredMCPTool(DRATA_SERVER, DRATA_MUTATION, async () => {
-					connections++;
-					return connection;
-				});
+	const source = new MCPTool(connection, DRATA_MUTATION);
 	const manager = new MCPManager(process.cwd());
 	const getTools = vi.spyOn(manager, "getTools").mockReturnValue([source]);
-	return { manager, source, calls, getTools, connections: () => connections };
+	return { manager, source, calls, getTools };
 }
 
 function createChildMCPTool(
@@ -233,54 +226,50 @@ function createChildMCPTool(
 }
 
 describe("child MCP native approval", () => {
-	it.each(["active", "cached"] as const)(
-		"requires new consent for every read-only-annotated Drata mutation from an %s source under default yolo",
-		async kind => {
-			const f = createApprovalFixture(kind);
-			const prompted = Promise.withResolvers<void>();
-			const choice = Promise.withResolvers<string>();
-			let prompts = 0;
-			const child = createChildMCPTool(
-				f.manager,
-				Settings.isolated({ "tools.approval": { [f.source.name]: "allow" } }),
-				async () => {
-					prompts++;
-					if (prompts > 1) return "Deny";
-					prompted.resolve();
-					return choice.promise;
-				},
+	it("requires new consent for every read-only-annotated Drata mutation under default yolo", async () => {
+		const f = createApprovalFixture();
+		const prompted = Promise.withResolvers<void>();
+		const choice = Promise.withResolvers<string>();
+		let prompts = 0;
+		const child = createChildMCPTool(
+			f.manager,
+			Settings.isolated({ "tools.approval": { [f.source.name]: "allow" } }),
+			async () => {
+				prompts++;
+				if (prompts > 1) return "Deny";
+				prompted.resolve();
+				return choice.promise;
+			},
+		);
+		const pending = child.execute("child-consent", { body: "synthetic control" });
+		try {
+			const outcome = await Promise.race([
+				prompted.promise.then(() => "prompted"),
+				pending.then(() => "dispatched"),
+			]);
+			expect(outcome).toBe("prompted");
+			expect(f.calls).toEqual([]);
+			choice.resolve("Approve");
+			const result = await pending;
+			expect(result.details).toMatchObject({ serverName: DRATA_SERVER, mcpToolName: DRATA_MUTATION.name });
+			await expect(child.execute("child-next-consent", { body: "another control" })).rejects.toThrow(
+				"denied by user",
 			);
-			const pending = child.execute("child-consent", { body: "synthetic control" });
-			try {
-				const outcome = await Promise.race([
-					prompted.promise.then(() => "prompted"),
-					pending.then(() => "dispatched"),
-				]);
-				expect(outcome).toBe("prompted");
-				expect(f.calls).toEqual([]);
-				expect(f.connections()).toBe(0);
-				choice.resolve("Approve");
-				const result = await pending;
-				expect(result.details).toMatchObject({ serverName: DRATA_SERVER, mcpToolName: DRATA_MUTATION.name });
-				await expect(child.execute("child-next-consent", { body: "another control" })).rejects.toThrow(
-					"denied by user",
-				);
-				expect(prompts).toBe(2);
-				expect(f.calls).toEqual([
-					{
-						method: "tools/call",
-						params: { name: DRATA_MUTATION.name, arguments: { body: "synthetic control" } },
-					},
-				]);
-			} finally {
-				choice.resolve("Deny");
-				await pending.catch(() => {});
-			}
-		},
-	);
+			expect(prompts).toBe(2);
+			expect(f.calls).toEqual([
+				{
+					method: "tools/call",
+					params: { name: DRATA_MUTATION.name, arguments: { body: "synthetic control" } },
+				},
+			]);
+		} finally {
+			choice.resolve("Deny");
+			await pending.catch(() => {});
+		}
+	});
 
-	it.each(["active", "cached"] as const)("honors an exact deny before connecting an %s source", async kind => {
-		const f = createApprovalFixture(kind);
+	it("honors an exact deny before connecting a source", async () => {
+		const f = createApprovalFixture();
 		let prompts = 0;
 		const child = createChildMCPTool(
 			f.manager,
@@ -294,12 +283,11 @@ describe("child MCP native approval", () => {
 			"blocked by user policy",
 		);
 		expect(prompts).toBe(0);
-		expect(f.connections()).toBe(0);
 		expect(f.calls).toEqual([]);
 	});
 
 	it("rebinds approval to the current raw namespace rather than a stale policy or colliding display name", async () => {
-		const f = createApprovalFixture("cached");
+		const f = createApprovalFixture();
 		const stale: CustomTool<TSchema, MCPToolDetails> = {
 			...f.source,
 			approval: "write",
@@ -319,13 +307,12 @@ describe("child MCP native approval", () => {
 		f.getTools.mockReturnValue([decoy, f.source]);
 		await expect(child.execute("child-rebound", { body: "blocked control" })).rejects.toThrow("denied by user");
 		expect(prompts).toBe(1);
-		expect(f.connections()).toBe(0);
 		expect(f.calls).toEqual([]);
 		expect(decoyCalls).toEqual([]);
 	});
 
 	it("preserves a legacy deny when the raw tool name contains digits", async () => {
-		const f = createApprovalFixture("active");
+		const f = createApprovalFixture();
 		if (!f.source.legacyName) throw new Error("Expected a legacy tool policy key");
 		const child = createChildMCPTool(
 			f.manager,

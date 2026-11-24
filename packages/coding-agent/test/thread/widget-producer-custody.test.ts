@@ -132,7 +132,7 @@ describe("worker widget producer admission", () => {
 			agentId: "CustodyRoot",
 			sessionManager: SessionManager.create(dir, path.join(dir, "sessions")),
 			bindProcessState: false,
-			cacheWarming: false,
+			cacheWarming: "off",
 			disableExtensionDiscovery: true,
 			skills: [],
 			contextFiles: [],

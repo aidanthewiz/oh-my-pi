@@ -40,7 +40,12 @@ import {
 	lookupProjectMcpOAuthCredential,
 	removeManagedMcpOAuthCredential,
 } from "./oauth-credentials";
-import { MCPOAuthFlow, type MCPStoredOAuthCredential, mcpOAuthCredentialId } from "./oauth-flow";
+import {
+	MCPOAuthClientIdRequiredError,
+	MCPOAuthFlow,
+	type MCPStoredOAuthCredential,
+	mcpOAuthCredentialId,
+} from "./oauth-flow";
 import type { AuthStorage } from "../session/auth-storage";
 import type { MCPAuthChallenge, MCPAuthConfig, MCPServerConfig } from "./types";
 
@@ -460,7 +465,7 @@ export async function reconnectMcpManagerServer(
 	const pending = manager.updateServerConfig(name, updated);
 	if (pending) await pending;
 	assertCurrent();
-	await manager.reconnectServer(name, {
+	const connection = await manager.reconnectServer(name, {
 		manual: true,
 		signal: options.signal,
 		isCurrent: () => {
@@ -469,7 +474,8 @@ export async function reconnectMcpManagerServer(
 		},
 	});
 	assertCurrent();
-	return manager.getConnectionStatus(name);
+	const state = manager.getConnectionStatus(name);
+	return connection || state !== "connected" ? state : "disconnected";
 }
 
 /**
@@ -501,6 +507,7 @@ export async function probeMcpConnection(
 
 	assertMcpOAuthCurrent(options);
 	const connection = await connectToServer(`mcp_probe_${Date.now()}`, resolvedConfig, {
+		live: true,
 		signal: options.signal,
 		...resolveMCPChildCredentialPolicy(
 			"mcp_probe",
@@ -811,6 +818,7 @@ export async function runMcpOAuthFlow(opts: McpOAuthFlowRunOptions): Promise<OAu
 			clientSecret: flow.registeredClientSecret ?? resolvedClientSecret,
 			resource: flow.resource,
 			authorizationUrl: flow.authorizationUrl,
+			scope: flow.grantedScope,
 		};
 
 		assertCurrent();
@@ -845,6 +853,9 @@ export async function runMcpOAuthFlow(opts: McpOAuthFlowRunOptions): Promise<OAu
 		if (cancellationRequested || error instanceof MCPOAuthCancelledError) {
 			throw new MCPOAuthCancelledError();
 		}
+
+		// Already a complete diagnostic; its "HTTP 403" must not hit the generic remap below.
+		if (error instanceof MCPOAuthClientIdRequiredError) throw error;
 
 		const errorMsg = error instanceof Error ? error.message : String(error);
 

@@ -78,7 +78,7 @@ export async function createCleanseAgentRuntime(options: {
 	if (resolved.error || !resolved.model) {
 		throw new Error(resolved.error ?? `Model "${options.model}" not found`);
 	}
-	const modelSelector = resolved.selector ?? formatModelString(resolved.model);
+	const modelSelector = resolved.selector ?? formatModelStringWithRouting(resolved.model);
 	const modelDisplay = formatModelString(resolved.model);
 	const sessionManager = SessionManager.create(cwd);
 	await sessionManager.setSessionName("Cleanse", "auto");

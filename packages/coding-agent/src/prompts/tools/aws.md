@@ -18,10 +18,10 @@ Mutations require verified STS Account, ARN, Region, and partition checks even w
 
 ## Secret delivery through finite stdin
 
-Use the existing `aws` device with optional `secretInput`, not a separate database API.
+Use the existing mounted `aws` command with optional `secretInput`, not a separate database API.
 The receiving CLI owns application reads and writes; no query parser, client adapter, or receiver allowlist applies.
 
-1. Read `xd://aws/schema` and compare its complete JSON input schema with the expected implementation.
+1. Read `help://aws/schema` and compare its complete JSON input schema with the expected implementation.
 2. Call `{"action":"secret-input-capabilities","protocol":"aws-secret-input/v1"}` before authentication or access approval.
 3. Verify the complete capability, manifest, limits, supported providers, and fingerprint, including actual host lifecycle and private worker support.
 4. Stop if schema or capability support is missing, old, skewed, or incompatible.
@@ -30,9 +30,9 @@ The receiving CLI owns application reads and writes; no query parser, client ada
 Capability discovery needs no profile, credentials, authentication, or network access.
 Discovery does not authorize unsupported execution paths.
 Require actual invocation ownership under `native-tool-host/v2`, not merely a canonical registered tool wrapper.
-Use the actual native Agent dispatcher or native Write → `xd://aws`, with intrinsic `await-cleanup` and session lifecycle ownership.
+Use the actual native Agent dispatcher, directly or through native Bash → mounted `aws`, with intrinsic `await-cleanup` and session lifecycle ownership.
 JavaScript/Python Eval and naked SDK/direct `.execute(...)` calls reject with `CAPABILITY_INCOMPATIBLE` before approval UI, provider work, or receiver execution.
-Canonical registered wrappers and nested Write → `xd://aws` calls do not make those unsupported invocations admissible.
+Canonical registered wrappers and nested Eval → Bash → `aws` calls do not make those unsupported invocations admissible.
 Discover the current fingerprint at runtime; do not reuse one from another host contract.
 Require manifest `hostPolicy:"native-tool-host/v2"`; retain `executionPolicy:"tool-cancellation-cleanup/v1"` and `outputPolicy:"raw-bounded-consumer-output/v1"`.
 Scope and lifecycle remain `aws-secret-input-sdk-scope/v2` and `tool-session-lifecycle/v2`.

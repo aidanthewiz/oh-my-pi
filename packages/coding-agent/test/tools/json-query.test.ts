@@ -350,7 +350,7 @@ describe("JSON query in read tool", () => {
 		expect(getText(next)).toBe("charlie");
 	});
 
-	it("queries located local JSONL and artifact JSON without losing pagination or URI identity", async () => {
+	it("queries located local JSONL and spill JSON without losing pagination or URI identity", async () => {
 		const artifactsDir = path.join(tempDir, "artifacts");
 		const localProtocolOptions = { getArtifactsDir: () => artifactsDir, getSessionId: () => "json-query" };
 		const locatedTool = new ReadTool(
@@ -358,9 +358,8 @@ describe("JSON query in read tool", () => {
 		);
 		const localFile = resolveLocalUrlToPath("local://events.jsonl", localProtocolOptions);
 		await fs.mkdir(path.dirname(localFile), { recursive: true });
-		await fs.mkdir(artifactsDir, { recursive: true });
 		await fs.copyFile(jsonlFile, localFile);
-		await fs.copyFile(jsonFile, path.join(artifactsDir, "0.json"));
+		await fs.copyFile(jsonFile, path.join(path.dirname(localFile), "0.log"));
 
 		const localUrl = "local://events.jsonl?q=.user&raw=true&offset=1&limit=1";
 		const localResult = await locatedTool.execute("local-json-page", { path: localUrl });
@@ -374,7 +373,7 @@ describe("JSON query in read tool", () => {
 			),
 		).toBe("charlie");
 
-		const artifactUrl = "artifact://0?q=.items&compact=true&offset=1&limit=1";
+		const artifactUrl = "local://0.log?q=.items&compact=true&offset=1&limit=1";
 		const artifactResult = await locatedTool.execute("artifact-json-page", { path: artifactUrl });
 		expect(getText(artifactResult)).toBe(
 			'[{"id":2,"name":"item-two","active":false}]\n[1 more items; append ?q=.items&compact=true&limit=1&offset=2 to continue]',

@@ -1,45 +1,33 @@
 /**
- * `xd://report_issue` is Coreforge's local handoff from automatic tool-failure
- * detection to the interactive `/report` workflow.
- *
- * A device write contains only `<tool>: <concise description>`. Interactive
- * mode asks for per-occurrence consent; accepting queues `/report` with the
- * same failure details. `/report` then checks GitHub for duplicates, prepares
- * a draft, and asks again before creating or commenting on an issue.
- *
- * The legacy grievance database and push functions remain temporarily so
- * existing local records can be listed or cleaned, but device writes never
- * insert or upload grievances.
+ * The `report_issue` command hands one observed tool failure to Coreforge's
+ * interactive `/report` workflow. Each occurrence requires consent; filing
+ * still requires approval of the resulting draft. No telemetry is submitted.
  */
+import { type } from "@oh-my-pi/omptype";
 import { Database } from "bun:sqlite";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
+import type { AgentTool, AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import type { FetchImpl } from "@oh-my-pi/pi-ai";
 import { $env, $flag, getAutoQaDbPath, getInstallId, logger, VERSION } from "@oh-my-pi/pi-utils";
 import type { Settings } from "..";
-import type { ToolSession } from "./index";
+import type { Tool, ToolSession } from "./index";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
-import type { XdevDispatch } from "./xdev";
+import { toolCommandCallName } from "./tool-commands";
 
-import { REPORT_ISSUE_DEVICE_NAME, REPORT_ISSUE_DEVICE_PATH } from "@oh-my-pi/pi-tui/tools/report-tool-issue";
+import { REPORT_ISSUE_COMMAND_NAME } from "@oh-my-pi/pi-tui/tools/report-tool-issue";
 import { truncateHeadBytes } from "@oh-my-pi/pi-tui/tools/streaming-output";
 
 import { cfgDevAutoqa, cfgDevAutoqaConsent, cfgDevAutoqaPushEndpoint, cfgDevAutoqaPushToken } from "./settings";
 
-/** Usage text for `read xd://report_issue`. */
-export function reportIssueDeviceUsage(): string {
-	return `Write \`<tool>: <concise description>\` as plain text to ${REPORT_ISSUE_DEVICE_PATH}. A two-line fallback also works: tool name on line 1, report body below.`;
-}
+/** Accepted `report` shapes, appended to format errors. */
+const REPORT_ISSUE_USAGE =
+	"Expected `<tool>: <concise description>`, or the tool name on line 1 with the report body below.";
 
-/** Whether a tool call writes to `xd://report_issue`. */
+/** Whether a tool call runs `report_issue`, directly or as a `bash` command. */
 export function isReportIssueToolCall(toolCall: { name: string; arguments?: Record<string, unknown> }): boolean {
-	if (toolCall.name !== "write") return false;
-	const args = toolCall.arguments;
-	const path =
-		typeof args?.path === "string" ? args.path : typeof args?.file_path === "string" ? args.file_path : undefined;
-	return path === REPORT_ISSUE_DEVICE_PATH || path === `${REPORT_ISSUE_DEVICE_PATH}/`;
+	return (toolCommandCallName(toolCall) ?? toolCall.name) === REPORT_ISSUE_COMMAND_NAME;
 }
 
 /**
@@ -107,7 +95,7 @@ function normalizeGrievance(rawTool: string, rawReport: string): { tool: string;
 function parseReportIssueBody(text: string): { tool: string; report: string } {
 	const body = text.trim();
 	if (!body) {
-		throw new ToolError(`Empty report. ${reportIssueDeviceUsage()}`);
+		throw new ToolError(`Empty report. ${REPORT_ISSUE_USAGE}`);
 	}
 	const firstNewline = body.indexOf("\n");
 	if (firstNewline >= 0) {
@@ -115,7 +103,7 @@ function parseReportIssueBody(text: string): { tool: string; report: string } {
 		const report = body.slice(firstNewline + 1).trim();
 		if (tool && report) return normalizeGrievance(tool, report);
 	}
-	// Only a colon followed by whitespace separates, so a URI (`xd://tui`) or an
+	// Only a colon followed by whitespace separates, so a URI (`help://read/sources`) or an
 	// unspaced argument (`{name:'x'}`) in the tool name stays in the tool name.
 	const colon = body.search(/:\s/);
 	if (colon > 0) {
@@ -123,7 +111,7 @@ function parseReportIssueBody(text: string): { tool: string; report: string } {
 		const report = body.slice(colon + 1).trim();
 		if (tool && report) return normalizeGrievance(tool, report);
 	}
-	throw new ToolError(`Invalid report format. ${reportIssueDeviceUsage()}`);
+	throw new ToolError(`Invalid report format. ${REPORT_ISSUE_USAGE}`);
 }
 
 /** Legacy Auto-QA is opt-in and cannot inject reports unless explicitly configured. */
@@ -197,7 +185,8 @@ export function openAutoQaDb(): Database | null {
 				report TEXT NOT NULL,
 				created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
 				pushed INTEGER NOT NULL DEFAULT 0,
-				push_error TEXT
+				push_error TEXT,
+				source TEXT
 			);
 		`);
 		// Legacy DBs (May 2026) predate `created_at`. ALTER TABLE only accepts
@@ -211,6 +200,8 @@ export function openAutoQaDb(): Database | null {
 		}
 		const hasPushError = db.prepare("SELECT 1 FROM pragma_table_info('grievances') WHERE name = 'push_error'").get();
 		if (!hasPushError) db.exec("ALTER TABLE grievances ADD COLUMN push_error TEXT;");
+		const hasSource = db.prepare("SELECT 1 FROM pragma_table_info('grievances') WHERE name = 'source'").get();
+		if (!hasSource) db.exec("ALTER TABLE grievances ADD COLUMN source TEXT;");
 		db.exec(`
 			CREATE INDEX IF NOT EXISTS grievances_pushed_created_at_idx
 			ON grievances (pushed, created_at, id);
@@ -244,14 +235,14 @@ export interface FlushResult {
 /**
  * Optional per-flush controls. Used by `omp grievances push` to surface
  * progress to a TTY and to skip the user-facing consent gate (manual
- * pushes are the user's explicit intent, not a side effect of a device write).
+ * pushes are the user's explicit intent, not a side effect of a model report).
  */
 export interface FlushOptions {
 	/**
 	 * Skip the `dev.autoqaConsent === "granted"` gate in
 	 * {@link resolvePushConfig}. Endpoint configuration is still required.
 	 * Reserved for explicit user-driven pushes (CLI `grievances push`,
-	 * future debug recipes); never set from the device's auto-flush path.
+	 * future debug recipes); never set from the tool's auto-flush path.
 	 */
 	bypassConsent?: boolean;
 	/**
@@ -332,6 +323,8 @@ interface GrievanceRow {
 	version: string;
 	tool: string;
 	report: string;
+	/** Historical tool provenance; null for rows recorded before provenance was stored. */
+	source: string | null;
 }
 
 /** Cap on collector error text kept for logs, `FlushResult`, and `push_error`. */
@@ -358,7 +351,7 @@ type BatchOutcome =
 
 async function performFlush(db: Database, config: PushConfig, options: FlushOptions = {}): Promise<FlushResult> {
 	const selectStmt = db.prepare(
-		"SELECT id, model, version, tool, report FROM grievances WHERE pushed = 0 ORDER BY id ASC LIMIT ?",
+		"SELECT id, model, version, tool, report, source FROM grievances WHERE pushed = 0 ORDER BY id ASC LIMIT ?",
 	);
 	// Planning snapshot — fires once so progress reporters can size their bar.
 	// Mid-flight inserts are NOT folded in (the worker drains them too, but
@@ -384,7 +377,11 @@ async function performFlush(db: Database, config: PushConfig, options: FlushOpti
 			// Normalized on the way out so rows recorded before record-time
 			// clamping and redaction existed neither poison every batch nor
 			// ship the user's home directory.
-			entries: batch.map(row => ({ ...row, ...normalizeGrievance(row.tool, row.report) })),
+			entries: batch.map(({ source, ...row }) => ({
+				...row,
+				...normalizeGrievance(row.tool, row.report),
+				...(source ? { source } : {}),
+			})),
 		});
 		const headers: Record<string, string> = { "content-type": "application/json" };
 		if (config.token) headers.authorization = `Bearer ${config.token}`;
@@ -507,15 +504,7 @@ export async function flushGrievances(
 	}
 }
 
-/**
- * Execute `write xd://report_issue`. `text` must be either:
- * - `<tool>: <concise description>` on one line, or
- * - tool name on the first line with the report body below.
- */
-export async function dispatchReportIssueDevice(
-	_session: ToolSession,
-	text: string,
-): Promise<{ result: AgentToolResult<unknown>; xdev: XdevDispatch }> {
+export async function reportToolIssue(_session: ToolSession, text: string): Promise<AgentToolResult<unknown>> {
 	const { tool, report } = parseReportIssueBody(text);
 	const accepted = await requestCoreforgeReport(tool, report);
 	const message =
@@ -526,8 +515,28 @@ export async function dispatchReportIssueDevice(
 				: accepted === false
 					? "Coreforge report dismissed. Nothing was filed."
 					: "Coreforge /report requires an interactive parent session. Nothing was filed.";
-	return {
-		result: { content: [{ type: "text", text: message }] },
-		xdev: { tool: REPORT_ISSUE_DEVICE_NAME, mode: "execute", args: { report: text.trim() } },
+	return { content: [{ type: "text", text: message }] };
+}
+
+const reportIssueSchema = type({
+	report: type("string").describe("Observed failure in `<tool>: <concise description>` form."),
+	"+": "reject",
+});
+
+export function createReportIssueTool(session: ToolSession): Tool {
+	const tool: AgentTool<typeof reportIssueSchema> = {
+		name: REPORT_ISSUE_COMMAND_NAME,
+		label: "Report Tool Issue",
+		summary: "Request review of an observed tool failure",
+		description:
+			"Request per-occurrence consent to start Coreforge /report with `<tool>: <concise description>`. No issue is filed until its draft is approved.",
+		parameters: reportIssueSchema,
+		strict: true,
+		intent: "omit",
+		approval: "write",
+		async execute(_toolCallId, params) {
+			return reportToolIssue(session, params.report);
+		},
 	};
+	return tool;
 }

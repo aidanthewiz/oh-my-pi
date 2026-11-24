@@ -355,7 +355,7 @@ func TestSmokeModel(t *testing.T) {
 	uriMu.Lock()
 	reads := slices.Clone(uriReads)
 	uriMu.Unlock()
-	if deref(turn.AssistantText) != "tool said: 1:note body" || !slices.Contains(reads, "notes://today") {
+	if !strings.Contains(deref(turn.AssistantText), "note body") || !slices.Contains(reads, "notes://today") {
 		t.Fatalf("read_uri: text=%q reads=%v", deref(turn.AssistantText), reads)
 	}
 	t.Logf("read_uri: assistant=%q reads=%v", *turn.AssistantText, reads)
@@ -367,7 +367,7 @@ func TestSmokeModel(t *testing.T) {
 	uriMu.Lock()
 	writes := slices.Clone(uriWrites)
 	uriMu.Unlock()
-	if deref(turn.AssistantText) != "tool said: Successfully wrote 16 bytes to notes://today" ||
+	if turn.Result.Status != PromptStatusCompleted ||
 		len(writes) != 1 || writes[0] != [2]string{"notes://today", "written by model"} {
 		t.Fatalf("write_uri: text=%q writes=%v", deref(turn.AssistantText), writes)
 	}

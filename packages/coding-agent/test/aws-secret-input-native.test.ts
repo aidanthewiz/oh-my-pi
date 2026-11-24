@@ -101,7 +101,7 @@ function safeReceipt(value: unknown): boolean {
 	return Bun.deepEquals(receipt, {
 		schema: "aws-secret-input-native/v1",
 		cases: CASES.map(name => ({ name, passed: true })),
-		transport: "native-write-xdev-private-worker-finite-stdin",
+		transport: "native-bash-command-private-worker-finite-stdin",
 		allWorkersReaped: true,
 		publicSurfacesClean: true,
 		ownedFilesClean: true,
@@ -176,7 +176,7 @@ test("owned-file inspection rejects a marker split across byte-sized chunks and 
 
 for (const mode of ["source", "compiled"] as const) {
 	test.skipIf(process.platform === "win32")(
-		`native Write xd://aws preserves admission, immutable approval, guards, and real stdin delivery (${mode} worker)`,
+		`native Bash aws command preserves admission, immutable approval, guards, and real stdin delivery (${mode} worker)`,
 		async () => {
 			const workspace = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "aws-secret-input-native-")));
 			const root = path.join(workspace, "runtime");

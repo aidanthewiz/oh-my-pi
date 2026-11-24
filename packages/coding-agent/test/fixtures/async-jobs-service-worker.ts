@@ -99,7 +99,7 @@ const probe: AsyncJobsProbe = {
 				asyncJobManager: manager,
 				sessionManager: SessionManager.inMemory(cwd),
 				bindProcessState: false,
-				cacheWarming: false,
+				cacheWarming: "off",
 				disableExtensionDiscovery: true,
 				skills: [],
 				contextFiles: [],

@@ -22,7 +22,7 @@ Build side:
 - `bazel/clippy.bazelrc` — generated from `[workspace.lints]` in `Cargo.toml`
 - `MODULE.bazel`, `MODULE.bazel.lock`, `.bazelrc`, `.bazelversion` (Bazel 9.2.0)
 - `scripts/bazel-natives.ts` — the canonical driver (build + locate + install)
-- `crates/pi-natives/BUILD.bazel`, `crates/pi-natives/Cargo.toml`
+- `crates/natives/BUILD.bazel`, `crates/natives/Cargo.toml`
 
 Package side (unchanged runtime/packaging):
 
@@ -58,7 +58,7 @@ Notes:
 
 ### 2) `native_addon` rule (`bazel/defs.bzl`)
 
-`native_addon` wraps `//crates/pi-natives:pi_natives` (a `rust_shared_library`) in a configuration transition that pins, per target:
+`native_addon` wraps `//crates/natives:pi_natives` (a `rust_shared_library`) in a configuration transition that pins, per target:
 
 - `--platforms=<the addon's platform>`
 - `--compilation_mode=opt`
@@ -69,12 +69,12 @@ This mirrors the old cargo `ci` profile. Because the profile lives **in the tran
 
 The macOS deployment target is pinned to 12.0 in `.bazelrc`. Rust's post-link `rust-objcopy` stripping corrupts those Mach-O dylibs with Xcode 27 (`mis-aligned LINKEDIT string pool`). Darwin release addons instead strip non-global symbols and debug information at link time. The same `.bazelrc` disables post-link stripping for Darwin exec tools and removes their debug information at link time. Actual Darwin hosts use Apple's linker; only Linux cross-builds use the pinned LLVM 23.1.3 `ld64.lld`.
 
-Per-target codegen that is not part of the transition lives in `crates/pi-natives/BUILD.bazel` `rustc_flags` selects: `-Ctarget-cpu=x86-64-v2` (baseline) / `x86-64-v3` (modern) via `//bazel/variants`, the napi link args (`-Wl,-undefined,dynamic_lookup` on macOS, `-Wl,-z,nodelete` on linux — `build.rs`/`napi_build::setup()` is deliberately not wired in), `-Ctarget-feature=-crt-static` for musl, and `-Ctarget-feature=+crt-static` for win32 msvc, x64 and arm64 (paired with the `static_link_msvcrt` cc feature enabled in the `native_addon` transition so the C deps compile `/MT` in lock-step — the shipped `.node` then imports no `VCRUNTIME140.dll` from the VC++ Redistributable). The Cargo host path applies the same `+crt-static` policy to local Windows ARM64 builds in `build-bindings.ts`.
+Per-target codegen outside the transition lives in `crates/natives/BUILD.bazel`: x64 baseline/modern CPU selections, N-API linker flags, dynamic musl CRT selection, and static Windows MSVC CRT selection. The `static_link_msvcrt` transition keeps C dependencies on `/MT`; the Cargo host path applies the matching `+crt-static` policy in `build-bindings.ts`.
 
-`pi-natives` embeds the Jev rank tables from `data/jev_*.bin.zst`. Bazel includes them through `compile_data`; Cargo uses `include_bytes!`.
+`omp-natives` embeds the Jev rank tables from `data/jev_*.bin.zst`. Bazel includes them through `compile_data`; Cargo uses `include_bytes!`.
 
 Highlighting embeds `syntaxes.packdump`, built from syntect defaults and the bundled syntax sources.
-Bazel produces it through `//crates/pi-natives:syntax_set` and supplies `OMP_SYNTAX_SET` as compile data.
+Bazel produces it through `//crates/natives:syntax_set` and supplies `OMP_SYNTAX_SET` as compile data.
 Cargo `build.rs` generates the same artifact through the shared syntax builder.
 No generated syntax dump belongs in tracked source or a separate release asset.
 
@@ -99,7 +99,7 @@ The `@applefm_swift` toolchain fingerprint prevents cache reuse across Swift SDK
 
 Rust toolchains are nightly (pinned in `MODULE.bazel`), with repo-local musl re-registrations in `//bazel/toolchains` carrying an explicit `@zig_sdk//libc:musl` constraint (rules_rust's generated gnu and musl toolchains otherwise share (os, cpu) constraints).
 
-The darwin-arm64 addon embeds the Apple Foundation Models bridge (`crates/pi-natives/src/applefm/bridge.swift`, Swift 6.4 against the macOS 27 SDK), built by the `applefm_bridge` rule with the `//bazel/toolchains/swift` toolchain: on mac exec hosts the host-detected Xcode/Command Line Tools Swift (`@applefm_swift`), on linux exec hosts the pinned swift.org Swift 6.4.0 for Ubuntu 22.04 (`@swift_linux`) against `@macos_sdk`, linked by `@llvm_darwin_tools`' ld64.lld. The open-source compiler reads the SDK's `.swiftinterface`s as long as the versions match; it needs `-resource-dir` pointed away from the Linux corelibs module maps and `-I <sdk>/usr/lib/swift/shims` (see `bazel/toolchains/swift/linux.bzl`). Without a toolchain (x86_64, or a mac without Swift 6.4 + SDK 27) the bridge is an empty file the addon reports as not built. A set `OMP_APPLEFM_SWIFTC` is the only candidate on mac hosts, and an unusable one fails the build (cargo and Bazel) instead of falling back to Xcode/CLT or the empty file; `OMP_APPLEFM_DISABLE=1` skips detection entirely (no bridge, no host toolchain probing) and conflicts with `OMP_APPLEFM_SWIFTC`. The Nix build sets one of the two on Darwin: nixpkgs' wrapped Swift, or `DISABLE` for `withAppleFm = false`. The AppKit/ScreenCaptureKit helpers (`darwin_helper`) compile with whichever darwin cc toolchain resolved.
+The darwin-arm64 addon embeds the Apple Foundation Models bridge (`crates/natives/src/applefm/bridge.swift`, Swift 6.4 against the macOS 27 SDK), built by the `applefm_bridge` rule with the `//bazel/toolchains/swift` toolchain: on mac exec hosts the host-detected Xcode/Command Line Tools Swift (`@applefm_swift`), on linux exec hosts the pinned swift.org Swift 6.4.0 for Ubuntu 22.04 (`@swift_linux`) against `@macos_sdk`, linked by `@llvm_darwin_tools`' ld64.lld. The open-source compiler reads the SDK's `.swiftinterface`s as long as the versions match; it needs `-resource-dir` pointed away from the Linux corelibs module maps and `-I <sdk>/usr/lib/swift/shims` (see `bazel/toolchains/swift/linux.bzl`). Without a toolchain (x86_64, or a mac without Swift 6.4 + SDK 27) the bridge is an empty file the addon reports as not built. A set `OMP_APPLEFM_SWIFTC` is the only candidate on mac hosts, and an unusable one fails the build (cargo and Bazel) instead of falling back to Xcode/CLT or the empty file; `OMP_APPLEFM_DISABLE=1` skips detection entirely (no bridge, no host toolchain probing) and conflicts with `OMP_APPLEFM_SWIFTC`. The Nix build sets one of the two on Darwin: nixpkgs' wrapped Swift, or `DISABLE` for `withAppleFm = false`. The AppKit/ScreenCaptureKit helpers (`darwin_helper`) compile with whichever darwin cc toolchain resolved.
 
 Linux-hosted Darwin Rust links receive `SDKROOT` from `//bazel/toolchains/darwin:rustc_sdk_env`; native macOS links retain Xcode discovery. Swift's `@swift_darwin_resources` overlay exposes the compiler's Clang headers and the SDK's real Swift runtime directory without Linux module maps. Only this small cross-repository symlink overlay is uncached; the compiler and SDK downloads remain independently cached.
 
@@ -158,7 +158,7 @@ The driver also supports `--source <dir>` to install prebuilt outputs arranged a
 bun --cwd=packages/natives run build:bindings   # = bun scripts/build-bindings.ts
 ```
 
-This runs the napi CLI (host-only, local cargo profile) against `crates/pi-natives`, installs the regenerated `index.d.ts`, normalizes the addon filename, and re-renders the explicit ESM exports + runtime enum objects via `gen-enums.ts`. Commit the resulting `index.js`/`index.d.ts` changes.
+This runs the napi CLI (host-only, local cargo profile) against `crates/natives`, installs the regenerated `index.d.ts`, normalizes the addon filename, and re-renders the explicit ESM exports + runtime enum objects via `gen-enums.ts`. Commit the resulting `index.js`/`index.d.ts` changes.
 
 ### Opt-in local cache (`.bazelrc.user`)
 
@@ -182,9 +182,9 @@ Only first-attempt branch runs share the latest-wins concurrency groups. Prepara
 
 The Windows ARM64 leg skips Bazel cache steps. The release's other legs save native caches before packaging, so packaging failures do not discard completed native work. Pull requests restore trusted base-branch caches without saving merge-ref caches; they build native addons from the resolved fork source when native inputs change. Only an unchanged, ancestor Coreforce release can provide verified native assets. Neither the deleted upstream `ci.yml` nor its public npm native leaves are release inputs.
 
-The eight binary targets are `darwin-arm64`, `darwin-x64`, `linux-x64`, `linux-arm64`, `linux-musl-x64`, `linux-musl-arm64`, `win32-x64`, and `win32-arm64`. Each release target has a matching `coreforge-pi-natives-<target>-<tag>.tgz`; Linux musl archives deliberately contain canonical `pi_natives.linux-<arch>*.node` names but never substitute glibc addons. Linux x64 carries both baseline and modern; musl x64 carries baseline only. The executable names are `omp-<target>` except the Windows `omp-windows-<arch>.exe` binaries.
+The eight binary targets are `darwin-arm64`, `darwin-x64`, `linux-x64`, `linux-arm64`, `linux-musl-x64`, `linux-musl-arm64`, `win32-x64`, and `win32-arm64`. Each release target has a matching `coreforge-pi-natives-<target>-<tag>.tgz`. Linux musl archives use canonical `pi_natives.linux-<arch>*.node` names but never substitute glibc addons. Linux x64 carries baseline and modern variants; musl x64 carries baseline only. Executables are `omp-<target>` except Windows `omp-windows-<arch>.exe`.
 
-`cf-verify.yml` uses the same eight-target matrix. If native inputs changed since the latest ancestor Coreforce release, each target builds the addon from the fork tree. Otherwise it installs and verifies the matching Coreforce release asset. Darwin ARM64 requires Swift 6.4/macOS 27 SDK on the `xcode-27` runner. Its addon must embed the bridge without linking FoundationModels or Swift; Darwin x64 embeds an empty bridge on `macos-15-intel`. Windows ARM64 builds the host Cargo addon on `windows-11-arm`. The release job always builds its native addons from the release commit, not upstream npm packages.
+The Coreforce verification matrix source-builds changed native inputs, or installs and verifies an unchanged matching ancestor Coreforce release asset. Darwin ARM64 uses Swift 6.4/macOS 27 SDK on `xcode-27`; its addon embeds the bridge without linking FoundationModels or Swift. Darwin x64 embeds an empty bridge on `macos-15-intel`. Windows ARM64 builds the host Cargo addon on `windows-11-arm`. Release jobs build from the release commit, not upstream npm packages. Generic upstream Bazel examples do not replace these required verification and publication gates.
 
 Both Darwin release legs verify the final strict signature before publishing. When all five signing credentials exist, an ad-hoc signature fails that gate. Coreforce retains its separate published-arm64 verification job; upstream npm, Homebrew and cluster publishing jobs remain absent.
 
@@ -198,7 +198,7 @@ bazelisk cquery --output=files //:natives-linux-x64-baseline
 
 # What actions/flags a target produces (add the same --config flags as the build):
 bazelisk aquery 'outputs(".*\.node", deps(//:natives-linux-arm64))'
-bazelisk aquery 'mnemonic("Rustc", deps(//crates/pi-natives:pi_natives))'
+bazelisk aquery 'mnemonic("Rustc", deps(//crates/natives:pi_natives))'
 
 # Which toolchain resolved (e.g. confirm @msvc_cc, not host cc, for win32):
 bazelisk cquery 'deps(//:natives-win32-x64-baseline)' | grep msvc_cc
@@ -216,7 +216,7 @@ bazelisk build --nobuild //:natives-win32-x64-baseline
 
 | Symptom                                                                            | Cause                                                                                                      | Fix (in tree)                                                                                                                                                  |
 | ---------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| musl build "succeeds" but emits no `.node`                                         | musl defaults to `+crt-static`; rustc silently emits no cdylib                                             | `-Ctarget-feature=-crt-static` select in `crates/pi-natives/BUILD.bazel`                                                                                       |
+| musl build "succeeds" but emits no `.node`                                         | musl defaults to `+crt-static`; rustc silently emits no cdylib                                             | `-Ctarget-feature=-crt-static` select in `crates/natives/BUILD.bazel`                                                                                       |
 | Opus objects pull the host UBSan runtime                                           | zig cc enables UBSan by default                                                                            | `CFLAGS=-fno-sanitize=undefined` in the `opusic-sys` annotation (`MODULE.bazel`)                                                                               |
 | blake3 msvc: `ml64.exe` not found                                                  | cc-rs resolves MASM from build-script PATH on non-windows hosts                                            | `bin/ml64.exe → llvm-ml -m64` shim in `@msvc_cc`, prepended via the `blake3` annotation PATH                                                                   |
 | `opusic-sys` msvc needs the cross CMake toolchain                                  | bundled Opus is configured on Linux/macOS for the Windows target                                           | `@msvc_cc`'s `toolchain.cmake` via `CMAKE_TOOLCHAIN_FILE_x86_64_pc_windows_msvc`; the sys crate selects Ninja, static try-compile, and `/MT`                   |
@@ -277,7 +277,7 @@ Runtime x64 candidate order also includes the unsuffixed default filename after 
 
 The frames are a pure function of the addon bytes: no container, file names, or timestamps. A release whose addon only changes its version stamp therefore embeds nearly identical bytes, so consecutive binaries differ only where the addon did. Do not reintroduce tar/gzip or per-build metadata into the embedded data.
 
-The overrides stay in memory on purpose: `Bun.build` shares the runtime's directory cache and does not re-read it on a miss, so a build process that imported pi-natives before writing frames to `native/` could not resolve them.
+The overrides stay in memory on purpose: `Bun.build` shares the runtime's directory cache and does not re-read it on a miss, so a build process that imported omp-natives before writing frames to `native/` could not resolve them.
 
 ## Dev workflow vs shipped/compiled behavior
 
@@ -312,7 +312,7 @@ Generated declarations currently include exports from these Rust modules:
 
 | Area                   | Representative JS exports                                                                                                          | Rust source                                                                  |
 | ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
-| Search/workspace       | `grep`, `search`, `hasMatch`, `fuzzyFind`, `glob`, `listWorkspace`                                                                 | `grep.rs`, `fd.rs`, `glob.rs`, `workspace.rs` (walk/search in `pi-walker`)   |
+| Search/workspace       | `grep`, `search`, `hasMatch`, `fuzzyFind`, `glob`, `listWorkspace`                                                                 | `grep.rs`, `fd.rs`, `glob.rs`, `workspace.rs` (walk/search in `omp-xfs`)   |
 | AST/block/summary      | `astGrep`, `astEdit`, `blockRangeAt`, `summarizeCode`                                                                              | `ast.rs`, `block.rs`, `summary.rs`                                           |
 | Text/highlight/tokens  | `visibleWidth`, `truncateToWidth`, `highlightCode`, `countTokens`                                                                  | `text.rs`, `highlight.rs`, `tokens.rs`                                       |
 | Shell/PTY/process/keys | `executeShell`, `Shell`, `PtySession`, `Process`, `parseKey`                                                                       | `shell.rs`, `pty.rs`, `ps.rs`, `keys.rs`                                     |
@@ -367,7 +367,7 @@ bun --cwd=packages/coding-agent run build
 
 ## Orchestrator-side content-addressed build cache (robomp)
 
-When `pi-natives` is built inside the robomp orchestrator (`python/robomp/`), workspaces share built artifacts through a content-addressed cache instead of rebuilding from scratch in every per-issue worktree. The cache is **orchestrator-side only** — `bun --cwd=packages/natives run build` itself is unchanged; the cache lives outside the build pipeline and is populated/captured around `ensure_workspace` and post-task success in `python/robomp/src/natives_cache.py`.
+When `omp-natives` is built inside the robomp orchestrator (`python/robomp/`), workspaces share built artifacts through a content-addressed cache instead of rebuilding from scratch in every per-issue worktree. The cache is **orchestrator-side only** — `bun --cwd=packages/natives run build` itself is unchanged; the cache lives outside the build pipeline and is populated/captured around `ensure_workspace` and post-task success in `python/robomp/src/natives_cache.py`.
 
 ### What is cached
 
@@ -385,7 +385,7 @@ An entry is only considered a hit when the `.node` glob matches AND every compan
 
 The key is `sha256` over `(path \t git-tree-hash \n)` pairs for the following inputs, in this order (order is significant), followed by the target triple:
 
-1. `crates` (whole subtree — pi-natives transitively depends on other workspace crates)
+1. `crates` (whole subtree — omp-natives transitively depends on other workspace crates)
 2. `Cargo.lock`
 3. `Cargo.toml`
 4. `rust-toolchain.toml`

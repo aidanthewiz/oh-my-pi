@@ -1,6 +1,6 @@
 """Rules for producing release-grade, canonically named pi_natives addons.
 
-`native_addon` transitions //crates/pi-natives:pi_natives onto a shipping
+`native_addon` transitions //crates/natives:pi_natives onto a shipping
 platform with the release codegen profile (opt, thin LTO, cgu=16). Darwin
 strips non-global symbols and debug information at link time because rustc's
 post-link strip corrupts Mach-O dylibs with macOS deployment targets >= 12;
@@ -81,7 +81,7 @@ native_addon = rule(
         "lib": attr.label(
             cfg = _addon_transition,
             mandatory = True,
-            doc = "The rust_shared_library target (//crates/pi-natives:pi_natives).",
+            doc = "The rust_shared_library target (//crates/natives:pi_natives).",
         ),
         "platform": attr.label(
             mandatory = True,

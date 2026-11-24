@@ -76,7 +76,7 @@ async function withSkills(run: (harness: SkillHarness) => Promise<void>, exclude
 			enableLsp: false,
 			enableIrc: false,
 			skipPythonPreflight: true,
-			cacheWarming: false,
+			cacheWarming: "off",
 		});
 		sessions.push(parent.session);
 		const toolSession: ToolSession = {

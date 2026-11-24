@@ -833,6 +833,11 @@ export function getBrowserRelayDir(): string {
 	return dirs.rootSubdir("browser-relay", "data");
 }
 
+/** Get the install registry shared by every omp profile and browser. */
+export function getBrowserRelayInstallRegistryFile(): string {
+	return dirs.baseRootSubdir(path.join("browser-relay", "installs.json"));
+}
+
 /** Get the profile root for Chromium browsers the browser tool spawns via `app.path` (~/.omp/browser-profiles). */
 export function getBrowserProfilesDir(): string {
 	return dirs.rootSubdir("browser-profiles", "state");
@@ -916,6 +921,15 @@ export function getAuthBrokerSnapshotCachePath(): string {
 	return dirs.rootSubdir(path.join("cache", "auth-broker-snapshot.enc"), "cache");
 }
 
+/**
+ * Get the cached OpenAI Codex client version record
+ * (~/.omp/agent/codex-client-version.json; XDG default: $XDG_CACHE_HOME/omp/codex-client-version.json).
+ * It is a refetchable cache, not config, so it belongs under the cache dir.
+ */
+export function getCodexClientVersionPath(agentDir?: string): string {
+	return dirs.agentSubdir(agentDir, "codex-client-version.json", "cache");
+}
+
 /** Get the commit-author avatar cache directory (~/.omp/cache/avatars). */
 export function getAvatarCacheDir(): string {
 	return dirs.rootSubdir(path.join("cache", "avatars"), "cache");
@@ -997,6 +1011,11 @@ export function getLastChangelogVersionPath(agentDir?: string): string {
 /** Get the path to history.db (SQLite database for session history). */
 export function getHistoryDbPath(agentDir?: string): string {
 	return dirs.agentSubdir(agentDir, "history.db", "data");
+}
+
+/** Get the path to transcripts.db (full-text index of session transcripts). */
+export function getTranscriptIndexDbPath(agentDir?: string): string {
+	return dirs.agentSubdir(agentDir, "transcripts.db", "data");
 }
 
 /** Get the path to models.db (model cache database). */
@@ -1155,9 +1174,9 @@ export function getSecretPlaceholderKeyPath(): string {
 	return keyPath;
 }
 
-/** Directory holding the per-model tiny-worker sockets and logs (~/.omp/run/tiny; XDG default: $XDG_STATE_HOME/omp/run/tiny). */
-export function getTinyWorkerRuntimeDir(): string {
-	return dirs.rootSubdir(path.join("run", "tiny"), "state");
+/** Runtime directory of the single per-user omp daemon (~/.omp/run/daemon; XDG default: $XDG_STATE_HOME/omp/run/daemon). Shared across profiles; holds its socket, token, sqlite store and unit logs. */
+export function getDaemonDir(): string {
+	return dirs.baseRootSubdir(path.join("run", "daemon"), "state");
 }
 
 /** Profile-independent directory for shared mnemopi embedding endpoints and logs (~/.omp/run/mnemopi; XDG default: $XDG_STATE_HOME/omp/run/mnemopi). */
@@ -1170,23 +1189,10 @@ export function getDaemonRuntimeRoot(): string {
 	return dirs.rootSubdir(path.join("run", "daemons"), "state");
 }
 
-/** Get the daemon runtime directory for a project (~/.omp/run/daemons/<hash>; XDG default: $XDG_STATE_HOME/omp/run/daemons/<hash>). */
+/** Get the per-project runtime directory (~/.omp/run/daemons/<hash>; XDG default: $XDG_STATE_HOME/omp/run/daemons/<hash>). */
 export function getDaemonRuntimeDir(projectDir: string): string {
 	const key = Bun.hash.wyhash(path.resolve(projectDir)).toString(16).padStart(16, "0");
-	return path.join(getDaemonRuntimeRoot(), key);
-}
-
-/** Root directory containing every machine-global daemon service scope (~/.omp/run/daemons/global; XDG default: $XDG_STATE_HOME/omp/run/daemons/global). Shared across profiles. */
-export function getGlobalDaemonRuntimeRoot(): string {
-	return dirs.baseRootSubdir(path.join("run", "daemons", "global"), "state");
-}
-
-/** Get a profile-independent runtime directory for a machine-global daemon service. */
-export function getGlobalDaemonRuntimeDir(service: string): string {
-	if (!/^[a-z0-9][a-z0-9._-]*$/i.test(service)) {
-		throw new Error(`Invalid global daemon service name: ${JSON.stringify(service)}`);
-	}
-	return path.join(getGlobalDaemonRuntimeRoot(), service);
+	return path.join(dirs.rootSubdir(path.join("run", "daemons"), "state"), key);
 }
 
 /**

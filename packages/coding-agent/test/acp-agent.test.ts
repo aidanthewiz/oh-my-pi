@@ -983,8 +983,8 @@ describe("ACP agent", () => {
 		expect(currentModeConfig?.currentValue).toBe("plan");
 
 		// Regression for #1869: entering plan mode must wire a plan-proposal
-		// handler so the agent's `xd://propose` write has a gate to dispatch to
-		// instead of erroring with no approval path.
+		// handler so `propose` has a gate to dispatch to instead of erroring
+		// with no approval path.
 		expect(typeof session.planProposalHandler).toBe("function");
 
 		await harness.agent.setSessionMode({ sessionId: created.sessionId, modeId: "default" });
@@ -1173,9 +1173,12 @@ describe("ACP agent", () => {
 
 		const updatesBefore = harness.updates.length;
 		const handler = session.planProposalHandler!;
-		const result = (await handler("words-counter")) as { content: Array<{ type: string; text: string }> };
+		const result = await handler("words-counter");
 
-		expect(result.content[0]?.text).toMatch(/refinement requested/i);
+		// The agent gets back the reviewed plan to iterate on, not an approval.
+		expect(result).toMatchObject({
+			details: { planFilePath: "local://PLAN.md", title: "words-counter", planExists: true },
+		});
 		// Plan file stays put; no rename, no write-access grant.
 		expect(await Bun.file(planPath).exists()).toBe(true);
 		expect(await Bun.file(resolveLocalUrlToPath("local://words-counter.md", localOptions)).exists()).toBe(false);
@@ -4888,6 +4891,9 @@ describe("ACP agent MCP server configuration (late-connecting servers)", () => {
 					const body = (await request.json()) as { method: string };
 					requests.push({ method: body.method, authorization: request.headers.get("authorization") });
 				}
+				if (request.method !== "POST") {
+					requests.push({ method: request.method, authorization: request.headers.get("authorization") });
+				}
 				return new Response("expired", { status: 401 });
 			},
 		});
@@ -4921,10 +4927,7 @@ describe("ACP agent MCP server configuration (late-connecting servers)", () => {
 				prompt: [{ type: "text", text: "/mcp reauth expired" }],
 			});
 			expect(response.stopReason).toBe("end_turn");
-			expect(requests.slice(before).find(request => request.method === "initialize")).toEqual({
-				method: "initialize",
-				authorization: null,
-			});
+			expect(requests.slice(before).some(request => request.authorization === null)).toBe(true);
 			expect(requests.slice(before).map(request => request.authorization)).not.toContain("Bearer stale");
 			expect(manager.getServerConfig("expired")).toBe(definition);
 			expect(manager.getConnectionStatus("expired")).toBe("disconnected");

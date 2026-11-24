@@ -1,14 +1,15 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import * as relayDiscovery from "../../src/tools/browser/relay/discovery";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import {
-	createBrowserPrelude,
-	DEFAULT_RELAY_URL,
-	resolveBrowserKind,
-	resolveRelayKind,
-} from "@oh-my-pi/pi-coding-agent/tools/browser";
+import { createBrowserPrelude, resolveBrowserKind, resolveRelayKind } from "@oh-my-pi/pi-coding-agent/tools/browser";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools/index";
 import { resolveRelayWebSocketEndpoint } from "../../src/tools/browser/relay/kind";
 import { connectPuppeteer, loadPuppeteer } from "../../src/tools/browser/launch";
+
+beforeEach(() => {
+	vi.spyOn(relayDiscovery, "discoverRelayEndpoints").mockReturnValue([]);
+});
+afterEach(() => vi.restoreAllMocks());
 
 describe("resolveRelayKind", () => {
 	it("is disabled by default", () => {
@@ -27,10 +28,21 @@ describe("resolveRelayKind", () => {
 		expect(resolveRelayKind({ settingEnabled: true }, { PI_BROWSER_RELAY: "0" })).toBeNull();
 	});
 
-	it("PI_BROWSER_RELAY=1 enables the relay when the setting is off", () => {
-		expect(resolveRelayKind({ settingEnabled: false }, { PI_BROWSER_RELAY: "1" })).toEqual({
+	it("PI_BROWSER_RELAY=only enables the relay when the setting is off", () => {
+		expect(
+			resolveRelayKind({ settingEnabled: false, url: "http://127.0.0.1:9333" }, { PI_BROWSER_RELAY: "only" }),
+		).toEqual({
 			kind: "relay",
-			cdpUrl: DEFAULT_RELAY_URL,
+			cdpUrl: "http://127.0.0.1:9333",
+		});
+	});
+
+	it("PI_BROWSER_RELAY=1 enables the relay when the setting is off", () => {
+		expect(
+			resolveRelayKind({ settingEnabled: false, url: "http://127.0.0.1:9333" }, { PI_BROWSER_RELAY: "1" }),
+		).toEqual({
+			kind: "relay",
+			cdpUrl: "http://127.0.0.1:9333",
 		});
 	});
 });
@@ -290,15 +302,29 @@ describe("resolveBrowserKind in a subagent", () => {
 			resolveBrowserKind({ action: "open", app: "relay" }, session, { ...pane, PI_BROWSER_RELAY: "0" }).kind,
 		).toBe("headless");
 	});
+});
 
-	it("gets no relay guidance, since its open without app stays out of the user's Chrome", () => {
-		const saved = process.env.PI_BROWSER_RELAY;
-		delete process.env.PI_BROWSER_RELAY;
-		try {
-			const guidance = createBrowserPrelude(subagent({ "browser.relay": true })).guidance;
-			expect(guidance).toBe(createBrowserPrelude(subagent({ "browser.relay": false })).guidance);
-		} finally {
-			if (saved !== undefined) process.env.PI_BROWSER_RELAY = saved;
+describe("relay-only sessions (PI_BROWSER_RELAY=only)", () => {
+	const only = { PI_BROWSER_RELAY: "only" };
+	const sessionAt = (taskDepth: number): ToolSession =>
+		({
+			cwd: process.cwd(),
+			hasUI: false,
+			taskDepth,
+			getSessionFile: () => null,
+			getSessionSpawns: () => "*",
+			settings: Settings.isolated({}),
+		}) as ToolSession;
+
+	it("sends every open to the relay, a subagent's included", () => {
+		expect(resolveBrowserKind({ action: "open" }, sessionAt(0), only).kind).toBe("relay");
+		expect(resolveBrowserKind({ action: "open" }, sessionAt(1), only).kind).toBe("relay");
+		expect(resolveBrowserKind({ action: "open", app: "relay" }, sessionAt(1), only).kind).toBe("relay");
+	});
+
+	it("refuses any other app", () => {
+		for (const app of ["auto", "own", "http://127.0.0.1:9222"]) {
+			expect(() => resolveBrowserKind({ action: "open", app }, sessionAt(0), only)).toThrow();
 		}
 	});
 });

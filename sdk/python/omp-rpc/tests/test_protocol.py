@@ -166,6 +166,7 @@ class ProtocolParsingTests(unittest.TestCase):
                 {
                     "type": "cache_warming_end",
                     "phase": "idle",
+                    "method": "replay",
                     "provider": "anthropic",
                     "model": "claude-sonnet-4-5",
                     "outcome": "miss",

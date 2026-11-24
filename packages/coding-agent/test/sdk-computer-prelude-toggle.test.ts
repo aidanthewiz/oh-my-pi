@@ -199,7 +199,7 @@ describe("AgentSession eval preludes", () => {
 		const [first, second, third, fourth] = mock.calls.map(call => call.context);
 		expect(prefix(second!)).toEqual(prefix(first!));
 		expect(prefix(third!)).toEqual(prefix(first!));
-		expect(prefix(first!).eval).not.toContain("xd://eval/computer");
+		expect(prefix(first!).eval).not.toContain("help://eval/computer");
 
 		const notices = session.agent.state.messages.filter(
 			message => message.role === "custom" && message.customType === "eval-prelude-notice",
@@ -209,7 +209,7 @@ describe("AgentSession eval preludes", () => {
 			{ added: [], removed: ["computer"] },
 		]);
 		const secondText = requestText(second!);
-		expect(secondText).toContain("xd://eval/computer");
+		expect(secondText).toContain("help://eval/computer");
 		expect(secondText).toContain(computerGuidance);
 		expect(requestText(fourth!).match(/<system-notice id="prelude-extension">/g)).toHaveLength(2);
 	});
@@ -222,9 +222,11 @@ describe("AgentSession eval preludes", () => {
 			"TERN_PANE_SOCKET",
 			"TERN_PANE",
 			"CMUX_SOCKET_PATH",
+			"PI_TERMINAL_OWNER_PID",
 		] as const;
 		const savedEnv = Object.fromEntries(envKeys.map(key => [key, process.env[key]]));
 		for (const key of envKeys) delete process.env[key];
+		process.env.PI_TERMINAL_OWNER_PID = String(process.pid);
 		try {
 			const settings = Settings.isolated({
 				"browser.enabled": true,
@@ -379,7 +381,7 @@ describe("AgentSession eval preludes", () => {
 	});
 
 	it("reconciles browser MCP filtering on live browser toggles", async () => {
-		const manager = new MCPManager(registryDir, null, async () => ({
+		const manager = new MCPManager(registryDir, async () => ({
 			configs: {},
 			sources: {},
 			exaApiKeys: [],

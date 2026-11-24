@@ -57,6 +57,7 @@ function createFakeCtx(cwd: string, modelRegistry: ModelRegistry, settingsValues
 		modelRegistry,
 		effectiveExtensionRoots: TEST_EXTENSION_ROOTS,
 		getEvalPreludes: () => [],
+		getActiveToolNames: () => [],
 		refreshMCPTools: vi.fn(async (_tools: unknown) => {}),
 		setMCPPromptCommands: vi.fn((_commands: unknown) => {}),
 	};

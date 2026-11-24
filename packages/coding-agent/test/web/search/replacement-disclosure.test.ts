@@ -131,11 +131,11 @@ describe("web role replacement disclosure reaches search consumers", () => {
 				if (id !== "parallel") throw new Error(`Unexpected provider ${id}`);
 				return searchProvider("parallel");
 			});
-			const result = await runSearchQuery({ query: "synthetic site:unmatched.invalid" }, context);
+			const result = await runSearchQuery({ query: "synthetic intitle:unmatched" }, context);
 			expect(result.details.response.sources).toEqual([
 				{ title: "Synthetic search result", url: "https://x.com/synthetic/status/1" },
 			]);
-			expect(result.content[0]!.text).toContain("site:unmatched.invalid");
+			expect(result.content[0]!.text).toContain("intitle:unmatched");
 			assertDisclosure(result.content[0]!.text, "web/parallel");
 		});
 	});

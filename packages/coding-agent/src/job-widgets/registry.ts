@@ -10,6 +10,7 @@ import type { AsyncJob } from "../async/job-manager";
 import type { JobWidgetAuthor, JobWidgetAuthorRequest } from "./author";
 import { type JobCaptionWriter, needsJobCaption, normalizeJobCaption } from "./caption";
 import { JobWidgetRuntime, sampleLines } from "./runtime";
+import { jobDisplayLabel } from "@oh-my-pi/pi-tui/tools/job-label";
 import { type JobWidgetSpec, jobWidgetSkip, validateJobWidgetSpec } from "./spec";
 import type { JobWidgetBrief, JobWidgetInputs, JobWidgetRegistry } from "./types";
 
@@ -159,7 +160,7 @@ export class JobWidgets implements JobWidgetRegistry {
 			job,
 			inputs: job.widgetInputs!,
 			runtime,
-			view: runtime.view({ label: job.intent ?? job.label, authoring: false }),
+			view: runtime.view({ label: jobDisplayLabel(job), authoring: false }),
 			viewKey: "",
 			lastIngestAt: Number.NEGATIVE_INFINITY,
 			shown: false,
@@ -287,7 +288,7 @@ export class JobWidgets implements JobWidgetRegistry {
 
 	#recompute(entry: WidgetEntry, brief: JobWidgetBrief): boolean {
 		const view = entry.runtime.view({
-			label: entry.job.intent ?? entry.job.label,
+			label: jobDisplayLabel(entry.job),
 			stage: brief.stage,
 			// A subagent's tool results are file contents and search hits; only a command's newest line says what it does.
 			lineStage: brief.kind === "bash",

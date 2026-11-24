@@ -27,11 +27,19 @@ import { withEvalBridgeToolCall } from "../tool-bridge-policy";
 import { EVAL_WORKPOOL_BRIDGE_NAME, type EvalWorkpoolResult, runEvalWorkpool } from "../workpool-bridge";
 import {
 	bridgeValueFromToolResult,
-	callRegisteredTool,
+	getSessionTool,
+	runSessionTool,
 	type SessionToolCallOptions,
 	type SessionToolValue,
 	type StatusSummarizer,
 } from "./session-tool";
+import {
+	EVAL_MCP_BRIDGE_NAME,
+	isEvalNamespaceTool,
+	type MCPNamespaceValue,
+	mcpNamespaceValue,
+	parseMCPNamespaceCall,
+} from "../../mcp/eval-namespaces";
 
 export type { JsStatusEvent } from "./shared/types";
 
@@ -50,6 +58,7 @@ type ToolValue =
 	| EvalJudgmentBatchResult
 	| EvalHandleSnapshot
 	| EvalWorkpoolResult
+	| MCPNamespaceValue
 	| { items: EvalHandleSnapshot[] }
 	| { cancelled: boolean };
 
@@ -80,7 +89,7 @@ function summarizePreludeResult(session: ToolSession): StatusSummarizer {
 }
 
 export function callSessionTool(name: string, args: unknown, options: ToolBridgeOptions): Promise<ToolValue> {
-	return withEvalBridgeToolCall(options.session.xdev, () => dispatchSessionTool(name, args, options));
+	return withEvalBridgeToolCall(options.session.toolCommands, () => dispatchSessionTool(name, args, options));
 }
 
 async function dispatchSessionTool(name: string, args: unknown, options: ToolBridgeOptions): Promise<ToolValue> {
@@ -146,5 +155,27 @@ async function dispatchSessionTool(name: string, args: unknown, options: ToolBri
 	if (name === EVAL_WORKPOOL_BRIDGE_NAME) {
 		return await runEvalWorkpool(args, options);
 	}
-	return withoutCleanupOwnedToolCall(() => callRegisteredTool(name, args, options));
+	if (name === EVAL_MCP_BRIDGE_NAME) {
+		return await withoutCleanupOwnedToolCall(() => runEvalMcpCall(args, options));
+	}
+	const call = await withoutCleanupOwnedToolCall(() =>
+		runSessionTool(getSessionTool(options.session, name), args, options),
+	);
+	return bridgeValueFromToolResult(call.name, call.args, call.result, options.emitStatus);
+}
+
+/** An MCP eval namespace method (`github.search(…)`): the tool's own call, mapped by `mcpNamespaceValue`. */
+async function runEvalMcpCall(args: unknown, options: ToolBridgeOptions): Promise<MCPNamespaceValue> {
+	const request = parseMCPNamespaceCall(args);
+	const tool = getSessionTool(options.session, request.tool);
+	if (!isEvalNamespaceTool(tool)) throw new ToolError(`${request.label} is not an MCP namespace method`);
+	const { result } = await runSessionTool(tool, request.args, options);
+	try {
+		const value = await mcpNamespaceValue(request.label, result, options.session.localProtocolOptions ?? {});
+		options.emitStatus?.({ op: request.label });
+		return value;
+	} catch (error) {
+		options.emitStatus?.({ op: request.label, error: error instanceof Error ? error.message : String(error) });
+		throw error;
+	}
 }

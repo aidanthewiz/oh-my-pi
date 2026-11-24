@@ -30,6 +30,7 @@ const NO_REPLY_SINK =
 export interface SessionToolCallOptions {
 	session: ToolSession;
 	signal?: AbortSignal;
+	parentToolCallId?: string;
 	emitStatus?: (event: JsStatusEvent) => void;
 	identity?: RuntimeCallIdentity;
 	shadowCell?: EvalShadowCellSession;
@@ -55,7 +56,7 @@ function toolResultHasError(result: AgentToolResult): boolean {
 	return isRecord(result.details) && result.details.isError === true;
 }
 
-function getTool(session: ToolSession, name: string): AgentTool {
+export function getSessionTool(session: ToolSession, name: string): AgentTool {
 	const tool = session.getToolForEvalBridge ? session.getToolForEvalBridge(name) : session.getToolByName?.(name);
 	if (tool) return tool;
 	// A registry hit means the tool exists, but the session does not expose it here.
@@ -172,17 +173,18 @@ function waitForSpeculativeClaim<T>(claim: Promise<T>, signal?: AbortSignal): Pr
 	return promise;
 }
 
-export async function callRegisteredTool(
-	name: string,
+export async function runSessionTool(
+	tool: AgentTool,
 	args: unknown,
 	options: SessionToolCallOptions,
-): Promise<SessionToolValue> {
-	const tool = getTool(options.session, name);
-	// Wire aliases share every guard, status and bookkeeping path with the canonical tool.
-	name = tool.name;
+): Promise<{ name: string; args: unknown; result: AgentToolResult }> {
+	const name = tool.name;
+	if (getSessionTool(options.session, name) !== tool)
+		throw new ToolError(`Tool was replaced before dispatch: ${name}`);
 	if (!isEvalBridgeToolCallable(tool)) {
 		throw new ToolError(`\`${name}\` cannot run through the eval bridge; call the direct \`${name}\` tool.`);
 	}
+	if (typeof args === "string" && tool.customFormat) args = { input: args };
 	const toolCallId = `js-${name}-${crypto.randomUUID()}`;
 	// A schema-owned name stays tool data across alternatives. Deleting an
 	// invalid value to make another branch match could select a different operation.
@@ -222,7 +224,7 @@ export async function callRegisteredTool(
 			options.signal,
 		);
 		options.signal?.throwIfAborted();
-		if (claimed) return bridgeValueFromToolResult(name, validatedArgs, claimed, options.emitStatus);
+		if (claimed) return { name, args: validatedArgs, result: claimed };
 	}
 	let settled = false;
 	const onUpdate: AgentToolUpdateCallback | undefined =
@@ -240,12 +242,13 @@ export async function callRegisteredTool(
 			Object.hasOwn(DELEGATED_WORK_TOOLS, name) ? options.emitStatus : undefined,
 			async () => {
 				try {
+					const context = options.session.getToolContext?.();
 					return await tool.execute(
 						toolCallId,
 						validatedArgs,
 						options.signal,
 						onUpdate,
-						options.session.getToolContext?.(),
+						context && { ...context, programmatic: true, parentToolCallId: options.parentToolCallId },
 					);
 				} finally {
 					settled = true;
@@ -264,7 +267,7 @@ export async function callRegisteredTool(
 			if (!options.onReply) throw new ToolError(NO_REPLY_SINK);
 			for (const text of replies) options.onReply(text);
 		}
-		return bridgeValueFromToolResult(name, validatedArgs, result, options.emitStatus);
+		return { name, args: validatedArgs, result };
 	} catch (error) {
 		options.emitStatus?.({
 			op: name,

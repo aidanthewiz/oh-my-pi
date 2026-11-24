@@ -16,6 +16,7 @@ import { MANAGED_MCP_FILENAME, MANAGED_MCP_PROVIDER_ID } from "../discovery/mcp-
 import { readMCPConfigFile } from "./config-writer";
 import { validateOAuthResourceMetadataUrl } from "./oauth-discovery";
 import { type MCPProjectTrustHandler, resolveCoreforgeProjectTrust } from "./project-trust";
+import { builtinDropFor, type MCPDroppedServer, type MCPTransformContext } from "./transforms";
 import type { MCPConfigFile, MCPServerConfig } from "./types";
 
 /** Options for loading MCP configs */
@@ -32,6 +33,11 @@ export interface LoadMCPConfigsOptions {
 	filterBrowser?: boolean;
 	/** Session-local extension roots for post-startup rediscovery (explicit + mode + configured). */
 	extensionRoots?: EffectiveExtensionRoots;
+	/**
+	 * What the session offers natively, so built-in transforms (`./transforms`) can drop
+	 * the servers it makes redundant. Omitted: no built-in transform applies.
+	 */
+	builtinTransforms?: MCPTransformContext;
 }
 
 /** Result of loading MCP configs */
@@ -42,6 +48,8 @@ export interface LoadMCPConfigsResult {
 	exaApiKeys: string[];
 	/** Source metadata for each server */
 	sources: Record<string, SourceMeta>;
+	/** Servers a built-in transform dropped, by name; absent when there are none. */
+	dropped?: Record<string, MCPDroppedServer>;
 }
 
 export interface MCPChildCredentialPolicy {
@@ -202,10 +210,29 @@ export async function loadAllMCPConfigs(cwd: string, options?: LoadMCPConfigsOpt
 	// lower-priority user `foo` disabled), but never equivalence-shadow a
 	// differently-named enabled server — otherwise the disabled alias would be
 	// removed downstream and starve the surviving connection.
+	//
+	// A built-in drop suppresses the same way, as if the entry said
+	// `enabled: false`, except that an explicit enable outranks it. Items arrive
+	// highest priority first, so only the first entry of a name is the one that
+	// would have connected; a drop of a later one is not worth reporting.
+	const transformContext = options?.builtinTransforms;
+	const claimed = new Set<string>();
+	let dropped: Record<string, MCPDroppedServer> | undefined;
 	const suppressServer = (server: MCPServer & { _source: SourceMeta }): boolean => {
+		const owner = !claimed.has(server.name);
+		claimed.add(server.name);
 		if (disabledServers.has(server.name)) return true;
-		if (server.enabled === false && !forcedEnabled.has(server.name)) return true;
-		return false;
+		const forced = forcedEnabled.has(server.name);
+		if (server.enabled === false && !forced) return true;
+		if (!transformContext || forced || server.enabled === true) return false;
+		const drop = builtinDropFor(server, transformContext);
+		if (!drop) return false;
+		if (owner) {
+			dropped ??= {};
+			dropped[server.name] = { reason: drop.reason, source: server._source };
+			logger.debug("Built-in MCP transform dropped a server", { server: server.name, transform: drop.id });
+		}
+		return true;
 	};
 
 	const result = await loadCapability<MCPServer>(mcpCapability.id, {
@@ -245,7 +272,9 @@ export async function loadAllMCPConfigs(cwd: string, options?: LoadMCPConfigsOpt
 		sources = browserResult.sources;
 	}
 
-	return { configs, exaApiKeys, sources };
+	const loaded: LoadMCPConfigsResult = { configs, exaApiKeys, sources };
+	if (dropped) loaded.dropped = dropped;
+	return loaded;
 }
 
 /** Pattern to match Exa MCP servers */

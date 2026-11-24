@@ -16,6 +16,7 @@ export const eventDefs = {
 	AutoCompactionReason: "'threshold' | 'overflow' | 'idle' | 'incomplete'",
 	AutoCompactionAction: "'context-full' | 'remote' | 'handoff' | 'shake' | 'snapcompact'",
 	CacheWarmingPhase: "'streaming' | 'idle'",
+	CacheWarmingMethod: "'prewarm' | 'replay'",
 	CacheWarmingOutcome: "'hit' | 'miss' | 'error' | 'aborted'",
 	NotifyType: "'info' | 'warning' | 'error'",
 	AgentLifecycleOutcome: "'success' | 'error' | 'aborted' | 'unknown'",
@@ -107,7 +108,7 @@ export const eventDefs = {
 			type: "'manual_compaction_start'",
 			"mode?": doc("string", "The `/compact <mode>` subcommand, when one was given."),
 		},
-		"A manual compaction (`compact` command, `/compact`, extension `ctx.compact()`) began; the live turn is already aborted.",
+		"A manual compaction began. Handoff mode leaves live turns running and applies between turns or when idle.",
 	),
 	ManualCompactionEndEvent: doc(
 		{
@@ -138,13 +139,20 @@ export const eventDefs = {
 		),
 	},
 	CacheWarmingStartEvent: doc(
-		{ type: "'cache_warming_start'", phase: "CacheWarmingPhase", provider: "string", model: "string" },
+		{
+			type: "'cache_warming_start'",
+			phase: "CacheWarmingPhase",
+			method: "CacheWarmingMethod",
+			provider: "string",
+			model: "string",
+		},
 		"A prompt-cache refresh was handed to the provider.",
 	),
 	CacheWarmingEndEvent: doc(
 		{
 			type: "'cache_warming_end'",
 			phase: "CacheWarmingPhase",
+			method: "CacheWarmingMethod",
 			provider: "string",
 			model: "string",
 			outcome: "CacheWarmingOutcome",

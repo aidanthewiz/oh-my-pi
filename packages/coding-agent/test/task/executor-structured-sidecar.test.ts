@@ -127,12 +127,21 @@ describe("structured output sidecar lifecycle", () => {
 			const entered = Promise.withResolvers<void>();
 			const release = Promise.withResolvers<void>();
 			const contended = Promise.withResolvers<void>();
-			const acquire = FileLock.tryAcquire.bind(FileLock);
-			vi.spyOn(FileLock, "tryAcquire").mockImplementation((...args) => {
-				const lock = acquire(...args);
-				if (!lock.acquired) contended.resolve();
-				return lock;
-			});
+			if (process.platform === "linux") {
+				const acquire = FileLock.tryAcquireNamed.bind(FileLock);
+				vi.spyOn(FileLock, "tryAcquireNamed").mockImplementation(name => {
+					const lock = acquire(name);
+					if (!lock.acquired) contended.resolve();
+					return lock;
+				});
+			} else {
+				const acquire = FileLock.tryAcquire.bind(FileLock);
+				vi.spyOn(FileLock, "tryAcquire").mockImplementation((...args) => {
+					const lock = acquire(...args);
+					if (!lock.acquired) contended.resolve();
+					return lock;
+				});
+			}
 			const holder = withArtifactPublicationLock(async () => {
 				entered.resolve();
 				await release.promise;

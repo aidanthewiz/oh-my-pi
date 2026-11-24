@@ -49,6 +49,7 @@ async function runGit(repo: string, args: string[]): Promise<string> {
 async function initRepo(dir: string, branch = "main"): Promise<void> {
 	await runGit(dir, ["init", "-q", "-b", branch]);
 	await runGit(dir, ["config", "core.autocrlf", "false"]);
+	await runGit(dir, ["config", "commit.gpgSign", "false"]);
 }
 
 async function createGitRepo(): Promise<string> {
@@ -691,6 +692,35 @@ describe("getRepoRoot", () => {
 		await initRepo(inner);
 
 		expect(await getRepoRoot(inner)).toBe(inner);
+	});
+
+	describe("bare-repository container (#19791)", () => {
+		// `repo/.git` is bare and the work tree lives in `repo/.worktrees/main`.
+		async function createBareContainer(): Promise<{ container: string; worktree: string }> {
+			const source = await createGitRepo();
+			await runGit(source, ["config", "user.email", "test@example.com"]);
+			await runGit(source, ["config", "user.name", "Test User"]);
+			await runGit(source, ["commit", "-q", "--allow-empty", "-m", "init"]);
+			const container = await fs.mkdtemp(path.join(os.tmpdir(), "omp-bare-container-"));
+			tempDirs.push(container);
+			const gitDir = path.join(container, ".git");
+			await runGit(container, ["clone", "-q", "--bare", source, gitDir]);
+			const worktree = path.join(container, ".worktrees", "main");
+			await runGit(gitDir, ["worktree", "add", "-q", worktree, "main"]);
+			return { container, worktree };
+		}
+
+		it("rejects the container, which has no work tree, and names its work trees", async () => {
+			const { container, worktree } = await createBareContainer();
+			const rejection = getRepoRoot(container);
+			await expect(rejection).rejects.toThrow(/requires a Git work tree/);
+			await expect(rejection).rejects.toThrow(await fs.realpath(worktree));
+		});
+
+		it("returns a linked work tree of the bare repository", async () => {
+			const { worktree } = await createBareContainer();
+			expect(await fs.realpath(await getRepoRoot(worktree))).toBe(await fs.realpath(worktree));
+		});
 	});
 });
 

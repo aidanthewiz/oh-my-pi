@@ -57,6 +57,21 @@ const CREDENTIAL_SCOPED_MODEL_CACHE_PROVIDERS: Readonly<Record<string, true>> = 
 	modal: true,
 };
 
+/**
+ * Cache namespace for a provider's auth-gateway roster (`transport: "pi-native"`).
+ * Scoped by gateway and the resolved bearer used for discovery. Client-scoped
+ * tokens can expose different authoritative rosters even when the configured
+ * environment variable or command is unchanged. Distinct from the provider's
+ * own namespace, which holds its direct roster.
+ */
+export function resolvePiNativeModelCacheProviderId(
+	providerId: string,
+	scope: { baseUrl: string; apiKey?: string },
+): string {
+	const baseUrl = scope.baseUrl.trim().replace(/\/+$/, "");
+	return `${providerId}:pi-native-v2:${Bun.hash(`${scope.apiKey ?? ""}\u0000${baseUrl}`).toString(36)}`;
+}
+
 /** Whether a provider's model-cache namespace requires its resolved credential. */
 export function isCredentialScopedModelCacheProvider(providerId: string): boolean {
 	return CREDENTIAL_SCOPED_MODEL_CACHE_PROVIDERS[providerId] === true;

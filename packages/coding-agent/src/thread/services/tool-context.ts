@@ -47,8 +47,8 @@ export interface WireSessionView {
 	readonly leafId: string | null;
 	readonly header: SessionHeader | null;
 	readonly ensureOnDisk: () => Promise<void>;
-	readonly allocateArtifactPath: (toolType: string) => Promise<{ id?: string; path?: string }>;
-	readonly saveArtifact: (content: string, toolType: string) => Promise<string | undefined>;
+	readonly allocateArtifactPath: () => Promise<{ id?: string; path?: string }>;
+	readonly saveArtifact: (content: string) => Promise<string | undefined>;
 	readonly getArtifactPath: (id: string) => Promise<string | null>;
 	readonly getArtifactContent: (id: string, maxBytes: number) => Promise<string | null>;
 	readonly putBlob: (data: Uint8Array, options?: BlobPutOptions) => Promise<BlobPutResult>;
@@ -123,12 +123,12 @@ export class ToolContextSessionView implements ReadonlySessionManager {
 		return this.#wire.ensureOnDisk();
 	}
 
-	allocateArtifactPath(toolType: string): Promise<{ id?: string; path?: string }> {
-		return this.#wire.allocateArtifactPath(toolType);
+	allocateArtifactPath(): Promise<{ id?: string; path?: string }> {
+		return this.#wire.allocateArtifactPath();
 	}
 
-	saveArtifact(content: string, toolType: string): Promise<string | undefined> {
-		return this.#wire.saveArtifact(content, toolType);
+	saveArtifact(content: string): Promise<string | undefined> {
+		return this.#wire.saveArtifact(content);
 	}
 
 	getArtifactPath(id: string): Promise<string | null> {
@@ -147,7 +147,7 @@ export class ToolContextSessionView implements ReadonlySessionManager {
 		throw new CrossThreadSessionReadError("putBlobSync");
 	}
 
-	getArtifactManager(): ArtifactManagerApi | null {
+	getArtifactManager(): ArtifactManagerApi {
 		throw new CrossThreadSessionReadError("getArtifactManager");
 	}
 
@@ -204,8 +204,8 @@ function wireSessionView(manager: ReadonlySessionManager): WireSessionView {
 		leafId: manager.getLeafId(),
 		header: manager.getHeader(),
 		ensureOnDisk: () => manager.ensureOnDisk(),
-		allocateArtifactPath: toolType => manager.allocateArtifactPath(toolType),
-		saveArtifact: (content, toolType) => manager.saveArtifact(content, toolType),
+		allocateArtifactPath: () => manager.allocateArtifactPath(),
+		saveArtifact: content => manager.saveArtifact(content),
 		getArtifactPath: id => manager.getArtifactPath(id),
 		getArtifactContent: (id, maxBytes) => manager.getArtifactContent(id, maxBytes),
 		putBlob: (data, options) => manager.putBlob(Buffer.from(data.buffer, data.byteOffset, data.byteLength), options),

@@ -432,8 +432,8 @@ describe("prefix-bound tool roster changes", () => {
 
 			await resumed.session.dispose();
 
-			// A WeakRef target stays alive until the current task ends; yield a task between collections.
-			for (let attempt = 0; attempt < 5 && reply.deref() !== undefined; attempt++) {
+			// Do not dereference between collections: deref itself keeps the target alive for that job.
+			for (let attempt = 0; attempt < 5; attempt++) {
 				const nextTask = Promise.withResolvers<void>();
 				setImmediate(nextTask.resolve);
 				await nextTask.promise;

@@ -4,7 +4,7 @@ import { resolveArchiveLinkPath, upsertArchiveEntry } from "./entries";
 import { ArchiveError } from "./error";
 import {
 	type ArchiveLimits,
-	assertArchiveMemberSize,
+	assertArchiveMemberSizeField,
 	assertEntryCount,
 	assertIndexSize,
 	assertInMemorySize,
@@ -760,7 +760,7 @@ async function readTarEntries(
 			continue;
 		}
 		if (typeFlag !== "0" && typeFlag !== "\0" && typeFlag !== "7" && typeFlag !== "S") continue;
-		assertArchiveMemberSize(displaySize, normalizedPath, limits);
+		assertArchiveMemberSizeField(displaySize, normalizedPath);
 		addEntry({
 			path: normalizedPath,
 			isDirectory: false,

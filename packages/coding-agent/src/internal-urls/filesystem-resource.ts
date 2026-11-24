@@ -1,4 +1,5 @@
 import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 import { hasFsCode, isEnoent, isEnotdir } from "@oh-my-pi/pi-utils";
 import { isMarkdownPath } from "@oh-my-pi/pi-tui/lang-from-path";
@@ -9,6 +10,61 @@ export function contentTypeForPath(filePath: string): InternalResource["contentT
 	if (isMarkdownPath(filePath)) return "text/markdown";
 	if (path.extname(filePath).toLowerCase() === ".json") return "application/json";
 	return "text/plain";
+}
+
+/**
+ * Extension for the binary types `read` parses by file name (documents,
+ * archives, notebooks); images and SQLite are sniffed from their bytes.
+ */
+const EXTENSION_BY_MIME: Record<string, string> = {
+	"application/pdf": ".pdf",
+	"application/x-pdf": ".pdf",
+	"application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+	"application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx",
+	"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+	"application/epub+zip": ".epub",
+	"application/zip": ".zip",
+	"application/x-zip-compressed": ".zip",
+	"application/x-tar": ".tar",
+	"application/gzip": ".tar.gz",
+	"application/x-gzip": ".tar.gz",
+	"application/x-ipynb+json": ".ipynb",
+};
+
+/**
+ * Write bytes into a private, read-scoped directory. The caller must dispose it
+ * after the file pipeline completes. Preserve the URL basename and inferred
+ * extension for format detection.
+ */
+export async function writeResourceBackingFile(
+	url: string,
+	bytes: Uint8Array,
+	mimeType: string,
+): Promise<AsyncDisposable & { path: string }> {
+	const root = await fs.realpath(os.tmpdir());
+	// Server URIs are often opaque (`repo://logo`), so take the last segment of the whole string.
+	let name = url.split(/[?#]/, 1)[0].split("/").filter(Boolean).at(-1) ?? "";
+	try {
+		name = decodeURIComponent(name);
+	} catch {
+		// Malformed percent-encoding: keep the segment as written.
+	}
+	name = name.replace(/[\\/:*?"<>|\u0000-\u001f]/g, "_");
+	if (!name || name === "." || name === "..") name = "resource";
+	const extension = EXTENSION_BY_MIME[mimeType.split(";")[0].trim().toLowerCase()];
+	if (extension && !path.extname(name)) name += extension;
+	const directory = await fs.mkdtemp(path.join(root, "omp-resource-"));
+	const file = path.join(directory, name);
+	try {
+		await fs.writeFile(file, bytes, { flag: "wx", mode: 0o600 });
+	} catch (error) {
+		await fs.rm(directory, { recursive: true, force: true });
+		throw error;
+	}
+	return {
+		path: file,
+		[Symbol.asyncDispose]: () => fs.rm(directory, { recursive: true, force: true }),
+	};
 }
 
 /**

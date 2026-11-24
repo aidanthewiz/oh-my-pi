@@ -34,7 +34,7 @@ export function createBridgeGrepFactory(
 ): (options: GrepToolOptions) => AgentTool {
 	return options => {
 		const grepTool: Tool = new GrepTool(session, options);
-		return new ExtensionToolWrapper(grepTool, extensionRunner, undefined, agent);
+		return new ExtensionToolWrapper(grepTool, extensionRunner, agent);
 	};
 }
 
@@ -57,7 +57,7 @@ export function createBridgeEditTool(
 	agent?: ExtensionAgentIdentity,
 ): AgentTool {
 	const editTool: Tool = new EditTool(session, "replace");
-	return new ExtensionToolWrapper(editTool, extensionRunner, undefined, agent);
+	return new ExtensionToolWrapper(editTool, extensionRunner, agent);
 }
 
 /**
@@ -73,7 +73,7 @@ export function createBridgeEditTool(
  * advertises hashline `edit` as MCP and still serves the replace-mode
  * instance through the bridge's `getEditReplaceTool` accessor — not the
  * `getTool` fallback, which doubles as the agent loop's resolver for
- * unadvertised calls and must stay device-only.
+ * unadvertised calls and must stay limited to mounted tool commands.
  */
 export function bridgeToolMap(
 	granted: ReadonlyMap<string, AgentTool>,

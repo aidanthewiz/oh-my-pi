@@ -28,7 +28,7 @@ import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import { type AuthStorage, SqliteAuthCredentialStore } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { cfgToolsXdev } from "@oh-my-pi/pi-coding-agent/tools/settings";
+import { cfgToolsCommands, NATIVE_TODO_BACKEND } from "@oh-my-pi/pi-coding-agent/tools/settings";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { TempDir, withTimeout } from "@oh-my-pi/pi-utils";
 import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
@@ -85,6 +85,12 @@ describe("startup-deferred extensions", () => {
 			"text-renderer.ts": `pi.registerAssistantTextRenderer(() => undefined);`,
 			"thinking-renderer.ts": `pi.registerAssistantThinkingRenderer(() => undefined);`,
 		};
+		// A resumed session's list goes to the selected todo backend as soon as the session starts.
+		const todoBackend = path.join(tempDir.path(), "todo-backend.ts");
+		fs.writeFileSync(
+			todoBackend,
+			`export default function(pi) { pi.registerTodoBackend({ id: "demo", replace() {} }); }`,
+		);
 		const drawingPaths = Object.entries(drawing).map(([name, body]) => {
 			const file = path.join(tempDir.path(), name);
 			fs.writeFileSync(file, `export default function(pi) { ${body} }`);
@@ -92,21 +98,25 @@ describe("startup-deferred extensions", () => {
 		});
 		fs.writeFileSync(neverLoaded, `export default function() {}`);
 
-		const loaded = await loadExtensions([toolOnly, withShortcut, ...drawingPaths], tempDir.path());
+		const loaded = await loadExtensions([toolOnly, withShortcut, ...drawingPaths, todoBackend], tempDir.path());
 		expect(loaded.errors).toEqual([]);
 		await recordStartupVerdicts(storage, loaded.extensions);
 
-		const paths = [toolOnly, withShortcut, ...drawingPaths, neverLoaded];
-		expect(await partitionStartupExtensions(storage, paths, tempDir.path())).toEqual({
+		const paths = [toolOnly, withShortcut, ...drawingPaths, todoBackend, neverLoaded];
+		expect(await partitionStartupExtensions(storage, paths, tempDir.path(), "native")).toEqual({
 			eager: [withShortcut, ...drawingPaths, neverLoaded],
+			deferred: [toolOnly, todoBackend],
+		});
+		expect(await partitionStartupExtensions(storage, paths, tempDir.path(), "demo")).toEqual({
+			eager: [withShortcut, ...drawingPaths, todoBackend, neverLoaded],
 			deferred: [toolOnly],
 		});
 
 		// An edited source may now register something startup needs: load it eagerly again.
 		fs.appendFileSync(toolOnly, "\n// edited\n");
-		expect(await partitionStartupExtensions(storage, paths, tempDir.path())).toEqual({
+		expect(await partitionStartupExtensions(storage, paths, tempDir.path(), "native")).toEqual({
 			eager: [toolOnly, withShortcut, ...drawingPaths, neverLoaded],
-			deferred: [],
+			deferred: [todoBackend],
 		});
 	});
 
@@ -127,7 +137,7 @@ describe("startup-deferred extensions", () => {
 			const eventBus = new EventBus();
 			const preloaded = await loadExtensions([eagerPath], tempDir.path(), eventBus);
 			const settings = Settings.isolated();
-			cfgToolsXdev.set(settings, presentation === "mounted");
+			cfgToolsCommands.set(settings, presentation === "mounted");
 			const { session } = await createAgentSession({
 				cwd: tempDir.path(),
 				agentDir: tempDir.path(),
@@ -146,7 +156,7 @@ describe("startup-deferred extensions", () => {
 				contextFiles: [],
 				promptTemplates: [],
 				slashCommands: [],
-				toolNames: presentation === "mounted" ? ["read", "write"] : ["read"],
+				toolNames: presentation === "mounted" ? ["read", "bash"] : ["read"],
 			});
 
 			try {
@@ -167,18 +177,17 @@ describe("startup-deferred extensions", () => {
 				expect(session.getAllToolInfos().find(entry => entry.name === tool.name)?.sourceInfo.path).toBe(
 					deferredPath,
 				);
-				expect(session.getMountedXdevToolNames().includes(tool.name)).toBe(presentation === "mounted");
+				expect(session.getMountedToolCommandNames().includes(tool.name)).toBe(presentation === "mounted");
 				if (presentation === "mounted") {
-					expect(session.getToolByName(`xd://${tool.name}`)).toBe(tool);
 					expect(session.agent.state.tools.some(candidate => candidate.name === tool.name)).toBe(false);
 				} else {
 					expect(session.agent.state.tools.find(candidate => candidate.name === tool.name)).toBe(tool);
 				}
-				const mounted = session.getMountedXdevToolNames();
+				const mounted = session.getMountedToolCommandNames();
 				await session.newSession();
 				expect(session.getToolByName(tool.name)).toBe(tool);
 				expect(session.getEnabledToolNames()).toContain(tool.name);
-				expect(session.getMountedXdevToolNames()).toEqual(mounted);
+				expect(session.getMountedToolCommandNames()).toEqual(mounted);
 				expect(await tool.execute("graduated", {})).toEqual({
 					content: [{ type: "text", text: "ok" }],
 					details: {},
@@ -198,14 +207,20 @@ describe("startup-deferred extensions", () => {
 		const loaded = await loadExtensions(paths, tempDir.path());
 		expect(loaded.errors).toEqual([]);
 		await recordStartupVerdicts(storage, loaded.extensions);
-		expect(await partitionStartupExtensions(storage, paths, tempDir.path())).toEqual({ eager: paths, deferred: [] });
+		expect(await partitionStartupExtensions(storage, paths, tempDir.path(), NATIVE_TODO_BACKEND)).toEqual({
+			eager: paths,
+			deferred: [],
+		});
 		storage.setCache(`extension_startup:v1:${paths[0]}`, "{broken", Math.floor(Date.now() / 1000) + 60);
 		storage.setCache(
 			`extension_startup:v1:${paths[1]}`,
 			JSON.stringify({ fingerprint: "invalid", deferrable: true }),
 			Math.floor(Date.now() / 1000) + 60,
 		);
-		expect(await partitionStartupExtensions(storage, paths, tempDir.path())).toEqual({ eager: paths, deferred: [] });
+		expect(await partitionStartupExtensions(storage, paths, tempDir.path(), NATIVE_TODO_BACKEND)).toEqual({
+			eager: paths,
+			deferred: [],
+		});
 	});
 
 	it("discards staged providers and rejects stale factory registrations without touching another owner's queue", async () => {
@@ -479,7 +494,7 @@ describe("startup-deferred extensions", () => {
 			{ isActive: () => true },
 		);
 		const settings = Settings.isolated();
-		cfgToolsXdev.set(settings, false);
+		cfgToolsCommands.set(settings, false);
 		const { session } = await createAgentSession({
 			cwd: tempDir.path(),
 			agentDir: tempDir.path(),
@@ -595,7 +610,7 @@ describe("startup-deferred extensions", () => {
 				{ isActive: () => true },
 			);
 			const settings = Settings.isolated();
-			cfgToolsXdev.set(settings, false);
+			cfgToolsCommands.set(settings, false);
 			const { session } = await createAgentSession({
 				cwd: tempDir.path(),
 				agentDir: tempDir.path(),
@@ -617,7 +632,7 @@ describe("startup-deferred extensions", () => {
 			const runner = session.extensionRunner!;
 			const prior = session.getToolByName("overlap_tool")!;
 			const priorInfo = session.getAllToolInfos().find(tool => tool.name === prior.name);
-			const priorMounted = session.getMountedXdevToolNames();
+			const priorMounted = session.getMountedToolCommandNames();
 			const ownerA = added.extensions[0]!;
 			const ownerB = added.extensions[1]!;
 			const startedA = Promise.withResolvers<void>();
@@ -703,7 +718,7 @@ describe("startup-deferred extensions", () => {
 					});
 				}
 				expect(session.getEnabledToolNames()).toContain(prior.name);
-				expect(session.getMountedXdevToolNames()).toEqual(priorMounted);
+				expect(session.getMountedToolCommandNames()).toEqual(priorMounted);
 				await expect(toolA.execute("failed-overlap-A", { A: "value" })).rejects.toThrow(
 					"Extension owner is no longer active",
 				);
@@ -798,7 +813,7 @@ describe("startup-deferred extensions", () => {
 				{ isActive: () => true },
 			);
 			const settings = Settings.isolated();
-			cfgToolsXdev.set(settings, false);
+			cfgToolsCommands.set(settings, false);
 			const { session } = await createAgentSession({
 				cwd: tempDir.path(),
 				agentDir: tempDir.path(),
@@ -861,7 +876,7 @@ describe("startup-deferred extensions", () => {
 				expect(session.agent.state.tools.find(tool => tool.name === prior.name)).toBe(prior);
 				expect(session.getAllToolInfos().find(tool => tool.name === prior.name)).toEqual(priorInfo);
 				expect(session.getEnabledToolNames()).toContain(prior.name);
-				expect(session.getMountedXdevToolNames()).not.toContain(prior.name);
+				expect(session.getMountedToolCommandNames()).not.toContain(prior.name);
 				expect(session.getAllToolNames()).not.toContain("retiring_dispatch_owner");
 			} finally {
 				releaseRegistration.resolve();
@@ -996,7 +1011,7 @@ describe("startup-deferred extensions", () => {
 			tempDir.path(),
 		);
 		const settings = Settings.isolated();
-		cfgToolsXdev.set(settings, false);
+		cfgToolsCommands.set(settings, false);
 		const { session } = await createAgentSession({
 			cwd: tempDir.path(),
 			agentDir: tempDir.path(),
@@ -1203,7 +1218,7 @@ describe("startup-deferred extensions", () => {
 				tempDir.path(),
 			);
 			const settings = Settings.isolated();
-			cfgToolsXdev.set(settings, false);
+			cfgToolsCommands.set(settings, false);
 			const { session } = await createAgentSession({
 				cwd: tempDir.path(),
 				agentDir: tempDir.path(),
@@ -1356,7 +1371,7 @@ describe("startup-deferred extensions", () => {
 				tempDir.path(),
 			);
 			const settings = Settings.isolated();
-			cfgToolsXdev.set(settings, presentation === "mounted");
+			cfgToolsCommands.set(settings, presentation === "mounted");
 			const { session } = await createAgentSession({
 				cwd: tempDir.path(),
 				agentDir: tempDir.path(),
@@ -1374,12 +1389,12 @@ describe("startup-deferred extensions", () => {
 				contextFiles: [],
 				promptTemplates: [],
 				slashCommands: [],
-				toolNames: presentation === "mounted" ? ["read", "write"] : ["read"],
+				toolNames: presentation === "mounted" ? ["read", "bash"] : ["read"],
 			});
 			const runner = session.extensionRunner!;
 			const prior = session.getToolByName("partial_shared")!;
 			const priorInfo = session.getAllToolInfos().find(tool => tool.name === prior.name);
-			const priorMounted = session.getMountedXdevToolNames();
+			const priorMounted = session.getMountedToolCommandNames();
 			const entered = Promise.withResolvers<void>();
 			const release = Promise.withResolvers<void>();
 			const scheduled = Promise.withResolvers<void>();
@@ -1414,7 +1429,7 @@ describe("startup-deferred extensions", () => {
 				expect(stale).not.toBe(prior);
 				expect(session.getToolByName("partial_second")).toBeUndefined();
 				if (presentation === "mounted") {
-					expect(session.getMountedXdevToolNames()).toContain(stale.name);
+					expect(session.getMountedToolCommandNames()).toContain(stale.name);
 					expect(session.agent.state.tools.some(tool => tool.name === stale.name)).toBe(false);
 				} else {
 					expect(session.agent.state.tools.find(tool => tool.name === stale.name)).toBe(stale);
@@ -1439,7 +1454,7 @@ describe("startup-deferred extensions", () => {
 				}
 				expect(session.getAllToolInfos().find(tool => tool.name === prior.name)).toEqual(priorInfo);
 				expect(session.getEnabledToolNames()).toContain(prior.name);
-				expect(session.getMountedXdevToolNames()).toEqual(priorMounted);
+				expect(session.getMountedToolCommandNames()).toEqual(priorMounted);
 				expect(session.getAllToolNames()).not.toContain("partial_second");
 				expect(session.getEnabledToolNames()).not.toContain("partial_second");
 				await expect(stale.execute("retained-partial", { stale: "value" })).rejects.toThrow(
@@ -1516,7 +1531,7 @@ describe("startup-deferred extensions", () => {
 			eventBus,
 		);
 		const settings = Settings.isolated();
-		cfgToolsXdev.set(settings, false);
+		cfgToolsCommands.set(settings, false);
 		let replaceOnRender = false;
 		const { session } = await createAgentSession({
 			cwd: tempDir.path(),
@@ -1548,7 +1563,7 @@ describe("startup-deferred extensions", () => {
 		const runner = session.extensionRunner!;
 		const prior = session.getToolByName("undo_chain")!;
 		const priorInfo = session.getAllToolInfos().find(tool => tool.name === prior.name);
-		const priorMounted = session.getMountedXdevToolNames();
+		const priorMounted = session.getMountedToolCommandNames();
 		const siblingStarted = Promise.withResolvers<void>();
 		const replacementScheduled = Promise.withResolvers<void>();
 		const releaseSibling = Promise.withResolvers<void>();
@@ -1588,7 +1603,7 @@ describe("startup-deferred extensions", () => {
 			expect(session.getToolByName("undo_chain")).toBe(prior);
 			expect(session.agent.state.tools.find(tool => tool.name === prior.name)).toBe(prior);
 			expect(session.getAllToolInfos().find(tool => tool.name === prior.name)).toEqual(priorInfo);
-			expect(session.getMountedXdevToolNames()).toEqual(priorMounted);
+			expect(session.getMountedToolCommandNames()).toEqual(priorMounted);
 			expect(session.getEnabledToolNames()).toContain(prior.name);
 			expect(session.getAllToolNames()).not.toContain("undo_chain_sibling");
 			expect(session.getEnabledToolNames()).not.toContain("undo_chain_sibling");
@@ -1668,7 +1683,7 @@ describe("startup-deferred extensions", () => {
 			eventBus,
 		);
 		const settings = Settings.isolated();
-		cfgToolsXdev.set(settings, false);
+		cfgToolsCommands.set(settings, false);
 		const { session } = await createAgentSession({
 			cwd: tempDir.path(),
 			agentDir: tempDir.path(),
@@ -1735,7 +1750,7 @@ describe("startup-deferred extensions", () => {
 			expect(updated).not.toBe(prior);
 			expect(session.agent.state.tools.find(tool => tool.name === updated.name)).toBe(updated);
 			expect(session.getEnabledToolNames()).toContain(updated.name);
-			expect(session.getMountedXdevToolNames()).not.toContain(updated.name);
+			expect(session.getMountedToolCommandNames()).not.toContain(updated.name);
 			expect(session.getAllToolInfos().find(tool => tool.name === updated.name)?.sourceInfo).toEqual(
 				priorInfo!.sourceInfo,
 			);
@@ -1784,7 +1799,7 @@ describe("startup-deferred extensions", () => {
 			tempDir.path(),
 		);
 		const settings = Settings.isolated();
-		cfgToolsXdev.set(settings, false);
+		cfgToolsCommands.set(settings, false);
 		const renderFailure = new Error("synthetic same-owner replacement render failure");
 		let failNextRender = false;
 		const { session } = await createAgentSession({
@@ -1814,7 +1829,7 @@ describe("startup-deferred extensions", () => {
 		});
 		const prior = session.getToolByName("owner_restore")!;
 		const priorInfo = session.getAllToolInfos().find(tool => tool.name === prior.name);
-		const priorMounted = session.getMountedXdevToolNames();
+		const priorMounted = session.getMountedToolCommandNames();
 		const runtimeErrors: string[] = [];
 		try {
 			failNextRender = true;
@@ -1854,7 +1869,7 @@ describe("startup-deferred extensions", () => {
 			expect(successor).not.toBe(prior);
 			expect(session.agent.state.tools.find(tool => tool.name === successor.name)).toBe(successor);
 			expect(session.getEnabledToolNames()).toContain(successor.name);
-			expect(session.getMountedXdevToolNames()).toEqual(priorMounted);
+			expect(session.getMountedToolCommandNames()).toEqual(priorMounted);
 			expect(session.getAllToolInfos().find(tool => tool.name === successor.name)?.sourceInfo).toEqual(
 				priorInfo!.sourceInfo,
 			);
@@ -1899,7 +1914,7 @@ describe("startup-deferred extensions", () => {
 			let original: RegisteredTool | undefined;
 			let renders = 0;
 			const settings = Settings.isolated();
-			cfgToolsXdev.set(settings, false);
+			cfgToolsCommands.set(settings, false);
 			const { session } = await createAgentSession({
 				cwd: tempDir.path(),
 				agentDir: tempDir.path(),
@@ -1935,7 +1950,7 @@ describe("startup-deferred extensions", () => {
 				await api!.setActiveTools(["read", "startup_blocker", name]);
 				expect(session.agent.state.tools.find(tool => tool.name === name)).toBe(current);
 				expect(session.getEnabledToolNames()).toContain(name);
-				expect(session.getMountedXdevToolNames()).not.toContain(name);
+				expect(session.getMountedToolCommandNames()).not.toContain(name);
 				expect(await current.execute("current-backfill", { replacement: "value" })).toEqual({
 					content: [{ type: "text", text: "replacement" }],
 					details: {},
@@ -2011,7 +2026,7 @@ describe("startup-deferred extensions", () => {
 			let invalidatedPrompt: string[] | undefined;
 			const renderedPrompts: string[][] = [];
 			const settings = Settings.isolated();
-			cfgToolsXdev.set(settings, false);
+			cfgToolsCommands.set(settings, false);
 			const { session } = await createAgentSession({
 				cwd: tempDir.path(),
 				agentDir: tempDir.path(),
@@ -2081,7 +2096,7 @@ describe("startup-deferred extensions", () => {
 				});
 				expect(session.agent.state.tools.find(tool => tool.name === "render_shared")).toBe(published);
 				expect(session.getEnabledToolNames()).toContain("render_shared");
-				expect(session.getMountedXdevToolNames()).not.toContain("render_shared");
+				expect(session.getMountedToolCommandNames()).not.toContain("render_shared");
 				if (replacement === "different-successor") {
 					const other = session.getToolByName("render_other");
 					expect(session.agent.state.tools.find(tool => tool.name === "render_other")).toBe(other);
@@ -2196,7 +2211,7 @@ describe("startup-deferred extensions", () => {
 			{ isActive: () => true },
 		);
 		const settings = Settings.isolated();
-		cfgToolsXdev.set(settings, false);
+		cfgToolsCommands.set(settings, false);
 		const { session } = await createAgentSession({
 			cwd: tempDir.path(),
 			agentDir: tempDir.path(),

@@ -24,7 +24,8 @@ import {
 	type AwsToolParams,
 } from "../../src/tools/aws-secret-input-contract";
 import { TOOL_EXECUTION_HOST_CAPABILITIES } from "../../src/tools/tool-execution-host";
-import { resolveMountedXdevExecutable } from "../../src/tools/xdev";
+import { resolveMountedToolCommand, toolCommandDispatches } from "../../src/tools/tool-commands";
+import { quotePosixArgv } from "../../src/utils/shell-quote";
 import { cfgToolsApproval, cfgToolsApprovalMode } from "../../src/tools/settings";
 import {
 	awsSecretInputLifecycleLaunch,
@@ -92,8 +93,8 @@ function requireVisibleApprovalBindings(title: string, request: AwsSecretInputRe
 
 export function awsSecretInputNativeResponse(result: AgentToolResult<unknown>): Record<string, unknown> | undefined {
 	if (!isRecord(result.details)) return undefined;
-	const details =
-		isRecord(result.details.xdev) && isRecord(result.details.xdev.inner) ? result.details.xdev.inner : result.details;
+	const inner = toolCommandDispatches("bash", result).find(dispatch => dispatch.tool === "aws")?.inner;
+	const details = isRecord(inner) ? inner : result.details;
 	return isRecord(details.response) ? details.response : undefined;
 }
 
@@ -108,7 +109,7 @@ export function requireNativeFailure(
 	requireNativeProof(
 		result.content.length === 1 &&
 			result.content[0]?.type === "text" &&
-			Bun.deepEquals(JSON.parse(result.content[0].text), expected),
+			Bun.deepEquals(JSON.parse(result.content[0].text.split("\n", 1)[0]!), expected),
 	);
 }
 
@@ -489,7 +490,7 @@ export interface AwsSecretInputNativeSmoke {
 export interface AwsSecretInputNativeReceipt extends AwsSecretInputNativeTransportEvidence {
 	schema: "aws-secret-input-native/v1";
 	cases: { name: string; passed: true }[];
-	transport: "native-write-xdev-private-worker-finite-stdin";
+	transport: "native-bash-command-private-worker-finite-stdin";
 	allWorkersReaped: true;
 	publicSurfacesClean: true;
 	ownedFilesClean: true;
@@ -522,14 +523,19 @@ export async function runAwsSecretInputNativeProbe(
 	let runWorkers = 0;
 	let artifactAllocations = 0;
 	let receiverEvidence: AwsSecretInputNativeTransportEvidence | undefined;
-	let executionWrite: AgentTool | undefined;
+	let executionBash: AgentTool | undefined;
 	let activeContext: AgentToolContext;
 	const audits: unknown[] = [];
 	const session: ToolSession = {
 		cwd: root,
 		hasUI: true,
 		skipPythonPreflight: true,
-		settings: Settings.isolated({ "tools.approvalMode": "yolo", "approval.notify": "off", "tools.xdev": true }),
+		settings: Settings.isolated({
+			"tools.approvalMode": "yolo",
+			"approval.notify": "off",
+			"tools.commands": true,
+			"tools.outputMaxColumns": 4_096,
+		}),
 		getSessionFile: () => null,
 		getSessionSpawns: () => null,
 		getSessionId: () => sessionId,
@@ -553,26 +559,18 @@ export async function runAwsSecretInputNativeProbe(
 			if (
 				disposed ||
 				!sessionId ||
-				!executionWrite ||
+				!executionBash ||
 				session.toolRegistry?.get(tool.name) !== tool ||
 				resolveToolCancellationBehavior(tool, args) !== "await-cleanup"
 			)
 				return undefined;
-			const input = getCleanupOwnedToolCallArgs(executionWrite);
-			if (!isRecord(input) || input.path !== "xd://aws" || typeof input.content !== "string") return undefined;
-			try {
-				if (!Bun.deepEquals(JSON.parse(input.content), args)) return undefined;
-			} catch {
-				return undefined;
-			}
-			const mounted = session.xdev && resolveMountedXdevExecutable(session.xdev, tool.name);
-			const canonicalWrite = session.toolRegistry?.get("write");
+			const mounted = session.toolCommands && resolveMountedToolCommand(session.toolCommands, tool.name);
+			const mountedArgs = mounted && getCleanupOwnedToolCallArgs(mounted);
 			if (
-				!mounted ||
-				!canonicalWrite ||
-				resolveToolCancellationBehavior(mounted, args) !== "await-cleanup" ||
-				resolveToolCancellationBehavior(canonicalWrite, input) !== "await-cleanup" ||
-				resolveToolCancellationBehavior(executionWrite, input) !== "await-cleanup"
+				mounted !== tool ||
+				mountedArgs === undefined ||
+				!Bun.deepEquals(mountedArgs, args) ||
+				resolveToolCancellationBehavior(mounted, args) !== "await-cleanup"
 			)
 				return undefined;
 			return TOOL_EXECUTION_HOST_CAPABILITIES;
@@ -681,19 +679,19 @@ export async function runAwsSecretInputNativeProbe(
 	const cases: { name: string; passed: true }[] = [];
 	const verifiedWorkers = new Set<(typeof workers)[number]>();
 	let sequence = 0;
-	const dispatchWrite = async (request: unknown, id: string) => {
-		requireNativeProof(executionWrite);
+	const dispatchCommand = async (request: unknown, id: string) => {
+		requireNativeProof(executionBash);
 		activeContext = context();
-		const input = { path: "xd://aws", content: JSON.stringify(request) };
+		const input = { command: quotePosixArgv(["aws", "--json", JSON.stringify(request)]) };
 		observation.inspect(input);
 		const mock = createMockModel({
 			responses: [
-				{ content: [{ type: "toolCall", id, name: executionWrite.name, arguments: input }] },
+				{ content: [{ type: "toolCall", id, name: executionBash.name, arguments: input }] },
 				{ content: ["Native fixture turn complete"] },
 			],
 		});
 		const agent = new Agent({
-			initialState: { model: mock.model, tools: [executionWrite] },
+			initialState: { model: mock.model, tools: [executionBash] },
 			streamFn: mock.stream,
 			getToolContext: () => activeContext,
 		});
@@ -704,31 +702,42 @@ export async function runAwsSecretInputNativeProbe(
 				outcome.result = { ...event.result, isError: event.isError === true };
 		});
 		try {
-			await agent.prompt("Run the native fixture Write call");
+			await agent.prompt("Run the native fixture command");
 			requireNativeProof(outcome.result);
 			return outcome.result;
 		} finally {
 			unsubscribe();
 		}
 	};
-	const atWriteExecution = async <T>(request: unknown, id: string, run: () => T | Promise<T>): Promise<T> => {
-		requireNativeProof(executionWrite);
-		const rootTool = executionWrite;
-		const originalExecute = Object.getOwnPropertyDescriptor(rootTool, "execute");
+	const atCommandExecution = async <T>(request: unknown, id: string, run: () => T | Promise<T>): Promise<T> => {
+		requireNativeProof(executionBash && session.toolCommands);
+		const state = session.toolCommands;
+		const originalDecorator = state.decorateExecution;
+		let decorated: Tool | undefined;
+		let originalExecute: PropertyDescriptor | undefined;
 		const checkpoint: { outcome?: { ok: true; value: T } | { ok: false; error: unknown } } = {};
-		rootTool.execute = async () => {
-			try {
-				checkpoint.outcome = { ok: true, value: await run() };
-			} catch (error) {
-				checkpoint.outcome = { ok: false, error };
-			}
-			return { content: [{ type: "text", text: "Native fixture checkpoint complete" }], details: {} };
+		state.decorateExecution = tool => {
+			requireNativeProof(tool.name === "aws");
+			decorated = originalDecorator?.(tool) ?? tool;
+			originalExecute = Object.getOwnPropertyDescriptor(decorated, "execute");
+			decorated.execute = async () => {
+				try {
+					checkpoint.outcome = { ok: true, value: await run() };
+				} catch (error) {
+					checkpoint.outcome = { ok: false, error };
+				}
+				return { content: [{ type: "text", text: "Native fixture checkpoint complete" }], details: {} };
+			};
+			return decorated;
 		};
 		try {
-			await dispatchWrite(request, id);
+			await dispatchCommand(request, id);
 		} finally {
-			if (originalExecute) Object.defineProperty(rootTool, "execute", originalExecute);
-			else Reflect.deleteProperty(rootTool, "execute");
+			state.decorateExecution = originalDecorator;
+			if (decorated) {
+				if (originalExecute) Object.defineProperty(decorated, "execute", originalExecute);
+				else Reflect.deleteProperty(decorated, "execute");
+			}
 		}
 		requireNativeProof(checkpoint.outcome);
 		if (!checkpoint.outcome.ok) throw checkpoint.outcome.error;
@@ -736,12 +745,14 @@ export async function runAwsSecretInputNativeProbe(
 	};
 	const invoke = async (request: unknown, id = `native-${++sequence}`) => {
 		try {
-			const result = await dispatchWrite(request, id);
+			const result = await dispatchCommand(request, id);
 			observation.inspect(result);
 			const response = awsSecretInputNativeResponse(result);
 			const code =
 				response?.code ??
-				(result.content.length === 1 && result.content[0]?.type === "text" ? result.content[0].text : undefined);
+				(result.content.length === 1 && result.content[0]?.type === "text"
+					? result.content[0].text.split("\n", 1)[0]
+					: undefined);
 			return { failed: result.isError === true, result, error: undefined, code };
 		} catch (error) {
 			observation.inspect(error);
@@ -755,7 +766,8 @@ export async function runAwsSecretInputNativeProbe(
 		session.settings = Settings.isolated({
 			"tools.approvalMode": "yolo",
 			"approval.notify": "off",
-			"tools.xdev": true,
+			"tools.commands": true,
+			"tools.outputMaxColumns": 4_096,
 		});
 		activeContext = context();
 		await run();
@@ -833,20 +845,20 @@ export async function runAwsSecretInputNativeProbe(
 		let tools: Tool[];
 		try {
 			for (const name of Object.keys(BUILTIN_TOOLS) as (keyof typeof BUILTIN_TOOLS)[]) {
-				if (name !== "aws" && name !== "read" && name !== "write") BUILTIN_TOOLS[name] = () => null;
+				if (name !== "aws" && name !== "read" && name !== "bash") BUILTIN_TOOLS[name] = () => null;
 			}
 			tools = await createTools(session);
 		} finally {
 			Object.assign(BUILTIN_TOOLS, originalFactories);
 		}
-		requireNativeProof(session.xdev);
-		requireNativeProof(session.xdev.mountedNames.has("aws") && session.toolRegistry);
-		session.xdev.decorateExecution = tool =>
+		requireNativeProof(session.toolCommands);
+		requireNativeProof(session.toolCommands.mountedNames.has("aws") && session.toolRegistry);
+		session.toolCommands.decorateExecution = tool =>
 			new ExtensionToolWrapper(tool as unknown as AgentTool, runner) as unknown as Tool;
-		const canonicalWrite = tools.find(tool => tool.name === "write");
+		const canonicalBash = tools.find(tool => tool.name === "bash");
 		const read = tools.find(tool => tool.name === "read");
-		requireNativeProof(canonicalWrite && read);
-		executionWrite = new ExtensionToolWrapper(canonicalWrite as unknown as AgentTool, runner);
+		requireNativeProof(canonicalBash && read);
+		executionBash = new ExtensionToolWrapper(canonicalBash as unknown as AgentTool, runner);
 		let native = install();
 		if (smoke) {
 			native = install("success", smoke.dependencies);
@@ -866,7 +878,7 @@ export async function runAwsSecretInputNativeProbe(
 			const approvals = choices.length;
 			const spawned = workers.length;
 			const result = await withoutNetwork(() =>
-				read.execute("schema", { path: "xd://aws/schema" }, undefined, observation.inspect, context()),
+				read.execute("schema", { path: "help://aws/schema" }, undefined, observation.inspect, context()),
 			);
 			observation.inspect(result);
 			requireNativeProof(
@@ -982,7 +994,7 @@ export async function runAwsSecretInputNativeProbe(
 			const invocation = await invoke(request, "denied");
 			requireNativeProof(invocation.failed && choices.length === approvals + 1 && runWorkers === 0);
 			requireVisibleApprovalBindings(choices.at(-1)?.title ?? "", request);
-			await atWriteExecution(request, "denied", async () => {
+			await atCommandExecution(request, "denied", async () => {
 				requireNativeFailure(await native.execute("denied", request), "APPROVAL_REQUIRED");
 			});
 		});
@@ -1032,7 +1044,13 @@ export async function runAwsSecretInputNativeProbe(
 				request.timeout! * 1_000,
 			])
 				requireNativeProof(visibleNumbers.has(String(value)));
-			const guarded = (await readNativeGuardReceipts(root)).slice(guardsBefore);
+			const allGuarded = (await readNativeGuardReceipts(root)).slice(guardsBefore);
+			const carrierCommand = quotePosixArgv(["aws", "--json", JSON.stringify(request)]);
+			const carrierGuards = allGuarded.filter(guard => guard.command === carrierCommand);
+			requireNativeProof(
+				carrierGuards.length > 0 && carrierGuards.every(guard => guard.decision === "allow" && guard.cwd === root),
+			);
+			const guarded = allGuarded.filter(guard => guard.command !== carrierCommand);
 			const title = choices.at(-1)?.title ?? "";
 			requireVisibleApprovalBindings(title, request);
 			requireNativeProof(
@@ -1048,7 +1066,7 @@ export async function runAwsSecretInputNativeProbe(
 				requireNativeProof(title.includes(guard.command) && title.includes(guard.cwd));
 				if (guard.decision === "ask") requireNativeProof(title.includes(guard.reason));
 			}
-			await atWriteExecution(request, "consume-once", async () => {
+			await atCommandExecution(request, "consume-once", async () => {
 				requireNativeFailure(await native.execute("consume-once", request), "APPROVAL_REQUIRED");
 			});
 			requireNativeProof(runWorkers === 1);
@@ -1094,13 +1112,13 @@ export async function runAwsSecretInputNativeProbe(
 			for (const [index, change] of changes.entries()) {
 				const request = structuredClone(awsSecretInputLifecycleRequest(root));
 				const id = `immutable-${index}`;
-				await atWriteExecution(request, id, async () => {
+				await atCommandExecution(request, id, async () => {
 					const approval = await native.prepareRuntimeApproval(id, request, undefined, context());
 					requireNativeProof(approval?.allowSessionApproval === false);
 					native.approveRuntimeApproval(id, request);
 				});
 				change(request);
-				await atWriteExecution(request, id, async () => {
+				await atCommandExecution(request, id, async () => {
 					requireNativeFailure(
 						await native.execute(id, request, undefined, observation.inspect, context()),
 						"APPROVAL_REQUIRED",
@@ -1111,7 +1129,7 @@ export async function runAwsSecretInputNativeProbe(
 		});
 		await record("changed-settings-reject-grant", async () => {
 			const request = awsSecretInputLifecycleRequest(root);
-			await atWriteExecution(request, "settings", async () => {
+			await atCommandExecution(request, "settings", async () => {
 				requireNativeProof(await native.prepareRuntimeApproval("settings", request, undefined, context()));
 				native.approveRuntimeApproval("settings", request);
 				cfgToolsApprovalMode.set(session.settings, "always-ask");
@@ -1124,7 +1142,7 @@ export async function runAwsSecretInputNativeProbe(
 		});
 		await record("changed-session-reject-grant", async () => {
 			const request = awsSecretInputLifecycleRequest(root);
-			await atWriteExecution(request, "session", async () => {
+			await atCommandExecution(request, "session", async () => {
 				requireNativeProof(await native.prepareRuntimeApproval("session", request, undefined, context()));
 				native.approveRuntimeApproval("session", request);
 				sessionId = "aws-secret-input-native-next";
@@ -1140,7 +1158,7 @@ export async function runAwsSecretInputNativeProbe(
 		});
 		await record("changed-host-cwd-reject-grant", async () => {
 			const request = awsSecretInputLifecycleRequest(root);
-			await atWriteExecution(request, "host-cwd", async () => {
+			await atCommandExecution(request, "host-cwd", async () => {
 				requireNativeProof(await native.prepareRuntimeApproval("host-cwd", request, undefined, context()));
 				native.approveRuntimeApproval("host-cwd", request);
 				const originalCwd = session.cwd;
@@ -1207,7 +1225,7 @@ export async function runAwsSecretInputNativeProbe(
 			native.sessionApproval.approve();
 			const request = awsSecretInputLifecycleRequest(root, "success", control.port);
 			const before = runWorkers;
-			await atWriteExecution(request, "no-session-once", async () => {
+			await atCommandExecution(request, "no-session-once", async () => {
 				requireNativeFailure(await native.execute("ordinary-session-grant", request), "APPROVAL_REQUIRED");
 				const approval = await native.prepareRuntimeApproval("no-session-once", request, undefined, context());
 				requireNativeProof(approval?.allowSessionApproval === false);
@@ -1226,7 +1244,7 @@ export async function runAwsSecretInputNativeProbe(
 			native = install();
 			native.sessionApproval.approve();
 			const request = awsSecretInputLifecycleRequest(root, "success", control.port);
-			const completed = await atWriteExecution(request, "completed-protected-once", async () => {
+			const completed = await atCommandExecution(request, "completed-protected-once", async () => {
 				requireNativeProof(
 					await native.prepareRuntimeApproval("completed-protected-once", request, undefined, context()),
 				);
@@ -1260,7 +1278,7 @@ export async function runAwsSecretInputNativeProbe(
 			for (const phase of ["execute", "prepare", "approve", "deny"] as const) {
 				const id = `strip-secret-input-${phase}`;
 				const request = awsSecretInputLifecycleRequest(root);
-				await atWriteExecution(request, id, async () => {
+				await atCommandExecution(request, id, async () => {
 					requireNativeProof(await native.prepareRuntimeApproval(id, request, undefined, context()));
 					native.approveRuntimeApproval(id, request);
 					if (phase === "deny") native.denyRuntimeApproval(id, request);
@@ -1310,7 +1328,7 @@ export async function runAwsSecretInputNativeProbe(
 			for (const [target, request] of targets) {
 				for (const phase of ["prepared", "completed", "denied"] as const) {
 					const id = `replace-capability-${target}-${phase}`;
-					await atWriteExecution(capability, id, async () => {
+					await atCommandExecution(capability, id, async () => {
 						if (phase === "completed") {
 							const result = await native.execute(id, capability, undefined, observation.inspect, context());
 							observation.inspect(result);
@@ -1443,7 +1461,7 @@ export async function runAwsSecretInputNativeProbe(
 							const replacement = Settings.isolated({
 								"tools.approvalMode": "yolo",
 								"approval.notify": "off",
-								"tools.xdev": true,
+								"tools.commands": true,
 							});
 							requireNativeProof(
 								replacement !== capturedSettings &&
@@ -1526,16 +1544,22 @@ export async function runAwsSecretInputNativeProbe(
 					title.includes(version) &&
 					title.includes(request.secretInput.expectedIdentity.arn),
 			);
+			const carrierCommand = quotePosixArgv(["aws", "--json", JSON.stringify(request)]);
 			const secretGuards = (await readNativeGuardReceipts(root))
 				.slice(beforeGuards)
-				.filter(guard => guard.command.includes("secretsmanager") && guard.command.includes("get-secret-value"));
+				.filter(
+					guard =>
+						guard.command !== carrierCommand &&
+						guard.command.includes("secretsmanager") &&
+						guard.command.includes("get-secret-value"),
+				);
 			requireNativeProof(
 				secretGuards.some(guard => guard.command.includes(approvedArn) && guard.command.includes(version)),
 			);
 			for (const guard of secretGuards)
 				requireNativeProof(title.includes(guard.command) && title.includes(guard.cwd));
 			const id = `cross-account-approved-${++sequence}`;
-			await atWriteExecution(request, id, async () => {
+			await atCommandExecution(request, id, async () => {
 				const approval = await native.prepareRuntimeApproval(id, request, undefined, context());
 				requireNativeProof(approval?.allowSessionApproval === false);
 				native.approveRuntimeApproval(id, request);
@@ -1544,7 +1568,7 @@ export async function runAwsSecretInputNativeProbe(
 			unapproved.parameters.SecretId = approvedArn.replace(":210987654321:", ":345678901234:");
 			const beforeWorkers = workers.length;
 			const promptsAfterApproval = choices.length;
-			await atWriteExecution(unapproved, id, () =>
+			await atCommandExecution(unapproved, id, () =>
 				withoutOrdinaryAwsIo(async () => {
 					const result = await native.execute(id, unapproved, undefined, observation.inspect, context());
 					observation.inspect(result);
@@ -1565,7 +1589,7 @@ export async function runAwsSecretInputNativeProbe(
 		return {
 			schema: "aws-secret-input-native/v1",
 			cases,
-			transport: "native-write-xdev-private-worker-finite-stdin",
+			transport: "native-bash-command-private-worker-finite-stdin",
 			allWorkersReaped: true,
 			publicSurfacesClean: true,
 			ownedFilesClean: true,

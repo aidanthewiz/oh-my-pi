@@ -573,7 +573,7 @@ describe("Codex model discovery", () => {
 		}
 	});
 
-	it("keeps bundled display names over Codex's slug-style display_name", async () => {
+	it("names discovered rows with the bundled spelling over Codex's slug-style display_name", async () => {
 		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-catalog-codex-names-"));
 		// Codex reports `GPT-6.1-Sol` where every other surface (and the bundled
 		// row) says `GPT-6.1 Sol`; the composer chip flipped between the two once
@@ -596,6 +596,8 @@ describe("Codex model discovery", () => {
 					JSON.stringify({
 						models: [
 							{ slug: "gpt-6.1-sol", display_name: "GPT-6.1-Sol", supported_in_api: true },
+							// Not in the Codex static catalog; OpenAI ships the same id (#20167).
+							{ slug: "gpt-6.2-sol", display_name: "GPT-6.2-Sol", supported_in_api: true },
 							{ slug: "gpt-6.2-nova", display_name: "GPT-6.2-Nova", supported_in_api: true },
 						],
 					}),
@@ -615,6 +617,7 @@ describe("Codex model discovery", () => {
 				const result = await resolveProviderModels(options, strategy);
 				const names = Object.fromEntries(result.models.map(model => [model.id, model.name]));
 				expect(names["gpt-6.1-sol"]).toBe("GPT-6.1 Sol");
+				expect(names["gpt-6.2-sol"]).toBe("GPT-6.2 Sol");
 				expect(names["gpt-6.2-nova"]).toBe("GPT-6.2-Nova");
 			}
 		} finally {

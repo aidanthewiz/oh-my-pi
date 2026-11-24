@@ -9,7 +9,7 @@ Native Rust functionality via N-API.
 - **SIXEL**: Terminal image encoding for SIXEL-capable terminals (decode, resize, encode in one pass)
 - **Audio**: Cross-platform low-latency microphone capture and gapless speaker playback
 - **WebRTC**: Native Opus media, SDP offer/answer negotiation, and data-channel events for live sessions
-- **File locking**: Process-owned cross-process locks with in-memory kernel names on Linux/Windows and `flock(2)` sidecars on other Unix platforms
+- **File locking**: Process-owned cross-process locks with in-memory kernel names on Windows, open-file-description lock sidecars on Linux and `flock(2)` sidecars on other Unix platforms
 - **Local IPC**: `IpcServer`/`IpcConnection` over Unix sockets and Windows named pipes — owner-only access, single-instance binding with stale-endpoint takeover, newline or raw framing; `ipcEndpoint(dir, name)` names endpoints per platform
 - **PDF**: In-memory PDF-to-Markdown extraction with OCR-page classification via `pdf-inspector`
 - **Binary patches**: `applyBinaryPatch(oldPath, patchPath, outPath)` applies an HDiffPatch single-stream patch (HDIFFSF20, zstd or uncompressed), streaming from files; callers verify digests
@@ -122,6 +122,14 @@ The addon loads only when a helper is called on Windows; other platforms preserv
 the input path without loading it. These helpers change long/8.3 spellings without
 resolving symlinks or junctions.
 
+### Loaded addon identity
+
+`nativeAddonPathFor(exportName, value)` from `@oh-my-pi/pi-natives/loader-state`
+returns the path of an already-opened addon only when its named class or function
+is exactly `value`. Foreign, missing and non-function exports return `undefined`.
+The lookup does not open another addon or infer identity from package versions.
+Use it instead of `require.cache`, which does not track `process.dlopen` loads.
+
 ### Git commits
 
 `VcsGitRepo.commitCreate(message, options)` honors configured signing and commit hooks.
@@ -163,7 +171,7 @@ for upstream npm installations. Coreforge instead distributes each fork-built
 addon alongside its matching binary on the authenticated Coreforce release:
 
 ```
-crates/pi-natives/       # Rust source (workspace member)
+crates/natives/       # Rust source (workspace member)
   src/lib.rs             # N-API exports
   src/sixel.rs           # SIXEL terminal-image encoding
   Cargo.toml             # Rust dependencies

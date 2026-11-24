@@ -32,6 +32,9 @@ import {
 import { approvalDirectoryKey, getApprovalGrants } from "@oh-my-pi/pi-coding-agent/tools/approval-cache";
 import { approvalTargetKey, approvalTreeSearchKey } from "@oh-my-pi/pi-coding-agent/tools/approval-targets";
 import { cfgToolsApprovalMode, cfgToolsRestrictedFolders } from "@oh-my-pi/pi-coding-agent/tools/settings";
+import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { BashTool } from "@oh-my-pi/pi-coding-agent/tools/bash";
+import { quotePosixArgv } from "@oh-my-pi/pi-coding-agent/utils/shell-quote";
 import { getAgentDir, isRecord, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
 
 function pathTool(name: string, tier: ToolTier, cwd: string): AgentTool {
@@ -352,15 +355,43 @@ describe("restricted folder execution", () => {
 		expect(fs.readFileSync(path.join(restricted, "secret.txt"), "utf8")).toBe("secret\n");
 	});
 
-	it("fails closed without UI and does not let xd dispatch approval cover restricted content", async () => {
+	it("fails closed without UI when a native command targets restricted content", async () => {
 		const h = harness();
 		const write = h.wrap(pathTool("write", "write", cwd));
-		await expect(
-			write.execute("no-ui", { path: "restricted/secret.txt", content: "blocked" }, undefined, undefined, {
-				...h.context,
-				xdevPolicyKey: "write",
-			}),
-		).rejects.toThrow(/requires approval/);
+		const tools = new Map([[write.name, write]]);
+		const session: ToolSession = {
+			cwd,
+			settings: h.settings,
+			hasUI: false,
+			getSessionFile: () => null,
+			getSessionSpawns: () => "*",
+			toolRegistry: tools,
+			isToolActive: name => name === "bash",
+			toolCommands: {
+				tools,
+				mountedNames: new Set([write.name]),
+				builtInNames: new Set(),
+				isActive: () => false,
+			},
+		};
+		const bash = h.wrap(new BashTool(session) as unknown as AgentTool);
+		const result = await bash.execute(
+			"no-ui",
+			{
+				command: quotePosixArgv([
+					write.name,
+					"--json",
+					JSON.stringify({
+						path: "restricted/secret.txt",
+						content: "blocked",
+					}),
+				]),
+			},
+			undefined,
+			undefined,
+			h.context,
+		);
+		expect(result.isError).toBe(true);
 		expect(fs.readFileSync(path.join(restricted, "secret.txt"), "utf8")).toBe("secret\n");
 	});
 

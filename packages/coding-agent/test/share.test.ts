@@ -12,6 +12,7 @@ import {
 import { SecretObfuscator } from "../src/secrets/obfuscator";
 import type { SessionEntry, SessionHeader } from "../src/session/session-entries";
 import { SessionManager } from "../src/session/session-manager";
+import { mkdir } from "node:fs/promises";
 
 const IV_LENGTH = 12;
 const TEST_MAX_SEALED_BYTES = 4_000;
@@ -309,6 +310,97 @@ describe("buildShareSnapshot", () => {
 		expect(flat).not.toContain(serverToolSentinel);
 		// Source entries keep the real values; redaction is share-only.
 		expect(JSON.stringify(entries)).toContain(secret);
+	});
+
+	test("drops chat-completions reasoning_details envelopes, which hold the raw reasoning text", () => {
+		const secret = "share-details-secret-ABCDE";
+		const entries: SessionEntry[] = [
+			{
+				type: "message",
+				id: "a1",
+				parentId: null,
+				timestamp: "2026-06-12T00:00:00.000Z",
+				message: {
+					role: "assistant",
+					content: [
+						{
+							type: "thinking",
+							thinking: `Use ${secret} now.`,
+							thinkingSignature: JSON.stringify({
+								reasoningDetails: [{ type: "reasoning.text", text: `Use ${secret} now.`, index: 0 }],
+								field: "reasoning",
+							}),
+						},
+					],
+					api: "openai-completions",
+					provider: "openrouter",
+					model: "google/gemini-3-pro-preview",
+					stopReason: "stop",
+					timestamp: 1,
+				},
+			} as unknown as SessionEntry,
+		];
+		const sm = {
+			getHeader: () => sessionData([], "x").header,
+			getEntries: () => entries,
+			getLeafId: () => "a1",
+		} as unknown as SessionManager;
+		const obfuscator = new SecretObfuscator([{ type: "plain", content: secret }]);
+
+		const flat = JSON.stringify(buildShareSnapshot(sm, { obfuscator }));
+
+		expect(flat).not.toContain(secret);
+		expect(flat).toContain('"thinkingSignature":"reasoning"');
+	});
+
+	test("drops the encrypted reasoning_details entry a tool call keeps, but not its Gemini signature", () => {
+		const blob = "share-encrypted-reasoning-blob";
+		const geminiSignature = JSON.stringify({ perCall: { google: { thought_signature: "gemini-call-signature" } } });
+		const entries: SessionEntry[] = [
+			{
+				type: "message",
+				id: "a1",
+				parentId: null,
+				timestamp: "2026-06-12T00:00:00.000Z",
+				message: {
+					role: "assistant",
+					content: [
+						{
+							type: "toolCall",
+							id: "call_1",
+							name: "get_weather",
+							arguments: { city: "Paris" },
+							thoughtSignature: JSON.stringify({
+								perCall: { type: "reasoning.encrypted", id: "call_1", data: blob, index: 1 },
+							}),
+						},
+						{
+							type: "toolCall",
+							id: "call_2",
+							name: "get_weather",
+							arguments: { city: "Rome" },
+							thoughtSignature: geminiSignature,
+						},
+					],
+					api: "openai-completions",
+					provider: "openrouter",
+					model: "google/gemini-3-pro-preview",
+					stopReason: "toolUse",
+					timestamp: 1,
+				},
+			} as unknown as SessionEntry,
+		];
+		const sm = {
+			getHeader: () => sessionData([], "x").header,
+			getEntries: () => entries,
+			getLeafId: () => "a1",
+		} as unknown as SessionManager;
+		const obfuscator = new SecretObfuscator([{ type: "plain", content: "share-unused-secret" }]);
+
+		const flat = JSON.stringify(buildShareSnapshot(sm, { obfuscator }));
+
+		expect(flat).not.toContain(blob);
+		expect(flat).toContain(JSON.stringify(geminiSignature));
 	});
 
 	test("redacts every title-change field before sharing", () => {
@@ -740,5 +832,75 @@ describe("share command", () => {
 		expect(stdout).toBe("");
 		expect(stderr).toBe(`Session "${sessionArg}" not found.\n`);
 		expect(await Bun.file(missingSession).exists()).toBe(false);
+	});
+
+	test("enforces the managed relay audience on CLI uploads while keeping self-hosted sharing", async () => {
+		using tempDir = TempDir.createSync("@omp-share-cli-audience-");
+		const agentDir = tempDir.join("agent");
+		await mkdir(agentDir);
+		const file = tempDir.join("session.jsonl");
+		const header: SessionHeader = {
+			type: "session",
+			version: 3,
+			id: "cli-share-audience",
+			timestamp: "2026-10-12T00:00:00.000Z",
+			cwd: tempDir.path(),
+		};
+		await Bun.write(
+			file,
+			`${[header, messageEntry("entry", null, "private fixture")].map(entry => JSON.stringify(entry)).join("\n")}\n`,
+		);
+		let uploads = 0;
+		const server = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			async fetch(request) {
+				await request.arrayBuffer();
+				uploads++;
+				return Response.json({ id: "cli-share-fixture" });
+			},
+		});
+		try {
+			for (const managed of [false, true]) {
+				await Bun.write(
+					path.join(agentDir, "config.yml"),
+					`share:\n  serverUrl: http://127.0.0.1:${server.port}/s\n  store: blob\n  redactSecrets: false\n` +
+						(managed ? "identity:\n  relay:\n    audience: https://relay.synthetic.invalid\n" : ""),
+				);
+				const before = uploads;
+				const child = Bun.spawn([process.execPath, "--no-env-file", CLI_ENTRY, "share", file], {
+					cwd: tempDir.path(),
+					env: {
+						PATH: process.env.PATH,
+						HOME: tempDir.path(),
+						USERPROFILE: tempDir.path(),
+						SystemRoot: process.env.SystemRoot,
+						WINDIR: process.env.WINDIR,
+						PI_CODING_AGENT_DIR: agentDir,
+						OMP_PROFILE: "",
+						PI_PROFILE: "",
+						OMP_NO_ENV_FILE: "1",
+						NO_COLOR: "1",
+					},
+					stdin: "ignore",
+					stdout: "pipe",
+					stderr: "pipe",
+				});
+				const [code, stdout, stderr] = await Promise.all([
+					child.exited,
+					new Response(child.stdout).text(),
+					new Response(child.stderr).text(),
+				]);
+				if (managed) {
+					expect(code, `${stdout}\n${stderr}`).not.toBe(0);
+					expect(uploads).toBe(before);
+				} else {
+					expect(code, `${stdout}\n${stderr}`).toBe(0);
+					expect(uploads).toBe(before + 1);
+				}
+			}
+		} finally {
+			server.stop(true);
+		}
 	});
 });

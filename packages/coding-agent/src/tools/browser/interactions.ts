@@ -17,6 +17,7 @@ import { ToolAbortError, throwIfAborted } from "../tool-errors";
 import { splitKeyCombo, ternKey } from "./tern/keys";
 import { devtoolsFrameId } from "./frames";
 import { untilAbortedOrReleased } from "./op-timeouts";
+import { CANCELLED_RELEASE_POINT } from "./relay/protocol";
 import type { SelectOptionChoice, SelectOptionInput } from "./select-options";
 import {
 	createFilePicker,
@@ -505,14 +506,28 @@ export async function focusKeyTarget(handle: ElementHandle, label: string, signa
 }
 
 /**
+ * Focus an element with the DOM's own `focus()`. Puppeteer's `ElementHandle.focus()` refuses anything but an
+ * HTMLElement, though a focusable SVG element (`<g tabindex="0" role="button">`) takes focus too.
+ */
+export async function focusElement(handle: ElementHandle, signal?: AbortSignal): Promise<void> {
+	await untilAborted(signal, () =>
+		handle.evaluate(el => {
+			const node = el as unknown as { focus?: () => void };
+			if (typeof node.focus !== "function") throw new Error("Cannot focus an element without a focus() method");
+			node.focus();
+		}),
+	);
+}
+
+/**
  * Click an element only after verifying the dispatched point is not occluded, then confirm the browser
  * delivered the click to it: the target got the `mousedown` or `click` (a label's forwarded `click` counts
- * for its control), or the page consumed its `pointerdown` with `preventDefault()`, which suppresses the
- * mouse events after it. A disabled control gets only an unconsumed `pointerdown` and an inert subtree
- * nothing, so a click the page never saw fails instead of reporting success. When the page took the record
- * with it, a navigation or a frame removed after the release counts as delivered. A child frame the page
- * removed while the first press was down took the element before any click, so that click fails as
- * unconfirmed even when the element saw the `mousedown`.
+ * for its control), or the page consumed its `pointerdown` with `preventDefault()` or removed the target
+ * during that event's dispatch. A disabled control gets only an unconsumed `pointerdown` and an inert
+ * subtree nothing, so a click the page never saw fails instead of reporting success. When the page took
+ * the record with it, a navigation or a frame removed after the release counts as delivered. A child
+ * frame removed while the first press was down took the element before any click, so that click fails
+ * even when the element saw the `mousedown`. Unrelated page or overlay mutations never confirm a click.
  */
 export async function clickElement(
 	handle: ElementHandle,
@@ -551,16 +566,23 @@ export async function clickElement(
 		const onPage = (event: InputEvent) => {
 			if (event.composedPath().includes(el)) record(event);
 		};
+		const handledRemoval = (event: InputEvent) => {
+			if (pointerDowns.includes(event) && state.detached) state.reached = true;
+		};
 		const types = ["pointerdown", "mousedown", "click"];
 		for (const type of types) {
 			target.addEventListener(type, record, true);
 			page.addEventListener(type, onPage, true);
 		}
+		target.addEventListener("pointerdown", handledRemoval, false);
+		page.addEventListener("pointerdown", handledRemoval, false);
 		state.stop = () => {
 			for (const type of types) {
 				target.removeEventListener(type, record, true);
 				page.removeEventListener(type, onPage, true);
 			}
+			target.removeEventListener("pointerdown", handledRemoval, false);
+			page.removeEventListener("pointerdown", handledRemoval, false);
 		};
 		return state;
 	});
@@ -800,7 +822,23 @@ const PICKER_VALUE_EXAMPLES: Record<string, string> = {
 const PICKER_INPUT_TYPES = Object.keys(PICKER_VALUE_EXAMPLES);
 
 /**
- * Focus a field that can take text, clear any existing value, then retype. A colour, date, time or
+ * Run on a filled text field (`this`, an HTML `<textarea>` or text-entry `<input>`) with the value's last character: a
+ * keydown and then a keyup, each only while it is still such a field and has focus. Created in the page, they carry
+ * no text, held modifier or default action.
+ */
+const FIELD_KEY_EVENTS = `function (key) {
+	const textEntry = ["text", "search", "email", "url", "tel", "password", "number"];
+	for (const type of ["keydown", "keyup"]) {
+		const field =
+			this.namespaceURI === "http://www.w3.org/1999/xhtml" &&
+			(this.localName === "textarea" || (this.localName === "input" && textEntry.includes(this.type)));
+		if (!field || this.getRootNode().activeElement !== this) return;
+		this.dispatchEvent(new KeyboardEvent(type, { key, bubbles: true, cancelable: true, composed: true }));
+	}
+}`;
+
+/**
+ * Focus a field that can take text, clear any existing value, then insert the value in one input. A colour, date, time or
  * range input gets its value set the way its picker would, and refuses one it rejects. A
  * contenteditable element has its contents selected and replaced by one text insertion (or deleted
  * by Backspace for an empty value), as a paste would.
@@ -958,7 +996,7 @@ export async function fillViaHandle(
 				}
 				const before = node.value;
 				if ("value" in node) write("");
-				// Typing a value fires its own input events; an empty value types nothing,
+				// Inserting a value fires its own input event; an empty value inserts nothing,
 				// so report the clear itself when there was something to clear.
 				if (wanted === "" && before) report();
 				return { target: "field" as const };
@@ -978,6 +1016,44 @@ export async function fillViaHandle(
 			return;
 		case "unfocused":
 			throw new ToolError("Cannot fill an element that does not keep focus");
+		case "field":
+			// One `Input.insertText` puts the whole value in with a single native input event: a newline stays text
+			// instead of pressing Enter (which submits chat forms), a controlled component sees the full value
+			// rather than re-rendering its old one between keys, and long text takes one round trip.
+			// It fires no key events, which pages that search as you type often wait for (`keyup`), so a text field
+			// then gets {@link FIELD_KEY_EVENTS} for the value's last code point that is not a control character. They
+			// go out without the user gesture puppeteer's `evaluate` requests, which would renew the page's user
+			// activation.
+			if (!value) return;
+			throwIfAborted(signal);
+			try {
+				await untilAborted(signal, () => page.keyboard.sendCharacter(value));
+				let end = value.length;
+				while (end > 0 && /\p{Cc}/u.test(value.charAt(end - 1))) end--;
+				// A trailing low surrogate ends the code point its high surrogate starts.
+				const start = end > 1 && (value.codePointAt(end - 2) ?? 0) > 0xffff ? end - 2 : end - 1;
+				const key = value.slice(start, end);
+				if (key) {
+					// The insert is done; a page that navigated or dropped the field in answer has no field to tell.
+					await untilAborted(signal, () =>
+						handle.frame.client
+							.send("Runtime.callFunctionOn", {
+								objectId: handle.remoteObject().objectId,
+								functionDeclaration: FIELD_KEY_EVENTS,
+								arguments: [{ value: key }],
+							})
+							.catch(() => undefined),
+					);
+				}
+			} catch (error) {
+				if (signal?.aborted) {
+					throw new TypingInterruptedError("the value was already sent and may have reached the field", {
+						cause: signal.reason,
+					});
+				}
+				throw error;
+			}
+			return;
 		case "editable":
 			if (!value && !prepared.deletable) return;
 			throwIfAborted(signal);
@@ -998,8 +1074,6 @@ export async function fillViaHandle(
 				throw error;
 			}
 			return;
-		case "field":
-			await typeKeys(page, value, signal);
 	}
 }
 
@@ -1788,8 +1862,10 @@ async function deliverToInput(
 ): Promise<void> {
 	if (route === "paths") {
 		const staged = await staging.stage(sources, signal);
+		const directory = sources.some(source => source.directory);
+		if (directory) await untilAborted(signal, () => input.frame.page().bringToFront());
 		// CDP acknowledges a directory before its asynchronous file selection completes.
-		const watch = sources.some(source => source.directory) ? await watchInputSelection(input, signal) : undefined;
+		const watch = directory ? await watchInputSelection(input, signal) : undefined;
 		try {
 			await untilAborted(signal, () => {
 				filling?.();
@@ -2073,12 +2149,6 @@ async function releaseKeys(page: Page, keys: readonly KeyInput[], signal?: Abort
 	if (failure) throw failure.error;
 	throwIfAborted(signal);
 }
-
-/**
- * Where a cancelled press is released: off the page, so the press drops no drag (unless the page captured the
- * pointer), at a point no real pointer reports, so {@link CANCELLED_RELEASE_GUARD} can tell the release apart.
- */
-const CANCELLED_RELEASE_POINT = -7919;
 
 /**
  * Swallows the `click`/`auxclick` Chrome fires on the document root for a release at

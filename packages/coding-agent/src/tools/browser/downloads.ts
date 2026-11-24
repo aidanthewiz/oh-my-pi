@@ -361,6 +361,22 @@ async function entryKind(file: string): Promise<"file" | "missing" | "other"> {
 	}
 }
 
+/** Keep the upstream two-second Windows share-lock budget without replacing an existing destination. */
+async function linkDownload(source: string, target: string): Promise<void> {
+	const deadline = Date.now() + 2_000;
+	for (let pause = 5; ; pause = Math.min(pause * 2, 100)) {
+		try {
+			await fs.link(source, target);
+			return;
+		} catch (error) {
+			if (process.platform !== "win32" || !hasFsCode(error, "EBUSY")) throw error;
+			const remaining = deadline - Date.now();
+			if (remaining <= 0) throw error;
+			await Bun.sleep(Math.min(pause, remaining));
+		}
+	}
+}
+
 /** Publish complete bytes without replacing another file, including another tab's download. */
 async function moveDownload(source: string, target: string): Promise<string> {
 	const directory = path.dirname(target);
@@ -373,7 +389,7 @@ async function moveDownload(source: string, target: string): Promise<string> {
 			const candidate = index === 0 ? target : path.join(directory, `${name.name} (${index})${name.ext}`);
 			if (path.resolve(source) === path.resolve(candidate)) return source;
 			try {
-				await fs.link(publicationSource, candidate);
+				await linkDownload(publicationSource, candidate);
 			} catch (error) {
 				if (hasFsCode(error, "EEXIST")) {
 					index++;

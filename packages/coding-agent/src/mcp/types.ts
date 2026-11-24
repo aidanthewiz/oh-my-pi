@@ -1,5 +1,6 @@
 import type { AgentToolContext } from "@oh-my-pi/pi-agent-core";
 import type {
+	MCPAudioContent,
 	MCPContent,
 	MCPImageContent,
 	MCPProgress,
@@ -167,26 +168,13 @@ export interface MCPConfigFile {
 	mcpServers?: Record<string, MCPServerConfig>;
 	/** Names to hide regardless of any source `enabled` flag. Highest precedence. */
 	disabledServers?: string[];
-	/** Names to force-enable when a non-writable source reports `enabled: false`. */
+	/** Names to force-enable when a non-writable source reports `enabled: false` or a built-in transform would drop them. */
 	enabledServers?: string[];
 }
 
 // =============================================================================
 // MCP Protocol Types
 // =============================================================================
-
-/**
- * Latest MCP protocol revision this client negotiates.
- *
- * Sent as `protocolVersion` in the `initialize` request and, for Streamable
- * HTTP, echoed back to the server in the `MCP-Protocol-Version` header on every
- * subsequent request (per the MCP HTTP transport spec). Must track the current
- * stable revision: AWS Bedrock AgentCore Gateway refuses tool calls on an
- * outbound per-user OAuth (`AUTHORIZATION_CODE`) target below `2025-11-25`, and
- * it checks the version *before* consulting its token vault, so an older client
- * is refused even for a caller whose consent is already stored.
- */
-export const MCP_PROTOCOL_VERSION = "2025-11-25";
 
 /** Optionally-sized icon for MCP UI metadata (implementation, tools, resources). */
 export interface MCPIcon {
@@ -300,9 +288,10 @@ export interface MCPToolCallResult {
 	/**
 	 * Machine-readable payload channel (MCP spec 2025-06-18, Tools → Structured
 	 * Content). Servers may return their data here while keeping `content`
-	 * minimal; the bridge surfaces it so it reaches the model.
+	 * minimal; the bridge surfaces it so it reaches the model. Any JSON value,
+	 * `null` included.
 	 */
-	structuredContent?: Record<string, unknown>;
+	structuredContent?: unknown;
 	_meta?: Record<string, unknown>;
 }
 
@@ -337,7 +326,7 @@ export interface MCPRequestOptions {
 	signal?: AbortSignal;
 	/**
 	 * Adds `_meta.progressToken` to the request and receives only this request's
-	 * `notifications/progress` while pending. Progress never extends its deadline.
+	 * `notifications/progress` while pending; each one restarts a default tool-call deadline (never a configured one).
 	 */
 	onProgress?: (progress: MCPProgress) => void;
 	/** False forbids refreshing credentials to resend this request after an authentication failure. */
@@ -346,6 +335,12 @@ export interface MCPRequestOptions {
 	mcpOwnerCurrent?: () => boolean;
 	/** Host-only cross-thread checkpoint; never part of an MCP request's parameters. */
 	mcpCheckOwner?: () => void | Promise<void>;
+	/**
+	 * Receives the JSON-RPC id the transport allocated, before the request is
+	 * written. A `subscriptions/listen` caller needs it: the stream's
+	 * notifications are tagged with that id.
+	 */
+	onRequestId?: (id: string | number) => void;
 }
 
 /** Transport interface - abstracts stdio/http */
@@ -385,6 +380,12 @@ export type TransportFactory = (config: MCPServerConfig) => Promise<MCPTransport
 // MCP Client Types
 // =============================================================================
 
+/** A filesystem root a session exposes to MCP servers. */
+export interface MCPRoot {
+	uri: string;
+	name?: string;
+}
+
 /** Connected MCP server state */
 export interface MCPServerConnection {
 	/** Server name from config */
@@ -419,6 +420,16 @@ export interface MCPServerConnection {
 	instructions?: string;
 	/** Cached prompts (populated on demand) */
 	prompts?: MCPPrompt[];
+	/**
+	 * Roots answered when the server asks `roots/list` through an
+	 * `input_required` result, read at each ask; the project directory when absent.
+	 */
+	roots?: () => MCPRoot[];
+	/**
+	 * Discovery and lists are asked of the server itself and never stored by
+	 * the host: set for connection tests and authentication probes.
+	 */
+	live?: boolean;
 }
 
 /** MCP tool with server context */
@@ -517,13 +528,6 @@ export interface MCPPrompt {
 export interface MCPPromptsListResult {
 	prompts: MCPPrompt[];
 	nextCursor?: string;
-}
-
-/** Audio content in prompt messages */
-export interface MCPAudioContent {
-	type: "audio";
-	data: string;
-	mimeType: string;
 }
 
 /** Content type union for prompt messages */

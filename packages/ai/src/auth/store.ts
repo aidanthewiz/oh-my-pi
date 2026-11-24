@@ -135,6 +135,8 @@ export interface CredentialBlockStore {
 
 /** Durable fencing for a single OAuth refresh owner. */
 export interface CredentialRefreshLeaseStore {
+	/** Mixed stores identify the rows whose refreshes they fence locally. */
+	supportsCredentialRefreshLease?(credentialId: number): boolean;
 	tryAcquireCredentialRefreshLease(credentialId: number, owner: string, expiresAtMs: number): boolean;
 	getCredentialRefreshLeaseExpiresAt(credentialId: number): number | undefined;
 	releaseCredentialRefreshLease(credentialId: number, owner: string): void;
@@ -274,11 +276,14 @@ export interface AuthCredentialStore
 /** Narrow stores that implement the complete durable refresh-lease concern. */
 export function hasRefreshLeases(
 	store: AuthCredentialStore,
+	credentialId: number | undefined,
 ): store is AuthCredentialStore & CredentialRefreshLeaseStore {
 	return (
 		typeof store.tryAcquireCredentialRefreshLease === "function" &&
 		typeof store.getCredentialRefreshLeaseExpiresAt === "function" &&
 		typeof store.releaseCredentialRefreshLease === "function" &&
-		typeof store.renewCredentialRefreshLease === "function"
+		typeof store.renewCredentialRefreshLease === "function" &&
+		credentialId !== undefined &&
+		store.supportsCredentialRefreshLease?.(credentialId) !== false
 	);
 }

@@ -199,12 +199,15 @@ describe("MCP tool ownership", () => {
 			try {
 				await Promise.all([fastConnected.promise, slow.toolsRequested]);
 				expect(manager.getTools().map(tool => tool.name)).toEqual(exposeTools ? ["mcp__fast_read_state"] : []);
-				expect((await manager.callTool("fast", "read_state")).structuredContent?.owner).toBe("original");
+				expect((await manager.callTool("fast", "read_state")).structuredContent).toMatchObject({
+					owner: "original",
+				});
 
 				if (!retained) await manager.disconnectServer("fast");
 				if (ownership === "refreshed") {
 					fastTools.splice(0, fastTools.length, "current_state");
 					await manager.refreshServerTools("fast");
+					expect(manager.getTools().map(tool => tool.name)).toEqual(["mcp__fast_current_state"]);
 				}
 				if (ownership === "replaced") {
 					const current = loopbackConfig("current", ["current_state"]);
@@ -230,7 +233,9 @@ describe("MCP tool ownership", () => {
 				} else {
 					const toolName = ownership === "replaced" || ownership === "refreshed" ? "current_state" : "read_state";
 					const result = await manager.callTool("fast", toolName);
-					expect(result.structuredContent?.owner).toBe(ownership === "replaced" ? "current" : "original");
+					expect(result.structuredContent).toMatchObject({
+						owner: ownership === "replaced" ? "current" : "original",
+					});
 					if (ownership === "replaced" || ownership === "refreshed") {
 						await expect(manager.callTool("fast", "read_state")).rejects.toThrow("not found");
 					}
@@ -261,7 +266,7 @@ describe("MCP tool ownership", () => {
 			expect(manager.getConnection("fast")).toBe(current);
 			expect(replacement.tools).toEqual([]);
 			expect(manager.getTools()).toEqual([]);
-			expect((await manager.callTool("fast", "read_state")).structuredContent?.owner).toBe("retained");
+			expect((await manager.callTool("fast", "read_state")).structuredContent).toMatchObject({ owner: "retained" });
 		} finally {
 			gate.resolve();
 			await reconnecting;

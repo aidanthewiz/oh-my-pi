@@ -3,15 +3,16 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { Api, Model } from "@oh-my-pi/pi-ai";
-import { Effort, getBundledModel } from "@oh-my-pi/pi-catalog";
+import { Effort } from "@oh-my-pi/pi-catalog";
 import { classifyTerminalMultiplexer, type TerminalMultiplexer } from "@oh-my-pi/pi-tui/terminal-multiplexer";
 import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
+import { parseArgs } from "@oh-my-pi/pi-coding-agent/cli/args";
+import { extractProfileFlags } from "@oh-my-pi/pi-coding-agent/cli/profile-bootstrap";
 import { CommandController } from "@oh-my-pi/pi-coding-agent/modes/controllers/command-controller";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import { Settings } from "../../../src/config/settings";
 import { cfgDefaultThinkingLevel } from "../../../src/session/settings";
-import { parseArgs } from "../../../src/cli/args";
 import {
 	createTerminalLauncher,
 	terminalLaunchCapabilities,
@@ -22,6 +23,7 @@ import {
 } from "../../../src/subprocess/terminal-launch";
 import { processCli } from "../../../src/subprocess/terminal-launch/shared";
 import { type FakeAnswer, type FakeDaemon, startFakeDaemon } from "../../tools/tern-fake-daemon";
+import { buildModel } from "@oh-my-pi/pi-catalog/build";
 
 let tempDirectory: string;
 let sourceSessionFile: string;
@@ -442,8 +444,18 @@ describe("/fork terminal placement", () => {
 	});
 
 	it("keeps the selected OpenRouter upstream route in the child model selector", async () => {
-		const model = getBundledModel<"openai-completions">("openrouter", "anthropic/claude-sonnet-4");
-		if (!model) throw new Error("Expected the bundled OpenRouter routing fixture");
+		const model = buildModel({
+			id: "fixture/model",
+			name: "Routing fixture",
+			api: "openrouter",
+			provider: "openrouter",
+			baseUrl: "https://example.invalid",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 8192,
+			maxTokens: 1024,
+		});
 		const { controller, launchTerminal } = createContext({
 			activeModel: {
 				...model,
@@ -453,7 +465,7 @@ describe("/fork terminal placement", () => {
 		await controller.handleForkCommand("pane");
 		const command = launchTerminal.mock.calls[0]?.[0].command ?? [];
 		expect(parseArgs(command.slice(command.indexOf("omp-entry") + 1)).model).toBe(
-			"openrouter/anthropic/claude-sonnet-4@anthropic",
+			"openrouter/fixture/model@anthropic",
 		);
 	});
 
@@ -478,6 +490,32 @@ describe("/fork terminal placement", () => {
 		expect(error).not.toContain(secret);
 		expect(flush).not.toHaveBeenCalled();
 		expect(launchTerminal).not.toHaveBeenCalled();
+	});
+
+	it("preserves boolean --plan across terminal forks while still blocking a following --api-key", async () => {
+		const secret = "do-not-include-this-key";
+		const blocked = createContext({
+			argv: ["--plan", "--api-key", secret, "prompt"],
+		});
+		await blocked.controller.handleForkCommand("pane");
+		expect(blocked.showError.mock.calls[0]?.[0]).toContain("--api-key");
+		expect(blocked.showError.mock.calls[0]?.[0]).not.toContain(secret);
+		expect(blocked.launchTerminal).not.toHaveBeenCalled();
+
+		const forked = createContext({
+			argv: ["--plan", "--model", "old-provider/model-a", "prompt"],
+		});
+		await forked.controller.handleForkCommand("pane");
+		const command = forked.launchTerminal.mock.calls[0]?.[0].command ?? [];
+		const appArgs = command.slice(command.indexOf("omp-entry") + 1);
+		const extracted = extractProfileFlags(appArgs);
+		expect(extracted.profile).toBe("active-profile");
+		const startupChild = parseArgs(extracted.argv);
+		expect(startupChild.model).toBe("provider/model");
+		expect(startupChild.messages).toEqual([]);
+		const extChild = parseArgs(extracted.argv, new Map([["plan", { type: "boolean" }]]));
+		expect(extChild.unknownFlags.get("plan")).toBe(true);
+		expect(extChild.model).toBe("provider/model");
 	});
 
 	it("rejects placement forks without a persisted transcript", async () => {

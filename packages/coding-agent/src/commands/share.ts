@@ -17,6 +17,7 @@ import { resolveResumableSession } from "../session/session-listing";
 import { SessionManager } from "../session/session-manager";
 
 import { cfgShareRedactSecrets, cfgShareServerUrl, cfgShareStore } from "./settings";
+import { createRelayIdentityTokenProvider } from "../identity/relay";
 
 export default class Share extends Command {
 	static description = commandHelp.description;
@@ -66,8 +67,10 @@ export default class Share extends Command {
 			? await buildSecretObfuscator(sm.getCwd(), getAgentDir(), { settings })
 			: undefined;
 
+		const serverUrl = cfgShareServerUrl.get(settings);
 		const result = await shareSession(sm, {
-			serverUrl: cfgShareServerUrl.get(settings),
+			serverUrl,
+			getAuthToken: createRelayIdentityTokenProvider(settings, serverUrl),
 			store: flags.gist ? "gist" : cfgShareStore.get(settings),
 			obfuscator,
 		});

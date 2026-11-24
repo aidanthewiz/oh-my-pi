@@ -171,14 +171,14 @@ describe("runSubprocess child policy", () => {
 		expect(persistedInits[0]).toMatchObject({ restrictToolNames: true, tools: ["read", "yield"] });
 	});
 
-	it("persists xd://-mounted tools from the enabled set", async () => {
+	it("persists mounted tool commands from the enabled set", async () => {
 		const session = yieldEmittingSession();
 		vi.spyOn(session, "getActiveToolNames").mockReturnValue(["read", "yield"]);
 		vi.spyOn(session, "getEnabledToolNames").mockReturnValue(["read", "lsp", "yield"]);
 		const appendSessionInit = vi.spyOn(session.sessionManager, "appendSessionInit");
 		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
 
-		const result = await runSubprocess({ ...baseOptions, id: "xdev-child" });
+		const result = await runSubprocess({ ...baseOptions, id: "tool-command-child" });
 
 		expect(result.exitCode).toBe(0);
 		expect(appendSessionInit).toHaveBeenCalledWith(expect.objectContaining({ tools: ["read", "lsp", "yield"] }));

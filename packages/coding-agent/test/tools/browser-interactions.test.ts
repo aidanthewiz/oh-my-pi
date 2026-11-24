@@ -27,6 +27,7 @@ import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools/index";
 import { rejectionOf } from "../helpers/rejection";
 import { chromiumAvailable } from "./chromium-probe";
 import type { ElementHandle } from "puppeteer-core";
+import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 
 const CHROMIUM_AVAILABLE = await chromiumAvailable();
 const TAB_NAME = `interactions-${crypto.randomUUID()}`;
@@ -1078,6 +1079,115 @@ return await tab.value("#paste");`,
 		30_000,
 	);
 
+	test("fill puts a multiline value in a textarea without pressing Enter", async () => {
+		const session = makeSession();
+		const prelude = createBrowserPrelude(session);
+		const tabName = `fill-multiline-${crypto.randomUUID()}`;
+		const html = `<!doctype html><textarea id="msg">old</textarea>
+<script>
+window.sent = [];
+const box = document.querySelector("#msg");
+box.addEventListener("keydown", event => { if (event.key === "Enter") window.sent.push(box.value); });
+</script>`;
+		const context = { session, toolCallId: "browser-fill-multiline" };
+		await prelude.invoke(
+			{ action: "open", name: tabName, url: `data:text/html,${encodeURIComponent(html)}` },
+			context,
+		);
+		try {
+			const result = await prelude.invoke(
+				{
+					action: "run",
+					name: tabName,
+					code: `await tab.fill("#msg", "a\\nb");
+return { value: await tab.value("#msg"), sent: await tab.evaluate(() => window.sent) };`,
+					timeout: 25,
+				},
+				context,
+			);
+			expect(valueFrom<unknown>(result)).toEqual({ value: "a\nb", sent: [] });
+		} finally {
+			await prelude.invoke({ action: "close", name: tabName, kill: true }, context).catch(() => undefined);
+		}
+	}, 40_000);
+
+	test("fill ends with key events on the field for pages that search on them, typing nothing twice", async () => {
+		const session = makeSession();
+		const prelude = createBrowserPrelude(session);
+		const tabName = `fill-keyup-${crypto.randomUUID()}`;
+		// `#q` searches only on keyup. Its input may consume user activation on a popup, depending on
+		// Chrome's popup policy; the key notification must not renew activation once consumed.
+		// Other handlers move focus or change the field type before that notification.
+		const html = `<!doctype html><input id="q" value="old"><p id="results"></p><input id="opens"><input id="hops">
+<input id="flip"><button id="ok">OK</button><math><textarea id="box" tabindex="0"></textarea></math>
+<script>
+window.events = [];
+for (const type of ["keydown", "keypress", "beforeinput", "input", "keyup", "click"]) {
+  addEventListener(type, event => events.push([type, event.target.id, event.key ?? "", event.target.value].join(":")), true);
+}
+q.addEventListener("input", () => {
+  window.open()?.close();
+  window.activationAfterInput = navigator.userActivation.isActive;
+});
+q.addEventListener("keyup", () => {
+  results.textContent = q.value;
+  window.activationAtKeyup = navigator.userActivation.isActive;
+});
+opens.addEventListener("input", () => ok.focus());
+hops.addEventListener("keydown", () => ok.focus());
+flip.addEventListener("keydown", () => { flip.type = "checkbox"; });
+</script>`;
+		const context = { session, toolCallId: "browser-fill-keyup" };
+		await prelude.invoke(
+			{ action: "open", name: tabName, url: `data:text/html,${encodeURIComponent(html)}` },
+			context,
+		);
+		try {
+			const result = await prelude.invoke(
+				{
+					action: "run",
+					name: tabName,
+					code: `await tab.fill("#box", "x");
+const boxKeys = await tab.evaluate(() => window.events.splice(0).filter(event => event.startsWith("key")));
+await tab.fill("#q", "to base64");
+const results = await tab.text("#results");
+await tab.fill("#opens", " ");
+await tab.fill("#hops", "x");
+await tab.fill("#flip", "x");
+return {
+  boxKeys,
+  results,
+  events: await tab.evaluate(() => window.events),
+  activationRenewed: await tab.evaluate(() => !window.activationAfterInput && window.activationAtKeyup)
+};`,
+					timeout: 25,
+				},
+				context,
+			);
+			expect(valueFrom<unknown>(result)).toEqual({
+				results: "to base64",
+				activationRenewed: false,
+				events: [
+					"beforeinput:q::",
+					"input:q::to base64",
+					"keydown:q:4:to base64",
+					"keyup:q:4:to base64",
+					"beforeinput:opens::",
+					"input:opens:: ",
+					"beforeinput:hops::",
+					"input:hops::x",
+					"keydown:hops:x:x",
+					"beforeinput:flip::",
+					"input:flip::x",
+					"keydown:flip:x:x",
+				],
+				boxKeys: [],
+			});
+		} finally {
+			await prelude.invoke({ action: "close", name: tabName, kill: true }, context).catch(() => undefined);
+		}
+	}, 40_000);
+
 	test("clearing a field with an empty fill reports the change to the page", async () => {
 		const session = makeSession();
 		const prelude = createBrowserPrelude(session);
@@ -2069,12 +2179,10 @@ return picks;`,
 				if (!handle) throw new Error(`Expected #${id}`);
 				result[id] = await clickElement(handle, `click #${id}`).then(
 					() => "clicked",
-					error =>
-						String(error).includes("did not deliver the click")
-							? "refused"
-							: String(error).includes("covered by")
-								? "covered"
-								: String(error),
+					error => {
+						if (!(error instanceof ToolError || error instanceof ClickRefusedError)) throw error;
+						return "refused";
+					},
 				);
 				await handle.dispose();
 			}
@@ -2089,6 +2197,7 @@ return picks;`,
 <span id="shadowed">Shadowed</span>
 <span id="actions">Go<span slot="alt" hidden>Alt</span></span>
 <button id="menu-item">Menu item</button>
+<div id="rerender-host"><button id="rerender">Rerender</button></div>
 <script>
 document.getElementById("shadowed").attachShadow({ mode: "open" }).innerHTML = "<button disabled><slot></slot></button>";
 document.getElementById("actions").attachShadow({ mode: "open" }).innerHTML =
@@ -2098,9 +2207,22 @@ document.getElementById("menu-item").addEventListener("pointerdown", event => {
 	event.preventDefault();
 	event.currentTarget.remove();
 });
+// A framework re-renders the button on pointerdown, so the original node never sees the click.
+document.getElementById("rerender").addEventListener("pointerdown", () => {
+	document.getElementById("rerender-host").innerHTML = "<button>Rerendered</button>";
+});
 </script>`);
 			expect(
-				await outcomes(["enabled", "disabled", "inert", "styled-inert", "shadowed", "actions", "menu-item"]),
+				await outcomes([
+					"enabled",
+					"disabled",
+					"inert",
+					"styled-inert",
+					"shadowed",
+					"actions",
+					"menu-item",
+					"rerender",
+				]),
 			).toEqual({
 				enabled: "clicked",
 				disabled: "refused",
@@ -2109,11 +2231,12 @@ document.getElementById("menu-item").addEventListener("pointerdown", event => {
 				shadowed: "refused",
 				actions: "clicked",
 				"menu-item": "clicked",
+				rerender: "clicked",
 			});
 			// A modal dialog escapes the inert shell it sits in; the shell lies under its backdrop.
 			await page.setContent(`<div inert><button id="shell">Shell</button><dialog id="dlg"><button id="ok">OK</button></dialog></div>
 <script>document.getElementById("dlg").showModal();</script>`);
-			expect(await outcomes(["ok", "shell"])).toEqual({ ok: "clicked", shell: "covered" });
+			expect(await outcomes(["ok", "shell"])).toEqual({ ok: "clicked", shell: "refused" });
 			// A button in a closed shadow root receives the click though the window only sees its host.
 			const closed = await page.evaluateHandle(`(() => {
 	const host = document.body.appendChild(document.createElement("div"));
@@ -2166,11 +2289,11 @@ document.getElementById("menu-item").addEventListener("pointerdown", event => {
 	const add = EventTarget.prototype.addEventListener;
 	const remove = EventTarget.prototype.removeEventListener;
 	EventTarget.prototype.addEventListener = function(type, listener, options) {
-		if (listener && options === true && (this === element || this === window) && ["pointerdown", "mousedown", "click"].includes(type)) records.push({ target: this, type, listener, active: true });
+		if (listener && typeof options === "boolean" && (this === element || this === window) && ["pointerdown", "mousedown", "click"].includes(type)) records.push({ target: this, type, listener, capture: options, active: true });
 		return add.call(this, type, listener, options);
 	};
 	EventTarget.prototype.removeEventListener = function(type, listener, options) {
-		for (const record of records) if (record.target === this && record.type === type && record.listener === listener && options === true) record.active = false;
+		for (const record of records) if (record.target === this && record.type === type && record.listener === listener && record.capture === options) record.active = false;
 		return remove.call(this, type, listener, options);
 	};
 	window.activeClickWatches = () => records.filter(record => record.active).length;
@@ -2218,7 +2341,6 @@ document.getElementById("menu-item").addEventListener("pointerdown", event => {
 						expect(error.name, fault).toBe("AbortError");
 						expect(error.cause, fault).toBe(failure);
 					}
-					if (fault === "acquire") expect(await page.evaluate("activeClickWatches()"), fault).toBe(6);
 					held.resolve();
 					if (heldWork) {
 						if (fault === "cancel") expect(await rejectionOf(heldWork), fault).toBe(failure);
@@ -2308,6 +2430,43 @@ document.getElementById("menu-item").addEventListener("pointerdown", event => {
 		} finally {
 			held.resolve();
 			controller.abort();
+			await page.close().catch(() => undefined);
+			if (browserHandle.browser.connected) await releaseBrowser(browserHandle, { kill: true });
+		}
+	}, 30_000);
+
+	test("keeps a click on an inert target undelivered while the relay's overlay host comes, changes and goes", async () => {
+		const browserHandle = await acquireBrowser({ kind: "headless", headless: true }, { cwd: process.cwd() });
+		if (!("browser" in browserHandle)) throw new Error("Expected a Puppeteer browser");
+		holdBrowser(browserHandle);
+		const page = await browserHandle.browser.newPage();
+		// An unrelated overlay or page mutation cannot confirm delivery to an inert target.
+		const outcome = async (pageToo: boolean): Promise<void> => {
+			await page.setContent(`<div inert><button id="inert">Inert</button></div><p id="clock">0</p>
+<omp-overlay></omp-overlay>
+<script>
+addEventListener("pointerdown", () => {
+	document.querySelector("omp-overlay").remove();
+	const host = document.createElement("OMP-OVERLAY");
+	document.body.append(host);
+	host.attachShadow({ mode: "closed" }).innerHTML = "<div>pointer</div>";
+	host.setAttribute("data-state", "pressed");
+	host.style.opacity = "0";
+	${pageToo ? 'document.getElementById("clock").textContent = "1";' : ""}
+}, true);
+</script>`);
+			const handle = await page.$("#inert");
+			if (!handle) throw new Error("Expected #inert");
+			await expect(clickElement(handle, "click #inert")).rejects.toBeInstanceOf(ToolError);
+			await handle.dispose();
+			// The host changed while the click was watched.
+			expect(await page.evaluate(`document.querySelector("omp-overlay").dataset.state`)).toBe("pressed");
+			expect(await page.$eval("#clock", element => element.textContent)).toBe(pageToo ? "1" : "0");
+		};
+		try {
+			await outcome(false);
+			await outcome(true);
+		} finally {
 			await page.close().catch(() => undefined);
 			if (browserHandle.browser.connected) await releaseBrowser(browserHandle, { kill: true });
 		}

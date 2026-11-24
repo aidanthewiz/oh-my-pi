@@ -477,11 +477,7 @@ async function getOAuthAccessFromStorage(provider: OAuthProvider): Promise<OAuth
 			// expired-but-refreshable credential gets rotated before discovery,
 			// and identity metadata (accountId/projectId/email) flows through
 			// for Codex/Antigravity downstream calls.
-			let access = await authStorage.oauth.access(provider);
-			if (!access && provider === "google-antigravity") {
-				access = await authStorage.oauth.access("google-gemini-cli");
-			}
-			return access ?? null;
+			return (await authStorage.oauth.access(provider)) ?? null;
 		} finally {
 			await authStorage.close();
 		}
@@ -501,7 +497,7 @@ async function getOAuthAccessFromStorage(provider: OAuthProvider): Promise<OAuth
 async function fetchAntigravityModels(): Promise<ModelSpec<"google-gemini-cli">[]> {
 	const access = await getOAuthAccessFromStorage("google-antigravity");
 	if (!access) {
-		console.log("No Antigravity or Gemini CLI credentials found, will use previous models.");
+		console.log("No Antigravity credentials found, will use previous models.");
 		console.log("Tip: If you are logged in under a specific profile, run with OMP_PROFILE=<name>.");
 		return [];
 	}
@@ -598,6 +594,13 @@ export async function generateModels(options: GenerateModelsOptions = {}): Promi
 					structuredClone(getCatalogProvider(frozenCatalog, provider)!),
 				]),
 			);
+	if (selectedProvider !== undefined && isRetiredProvider(selectedProvider)) {
+		delete previousModels[selectedProvider];
+		const outputPath = options.outputPath ?? path.join(packageRoot, "src/models.json");
+		await Bun.write(outputPath, encodeModelCatalog(previousModels));
+		console.log(`Removed ${selectedProvider} from ${outputPath}`);
+		return;
+	}
 	const modelsDevModels = frozenCatalog === undefined ? await loadModelsDevData() : [];
 	const catalogProviderDescriptors = PROVIDER_DESCRIPTORS.filter(
 		(descriptor): descriptor is CatalogProviderDescriptor =>

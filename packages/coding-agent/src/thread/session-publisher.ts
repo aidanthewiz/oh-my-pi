@@ -89,6 +89,7 @@ export function captureSessionState(session: AgentSession): SessionMirrorState {
 		promptSequence: session.promptSequence,
 		runStartedAt: read.runStartedAt(session),
 		ircWakesPending: read.ircWakesPending(session),
+		hasPendingWake: read.hasPendingWake(session),
 		ircQueuedFrom: session.queuedIrcSenders(),
 		isPaused: read.isPaused(session),
 		streamMessage: read.streamMessage(session),
@@ -229,7 +230,7 @@ export class SessionPublisher {
 	readonly #unsubscribeRunState: () => void;
 	readonly #unsubscribeLifecycle: () => void;
 	readonly #unsubscribeSessionTransition: () => void;
-	readonly #unsubscribeIrcWakeHolds: () => void;
+	readonly #unsubscribeWakeState: () => void;
 
 	constructor(session: AgentSession, bridge: SessionBridgeClient) {
 		this.session = session;
@@ -272,8 +273,7 @@ export class SessionPublisher {
 			);
 		});
 		this.#unsubscribeSessionTransition = session.subscribeSessionTransition(() => this.flush());
-		// `ircWakesPending` gates main's idle parking and changes without an event.
-		this.#unsubscribeIrcWakeHolds = session.subscribeIrcWakeHolds(() => this.schedule());
+		this.#unsubscribeWakeState = session.subscribeWakeState(() => this.schedule());
 		session.addDisposer(() => this.close());
 	}
 
@@ -322,7 +322,7 @@ export class SessionPublisher {
 		this.#unsubscribeRunState();
 		this.#unsubscribeLifecycle();
 		this.#unsubscribeSessionTransition();
-		this.#unsubscribeIrcWakeHolds();
+		this.#unsubscribeWakeState();
 		this.#bridge.remote.notify("closed", this.#key);
 	}
 
@@ -521,7 +521,6 @@ export class SessionPublisher {
 			compactionSpeculation: session.compactionSpeculation,
 			contextUsageRevision: session.contextUsageRevision,
 			contextUsage: toWireData(session.getContextUsage()),
-			isGeneratingHandoff: session.isGeneratingHandoff,
 			isRetrying: session.isRetrying,
 			retryAttempt: session.retryAttempt,
 			isTtsrAbortPending: session.isTtsrAbortPending,
@@ -629,10 +628,6 @@ export const SESSION_HOST_SERVE: RpcServe<SessionPublisher, SessionHostProtocol>
 	},
 	abortCompaction: (publisher, reason) => {
 		publisher.session.abortCompaction(reason);
-		publisher.schedule();
-	},
-	abortHandoff: publisher => {
-		publisher.session.abortHandoff();
 		publisher.schedule();
 	},
 	setModelTemporary: async (publisher, model, thinkingLevel, options) =>

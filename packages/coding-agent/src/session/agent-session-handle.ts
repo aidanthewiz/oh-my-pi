@@ -55,7 +55,7 @@ import type { CustomMessage } from "./messages";
 import type { ServingModel } from "./retry-fallback-chains";
 import type { AdvisorStatusOverviewEntry } from "./session-advisors";
 import type { SessionContext, TranscriptSessionContextOptions } from "./session-context";
-import type { ModelUsageEntry, SessionEntry, UsageStatistics } from "./session-entries";
+import type { ModelUsageRecord, SessionEntry, UsageStatistics } from "./session-entries";
 
 /** Session-manager reads other agents' code performs on a session it does not own. */
 export interface AgentSessionManagerHandle {
@@ -125,6 +125,12 @@ export interface AgentSessionHandle {
 	readonly runStartedAt: number | undefined;
 	/** Whether the session still owes turns to IRC messages (held, queued, or awaiting compaction). */
 	readonly ircWakesPending: boolean;
+	/**
+	 * Whether the agent acts again without anyone messaging it: its turn is streaming or
+	 * continues, or something wakes it once the turn ends (queued input, or a background
+	 * job, live service or running subagent of its own that is not waiting on it).
+	 */
+	readonly hasPendingWake: boolean;
 	/** Full message list, including custom message types. */
 	readonly messages: AgentMessage[];
 	/** Current transcript path, or undefined when sessions are disabled. */
@@ -195,13 +201,7 @@ export interface AgentViewSessionManager extends AgentSessionManagerHandle {
 	/** Materialize the session file on disk. */
 	ensureOnDisk(): Promise<void>;
 	/** Record an off-transcript model call under the entry `owner.parentId` (a worker-homed session records on its home thread). */
-	appendModelUsage(
-		usage: Pick<
-			ModelUsageEntry,
-			"purpose" | "role" | "api" | "provider" | "model" | "usage" | "stopReason" | "errorMessage"
-		>,
-		owner: { sessionId: string; parentId: string | null },
-	): void;
+	appendModelUsage(usage: ModelUsageRecord, owner: { sessionId: string; parentId: string | null }): void;
 	/** Store a blob in the session's blob store. */
 	putBlob(data: Buffer, options?: BlobPutOptions): Promise<BlobPutResult>;
 	/** Store a blob in the session's blob store synchronously. */
@@ -305,8 +305,6 @@ export interface AgentViewSession extends AgentSessionHandle {
 	readonly compactionSpeculation: "idle" | "running" | "armed";
 	/** Bumped whenever context usage changes. */
 	readonly contextUsageRevision: number;
-	/** Whether a handoff is being generated. */
-	readonly isGeneratingHandoff: boolean;
 	/** Whether a retry is pending. */
 	readonly isRetrying: boolean;
 	/** Current retry attempt (0 when not retrying). */
@@ -339,8 +337,6 @@ export interface AgentViewSession extends AgentSessionHandle {
 	setThinkingLevel(level: ConfiguredThinkingLevel | undefined, persist?: boolean): void;
 	/** Advance to the next thinking level. */
 	cycleThinkingLevel(): ConfiguredThinkingLevel | undefined;
-	/** Thinking level a temporary switch to `model` would use. */
-	resolveTemporaryModelThinkingLevel(model: Model): ConfiguredThinkingLevel | undefined;
 	/** Switch model without persisting it as the default. */
 	setModelTemporary(
 		model: Model,
@@ -406,8 +402,6 @@ export interface AgentViewSession extends AgentSessionHandle {
 	abortRetry(): void;
 	/** Cancel an in-progress compaction. */
 	abortCompaction(reason?: unknown): void;
-	/** Cancel an in-progress handoff. */
-	abortHandoff(): void;
 	/** Run a side turn (e.g. /btw) against the session's model without touching its transcript. */
 	runEphemeralTurn(args: EphemeralTurnOptions): Promise<EphemeralTurnResult>;
 	/** Whether an ephemeral turn's `maxTokens` reaches the provider unchanged. */

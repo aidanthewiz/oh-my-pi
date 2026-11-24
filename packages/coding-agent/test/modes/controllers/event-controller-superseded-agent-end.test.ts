@@ -92,7 +92,7 @@ function createContext(): FocusHarness {
 			ctx.statusContainer,
 			new Text("EDITOR", 0, 0),
 		],
-		{ selfClearingChrome: [ctx.statusContainer] },
+		{ coveringChrome: [ctx.statusContainer] },
 	);
 	composer.start({ playWelcomeIntro: false });
 	const controller = new EventController(ctx);

@@ -314,10 +314,6 @@ export class SessionProviderBoundary {
 		const model = this.#host.model();
 		if (!shouldDescribeImagesForTextModel(model, this.#host.settings)) return undefined;
 		const sessionId = this.#host.sessionId();
-		const usageOwner = {
-			sessionId: this.#host.sessionManager.getSessionId(),
-			parentId: this.#host.sessionManager.getLeafId(),
-		};
 		const providerSessionId = this.#host.agent.sessionId ?? sessionId;
 
 		let blocks: TextContent[];
@@ -335,18 +331,7 @@ export class SessionProviderBoundary {
 					sessionId: providerSessionId,
 					isCurrent,
 					prepareStreamOptions: visionModel => this.prepareSimpleStreamOptions({ signal }, visionModel.provider),
-					onUsage: message =>
-						this.#host.sessionManager.appendModelUsage(
-							{
-								purpose: "image-attachment-describe",
-								api: message.api,
-								provider: message.provider,
-								model: message.model,
-								usage: message.usage,
-								stopReason: message.stopReason,
-							},
-							usageOwner,
-						),
+					usageLedger: this.#host.sessionManager,
 				},
 				signal,
 			);

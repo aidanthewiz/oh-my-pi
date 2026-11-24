@@ -1,22 +1,7 @@
 {
-	"type": "module",
 	"name": "@oh-my-pi/omp-stats",
-	"version": "18.22.2",
+	"version": "19.1.1",
 	"description": "Local observability dashboard for omp AI usage statistics",
-	"homepage": "https://omp.sh",
-	"author": {
-		"name": "Stencil Labs, Inc.",
-		"url": "https://stencil.so"
-	},
-	"license": "MIT",
-	"repository": {
-		"type": "git",
-		"url": "git+https://github.com/can1357/oh-my-pi.git",
-		"directory": "packages/stats"
-	},
-	"bugs": {
-		"url": "https://github.com/can1357/oh-my-pi/issues"
-	},
 	"keywords": [
 		"ai",
 		"dashboard",
@@ -25,10 +10,56 @@
 		"observability",
 		"statistics"
 	],
-	"main": "./src/index.ts",
-	"types": "./src/index.ts",
+	"homepage": "https://omp.sh",
+	"bugs": {
+		"url": "https://github.com/can1357/oh-my-pi/issues"
+	},
+	"license": "MIT",
+	"author": {
+		"name": "Stencil Labs, Inc.",
+		"url": "https://stencil.so"
+	},
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/can1357/oh-my-pi.git",
+		"directory": "packages/stats"
+	},
 	"bin": {
 		"omp-stats": "./src/index.ts"
+	},
+	"files": [
+		"src",
+		"build.ts",
+		"README.md",
+		"CHANGELOG.md"
+	],
+	"type": "module",
+	"main": "./src/index.ts",
+	"types": "./src/index.ts",
+	"exports": {
+		".": {
+			"types": "./src/index.ts",
+			"import": "./src/index.ts"
+		},
+		"./*": {
+			"types": "./src/*.ts",
+			"import": "./src/*.ts"
+		},
+		"./client": {
+			"types": "./src/client/index.tsx",
+			"import": "./src/client/index.tsx"
+		},
+		"./client/traces": {
+			"types": "./src/client/traces/index.ts",
+			"import": "./src/client/traces/index.ts"
+		},
+		"./client/styles.css": "./src/client/styles.css",
+		"./client/traces/traces.css": "./src/client/traces/traces.css",
+		"./client/*": {
+			"types": "./src/client/*.ts",
+			"import": "./src/client/*.ts"
+		},
+		"./*.js": "./src/*.ts"
 	},
 	"scripts": {
 		"gen:stats": "bun scripts/generate-client-bundle.ts --generate",
@@ -56,36 +87,5 @@
 	},
 	"engines": {
 		"bun": ">=1.4.4"
-	},
-	"files": [
-		"src",
-		"build.ts",
-		"README.md",
-		"CHANGELOG.md"
-	],
-	"exports": {
-		".": {
-			"types": "./src/index.ts",
-			"import": "./src/index.ts"
-		},
-		"./*": {
-			"types": "./src/*.ts",
-			"import": "./src/*.ts"
-		},
-		"./client": {
-			"types": "./src/client/index.tsx",
-			"import": "./src/client/index.tsx"
-		},
-		"./client/traces": {
-			"types": "./src/client/traces/index.ts",
-			"import": "./src/client/traces/index.ts"
-		},
-		"./client/styles.css": "./src/client/styles.css",
-		"./client/traces/traces.css": "./src/client/traces/traces.css",
-		"./client/*": {
-			"types": "./src/client/*.ts",
-			"import": "./src/client/*.ts"
-		},
-		"./*.js": "./src/*.ts"
 	}
 }

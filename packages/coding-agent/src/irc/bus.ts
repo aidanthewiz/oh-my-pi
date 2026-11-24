@@ -14,6 +14,8 @@ import { logger, Snowflake, untilAborted } from "@oh-my-pi/pi-utils";
 import { type AgentLifecycleApi, AgentLifecycleManager } from "../registry/agent-lifecycle";
 import { AgentRegistry, type AgentRef, type AgentRegistryApi, MAIN_AGENT_ID } from "../registry/agent-registry";
 import type { CustomMessage } from "../session/messages";
+import { agentMesh } from "./mesh";
+import { parsePeerAddress } from "./mesh-protocol";
 
 interface IrcWaiter {
 	filter: IrcWaitFilter;
@@ -59,24 +61,55 @@ interface SendMark {
 	seq: number;
 	fromRef?: WeakRef<AgentRef>;
 	toRef?: WeakRef<AgentRef>;
+	pendingMessageId?: string;
 	fromSessionId?: string;
 	fromRunId?: string;
 	toSessionId?: string;
 	fromFile?: string | null;
 	toFile?: string | null;
+	fromPeerFile?: string;
+	toPeerFile?: string;
+	excerpt: string;
 }
 
 /** Mailbox cap per agent; oldest messages are dropped beyond it. */
 const MAILBOX_CAP = 100;
+/** Longest message excerpt the bus keeps per sender → recipient pair. */
+const EXCERPT_MAX_CHARS = 280;
+
+/** `body` on one line, cut to {@link EXCERPT_MAX_CHARS}. */
+function excerptOf(body: string): string {
+	const text = body.replace(/\s+/g, " ").trim();
+	return text.length <= EXCERPT_MAX_CHARS ? text : `${text.slice(0, EXCERPT_MAX_CHARS - 1)}…`;
+}
+
+/** A direct message still waiting for its answer; see {@link IrcBusApi.unansweredSends}. */
+export interface UnansweredSend {
+	/** The agent asked. */
+	to: string;
+	/** When the latest unanswered message to it went out. */
+	sentAt: number;
+	/** The agent asked sent progress since: it promised a later reply. */
+	promised: boolean;
+	/** Opening text of that message. */
+	ask: string;
+	/** Opening text of the agent's latest progress note since, when `promised`. */
+	promise?: string;
+}
+
+/** A message awaiting delivery; local-only sends never fall through to a peer tunnel. */
+export type IrcSend = Omit<IrcMessage, "id" | "ts"> & { localOnly?: boolean };
 
 /** Public surface of the process-global IRC bus, implemented locally on main and by a proxy in workers. */
 export interface IrcBusApi {
 	/** Fire-and-forget delivery; the receipt reports how the message reached the recipient. */
-	send(msg: Omit<IrcMessage, "id" | "ts">, opts?: { signal?: AbortSignal }): Promise<IrcDeliveryReceipt>;
+	send(msg: IrcSend, opts?: { signal?: AbortSignal }): Promise<IrcDeliveryReceipt>;
 	/** Whether `from` successfully sent `to` anything, progress included, at or after `sinceTs`. */
 	sentSince(from: string, to: string, sinceTs: number): boolean;
 	/** Agents `from` messaged directly at or after `sinceTs` that have not answered since. */
-	unansweredSends(from: string, sinceTs: number): Array<{ to: string; sentAt: number; promised: boolean }>;
+	unansweredSends(from: string, sinceTs: number): UnansweredSend[];
+	/** When `from` last sent `to` a message that ends a wait of `to`'s (not broadcast, not progress); undefined if never. */
+	lastMessageAt(from: string, to: string): number | undefined;
 	/** Block until a message for `agentId` that `filter` accepts arrives; null on timeout. */
 	wait(
 		agentId: string,
@@ -87,6 +120,8 @@ export interface IrcBusApi {
 	): Promise<IrcMessage | null>;
 	/** Consume the oldest pending message for `agentId` (optionally from `from`). */
 	take(agentId: string, from?: string): IrcMessage | undefined;
+	/** Hold a direct message for a spawned agent that has not started yet; its run takes it on start. */
+	park(msg: Omit<IrcMessage, "id" | "ts">): IrcMessage;
 	/** Unread count for the local Agent Hub overlay. */
 	unreadCount(agentId: string): number;
 	/** Capture generation-bound reply credit before work starts; commit only an accepted result. */
@@ -101,6 +136,11 @@ export class IrcBus implements IrcBusApi {
 		if (!IrcBus.#global) {
 			IrcBus.#global = new IrcBus();
 		}
+		return IrcBus.#global;
+	}
+
+	/** The process-global bus if one exists; never creates it (no bus means no message was ever held). */
+	static existing(): IrcBusApi | undefined {
 		return IrcBus.#global;
 	}
 
@@ -150,20 +190,21 @@ export class IrcBus implements IrcBusApi {
 	 * `wait`/`inbox` and inflate unread counts. Only a failed live hand-off
 	 * is buffered for the recipient to drain later.
 	 */
-	async send(msg: Omit<IrcMessage, "id" | "ts">, opts?: { signal?: AbortSignal }): Promise<IrcDeliveryReceipt> {
+	async send({ localOnly, ...msg }: IrcSend, opts?: { signal?: AbortSignal }): Promise<IrcDeliveryReceipt> {
 		const message: IrcMessage = { ...msg, id: Snowflake.next(), ts: Date.now() };
-		// Taken before delivery: a reply sent while this message is still being
-		// delivered must still order after it.
 		const fromRef = this.#registry.get(message.from);
 		const mark: SendMark = {
 			ts: message.ts,
 			seq: ++this.#sendSeq,
+			excerpt: excerptOf(message.body),
 			fromRef: fromRef ? new WeakRef(fromRef) : undefined,
 			fromSessionId: fromRef?.session?.sessionManager?.getSessionId(),
 			fromRunId: fromRef?.session?.lifecycleState?.runId,
 			fromFile: fromRef?.sessionFile,
+			fromPeerFile: this.#peerFile(message.from),
+			toPeerFile: this.#peerFile(message.to),
 		};
-		const receipt = await this.#deliver(message, opts, ref => {
+		const receipt = await this.#deliver(message, { ...opts, localOnly }, ref => {
 			mark.toRef = new WeakRef(ref);
 			mark.toSessionId = ref.session?.sessionManager?.getSessionId();
 			mark.toFile = ref.sessionFile;
@@ -180,6 +221,35 @@ export class IrcBus implements IrcBusApi {
 			}
 		}
 		return receipt;
+	}
+
+	park(msg: Omit<IrcMessage, "id" | "ts">): IrcMessage {
+		const message: IrcMessage = { ...msg, id: Snowflake.next(), ts: Date.now() };
+		const from = this.#registry.get(message.from);
+		const to = this.#registry.get(message.to);
+		const mark: SendMark = {
+			ts: message.ts,
+			seq: ++this.#sendSeq,
+			excerpt: excerptOf(message.body),
+			fromRef: from ? new WeakRef(from) : undefined,
+			toRef: to ? new WeakRef(to) : undefined,
+			pendingMessageId: to === undefined ? message.id : undefined,
+			fromSessionId: from?.session?.sessionManager?.getSessionId(),
+			fromRunId: from?.session?.lifecycleState?.runId,
+			toSessionId: to?.session?.sessionManager?.getSessionId(),
+			fromFile: from?.sessionFile,
+			toFile: to?.sessionFile,
+		};
+		this.#enqueue(message);
+		// Counts as sent: a reply wait on the recipient blocks for its answer.
+		if (message.progress) {
+			this.#record(this.#lastProgress, message.from, message.to, mark);
+		} else {
+			this.#record(this.#lastSent, message.from, message.to, mark);
+			this.#record(this.#lastReply, message.from, message.to, mark);
+			this.#record(this.#lastDirect, message.from, message.to, mark);
+		}
+		return message;
 	}
 
 	#record(table: Map<string, Map<string, SendMark>>, from: string, to: string, mark: SendMark): void {
@@ -200,6 +270,7 @@ export class IrcBus implements IrcBusApi {
 		const mark: SendMark = {
 			ts: 0,
 			seq: 0,
+			excerpt: "",
 			fromRef: new WeakRef(from),
 			fromSessionId: fromSession?.sessionManager?.getSessionId(),
 			fromFile: from.sessionFile,
@@ -222,19 +293,36 @@ export class IrcBus implements IrcBusApi {
 	#markCurrent(from: string, to: string, mark: SendMark): boolean {
 		const fromRef = this.#registry.get(from);
 		const toRef = this.#registry.get(to);
-		return (
-			(mark.fromRef === undefined || fromRef !== undefined) &&
-			toRef !== undefined &&
-			mark.fromRef?.deref() === fromRef &&
-			mark.toRef?.deref() === toRef &&
-			fromRef?.sessionFile === mark.fromFile &&
-			toRef.sessionFile === mark.toFile &&
-			(!fromRef?.session || fromRef.session.sessionManager?.getSessionId() === mark.fromSessionId) &&
-			(!fromRef?.session || fromRef.session.lifecycleState?.runId === mark.fromRunId) &&
-			(!toRef.session || toRef.session.sessionManager?.getSessionId() === mark.toSessionId) &&
-			fromRef?.status !== "aborted" &&
-			toRef?.status !== "aborted"
-		);
+		const fromCurrent =
+			mark.fromPeerFile !== undefined
+				? this.#peerFile(from) === mark.fromPeerFile
+				: mark.fromRef?.deref() === fromRef &&
+					fromRef?.sessionFile === mark.fromFile &&
+					(!fromRef?.session || fromRef.session.sessionManager?.getSessionId() === mark.fromSessionId) &&
+					(!fromRef?.session || fromRef.session.lifecycleState?.runId === mark.fromRunId) &&
+					fromRef?.status !== "aborted";
+		const toCurrent =
+			mark.pendingMessageId !== undefined
+				? toRef === undefined &&
+					this.#mailboxes.get(to)?.some(message => message.id === mark.pendingMessageId) === true
+				: mark.toPeerFile !== undefined
+					? this.#peerFile(to) === mark.toPeerFile
+					: toRef !== undefined &&
+						mark.toRef?.deref() === toRef &&
+						toRef.sessionFile === mark.toFile &&
+						(!toRef.session || toRef.session.sessionManager?.getSessionId() === mark.toSessionId) &&
+						toRef.status !== "aborted";
+		return fromCurrent && toCurrent;
+	}
+
+	#peerFile(address: string): string | undefined {
+		const parsed = parsePeerAddress(address);
+		if (!parsed || parsed.pid === process.pid) return undefined;
+		const peer = agentMesh()?.peer(parsed.pid);
+		if (!peer?.sessionFile || peer.status === "aborted") return undefined;
+		if (parsed.id === undefined) return peer.sessionFile;
+		const agent = peer.agents.find(agent => agent.id === parsed.id);
+		return agent && agent.status !== "aborted" ? `${peer.sessionFile}\0${agent.sessionFile}` : undefined;
 	}
 
 	/**
@@ -258,12 +346,13 @@ export class IrcBus implements IrcBusApi {
 	 * an explicit message answers it (a job settling the turn that sent the
 	 * progress must not). "Since" is by send order, not timestamp, so an answer
 	 * to an earlier question never settles a later one sent within the same
-	 * millisecond.
+	 * millisecond. Each row quotes the asking message and, when promised, the
+	 * latest progress note.
 	 */
-	unansweredSends(from: string, sinceTs: number): Array<{ to: string; sentAt: number; promised: boolean }> {
+	unansweredSends(from: string, sinceTs: number): UnansweredSend[] {
 		const sends = this.#lastDirect.get(from);
 		if (!sends) return [];
-		const unanswered: Array<{ to: string; sentAt: number; promised: boolean }> = [];
+		const unanswered: UnansweredSend[] = [];
 		for (const [to, sent] of sends) {
 			if (sent.ts < sinceTs || !this.#markCurrent(from, to, sent)) continue;
 			const after = (table: Map<string, Map<string, SendMark>>) => {
@@ -272,17 +361,43 @@ export class IrcBus implements IrcBusApi {
 			};
 			const promised = after(this.#lastProgress);
 			if (after(this.#lastReply) || (!promised && after(this.#lastJobReply))) continue;
-			unanswered.push({ to, sentAt: sent.ts, promised });
+			const row: UnansweredSend = { to, sentAt: sent.ts, promised, ask: sent.excerpt };
+			const promise = promised ? this.#lastProgress.get(to)?.get(from)?.excerpt : undefined;
+			if (promise !== undefined) row.promise = promise;
+			unanswered.push(row);
 		}
 		return unanswered;
 	}
 
+	/**
+	 * When `from` last sent `to` a non-broadcast, non-progress message in these generations.
+	 */
+	lastMessageAt(from: string, to: string): number | undefined {
+		const mark = this.#lastReply.get(from)?.get(to);
+		return mark && this.#markCurrent(from, to, mark) ? mark.ts : undefined;
+	}
+
 	async #deliver(
 		message: IrcMessage,
-		opts?: { signal?: AbortSignal },
+		opts: { signal?: AbortSignal; localOnly?: boolean },
 		onDeliver?: (ref: AgentRef) => void,
 	): Promise<IrcDeliveryReceipt> {
+		if (opts.signal?.aborted) {
+			return { to: message.to, outcome: "failed", error: "Peer delivery was cancelled before dispatch." };
+		}
 		const ref = this.#registry.get(message.to);
+		const mesh = ref || opts.localOnly ? undefined : agentMesh();
+		const peer = mesh && parsePeerAddress(message.to);
+		if (mesh && peer && peer.pid !== process.pid) {
+			// Another omp instance in this project: the mesh forwards it, and the
+			// recipient's own bus decides how it lands.
+			try {
+				return await untilAborted(opts.signal, () => mesh.send(peer, message.from, message.body, message.progress));
+			} catch (error) {
+				if (opts.signal?.aborted) throw new IrcDeliveryUncertainError(error);
+				throw error;
+			}
+		}
 		if (!ref) {
 			return {
 				to: message.to,

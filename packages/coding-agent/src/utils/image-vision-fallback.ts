@@ -19,15 +19,7 @@ import {
 	resolveTelemetry,
 } from "@oh-my-pi/pi-agent-core";
 import { sendsImageInputOnWire } from "@oh-my-pi/pi-ai/providers/vision-guard";
-import type {
-	Api,
-	AssistantMessage,
-	completeSimple,
-	ImageContent,
-	Model,
-	SimpleStreamOptions,
-	TextContent,
-} from "@oh-my-pi/pi-ai";
+import type { Api, completeSimple, ImageContent, Model, SimpleStreamOptions, TextContent } from "@oh-my-pi/pi-ai";
 import { getEffectiveTokenCost, getModelPricingStatus } from "@oh-my-pi/pi-catalog/models";
 import { logger, prompt, toError } from "@oh-my-pi/pi-utils";
 import { extractTextContent } from "../commit/utils";
@@ -42,6 +34,7 @@ import type { Settings } from "../config/settings";
 import { type LocalProtocolOptions, resolveLocalRoot } from "../internal-urls";
 import { cfgImagesBlockImages } from "../modes/settings";
 import type { CostGateApi } from "../session/cost-gate";
+import { type CompletionJournal, journalCompletion, type ModelUsageLedger } from "../session/model-usage-journal";
 import { cfgImagesDescribeForTextModels } from "../session/settings";
 import describeUserPrompt from "../prompts/tools/image-attachment-describe.md" with { type: "text" };
 import describeSystemPrompt from "../prompts/tools/image-attachment-describe-system.md" with { type: "text" };
@@ -85,11 +78,12 @@ export interface DescribeAttachedImagesDeps {
 	sessionId?: string;
 	isCurrent?: () => boolean;
 	prepareStreamOptions?: (model: Model<Api>) => SimpleStreamOptions;
-	onUsage?: (message: AssistantMessage) => void;
 	/** Test seam: overrides the underlying completeSimple call. */
 	completeImpl?: typeof completeSimple;
 	/** The session tree's cost gate: at the cap images are not described, and each description's cost is added. */
 	costGate?: CostGateApi;
+	/** The session the images were attached to; each description request is journaled there as `image-describe`. */
+	usageLedger?: Partial<ModelUsageLedger>;
 }
 
 /** Map an image MIME type to a file extension for the saved artifact. */
@@ -173,6 +167,7 @@ async function describeImage(
 	deps: DescribeAttachedImagesDeps,
 	telemetry: AgentTelemetry | undefined,
 	signal: AbortSignal | undefined,
+	journal: CompletionJournal | undefined,
 ): Promise<string | null> {
 	if (deps.costGate?.check()) return null;
 	try {
@@ -226,7 +221,7 @@ async function describeImage(
 			{ telemetry, oneshotKind: ONESHOT_KIND, completeImpl: deps.completeImpl },
 		);
 		deps.costGate?.record(response.usage.cost.total);
-		deps.onUsage?.(response);
+		journal?.(response);
 		signal?.throwIfAborted();
 		if (deps.isCurrent?.() === false) return null;
 		if (response.stopReason === "error" || response.stopReason === "aborted") {
@@ -260,6 +255,7 @@ export async function describeAttachedImagesForTextModel(
 ): Promise<TextContent[]> {
 	signal?.throwIfAborted();
 	if (deps.isCurrent?.() === false) throw new Error("Image description owner is no longer current");
+	const journal = journalCompletion(deps.usageLedger, { purpose: "image-describe", usageOnly: true });
 	const localRoot = resolveLocalRoot(deps.localProtocolOptions);
 	const visionModel = resolveVisionModel(deps);
 	const apiKey = visionModel ? await deps.modelRegistry.getApiKey(visionModel, deps.sessionId, { signal }) : undefined;
@@ -278,7 +274,8 @@ export async function describeAttachedImagesForTextModel(
 			let description: string;
 			if (canDescribe && visionModel) {
 				description =
-					(await describeImage(image, visionModel, deps, telemetry, signal)) ?? DESCRIPTION_UNAVAILABLE_NOTE;
+					(await describeImage(image, visionModel, deps, telemetry, signal, journal)) ??
+					DESCRIPTION_UNAVAILABLE_NOTE;
 			} else {
 				description = NO_VISION_MODEL_NOTE;
 			}

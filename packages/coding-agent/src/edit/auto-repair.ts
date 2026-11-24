@@ -20,6 +20,7 @@ import { logger, prompt } from "@oh-my-pi/pi-utils";
 import { cfgOffline } from "../config/auxiliary-model-policy";
 import { getAllowedAvailableModels, resolveRoleSelection } from "../config/model-resolver";
 import type { WritethroughCallback } from "../lsp";
+import { completionRecord } from "../session/model-usage-journal";
 import type { ToolSession } from "../tools";
 import repairPromptSource from "./auto-repair.md" with { type: "text" };
 import type { AppliedEditSnapshot } from "./blackbox";
@@ -430,6 +431,10 @@ export async function attemptEditAutoRepair(options: {
 										model: message.model,
 										usage: message.usage,
 										stopReason: message.stopReason,
+										errorMessage: message.errorMessage,
+										duration: message.duration,
+										ttft: message.ttft,
+										completion: completionRecord(builtPrompt, message),
 									},
 									usageOwner,
 								);

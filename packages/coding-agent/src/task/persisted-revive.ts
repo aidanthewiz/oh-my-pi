@@ -46,6 +46,7 @@ import {
 	followMCPTools,
 	replayRevivedAgentStart,
 	softRequestBudgetFor,
+	subagentLspWritethroughSettings,
 	subagentRetryFallbackRole,
 	usesYield,
 } from "./executor";
@@ -398,6 +399,7 @@ export async function revivePersistedSubagent(spec: PersistedReviveSpec, expecte
 	// in files written before that. Absent = unadvised (the
 	// createSubagentSettings default).
 	const subagentSettings = createSubagentSettings(spec.settings, {
+		...subagentLspWritethroughSettings(spec.settings),
 		...(init.readSummarize === false ? { "read.summarize.enabled": false } : undefined),
 		...(init.advisor
 			? {
@@ -499,7 +501,7 @@ export async function revivePersistedSubagent(spec: PersistedReviveSpec, expecte
 			modelRegistry: spec.modelRegistry,
 			...(perCallModel ? { model: perCallModel, thinkingLevel: init.perCallThinkingLevel ?? undefined } : {}),
 			...(persistedModelPattern ? { modelPattern: persistedModelPattern } : {}),
-			modelPatternAuthFallback: restoredSeance || init.perCallModel ? undefined : init.resolvedModel,
+			modelPatternParentFallback: restoredSeance || init.perCallModel ? undefined : init.resolvedModel,
 			settings: subagentSettings,
 			sessionManager: reopened,
 			agentId: ref.id,
@@ -526,7 +528,7 @@ export async function revivePersistedSubagent(spec: PersistedReviveSpec, expecte
 			expectedAgentRef: expectedRef,
 			taskDepth,
 			toolNames: revivedToolNames,
-			// `revivedToolNames` is the enabled set, devices included: keep those devices,
+			// The persisted enabled set includes tool commands: keep them as commands,
 			// or they come back as top-level tools and change the replayed tool list.
 			mountedToolNames: restoredSeance ? undefined : init.mountedTools,
 			outputSchema: init.outputSchema,
@@ -580,9 +582,9 @@ export async function revivePersistedSubagent(spec: PersistedReviveSpec, expecte
 		}
 		mcpFollower?.bind(session);
 		bindSubagentOwnerLifetime(session, ref.id, spec.isOwnerLifetimeCurrent);
-		// Clamp the active set to the persisted list, including mounted device tools.
+		// Clamp to the persisted grant set; mounted commands retain their own policy.
 		await session.setActiveToolsByName(
-			restoredSeance ? revivedToolNames : [...revivedToolNames, ...session.getMountedXdevToolNames()],
+			restoredSeance ? revivedToolNames : [...revivedToolNames, ...session.getMountedToolCommandNames()],
 		);
 		if (init.workPoolYieldItems) await session.setWorkPoolYieldItems(init.workPoolYieldItems);
 		await initializeExtensions(session, {

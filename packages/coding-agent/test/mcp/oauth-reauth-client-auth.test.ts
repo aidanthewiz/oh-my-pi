@@ -81,9 +81,12 @@ class FakeReconnectManager {
 	readonly configs = new Map<string, MCPServerConfig>();
 	readonly updated: Array<{ name: string; config: MCPServerConfig }> = [];
 	readonly reconnected: Array<{ name: string; manual?: boolean }> = [];
+	readonly order: string[] = [];
 	pending: Promise<unknown> | undefined;
 	status: "connected" | "connecting" | "disconnected" = "connected";
 	source: FoundMcpServer["source"];
+	/** What the manual reconnect yields: a connection, or null when it failed. */
+	outcome: object | null = {};
 
 	getServerConfig(name: string): MCPServerConfig | undefined {
 		return this.configs.get(name);
@@ -92,13 +95,15 @@ class FakeReconnectManager {
 		return this.source;
 	}
 	updateServerConfig(name: string, config: MCPServerConfig): Promise<unknown> | undefined {
+		this.order.push("update");
 		this.updated.push({ name, config });
 		this.configs.set(name, config);
 		return this.pending;
 	}
-	async reconnectServer(name: string, options?: { manual?: boolean }): Promise<null> {
+	async reconnectServer(name: string, options?: { manual?: boolean }): Promise<object | null> {
 		this.reconnected.push({ name, manual: options?.manual });
-		return null;
+		this.order.push("reconnect");
+		return this.outcome;
 	}
 	getConnectionStatus(_name: string): "connected" | "connecting" | "disconnected" {
 		return this.status;
@@ -106,6 +111,68 @@ class FakeReconnectManager {
 }
 
 describe("reconnectMcpManagerServer", () => {
+	test("awaits the superseded reconnect, then starts a fresh manual attempt and reports status", async () => {
+		const manager = new FakeReconnectManager();
+		// The manager entry carries the client's auth surface — the definition
+		// a reauth of this server refreshes.
+		manager.configs.set("client-server", {
+			type: "http",
+			url: "https://acp.example.com/mcp",
+			headers: { Authorization: "Bearer client-token" },
+			auth: staleAuth,
+		});
+		const release = Promise.withResolvers<void>();
+		manager.pending = release.promise.then(() => {
+			manager.order.push("pending-settled");
+		});
+		const selected = manager.configs.get("client-server")!;
+		const committed = clearMcpClientAuthSurface(selected);
+
+		const call = reconnectMcpManagerServer(
+			manager as unknown as MCPManager,
+			"client-server",
+			selectedManagerConfig(selected),
+			committed,
+		);
+		// The old automatic attempt is still settling: no reconnect started yet.
+		expect(manager.reconnected).toEqual([]);
+		release.resolve();
+		expect(await call).toBe("connected");
+		// The pending attempt settled before the manual one started.
+		expect(manager.order).toEqual(["update", "pending-settled", "reconnect"]);
+		expect(manager.reconnected).toEqual([{ name: "client-server", manual: true }]);
+		// The installed definition has the client auth surface cleared.
+		const installed = manager.updated[0]!.config;
+		expect(asHttpServerConfig(installed).url).toBe("https://acp.example.com/mcp");
+		expect(Object.keys(asHttpServerConfig(installed).headers ?? {})).toEqual([]);
+		expect(installed.auth).toBeUndefined();
+	});
+
+	test("never reports a failed reconnect as connected, whatever the entry's status says", async () => {
+		const manager = new FakeReconnectManager();
+		manager.configs.set("client-server", { type: "http", url: "https://acp.example.com/mcp" });
+		const selected: MCPServerConfig = { type: "http", url: "https://acp.example.com/mcp" };
+		manager.outcome = null;
+
+		expect(
+			await reconnectMcpManagerServer(
+				manager as unknown as MCPManager,
+				"client-server",
+				selectedManagerConfig(selected),
+				selected,
+			),
+		).toBe("disconnected");
+		manager.status = "connecting";
+		expect(
+			await reconnectMcpManagerServer(
+				manager as unknown as MCPManager,
+				"client-server",
+				selectedManagerConfig(selected),
+				selected,
+			),
+		).toBe("connecting");
+	});
+
 	test("refuses a manager entry that is not the reauthorized definition", async () => {
 		const manager = new FakeReconnectManager();
 		// ACP client declares `foo` at URL B while the reauthorized config-file
@@ -333,7 +400,13 @@ describe("reconnectMcpManagerServer", () => {
 					toolLists++;
 					return Response.json({ jsonrpc: "2.0", id: body.id, result: { tools: [] } });
 				}
-				return new Response(null, { status: 202 });
+				return body.id === undefined
+					? new Response(null, { status: 202 })
+					: Response.json({
+							jsonrpc: "2.0",
+							id: body.id,
+							error: { code: -32601, message: "Method not found" },
+						});
 			},
 		});
 		const manager = new MCPManager(os.tmpdir());
@@ -424,18 +497,26 @@ describe("MCP OAuth persistence and discovery boundaries", () => {
 	test.each([false, true])(
 		"never sends a supplied bearer on the anonymous initialization probe (tool challenge: %s)",
 		async toolChallenge => {
-			const requests: Array<{ method: string; authorization: string | null; custom: string | null }> = [];
+			const requests: Array<{ path: string; method: string; authorization: string | null; custom: string | null }> =
+				[];
 			const server = Bun.serve({
+				hostname: "127.0.0.1",
 				port: 0,
 				async fetch(request) {
-					if (request.method === "POST") {
-						const body = (await request.json()) as { method?: string };
-						requests.push({
-							method: body.method ?? "",
-							authorization: request.headers.get("authorization"),
-							custom: request.headers.get("x-routing"),
-						});
+					let method = request.method;
+					if (method === "POST") {
+						const body: unknown = await request.json();
+						method =
+							body && typeof body === "object" && "method" in body && typeof body.method === "string"
+								? body.method
+								: "";
 					}
+					requests.push({
+						path: new URL(request.url).pathname,
+						method,
+						authorization: request.headers.get("authorization"),
+						custom: request.headers.get("x-routing"),
+					});
 					return Response.json(
 						{
 							authorization_url: "https://auth.example/authorize",
@@ -460,11 +541,14 @@ describe("MCP OAuth persistence and discovery boundaries", () => {
 						authChallenge: toolChallenge ? { wwwAuthenticate: ['Bearer scope="read"'] } : undefined,
 					},
 				);
-				expect(requests.find(request => request.method === "initialize")).toEqual({
-					method: "initialize",
+				expect(requests.find(request => request.path === "/mcp")).toMatchObject({
 					authorization: null,
 					custom: "tenant-a",
 				});
+				for (const request of requests) {
+					expect(request.authorization).toBeNull();
+					if (request.path === "/mcp") expect(request.custom).toBe("tenant-a");
+				}
 				expect(endpoints.tokenUrl).toBe("https://auth.example/token");
 				expect(endpoints.authorizationUrl).toBe("https://auth.example/authorize");
 				if (toolChallenge) expect(endpoints.scopes).toBe("read");

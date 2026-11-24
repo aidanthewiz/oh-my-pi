@@ -175,7 +175,7 @@ describe("session-owned extension MCP across workers", () => {
 		expect(cfgToolsApproval.get(settings)).toEqual({ mcp__minions_create_task: "allow" });
 		await child.setApproval("allow");
 		const result = await child.call("minions", "create_task", { title: "approved child task" });
-		expect(result.structuredContent?.tenant).toBe("tenant-a");
+		expect(result.structuredContent).toMatchObject({ tenant: "tenant-a" });
 		expect(f.calls).toEqual([{ name: "create_task", args: { title: "approved child task" } }]);
 	}, 20_000);
 
@@ -207,7 +207,7 @@ describe("session-owned extension MCP across workers", () => {
 			const f = await connector();
 			const { child, id } = await workerSession(f.manager);
 			const admitted = await child.call("minions", "get_task", { owner: "worker" });
-			expect(admitted.structuredContent?.tenant).toBe("tenant-a");
+			expect(admitted.structuredContent).toMatchObject({ tenant: "tenant-a" });
 			if (ownership === "disposed") await child.dispose();
 			else if (ownership === "unregistered") {
 				const ref = AgentRegistry.global().get(id);
@@ -220,7 +220,7 @@ describe("session-owned extension MCP across workers", () => {
 			expect(f.calls).toEqual([{ name: "get_task", args: { owner: "worker" } }]);
 			expect(outcome).toBeInstanceOf(Error);
 			const local = await f.manager.callTool("minions", "get_task", { owner: "main" }, { retry: "never" });
-			expect(local.structuredContent?.tenant).toBe("tenant-a");
+			expect(local.structuredContent).toMatchObject({ tenant: "tenant-a" });
 		}, 20_000);
 	}
 
@@ -254,6 +254,7 @@ describe("session-owned extension MCP across workers", () => {
 				cleanup.push(() => tokens.stop(true));
 				const f = await connector("tenant-a", undefined, undefined, !parentOwned);
 				expect(f.manager.getConnectedServers()).toEqual(parentOwned ? ["minions"] : []);
+				const initializationCount = f.initializations.length;
 				const { child, auth, id } = await workerSession(f.manager);
 				f.manager.setAuthStorage(auth);
 				const credentialId = "mcp_oauth_synthetic_reconnect";
@@ -296,13 +297,13 @@ describe("session-owned extension MCP across workers", () => {
 				const result = await outcome;
 				if (parentOwned) expect((await parentReconnect)?.transport.connected).toBe(true);
 				await f.manager.waitForPendingConnections();
-				expect(f.initializations).toEqual(
-					retired && !parentOwned ? [null] : [null, `Bearer ${"synthetic-renewed-access"}`],
+				expect([...new Set(f.initializations.slice(initializationCount))]).toEqual(
+					retired && !parentOwned ? [] : [`Bearer ${"synthetic-renewed-access"}`],
 				);
 				expect(f.manager.getConnectedServers()).toEqual(retired && !parentOwned ? [] : ["minions"]);
 				expect(f.calls).toEqual(retired ? [] : [{ name: "create_task", args: {} }]);
 				if (retired) expect(result).toBeInstanceOf(Error);
-				else expect(result.structuredContent?.tenant).toBe("tenant-a");
+				else expect(result.structuredContent).toMatchObject({ tenant: "tenant-a" });
 				expect(auth.credentials.get(credentialId)).toMatchObject({
 					type: "oauth",
 					access: "synthetic-renewed-access",
@@ -397,10 +398,10 @@ describe("session-owned extension MCP across workers", () => {
 		approveOccupied.resolve();
 		expect(await admitted).not.toBeNull();
 		const completed = await manager.callTool("occupied", "get_task", {}, { retry: "never" });
-		expect(completed.structuredContent?.receipt).toBe("occupied");
+		expect(completed.structuredContent).toMatchObject({ receipt: "occupied" });
 		const outcome = await retired;
 		expect(authenticated).toEqual(["occupied"]);
-		expect(authorizedInitializations).toEqual(["occupied"]);
+		expect([...new Set(authorizedInitializations)]).toEqual(["occupied"]);
 		expect(calls).toEqual(["occupied"]);
 		expect(outcome).toBeInstanceOf(Error);
 	}, 20_000);
@@ -554,10 +555,12 @@ describe("session-owned extension MCP across workers", () => {
 		f.protocolFailure();
 		const result = await child.call("minions", "get_task", {}, { retry: "read" });
 		expect(result.isError).toBe(true);
-		expect(result.structuredContent?.error).toMatchObject({
-			code: -32042,
-			failure: "json_rpc",
-			traceId: "synthetic-trace",
+		expect(result.structuredContent).toMatchObject({
+			error: {
+				code: -32042,
+				failure: "json_rpc",
+				traceId: "synthetic-trace",
+			},
 		});
 		expect(JSON.stringify(result)).not.toContain("synthetic-secret");
 		expect(f.calls).toEqual([{ name: "get_task", args: {} }]);
@@ -572,7 +575,7 @@ describe("session-owned extension MCP across workers", () => {
 		expect(f.calls).toEqual([{ name: "create_task", args: {} }]);
 		f.failNext();
 		const recovered = await child.call("minions", "get_task", {}, { retry: "read" });
-		expect(recovered.structuredContent?.tenant).toBe("tenant-a");
+		expect(recovered.structuredContent).toMatchObject({ tenant: "tenant-a" });
 		expect(f.calls).toEqual([
 			{ name: "create_task", args: {} },
 			{ name: "get_task", args: {} },

@@ -28,7 +28,7 @@ import {
 	setMnemopiSessionState,
 } from "@oh-my-pi/pi-coding-agent/mnemopi/state";
 import type { AgentSessionEventListener } from "@oh-my-pi/pi-coding-agent/session/agent-session";
-import type { Tool, ToolSession } from "@oh-my-pi/pi-coding-agent/tools/index";
+import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools/index";
 import { LearnTool } from "@oh-my-pi/pi-coding-agent/tools/learn";
 import { MemoryEditTool } from "@oh-my-pi/pi-coding-agent/tools/memory-edit";
 import { MemoryRecallTool } from "@oh-my-pi/pi-coding-agent/tools/memory-recall";
@@ -274,34 +274,6 @@ describe("Mnemopi tool factories", () => {
 		expect(MemoryRecallTool.createIf(session)).toBeInstanceOf(MemoryRecallTool);
 		expect(MemoryReflectTool.createIf(session)).toBeInstanceOf(MemoryReflectTool);
 		expect(MemoryEditTool.createIf(session)).toBeInstanceOf(MemoryEditTool);
-	});
-
-	it("names sibling memory tools by their xd:// URL only when they are mounted as devices", () => {
-		const session = makeSession(Settings.isolated({ "memory.backend": "mnemopi" }));
-		const recall = new MemoryRecallTool(session);
-		const reflect = new MemoryReflectTool(session);
-		const edit = new MemoryEditTool(session);
-		const tools = new Map<string, Tool>([
-			["recall", recall],
-			["reflect", reflect],
-			["memory_edit", edit],
-		]);
-		session.xdev = {
-			tools,
-			mountedNames: new Set(["recall", "memory_edit"]),
-			builtInNames: new Set(tools.keys()),
-			isActive: name => name === "reflect",
-		};
-
-		expect(reflect.description).toContain("unlike `xd://recall`, blends them");
-		expect(recall.description).toContain("`reflect`: synthesized answer");
-		expect(recall.description).toContain("Before any `xd://memory_edit update`");
-		expect(edit.description).toContain("Only ids returned by `xd://recall`.");
-
-		// A mounted device without a summary makes catalog summaries read its description;
-		// rendering refs must not depend on them, or this recurses without bound.
-		Object.assign(recall, { summary: undefined });
-		expect(recall.description).toContain("`reflect`: synthesized answer");
 	});
 });
 
@@ -1066,9 +1038,34 @@ describe("Mnemopi backend lifecycle", () => {
 
 		expect(warn).toHaveBeenCalledWith("Mnemopi: lifecycle hook failed", {
 			banks: ["test-bank"],
-			operation: "agent_end retention",
+			operation: "turn-end retention",
 			error: "Cannot use a closed database",
 		});
+	});
+
+	it("auto-retains on a yielded agent_pause but not a non-yielded one", async () => {
+		const listeners = new Set<AgentSessionEventListener>();
+		const entries = [{ type: "message", message: { role: "user", content: "turn one" } }];
+		const state = registerMnemopiState(makeMnemopiConfig({ retainEveryNTurns: 1 }), {
+			entries: () => entries,
+			listeners,
+		});
+		state.attachSessionListeners();
+		const retained = Promise.withResolvers<void>();
+		const retainSpy = vi.spyOn(state, "retainMessages").mockImplementation(async () => retained.resolve());
+		const emit = (yielded: boolean) => {
+			for (const listener of listeners) {
+				listener({ type: "agent_pause", messages: [], yielded, awaiting: yielded } as never);
+			}
+		};
+
+		emit(false);
+		expect(retainSpy).not.toHaveBeenCalled();
+		emit(true);
+		await retained.promise;
+
+		expect(retainSpy).toHaveBeenCalledTimes(1);
+		expect(retainSpy.mock.calls[0][0]).toEqual([{ role: "user", content: "turn one" }]);
 	});
 
 	it("contains failures before agent-start recall reaches its internal bank guard", async () => {
@@ -1508,36 +1505,35 @@ describe("Mnemopi backend lifecycle", () => {
 		const lock = new Database(sharedDbPath!);
 		lock.exec("BEGIN IMMEDIATE");
 		const sharedMemory = state.globalMemory;
-		const sharedFlushCalled = Promise.withResolvers<void>();
+		const sharedFlushFinished = Promise.withResolvers<void>();
+		let sharedWaitMs = Number.POSITIVE_INFINITY;
+		let sharedError: unknown;
 		const sharedFlushSpy = vi.spyOn(sharedMemory!, "flushExtractions").mockImplementation(async () => {
-			// Signal first: the exec below may throw SQLITE_BUSY while the lock is
-			// still held, and the call itself is what the test awaits.
-			sharedFlushCalled.resolve();
-			// Model a pending extraction/embedding commit. An idle shared bank performs
-			// no SQLite work during flush, so merely locking it would not exercise its
-			// connection's busy timeout.
-			sharedMemory!.beam.db.exec("PRAGMA user_version=7351");
+			// Force a write on the shared connection while the independent owner
+			// still holds its transaction; an idle bank would not exercise a wait.
+			const started = performance.now();
+			try {
+				sharedMemory!.beam.db.exec("PRAGMA user_version=7351");
+			} catch (error) {
+				sharedError = error;
+				throw error;
+			} finally {
+				sharedWaitMs = performance.now() - started;
+				sharedFlushFinished.resolve();
+			}
 		});
 
-		const started = performance.now();
 		try {
 			await state.dispose({ timeoutMs: 50 });
+			// Disposal may detach the flush. Keep the competing transaction held
+			// until the actual write finishes so the lock-wait assertion cannot pass vacuously.
+			await sharedFlushFinished.promise;
+			expect(sharedError).toMatchObject({ code: "SQLITE_BUSY" });
+			expect(sharedWaitMs).toBeLessThan(500);
+			expect(sharedFlushSpy).toHaveBeenCalledTimes(1);
 		} finally {
 			lock.exec("ROLLBACK");
 			lock.close();
-		}
-		const elapsedMs = performance.now() - started;
-
-		try {
-			expect(elapsedMs).toBeLessThan(500);
-			// When the shutdown budget expires mid-consolidate, dispose detaches the
-			// pass instead of abandoning it (#3641) — so on a slow runner the shared
-			// flush may not have run yet when dispose returns. The lock is released
-			// above, so the detached pass must still reach the shared bank; await
-			// the call itself instead of asserting synchronously.
-			await sharedFlushCalled.promise;
-			expect(sharedFlushSpy).toHaveBeenCalledTimes(1);
-		} finally {
 			registeredMnemopiState = undefined;
 		}
 	});

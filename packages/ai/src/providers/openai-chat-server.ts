@@ -37,6 +37,7 @@ import {
 import { decodeDataUri } from "./openai-data-uri";
 import {
 	geminiToolCallExtraContent,
+	geminiToolCallFunctionSignature,
 	rawGeminiToolCallSignature,
 	storeGeminiToolCallSignature,
 } from "./openai-completions";
@@ -287,7 +288,7 @@ function buildAssistantMessage(
 				}
 			}
 			// A Gemini tool call replays the signature its response carried; store it as this API's transport does.
-			const thoughtSignature = storeGeminiToolCallSignature(Reflect.get(raw, "extra_content"));
+			const thoughtSignature = storeGeminiToolCallSignature(raw);
 			const call: ToolCall = {
 				type: "toolCall",
 				id: raw.id,
@@ -456,10 +457,15 @@ export function encodeResponse(message: AssistantMessage, requestedModelId: stri
 	if (toolCalls.length > 0) {
 		responseMessage.tool_calls = toolCalls.map(tc => {
 			const extraContent = geminiToolCallExtraContent(tc.thoughtSignature);
+			const functionSignature = geminiToolCallFunctionSignature(tc.thoughtSignature);
 			return {
 				id: tc.id,
 				type: "function",
-				function: { name: tc.name, arguments: stringifyArgs(tc.arguments) },
+				function: {
+					name: tc.name,
+					arguments: stringifyArgs(tc.arguments),
+					...(functionSignature ? { thought_signature: functionSignature } : {}),
+				},
 				...(extraContent ? { extra_content: extraContent } : {}),
 			};
 		});
@@ -626,7 +632,13 @@ export function encodeStream(
 			// concatenation-safe corrective chunk before the finish.
 			const sentToolMeta = new Map<
 				number,
-				{ id: string; name: string; hasArgumentBytes: boolean; signed: boolean }
+				{
+					id: string;
+					name: string;
+					hasArgumentBytes: boolean;
+					sentExtraContent: boolean;
+					sentFunctionSignature: boolean;
+				}
 			>();
 			let nextToolIndex = 0;
 			let hasToolCalls = false;
@@ -676,13 +688,15 @@ export function encodeStream(
 							toolIndexByContentIndex.set(event.contentIndex, idx);
 							const partial = event.partial.content[event.contentIndex];
 							const call = partial && partial.type === "toolCall" ? partial : undefined;
+							const extraContent = geminiToolCallExtraContent(call?.thoughtSignature);
+							const functionSignature = geminiToolCallFunctionSignature(call?.thoughtSignature);
 							sentToolMeta.set(idx, {
 								id: call?.id ?? "",
 								name: call?.name ?? "",
 								hasArgumentBytes: false,
-								signed: Boolean(call?.thoughtSignature),
+								sentExtraContent: extraContent !== undefined,
+								sentFunctionSignature: functionSignature !== undefined,
 							});
-							const extraContent = geminiToolCallExtraContent(call?.thoughtSignature);
 							writeSse(
 								controller,
 								baseChunk(
@@ -692,7 +706,11 @@ export function encodeStream(
 												index: idx,
 												id: call?.id ?? "",
 												type: "function",
-												function: { name: call?.name ?? "", arguments: "" },
+												function: {
+													name: call?.name ?? "",
+													arguments: "",
+													...(functionSignature ? { thought_signature: functionSignature } : {}),
+												},
 												...(extraContent ? { extra_content: extraContent } : {}),
 											},
 										],
@@ -730,14 +748,18 @@ export function encodeStream(
 							const correctArguments = sent.hasArgumentBytes
 								? undefined
 								: stringifyArgs(event.toolCall.arguments);
-							const extraContent = sent.signed
+							const extraContent = sent.sentExtraContent
 								? undefined
 								: geminiToolCallExtraContent(event.toolCall.thoughtSignature);
+							const functionSignature = sent.sentFunctionSignature
+								? undefined
+								: geminiToolCallFunctionSignature(event.toolCall.thoughtSignature);
 							if (
 								correctId !== undefined ||
 								correctName !== undefined ||
 								correctArguments !== undefined ||
-								extraContent !== undefined
+								extraContent !== undefined ||
+								functionSignature !== undefined
 							) {
 								writeSse(
 									controller,
@@ -748,12 +770,17 @@ export function encodeStream(
 													index: idx,
 													...(extraContent ? { extra_content: extraContent } : {}),
 													...(correctId !== undefined ? { id: correctId } : {}),
-													...(correctName !== undefined || correctArguments !== undefined
+													...(correctName !== undefined ||
+													correctArguments !== undefined ||
+													functionSignature !== undefined
 														? {
 																function: {
 																	...(correctName !== undefined ? { name: correctName } : {}),
 																	...(correctArguments !== undefined
 																		? { arguments: correctArguments }
+																		: {}),
+																	...(functionSignature !== undefined
+																		? { thought_signature: functionSignature }
 																		: {}),
 																},
 															}

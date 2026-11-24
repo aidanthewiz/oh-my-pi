@@ -92,6 +92,9 @@ async function createGoalHarness(shared: SharedFixture): Promise<GoalHarness> {
 				tools: initialTools,
 				messages: [],
 			},
+			streamFn: () => {
+				throw new Error("Unexpected network model request in goal fixture");
+			},
 		}),
 		sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
 		settings,

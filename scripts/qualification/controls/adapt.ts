@@ -54,6 +54,35 @@ export function adaptFixture(id: string, raw: string, checkout: string): string 
 		);
 		text = text.replace("externalNetworkDeniedByParent: true", "externalFetchIntercepted: true");
 	}
+	if (id === "mcp") {
+		const oldHttpPath = "packages/coding-agent/src/mcp/transports/http.ts";
+		assert.equal(text.split(oldHttpPath).length, 3);
+		text = text.replaceAll(oldHttpPath, "packages/coding-agent/src/mcp/host/http-upstream.ts");
+		text = replaceOne(text, "const { HttpTransport } =", "const { HttpUpstream } =");
+		text = replaceOne(
+			text,
+			"new HttpTransport(config)",
+			"new HttpUpstream({ transport: 'http', url: config.url, headers: {}, timeoutMs: config.timeout }, 'legacy')",
+		);
+		text = replaceOne(
+			text,
+			"real HttpTransport/client/MCPTool serialization and retry code",
+			"real HttpUpstream legacy binding/client/MCPTool serialization and retry code",
+		);
+	}
+	if (id === "stream") {
+		text = replaceOne(
+			text,
+			"o/run/daemons/0000000000000000/stream.sock",
+			"o/run/daemon/streams/0000000000000000/stream.sock",
+		);
+		text = replaceOne(text, "setAgentDir, getDaemonRuntimeDir", "setAgentDir, getDaemonDir");
+		text = replaceOne(
+			text,
+			'path.join(getDaemonRuntimeDir(await fs.realpath(cwd)), "stream.sock")',
+			'path.join(getDaemonDir(), "streams", Bun.hash.wyhash(await fs.realpath(cwd)).toString(16).padStart(16, "0"), "stream.sock")',
+		);
+	}
 	if (id === "provider") {
 		text = replaceOne(
 			text,
@@ -97,6 +126,11 @@ export function adaptFixture(id: string, raw: string, checkout: string): string 
 			text,
 			"['--no-env-file', import.meta.path, bindingFile, 'cli-child', config]",
 			"[...(process.env.PI_COMPILED === 'true' ? [] : ['--no-env-file', import.meta.path]), bindingFile, 'cli-child', config]",
+		);
+		text = replaceOne(
+			text,
+			"  await runAuthBrokerCommand({ action: 'serve', flags: { bind: '127.0.0.1:0' } });",
+			"  utils.postmortem.installProcessHandlers();\n  await runAuthBrokerCommand({ action: 'serve', flags: { bind: '127.0.0.1:0' } });",
 		);
 	}
 	if (id === "browser") {

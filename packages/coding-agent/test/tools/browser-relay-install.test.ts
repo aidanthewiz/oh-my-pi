@@ -9,13 +9,17 @@ afterEach(async () => {
 });
 
 describe("browser-relay install", () => {
-	it("installs legal files without overwriting the injected relay token", async () => {
+	it("installs complete current legal files without changing legacy relay data", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "coreforge-relay-install-"));
 		temporaryDirectories.push(root);
 		const home = path.join(root, "home");
 		const extensionDir = path.join(root, "extension");
 		const repoRoot = path.resolve(import.meta.dir, "../../../..");
 		const cli = path.join(repoRoot, "packages", "coding-agent", "src", "cli.ts");
+		const legacyToken = path.join(home, ".omp", "browser-relay", "token");
+		const legacyValue = "synthetic-legacy-relay-token";
+		await fs.mkdir(path.dirname(legacyToken), { recursive: true });
+		await fs.writeFile(legacyToken, legacyValue);
 		const proc = Bun.spawn(
 			[process.execPath, "--no-env-file", cli, "browser-relay", "install", "--dir", extensionDir],
 			{
@@ -32,13 +36,14 @@ describe("browser-relay install", () => {
 		]);
 		expect(exitCode, `${stdout}\n${stderr}`).toBe(0);
 
-		const token = await fs.readFile(path.join(home, ".omp", "browser-relay", "token"), "utf8");
+		expect(await fs.readFile(legacyToken, "utf8")).toBe(legacyValue);
 		const background = await fs.readFile(path.join(extensionDir, "background.js"), "utf8");
-		expect(background).toContain(JSON.stringify(token));
-		expect(background).not.toContain("__COREFORGE_BROWSER_RELAY_TOKEN__");
-		expect(await fs.readFile(path.join(extensionDir, "LICENSE"), "utf8")).toContain("MIT License");
-		expect(await fs.readFile(path.join(extensionDir, "THIRD-PARTY-NOTICES.txt"), "utf8")).toContain(
-			"COREFORGE THIRD-PARTY NOTICES",
+		expect(background).not.toContain(legacyValue);
+		expect(await fs.readFile(path.join(extensionDir, "LICENSE"), "utf8")).toBe(
+			await fs.readFile(path.join(repoRoot, "LICENSE"), "utf8"),
+		);
+		expect(await fs.readFile(path.join(extensionDir, "THIRD-PARTY-NOTICES.txt"), "utf8")).toBe(
+			await fs.readFile(path.join(repoRoot, "THIRD-PARTY-NOTICES.txt"), "utf8"),
 		);
 	});
 });

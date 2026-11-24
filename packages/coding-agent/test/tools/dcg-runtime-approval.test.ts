@@ -16,7 +16,7 @@ import type {
 import { ExtensionToolWrapper } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import type { ClientBridge } from "@oh-my-pi/pi-coding-agent/session/client-bridge";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
-import { closeDaemonClients } from "@oh-my-pi/pi-coding-agent/launch/client";
+import { closeDaemonClient, isolateDaemonForSmokeTest } from "@oh-my-pi/pi-coding-agent/daemon/client";
 import { stopService } from "@oh-my-pi/pi-coding-agent/launch/services";
 import { BashTool, type BashToolInput } from "@oh-my-pi/pi-coding-agent/tools/bash";
 import { removeSyncWithRetries } from "@oh-my-pi/pi-utils";
@@ -27,6 +27,7 @@ const DCG_ENV_KEYS = [
 	"OMP_DCG_BINARY_SHA256",
 	"OMP_DCG_CONFIG",
 	"OMP_DCG_CONFIG_SHA256",
+	"PI_NO_PTY",
 ] as const;
 
 describe.skipIf(process.platform === "win32")("DCG runtime approval", () => {
@@ -35,10 +36,13 @@ describe.skipIf(process.platform === "win32")("DCG runtime approval", () => {
 	let tool: BashTool;
 	let session: ToolSession;
 	let previousEnv: Record<string, string | undefined>;
+	let cleanupDaemon: (() => Promise<void>) | undefined;
 
-	beforeAll(() => {
+	beforeAll(async () => {
 		previousEnv = Object.fromEntries(DCG_ENV_KEYS.map(key => [key, process.env[key]]));
+		delete process.env.PI_NO_PTY;
 		tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-dcg-runtime-"));
+		cleanupDaemon = await isolateDaemonForSmokeTest();
 		const dcgPath = path.join(tempDir, "dcg-ask.ts");
 		const dcgProgram = `#!/usr/bin/env bun
 const command = await Bun.stdin.text();
@@ -107,7 +111,8 @@ process.exit(1);
 		tool = new BashTool(session);
 	});
 
-	afterAll(() => {
+	afterAll(async () => {
+		await cleanupDaemon?.();
 		for (const [key, value] of Object.entries(previousEnv)) {
 			if (value === undefined) delete process.env[key];
 			else process.env[key] = value;
@@ -156,7 +161,7 @@ process.exit(1);
 		} as unknown as NonNullable<AgentToolContext["ui"]>;
 	}
 
-	it("selects the configured shell dialect for local PTY execution", async () => {
+	it("guards local embedded PTY commands as POSIX regardless of the external shell setting", async () => {
 		for (const [shellName, dialect] of [
 			["cmd.exe", "cmd"],
 			["pwsh", "ps"],
@@ -182,7 +187,7 @@ process.exit(1);
 			const routeTool = new BashTool(routeSession);
 			const approval = await routeTool.prepareRuntimeApproval(
 				`dcg-${dialect}-call`,
-				{ command: `printf expected-${dialect}`, cwd: tempDir, pty: true },
+				{ command: "printf native-posix", cwd: tempDir, pty: true },
 				undefined,
 				{ hasUI: true, ui: {} } as AgentToolContext,
 			);
@@ -303,12 +308,13 @@ process.exit(1);
 		);
 	});
 
-	it("starts a local PTY with the isolated session shell reviewed by DCG", async () => {
+	it("runs a local PTY in the reviewed embedded shell, not the external shell setting", async () => {
 		const marker = path.join(tempDir, "prepared-pty-shell");
+		const externalMarker = path.join(tempDir, "unreviewed-external-shell");
 		const shellDir = path.join(tempDir, "isolated-pty-shell");
 		fs.mkdirSync(shellDir);
 		const shellPath = path.join(shellDir, "pwsh");
-		fs.writeFileSync(shellPath, `#!/bin/sh\nprintf prepared > '${marker}'\nexit 0\n`, { mode: 0o755 });
+		fs.writeFileSync(shellPath, `#!/bin/sh\nprintf external > '${externalMarker}'\nexit 0\n`, { mode: 0o755 });
 		const routeSettings = Settings.isolated({
 			"async.enabled": false,
 			"bash.autoBackground.enabled": false,
@@ -328,7 +334,7 @@ process.exit(1);
 		const routeTool = new BashTool(routeSession);
 		const ui = headlessUi();
 		const context = { hasUI: true, ui } as AgentToolContext;
-		const args: BashToolInput = { command: "printf expected-ps", cwd: tempDir, pty: true };
+		const args: BashToolInput = { command: `printf embedded > '${marker}'`, cwd: tempDir, pty: true };
 		const toolCallId = "dcg-isolated-pty-call";
 
 		const approval = await routeTool.prepareRuntimeApproval(toolCallId, args, undefined, context);
@@ -336,7 +342,8 @@ process.exit(1);
 		routeTool.approveRuntimeApproval(toolCallId, args);
 		await routeTool.execute(toolCallId, args, undefined, undefined, context);
 
-		expect(fs.readFileSync(marker, "utf8")).toBe("prepared");
+		expect(fs.readFileSync(marker, "utf8")).toBe("embedded");
+		expect(fs.existsSync(externalMarker)).toBe(false);
 	});
 
 	it("uses the native approval selector, notifies the terminal, and executes only after approval", async () => {
@@ -560,7 +567,7 @@ process.exit(1);
 			expect(result.content[0]).toMatchObject({ type: "text", text: expect.stringContaining("svc-ask") });
 		} finally {
 			await stopService(session, "approved-service").catch(() => undefined);
-			await closeDaemonClients();
+			await closeDaemonClient();
 		}
 	});
 
@@ -591,7 +598,7 @@ process.exit(1);
 			expect(fs.readFileSync(envMarker, "utf8")).toBe("prepared");
 		} finally {
 			await stopService(serviceSession, "prefix-once-service").catch(() => undefined);
-			await closeDaemonClients();
+			await closeDaemonClient();
 			shellConfig.mockRestore();
 		}
 	});
@@ -660,7 +667,7 @@ process.exit(1);
 			).rejects.toThrow("Custom service block");
 		} finally {
 			await stopService(interceptorSession, "blocked-service").catch(() => undefined);
-			await closeDaemonClients();
+			await closeDaemonClient();
 		}
 	});
 
@@ -678,7 +685,7 @@ process.exit(1);
 			expect(result.content[0]).toMatchObject({ type: "text", text: expect.stringContaining("svc-allow") });
 		} finally {
 			await stopService(session, "allowed-service").catch(() => undefined);
-			await closeDaemonClients();
+			await closeDaemonClient();
 		}
 	});
 });

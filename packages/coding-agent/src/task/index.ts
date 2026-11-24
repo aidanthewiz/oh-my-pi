@@ -33,6 +33,7 @@ import taskFollowUpTemplate from "../prompts/tools/task-follow-up.md" with { typ
 import { TASK_EFFORTS, type TaskEffort } from "@oh-my-pi/pi-tui/thinking";
 import { truncateForPrompt } from "../tools/approval";
 import { hasWaitTool } from "../tools/wait";
+import { IrcBus } from "../irc/bus";
 import { isIrcEnabled } from "../irc/messaging";
 import { isReadOnlyAgent } from "./read-only-policy";
 import { formatTaskResultSummary } from "./result-summary";
@@ -71,7 +72,6 @@ import {
 	cfgTaskBatch,
 	cfgTaskDisabledAgents,
 	cfgTaskEnableEffort,
-	cfgTaskEnableLsp,
 	cfgTaskIsolationApply,
 	cfgTaskIsolationEnabled,
 	cfgTaskMaxConcurrency,
@@ -554,7 +554,7 @@ export function buildSpecializationAdvisory(
 	return prompt
 		.render(taskSpecializationAdvisoryTemplate, {
 			count: generics.length,
-			agent: generics[0],
+			agents: [...new Set(generics)].map(name => `\`${name}\``).join(", "),
 			scoutAvailable,
 		})
 		.trim();
@@ -923,7 +923,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	#outputManager(): AgentOutputManager {
 		let manager = this.session.agentOutputManager;
 		if (!manager) {
-			manager = new AgentOutputManager(this.session.getArtifactsDir ?? (() => null));
+			manager = new AgentOutputManager(this.session.getArtifactsDir ?? (() => null), {
+				settings: this.session.settings,
+			});
 			this.session.agentOutputManager = manager;
 		}
 		return manager;
@@ -991,7 +993,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			...this.#effortParams(params),
 			...("isolated" in params ? { isolation: { requested: params.isolated } } : {}),
 			blockedAgent: this.#blockedAgent,
-			enableLsp: (this.session.enableLsp ?? true) && cfgTaskEnableLsp.get(this.session.settings),
+			enableLsp: this.session.enableLsp ?? true,
 			enableIrc: isIrcEnabled(this.session.settings, this.session.taskDepth ?? 0),
 			maxRuntimeMs: cfgTaskMaxRuntimeMs.get(this.session.settings),
 		});
@@ -1453,19 +1455,19 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			// nothing about the worktree itself: the runner keeps it when captured
 			// changes could not be written, and names that path in the result.
 			const isolated = spawnParams.isolated === true;
-			const transcriptAvailable = aborted ? await hasResolvableTranscript(agentId) : true;
 			const owner = spawnRun?.ownerRef;
-			const ref = aborted && AgentRegistry.global().get(agentId) === owner ? owner : undefined;
+			const transcriptAvailable = await hasResolvableTranscript(agentId);
+			const ref = AgentRegistry.global().get(agentId) === owner ? owner : undefined;
 			return `\n\n${prompt.render(taskFollowUpTemplate, {
 				agentId,
 				aborted,
 				isolated,
 				ircEnabled,
-				resumable: !isolated && isResumable(ref),
+				resumable: !isolated && transcriptAvailable && (Boolean(ref?.session) || isResumable(ref)),
 				transcriptAvailable,
 			})}`;
 		};
-		return manager.register(
+		const jobId = manager.register(
 			"task",
 			agentId,
 			async ({ jobId, signal: runSignal, reportProgress, markRunning }) => {
@@ -1645,6 +1647,17 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				},
 			},
 		);
+		// A spawn that ends without ever registering its agent (cancelled while
+		// queued, or failed before its session opened) never takes the messages
+		// held for it; drop them so none reach a later agent of the same id.
+		const dropHeld = () => {
+			if (AgentRegistry.global().get(agentId)) return;
+			const bus = IrcBus.existing();
+			let held = bus?.take(agentId);
+			while (held) held = bus?.take(agentId);
+		};
+		void manager.getJob(jobId)?.promise.then(dropHeld, dropHeld);
+		return jobId;
 	}
 
 	/**
@@ -1852,7 +1865,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				acquiredAt: launchTiming?.acquiredAt,
 				...("isolated" in params ? { isolation: { requested: params.isolated } } : {}),
 				blockedAgent: this.#blockedAgent,
-				enableLsp: (this.session.enableLsp ?? true) && cfgTaskEnableLsp.get(this.session.settings),
+				enableLsp: this.session.enableLsp ?? true,
 				enableIrc: isIrcEnabled(this.session.settings, this.session.taskDepth ?? 0),
 				maxRuntimeMs: cfgTaskMaxRuntimeMs.get(this.session.settings),
 				signal,

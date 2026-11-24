@@ -16,12 +16,14 @@ import type { Extension } from "./types";
 
 // Bumped whenever canBindAfterStartup counts a new registration, so verdicts recorded without it
 // are not trusted.
-const CACHE_PREFIX = "extension_startup:v2:";
+const CACHE_PREFIX = "extension_startup:v3:";
 const CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 
 interface StartupVerdict {
 	fingerprint: string;
 	deferrable: boolean;
+	/** Todo backend ids the extension registered: selecting one keeps it eager. */
+	todoBackends: string[];
 }
 
 /** Discovered extension paths split by whether they must bind before the session is created. */
@@ -44,16 +46,25 @@ function readVerdict(storage: AgentStorageApi, resolvedPath: string): StartupVer
 		const raw = storage.getCache(`${CACHE_PREFIX}${resolvedPath}`);
 		if (!raw) return undefined;
 		const parsed: unknown = JSON.parse(raw);
-		if (!isRecord(parsed) || typeof parsed.fingerprint !== "string" || typeof parsed.deferrable !== "boolean") {
+		if (
+			!isRecord(parsed) ||
+			typeof parsed.fingerprint !== "string" ||
+			typeof parsed.deferrable !== "boolean" ||
+			!Array.isArray(parsed.todoBackends) ||
+			!parsed.todoBackends.every(id => typeof id === "string")
+		) {
 			return undefined;
 		}
-		return { fingerprint: parsed.fingerprint, deferrable: parsed.deferrable };
+		return { fingerprint: parsed.fingerprint, deferrable: parsed.deferrable, todoBackends: parsed.todoBackends };
 	} catch {
 		return undefined;
 	}
 }
 
-/** Whether observed factory registrations contain no startup-sensitive state. */
+/**
+ * Whether observed factory registrations contain no startup-sensitive state.
+ * Selected todo backends are kept eager by {@link partitionStartupExtensions}.
+ */
 export function canBindAfterStartup(extension: Extension): boolean {
 	return (
 		extension.registersProviders !== true &&
@@ -71,18 +82,19 @@ export function canBindAfterStartup(extension: Extension): boolean {
 /**
  * Split admitted extension paths using a prior factory's scheduling hint.
  * A matching entry-file fingerprint does not establish trust or current behavior.
- * Order within each list follows `paths`.
+ * The selected `todoBackend` stays eager. Order within each list follows `paths`.
  */
 export async function partitionStartupExtensions(
 	storage: AgentStorageApi,
 	paths: readonly string[],
 	cwd: string,
+	todoBackend: string,
 ): Promise<StartupExtensionPartition> {
 	const deferrable = await Promise.all(
 		paths.map(async extensionPath => {
 			const resolvedPath = resolvePath(extensionPath, cwd);
 			const verdict = readVerdict(storage, resolvedPath);
-			if (!verdict?.deferrable) return false;
+			if (!verdict?.deferrable || verdict.todoBackends.includes(todoBackend)) return false;
 			return verdict.fingerprint === (await fingerprintSource(resolvedPath));
 		}),
 	);
@@ -104,7 +116,11 @@ export async function recordStartupVerdicts(storage: AgentStorageApi, extensions
 			if (extension.resolvedPath.startsWith("<inline")) return;
 			const fingerprint = await fingerprintSource(extension.resolvedPath);
 			if (fingerprint === undefined) return;
-			const verdict: StartupVerdict = { fingerprint, deferrable: canBindAfterStartup(extension) };
+			const verdict: StartupVerdict = {
+				fingerprint,
+				deferrable: canBindAfterStartup(extension),
+				todoBackends: [...(extension.todoBackends?.keys() ?? [])],
+			};
 			try {
 				storage.setCache(`${CACHE_PREFIX}${extension.resolvedPath}`, JSON.stringify(verdict), expiresAtSec);
 			} catch (error) {

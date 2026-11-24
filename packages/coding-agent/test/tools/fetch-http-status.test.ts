@@ -16,7 +16,7 @@ function makeSession(fetch?: FetchImpl): ToolSession {
 		getSessionFile: () => path.join(cwd, "session.jsonl"),
 		getArtifactsDir: () => artifactsDir,
 		getSessionSpawns: () => null,
-		allocateOutputArtifact: async toolType => ({ id: "test", path: path.join(artifactsDir, `test.${toolType}.log`) }),
+		allocateOutputArtifact: async () => ({ id: "test", path: path.join(artifactsDir, "test.log") }),
 		settings: Settings.isolated({ "fetch.enabled": true, "providers.webKeyless": true }),
 		fetch,
 	};
@@ -31,6 +31,7 @@ describe("read URL HTTP status without a body", () => {
 
 	it("reports a bodyless 204 as a successful empty read, not a failed fetch", async () => {
 		const server = Bun.serve({
+			hostname: "127.0.0.1",
 			port: 0,
 			fetch: () => new Response(null, { status: 204, headers: { "content-type": "text/html" } }),
 		});
@@ -46,7 +47,7 @@ describe("read URL HTTP status without a body", () => {
 	});
 
 	it("reports a bodyless 503 as a failed fetch", async () => {
-		const server = Bun.serve({ port: 0, fetch: () => new Response(null, { status: 503 }) });
+		const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response(null, { status: 503 }) });
 		servers.push(server);
 		const result = await new ReadTool(makeSession()).execute("call", {
 			path: `http://127.0.0.1:${server.port}/healthz`,

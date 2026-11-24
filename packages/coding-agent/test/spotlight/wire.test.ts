@@ -6,12 +6,14 @@ import type { AgentMessage, AgentTool, AgentToolContext, AgentToolResult } from 
 import type { Message } from "@oh-my-pi/pi-ai";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import * as bashExecutor from "@oh-my-pi/pi-coding-agent/exec/bash-executor";
+import { resolveToolCallIntent } from "@oh-my-pi/pi-coding-agent/job-widgets/intent";
 import type { CustomEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { SpotlightClient } from "@oh-my-pi/pi-coding-agent/spotlight/client";
 import { type CalledToolResult, shapeCalledTool } from "@oh-my-pi/pi-coding-agent/spotlight/index";
 import { buildCallContext, callSummary } from "@oh-my-pi/pi-coding-agent/spotlight/context";
 import { RecordingScorer } from "@oh-my-pi/pi-coding-agent/spotlight/scorer";
+import { readArtifactText } from "@oh-my-pi/pi-coding-agent/spotlight/sink";
 import {
 	SpotlightExperiment,
 	type SpotlightExperimentOptions,
@@ -163,10 +165,10 @@ describe("spotlight artifact reads", () => {
 		const experiment = new SpotlightExperiment(spotlightClient(fakeSpotlight({})), "low", manager);
 		const content = "é".repeat(SPOTLIGHT_FULL_OUTPUT_MAX_BYTES / 2);
 		try {
-			const id = await manager.saveArtifact(content, "bash");
-			const oversizedId = await manager.saveArtifact(`${content}é`, "bash");
+			const id = await manager.saveArtifact(content);
+			const oversizedId = await manager.saveArtifact(`${content}é`);
 			if (id === undefined || oversizedId === undefined) throw new Error("Expected session artifact ids");
-			expect(await experiment.readArtifact(`artifact://${id}`)).toBe(content);
+			expect(await experiment.readArtifact(`local://${id}.log`)).toBe(content);
 			expect(await experiment.readArtifact(oversizedId)).toBeNull();
 		} finally {
 			await manager.close();
@@ -179,14 +181,13 @@ describe("spotlight artifact reads", () => {
 		const manager = SessionManager.create(cwd, path.join(cwd, "sessions"));
 		const experiment = new SpotlightExperiment(spotlightClient(fakeSpotlight({})), "low", manager);
 		try {
-			const id = await manager.saveArtifact("owned output", "bash");
+			const id = await manager.saveArtifact("owned output");
 			if (id === undefined) throw new Error("Expected a persisted artifact id");
 			expect(await experiment.readArtifact(id)).toBe("owned output");
-			const artifactsDir = manager.getArtifactsDir();
-			if (!artifactsDir) throw new Error("Expected a session artifact directory");
+			const artifactsDir = manager.getArtifactManager().dir;
 			const privatePath = path.join(cwd, "private.log");
 			await Bun.write(privatePath, "another owner's content");
-			await fs.symlink(privatePath, path.join(artifactsDir, "99.bash.log"));
+			await fs.symlink(privatePath, path.join(artifactsDir, "99.log"));
 			expect(await experiment.readArtifact("99")).toBeNull();
 			manager.releaseRetainedEntries();
 			expect(await experiment.readArtifact(id)).toBeNull();
@@ -254,7 +255,7 @@ describe("spotlight shaping hooks", () => {
 		const text = resultText(await new BashTool(session).execute("b2", { command: "./ingest.sh" }));
 
 		expect(text).toContain("ERROR: connection refused at db.ts:42");
-		expect(text).toMatch(/artifact:\/\/\d+/);
+		expect(text).toMatch(/local:\/\/\d+\.log/);
 		expect(text).not.toContain("step 300:");
 		const [entry] = entries(manager, SPOTLIGHT_ENTRY.shape);
 		expect(entry).toMatchObject({ toolCallId: "b2", tool: "bash", inChars: LONG_LOG.length });
@@ -275,8 +276,7 @@ describe("spotlight shaping hooks", () => {
 		expect(trace).toMatchObject({ tool: "bash", inChars: LONG_LOG.length });
 		expect(trace.savedTokens).toBe(trace.inTokens - trace.outTokens);
 		expect(trace.savedTokens).toBeGreaterThan(0);
-		const id = trace.original.url.replace("artifact://", "");
-		expect(await manager.getArtifactContent(id, SPOTLIGHT_FULL_OUTPUT_MAX_BYTES)).toBe(LONG_LOG);
+		expect(await readArtifactText(manager, trace.original.url)).toBe(LONG_LOG);
 		// Line 201 is the error: the hottest line, and shown to the agent; most of the log was not. The rest tie, so
 		// they share one rank.
 		const heat = trace.original.heat;
@@ -358,6 +358,55 @@ describe("spotlight shaping hooks", () => {
 	});
 });
 
+describe("spotlight access denial", () => {
+	it("stops asking for a waitlisted account, says so once, and asks again for another account", async () => {
+		const credential = new StencilCredential();
+		let token = "waitlisted-account";
+		const resolve = vi.spyOn(credential, "resolve").mockImplementation(async () => token);
+		const sent: (string | null)[] = [];
+		const denying = (async (_url: string | URL | Request, init?: RequestInit) => {
+			const headers = new Headers(init?.headers);
+			sent.push(headers.get("user-agent"));
+			if (headers.get("authorization") === "Bearer waitlisted-account") {
+				return Response.json(
+					{ error: "waitlisted", message: "This Stencil account does not have Stencil Cloud access yet." },
+					{ status: 403 },
+				);
+			}
+			return Response.json({ answers: { line: { scores: [0.5] } }, usage: { input_tokens: 1 } });
+		}) as typeof fetch;
+		const client = new SpotlightClient({
+			url: "http://waitlisted.test/v1/spotlight",
+			timeoutMs: 2_000,
+			credential,
+			fetch: denying,
+		});
+		const denied: string[] = [];
+		client.onAccessDenied = reason => denied.push(reason);
+		const ctx = buildCallContext([], "x", "./ingest.sh", undefined);
+		const score = async () => {
+			const scorer = new RecordingScorer(client, "low");
+			return { scores: await scorer.score(["a"], ctx), usage: scorer.usage };
+		};
+
+		for (let call = 0; call < 3; call++) {
+			const result = await score();
+			expect(result.scores).toBeNull();
+			expect(result.usage.failureCauses).toEqual({ waitlisted: 1 });
+		}
+		// The warm-up stays quiet too: it would send right after its credential lookup settles.
+		client.warm();
+		await resolve.mock.results.at(-1)?.value;
+		expect(sent).toHaveLength(1);
+		expect(sent[0]).toStartWith("omp/");
+		expect(denied).toEqual(["This Stencil account does not have Stencil Cloud access yet."]);
+
+		token = "admitted-account";
+		expect((await score()).scores).toEqual([0.5]);
+		expect(sent).toHaveLength(2);
+	});
+});
+
 /** A source file well past `plain`'s read page (300 lines), which shaping outlines. */
 const BIG_SOURCE = Array.from(
 	{ length: 120 },
@@ -386,17 +435,8 @@ describe("spotlight holdout", () => {
 		if (!trace?.original?.shapedUrl) throw new Error("a held-out cut keeps its would-be text");
 		expect(trace).toMatchObject({ holdout: true, savedTokens: trace.inTokens - trace.outTokens });
 		expect(trace.savedTokens).toBeGreaterThan(0);
-		expect(
-			await held.manager.getArtifactContent(
-				trace.original.url.replace("artifact://", ""),
-				SPOTLIGHT_FULL_OUTPUT_MAX_BYTES,
-			),
-		).toBe(LONG_LOG);
-		const wouldBe =
-			(await held.manager.getArtifactContent(
-				trace.original.shapedUrl.replace("artifact://", ""),
-				SPOTLIGHT_FULL_OUTPUT_MAX_BYTES,
-			)) ?? "";
+		expect(await readArtifactText(held.manager, trace.original.url)).toBe(LONG_LOG);
+		const wouldBe = (await readArtifactText(held.manager, trace.original.shapedUrl)) ?? "";
 		expect(wouldBe).toContain("ERROR: connection refused at db.ts:42");
 		expect(wouldBe).not.toContain("step 300:");
 		expect(wouldBe.length).toBe(entry.outChars as number);
@@ -421,9 +461,7 @@ describe("spotlight holdout", () => {
 		if (!shapedUrl) throw new Error("a held-out cut keeps its would-be text");
 		expect(trace).toMatchObject({ holdout: true, tool: "read" });
 		expect(trace?.original?.lines).toBeGreaterThan(1_500);
-		expect(
-			await held.manager.getArtifactContent(shapedUrl.replace("artifact://", ""), SPOTLIGHT_FULL_OUTPUT_MAX_BYTES),
-		).toContain("export function step119");
+		expect(await readArtifactText(held.manager, shapedUrl)).toContain("export function step119");
 	});
 
 	it("applies every cut with holdout 0", async () => {
@@ -620,7 +658,7 @@ describe("spotlight plain baseline", () => {
 
 	/** Every bash call spills: the sink keeps the last 300 lines and the session holds the whole output. */
 	async function spill(manager: SessionManager): Promise<void> {
-		const artifactId = await manager.saveArtifact(FULL, "bash");
+		const artifactId = await manager.saveArtifact(FULL);
 		if (artifactId === undefined) throw new Error("the in-memory session keeps artifacts");
 		vi.spyOn(bashExecutor, "executeBash").mockResolvedValue({
 			...bashOutput(FULL.split("\n").slice(-300).join("\n")),
@@ -646,7 +684,7 @@ describe("spotlight plain baseline", () => {
 		const cut = await new BashTool(shaping.session).execute("b1", { command: "./ingest.sh" });
 
 		const plain = await plainText();
-		expect(plain).toContain("artifact://");
+		expect(plain).toMatch(/local:\/\/\d+\.log/);
 		const trace = cut.details?.spotlight;
 		if (!trace?.original) throw new Error("the spilled output was shaped whole and cut");
 		expect(trace.inChars).toBe(FULL.length);
@@ -692,7 +730,7 @@ describe("spotlight column-capped output", () => {
 	it("gives a short cut of the whole artifact over the column cap's preview, counting what it costs", async () => {
 		const client = spotlightClient(fakeSpotlight({ score: item => (item.includes("on_hold") ? 1 : 0.05) }));
 		const { session, manager } = await experimentSession(client);
-		const artifactId = await manager.saveArtifact(FULL, "bash");
+		const artifactId = await manager.saveArtifact(FULL);
 		if (artifactId === undefined) throw new Error("the in-memory session keeps artifacts");
 		const preview = `${FULL.slice(0, 768)}…`;
 		const capped: bashExecutor.BashResult = {
@@ -718,7 +756,7 @@ describe("spotlight column-capped output", () => {
 	it("still says a timed-out command timed out when its cut comes from the artifact", async () => {
 		const client = spotlightClient(fakeSpotlight({ score: item => (item.includes("on_hold") ? 1 : 0.05) }));
 		const { session, manager } = await experimentSession(client);
-		const artifactId = await manager.saveArtifact(FULL, "bash");
+		const artifactId = await manager.saveArtifact(FULL);
 		if (artifactId === undefined) throw new Error("the in-memory session keeps artifacts");
 		// The sink puts its timeout notice above the preview; the artifact holds only what the command printed.
 		const preview = `[Command timed out after 1 seconds]\n${FULL.slice(0, 768)}…`;
@@ -847,14 +885,14 @@ function grepOutput(files: number, perFile = 10): string {
 }
 
 /** A tool without shaping of its own, wrapped as sessions wrap every tool, returning `text`. */
-function fakeTool(name: string, text: string): AgentTool {
+function fakeTool(name: string, text: string, isError = false): AgentTool {
 	return wrapToolWithMetaNotice({
 		name,
 		label: name,
 		description: `fake ${name}`,
 		parameters: {},
 		async execute() {
-			return { content: [{ type: "text", text }] };
+			return { content: [{ type: "text", text }], ...(isError ? { isError: true } : {}) };
 		},
 	} as unknown as AgentTool);
 }
@@ -925,9 +963,9 @@ describe("spotlight shaping of any tool", () => {
 		expect(text.length).toBeLessThan(OUTPUT.length / 4);
 		expect(sources).toContain(callSummary("grep", ARGS));
 		// Every hidden run reads back from the saved copy the last line names.
-		const footer = /\[cut: (artifact:\/\/(\d+))\]$/.exec(text);
+		const footer = /\[cut: (local:\/\/(\d+)\.log)\]$/.exec(text);
 		if (!footer) throw new Error("a cut names where its hidden lines are");
-		const saved = (await run.manager.getArtifactContent(footer[2], SPOTLIGHT_FULL_OUTPUT_MAX_BYTES)) ?? "";
+		const saved = (await readArtifactText(run.manager, footer[1])) ?? "";
 		expect(saved).toBe(OUTPUT);
 		// The trace's original is that same copy, not a second one.
 		expect(result.details?.spotlight?.original?.url).toBe(footer[1]);
@@ -948,12 +986,7 @@ describe("spotlight shaping of any tool", () => {
 		});
 		expect(trace.savedTokens).toBe(countTokens(OUTPUT) - trace.outTokens);
 		expect(trace.savedTokens).toBeGreaterThan(0);
-		expect(
-			await run.manager.getArtifactContent(
-				trace.original.url.replace("artifact://", ""),
-				SPOTLIGHT_FULL_OUTPUT_MAX_BYTES,
-			),
-		).toBe(OUTPUT);
+		expect(await readArtifactText(run.manager, trace.original.url)).toBe(OUTPUT);
 		const [entry] = entries(run.manager, SPOTLIGHT_ENTRY.shape);
 		expect(entry).toMatchObject({ toolCallId: "g1", tool: "grep", plainTokens: countTokens(OUTPUT) });
 		expect(entry.steps).toContain("window");
@@ -964,7 +997,7 @@ describe("spotlight shaping of any tool", () => {
 		const plain = await plainSession(SMALL_SPILL);
 		const plainResult = await agentCall(fakeTool("grep", big), plain, "g1", ARGS);
 		const plainText = resultText(plainResult);
-		expect(plainText).toContain("artifact://");
+		expect(plainText).toMatch(/local:\/\/\d+\.log/);
 		expect(plainText.length).toBeLessThan(big.length / 4);
 
 		const run = await experimentSession(ranked(), SMALL_SPILL);
@@ -992,9 +1025,7 @@ describe("spotlight shaping of any tool", () => {
 		if (!shapedUrl) throw new Error("a held-out cut keeps its would-be text");
 		expect(trace).toMatchObject({ holdout: true, tool: "find", plainTokens: countTokens(OUTPUT) });
 		expect(trace?.savedTokens).toBeGreaterThan(0);
-		expect(
-			await run.manager.getArtifactContent(shapedUrl.replace("artifact://", ""), SPOTLIGHT_FULL_OUTPUT_MAX_BYTES),
-		).toContain(NEEDED);
+		expect(await readArtifactText(run.manager, shapedUrl)).toContain(NEEDED);
 		expect(entries(run.manager, SPOTLIGHT_ENTRY.shape)[0]).toMatchObject({ tool: "find", holdout: true });
 	});
 
@@ -1046,12 +1077,54 @@ describe("spotlight shaping of any tool", () => {
 		expect(resultText(again)).toBe(
 			[
 				"board: 10 open, 2 done",
-				"… [10 lines as shown before: read artifact://0:2-11]",
+				"… [10 lines as shown before: read local://0.log:2-11]",
 				"- [done] add the edit gate setting",
 			].join("\n"),
 		);
 		const entry = entries(run.manager, SPOTLIGHT_ENTRY.shape)[1];
 		expect(entry).toMatchObject({ toolCallId: "t2", steps: ["seen"], stats: { short: 1, seenLines: 10 } });
+	});
+
+	it("keeps an edit error's revealed lines whole when their text appeared earlier", async () => {
+		const run = await experimentSession(ranked());
+		await agentCall(fakeTool("board", OPEN.join("\n")), run, "t1");
+		const rejection = [
+			"This edit anchors to lines 15-24 of example.ts that [example.ts#TAG] never displayed.",
+			"Actual file content at those lines:",
+			...OPEN.map((line, i) => `  ${i + 15}: ${line}`),
+			"Verify the content matches what you intend to touch, then re-issue the edit with the same [example.ts#TAG] header — a straight retry now succeeds without a re-read.",
+		].join("\n");
+
+		const result = await agentCall(fakeTool("edit", rejection, true), run, "e1", { path: "example.ts" });
+
+		expect(result.isError).toBe(true);
+		expect(resultText(result)).toBe(rejection);
+		expect(spotlightDetails(result.details)).toBeUndefined();
+	});
+
+	it("keeps a non-edit tool's error result whole without journaling a Spotlight entry", async () => {
+		const run = await experimentSession(ranked());
+		await agentCall(fakeTool("board", BOARD.join("\n")), run, "t1");
+
+		const err = await agentCall(fakeTool("board", NEXT_BOARD, true), run, "t2");
+
+		expect(err.isError).toBe(true);
+		expect(resultText(err)).toBe(NEXT_BOARD);
+		expect(spotlightDetails(err.details)).toBeUndefined();
+		expect(entries(run.manager, SPOTLIGHT_ENTRY.shape).map(e => e.toolCallId)).toEqual(["t1"]);
+	});
+
+	it.each([10, 50])("keeps all %i numbered lines in an edit result when their text appeared earlier", async count => {
+		const run = await experimentSession(ranked());
+		const text = [
+			"Edit preview:",
+			...Array.from({ length: count }, (_, i) => `  ${i + 15}: ${OPEN[i % OPEN.length]}`),
+		].join("\n");
+		await agentCall(fakeTool("edit", text), run, "e1", { path: "example.ts" });
+
+		const again = await agentCall(fakeTool("edit", text), run, "e2", { path: "example.ts" });
+
+		expect(resultText(again)).toBe(text);
 	});
 
 	it("passes a short result whole when its runs already shown are too short to pay for a marker", async () => {
@@ -1096,7 +1169,7 @@ describe("spotlight shaping of any tool", () => {
 		const next = fakeTool("board", NEXT_BOARD);
 		context.push(shown("t1", await agentCall(board, run, "t1")), call("t2"));
 		expect(resultText(await agentCall(next, run, "t2"))).toMatch(
-			/… \[10 lines as shown before: read artifact:\/\/\d+:2-11\]/,
+			/… \[10 lines as shown before: read local:\/\/\d+\.log:2-11\]/,
 		);
 
 		// A compaction leaves its summary and the new turn: the boards are gone from the context.
@@ -1114,7 +1187,7 @@ describe("spotlight shaping of any tool", () => {
 		await agentCall(fakeTool("board", BOARD.join("\n")), run, "t1");
 		const sibling = await agentCall(fakeTool("board", NEXT_BOARD), run, "t2");
 
-		expect(resultText(sibling)).toMatch(/… \[10 lines as shown before: read artifact:\/\/\d+:2-11\]/);
+		expect(resultText(sibling)).toMatch(/… \[10 lines as shown before: read local:\/\/\d+\.log:2-11\]/);
 	});
 
 	it("shapes and journals only the tools spotlight.experiment.tools names", async () => {
@@ -1224,6 +1297,7 @@ describe("spotlight call context", () => {
 			name: "bash",
 			arguments: { command },
 		});
+		const fullIntent = "Checking retry timing: Does http.py:42 honor Retry-After?";
 		const messages = [
 			{ role: "user", content: "fix the flaky test", timestamp: 0 },
 			{ role: "assistant", content: [bash("a", "ls"), bash("b", "git status")] },
@@ -1234,17 +1308,17 @@ describe("spotlight call context", () => {
 				content: [
 					bash("d", "cat log"),
 					{ type: "text", text: "Now the suite." },
-					bash("now", "bun test --rerun"),
+					{ ...bash("now", "bun test --rerun"), intent: `  ${fullIntent}  ` },
 					bash("later", "echo after"),
 				],
 			},
 		] as unknown as AgentMessage[];
 
-		const ctx = buildCallContext(messages, "now", "bun test --rerun", "  rerun the suite ");
+		const ctx = buildCallContext(messages, "now", "bun test --rerun", resolveToolCallIntent(messages, "now"));
 		expect(ctx).toEqual({
 			task: "fix the flaky test",
 			said: "Now the suite.",
-			intent: "rerun the suite",
+			intent: fullIntent,
 			commands: ["git status", "bun test", "cat log"],
 			source: "bun test --rerun",
 		});

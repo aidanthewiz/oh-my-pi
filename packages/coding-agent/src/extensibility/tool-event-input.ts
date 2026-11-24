@@ -1,8 +1,8 @@
 import { HL_FILE_PREFIX, HL_FILE_SUFFIX } from "@oh-my-pi/pi-tui/tools/hashline-format";
-import { parseXdUrl } from "@oh-my-pi/pi-tui/tools/xd-url";
 
 const LEGACY_HASHLINE_FILE_PREFIX = "¶";
 const HASHLINE_FILE_TAG_RE = /#[0-9a-fA-F]{4}$/u;
+const WHITE_SPACE_CHAR_RE = /^\p{White_Space}$/u;
 
 interface ToolEventInputResolver {
 	name: string;
@@ -20,23 +20,10 @@ export interface McpToolEventIdentity {
 	mcpToolName?: string;
 }
 
-/**
- * Preserve an MCP tool's original server and operation names on extension
- * events. For `write xd://<tool>`, resolve the mounted inner tool because the
- * outer transport itself carries no MCP identity.
- */
-export function mcpToolEventIdentity(
-	tool: McpToolIdentitySource,
-	input: Record<string, unknown>,
-	resolveToolByName?: (name: string) => McpToolIdentitySource | undefined,
-): McpToolEventIdentity {
-	let source = tool;
-	if (tool.name === "write" && typeof input.path === "string" && resolveToolByName) {
-		const target = parseXdUrl(input.path);
-		if (target?.name) source = resolveToolByName(target.name) ?? source;
-	}
-	return typeof source.mcpServerName === "string" && typeof source.mcpToolName === "string"
-		? { mcpServerName: source.mcpServerName, mcpToolName: source.mcpToolName }
+/** Preserve the original MCP server and operation identity on canonical tool events. */
+export function mcpToolEventIdentity(tool: McpToolIdentitySource): McpToolEventIdentity {
+	return typeof tool.mcpServerName === "string" && typeof tool.mcpToolName === "string"
+		? { mcpServerName: tool.mcpServerName, mcpToolName: tool.mcpToolName }
 		: {};
 }
 
@@ -75,11 +62,24 @@ function normalizeHashlineHeaderPath(body: string): string | undefined {
 	return rawPath;
 }
 
+/**
+ * Strips trailing Unicode White_Space like Rust's `trim_end`, which the patch
+ * parser applies to headers (`String.prototype.trimEnd` misses U+0085). Scans
+ * backward once: an unanchored `/\p{White_Space}+$/` is quadratic on rows
+ * with long interior whitespace runs. Every White_Space code point is in the
+ * BMP, so stepping by UTF-16 code unit is exact.
+ */
+function trimEndWhiteSpace(line: string): string {
+	let end = line.length;
+	while (end > 0 && WHITE_SPACE_CHAR_RE.test(line[end - 1])) end--;
+	return end === line.length ? line : line.slice(0, end);
+}
+
 function extractHashlinePaths(input: string): string[] {
 	const paths: string[] = [];
 	const stripped = input.startsWith("\uFEFF") ? input.slice(1) : input;
 	for (const rawLine of stripped.split("\n")) {
-		const line = rawLine.replace(/\r$/, "");
+		const line = trimEndWhiteSpace(rawLine);
 		let body: string;
 		if (line.startsWith(HL_FILE_PREFIX) && line.endsWith(HL_FILE_SUFFIX)) {
 			body = line.slice(HL_FILE_PREFIX.length, line.length - HL_FILE_SUFFIX.length);

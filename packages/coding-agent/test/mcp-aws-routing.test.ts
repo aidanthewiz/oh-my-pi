@@ -5,7 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 // Launch provenance is captured at module import, so the bridge runs in a separate process.
-test("managed AWS validates deferred legacy schemas against live profile bindings", async () => {
+test("managed AWS validates current schemas and rejects stale profile choices until catalog refresh", async () => {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "mcp-aws-routing-"));
 	try {
 		const config = path.join(root, "config");
@@ -15,7 +15,8 @@ test("managed AWS validates deferred legacy schemas against live profile binding
 		);
 		const bridge = path.resolve(import.meta.dir, "../src/mcp/tool-bridge.ts");
 		const script = `
-import { MCPTool, DeferredMCPTool } from ${JSON.stringify(bridge)};
+import { MCPTool } from ${JSON.stringify(bridge)};
+import { listTools } from ${JSON.stringify(path.resolve(import.meta.dir, "../src/mcp/client.ts"))};
 const requests = [];
 let connects = 0;
 let reconnects = 0;
@@ -23,14 +24,17 @@ let expired = false;
 const definition = { name: "aws___run_script", inputSchema: { type: "object", properties: { aws_profile: { type: "string", enum: ["commercial", "other", "government", "coreforge"] }, code: { type: "string" } } } };
 const connection = {
  name: "coreforge-aws-agent-toolkit", config: { command: "unused" }, capabilities: { tools: {} },
- transport: { request: async (method, params) => {
+ transport: { connected: true, request: async (method, params) => {
   if (method === "tools/list") return { tools: [definition] };
   requests.push(params.arguments?.aws_profile ?? "knowledge");
   if (expired) return { isError: true, content: [{ type: "text", text: "SSO token expired: login required" }] };
   return { content: [{ type: "text", text: JSON.stringify({ profile: params.arguments?.aws_profile }) }] };
  } },
 };
-const deferred = new DeferredMCPTool(connection.name, definition, async () => { connects++; return connection; }, undefined, async () => { reconnects++; return connection; });
+const deferred = new MCPTool(
+ { ...connection, transport: { ...connection.transport, connected: false } },
+ definition, async () => { connects++; return connection; },
+);
 const context = {};
 const rejected = [];
 for (const selected of [undefined, "government", "coreforge", "missing"]) {
@@ -39,7 +43,7 @@ for (const selected of [undefined, "government", "coreforge", "missing"]) {
  rejected.push({ error: result.isError, text: result.content[0].text });
 }
 const afterRejections = { connects, reconnects, requests: requests.length };
-const direct = new MCPTool(connection, definition);
+const direct = new MCPTool(connection, definition, async () => { reconnects++; return connection; });
 await direct.execute("one", { aws_profile: "commercial", code: "result = {}\\nresult" }, undefined, context);
 await direct.execute("two", { aws_profile: "other", code: "result = {}\\nresult" }, undefined, context);
 const knowledge = new MCPTool(connection, { name: "aws___list_regions", inputSchema: { type: "object", properties: {} } });
@@ -53,14 +57,14 @@ const legacyCachedDefinition = {
 };
 const boundConnection = {
  name: connection.name, config: connection.config, capabilities: { tools: {} }, operationalAwsProfiles: ["commercial"],
- transport: { request: async (method, params) => {
+ transport: { connected: true, request: async (method, params) => {
   if (method === "tools/list") return { tools: [legacyCachedDefinition] };
   if ("aws_profile" in params.arguments) throw new Error("Upstream single-profile schema rejects aws_profile");
   boundCalls.push(params.arguments.code);
   return { content: [{ type: "text", text: "bound-commercial identity" }] };
  } },
 };
-const legacyTool = new DeferredMCPTool(connection.name, legacyCachedDefinition, async () => boundConnection);
+const legacyTool = new MCPTool(boundConnection, (await listTools(boundConnection))[0]);
 const legacySchema = legacyTool.parameters;
 const legacyMissing = await legacyTool.execute("legacy-missing", { code: "read" }, undefined, context);
 const legacyAllowed = await legacyTool.execute("legacy-allowed", { aws_profile: "commercial", code: "read" }, undefined, context);
@@ -74,15 +78,20 @@ const staleDefinition = {
 };
 const freshConnection = {
  name: connection.name, config: connection.config, capabilities: { tools: {} }, operationalAwsProfiles: ["other"],
- transport: { request: async (method, params) => {
+ transport: { connected: true, request: async (method, params) => {
   if (method === "tools/list") return { tools: [{ name: "aws___run_script", inputSchema: { type: "object", properties: { code: { type: "string" } }, required: ["code"] } }] };
   if ("aws_profile" in params.arguments) throw new Error("Single-profile proxy rejected aws_profile");
   return { content: [{ type: "text", text: "current-other identity" }] };
  } },
 };
-const staleTool = new DeferredMCPTool(connection.name, staleDefinition, async () => { staleConnects++; return freshConnection; });
-const staleAllowed = await staleTool.execute("stale", { aws_profile: "other", code: "read" }, undefined, context);
-const staleResult = { connects: staleConnects, error: staleAllowed.isError, text: staleAllowed.content[0].text };
+const staleTool = new MCPTool(
+ { ...connection, transport: { ...connection.transport, connected: false } },
+ staleDefinition, async () => { staleConnects++; return freshConnection; },
+);
+const staleDenied = await staleTool.execute("stale", { aws_profile: "other", code: "read" }, undefined, context);
+const refreshedTool = new MCPTool(freshConnection, (await listTools(freshConnection))[0]);
+const staleAllowed = await refreshedTool.execute("refreshed", { aws_profile: "other", code: "read" }, undefined, context);
+const staleResult = { connects: staleConnects, rejected: staleDenied.isError, error: staleAllowed.isError, text: staleAllowed.content[0].text };
 console.log(JSON.stringify({ rejected, afterRejections, requests, authResult, reconnects, boundCalls, legacyMissing, legacyWrong, legacyAllowed, legacyChanged, legacySchema, staleResult }));
 `;
 		const child = Bun.spawn([process.execPath, "--no-env-file", "-e", script], {
@@ -125,7 +134,7 @@ console.log(JSON.stringify({ rejected, afterRejections, requests, authResult, re
 		expect(result.boundCalls).toEqual(["read"]);
 		expect(result.legacyChanged.content[0].text).toContain("PROFILE_NOT_FOUND");
 		expect(result.legacySchema.required).toContain("aws_profile");
-		expect(result.staleResult).toEqual({ connects: 1, text: "current-other identity" });
+		expect(result.staleResult).toEqual({ connects: 0, rejected: true, text: "current-other identity" });
 		expect(result.legacySchema.properties.aws_profile).toMatchObject({
 			type: "string",
 		});
@@ -207,7 +216,7 @@ let connection = await connectToServer("coreforge-aws-agent-toolkit", config, op
 const tools = await listTools(connection);
 assert.deepEqual(connection.operationalAwsProfiles, []);
 assert.deepEqual(tools.find(t => t.name === "aws___run_script").inputSchema.properties.aws_profile.enum, ["expired", "healthy", "still-expired"]);
-assert.equal(readFileSync(join(process.env.HOME, "proxy.starts"), "utf8").trim(), "[]");
+assert.deepEqual(new Set(readFileSync(join(process.env.HOME, "proxy.starts"), "utf8").trim().split("\\n")), new Set(["[]"]));
 assert.equal(readFileSync(join(process.env.HOME, "aws.calls"), "utf8").trim(), "");
 const awsCalls = () => readFileSync(join(process.env.HOME, "aws.calls"), "utf8").trim().split("\\n").filter(Boolean).map(JSON.parse);
 const proxyCalls = () => readFileSync(join(process.env.HOME, "proxy.calls"), "utf8").trim().split("\\n").filter(Boolean).map(JSON.parse);

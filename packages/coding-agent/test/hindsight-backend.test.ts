@@ -35,7 +35,6 @@ interface FakeSessionDeps {
 	cwd?: string;
 	entries?: Array<{ role: "user" | "assistant"; text: string }>;
 	settings?: Settings;
-	xdevEntries?: Array<{ name: string; summary: string }>;
 }
 
 // Primary states resolve their retain outbox under the agent dir.
@@ -99,7 +98,6 @@ function makeFakeSession(deps: FakeSessionDeps) {
 		emitNotice: () => {},
 		settleMemoryBackend: async () => {},
 		getHindsightSessionState: () => hindsightState,
-		getXdevToolEntries: () => deps.xdevEntries ?? [],
 		setHindsightSessionState(state: HindsightSessionState | undefined) {
 			const previous = hindsightState;
 			hindsightState = state;

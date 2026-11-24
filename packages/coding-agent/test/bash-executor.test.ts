@@ -23,6 +23,7 @@ import {
 } from "@oh-my-pi/pi-tui/tools/shell-viz";
 import * as shellSnapshot from "@oh-my-pi/pi-coding-agent/utils/shell-snapshot";
 import { encodeTerminalImage } from "@oh-my-pi/pi-coding-agent/utils/terminal-graphics";
+import { saveImagesToTemp } from "@oh-my-pi/pi-coding-agent/utils/image-temp";
 import type { Shell, ShellRunResult } from "@oh-my-pi/pi-natives";
 import * as piNatives from "@oh-my-pi/pi-natives";
 import { $which, removeSyncWithRetries } from "@oh-my-pi/pi-utils";
@@ -235,9 +236,15 @@ describe("executeBash", () => {
 			timeout: 5000,
 		});
 
-		expect(result.output).toBe("beforeafter");
+		const [body, ...linkLines] = result.output.split("\n");
+		expect(body).toBe("beforeafter");
 		expect(result.images).toHaveLength(1);
 		expect(result.images?.[0]).toMatchObject({ type: "image", mimeType: "image/png" });
+		const savedLines = linkLines.filter(line => line.startsWith("Image saved: "));
+		expect(savedLines).toHaveLength(1);
+		const savedPath = savedLines[0].slice("Image saved: ".length);
+		expect(fs.existsSync(savedPath)).toBe(true);
+		removeSyncWithRetries(savedPath);
 		expect(result.output).not.toContain("\x1bP");
 	});
 
@@ -257,6 +264,51 @@ describe("executeBash", () => {
 		expect(result.timedOut).toBe(true);
 		expect(result.images).toHaveLength(1);
 		expect(result.output).not.toContain("\x1b_G");
+	});
+
+	it("saves decoded command images to temp files and links them in the text", async () => {
+		const image: ImageContent = {
+			type: "image",
+			mimeType: "image/png",
+			data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC",
+		};
+		const frame = await encodeTerminalImage(image);
+		const framePath = path.join(tempDir, "frame.bin");
+		await Bun.write(framePath, frame);
+
+		const result = await executeBash(`cat ${shellQuote(framePath)}`, { cwd: tempDir, timeout: 5000 });
+
+		expect(result.images).toHaveLength(1);
+		expect(result.output).not.toContain("\x1b_G");
+		const savedLines = result.output.split("\n").filter(line => line.startsWith("Image saved: "));
+		expect(savedLines).toHaveLength(1);
+		const savedPath = savedLines[0].slice("Image saved: ".length);
+		expect(fs.existsSync(savedPath)).toBe(true);
+		const bytes = fs.readFileSync(savedPath);
+		expect([...bytes.subarray(0, 8)]).toEqual([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+		removeSyncWithRetries(savedPath);
+	});
+
+	it("writes images to content-addressed temp paths", async () => {
+		const image: ImageContent = {
+			type: "image",
+			mimeType: "image/png",
+			data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC",
+		};
+		const [first] = await saveImagesToTemp([image]);
+		const [again] = await saveImagesToTemp([image]);
+		expect(again).toBe(first);
+
+		const other: ImageContent = {
+			type: "image",
+			mimeType: "image/png",
+			data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==",
+		};
+		const [different] = await saveImagesToTemp([other]);
+		expect(different).not.toBe(first);
+
+		removeSyncWithRetries(first);
+		removeSyncWithRetries(different);
 	});
 
 	it("passes the full direnv-load budget when the command deadline is disabled (timeout: 0)", async () => {
@@ -732,6 +784,11 @@ exit 64
 		if (!zshPath) {
 			return;
 		}
+		// An interactive zsh whose ZDOTDIR holds none of .zshenv, .zprofile, .zshrc and .zlogin
+		// runs zsh-newuser-install where the zsh install ships it (Debian and Ubuntu do), and its
+		// menu waits for a key before the command runs, so the prompt this test answers never
+		// appears. An empty .zshrc is a startup file, so zsh runs the command straight away.
+		fs.writeFileSync(path.join(tempDir, ".zshrc"), "");
 		cfgShellPath.set(Settings.instance, zshPath);
 		vi.spyOn(Settings.prototype, "getShellConfig").mockReturnValue({
 			shell: zshPath,
@@ -1034,7 +1091,7 @@ exit 64
 		},
 	);
 
-	it("aborts the shell without aborting its native signal when the JavaScript timeout fallback wins", async () => {
+	it("aborts and drains mounted commands without aborting the native signal when the timeout fallback wins", async () => {
 		// Compress the JS-side fallback timer (floored at 1000ms in the source) so
 		// the safety-net fires deterministically without a real 1s wait. Only long
 		// timers are shrunk — fs/subprocess setup keeps real scheduling — and the
@@ -1046,31 +1103,62 @@ exit 64
 				typeof ms === "number" && ms >= 1000 ? 5 : ms,
 				...rest,
 			)) as typeof globalThis.setTimeout);
+		// The fallback waits until the clock says the deadline passed; advance it with the timers.
+		let clock = 0;
+		vi.spyOn(performance, "now").mockImplementation(() => (clock += 10_000));
 
+		const nativeRun = Promise.withResolvers<ShellRunResult>();
+		const commandAborted = Promise.withResolvers<void>();
+		const commandReleased = Promise.withResolvers<void>();
+		let commandSettled = false;
+		const watchdog = Promise.withResolvers<never>();
+		void watchdog.promise.catch(() => {});
+		const watchdogTimer = realSetTimeout(() => watchdog.reject(new Error("Mounted command was not cancelled")), 1000);
 		let nativeSignal: AbortSignal | undefined;
 		vi.spyOn(piNatives.Shell.prototype, "run").mockImplementation((options, onChunk) => {
 			if (options.signal instanceof AbortSignal) {
 				nativeSignal = options.signal;
 			}
+			void options.commands?.handler({ name: "held", argv: [], cwd: tempDir, stdin: "" });
 			onChunk?.(null, "streamed-before-timeout\n");
-			return Promise.withResolvers<never>().promise;
+			return nativeRun.promise;
 		});
 		const abortSpy = vi.spyOn(piNatives.Shell.prototype, "abort").mockResolvedValue();
 
-		const result = await executeBash("sleep 10", {
+		const pending = executeBash("held", {
 			cwd: tempDir,
 			timeout: 1000,
 			sessionKey: "explicit-timeout-keeps-native-signal",
+			commands: {
+				names: ["held"],
+				abort: () => commandAborted.resolve(),
+				handler: async () => {
+					await commandAborted.promise;
+					await commandReleased.promise;
+					commandSettled = true;
+					return { stdout: "", stderr: "", exitCode: 1 };
+				},
+			},
 		});
-
-		expect(result.cancelled).toBe(true);
-		expect(result.output).toContain("streamed-before-timeout");
-		expect(result.output).toContain("Command timed out after 1 seconds");
-		// Watchdog-win path: native never returned, so the result must be
-		// distinguishable from a confirmed empty run (#10308).
-		expect(result.output).toContain("the shell backend did not respond");
-		expect(nativeSignal?.aborted).toBe(false);
-		expect(abortSpy).toHaveBeenCalledTimes(1);
+		try {
+			await Promise.race([commandAborted.promise, watchdog.promise]);
+			expect(commandSettled).toBe(false);
+			commandReleased.resolve();
+			const result = await Promise.race([pending, watchdog.promise]);
+			expect(commandSettled).toBe(true);
+			expect(result.cancelled).toBe(true);
+			expect(result.output).toContain("streamed-before-timeout");
+			expect(result.output).toContain("Command timed out after 1 seconds");
+			expect(result.output).toContain("the shell backend did not respond");
+			expect(nativeSignal?.aborted).toBe(false);
+			expect(abortSpy).toHaveBeenCalledTimes(1);
+		} finally {
+			clearTimeout(watchdogTimer);
+			commandAborted.resolve();
+			commandReleased.resolve();
+			nativeRun.resolve({ exitCode: undefined, cancelled: true, timedOut: true });
+			await pending;
+		}
 	});
 
 	it("explicitly aborts an overlapping one-shot shell when timeout cleanup stalls", async () => {
@@ -1081,6 +1169,9 @@ exit 64
 				typeof ms === "number" && ms >= 1000 ? 5 : ms,
 				...rest,
 			)) as typeof globalThis.setTimeout);
+		// The fallback waits until the clock says the deadline passed; advance it with the timers.
+		let clock = 0;
+		vi.spyOn(performance, "now").mockImplementation(() => (clock += 10_000));
 
 		const ownerResult = Promise.withResolvers<ShellRunResult>();
 		const isolatedResult = Promise.withResolvers<ShellRunResult>();
@@ -1623,6 +1714,18 @@ describe("executeBash :async: background retention", () => {
 		if (fs.existsSync(tmp)) removeSyncWithRetries(tmp);
 	});
 
+	it("starts a per-job :async: shell as a copy of the seed session's shell", async () => {
+		await executeBash("export SEEDED=yes; seeded_fn() { echo fn-ok; }", { sessionKey: "seed-probe", cwd: tmp });
+		const job = await executeBash('echo "$SEEDED"; seeded_fn; export SEEDED=changed', {
+			sessionKey: "seed-probe:async:job1",
+			seedSessionKey: "seed-probe",
+			cwd: tmp,
+		});
+		expect(job.output).toBe("yes\nfn-ok\n");
+		const after = await executeBash('echo "$SEEDED"', { sessionKey: "seed-probe", cwd: tmp });
+		expect(after.output).toBe("yes\n");
+	});
+
 	it.skipIf(process.platform === "win32")(
 		"keeps a per-job :async: shell's plain-`&` background process alive across turns",
 		async () => {
@@ -1676,7 +1779,7 @@ describe("executeBash :async: background retention", () => {
 			if (!sleepBin) throw new Error("sleep executable not found");
 			let pid: number | undefined;
 			try {
-				// pi's `nohup` tool (crates/pi-shell/src/tools/nohup.rs) runs the operand
+				// pi's `nohup` tool (crates/shell/src/tools/nohup.rs) runs the operand
 				// in a detached tree that session cancel and teardown leave running,
 				// independently of the retain map. `$!` names the background job, not
 				// the external that survives — the operand writes its own pid before

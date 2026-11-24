@@ -2,6 +2,7 @@ import { type TitleCard, validateTitleCard } from "../utils/title-card";
 import type { SessionTitleCard } from "./session-entries";
 import * as buffer from "node:buffer";
 import { createHash, type Hash } from "node:crypto";
+import type { Settings } from "../config/settings";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type {
@@ -13,6 +14,7 @@ import type {
 	Usage,
 } from "@oh-my-pi/pi-ai";
 import {
+	$env,
 	directoryIsEnterable,
 	directoryIsMissing,
 	getBlobsDir,
@@ -25,15 +27,20 @@ import {
 	isFsError,
 	logger,
 	pathIsWithin,
+	spillFileName,
+	spillIdOfFileName,
 	stringifyJson,
 	toError,
 	withLoopPhase,
 } from "@oh-my-pi/pi-utils";
 import { isTaskToolDetails, type StructuredSubagentSchemaMode } from "@oh-my-pi/pi-tui/tools/task";
 import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
+import { isUserRequestEntry } from "@oh-my-pi/pi-tui/chat/transcript-entry";
+import type { SessionTreePosition } from "@oh-my-pi/pi-tui/status-line/host";
 import * as snapcompact from "@oh-my-pi/snapcompact";
 import { moveFileAcrossDevices } from "../utils/atomic-file";
 import { hasAnnotationDraftsSync } from "../extensibility/custom-commands/bundled/annotate/draft-store";
+import { resolveLocalRoot } from "../internal-urls/local-root";
 import { withArtifactPublicationLock } from "./artifact-publication";
 import {
 	artifactFileGeneration,
@@ -72,13 +79,16 @@ import {
 	type CustomMessageEntry,
 	EPHEMERAL_MODEL_CHANGE_ROLE,
 	PREWALK_MODEL_CHANGE_ROLE,
+	TEMPORARY_MODEL_CHANGE_ROLE,
 	type FileEntry,
 	type LabelEntry,
 	type ModeChangeEntry,
 	type ModelChangeEntry,
 	type ModelUsageEntry,
+	type ModelUsageRecord,
 	lastSelfSelectedLeafId,
 	type NewSessionOptions,
+	parseSessionOrigin,
 	type ResetBoundaryEntry,
 	type ServiceTierChangeEntry,
 	sessionEntryLeafId,
@@ -86,6 +96,7 @@ import {
 	type SessionHeader,
 	type SessionInitEntry,
 	type SessionMessageEntry,
+	type SessionOrigin,
 	type SessionTitleSource,
 	type SessionTreeNode,
 	type ThinkingLevelChangeEntry,
@@ -387,9 +398,11 @@ async function copyArtifactDirectoryWithoutReplacing(source: string, destination
 	}
 }
 
-/** The numeric id an artifact file name (`<id>.<tool>.log`) carries, if any. */
-function artifactIdOf(name: string): string | undefined {
-	return /^(\d+)\./.exec(name)?.[1];
+/** The spill id a file at a session's local root carries. */
+function artifactIdOf(name: string, prefix: string): string | undefined {
+	if (prefix !== "local/") return undefined;
+	const id = spillIdOfFileName(name);
+	return id === undefined ? undefined : String(id);
 }
 
 /** The caller holds the shared artifact lease for source removal and destination publication. */
@@ -433,15 +446,16 @@ async function moveSessionFileWithoutReplacing(source: string, destination: stri
 	}
 }
 
-/** What `destination` currently holds: entries by name, and the artifact ids (`<id>.<tool>.log`) already in use. */
+/** What the destination holds: names and local spill ids already in use. */
 async function destinationOccupancy(
 	destination: string,
+	prefix: string,
 ): Promise<{ occupants: Map<string, fs.Dirent>; takenIds: Set<string> }> {
 	const present = await fs.promises.readdir(destination, { withFileTypes: true });
 	const occupants = new Map(present.map(entry => [entry.name, entry]));
 	const takenIds = new Set<string>();
 	for (const entry of present) {
-		const id = artifactIdOf(entry.name);
+		const id = artifactIdOf(entry.name, prefix);
 		if (id !== undefined) takenIds.add(id);
 	}
 	return { occupants, takenIds };
@@ -450,8 +464,8 @@ async function destinationOccupancy(
 /**
  * Move `source`'s entries into `destination`, recursing into directories that
  * exist on both sides, then remove `source` once it is empty. Nothing at the
- * destination is ever replaced: an entry whose name — or, for `<id>.<tool>.log`
- * artifact files, whose id — is already taken stays at the source, as does one
+ * destination is ever replaced: an entry whose name — or, for `local/<id>.log`
+ * spill files, whose id — is already taken stays at the source, as does one
  * whose move fails. Once moving has begun this never throws, so the caller is
  * never left with a session file rolled back away from artifacts that already
  * moved. Returns the entries left at the source, each with its reason.
@@ -462,7 +476,7 @@ async function mergeDirectoryInto(
 	stranded: string[] = [],
 	prefix = "",
 ): Promise<string[]> {
-	let { occupants, takenIds } = await destinationOccupancy(destination);
+	let { occupants, takenIds } = await destinationOccupancy(destination, prefix);
 	const strandedBefore = stranded.length;
 	const entries = await fs.promises.readdir(source, { withFileTypes: true });
 	entries.sort((left, right) => Number(right.name.endsWith(".md")) - Number(left.name.endsWith(".md")));
@@ -472,11 +486,9 @@ async function mergeDirectoryInto(
 		const from = path.join(source, entry.name);
 		const to = path.join(destination, entry.name);
 		const label = prefix + entry.name;
-		const id = artifactIdOf(entry.name);
+		const id = artifactIdOf(entry.name, prefix);
 		try {
-			// Refresh id occupancy inside the lease before each id-bearing move.
-			// A failed listing strands this entry without aborting an earlier move.
-			if (id !== undefined) ({ occupants, takenIds } = await destinationOccupancy(destination));
+			if (id !== undefined) ({ occupants, takenIds } = await destinationOccupancy(destination, prefix));
 			const occupant = occupants.get(entry.name);
 			if (occupant === undefined && (id === undefined || !takenIds.has(id))) {
 				if (entry.isDirectory()) {
@@ -532,13 +544,13 @@ async function mergeDirectoryInto(
  * (ENOTEMPTY, EEXIST, EPERM on Windows), so the fallback is decided by what is
  * there, not by the code: an existing directory is merged into.
  *
- * A name or artifact id taken on both sides is left at the source rather than
- * resolved: artifact ids resolve by `<id>.` prefix against one directory, so
+ * A name or spill id taken on both sides is left at the source rather than
+ * resolved: `local://<id>.log` names one file of one directory, so
  * overwriting the destination copy or parking a renamed duplicate beside it
  * would each destroy or misdirect a referenced artifact. The copy already at
  * the destination keeps the id; the session's own copy stays at the source,
  * retained on disk under the path the header's `previousSessionFiles` records
- * but not reachable through `artifact://` — two writers that shared one id
+ * but not reachable as a spill — two writers that shared one id
  * space cannot both be.
  */
 async function relocateArtifactsDirectory(source: string, destination: string): Promise<"renamed" | "merged"> {
@@ -723,6 +735,15 @@ function orderedByTimestamp(a: SessionTreeNode, b: SessionTreeNode): number {
 	return new Date(a.entry.timestamp).getTime() - new Date(b.entry.timestamp).getTime();
 }
 
+function entriesByTimestamp(a: SessionEntry, b: SessionEntry): number {
+	return new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime();
+}
+
+function sameTreePosition(a: SessionTreePosition | undefined, b: SessionTreePosition | undefined): boolean {
+	if (a === undefined || b === undefined) return a === b;
+	return a.ahead === b.ahead && a.branch?.index === b.branch?.index && a.branch?.count === b.branch?.count;
+}
+
 /**
  * The most recent model role on `branch`, or undefined when no model change
  * was recorded. `skipEphemeral` passes over temporary switches (retry fallback
@@ -778,10 +799,18 @@ export class SessionEntryIndex {
 	// change or rebuild starts a fresh array (the old one is never mutated).
 	#generation = 0;
 	#branchCache: { leaf: string | null | undefined; generation: number; branch: SessionEntry[] } | undefined;
+	/**
+	 * Ids of the entries whose subtree holds a user turn ({@link isUserRequestEntry}): the
+	 * branches a fork counts. Recovery paths that drop a failed reply branch the
+	 * session too, but leave no user turn behind, so they never read as forks.
+	 */
+	#withUserTurn = new Set<string>();
+	#treePositionMemo: { generation: number; position: SessionTreePosition | undefined } | undefined;
 
 	clear(): void {
 		this.#entriesById.clear();
 		this.#children.clear();
+		this.#withUserTurn.clear();
 		this.#labels.clear();
 		this.#leaf = null;
 		this.#usage = emptyUsageStatistics();
@@ -824,6 +853,10 @@ export class SessionEntryIndex {
 		const bucket = this.#children.get(entry.parentId);
 		if (bucket) bucket.push(entry);
 		else this.#children.set(entry.parentId, [entry]);
+		// A child indexed before its parent (an out-of-order journal) already holds a user turn.
+		if (isUserRequestEntry(entry) || this.#children.get(entry.id)?.some(child => this.#withUserTurn.has(child.id))) {
+			this.#markUserTurn(entry);
+		}
 
 		if (entry.type === "label") {
 			if (entry.label) this.#labels.set(entry.targetId, entry.label);
@@ -877,6 +910,62 @@ export class SessionEntryIndex {
 	 */
 	detachBranchView(): void {
 		this.#branchCache = undefined;
+	}
+
+	/** Mark `entry` and its ancestors as holding a user turn, stopping at the first already marked. */
+	#markUserTurn(entry: SessionEntry): void {
+		let cursor: SessionEntry | undefined = entry;
+		while (cursor && !this.#withUserTurn.has(cursor.id)) {
+			this.#withUserTurn.add(cursor.id);
+			cursor = cursor.parentId === null ? undefined : this.#entriesById.get(cursor.parentId);
+		}
+	}
+
+	/**
+	 * Where the active leaf sits in the tree: the branch it is on at the deepest
+	 * fork its path passes through, and the user turns on the newest
+	 * continuation below it. Undefined at the tip of a session without forks;
+	 * the same object while the position is unchanged.
+	 */
+	treePosition(): SessionTreePosition | undefined {
+		const memo = this.#treePositionMemo;
+		if (memo?.generation === this.#generation) return memo.position;
+		const next = this.#computeTreePosition();
+		const position = memo && sameTreePosition(memo.position, next) ? memo.position : next;
+		this.#treePositionMemo = { generation: this.#generation, position };
+		return position;
+	}
+
+	#computeTreePosition(): SessionTreePosition | undefined {
+		const path = this.branchView();
+		let branch: SessionTreePosition["branch"];
+		for (let index = path.length - 1; index >= 0 && branch === undefined; index--) {
+			const entry = path[index]!;
+			const siblings = this.#children.get(entry.parentId);
+			if (!siblings || siblings.length < 2) continue;
+			const branches = siblings.filter(sibling => sibling === entry || this.#withUserTurn.has(sibling.id));
+			if (branches.length < 2) continue;
+			branches.sort(entriesByTimestamp);
+			branch = { index: branches.indexOf(entry) + 1, count: branches.length };
+		}
+
+		let ahead = 0;
+		const seen = new Set<string>();
+		let cursor = this.#leaf;
+		while (true) {
+			const next = this.#children
+				.get(cursor)
+				?.filter(child => this.#withUserTurn.has(child.id))
+				.sort(entriesByTimestamp)
+				.at(-1);
+			if (!next || seen.has(next.id)) break;
+			seen.add(next.id);
+			if (isUserRequestEntry(next)) ahead++;
+			cursor = next.id;
+		}
+
+		if (branch === undefined) return ahead === 0 ? undefined : { ahead };
+		return { branch, ahead };
 	}
 
 	childrenOf(parentId: string): SessionEntry[] {
@@ -1008,8 +1097,6 @@ interface SessionManagerStateSnapshot {
 	loadedMalformedRecords: number;
 	draftOnlySessionCleanupArmed: boolean;
 	fallbackRuntimeOnly: boolean;
-	inMemoryArtifacts: ReadonlyMap<string, string> | null;
-	inMemoryArtifactCounter: number;
 	/** Stashed sibling family candidate; moveTo drops it, so a rollback must restore it. */
 	taskSiblingCandidate: string | undefined;
 	header: SessionHeader;
@@ -1253,12 +1340,16 @@ export class SessionManager {
 	#atomicEntryBatch: AtomicEntryBatch | undefined;
 
 	#artifactManager: ArtifactManager | null = null;
-	#artifactManagerSessionFile: string | null = null;
+	#artifactManagerLocalRoot: string | null = null;
 	#adoptedArtifactManager: ArtifactManagerApi | null = null;
-	#inMemoryArtifacts: Map<string, string> | null = null;
-	#inMemoryArtifactCounter = 0;
 
 	#suppressBreadcrumb = false;
+	/**
+	 * Client this process serves, from `PI_SESSION_ORIGIN` (the Chrome extension's native host sets `chrome`): stamped
+	 * on every session file the manager starts, and such a process writes no terminal breadcrumb, so `--continue`
+	 * in a terminal never picks its sessions.
+	 */
+	readonly #origin: SessionOrigin | undefined;
 	/**
 	 * The last breadcrumb this manager wrote marked a lazy fresh session whose
 	 * JSONL is not yet on disk. Cleared (and the crumb re-stamped non-fresh) once
@@ -1292,13 +1383,14 @@ export class SessionManager {
 		this.#persist = persist;
 		this.#storage = storage;
 		this.#blobs = new BlobStore(getBlobsDir());
+		this.#origin = parseSessionOrigin($env.PI_SESSION_ORIGIN);
 
 		if (persist && sessionDir) this.#storage.ensureDirSync(this.#sessionDir);
 	}
 
 	#rememberBreadcrumb(cwd: string, sessionFile: string, fresh = false): void {
 		this.#breadcrumbFresh = fresh;
-		if (this.#suppressBreadcrumb) return;
+		if (this.#suppressBreadcrumb || this.#origin) return;
 		writeTerminalBreadcrumb(cwd, sessionFile, fresh, {
 			remoteStorage: !(this.#storage instanceof FileSessionStorage),
 		});
@@ -1567,7 +1659,7 @@ export class SessionManager {
 	 *
 	 * The artifact copy runs in the background so a move never blocks the turn
 	 * loop on a large artifacts directory; the sibling's artifact manager waits
-	 * for it before scanning ids or resolving `artifact://`, and flush/close
+	 * for it before scanning ids or resolving spills, and flush/close
 	 * await it. Returns the sibling.
 	 */
 	#moveOffSessionFile(reason: SessionPersistenceNotice["reason"]): string {
@@ -1604,7 +1696,7 @@ export class SessionManager {
 		this.#fileIsCurrent = false;
 		this.#rewriteRequired = true;
 		this.#artifactManager = null;
-		this.#artifactManagerSessionFile = null;
+		this.#artifactManagerLocalRoot = null;
 		this.#pendingArtifactCopy = { sessionFile: to, done: copySessionArtifacts(from, to) };
 		this.#rememberBreadcrumb(this.#cwd, to);
 		this.#claimSession();
@@ -2411,6 +2503,7 @@ export class SessionManager {
 			id: this.#sessionId,
 			timestamp,
 			cwd: this.#cwd,
+			origin: this.#origin,
 			parentSession: options?.parentSession,
 			providerPromptCacheKey: options?.providerPromptCacheKey,
 			taskPromptCacheKey: options?.taskPromptCacheKey,
@@ -2437,10 +2530,8 @@ export class SessionManager {
 		this.#turnOutputBaseline = 0;
 		this.#turnEvalOutput = 0;
 		this.#artifactManager = null;
-		this.#artifactManagerSessionFile = null;
+		this.#artifactManagerLocalRoot = null;
 		this.#adoptedArtifactManager = null;
-		this.#inMemoryArtifacts = null;
-		this.#inMemoryArtifactCounter = 0;
 
 		if (this.#persist) {
 			this.#sessionFile =
@@ -2562,25 +2653,26 @@ export class SessionManager {
 		}
 	}
 
-	#artifactManagerForSession(): ArtifactManagerApi | null {
+	/**
+	 * The spill manager: the adopted parent's, else one over this session's
+	 * `local://` root — `<session>/local`, or `$TMPDIR/omp-local/<sessionId>`
+	 * without a session file. Rebuilt when that root moves.
+	 */
+	#artifactManagerForSession(): ArtifactManagerApi {
 		if (this.#adoptedArtifactManager) return this.#adoptedArtifactManager;
 
 		const sessionFile = this.#sessionFile;
-		if (!sessionFile) {
-			this.#artifactManager = null;
-			this.#artifactManagerSessionFile = null;
-			return null;
-		}
-
-		if (this.#artifactManager && this.#artifactManagerSessionFile === sessionFile) return this.#artifactManager;
+		const sessionDir = artifactsDirectoryFor(sessionFile);
+		const localRoot = resolveLocalRoot({ getArtifactsDir: () => sessionDir, getSessionId: () => this.#sessionId });
+		if (this.#artifactManager && this.#artifactManagerLocalRoot === localRoot) return this.#artifactManager;
 
 		const pendingCopy = this.#pendingArtifactCopy;
 		this.#artifactManager = new ArtifactManager(
-			sessionFile.slice(0, -JSONL_SUFFIX_LENGTH),
-			pendingCopy?.sessionFile === sessionFile ? pendingCopy.done : undefined,
-			this.getSeanceSourceArtifactsDir() ?? undefined,
+			localRoot,
+			sessionDir,
+			sessionFile && pendingCopy?.sessionFile === sessionFile ? pendingCopy.done : undefined,
 		);
-		this.#artifactManagerSessionFile = sessionFile;
+		this.#artifactManagerLocalRoot = localRoot;
 		return this.#artifactManager;
 	}
 
@@ -2630,8 +2722,6 @@ export class SessionManager {
 			loadedMalformedRecords: this.#loadedMalformedRecords,
 			draftOnlySessionCleanupArmed: this.#draftOnlySessionCleanupArmed,
 			fallbackRuntimeOnly: this.#fallbackRuntimeOnly,
-			inMemoryArtifacts: this.#inMemoryArtifacts ? new Map(this.#inMemoryArtifacts) : null,
-			inMemoryArtifactCounter: this.#inMemoryArtifactCounter,
 			taskSiblingCandidate: this.#taskSiblingCandidate,
 			// Entries are snapshotted by reference (switch/reload replaces the
 			// array wholesale). The header is cloned: moveTo mutates it in place
@@ -2682,8 +2772,6 @@ export class SessionManager {
 		this.#forceFileCreation = snapshot.onDisk;
 		this.#draftOnlySessionCleanupArmed = snapshot.draftOnlySessionCleanupArmed;
 		this.#fallbackRuntimeOnly = snapshot.fallbackRuntimeOnly;
-		this.#inMemoryArtifacts = snapshot.inMemoryArtifacts ? new Map(snapshot.inMemoryArtifacts) : null;
-		this.#inMemoryArtifactCounter = snapshot.inMemoryArtifactCounter;
 		// A completed moveTo drops the stash, so a rollback restores it here.
 		this.#taskSiblingCandidate = snapshot.taskSiblingCandidate;
 		this.#applyEntries(snapshot.header, [...snapshot.entries]);
@@ -2695,7 +2783,7 @@ export class SessionManager {
 		this.#titleUpdatedAt = snapshot.titleUpdatedAt;
 		this.#hasTitleSlot = snapshot.hasTitleSlot;
 		this.#artifactManager = null;
-		this.#artifactManagerSessionFile = null;
+		this.#artifactManagerLocalRoot = null;
 		this.#adoptedArtifactManager = null;
 
 		if (this.#sessionFile) this.#rememberBreadcrumb(this.#cwd, this.#sessionFile);
@@ -2837,7 +2925,7 @@ export class SessionManager {
 		this.#loadedMalformedRecords = loaded.malformedRecords;
 		this.#forceFileCreation = true;
 		this.#artifactManager = null;
-		this.#artifactManagerSessionFile = null;
+		this.#artifactManagerLocalRoot = null;
 
 		if (this.sanitizeLoadedOpenAIResponsesReplayMetadata()) this.#rewriteRequired = true;
 	}
@@ -2902,6 +2990,7 @@ export class SessionManager {
 			titleUpdatedAt: this.#titleUpdatedAt,
 			timestamp,
 			cwd: this.#cwd,
+			origin: this.#origin,
 			additionalDirectories: this.#additionalDirectories.length > 0 ? [...this.#additionalDirectories] : undefined,
 			parentSession: parentSessionId,
 			providerPromptCacheKey: SessionManager.getInheritedProviderPromptCacheKey(this.#header),
@@ -2916,7 +3005,7 @@ export class SessionManager {
 		this.#forceFileCreation = true;
 		this.#draftOnlySessionCleanupArmed = false;
 		this.#artifactManager = null;
-		this.#artifactManagerSessionFile = null;
+		this.#artifactManagerLocalRoot = null;
 		this.#rememberBreadcrumb(this.#cwd, this.#sessionFile);
 
 		await this.#rewriteAtomically();
@@ -3103,7 +3192,7 @@ export class SessionManager {
 					if (sessionPathChanged && !sessionMoved) this.#expectedDiskFingerprint = undefined;
 					if (sessionPathChanged && !sessionMoved) this.#expectedDiskTitleMeta = undefined;
 					this.#artifactManager = null;
-					this.#artifactManagerSessionFile = null;
+					this.#artifactManagerLocalRoot = null;
 					// Path is repointed; hot-path appends may use `#sessionFile` again.
 					this.#sessionFileRelocating = null;
 				});
@@ -3452,7 +3541,6 @@ export class SessionManager {
 		this.seal();
 		this.#entries = [];
 		this.#index.clear();
-		this.#inMemoryArtifacts = null;
 		this.#closeWriterEventually();
 		this.#entriesReleased = true;
 	}
@@ -3667,7 +3755,7 @@ export class SessionManager {
 	}
 
 	getArtifactsDir(): string | null {
-		if (this.#adoptedArtifactManager) return this.#adoptedArtifactManager.dir;
+		if (this.#adoptedArtifactManager) return this.#adoptedArtifactManager.sessionDir;
 		return artifactsDirectoryFor(this.#sessionFile);
 	}
 
@@ -3680,37 +3768,24 @@ export class SessionManager {
 		this.#adoptedArtifactManager = manager;
 	}
 
-	getArtifactManager(): ArtifactManagerApi | null {
+	getArtifactManager(): ArtifactManagerApi {
 		return this.#artifactManagerForSession();
 	}
 
-	async allocateArtifactPath(toolType: string): Promise<{ id?: string; path?: string }> {
+	/** Claim a spill id and file (`local://<id>.log`) without writing it. */
+	async allocateArtifactPath(): Promise<{ id?: string; path?: string }> {
 		if (this.#released) return {};
-		return (await this.#artifactManagerForSession()?.allocatePath(toolType)) ?? {};
+		return this.#artifactManagerForSession().allocatePath();
 	}
 
-	async saveArtifact(content: string, toolType: string): Promise<string | undefined> {
+	/** Save `content` as a spill read back at `spillUrl(id)`; undefined once released. */
+	async saveArtifact(content: string): Promise<string | undefined> {
 		if (this.#released) return undefined;
-		const manager = this.#artifactManagerForSession();
-		if (manager) return manager.save(content, toolType);
-
-		// Non-persistent session: keep an in-memory copy so spill truncation works.
-		this.#inMemoryArtifacts ??= new Map();
-		const id = String(this.#inMemoryArtifactCounter++);
-		this.#inMemoryArtifacts.set(id, content);
-		return id;
+		return this.#artifactManagerForSession().save(content);
 	}
 
 	async getArtifactPath(id: string): Promise<string | null> {
-		return (await this.#artifactManagerForSession()?.getPath(id)) ?? null;
-	}
-
-	/** Resident spill bytes owned by this live session; never resolves a file-backed artifact. */
-	getResidentArtifactContent(id: string): string | null {
-		if (this.#released || !/^(0|[1-9]\d*)$/.test(id) || this.#sessionFile || this.#adoptedArtifactManager) {
-			return null;
-		}
-		return this.#inMemoryArtifacts?.get(id) ?? null;
+		return this.#artifactManagerForSession().getPath(id);
 	}
 
 	/** Read only this live owner's artifact, with a UTF-8 byte limit. */
@@ -3719,10 +3794,6 @@ export class SessionManager {
 			return null;
 		}
 		const manager = this.#artifactManagerForSession();
-		if (!manager) {
-			const content = this.#inMemoryArtifacts?.get(id);
-			return content !== undefined && Buffer.byteLength(content, "utf8") <= maxBytes ? content : null;
-		}
 		const sessionId = this.#sessionId;
 		const ownerStillCurrent = (): boolean =>
 			!this.#released && this.#sessionId === sessionId && this.#artifactManagerForSession() === manager;
@@ -3731,12 +3802,7 @@ export class SessionManager {
 			if (!ownerStillCurrent()) return null;
 			const directory = await fs.promises.lstat(manager.dir);
 			if (!directory.isDirectory() || !ownerStillCurrent()) return null;
-			const prefix = `${id}.`;
-			const filename = (await manager.listFiles()).find(
-				name => name.startsWith(prefix) && /^\d+\.[A-Za-z0-9_-]{1,64}\.log$/.test(name),
-			);
-			if (!filename || !ownerStillCurrent()) return null;
-			const artifactPath = path.join(manager.dir, filename);
+			const artifactPath = path.join(manager.dir, spillFileName(id));
 			const expected = await fs.promises.lstat(artifactPath);
 			if (!ownerStillCurrent() || !expected.isFile() || expected.size > maxBytes) return null;
 			const file = await fs.promises.open(artifactPath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
@@ -3949,8 +4015,9 @@ export class SessionManager {
 		this.#notifyEntryAppended(entry);
 		await this.#persistTitleChangeEntry(entry, update);
 		// Keep the recent-sessions title index current so welcome-screen lookups
-		// never have to content-scan this session's file.
-		if (this.#persist && this.#storage instanceof FileSessionStorage) {
+		// never have to content-scan this session's file. Another client's session
+		// stays out: the picker lists indexed titles without reading the header.
+		if (this.#persist && this.#storage instanceof FileSessionStorage && !this.#header.origin) {
 			recordSessionTitle(this.#sessionId, title);
 		}
 
@@ -4091,10 +4158,7 @@ export class SessionManager {
 
 	/** Record usage on its initiating branch without moving a successor branch or session. */
 	appendModelUsage(
-		usage: Pick<
-			ModelUsageEntry,
-			"purpose" | "role" | "api" | "provider" | "model" | "usage" | "stopReason" | "errorMessage" | "cacheRefresh"
-		>,
+		usage: ModelUsageRecord,
 		owner: { sessionId: string; parentId: string | null },
 	): string | undefined {
 		if (this.#sessionId !== owner.sessionId || (owner.parentId !== null && !this.#index.has(owner.parentId))) {
@@ -4247,12 +4311,14 @@ export class SessionManager {
 	}
 
 	/**
-	 * Append a custom message entry (for extensions) that participates in LLM context.
+	 * Append a custom message entry (for extensions) that participates in LLM context unless `excludeFromContext`.
 	 * @param customType Hook identifier for filtering on reload
 	 * @param content Message content (string or TextContent/ImageContent array)
 	 * @param display Whether to show in TUI (true = styled display, false = hidden)
 	 * @param details Optional extension-specific metadata (not sent to LLM)
 	 * @param attribution Who initiated this message for billing/attribution semantics
+	 * @param timestamp The message's own timestamp; defaults to now
+	 * @param excludeFromContext Render and save the message but never send it to the model
 	 */
 	appendCustomMessageEntry<T = unknown>(
 		customType: string | undefined,
@@ -4261,9 +4327,17 @@ export class SessionManager {
 		details?: T,
 		attribution: MessageAttribution | undefined = "agent",
 		timestamp?: number,
+		excludeFromContext?: boolean,
 		stopHookAssistantEntryId?: string,
 	): string {
-		const normalized = normalizeCustomMessagePayload<T>({ customType, content, display, details, attribution });
+		const normalized = normalizeCustomMessagePayload<T>({
+			customType,
+			content,
+			display,
+			details,
+			attribution,
+			excludeFromContext,
+		});
 		const fresh = this.#freshEntryFields();
 		const entry: CustomMessageEntry<T> = {
 			type: "custom_message",
@@ -4273,6 +4347,7 @@ export class SessionManager {
 			// Drop AgentSession-internal transient fields before disk persistence.
 			details: stripInternalDetailsFields(normalized.details),
 			attribution: normalized.attribution,
+			excludeFromContext: normalized.excludeFromContext,
 			...fresh,
 			// Prefer the initiating message's own timestamp: without it the entry
 			// records the emission time, which on rebuild excludes provider
@@ -4368,13 +4443,20 @@ export class SessionManager {
 		for (let index = branch.length - 1; index >= 0; index--) {
 			const entry = branch[index];
 			if (entry.type !== "model_change") continue;
-			return entry.role === "temporary" || entry.role === PREWALK_MODEL_CHANGE_ROLE ? entry : undefined;
+			return entry.role === TEMPORARY_MODEL_CHANGE_ROLE || entry.role === PREWALK_MODEL_CHANGE_ROLE
+				? entry
+				: undefined;
 		}
 		return undefined;
 	}
 
 	getEntry(id: string): SessionEntry | undefined {
 		return this.#index.get(id);
+	}
+
+	/** The active leaf's place in the session tree ({@link SessionEntryIndex.treePosition}). */
+	getTreePosition(): SessionTreePosition | undefined {
+		return this.#index.treePosition();
 	}
 
 	/** All direct children of an entry. */
@@ -4610,8 +4692,8 @@ export class SessionManager {
 	/**
 	 * Create a new session file containing only the path from root to `leafId`.
 	 * With `copyArtifacts`, the source artifact directory is copied in the background;
-	 * the new artifact manager waits for it before allocating ids or resolving
-	 * `artifact://`, so kept references stay valid and new ids cannot collide.
+	 * the new spill manager waits for it before allocating ids or resolving
+	 * spills, so kept references stay valid and new ids cannot collide.
 	 * Returns the new file path, or undefined when not persisting.
 	 */
 	createBranchedSession(leafId: string, options?: { copyArtifacts?: boolean }): string | undefined {
@@ -4643,6 +4725,7 @@ export class SessionManager {
 			id: newSessionId,
 			timestamp,
 			cwd: this.#cwd,
+			origin: this.#origin,
 			title: this.#sessionName,
 			titleSource: this.#titleSource,
 			titleCard: this.#titleCard,
@@ -4679,7 +4762,7 @@ export class SessionManager {
 		this.#hasTitleSlot = true;
 		this.#index.rebuild(this.#entries);
 		this.#artifactManager = null;
-		this.#artifactManagerSessionFile = null;
+		this.#artifactManagerLocalRoot = null;
 		this.#forceFileCreation = this.#persist;
 
 		if (!this.#persist) {
@@ -4968,12 +5051,15 @@ export class SessionManager {
 		session: Pick<SessionInfo, "path" | "cwd">,
 		cwd: string,
 		sessionDir?: string,
+		settings?: Settings,
 	): Promise<boolean> {
 		if (!session.cwd || !(await directoryIsMissing(session.cwd))) return false;
 		const dir = path.resolve(sessionDir ?? SessionManager.getDefaultSessionDir(cwd));
 		const home = path.resolve(path.dirname(session.path));
 		if (home === dir) return resolveManagedSessionRoot(dir, cwd) !== undefined;
-		return (await worktreeSessionDirs(cwd, dir)).some(sibling => path.resolve(sibling) === home);
+		return (await worktreeSessionDirs(cwd, dir, { settings, stranded: true })).some(
+			sibling => path.resolve(sibling) === home,
+		);
 	}
 
 	/**
@@ -5042,7 +5128,9 @@ export class SessionManager {
 		};
 	}
 	/**
-	 * Continue the most recent session, or create a new one if none exists.
+	 * Continue the most recent session, or create a new one if none exists or
+	 * another live omp process writes the one picked
+	 * ({@link SessionStorage.isSessionOwnedElsewhere}).
 	 *
 	 * When the chosen session's conversation went on in another file (it moved
 	 * off its file; see `findSessionContinuation`), this opens the copy to
@@ -5172,9 +5260,15 @@ export class SessionManager {
 			const continuation = fromBreadcrumb
 				? await findSessionContinuation(chosenSession, storage)
 				: await findRecentSessionContinuation(chosenSession, storage);
-			if (continuation) {
-				options.onSessionContinuation?.(continuation);
-				chosenSession = continuation.session.path;
+			const resumable = continuation?.session.path ?? chosenSession;
+			if (storage.isSessionOwnedElsewhere?.(resumable)) {
+				// Its first write would move it to a sibling, duplicating the
+				// conversation the running process keeps writing: start fresh.
+				logger.debug("Not continuing a session another omp process writes", { sessionFile: resumable });
+				chosenSession = null;
+			} else {
+				if (continuation) options.onSessionContinuation?.(continuation);
+				chosenSession = resumable;
 			}
 		}
 
@@ -5219,7 +5313,7 @@ export class SessionManager {
 	 * untitled empties dropped. Titled empties stay — a title is user intent worth resuming.
 	 * Arrives in two passes: rows for history.db-indexed titles first, the full
 	 * scan in `complete` (see {@link listSessionsForPicker}).
-	 * By default includes the same folder in the repository's other git worktrees,
+	 * By default includes the same folder in the repository's Git and ovnfs worktrees,
 	 * so a session `/wt` moved stays reachable from the checkout it left.
 	 * The directory scope limits the picker to its own session bucket.
 	 */
@@ -5228,11 +5322,12 @@ export class SessionManager {
 		sessionDir?: string,
 		storage: SessionStorage = new FileSessionStorage(),
 		worktreeScope: "directory" | "repo" = "repo",
+		settings?: Settings,
 	): Promise<PickerListing> {
 		const dir = sessionDir ?? SessionManager.getDefaultSessionDir(cwd, undefined, storage);
 		const [pinned, siblingDirs] = await Promise.all([
 			loadPinnedSessionIds(),
-			worktreeScope === "repo" ? worktreeSessionDirs(cwd, dir) : [],
+			worktreeScope === "repo" ? worktreeSessionDirs(cwd, dir, { settings }) : [],
 		]);
 		return listSessionsForPicker(dir, storage, pinned, siblingDirs);
 	}

@@ -1,12 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
-import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { ipcEndpoint } from "@oh-my-pi/pi-natives";
+import { daemonClient, isolateDaemonForSmokeTest } from "../src/daemon/client";
 import { TempDir } from "@oh-my-pi/pi-utils";
-import * as daemonClient from "../src/launch/client";
-import { daemonBrokerRuntimeDir, daemonRuntimeDir } from "../src/launch/paths";
 import * as lspClient from "../src/lsp/client";
-import { LspMuxServer } from "../src/lsp/mux/server";
 import type { ServerConfig } from "../src/lsp/types";
 
 const fixturePath = path.join(import.meta.dir, "fixtures", "fake-lsp-server.ts");
@@ -21,7 +17,7 @@ function isRunning(pid: number): boolean {
 }
 
 async function waitForProcessExit(pid: number, timeoutMs: number): Promise<boolean> {
-	// The mux stops servers asynchronously; poll with a wall-clock bound far below its 5-minute idle linger.
+	// Bound asynchronous server retirement well below the five-minute idle grace.
 	const deadline = Date.now() + timeoutMs;
 	while (Date.now() < deadline) {
 		if (!isRunning(pid)) return true;
@@ -30,25 +26,17 @@ async function waitForProcessExit(pid: number, timeoutMs: number): Promise<boole
 	return !isRunning(pid);
 }
 
-describe("lsp reload through the shared mux", () => {
+describe("LSP reload through the daemon module", () => {
 	afterEach(() => {
 		vi.restoreAllMocks();
 	});
 
-	it("stops the server of a superseded shared client instead of leaving it idle in the mux", async () => {
+	it("stops the server of a superseded shared client instead of leaving it idle", async () => {
 		const tempDir = TempDir.createSync("@omp-lsp-mux-reload-");
-		const runtimeDir = daemonRuntimeDir(tempDir.path());
-		const muxRuntimeDir = daemonBrokerRuntimeDir(runtimeDir);
-		const mux = new LspMuxServer();
+		const restoreDaemon = await isolateDaemonForSmokeTest();
 		const shared = lspClient.holdSharedLsp(true);
 		try {
-			await fs.mkdir(muxRuntimeDir, { recursive: true });
-			await mux.listen(ipcEndpoint(muxRuntimeDir, "lsp-mux"));
-			// The client finds this in-process mux at the project's endpoint; the broker only has to answer its ping.
-			vi.spyOn(daemonClient, "daemonClientForProject").mockResolvedValue({
-				projectDir: tempDir.path(),
-				request: async () => ({}),
-			} as unknown as daemonClient.DaemonBrokerClient);
+			await daemonClient();
 
 			const config: ServerConfig = {
 				command: process.execPath,
@@ -72,8 +60,7 @@ describe("lsp reload through the shared mux", () => {
 		} finally {
 			shared.release();
 			await lspClient.shutdownAll();
-			await mux.shutdown();
-			await fs.rm(runtimeDir, { recursive: true, force: true });
+			await restoreDaemon();
 			tempDir.removeSync();
 		}
 	}, 15_000);
