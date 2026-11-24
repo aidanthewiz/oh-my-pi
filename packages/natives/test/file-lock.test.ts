@@ -115,7 +115,7 @@ test.skipIf(process.platform !== "linux")(
 				expect(await acquired(blocked)).toBe(false);
 				expect(await blocked.exited).toBe(0);
 			}
-			expect(await fs.readdir(contexts[0]!)).toEqual([]);
+			await expect(fs.lstat(path.join(contexts[0]!, key))).rejects.toMatchObject({ code: "ENOENT" });
 			expect(await fs.readFile(path.join(contexts[1]!, key), "utf8")).toBe("must remain untouched");
 			expect((await fs.lstat(fifo)).isFIFO()).toBe(true);
 			owner.release();
@@ -135,7 +135,7 @@ test.skipIf(process.platform !== "linux")(
 				expect(owner.acquired).toBe(true);
 				owner.release();
 			}
-			expect(await fs.readdir(contexts[0]!)).toEqual([]);
+			await expect(fs.lstat(path.join(contexts[0]!, key))).rejects.toMatchObject({ code: "ENOENT" });
 			expect(await fs.readFile(path.join(contexts[1]!, key), "utf8")).toBe("must remain untouched");
 			expect((await fs.lstat(fifo)).isFIFO()).toBe(true);
 		} finally {

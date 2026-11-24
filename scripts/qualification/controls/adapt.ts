@@ -54,6 +54,17 @@ export function adaptFixture(id: string, raw: string, checkout: string): string 
 		);
 		text = text.replace("externalNetworkDeniedByParent: true", "externalFetchIntercepted: true");
 	}
+	if (id === "mcp") {
+		const oldHttpPath = "packages/coding-agent/src/mcp/transports/http.ts";
+		assert.equal(text.split(oldHttpPath).length, 3);
+		text = text.replaceAll(oldHttpPath, "packages/coding-agent/src/mcp/host/http-upstream.ts");
+		text = replaceOne(text, "const { HttpTransport } =", "const { HttpUpstream } =");
+		text = replaceOne(
+			text,
+			"new HttpTransport(config)",
+			"new HttpUpstream({ transport: 'http', url: config.url, headers: {}, timeoutMs: config.timeout }, 'legacy')",
+		);
+	}
 	if (id === "provider") {
 		text = replaceOne(
 			text,

@@ -202,10 +202,13 @@ mod platform {
 
 		/// Resolves once the process exits: its pidfd becomes readable then.
 		pub async fn exited(&self) -> std::io::Result<()> {
-			let pidfd = tokio::io::unix::AsyncFd::with_interest(
-				self.pidfd.try_clone()?,
-				tokio::io::Interest::READABLE,
-			)?;
+			let pidfd = self.pidfd.try_clone()?;
+			// SAFETY: AsyncFd owns this duplicate until deregistration. Nothing
+			// closes it externally; readiness is observed without reading the
+			// pidfd.
+			let pidfd = unsafe {
+				tokio::io::unix::AsyncFd::register_with_interest(pidfd, tokio::io::Interest::READABLE)
+			}?;
 			let _ready = pidfd.readable().await?;
 			Ok(())
 		}

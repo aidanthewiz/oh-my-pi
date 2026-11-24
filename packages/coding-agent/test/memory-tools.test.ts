@@ -1505,36 +1505,35 @@ describe("Mnemopi backend lifecycle", () => {
 		const lock = new Database(sharedDbPath!);
 		lock.exec("BEGIN IMMEDIATE");
 		const sharedMemory = state.globalMemory;
-		const sharedFlushCalled = Promise.withResolvers<void>();
+		const sharedFlushFinished = Promise.withResolvers<void>();
+		let sharedWaitMs = Number.POSITIVE_INFINITY;
+		let sharedError: unknown;
 		const sharedFlushSpy = vi.spyOn(sharedMemory!, "flushExtractions").mockImplementation(async () => {
-			// Signal first: the exec below may throw SQLITE_BUSY while the lock is
-			// still held, and the call itself is what the test awaits.
-			sharedFlushCalled.resolve();
-			// Model a pending extraction/embedding commit. An idle shared bank performs
-			// no SQLite work during flush, so merely locking it would not exercise its
-			// connection's busy timeout.
-			sharedMemory!.beam.db.exec("PRAGMA user_version=7351");
+			// Force a write on the shared connection while the independent owner
+			// still holds its transaction; an idle bank would not exercise a wait.
+			const started = performance.now();
+			try {
+				sharedMemory!.beam.db.exec("PRAGMA user_version=7351");
+			} catch (error) {
+				sharedError = error;
+				throw error;
+			} finally {
+				sharedWaitMs = performance.now() - started;
+				sharedFlushFinished.resolve();
+			}
 		});
 
-		const started = performance.now();
 		try {
 			await state.dispose({ timeoutMs: 50 });
+			// Disposal may detach the flush. Keep the competing transaction held
+			// until the actual write finishes so the lock-wait assertion cannot pass vacuously.
+			await sharedFlushFinished.promise;
+			expect(sharedError).toMatchObject({ code: "SQLITE_BUSY" });
+			expect(sharedWaitMs).toBeLessThan(500);
+			expect(sharedFlushSpy).toHaveBeenCalledTimes(1);
 		} finally {
 			lock.exec("ROLLBACK");
 			lock.close();
-		}
-		const elapsedMs = performance.now() - started;
-
-		try {
-			expect(elapsedMs).toBeLessThan(500);
-			// When the shutdown budget expires mid-consolidate, dispose detaches the
-			// pass instead of abandoning it (#3641) — so on a slow runner the shared
-			// flush may not have run yet when dispose returns. The lock is released
-			// above, so the detached pass must still reach the shared bank; await
-			// the call itself instead of asserting synchronously.
-			await sharedFlushCalled.promise;
-			expect(sharedFlushSpy).toHaveBeenCalledTimes(1);
-		} finally {
 			registeredMnemopiState = undefined;
 		}
 	});

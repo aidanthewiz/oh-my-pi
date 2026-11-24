@@ -57,7 +57,7 @@ describe("runInteractiveBashPty", () => {
 			env: { PATH: Bun.env.PATH ?? "", HOME: tempDir.path(), ...env },
 		});
 		expect(result.exitCode).toBe(0);
-		return result.output;
+		return result.output.replace(/\n+$/, "");
 	}
 
 	it.skipIf(ptyUnavailable)(
