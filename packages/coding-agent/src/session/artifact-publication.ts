@@ -20,13 +20,14 @@ interface PublicationScope {
 
 const publicationScope = new AsyncLocalStorage<PublicationScope>();
 
-function publicationLockTarget(): { path: string; legacyKey?: string } {
+function publicationLockTarget(): { kind: "named"; name: string } | { kind: "path"; path: string } {
 	const user = userInfo();
 	if (process.platform === "win32") {
 		const identity = createHash("sha256").update(`${user.username}\0${user.homedir}`.toLowerCase()).digest("hex");
-		return { path: `coreforge-artifact-publication-v1-${identity}` };
+		return { kind: "path", path: `coreforge-artifact-publication-v1-${identity}` };
 	}
 	const name = `coreforge-artifact-publication-v1-${user.uid}`;
+	if (process.platform === "linux") return { kind: "named", name };
 
 	// HOME, TMPDIR, CWD and artifact paths cannot select a different lease namespace.
 	const root = realpathSync("/tmp");
@@ -54,7 +55,7 @@ function publicationLockTarget(): { path: string; legacyKey?: string } {
 	if (!lockStat.isFile() || lockStat.uid !== user.uid || lockStat.nlink !== 1 || (lockStat.mode & 0o777) !== 0o600)
 		throw new Error("Artifact publication lock file is not private to this OS user.");
 	// This inode is persistent: unlinking it would split concurrent flock owners.
-	return { path: lockPath, legacyKey: process.platform === "linux" ? name : undefined };
+	return { kind: "path", path: lockPath };
 }
 
 /** Serialize cooperating artifact writers and directory relocations for this OS user. */
@@ -69,7 +70,8 @@ export async function withArtifactPublicationLock<T>(
 		const target = publicationLockTarget();
 		for (;;) {
 			signal?.throwIfAborted();
-			const lock = FileLock.tryAcquire(target.path, false, target.legacyKey);
+			const lock =
+				target.kind === "named" ? FileLock.tryAcquireNamed(target.name) : FileLock.tryAcquire(target.path, false);
 			if (lock.acquired) {
 				lease = { lock, holders: 0, live: true };
 				break;

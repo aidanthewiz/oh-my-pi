@@ -205,12 +205,21 @@ describe("runSubprocess wall clock (task.maxRuntimeMs)", () => {
 		});
 		await entered.promise;
 		const contended = Promise.withResolvers<undefined>();
-		const acquire = FileLock.tryAcquire.bind(FileLock);
-		vi.spyOn(FileLock, "tryAcquire").mockImplementation((...args) => {
-			const lock = acquire(...args);
-			if (!lock.acquired) contended.resolve(undefined);
-			return lock;
-		});
+		if (process.platform === "linux") {
+			const acquire = FileLock.tryAcquireNamed.bind(FileLock);
+			vi.spyOn(FileLock, "tryAcquireNamed").mockImplementation(name => {
+				const lock = acquire(name);
+				if (!lock.acquired) contended.resolve(undefined);
+				return lock;
+			});
+		} else {
+			const acquire = FileLock.tryAcquire.bind(FileLock);
+			vi.spyOn(FileLock, "tryAcquire").mockImplementation((...args) => {
+				const lock = acquire(...args);
+				if (!lock.acquired) contended.resolve(undefined);
+				return lock;
+			});
+		}
 		const pending = runSubprocess({
 			...baseOptions,
 			id,

@@ -1,7 +1,5 @@
 #[cfg(not(target_os = "linux"))]
 use std::fs::TryLockError;
-#[cfg(target_os = "linux")]
-use std::os::unix::net::UnixDatagram;
 use std::{
 	fs::{File, OpenOptions},
 	io,
@@ -10,9 +8,7 @@ use std::{
 
 /// Unix lock held by a persistent sidecar's open file description.
 pub struct PlatformFileLock {
-	file:              Option<File>,
-	#[cfg(target_os = "linux")]
-	pub(super) legacy: Option<UnixDatagram>,
+	file: Option<File>,
 }
 
 pub fn try_acquire_with_create(path: &str, create: bool) -> io::Result<Option<PlatformFileLock>> {
@@ -31,11 +27,7 @@ pub fn try_acquire_with_create(path: &str, create: bool) -> io::Result<Option<Pl
 		Err(error) if !create && error.kind() == io::ErrorKind::NotFound => return Ok(None),
 		Err(error) => return Err(error),
 	};
-	Ok(lock_exclusive(&file)?.then(|| PlatformFileLock {
-		file: Some(file),
-		#[cfg(target_os = "linux")]
-		legacy: None,
-	}))
+	Ok(lock_exclusive(&file)?.then(|| PlatformFileLock { file: Some(file) }))
 }
 
 #[cfg(target_os = "linux")]
@@ -111,8 +103,6 @@ impl PlatformFileLock {
 	#[allow(clippy::unnecessary_wraps, reason = "uniform cross-platform interface")]
 	pub fn release(&mut self) -> io::Result<()> {
 		drop(self.file.take());
-		#[cfg(target_os = "linux")]
-		drop(self.legacy.take());
 		Ok(())
 	}
 }

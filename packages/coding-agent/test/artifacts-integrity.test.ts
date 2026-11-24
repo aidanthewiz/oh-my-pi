@@ -18,6 +18,22 @@ describe("ArtifactManager write integrity", () => {
 		return dir;
 	}
 
+	function observeContention(): Promise<void> {
+		const contended = Promise.withResolvers<void>();
+		const observe = (lock: FileLock): FileLock => {
+			if (!lock.acquired) contended.resolve();
+			return lock;
+		};
+		if (process.platform === "linux") {
+			const acquire = FileLock.tryAcquireNamed.bind(FileLock);
+			vi.spyOn(FileLock, "tryAcquireNamed").mockImplementation(name => observe(acquire(name)));
+		} else {
+			const acquire = FileLock.tryAcquire.bind(FileLock);
+			vi.spyOn(FileLock, "tryAcquire").mockImplementation((...args) => observe(acquire(...args)));
+		}
+		return contended.promise;
+	}
+
 	afterEach(() => {
 		vi.restoreAllMocks();
 		for (const dir of dirs.splice(0)) removeSyncWithRetries(dir);
@@ -115,13 +131,7 @@ describe("ArtifactManager write integrity", () => {
 		const destination = path.join(dir, "Worker.md");
 		const entered = Promise.withResolvers<void>();
 		const release = Promise.withResolvers<void>();
-		const contended = Promise.withResolvers<void>();
-		const acquire = FileLock.tryAcquire.bind(FileLock);
-		vi.spyOn(FileLock, "tryAcquire").mockImplementation((...args) => {
-			const lock = acquire(...args);
-			if (!lock.acquired) contended.resolve();
-			return lock;
-		});
+		const contended = observeContention();
 		const holder = withArtifactPublicationLock(async () => {
 			await writeArtifact(destination, "first accepted report");
 			entered.resolve();
@@ -130,7 +140,7 @@ describe("ArtifactManager write integrity", () => {
 		await entered.promise;
 		const replacement = writeArtifact(destination, "second accepted report");
 		try {
-			await contended.promise;
+			await contended;
 			expect(await Bun.file(destination).text()).toBe("first accepted report");
 		} finally {
 			release.resolve();
@@ -147,13 +157,7 @@ describe("ArtifactManager write integrity", () => {
 		await writeArtifact(destination, "accepted report");
 		const entered = Promise.withResolvers<void>();
 		const release = Promise.withResolvers<void>();
-		const contended = Promise.withResolvers<void>();
-		const acquire = FileLock.tryAcquire.bind(FileLock);
-		vi.spyOn(FileLock, "tryAcquire").mockImplementation((...args) => {
-			const lock = acquire(...args);
-			if (!lock.acquired) contended.resolve();
-			return lock;
-		});
+		const contended = observeContention();
 		const holder = withArtifactPublicationLock(async () => {
 			entered.resolve();
 			await release.promise;
@@ -168,7 +172,7 @@ describe("ArtifactManager write integrity", () => {
 			error => error,
 		);
 		try {
-			await contended.promise;
+			await contended;
 			controller.abort();
 			expect(await waiting).toMatchObject({ name: "AbortError" });
 			expect(await Bun.file(destination).text()).toBe("accepted report");
@@ -192,13 +196,7 @@ describe("ArtifactManager write integrity", () => {
 		});
 		const entered = Promise.withResolvers<void>();
 		const release = Promise.withResolvers<void>();
-		const contended = Promise.withResolvers<void>();
-		const acquire = FileLock.tryAcquire.bind(FileLock);
-		vi.spyOn(FileLock, "tryAcquire").mockImplementation((...args) => {
-			const lock = acquire(...args);
-			if (!lock.acquired) contended.resolve();
-			return lock;
-		});
+		const contended = observeContention();
 		const holder = withArtifactPublicationLock(async () => {
 			entered.resolve();
 			await release.promise;
@@ -206,7 +204,7 @@ describe("ArtifactManager write integrity", () => {
 		await entered.promise;
 		wake.resolve();
 		try {
-			await contended.promise;
+			await contended;
 			expect(await Bun.file(destination).text()).toBe("accepted report");
 		} finally {
 			release.resolve();

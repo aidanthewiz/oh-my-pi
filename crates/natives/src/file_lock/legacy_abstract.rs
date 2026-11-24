@@ -6,7 +6,7 @@ use std::{
 	},
 };
 
-/// Acquire the exact old abstract identity without interpreting it as a path.
+/// Acquire a logical name using the unchanged abstract-socket protocol.
 pub fn try_bind(key: &str) -> io::Result<Option<UnixDatagram>> {
 	let address = SocketAddr::from_abstract_name(super::memory_lock_name(key).as_bytes())?;
 	match UnixDatagram::bind_addr(&address) {

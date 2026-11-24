@@ -307,7 +307,7 @@ export declare class FdStream {
 /**
  * Process-owned cross-platform advisory lock.
  *
- * `tryAcquire()` is non-blocking; its returned handle reports whether it won
+ * Acquisition is non-blocking; the returned handle reports whether it won
  * through `acquired`. Ownership ends on `release()`, garbage collection, or
  * process exit; `release()` is idempotent.
  */
@@ -317,12 +317,18 @@ export declare class FileLock {
    *
    * File-backed Unix locks create their file by default. `create = false`
    * refuses symlinks and leaves missing files unacquired.
-   * Name-only locks never create files.
-   *
-   * On Linux, `legacy_key` also retains that exact old abstract identity
-   * until release. It is never opened as a path. Other platforms ignore it.
+   * Name-only Windows locks never create files.
    */
-  static tryAcquire(path: string, create?: boolean | undefined | null, legacyKey?: string | undefined | null): FileLock
+  static tryAcquire(path: string, create?: boolean | undefined | null): FileLock
+  /**
+   * Try to acquire a Linux abstract-socket name without filesystem access.
+   *
+   * The exact name bytes select the existing kernel lease protocol. The
+   * socket is retained until release, garbage collection, or process exit.
+   * Coordination is within one network namespace; other platforms reject
+   * this operation.
+   */
+  static tryAcquireNamed(name: string): FileLock
   /**
    * Whether any handle, in any process including this one, holds `path`.
    *

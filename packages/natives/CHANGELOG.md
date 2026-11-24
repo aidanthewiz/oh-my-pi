@@ -6,7 +6,7 @@
 
 - Added `clearEnv` to PTY start options so callers can replace, rather than overlay, the inherited process environment.
 - Expose an identity-checked path lookup for already-loaded native classes and functions.
-- Allow Linux file-lock callers to retain an explicit legacy abstract key for the full file-backed lease lifetime.
+- Expose Linux named kernel leases without filesystem prerequisites; retain the exact abstract identity through release, collection and process exit.
 
 ### Fixed
 

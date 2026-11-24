@@ -7,7 +7,6 @@ import { compileFixture, environment, receipt, required, run, runCompiled } from
 import { requiredSurfaces, selectVisualCaptures } from "../visual/contract.ts";
 import { inside, inventory, materialize, sha256 } from "./materialize.ts";
 import type { Domain, Mode } from "./materialize.ts";
-import { captureNamespaceIdentity } from "../namespace-identity.ts";
 
 type Json = Record<string, any>;
 type Capture = { id: string; domain: Domain; file: string; sha256: string; bytes: number; displayed?: string };
@@ -155,7 +154,6 @@ export async function executeDomains(options: { mode: Mode; domain?: Domain; bac
 			await fs.mkdir(resultDirectory, { mode: 0o700 });
 			const authored = await materialize({ checkout, work });
 			const entrypoint = authored.fixtures.find(row => row.id === spec.id)!.entrypoint;
-			const observeNamespace = mode === "compiled" && spec.id === "task-dispatch";
 			await json(path.join(resultDirectory, "effective-sources.json"), {
 				...authored,
 				companionQualification: "excluded",
@@ -196,15 +194,11 @@ export async function executeDomains(options: { mode: Mode; domain?: Domain; bac
 				`import assert from 'node:assert/strict';import fs from 'node:fs';import{createHash}from'node:crypto';
 if(process.argv[2]?.startsWith('__omp_worker_')){const{runCli}=await import(${JSON.stringify(cli)});if(process.env.PI_COMPILED!=='true'&&Bun.isMainThread)await runCli(process.argv.slice(2));}
 else{await import(${JSON.stringify(nativeIndex)});const{nativeAddonStatus}=await import(${JSON.stringify(nativeState)});const native=nativeAddonStatus();assert(native&&!native.stale);assert.equal(native.version,${JSON.stringify(manifest.version)});assert.equal(native.packageVersion,${JSON.stringify(manifest.version)});const loaded=fs.realpathSync(native.path);const digest=()=>createHash('sha256').update(fs.readFileSync(loaded)).digest('hex');assert.equal(digest(),${JSON.stringify(nativeSha256)});${mode === "compiled" ? `assert(loaded.startsWith(${JSON.stringify(work + path.sep)}));` : ""}
-${observeNamespace ? `const{captureNamespaceIdentity}=await import(${JSON.stringify(path.join(checkout, "scripts/qualification/namespace-identity.ts"))});await fs.promises.writeFile(${JSON.stringify(path.join(resultDirectory, "namespace-inside.json"))},JSON.stringify(await captureNamespaceIdentity("inside"))+"\\n",{flag:"wx",mode:0o600});` : ""}
 const module=await import(${JSON.stringify(entrypoint)});${"invoke" in spec ? `console.log(JSON.stringify(await module.${spec.invoke}()));` : ""}
 assert.equal(nativeAddonStatus()?.path,native.path);assert.equal(digest(),${JSON.stringify(nativeSha256)});console.log(JSON.stringify({schema:'CoreforgeQualificationDomainCompleted',domain:${JSON.stringify(spec.id)},mode:${JSON.stringify(mode)},nativeSha256:digest(),importedAndReturned:true}));}\n`,
 				{ flag: "wx", mode: 0o600 },
 			);
 			if (mode === "compiled") await compileFixture(wrapper, consumer);
-			if (observeNamespace) {
-				await json(path.join(resultDirectory, "namespace-outside.json"), await captureNamespaceIdentity("outside"));
-			}
 			const execution = await (mode === "compiled"
 				? runCompiled([consumer], { cwd: work, env, timeoutMs: 420_000, allowFailure: true })
 				: run([process.execPath, "--no-env-file", wrapper], {

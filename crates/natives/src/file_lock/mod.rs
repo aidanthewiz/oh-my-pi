@@ -37,21 +37,23 @@ fn memory_lock_name(path: &str) -> String {
 	format!("omp-file-lock-{high:016x}{low:016x}")
 }
 
+enum LockLease {
+	Path(platform::PlatformFileLock),
+	#[cfg(target_os = "linux")]
+	Named(std::os::unix::net::UnixDatagram),
+}
+
 /// Process-owned cross-platform advisory lock.
 ///
-/// `tryAcquire()` is non-blocking; its returned handle reports whether it won
+/// Acquisition is non-blocking; the returned handle reports whether it won
 /// through `acquired`. Ownership ends on `release()`, garbage collection, or
 /// process exit; `release()` is idempotent.
 #[napi(js_name = "FileLock")]
 pub struct FileLock {
-	inner: Option<platform::PlatformFileLock>,
+	inner: Option<LockLease>,
 }
 
-fn acquire(
-	path: &str,
-	create: bool,
-	legacy_key: Option<&str>,
-) -> io::Result<Option<platform::PlatformFileLock>> {
+fn acquire(path: &str, create: bool) -> io::Result<Option<platform::PlatformFileLock>> {
 	#[cfg(unix)]
 	let inner = platform::try_acquire_with_create(path, create)?;
 	#[cfg(target_os = "windows")]
@@ -65,20 +67,19 @@ fn acquire(
 	} else {
 		inner
 	};
-	#[cfg(target_os = "linux")]
-	let inner = {
-		let mut inner = inner;
-		if let (Some(lock), Some(key)) = (inner.as_mut(), legacy_key) {
-			let Some(legacy) = legacy_abstract::try_bind(key)? else {
-				return Ok(None);
-			};
-			lock.legacy = Some(legacy);
-		}
-		inner
-	};
-	#[cfg(not(target_os = "linux"))]
-	let _ = legacy_key;
 	Ok(inner)
+}
+
+fn acquire_named(name: &str) -> io::Result<Option<LockLease>> {
+	#[cfg(target_os = "linux")]
+	{
+		legacy_abstract::try_bind(name).map(|lease| lease.map(LockLease::Named))
+	}
+	#[cfg(not(target_os = "linux"))]
+	{
+		let _ = name;
+		Err(io::ErrorKind::Unsupported.into())
+	}
 }
 
 #[napi]
@@ -91,7 +92,7 @@ impl FileLock {
 		let path = path.to_str().ok_or_else(|| {
 			io::Error::new(io::ErrorKind::InvalidInput, "lock path is not valid UTF-8")
 		})?;
-		acquire(path, true, None).map(|inner| Self { inner })
+		acquire(path, true).map(|inner| Self { inner: inner.map(LockLease::Path) })
 	}
 
 	pub(crate) fn is_held_path(path: &str) -> io::Result<bool> {
@@ -105,24 +106,35 @@ impl FileLock {
 	///
 	/// File-backed Unix locks create their file by default. `create = false`
 	/// refuses symlinks and leaves missing files unacquired.
-	/// Name-only locks never create files.
-	///
-	/// On Linux, `legacy_key` also retains that exact old abstract identity
-	/// until release. It is never opened as a path. Other platforms ignore it.
+	/// Name-only Windows locks never create files.
 	#[napi(factory)]
-	pub fn try_acquire(
-		path: JsString,
-		create: Option<bool>,
-		legacy_key: Option<JsString>,
-	) -> napi::Result<Self> {
+	pub fn try_acquire(path: JsString, create: Option<bool>) -> napi::Result<Self> {
 		let path = js::utf8(path)?;
-		let legacy_key = legacy_key.map(js::utf8).transpose()?;
-		acquire(&path, create.unwrap_or(true), legacy_key.as_deref())
-			.map(|inner| Self { inner })
+		acquire(&path, create.unwrap_or(true))
+			.map(|inner| Self { inner: inner.map(LockLease::Path) })
 			.map_err(|error| {
 				napi::Error::from_reason(format!(
 					"Failed to acquire native file lock for {}: {error}",
 					&*path
+				))
+			})
+	}
+
+	/// Try to acquire a Linux abstract-socket name without filesystem access.
+	///
+	/// The exact name bytes select the existing kernel lease protocol. The
+	/// socket is retained until release, garbage collection, or process exit.
+	/// Coordination is within one network namespace; other platforms reject
+	/// this operation.
+	#[napi(factory)]
+	pub fn try_acquire_named(name: JsString) -> napi::Result<Self> {
+		let name = js::utf8(name)?;
+		acquire_named(&name)
+			.map(|inner| Self { inner })
+			.map_err(|error| {
+				napi::Error::from_reason(format!(
+					"Failed to acquire native named lock for {}: {error}",
+					&*name
 				))
 			})
 	}
@@ -166,12 +178,18 @@ impl FileLock {
 
 	/// Release native ownership while preserving the handle on failure.
 	pub(crate) fn release_native(&mut self) -> io::Result<()> {
-		let Some(mut inner) = self.inner.take() else {
+		let Some(inner) = self.inner.take() else {
 			return Ok(());
 		};
-		if let Err(error) = inner.release() {
-			self.inner = Some(inner);
-			return Err(error);
+		match inner {
+			LockLease::Path(mut lease) => {
+				if let Err(error) = lease.release() {
+					self.inner = Some(LockLease::Path(lease));
+					return Err(error);
+				}
+			},
+			#[cfg(target_os = "linux")]
+			LockLease::Named(lease) => drop(lease),
 		}
 		Ok(())
 	}
@@ -179,9 +197,7 @@ impl FileLock {
 
 impl Drop for FileLock {
 	fn drop(&mut self) {
-		if let Some(inner) = self.inner.as_mut() {
-			let _ = inner.release();
-		}
+		let _ = self.release_native();
 	}
 }
 
@@ -207,14 +223,12 @@ mod tests {
 		let path = unique_lock_path("probe");
 		let path = path.as_str();
 		assert!(!is_held(path).expect("probe unlocked path"));
-		let mut lease = acquire(path, true, None)
-			.expect("acquire")
-			.expect("free lease");
+		let mut lease = acquire(path, true).expect("acquire").expect("free lease");
 		assert!(is_held(path).expect("probe held path"));
 		lease.release().expect("release");
 		assert!(!is_held(path).expect("probe released path"));
 		// A probe never leaves the path held for the next acquirer.
-		let mut successor = acquire(path, true, None)
+		let mut successor = acquire(path, true)
 			.expect("reacquire")
 			.expect("probe left the lease free");
 		successor.release().expect("release successor");
@@ -244,7 +258,7 @@ mod tests {
 		assert!(FileLock::is_held_path(&path).expect("probe while the older build holds it"));
 		for create in [false, true] {
 			assert!(
-				super::acquire(&path, create, None)
+				super::acquire(&path, create)
 					.expect("shared acquisition")
 					.is_none()
 			);
@@ -260,68 +274,81 @@ mod tests {
 
 	#[cfg(target_os = "linux")]
 	#[test]
-	fn explicit_legacy_identity_is_owned_until_release_or_drop() {
+	fn named_lease_excludes_old_and_intermediate_owners_until_release_or_drop() {
 		use std::os::{
 			linux::net::SocketAddrExt,
 			unix::net::{SocketAddr, UnixDatagram},
 		};
 
-		use super::FileLock;
+		use super::{FileLock, acquire_named};
 
 		let root = tempfile::tempdir().expect("private lock directory");
-		let first_path = root.path().join("first.lock");
-		let second_path = root.path().join("second.lock");
-		std::fs::write(&first_path, []).expect("prepare first sidecar");
-		std::fs::write(&second_path, []).expect("prepare second sidecar");
-		let first_path = first_path.to_str().expect("UTF-8 sidecar");
-		let second_path = second_path.to_str().expect("UTF-8 sidecar");
-		let key = format!(
-			"omp-legacy-{} α",
-			root
-				.path()
-				.file_name()
-				.expect("directory name")
-				.to_string_lossy()
-		);
+		let sidecar = root.path().join("publication.lock");
+		std::fs::write(&sidecar, []).expect("prepare intermediate sidecar");
+		let sidecar = sidecar.to_str().expect("UTF-8 sidecar");
+		let key_path = root.path().join("logical name α");
+		let key = key_path.to_str().expect("UTF-8 logical name");
 		let address =
-			SocketAddr::from_abstract_name(super::memory_lock_name(&key).as_bytes()).expect("address");
+			SocketAddr::from_abstract_name(super::memory_lock_name(key).as_bytes()).expect("address");
 
 		let old_owner = UnixDatagram::bind_addr(&address).expect("old protocol owner");
-		assert!(
-			acquire(first_path, false, Some(&key))
-				.expect("old owner contention")
-				.is_none()
-		);
-		let mut file_only = acquire(first_path, false, None)
-			.expect("file-only acquisition")
-			.expect("failed compatibility acquisition released its file lease");
-		file_only.release().expect("release file-only lease");
+		assert!(acquire_named(key).expect("old owner contention").is_none());
 		drop(old_owner);
 
-		let mut owner =
-			FileLock { inner: acquire(first_path, false, Some(&key)).expect("new owner") };
+		let intermediate_file = acquire(sidecar, false)
+			.expect("intermediate file")
+			.expect("free file");
+		let intermediate_name = UnixDatagram::bind_addr(&address).expect("intermediate named owner");
+		assert!(
+			acquire_named(key)
+				.expect("intermediate contention")
+				.is_none()
+		);
+		drop(intermediate_name);
+
+		// The name and sidecar are distinct resources; the file alone cannot
+		// prevent acquiring the logical lease.
+		let mut owner = FileLock { inner: acquire_named(key).expect("new owner") };
 		assert!(owner.is_acquired());
+		assert!(!key_path.exists());
+		assert!(acquire_named(key).expect("new owner contention").is_none());
 		assert_eq!(
 			UnixDatagram::bind_addr(&address)
 				.expect_err("new owner excludes old protocol")
 				.kind(),
 			std::io::ErrorKind::AddrInUse
 		);
-		assert!(
-			acquire(second_path, false, Some(&key))
-				.expect("same identity with a different sidecar")
-				.is_none()
+		drop(intermediate_file);
+
+		// An intermediate owner can take its file first, but cannot enter
+		// while the new owner retains the same kernel name.
+		let intermediate_file = acquire(sidecar, false)
+			.expect("intermediate file")
+			.expect("free file");
+		assert_eq!(
+			UnixDatagram::bind_addr(&address)
+				.expect_err("new owner excludes intermediate")
+				.kind(),
+			std::io::ErrorKind::AddrInUse
 		);
-		let mut second_file = acquire(second_path, false, None)
-			.expect("second file-only acquisition")
-			.expect("contended identity released the second file lease");
-		second_file.release().expect("release second file");
-		owner.release_native().expect("release both identities");
+		drop(intermediate_file);
+		assert!(!is_held(sidecar).expect("no leaked intermediate file lease"));
+		owner.release_native().expect("release name");
+		owner.release_native().expect("idempotent release");
 		drop(UnixDatagram::bind_addr(&address).expect("old protocol after release"));
 
-		let owner = FileLock { inner: acquire(first_path, false, Some(&key)).expect("reacquire") };
+		let owner = FileLock { inner: acquire_named(key).expect("reacquire") };
 		assert!(owner.is_acquired());
 		drop(owner);
 		drop(UnixDatagram::bind_addr(&address).expect("old protocol after owner drop"));
+	}
+
+	#[cfg(not(target_os = "linux"))]
+	#[test]
+	fn named_lease_rejects_unsupported_platforms() {
+		let error = super::acquire_named("logical name")
+			.err()
+			.expect("unsupported named lease");
+		assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
 	}
 }
