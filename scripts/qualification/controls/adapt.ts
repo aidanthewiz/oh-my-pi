@@ -64,6 +64,24 @@ export function adaptFixture(id: string, raw: string, checkout: string): string 
 			"new HttpTransport(config)",
 			"new HttpUpstream({ transport: 'http', url: config.url, headers: {}, timeoutMs: config.timeout }, 'legacy')",
 		);
+		text = replaceOne(
+			text,
+			"real HttpTransport/client/MCPTool serialization and retry code",
+			"real HttpUpstream legacy binding/client/MCPTool serialization and retry code",
+		);
+	}
+	if (id === "stream") {
+		text = replaceOne(
+			text,
+			"o/run/daemons/0000000000000000/stream.sock",
+			"o/run/daemon/streams/0000000000000000/stream.sock",
+		);
+		text = replaceOne(text, "setAgentDir, getDaemonRuntimeDir", "setAgentDir, getDaemonDir");
+		text = replaceOne(
+			text,
+			'path.join(getDaemonRuntimeDir(await fs.realpath(cwd)), "stream.sock")',
+			'path.join(getDaemonDir(), "streams", Bun.hash.wyhash(await fs.realpath(cwd)).toString(16).padStart(16, "0"), "stream.sock")',
+		);
 	}
 	if (id === "provider") {
 		text = replaceOne(
