@@ -5,6 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { Process as ProcessHandle } from "@oh-my-pi/pi-natives";
 import { isEnoent } from "@oh-my-pi/pi-utils/fs-error";
+import { reportCIDiskMetadata } from "./ci-disk-metadata";
 
 type Mode =
 	| "all"
@@ -34,6 +35,24 @@ interface TestCommand {
 type CodingAgentTestPartition = Record<CodingAgentBucket, string[]>;
 
 const repoRoot = path.join(import.meta.dir, "..");
+
+async function recordDiskMetadata(
+	phase: "initial" | "child-failure",
+	exitCode?: number,
+	command?: TestCommand,
+): Promise<void> {
+	if (process.platform === "linux" && Bun.env.GITHUB_ACTIONS === "true" && Bun.env.RUNNER_TEMP) {
+		await reportCIDiskMetadata(
+			repoRoot,
+			Bun.env.RUNNER_TEMP,
+			phase,
+			exitCode,
+			undefined,
+			command ? { label: command.label, cwd: command.cwd } : undefined,
+		);
+	}
+}
+
 const args = process.argv.slice(2);
 const isDryRun = args.includes("--dry-run");
 const requestedMode = args.find(arg => !arg.startsWith("--")) ?? "all";
@@ -717,6 +736,7 @@ async function runTestCommand(testCommand: TestCommand, junitPath: string, runs:
 			}, chunkTimeoutMs());
 			const exitCode = await proc.exited;
 			clearTimeout(killTimer);
+			if (exitCode !== 0) await recordDiskMetadata("child-failure", exitCode, testCommand);
 			await retirement;
 			if (exitCode === 0 && !timedOut) {
 				return;
@@ -1327,6 +1347,7 @@ async function runTestCommandsInParallel(
 		}, chunkTimeoutMs());
 		const exitCode = await proc.exited;
 		clearTimeout(killTimer);
+		if (exitCode !== 0) await recordDiskMetadata("child-failure", exitCode, testCommand);
 		await retirement;
 		if (!(await settleWithin(drains, 5000))) {
 			stdoutDrain.cancel();
@@ -1467,6 +1488,7 @@ const testCommands = applyChunkBudget(requestedCommands, poolWidth);
 if (isDryRun) {
 	for (const testCommand of testCommands) printCommandHeader(testCommand);
 } else {
+	await recordDiskMetadata("initial");
 	// Per-command junit reports (see spawnArgv) live only for this run; what they
 	// say is folded into the timing history before they are removed.
 	const junitDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-test-junit-"));

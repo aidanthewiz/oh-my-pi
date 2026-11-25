@@ -227,16 +227,22 @@ describe("browser init deadline carry-over", () => {
 			// A fresh ready budget can accept this response; the carried, exhausted budget cannot.
 			const pendingResponses = new Map<ReturnType<typeof setTimeout>, (response: Response) => void>();
 			let requestStarted = false;
+			let controlRequests = 0;
+			let controlResponses = 0;
 			const server = Bun.serve({
 				port: 0,
 				fetch: request => {
-					if (new URL(request.url).pathname === "/hang") requestStarted = true;
+					const pathname = new URL(request.url).pathname;
+					const isControl = pathname === "/control";
+					if (isControl) controlRequests++;
+					if (pathname === "/hang") requestStarted = true;
 					const response = Promise.withResolvers<Response>();
 					const timer = setTimeout(() => {
 						pendingResponses.delete(timer);
 						response.resolve(
 							new Response("<title>late response</title>", { headers: { "content-type": "text/html" } }),
 						);
+						if (isControl) controlResponses++;
 					}, 1_500);
 					pendingResponses.set(timer, response.resolve);
 					return response.promise;
@@ -246,11 +252,27 @@ describe("browser init deadline carry-over", () => {
 			const controlName = `deadline-control-${process.pid}-${Math.random().toString(36).slice(2)}`;
 			const lateName = `deadline-carry-${process.pid}-${Math.random().toString(36).slice(2)}`;
 			try {
-				await acquireTab(controlName, launched, {
-					url: `http://127.0.0.1:${server.port}/control`,
-					waitUntil: "domcontentloaded",
-					timeoutMs: 5_000,
-				});
+				const controlStarted = performance.now();
+				try {
+					await acquireTab(controlName, launched, {
+						url: `http://127.0.0.1:${server.port}/control`,
+						waitUntil: "domcontentloaded",
+						timeoutMs: 5_000,
+					});
+				} catch (error) {
+					try {
+						console.error(
+							`[browser-cold-control] ${JSON.stringify({
+								controlRequests,
+								controlResponses,
+								elapsedMs: performance.now() - controlStarted,
+								connected: launched.browser.connected,
+								refCount: launched.refCount,
+							})}`,
+						);
+					} catch {}
+					throw error;
+				}
 				const control = await runInTab(controlName, {
 					code: "return await page.title();",
 					timeoutMs: 5_000,

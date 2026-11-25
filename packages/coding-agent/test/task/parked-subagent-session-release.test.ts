@@ -89,10 +89,35 @@ function collectionPass(ref: WeakRef<object>): boolean {
 
 async function collected(ref: WeakRef<object>, deadlineMs: number): Promise<boolean> {
 	const deadline = Date.now() + deadlineMs;
+	const monotonicStart = performance.now();
+	let passes = 0;
+	let collectionTotalMs = 0;
+	let collectionMaxMs = 0;
 	for (;;) {
 		// Keep the dereferenced target out of the suspended polling frame.
-		if (collectionPass(ref)) return true;
-		if (Date.now() > deadline) return false;
+		const passStarted = performance.now();
+		const released = collectionPass(ref);
+		const collectionMs = performance.now() - passStarted;
+		passes++;
+		collectionTotalMs += collectionMs;
+		collectionMaxMs = Math.max(collectionMaxMs, collectionMs);
+		if (released) return true;
+		const now = Date.now();
+		if (now > deadline) {
+			try {
+				console.error(
+					`[parked-collection] ${JSON.stringify({
+						deadlineMs,
+						passes,
+						wallElapsedMs: now - (deadline - deadlineMs),
+						monotonicElapsedMs: performance.now() - monotonicStart,
+						collectionTotalMs,
+						collectionMaxMs,
+					})}`,
+				);
+			} catch {}
+			return false;
+		}
 		await Bun.sleep(100);
 	}
 }

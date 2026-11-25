@@ -26,7 +26,9 @@ const inspectedNames = [
 
 async function prepareFixture(root: string): Promise<void> {
 	await fs.mkdir(path.join(root, "scripts"), { recursive: true });
-	await fs.copyFile(new URL("./ci-test-ts.ts", import.meta.url), path.join(root, "scripts/ci-test-ts.ts"));
+	for (const name of ["ci-test-ts.ts", "ci-disk-metadata.ts"]) {
+		await fs.copyFile(new URL(`./${name}`, import.meta.url), path.join(root, "scripts", name));
+	}
 	await fs.symlink(path.resolve(import.meta.dir, "../node_modules"), path.join(root, "node_modules"), "junction");
 	for (const { name, file } of fixtures) {
 		const target = path.join(root, file);
