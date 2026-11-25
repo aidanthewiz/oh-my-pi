@@ -176,7 +176,7 @@ jobs:
       runner: ubuntu-22.04
       binary: omp-linux-x64
       native-targets: linux-x64-baseline linux-x64-modern
-      qualification-runner: ubuntu-24.04
+      qualification-runner: ubuntu-26.04
     permissions:
       contents: read
       actions: read
