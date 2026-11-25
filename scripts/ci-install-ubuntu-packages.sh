@@ -11,8 +11,9 @@ fi
 case "$ID:$VERSION_ID" in
   ubuntu:22.04) suite=jammy ;;
   ubuntu:24.04) suite=noble ;;
+  ubuntu:26.04) suite=resolute ;;
   *)
-    echo "CI package setup requires Ubuntu 22.04 or 24.04" >&2
+    echo "CI package setup requires Ubuntu 22.04, 24.04 or 26.04" >&2
     exit 1
     ;;
 esac

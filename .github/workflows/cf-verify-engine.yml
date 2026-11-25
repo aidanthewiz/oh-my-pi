@@ -100,9 +100,9 @@ jobs:
             ${{ runner.temp }}/qualification-cargo
             ${{ runner.temp }}/qualification-rustup
             target
-          key: qualification-cargo-v1-${{ inputs.target }}-${{ matrix.scope == 'rust' && format('rust-nextest-{0}', env.NEXTEST_VERSION) || 'typescript' }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', '.cargo/config.toml') }}
+          key: qualification-cargo-v1-${{ inputs.target }}-${{ inputs.qualification-runner == 'ubuntu-26.04' && 'ubuntu-26.04-' || '' }}${{ matrix.scope == 'rust' && format('rust-nextest-{0}', env.NEXTEST_VERSION) || 'typescript' }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', '.cargo/config.toml') }}
           restore-keys: |
-            qualification-cargo-v1-${{ inputs.target }}-${{ matrix.scope == 'rust' && 'rust' || 'typescript' }}-
+            qualification-cargo-v1-${{ inputs.target }}-${{ inputs.qualification-runner == 'ubuntu-26.04' && 'ubuntu-26.04-' || '' }}${{ matrix.scope == 'rust' && 'rust' || 'typescript' }}-
       - name: Install pinned qualification tools
         shell: bash
         run: |
