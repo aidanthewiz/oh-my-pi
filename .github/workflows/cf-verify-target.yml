@@ -420,14 +420,14 @@ jobs:
           BAZEL="$(command -v bazelisk || command -v bazel)"
           "$BAZEL" --bazelrc="$RUNNER_TEMP/coreforge-bazel.rc" shutdown
       - name: Save successful PR hot cache
-        if: success() && steps.pr-cache-close.outcome == 'success' && steps.bazel-cache.outputs.cache-primary-key != '' && steps.bazel-cache.outputs.cache-hit != 'true'
+        if: success() && steps.pr-cache-close.outcome == 'success' && steps.bazel-cache.outputs.cache-hit != 'true'
         continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cache/omp-bazel-disk
             ~/.cache/omp-bazel-repo
-          key: ${{ steps.bazel-cache.outputs.cache-primary-key }}
+          key: coreforge-bazel-v2-${{ steps.cache-identity.outputs.key }}-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'MODULE.bazel', 'MODULE.bazel.lock', 'rust-toolchain.toml', 'rustfmt.toml', '.bazelrc', '.bazelignore', '.bazelversion', 'bazel/**', 'crates/**', 'BUILD.bazel') }}
       - name: Prepare successful PR cache snapshot
         if: success() && steps.pr-cache-close.outcome == 'success' && vars.CI_CACHE_ENABLED == 'true'
         id: pr-cache-pack

@@ -111,6 +111,11 @@ describe.skipIf(process.platform === "win32")("daemon unit lifecycle", () => {
 			await first.close();
 
 			const second = await d.connect();
+			// Local socket closure does not acknowledge daemon-side lease removal.
+			await until(
+				async () => ((await second.describe("rejoin")).leases === 0 ? true : undefined),
+				"the previous connection's lease to be released",
+			);
 			const again = await second.openProc("rejoin", proc, { policy: { idleMs: 0 } });
 
 			expect(again.created).toBe(false);
