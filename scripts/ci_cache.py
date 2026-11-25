@@ -376,9 +376,9 @@ def output_value(name, value):
             target.write(f"{name}={value}\n")
 
 
-def preflight_state(identity_outcome, durable_outcome, durable_hit, hot_outcome, hot_hit, hot_matched_key):
+def preflight_state(identity_outcome, download_outcome, durable_outcome, durable_hit, hot_outcome, hot_hit, hot_matched_key):
     outcomes = {"", "success", "skipped", "failure", "cancelled"}
-    if (any(value not in outcomes for value in (identity_outcome, durable_outcome, hot_outcome))
+    if (any(value not in outcomes for value in (identity_outcome, download_outcome, durable_outcome, hot_outcome))
             or durable_hit not in {"", "true", "false"} or hot_hit not in {"", "true", "false"}
             or len(hot_matched_key) > 1024):
         return {"state": "unknown", "source": "none", "reason": "invalid restore metadata"}
@@ -386,22 +386,25 @@ def preflight_state(identity_outcome, durable_outcome, durable_hit, hot_outcome,
         return {"state": "unknown", "source": "none", "reason": "cache identity unavailable"}
     if durable_outcome == "success" and durable_hit == "true":
         return {"state": "restored", "source": "durable", "reason": "compatible snapshot restored"}
-    if hot_outcome == "success" and hot_matched_key:
+    if hot_outcome == "success" and hot_matched_key and hot_hit in {"true", "false"}:
         if hot_hit == "true":
             return {"state": "restored", "source": "github", "reason": "exact hot-cache key restored"}
         return {"state": "partial", "source": "github", "reason": "prefix-matched hot cache restored"}
-    if hot_hit == "true" or durable_hit == "true":
+    if hot_matched_key or hot_hit == "true" or durable_hit == "true":
         return {"state": "unknown", "source": "none", "reason": "inconsistent restore metadata"}
-    if "failure" in (durable_outcome, hot_outcome) or "cancelled" in (durable_outcome, hot_outcome):
+    if any(value in {"failure", "cancelled"} for value in (download_outcome, durable_outcome, hot_outcome)):
         return {"state": "unknown", "source": "none", "reason": "cache restore unavailable"}
-    if hot_outcome == "success":
-        return {"state": "cold", "source": "none", "reason": "no cache restored"}
+    if hot_outcome == "success" and hot_hit == "false":
+        if download_outcome == "skipped" and durable_outcome == "skipped":
+            return {"state": "cold", "source": "none", "reason": "durable cache disabled and no hot cache"}
+        if download_outcome == "success" and durable_outcome == "success" and durable_hit == "false":
+            return {"state": "cold", "source": "none", "reason": "no cache restored"}
     return {"state": "unknown", "source": "none", "reason": "cache lookup did not complete"}
 
 
 def record_preflight(output):
     result = preflight_state(*(os.environ.get(name, "") for name in (
-        "CACHE_IDENTITY_OUTCOME", "CACHE_DURABLE_OUTCOME", "CACHE_DURABLE_HIT",
+        "CACHE_IDENTITY_OUTCOME", "CACHE_DOWNLOAD_OUTCOME", "CACHE_DURABLE_OUTCOME", "CACHE_DURABLE_HIT",
         "CACHE_HOT_OUTCOME", "CACHE_HOT_HIT", "CACHE_HOT_MATCHED_KEY",
     )))
     atomic_json(output, result)
