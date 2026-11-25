@@ -78,8 +78,11 @@ Output bases, extracted repository trees, logs, credentials, signing material, a
 
 Compatibility identities include target/runner slot, actual OS and architecture, Bazel 9.2.0, compiler/SDK/tool identities, and pinned toolchain/configuration inputs.
 Native source files, dependency lock changes, and commit SHAs do not partition durable snapshots; Bazel action hashes invalidate changed inputs.
-S3 restores first. A missing, incompatible, or rejected snapshot falls back to the identity-scoped GitHub hot cache, then a real cold build.
-Cache-only failures produce warnings; they never skip required work or turn a failed build into success.
+Protected releases first consider the cache built by the exact merged PR. Reuse requires a successful same-repository `cf-verify` run, an identical committed tree, the expected completed producer job and attempt, and matching platform/toolchain/options identity. Metadata is verified before downloading the cache payload; archive hashes and member validation still apply.
+If that candidate is missing, expired, incompatible or rejected, restoration falls back to the protected S3 snapshot, the identity-scoped GitHub hot cache, then a real cold build.
+Cache-only failures produce warnings and explicit hit/miss summaries; they never skip required work or turn a failed build into success.
+
+PR producers save their own merge-ref-scoped hot caches and retain inert snapshot metadata/payload artifacts for three days. These artifacts do not grant shared-cache or AWS write authority. GitHub does not expose a PR merge-ref cache directly to the base branch; the validated artifact handoff is separate.
 
 Build jobs receive verified snapshot data through one-day GitHub transfer artifacts, never AWS credentials.
 Immutable reusable brokers execute only protected `coreforge` helper code.

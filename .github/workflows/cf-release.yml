@@ -186,6 +186,10 @@ jobs:
     name: build (${{ matrix.target }})
     needs: [prepare, cache_restore]
     if: ${{ !cancelled() && needs.prepare.result == 'success' && needs.prepare.outputs.should_release == 'true' }}
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
     concurrency:
       group: cf-release-build-${{ matrix.target }}-${{ github.ref_type == 'branch' && github.run_attempt == 1 && 'latest' || github.run_id }}
       cancel-in-progress: true
@@ -314,8 +318,18 @@ jobs:
         id: cache-identity
         continue-on-error: true
         run: python3 scripts/ci_cache.py identity --slot "${{ matrix.target }}-${{ matrix.os }}" --output "$RUNNER_TEMP/cache-identity.json"
+      - name: Restore verified merged-PR cache
+        if: matrix.windows != '1' && vars.CI_CACHE_ENABLED == 'true' && steps.cache-identity.outcome == 'success'
+        id: pr-cache
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/ci_cache_pr.py restore --source "${{ needs.prepare.outputs.release_sha }}" \
+            --identity "$RUNNER_TEMP/cache-identity.json" \
+            --disk "$HOME/.cache/omp-bazel-disk" --repo "$HOME/.cache/omp-bazel-repo"
       - name: Download durable Bazel snapshot
-        if: matrix.windows != '1' && vars.CI_CACHE_ENABLED == 'true'
+        if: matrix.windows != '1' && vars.CI_CACHE_ENABLED == 'true' && steps.pr-cache.outputs.hit != 'true'
         id: cache-download
         continue-on-error: true
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -334,7 +348,7 @@ jobs:
         if: steps.cache-identity.outcome == 'failure' || steps.cache-download.outcome == 'failure' || steps.cache-restore.outcome == 'failure'
         run: echo "::warning::Bazel snapshot unavailable; required native build will run with compatible hot cache or cold inputs."
       - name: Restore compatible GitHub hot cache
-        if: steps.cache-identity.outcome == 'success' && steps.cache-restore.outputs.hit != 'true'
+        if: steps.cache-identity.outcome == 'success' && steps.pr-cache.outputs.hit != 'true' && steps.cache-restore.outputs.hit != 'true'
         id: bazel-cache
         continue-on-error: true
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -492,14 +506,14 @@ jobs:
           if-no-files-found: error
           overwrite: true
       - name: Save successful GitHub hot cache
-        if: success() && matrix.windows != '1' && steps.bazel-cache.outputs.cache-primary-key != '' && steps.bazel-cache.outputs.cache-hit != 'true'
+        if: success() && matrix.windows != '1' && steps.cache-identity.outcome == 'success' && steps.bazel-cache.outputs.cache-hit != 'true'
         continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cache/omp-bazel-disk
             ~/.cache/omp-bazel-repo
-          key: ${{ steps.bazel-cache.outputs.cache-primary-key }}
+          key: coreforge-bazel-v2-${{ steps.cache-identity.outputs.key }}-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'MODULE.bazel', 'MODULE.bazel.lock', 'rust-toolchain.toml', 'rustfmt.toml', '.bazelrc', '.bazelignore', '.bazelversion', 'bazel/**', 'crates/**', 'BUILD.bazel') }}
       - name: Prepare successful durable cache candidate
         if: success() && matrix.windows != '1' && vars.CI_CACHE_ENABLED == 'true' && steps.cache-identity.outcome == 'success'
         id: cache-pack

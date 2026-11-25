@@ -342,6 +342,58 @@ class GitDecisionTests(unittest.TestCase):
                 self.assertEqual(result.stdout, b'')
 
 
+    def test_pr_cache_export_does_not_release_but_native_command_changes_do(self):
+        path = '.github/workflows/cf-verify-target.yml'
+        workflow = {'jobs': {'build': {'steps': [
+            {'name': 'Restore compatible GitHub hot cache', 'uses': 'actions/cache/restore@fixture'},
+            {'name': 'Build native addon', 'run': 'native-build'},
+        ]}}}
+        files = {**self.fixture.files, path: json.dumps(workflow).encode()}
+        base = self.fixture.commit(files, [self.fixture.base])
+        changed = copy.deepcopy(workflow)
+        changed['jobs']['build']['steps'][0]['id'] = 'bazel-cache'
+        changed['jobs']['build']['steps'].append({
+            'id': 'pr-cache-pack', 'name': 'Prepare successful PR cache snapshot', 'run': 'pack-inert-cache',
+        })
+        source = self.fixture.commit({**files, path: json.dumps(changed).encode()}, [base])
+        result = self.fixture.classify(source, published_ref=base)
+        self.assertEqual((result.returncode, result.stdout), (0, b'false\n'), result.stderr)
+        changed['jobs']['build']['steps'][1]['run'] = 'changed-native-build'
+        source = self.fixture.commit({**files, path: json.dumps(changed).encode()}, [base])
+        result = self.fixture.classify(source, published_ref=base)
+        self.assertEqual((result.returncode, result.stdout), (0, b'true\n'), result.stderr)
+
+    def test_release_cache_import_cannot_hide_a_signing_change(self):
+        workflow = artifact_workflow()
+        workflow['jobs']['build']['permissions'] = {
+            'contents': 'read', 'pull-requests': 'read', 'actions': 'read',
+        }
+        workflow['jobs']['build']['steps'].append({
+            'id': 'pr-cache', 'name': 'Restore verified merged-PR cache', 'run': 'verify-cache',
+        })
+        source = self.fixture.changed({'.github/workflows/cf-release.yml': json.dumps(workflow).encode()})
+        self.assert_decision(source, 'false')
+        workflow['jobs']['build']['steps'][2]['run'] = 'different-signing-command'
+        source = self.fixture.changed({'.github/workflows/cf-release.yml': json.dumps(workflow).encode()})
+        self.assert_decision(source, 'true')
+
+    def test_cache_only_tip_cannot_hide_an_unpublished_runtime_ancestor(self):
+        files = {**self.fixture.files, 'crates/runtime.rs': b'unreleased runtime change'}
+        runtime = self.fixture.commit(files, [self.fixture.base])
+        source = self.fixture.commit({**files, 'scripts/ci_cache_pr.py': b'cache tooling'}, [runtime])
+        self.assert_decision(source, 'true')
+
+    def test_cache_restore_cannot_hide_new_write_permission(self):
+        workflow = artifact_workflow()
+        workflow['jobs']['build']['permissions'] = {
+            'contents': 'write', 'pull-requests': 'read', 'actions': 'read',
+        }
+        workflow['jobs']['build']['steps'].append({
+            'id': 'pr-cache', 'name': 'Restore verified merged-PR cache', 'run': 'verify-cache',
+        })
+        source = self.fixture.changed({'.github/workflows/cf-release.yml': json.dumps(workflow).encode()})
+        self.assert_decision(source, 'true')
+
     def test_malformed_workflow_or_cache_region_cannot_skip_release(self):
         invalid = artifact_workflow()
         invalid['jobs']['prepare']['steps'][0]['run'] = (

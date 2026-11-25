@@ -303,7 +303,7 @@ def cache_files(root, kind):
                     yield path, member
 
 
-def pack(identity_path, disk, repo, output):
+def pack(identity_path, disk, repo, output, *, source_sha=None):
     identity = validate_identity(read_json(identity_path))
     disk, repo, output = root_path(disk), root_path(repo), root_path(output)
     disjoint([disk, repo, output])
@@ -326,7 +326,8 @@ def pack(identity_path, disk, repo, output):
                         count += 1
         require(count > 0, "no supported cache payloads to pack")
         archive_path = temporary / "snapshot.tar.gz"
-        manifest = validate_manifest({"schema": SCHEMA, "slot": identity["slot"], "identity": identity, "dimension": dimension(identity), "sha256": digest_file(archive_path), "size": archive_path.stat().st_size, "source_sha": os.environ.get("GITHUB_SHA", ""), "run_id": os.environ.get("GITHUB_RUN_ID", ""), "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT", "1"), "created_at": timestamp()})
+        source = os.environ.get("GITHUB_SHA", "") if source_sha is None else source_sha
+        manifest = validate_manifest({"schema": SCHEMA, "slot": identity["slot"], "identity": identity, "dimension": dimension(identity), "sha256": digest_file(archive_path), "size": archive_path.stat().st_size, "source_sha": source, "run_id": os.environ.get("GITHUB_RUN_ID", ""), "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT", "1"), "created_at": timestamp()})
         atomic_json(temporary / "manifest.json", manifest)
     print(f"Packed {count} files: {manifest['sha256']}")
     return manifest
