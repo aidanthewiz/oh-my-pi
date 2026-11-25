@@ -1081,44 +1081,63 @@ else:
 
 
 class PreflightTests(unittest.TestCase):
+    def state(self, **changes):
+        values = {
+            "identity_outcome": "success", "download_outcome": "success",
+            "durable_outcome": "success", "durable_hit": "false",
+            "hot_outcome": "success", "hot_hit": "",
+            "hot_primary_key": "requested-key", "hot_matched_key": "",
+        }
+        values.update(changes)
+        return cache.preflight_state(**values)
+
     def test_verified_durable_restore_does_not_require_a_hot_lookup(self):
-        result = cache.preflight_state("success", "success", "success", "true", "skipped", "", "")
+        result = self.state(durable_hit="true", hot_outcome="skipped", hot_primary_key="")
         self.assertEqual((result["state"], result["source"]), ("restored", "durable"))
 
     def test_exact_and_prefix_hot_restores_remain_distinct(self):
-        exact = cache.preflight_state("success", "success", "success", "false", "success", "true", "exact-key")
-        partial = cache.preflight_state("success", "success", "success", "false", "success", "false", "older-key")
+        exact = self.state(hot_hit="true", hot_matched_key="requested-key")
+        partial = self.state(hot_hit="false", hot_matched_key="older-key")
         self.assertEqual((exact["state"], exact["source"]), ("restored", "github"))
         self.assertEqual((partial["state"], partial["source"]), ("partial", "github"))
 
-    def test_completed_misses_report_cold(self):
-        result = cache.preflight_state("success", "success", "success", "false", "success", "false", "")
+    # Pinned restoreImpl.ts leaves cache-hit unset on a completed miss; NullStateProvider publishes the requested key.
+    # https://github.com/actions/cache/blob/55cc8345863c7cc4c66a329aec7e433d2d1c52a9/src/restoreImpl.ts
+    # https://github.com/actions/cache/blob/55cc8345863c7cc4c66a329aec7e433d2d1c52a9/src/stateProvider.ts
+    def test_completed_miss_has_a_primary_key_but_no_hit_output(self):
+        result = self.state()
         self.assertEqual((result["state"], result["source"]), ("cold", "none"))
 
     def test_unknown_or_inconsistent_state_never_claims_a_restored_cache(self):
         cases = [
-            ("failure", "success", "success", "true", "skipped", "", ""),
-            ("success", "failure", "skipped", "", "success", "false", ""),
-            ("success", "skipped", "skipped", "", "skipped", "", ""),
-            ("success", "success", "success", "false", "success", "true", ""),
-            ("success", "success", "success", "false", "success", "invalid", "key"),
-            ("success", "success", "success", "false", "success", "", "older-key"),
-            ("success", "success", "success", "", "success", "false", ""),
-            ("success", "", "skipped", "", "success", "false", ""),
-            ("success", "success", "success", "false", "success", "", ""),
+            {"identity_outcome": "failure", "durable_hit": "true"},
+            {"download_outcome": "failure", "durable_outcome": "skipped", "durable_hit": ""},
+            {"download_outcome": "skipped", "durable_outcome": "skipped", "durable_hit": "", "hot_outcome": "skipped"},
+            {"hot_hit": "true"},
+            {"hot_hit": "invalid", "hot_matched_key": "key"},
+            {"hot_matched_key": "older-key"},
+            {"durable_hit": ""},
+            {"download_outcome": "", "durable_outcome": "skipped", "durable_hit": ""},
+            {"hot_hit": "false"},
+            {"hot_primary_key": "", "hot_hit": "true", "hot_matched_key": "key"},
         ]
-        for values in cases:
-            with self.subTest(values=values):
-                result = cache.preflight_state(*values)
+        for changes in cases:
+            with self.subTest(changes=changes):
+                result = self.state(**changes)
                 self.assertEqual((result["state"], result["source"]), ("unknown", "none"))
 
     def test_successful_hot_restore_survives_an_unavailable_durable_source(self):
-        result = cache.preflight_state("success", "failure", "skipped", "", "success", "true", "key")
+        result = self.state(download_outcome="failure", durable_outcome="skipped", durable_hit="",
+                            hot_hit="true", hot_matched_key="requested-key")
         self.assertEqual((result["state"], result["source"]), ("restored", "github"))
 
     def test_intentionally_disabled_durable_layer_can_still_have_a_known_hot_miss(self):
-        result = cache.preflight_state("success", "skipped", "skipped", "", "success", "false", "")
+        result = self.state(download_outcome="skipped", durable_outcome="skipped", durable_hit="")
         self.assertEqual((result["state"], result["source"]), ("cold", "none"))
+
+    def test_feature_unavailable_false_output_without_a_primary_key_is_unknown(self):
+        result = self.state(hot_hit="false", hot_primary_key="")
+        self.assertEqual((result["state"], result["source"]), ("unknown", "none"))
 
 
 if __name__ == "__main__":

@@ -179,6 +179,7 @@ jobs:
           CACHE_DURABLE_HIT: ${{ steps.cache-restore.outputs.hit }}
           CACHE_HOT_OUTCOME: ${{ steps.bazel-cache.outcome }}
           CACHE_HOT_HIT: ${{ steps.bazel-cache.outputs.cache-hit }}
+          CACHE_HOT_PRIMARY_KEY: ${{ steps.bazel-cache.outputs.cache-primary-key }}
           CACHE_HOT_MATCHED_KEY: ${{ steps.bazel-cache.outputs.cache-matched-key }}
         run: python3 scripts/ci_cache.py preflight --output "$RUNNER_TEMP/cache-preflight.json"
       - name: Build native addon from Coreforge sources
