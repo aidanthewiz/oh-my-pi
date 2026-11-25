@@ -83,6 +83,7 @@ If that candidate is missing, expired, incompatible or rejected, restoration fal
 Cache-only failures produce warnings and explicit hit/miss summaries; they never skip required work or turn a failed build into success.
 
 PR producers save their own merge-ref-scoped hot caches and retain inert snapshot metadata/payload artifacts for three days. These artifacts do not grant shared-cache or AWS write authority. GitHub does not expose a PR merge-ref cache directly to the base branch; the validated artifact handoff is separate.
+After restoration and before compilation, each Bazel producer reports `restored`, `partial`, `cold`, or `unknown`. This preflight describes available cache data, not guaranteed action hits, and does not change runner sizes or required checks.
 
 Build jobs receive verified snapshot data through one-day GitHub transfer artifacts, never AWS credentials.
 Immutable reusable brokers execute only protected `coreforge` helper code.

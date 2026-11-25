@@ -355,6 +355,9 @@ class GitDecisionTests(unittest.TestCase):
         changed['jobs']['build']['steps'].append({
             'id': 'pr-cache-pack', 'name': 'Prepare successful PR cache snapshot', 'run': 'pack-inert-cache',
         })
+        changed['jobs']['build']['steps'].append({
+            'id': 'cache-preflight', 'name': 'Report native cache preflight', 'run': 'report-cache-state',
+        })
         source = self.fixture.commit({**files, path: json.dumps(changed).encode()}, [base])
         result = self.fixture.classify(source, published_ref=base)
         self.assertEqual((result.returncode, result.stdout), (0, b'false\n'), result.stderr)

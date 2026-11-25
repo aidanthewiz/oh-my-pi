@@ -168,6 +168,18 @@ jobs:
           key: coreforge-bazel-v2-${{ steps.cache-identity.outputs.key }}-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'MODULE.bazel', 'MODULE.bazel.lock', 'rust-toolchain.toml', 'rustfmt.toml', '.bazelrc', '.bazelignore', '.bazelversion', 'bazel/**', 'crates/**', 'BUILD.bazel') }}
           restore-keys: |
             coreforge-bazel-v2-${{ steps.cache-identity.outputs.key }}-
+      - name: Report native cache preflight
+        if: inputs.native-changed == true && inputs.windows != true
+        id: cache-preflight
+        continue-on-error: true
+        env:
+          CACHE_IDENTITY_OUTCOME: ${{ steps.cache-identity.outcome }}
+          CACHE_DURABLE_OUTCOME: ${{ steps.cache-restore.outcome }}
+          CACHE_DURABLE_HIT: ${{ steps.cache-restore.outputs.hit }}
+          CACHE_HOT_OUTCOME: ${{ steps.bazel-cache.outcome }}
+          CACHE_HOT_HIT: ${{ steps.bazel-cache.outputs.cache-hit }}
+          CACHE_HOT_MATCHED_KEY: ${{ steps.bazel-cache.outputs.cache-matched-key }}
+        run: python3 scripts/ci_cache.py preflight --output "$RUNNER_TEMP/cache-preflight.json"
       - name: Build native addon from Coreforge sources
         if: inputs.native-changed == true && inputs.windows != true
         env:

@@ -1080,5 +1080,38 @@ else:
         self.assertEqual({row["key"] for row in self.store.listing()}, before)
 
 
+class PreflightTests(unittest.TestCase):
+    def test_verified_durable_restore_does_not_require_a_hot_lookup(self):
+        result = cache.preflight_state("success", "success", "true", "skipped", "", "")
+        self.assertEqual((result["state"], result["source"]), ("restored", "durable"))
+
+    def test_exact_and_prefix_hot_restores_remain_distinct(self):
+        exact = cache.preflight_state("success", "success", "false", "success", "true", "exact-key")
+        partial = cache.preflight_state("success", "success", "false", "success", "false", "older-key")
+        self.assertEqual((exact["state"], exact["source"]), ("restored", "github"))
+        self.assertEqual((partial["state"], partial["source"]), ("partial", "github"))
+
+    def test_completed_misses_report_cold(self):
+        result = cache.preflight_state("success", "success", "false", "success", "", "")
+        self.assertEqual((result["state"], result["source"]), ("cold", "none"))
+
+    def test_unknown_or_inconsistent_state_never_claims_a_restored_cache(self):
+        cases = [
+            ("failure", "success", "true", "skipped", "", ""),
+            ("success", "failure", "", "success", "false", ""),
+            ("success", "skipped", "", "skipped", "", ""),
+            ("success", "success", "false", "success", "true", ""),
+            ("success", "success", "false", "success", "invalid", "key"),
+        ]
+        for values in cases:
+            with self.subTest(values=values):
+                result = cache.preflight_state(*values)
+                self.assertEqual((result["state"], result["source"]), ("unknown", "none"))
+
+    def test_successful_hot_restore_survives_an_unavailable_durable_source(self):
+        result = cache.preflight_state("success", "failure", "", "success", "true", "key")
+        self.assertEqual((result["state"], result["source"]), ("restored", "github"))
+
+
 if __name__ == "__main__":
     unittest.main()

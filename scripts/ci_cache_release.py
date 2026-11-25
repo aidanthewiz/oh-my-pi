@@ -39,6 +39,7 @@ CACHE_STEPS = frozenset({
     (None, 'Retain durable cache candidate for successful-release publication'),
 })
 PR_CACHE_STEPS = frozenset({
+    ('cache-preflight', 'Report native cache preflight'),
     ('pr-cache-close', 'Stop successful PR Bazel server before cache export'),
     (None, 'Save successful PR hot cache'),
     ('pr-cache-pack', 'Prepare successful PR cache snapshot'),

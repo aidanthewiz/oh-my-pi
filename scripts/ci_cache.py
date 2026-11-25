@@ -376,6 +376,45 @@ def output_value(name, value):
             target.write(f"{name}={value}\n")
 
 
+def preflight_state(identity_outcome, durable_outcome, durable_hit, hot_outcome, hot_hit, hot_matched_key):
+    outcomes = {"", "success", "skipped", "failure", "cancelled"}
+    if (any(value not in outcomes for value in (identity_outcome, durable_outcome, hot_outcome))
+            or durable_hit not in {"", "true", "false"} or hot_hit not in {"", "true", "false"}
+            or len(hot_matched_key) > 1024):
+        return {"state": "unknown", "source": "none", "reason": "invalid restore metadata"}
+    if identity_outcome != "success":
+        return {"state": "unknown", "source": "none", "reason": "cache identity unavailable"}
+    if durable_outcome == "success" and durable_hit == "true":
+        return {"state": "restored", "source": "durable", "reason": "compatible snapshot restored"}
+    if hot_outcome == "success" and hot_matched_key:
+        if hot_hit == "true":
+            return {"state": "restored", "source": "github", "reason": "exact hot-cache key restored"}
+        return {"state": "partial", "source": "github", "reason": "prefix-matched hot cache restored"}
+    if hot_hit == "true" or durable_hit == "true":
+        return {"state": "unknown", "source": "none", "reason": "inconsistent restore metadata"}
+    if "failure" in (durable_outcome, hot_outcome) or "cancelled" in (durable_outcome, hot_outcome):
+        return {"state": "unknown", "source": "none", "reason": "cache restore unavailable"}
+    if hot_outcome == "success":
+        return {"state": "cold", "source": "none", "reason": "no cache restored"}
+    return {"state": "unknown", "source": "none", "reason": "cache lookup did not complete"}
+
+
+def record_preflight(output):
+    result = preflight_state(*(os.environ.get(name, "") for name in (
+        "CACHE_IDENTITY_OUTCOME", "CACHE_DURABLE_OUTCOME", "CACHE_DURABLE_HIT",
+        "CACHE_HOT_OUTCOME", "CACHE_HOT_HIT", "CACHE_HOT_MATCHED_KEY",
+    )))
+    atomic_json(output, result)
+    for key in ("state", "source"):
+        output_value(key, result[key])
+    message = f"Native cache preflight: {result['state']} ({result['source']}; {result['reason']})."
+    print(message + " Cache availability is not a guarantee of Bazel action hits.")
+    if summary := os.environ.get("GITHUB_STEP_SUMMARY"):
+        with open(summary, "a", encoding="utf-8") as target:
+            target.write(message + " Required build and test commands are unchanged.\n")
+    return result
+
+
 def replace_roots(staged):
     backups = {}
     installed = []
@@ -733,6 +772,8 @@ def main(argv=None):
     identity.add_argument("--slot", required=True)
     identity.add_argument("--output", required=True)
     pack_parser = commands.add_parser("pack")
+    preflight_parser = commands.add_parser("preflight")
+    preflight_parser.add_argument("--output", required=True)
     restore_parser = commands.add_parser("restore")
     for command in (pack_parser, restore_parser):
         command.add_argument("--identity", required=True)
@@ -759,6 +800,8 @@ def main(argv=None):
             key = dimension(value)
             print(key)
             output_value("key", key)
+        elif arguments.command == "preflight":
+            record_preflight(arguments.output)
         elif arguments.command == "pack":
             pack(arguments.identity, arguments.disk, arguments.repo, arguments.output)
         elif arguments.command == "restore":
